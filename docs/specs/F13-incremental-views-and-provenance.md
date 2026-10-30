@@ -121,7 +121,7 @@ PUT /$/views/{ds}/{name}
 | `provenance` | `none`, `count`, `why`, `lineage` | `none` | The annotation kept per row (§5). |
 | `maintenance` | `async`, `commit` | `async` | Whether the view is maintained after the commit or inside it (§3.3). |
 | `onFailure` | `suspend`, `reject` | `suspend` | What a failed pass at commit time does (§3.3). |
-| `declassify` | boolean | `false` | Whether a `graph` view may publish data that some readers of its graph cannot read (§6.1). |
+| `declassify` | boolean | `false` | Whether a `graph` view may publish data that some readers of its output graph cannot read (§6.1). |
 | `branches` | branch names or globs | `["main"]` | The branches with their own state (§7). |
 | `memoryBytes` | bytes | 256 MiB | The budget of the view's state (§8.2). |
 | `keepCommits` | integer | 0 | Diffs kept in memory for reads at past commits (§7.2). |
@@ -360,12 +360,14 @@ passes the per-query budget fails with an `error` event naming the budget.
 The server can attach a circuit that no user defined. An internal circuit has no
 `view.json`, no name in `GET /$/views/{ds}` and no principal. It reads through
 `InternalAccess`, which only server code can construct, and it is never granted to a
-caller. Its sink is either a view's rows or an accumulator that sums a count per key from
-the weights of its output, without keeping the rows. C22's refresh counts the changed
-facts per community with an accumulator on an internal circuit, and the accumulator
-counts churn in the same way as the counter that refresh reads today. It does not use a
-grouped `COUNT` view, which would see a fact that is added and removed in the same round
-as no change.
+caller. Its sink is either a view's rows or an accumulator that keeps a count per key and not
+the rows. For each commit the accumulator adds the magnitude of every change event of the
+circuit's output, the sum of the absolute weights per key, and it records that sum before
+the changes of different commits can cancel. A fact that is added by one commit and
+removed by the next counts 2, and a deletion counts 1, which is what the feed-based
+counter that C22's refresh reads today produces. C22's refresh counts the changed facts
+per community with such an accumulator. It does not use a grouped `COUNT` view, whose
+rows hold the net weights and so lose the churn.
 
 ## 4. The incremental fragment
 
@@ -492,9 +494,19 @@ to callers who cannot read its inputs grants them the view by name
 written to the audit log.
 
 A `graph` view writes its output into a graph that anyone with access to that graph
-reads, whatever the view's principal could read. A `graph` view is therefore refused at
-definition unless its principal reads every quad of the dataset or the definition sets
-`declassify: true`. Setting it is written to the audit log with the definer.
+reads, whatever the view's principal could read. A principal that reads every quad can
+still copy protected facts into a graph that more people read, so the test is on the
+readers of the output and not on the view's principal. A `graph` view needs
+`declassify: true` unless every principal able to read its output graph can also read
+every graph and predicate that its query can touch. Setting `declassify` is written to
+the audit log with the definer, and it is the graph-view counterpart of the `view:{name}`
+grant, which declassifies a table view for the callers it names.
+
+The rule is evaluated at `PUT` and again on each access-policy reload. A `PUT` that fails
+it without `declassify: true` is refused with `403 declassify-required`. A view that
+stops satisfying it after a reload, and was not declassified, is suspended with the
+reason `declassify-required` and no longer runs, rather than left publishing data to
+readers who could not see it.
 
 ### 6.2 Live queries
 
