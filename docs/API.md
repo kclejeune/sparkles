@@ -124,7 +124,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 |--------|---------------|-------------|
 | GET    | `/$/ping`     | Liveness check. Returns a plain-text timestamp with `200` whenever the process serves HTTP. |
 | GET    | `/$/ready`    | Readiness check. Returns `200` when the server is ready and `503` otherwise. The body is always `ReadyInfo`, sent with `Cache-Control: no-store`. |
-| GET    | `/$/ready/{ds}` | Readiness of one dataset. `datasets` has one entry. `404` if the dataset is unknown. |
+| GET    | `/$/ready/{ds}` | Readiness of one dataset. `datasets` has one entry, and `ready` is false while the dataset is opening or failed. `404` if the dataset is unknown. |
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | GET    | `/$/openapi.json`, `/$/openapi.yaml` | The OpenAPI 3.1 description of the API. See [OpenAPI description](#openapi-description). |
@@ -134,21 +134,59 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 
 ```ts
 type ReadyInfo = {
-  status: "starting" | "ready" | "draining";   // draining: shutting down (SIGINT / SIGTERM, see Shutdown)
+  // starting: datasets are opening; degraded: a dataset failed to open (see Startup);
+  // draining: shutting down (SIGINT / SIGTERM, see Shutdown)
+  status: "starting" | "ready" | "degraded" | "draining";
   ready: boolean;
   uptimeSeconds: number;
   datasets: {
     name: string; type: "persistent" | "mem";
-    state: "open"; ready: boolean;
-    generation?: string;   // persistent datasets: the index generation in use
-    walBytes: number;      // size of the write-ahead log (0 for mem)
-    deltaQuads: number;    // inserts + deletes not yet compacted
+    state: "open" | "opening" | "failed"; ready: boolean;
+    generation?: string;   // open persistent datasets: the index generation in use
+    walBytes?: number;     // open datasets: size of the write-ahead log (0 for mem)
+    deltaQuads?: number;   // open datasets: inserts + deletes not yet compacted
+    error?: string;        // failed: why, in full only for a server administrator
+    errorKind?: string;    // failed: unsupported-format, missing, corrupt, io, locked, invalid, recovery or error
   }[];
 };
 
 // 0 means unlimited
 type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxRowsProduced: number; maxDatasetBytes: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
 ```
+
+### Startup
+
+`serve` binds its listener before it opens the registered datasets, so `/$/ping` answers
+at once and `/$/ready` reports `"status": "starting"` until startup has finished. The
+datasets open in parallel on `--open-threads` threads, which default to the number of
+cores and at most 4. The datasets of `--mem`, `--loc` and `--fuseki-config` are attached
+once the registered ones are open, and the startup steps that name datasets, such as
+`--text`, `--geo`, `--validate` and `--rdfs`, run after that. Meanwhile each dataset
+still to open is listed with `"state": "opening"`, and a request to it answers `503`
+with `Retry-After: 5` and the code `dataset-opening`. Creating, renaming, deleting or
+restoring a dataset under the name of one that is opening is refused.
+
+A registered dataset that fails to open stays registered and closed, and startup
+continues with the others. Its state is `failed`, with `error` and `errorKind`, and a
+request to it answers `503` with the code `dataset-failed` and a `kind`. A failure from
+a format this release does not read has the kind `unsupported-format`, and one whose
+directory or CURRENT file is missing has the kind `missing` and names the expected path. Once startup has
+finished, the server reports `"status": "degraded"` and is not ready while any dataset
+is failed. `--ready-ignore-failed` keeps such a server ready, still reporting
+`degraded`. `--require-all-datasets` stops the server with an error instead. A startup
+step for a failed dataset is skipped and logged. A `--mem` or `--loc` dataset that fails
+to attach, or another startup step that fails, still stops the server.
+
+`/$/ready` lists only the datasets the caller may read, or all of them with the
+`metrics` permission. Only a server administrator reads a failure's full message, which
+names paths, and other callers get a fixed sentence. `GET /$/server` lists the failed
+datasets under `refusedDatasets` with their `kind`, and the ones still opening under
+`openingDatasets`, with the same rules. A caller that may not read a dataset gets the
+same `404` for an opening or failed dataset as for a missing one.
+`sparkles_datasets{state}` counts the datasets that are open, opening and failed.
+
+A shutdown during startup opens no more datasets and waits for those that are opening.
+The others stay registered and open at the next start.
 
 ### Shutdown
 
@@ -212,6 +250,7 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_build_info` | gauge (1) | `version` |
 | `sparkles_start_time_seconds` | gauge | |
 | `sparkles_ready` | gauge (0/1) | |
+| `sparkles_datasets` | gauge. Declared datasets that are open, opening at startup, or failed to open. | `state` |
 | `sparkles_requests_total` | counter | `dataset`, `operation`, `outcome` |
 | `sparkles_request_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `operation` |
 | `sparkles_requests_active` | gauge | `operation` |

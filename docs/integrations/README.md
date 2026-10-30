@@ -35,9 +35,11 @@ After runtime close commits, an I/O failure can reopen the existing dataset thro
 fresh runtime. Recovery verifies its original UUID and existing CURRENT before opening.
 If a delete cannot synchronize its rollback, the catalog leaves the dataset unavailable
 and reports the retained data path. Unresolved moved bytes stay in
-`databases/.kept-<name>-<token>` and catalog startup does not remove them. Startup refuses
-only a registered dataset whose directory or CURRENT file is missing. It serves the other
-datasets, keeps the refused one registered and names its expected path in the refusal.
+`databases/.kept-<name>-<token>` and catalog startup does not remove them. `Catalog::open`
+refuses alone only a registered dataset whose directory or CURRENT file is missing, or
+whose format this release does not read. It serves the other datasets, keeps the refused
+one registered and names its expected path in the refusal. A server keeps any dataset
+that fails to open closed in the same way ([API.md](../API.md#startup)).
 Moving the retained directory back to that path and restarting recovers the dataset.
 A close callback that panics after the runtime close commits leaves the dataset
 registered and closed, and the next catalog open reopens it. Restore publication

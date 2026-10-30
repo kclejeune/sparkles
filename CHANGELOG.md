@@ -10,6 +10,13 @@ a commit-labeled development baseline. No published release baseline exists.
 Library and binding checks, broader machine-readable contracts and deprecation
 signals remain incomplete.
 
+`GET /$/ready` and `GET /$/ready/{ds}` can report the status `degraded`, which spec
+C01 reserved. A server reports it when a dataset failed to open at startup. Such a
+dataset, including one in a format this release does not read, now makes the server
+not ready unless `serve --ready-ignore-failed` is set. `/$/ping` answers as soon as the
+listener is bound, before the datasets open, so scripts that waited for `/$/ping` before
+querying now wait for `/$/ready`.
+
 ### Changed
 
 Change feeds, live queries and long polls end with `access-changed` when the session

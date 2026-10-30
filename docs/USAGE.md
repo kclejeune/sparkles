@@ -236,7 +236,11 @@ A dataset `ds` has the Fuseki-style endpoints `/ds/sparql`, `/ds/update`, `/ds/d
 `/$/compact/ds`, `/$/backup/ds` and `/$/tasks` (see [API.md](API.md)). `--mem NAME` adds
 an in-memory dataset, and `--loc NAME=PATH` serves an existing database.
 
-`/$/ping` is the liveness check and `/$/ready` the readiness check. `/$/ready` returns
+`/$/ping` is the liveness check and `/$/ready` the readiness check. The server listens
+before its datasets open, so a script or health check waits for `/$/ready` before it
+sends queries. A dataset that fails to open leaves the others serving and the server
+`degraded` and not ready. `--ready-ignore-failed` keeps it ready and
+`--require-all-datasets` stops it instead ([API.md](API.md#startup)). `/$/ready` returns
 `503` once shutdown starts on SIGINT or SIGTERM. The requests in flight then get
 `--shutdown-grace` seconds to finish, after which the rest are cancelled and commit
 nothing ([API.md](API.md#shutdown)). `/$/metrics` serves Prometheus metrics.
@@ -2152,8 +2156,9 @@ A server that finds a dataset in a version it does not read leaves that dataset 
 logs why, and serves the others. That covers an index or a log in a newer version, a
 `dataset.json` that needs a later reader, and a settings file such as `describe.json`,
 `rdfs.json` or `assistant.json` with a newer `format`, which a store checks at open before
-it writes any file. The dataset stays registered, and `GET /$/server` lists it under
-`refusedDatasets`. A caller sees the refused datasets it may read, and a server
+it writes any file. The dataset stays registered, `GET /$/server` lists it under
+`refusedDatasets`, and the server reports itself `degraded` and not ready
+([API.md](API.md#startup)). A caller sees the refused datasets it may read, and a server
 administrator sees all of them and alone gets the full reason, which names paths. The
 other callers get a fixed sentence. A refused dataset cannot be deleted or renamed through
 the API while it is closed. Stop the server and run `sparkles migrate`, or edit
@@ -6991,10 +6996,11 @@ The pod runs as uid 10001 with a read-only root filesystem, no privilege escalat
 every capability dropped. The server writes only to the data volume and to `/tmp`, which
 is an emptyDir where large request bodies are spooled. `tmp.sizeLimit` bounds it. The
 probes need no credentials. The startup probe asks for `GET /$/ready` every 5 seconds
-for up to 30 minutes, which is the time the server has to open large datasets before it
-listens. The readiness probe uses `/$/ready` as well, and the liveness probe uses
-`/$/ping`. `terminationGracePeriodSeconds` (40) must be longer than
-`server.shutdownGrace` (20), so that requests in flight can finish after SIGTERM, and the
+for up to 30 minutes, which is the time the server has to open large datasets. The
+readiness probe uses `/$/ready` as well, and the liveness probe uses `/$/ping`. A server
+with a dataset that failed to open is not ready, so the Service sends it no requests.
+Add `--ready-ignore-failed` to `server.extraArgs` to serve the other datasets anyway.
+`terminationGracePeriodSeconds` (40) must be longer than `server.shutdownGrace` (20), so that requests in flight can finish after SIGTERM, and the
 chart refuses values where it is not.
 
 ### Settings, models and secrets

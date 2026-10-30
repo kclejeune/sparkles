@@ -156,12 +156,21 @@ callers and records the selected numeric user in its receipt.
   writes and the versions it reads, and `GET /$/server` reports it
   ([X12](../specs/X12-release-engineering.md), [USAGE.md](../USAGE.md#upgrading-databases)). A
   newer version is refused with a message that says what to do, and a dataset in an
-  unreadable format stays closed while the others are served.
+  unreadable format stays closed while the others are served, which leaves the server
+  `degraded`.
 * The generation index is read from a set of formats, so a format change lands at the
   next compaction, and backups restore when their index format is in that set.
 * `sparkles migrate` lists a stopped server's file versions and runs upgrade steps on a
   checked copy that it swaps in, keeping the dataset id and history. Fixtures in
   `testsuite/formats/` test that older files open, query, write, compact and restore.
+* The server listens before its datasets open and opens them in parallel
+  ([API.md](../API.md#startup)). `/$/ready` reports each dataset as `open`, `opening` or
+  `failed`, and a request to a dataset that is opening answers `503` with `Retry-After`.
+  A dataset that fails to open stays registered and closed while the others serve, and
+  the server is `degraded` and not ready unless `--ready-ignore-failed` is set.
+  `--require-all-datasets` stops the server instead. A dataset whose derived index is
+  unavailable is not reported separately, and the opening reports no progress through a
+  log replay, under [item 402](../ROADMAP.md).
 * On SIGTERM or SIGINT the server stops accepting connections and gives requests in
   flight `--shutdown-grace` seconds to finish. It then cancels the rest, and a cancelled
   write commits nothing.
