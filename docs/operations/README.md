@@ -33,6 +33,11 @@ support. Published server downloads, signed provenance, the other server platfor
 and published container images remain open under [item 59](../ROADMAP.md). Candidate
 build records are unsigned metadata. [DEVELOPMENT](../DEVELOPMENT.md#server-artifact-candidates)
 describes the commands and evidence boundaries.
+The archive bundles no CA certificates. A host needs the system CA certificates, the
+`ca-certificates` package on Debian, Ubuntu and Rocky Linux, because the built-in HTTP
+client loads them when it starts, even for a loopback command such as `sparkles ping`.
+A bare Debian image does not include them, so the Debian 11 check mounts a pinned CA
+bundle.
 Installed acceptance requires a nonzero host UID and GID. The smoke refuses root
 callers and records the selected numeric user in its receipt.
 

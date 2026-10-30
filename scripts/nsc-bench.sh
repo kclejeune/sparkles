@@ -7,7 +7,9 @@
 # A and B are git revisions of this repository or paths to built `sparkles` binaries. A
 # revision is built here, before any instance exists, from a `git archive` of it with
 # `mbx build --release -p sparkles-server`, and the binary is cached under
-# $SPARKLES_NSC_CACHE/bin/<commit> (default ~/.cache/sparkles-nsc). The dataset comes from
+# $SPARKLES_NSC_CACHE/bin/<commit> (default ~/.cache/sparkles-nsc), or under
+# bin/<commit>-<SHA-256 of the --cargo-args text> when --cargo-args is given. An entry is
+# reused only when its build.txt records the same cargo arguments. The dataset comes from
 # scripts/gen-data.py and is cached there as zstd. The queries are those of scripts/bench.sh
 # unless --query-dir names a directory of *.rq files.
 #
@@ -156,17 +158,23 @@ compilers() {
 declare -A COMPILERS
 # binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source, SHA-256 and compilers
 binary() {
-  local ref=$1 v=$2 bin sha src
+  local ref=$1 v=$2 bin sha src key entry
   if [ -f "$ref" ]; then
     bin=$(realpath "$ref")
     src="file $bin"
   else
     sha=$(git -C "$ROOT" rev-parse --verify --quiet "$ref^{commit}") || die "$ref is neither a file nor a commit"
-    bin=$CACHE/bin/$sha/sparkles
-    if [ ! -x "$bin" ]; then
+    # Default builds keep the plain commit key, so existing entries stay usable. Other
+    # cargo arguments get their own entry, as in scripts/nsc-writes.sh.
+    key=$sha
+    [ -z "$CARGO_ARGS" ] || key=$sha-$(printf '%s' "$CARGO_ARGS" | sha256sum | cut -d' ' -f1)
+    entry=$CACHE/bin/$key
+    bin=$entry/sparkles
+    # An entry without a build record, or one recording other arguments, is rebuilt.
+    if [ ! -x "$bin" ] || ! grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null; then
       echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
-      rm -rf "${CACHE:?}/src/$sha"
-      mkdir -p "$CACHE/src/$sha" "$CACHE/bin/$sha"
+      rm -rf "${CACHE:?}/src/$sha" "$entry/build.txt"
+      mkdir -p "$CACHE/src/$sha" "$entry"
       # Keep source mtimes current. Each archive has its own managed mutable target;
       # Boxington shares immutable build results rather than one Cargo target.
       git -C "$ROOT" archive "$sha" | tar -x -m -C "$CACHE/src/$sha"
@@ -185,7 +193,8 @@ binary() {
         echo "cc: $(cc --version 2> /dev/null | head -1)"
         echo "c++: $(c++ --version 2> /dev/null | head -1)"
         (cd "$CACHE/src/$sha" && rustc -V)
-      } > "$CACHE/bin/$sha/build.txt"
+      } > "$entry/build.txt.tmp"
+      mv "$entry/build.txt.tmp" "$entry/build.txt"
       rm -rf "${CACHE:?}/src/$sha"
     fi
     src="commit $sha ($ref)"
@@ -206,7 +215,7 @@ if [ -z "${COMPILERS[A]}" ] || [ -z "${COMPILERS[B]}" ] || [ "${COMPILERS[A]}" !
   if [ "$MIXED" = 1 ]; then
     note "warning: the compilers differ or are unknown, compared anyway (--allow-mixed-compilers)"
   else
-    die "A and B were not built with the same known compilers (see $MANIFEST). Rebuild both in \`nix develop\`, after removing a stale $CACHE/bin/<commit>, or pass --allow-mixed-compilers"
+    die "A and B were not built with the same known compilers (see $MANIFEST). Rebuild both in \`nix develop\`, after removing a stale $CACHE/bin/<commit> entry, or pass --allow-mixed-compilers"
   fi
 fi
 

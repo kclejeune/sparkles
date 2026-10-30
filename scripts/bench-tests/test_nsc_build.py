@@ -94,5 +94,99 @@ raise SystemExit(subprocess.run([os.environ['BUILD_TEST_CP'],*sys.argv[1:]]).ret
         self.assertFalse((self.root / "calls.jsonl").exists())
 
 
+class RevisionBinaryCache(unittest.TestCase):
+    """A cached revision binary is reused only for the cargo arguments it was built with."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="sparkles-nsc-cache-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = self.root / "repo"
+        (self.repo / "scripts").mkdir(parents=True)
+        for name in ("nsc-bench.sh", "nsc-build.sh"):
+            shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
+               "-c", "commit.gpgsign=false"]
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "fixture"], check=True)
+        self.sha = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        self.cache = self.root / "cache"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        tools = {
+            # The build writes its own arguments into the binary.
+            "mbx": """#!/usr/bin/env python3
+import json,os,pathlib,subprocess,sys
+args=sys.argv[1:]
+with open(os.environ['CACHE_TEST_CALLS'],'a') as stream:stream.write(json.dumps(args)+'\\n')
+if args[:2]==['sparkles-task','--']:raise SystemExit(subprocess.run(args[2:]).returncode)
+pathlib.Path('target/release').mkdir(parents=True,exist_ok=True)
+pathlib.Path('target/release/sparkles').write_text('built with '+' '.join(args[4:]))
+pathlib.Path('target/release/sparkles').chmod(0o755)
+""",
+            # Stop the run at the compiler check, after both binaries are staged.
+            "readelf": "#!/bin/sh\nexit 0\n",
+            "nsc": "#!/bin/sh\necho 'nsc must not run' >&2\nexit 99\n",
+            "cargo": "#!/bin/sh\nexit 0\n",
+            "rustc": "#!/bin/sh\necho 'rustc test'\n",
+            "zstd": """#!/usr/bin/env python3
+import shutil,sys
+a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a.index('-o')+1]][0],a[a.index('-o')+1])
+""",
+        }
+        for name, text in tools.items():
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.calls = self.root / "calls.jsonl"
+        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                        SPARKLES_NSC_CACHE=str(self.cache), CACHE_TEST_CALLS=str(self.calls))
+        self.env.pop("CARGO_TARGET_DIR", None)
+        self.env.pop("CARGO_BUILD_TARGET", None)
+        self.runs = 0
+
+    def bench(self, *args):
+        self.runs += 1
+        out = self.root / f"out-{self.runs}"
+        result = subprocess.run(["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out),
+                                 *args, self.sha, self.sha], env=self.env, capture_output=True,
+                                text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not built with the same known compilers", result.stderr)
+        return (out / "stage/bin-A.zst").read_text(), (out / "manifest.txt").read_text()
+
+    def builds(self):
+        if not self.calls.exists():
+            return 0
+        return sum(json.loads(line)[0] == "build" for line in self.calls.read_text().splitlines())
+
+    def test_other_cargo_args_do_not_reuse_the_default_binary(self):
+        binary, _ = self.bench()
+        self.assertEqual(binary, "built with ")
+        self.assertEqual(self.builds(), 1)
+        binary, manifest = self.bench("--cargo-args", "--features text")
+        self.assertEqual(binary, "built with --features text")
+        self.assertIn("cargo --features text", manifest)
+        self.assertEqual(self.builds(), 2)
+        # Each entry is then reused for its own arguments.
+        self.assertEqual(self.bench()[0], "built with ")
+        self.assertEqual(self.bench("--cargo-args", "--features text")[0], "built with --features text")
+        self.assertEqual(self.builds(), 2)
+
+    def test_existing_default_entry_is_reused_and_unrecorded_entry_is_rebuilt(self):
+        entry = self.cache / "bin" / self.sha
+        entry.mkdir(parents=True)
+        (entry / "sparkles").write_text("earlier default build")
+        (entry / "sparkles").chmod(0o755)
+        (entry / "build.txt").write_text("built: earlier\ncargo args: \nrustc test\n")
+        self.assertEqual(self.bench()[0], "earlier default build")
+        self.assertEqual(self.builds(), 0)
+        (entry / "build.txt").unlink()
+        self.assertEqual(self.bench()[0], "built with ")
+        self.assertEqual(self.builds(), 1)
+        self.assertIn("cargo args: \n", (entry / "build.txt").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -779,8 +779,8 @@ relative A/B comparison does not have to wait for a quiet local machine. It need
 `nsc` CLI, logged in to the workspace. A and B are git revisions or paths to `sparkles`
 binaries. The script builds each revision locally before it creates the instance,
 from a `git archive` of the revision, and caches the binary in `~/.cache/sparkles-nsc`
-(`SPARKLES_NSC_CACHE`). The cache keys a binary by its commit alone and builds with
-whatever compilers the shell provides, so run it inside `nix develop`. The dataset comes
+(`SPARKLES_NSC_CACHE`). The build uses whatever compilers the shell provides, so run it
+inside `nix develop`. The dataset comes
 from `scripts/gen-data.py` and is cached there as zstd. The queries are those of
 `scripts/bench.sh` except `export-500k`.
 
@@ -789,8 +789,10 @@ for each archived source tree. The build and binary copy hold one target lease, 
 collection cannot remove the executable before it is staged. Revision builds accept
 feature flags and `--locked`, `--offline` or `--frozen`. Configuration files, target
 selectors and output overrides are refused. Supply a prebuilt binary when a comparison
-needs other settings. The commit-only binary cache still requires manual
-invalidation when compiler or feature settings change.
+needs other settings. The binary cache keys each entry by commit and by the SHA-256 of
+the `--cargo-args` text, and a default build keeps the plain commit key. An entry is
+reused only when its `build.txt` records the same cargo arguments, and an entry without
+that record is rebuilt. Compiler changes still require removing the entry by hand.
 
 ```sh
 mise run bench:nsc main my-branch                                   # 1.05M triples, every query
