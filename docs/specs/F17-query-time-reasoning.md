@@ -860,15 +860,16 @@ list terms in input or rule heads also exclude the route. The temporary closure 
 the ordinary engine and the same cancellation, deadline, memory, derived-fact and
 iteration controls. Its facts remain private to the captured view and session.
 This can retain more intermediate facts than selective demand evaluation, trading
-temporary memory for avoiding the expanded program. It does not persist a
+temporary memory for avoiding evaluation of the expanded program. It does not persist a
 materialization or implement Phase 2's automatic cost selection.
 
 Explanation search uses first-emission rounds to seed a minimum-depth proof. It then
 checks alternative root instances against the complete closure, including independent
 support that becomes available after the root was first derived. Distinct supported
 premise sets of the same rule count as alternatives. A root-only cycle does not.
-Partial retries retain consumed search budgets and cannot reuse an incomplete round
-ordering as proof of completeness.
+The alternative search retains consumed budgets when it continues from the initial
+proof. A session retried after partial compact evaluation disables its incomplete
+round metadata rather than treating that ordering as proof of completeness.
 
 The default-budget why-not acceptance fixture retains every returned-hypothesis
 rematerialization assertion and the existing test timeout. The repair passes a 250-case regression matrix and three supplemental proof-metadata

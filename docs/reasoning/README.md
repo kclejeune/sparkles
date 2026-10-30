@@ -200,8 +200,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Analysis caps keep memory bounded and leave unproven relations for ordinary demand.
   Programs containing `makeTemp` forgo schema specialization and reuse. Implicit fact
   replay can allocate a temporary generator term before refusing an old output.
-  A bounded temporary closure can avoid a large schema expansion for a tiny positive
-  feedback view, but can retain more intermediate facts than selective evaluation.
+  A bounded temporary closure can avoid evaluating the expanded schema program for a
+  tiny positive feedback view, but can retain more intermediate facts than selective
+  evaluation.
   Structural list terms, negation and term-generating rules exclude this route.
   Roadmap item 190 covers these costs and matched Forge measurement. The
   [recorded demand measurements](../specs/F17-query-time-reasoning.md#outcome) identify
