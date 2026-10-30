@@ -1569,12 +1569,12 @@ mappings as a part or by name, and the Graph Store protocol takes CSV bodies
 ## Formatting
 
 `sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`), Turtle
-(`.ttl`, `.turtle`), TriG (`.trig`), N-Triples (`.nt`), N-Quads (`.nq`) and JSON-LD
-(`.jsonld`). It follows Prettier's modes and exit codes. It exits 0 when everything is
-formatted or was written, and 1 when `--check` or `-l` found a file that would change.
-It exits 2 on any error: a syntax error, a refused output, an unreadable file or a bad
-option. It processes every file, so one run reports every problem, and it formats files
-in parallel (`--threads N`).
+(`.ttl`, `.turtle`), TriG (`.trig`), N-Triples (`.nt`), N-Quads (`.nq`), JSON-LD
+(`.jsonld`) and SHACL Compact Syntax (`.shaclc`, `.shc`). It follows Prettier's modes
+and exit codes. It exits 0 when everything is formatted or was written, and 1 when
+`--check` or `-l` found a file that would change. It exits 2 on any error: a syntax
+error, a refused output, an unreadable file or a bad option. It processes every file, so
+one run reports every problem, and it formats files in parallel (`--threads N`).
 
 ```sh
 sparkles fmt q.rq                    # print the formatted query (stdin to stdout without a path)
@@ -1591,8 +1591,8 @@ sparkles fmt --canonicalize data.nq  # RDFC-1.0 canonical form (drops comments)
   files but never enters `.git`, `node_modules` or `target`. A file named on the command
   line is formatted whatever its extension. `--language` names its language; otherwise
   the extension does. With an unknown extension, the content decides, and it is never
-  detected as N-Triples, because N-Triples is also valid Turtle. Walks skip `.n3`, `.shc`
-  and `.json` files, which need `--language` when named. RDF/XML and compressed files are
+  detected as N-Triples, because N-Triples is also valid Turtle. Walks skip `.n3` and
+  `.json` files, which need `--language` when named. RDF/XML and compressed files are
   refused.
 - **Ignore file.** `.sparklesfmtignore` in the current directory, in gitignore syntax, or
   `--ignore-path FILE` (repeatable). It applies to walks and to named files. A named file
@@ -1611,8 +1611,8 @@ sparkles fmt --canonicalize data.nq  # RDFC-1.0 canonical form (drops comments)
   compact-iris = true            # full IRI → prefixed name
   quote-style = "double"         # "double" | "preserve"
   operator-position = "leading"  # "leading" | "trailing": where a broken || or && chain puts its operator
-  align-values = false           # SPARQL: pad multi-variable VALUES rows into columns
-  prune-prefixes = false         # SPARQL, Turtle, TriG: drop prefix declarations nothing uses
+  align-values = false           # SPARQL: pad multi-variable VALUES rows into columns; SHACLC: pad runs of one-line properties
+  prune-prefixes = false         # SPARQL, Turtle, TriG, SHACLC: drop prefix declarations nothing uses
   directive-style = "sparql"     # Turtle, TriG: "sparql" (PREFIX, GRAPH) | "turtle" (@prefix, no GRAPH)
   turtle-layout = "diff"         # Turtle, TriG: "diff" | "conventional"
   sort = false                   # Turtle, TriG, JSON-LD terms, N-Triples, N-Quads

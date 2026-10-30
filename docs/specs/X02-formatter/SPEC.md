@@ -2162,7 +2162,7 @@ design remains part of its original record.
 
 ## Outcome
 
-The formatter, language server and browser WebAssembly build are available for the implemented language scope. SHACLC formatting remains under item 48.
+The formatter, language server and browser WebAssembly build are available for the implemented language scope, which includes SHACL Compact Syntax.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

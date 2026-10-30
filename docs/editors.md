@@ -66,7 +66,7 @@ nothing. The server provides:
   an unsaved buffer, use the defaults. There are no editor-side settings, so the editor,
   the command line and CI always agree.
 - **Language.** The server takes the language from the editor's language id (`sparql`,
-  `turtle`, `ttl`, `trig`, `ntriples`, `nquads`, `jsonld`, `json-ld`). Failing that, it
+  `turtle`, `ttl`, `trig`, `ntriples`, `nquads`, `jsonld`, `json-ld`, `shaclc`). Failing that, it
   uses the file extension, as `sparkles fmt` reads it, and then the content. A language
   this build does not format yet is refused with "… formatting is not available yet" and
   gets no diagnostics.
@@ -139,14 +139,16 @@ own `.sparklesfmt.toml` replaces the user-wide one and needs its own `[prefixes]
 ```lua
 vim.lsp.config("sparkles", {
   cmd = { "sparkles", "lsp" },
-  filetypes = { "sparql", "turtle", "trig", "ntriples", "nquads", "jsonld" },
+  filetypes = { "sparql", "turtle", "trig", "ntriples", "nquads", "jsonld", "shaclc" },
   root_markers = { ".sparklesfmt.toml", "sparklesfmt.toml", ".git" },
 })
 vim.lsp.enable("sparkles")
 
--- extensions Neovim may not know, and JSON-LD apart from plain JSON
+-- extensions Neovim may not know, JSON-LD apart from plain JSON, and SHACL Compact Syntax
 vim.filetype.add({
-  extension = { ru = "sparql", trig = "trig", nt = "ntriples", nq = "nquads", jsonld = "jsonld" },
+  extension = {
+    ru = "sparql", trig = "trig", nt = "ntriples", nq = "nquads", jsonld = "jsonld", shaclc = "shaclc",
+  },
 })
 vim.treesitter.language.register("json", "jsonld")
 ```
@@ -202,6 +204,7 @@ require("conform").setup({
     ntriples = { "sparkles" },
     nquads = { "sparkles" },
     jsonld = { "sparkles" },
+    shaclc = { "sparkles" },
   },
   format_on_save = { timeout_ms = 2000, lsp_format = "fallback" },
 })
@@ -245,7 +248,7 @@ reloads it. Add this to `settings.json`:
   "emeraldwalk.runonsave": {
     "commands": [
       {
-        "match": "\\.(rq|ru|sparql|ttl|trig|nt|nq|jsonld)$",
+        "match": "\\.(rq|ru|sparql|ttl|trig|nt|nq|jsonld|shaclc)$",
         "cmd": "sparkles fmt --write \"${file}\""
       }
     ]

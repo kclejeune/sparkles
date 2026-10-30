@@ -2,7 +2,7 @@
 
 > **Status:** implemented
 
-The formatter, language server and browser WebAssembly build are available for the implemented language scope. SHACLC formatting remains under item 48.
+The formatter, language server and browser WebAssembly build are available for the implemented language scope, which includes SHACL Compact Syntax.
 
 ## Documents
 
