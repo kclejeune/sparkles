@@ -244,9 +244,19 @@ mod tests {
         let (dir, store) = shex_database();
         let v = install(&store).unwrap().unwrap();
         assert_eq!(v.language(), GuardLanguage::Shex);
-        assert_eq!(v.json()["language"], "shex");
-        assert_eq!(v.json()["status"]["shapeCount"], 1);
-        assert_eq!(v.stats_line(), "reject · ShEx · 1 shapes");
+        let j = v.json();
+        assert_eq!(j["language"], "shex");
+        assert_eq!(j["status"]["mode"], "reject");
+        assert_eq!(j["status"]["shapeCount"], 1);
+        // Legacy copies without a digest establish their baseline by validating
+        // the stable head, so the status and stats include that full validation.
+        assert_eq!(j["status"]["associations"], 0);
+        assert_eq!(j["status"]["baseline"]["conforms"], true);
+        let millis = j["status"]["lastFullMillis"].as_u64().unwrap();
+        assert_eq!(
+            v.stats_line(),
+            format!("reject · ShEx · 1 shapes · last full {millis} ms")
+        );
         assert!(matches!(insert(&store), Err(sparkles::Error::Rejected(_))));
         // without its schema copy the guard cannot be installed: writes stay refused
         drop(store);

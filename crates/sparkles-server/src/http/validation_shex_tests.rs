@@ -152,7 +152,7 @@ async fn reject_mode_over_http() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
     assert_eq!(j["language"], "shex");
-    assert_eq!(j["config"]["format"], 2);
+    assert_eq!(j["config"]["format"], 3);
     assert_eq!(j["config"]["schema"]["file"], SHEX_SCHEMA_SHEXC_FILE);
     assert!(j["config"]["schema"].get("inline").is_none());
     assert_eq!(j["status"]["shapeCount"], 2);
@@ -160,6 +160,12 @@ async fn reject_mode_over_http() {
     assert_eq!(j["status"]["baseline"]["conforms"], true);
     let root = st.get("v").unwrap().store.root().unwrap().to_path_buf();
     assert!(root.join(SHEX_SCHEMA_SHEXC_FILE).exists());
+    assert_eq!(
+        j["config"]["schema"]["copySha256"],
+        sparkles::guard::config::sha256_hex(
+            &std::fs::read(root.join(SHEX_SCHEMA_SHEXC_FILE)).unwrap()
+        )
+    );
 
     // a person without a name
     let r = update(&app, "INSERT DATA { ex:dave a ex:Person }").await;
