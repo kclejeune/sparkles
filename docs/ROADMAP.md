@@ -298,8 +298,8 @@ These decisions fix what completes four capabilities in the [capability matrix](
   items 79 and 80 are optional and outside the completion path.
 * Server and Fuseki integration completes with items 76, 38, 51, 37 and 39. Item 37
   excludes subscriptions, and item 51 excludes `shortest(…)` evaluation, which ARQ does not
-  evaluate either. Item 69 adds ARQ's non-standard functions and the `JSON` query form as a
-  lower-priority extension outside the completion path.
+  evaluate either. Item 69 adds the ARQ extensions that it lists as a lower-priority
+  extension outside the completion path.
 * GeoSPARQL completes with item 24. Item 70's Jena-compatible mode is not adopted, and
   exact arithmetic on curves, GML solids, 3D constructions and splitting lines at crossings
   are not part of the capability.

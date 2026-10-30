@@ -153,11 +153,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 * The JSON metrics snapshot and OTLP export omit some produced-row, memory-peak and
   rebuild series available in Prometheus. Cross-format parity is roadmap item 342.
-* Sparkles supports none of the ARQ extension functions that are not part of SPARQL: the
-  JavaScript functions, `afn:context` and the Leviathan `lfn:` library are missing, and the
-  `JSON` query form is not accepted. `afn:collation` orders by code point and not by
-  locale. Roadmap item 69, a lower-priority extension outside the completion of Server and
-  Fuseki integration.
+* Sparkles implements most of ARQ's function library, including `afn:sprintf`,
+  `afn:localname` and `afn:version`. It lacks the JavaScript functions (`js:`),
+  `afn:context`, the Leviathan `lfn:` library and the `JSON` query form. `afn:collation`
+  returns its string, so it orders by code point and not by locale. Roadmap item 69, a
+  lower-priority extension outside the completion of Server and Fuseki integration.
 * There are no JVM metrics. Assembler bodies are read only for the part that maps to a
   dataset. Direct Graph Store naming is chosen per dataset at start with
   `--gsp-direct-naming` and not through the settings API. Roadmap item 76.
