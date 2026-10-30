@@ -4,8 +4,9 @@
 >
 > **Phases:** The graph algorithms, projections, write-back runs and graph embeddings
 > are available. Algorithm lenses are available through [U10](U10-canvas-lenses.md).
-> The full Graphalytics harness, algorithm-name completion, richer background progress,
-> a typed JVM algorithm handle and C23 writer integration remain. openCypher procedures
+> A typed JVM handle exposes projection administration, query text, query execution,
+> statistics and write-back. The full Graphalytics harness, algorithm-name completion,
+> richer background progress and C23 writer integration remain. openCypher procedures
 > wait for [F01](F01-cypher.md).
 >
 > **User docs:** [Graph algorithms API](../API.md#graph-algorithms),
@@ -941,6 +942,11 @@ run and +0.4% to +0.9% in a repeat, within the noise of the measurement. The tab
 * The default `batchSize` of 100,000 is below the store's bulk threshold of 250,000
   quads, so a run's commits stay ordinary commits. A larger batch takes the bulk path.
 
+The JVM algorithm handle exposes eight operations: projection list, get, put and
+delete, query text, query execution, statistics and write-back. Write-back retains
+committed batches if a later batch fails. Further JVM algorithm surfaces and acceptance
+remain under roadmap item 8. See the [JVM outcome](P04-jvm-bindings/OUTCOME.md).
+
 **Not built.**
 * The full Graphalytics benchmark harness. A
   [reference adapter](../../testsuite/graphalytics/README.md) prepares RDF and queries
@@ -955,7 +961,6 @@ run and +0.4% to +0.9% in a repeat, within the noise of the measurement. The tab
 * The openCypher procedures, which wait for F01.
 * The web UI: colouring a graph view by community, and `algo:` completions in the
   editor.
-* The JVM binding. `SERVICE algo:…` works through it, but there is no typed handle.
 * The routing of write-back through the writer of C23.
 
 ### Nonnegative weighted betweenness semantics
