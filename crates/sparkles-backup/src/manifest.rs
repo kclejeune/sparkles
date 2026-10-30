@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn hostile_definition_entries_are_refused() {
         let n = good().files.len();
-        let cases: Vec<(&str, Box<dyn Fn(&mut Manifest)>)> = vec![
+        let cases: Vec<Case> = vec![
             (
                 "traversal",
                 Box::new(move |m| m.files[n].path = "views/../../etc/view.json".into()),
@@ -761,7 +761,8 @@ mod tests {
             let e = validate(&m, MAX_DEFINITION_BYTES + 1, &[2]).unwrap_err();
             assert_eq!(e.code(), Code::InvalidBackup, "{what}: {e}");
         }
-        // a definition path without its `definition` member is a plain file path
+        // an older reader ignores `definition` and `requires`, so it sees a plain file
+        // path that it does not allow, and refuses the backup before writing anything
         let mut m = with_views(&["a"]);
         m.files[n].definition = None;
         assert_eq!(
