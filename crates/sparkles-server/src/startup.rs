@@ -156,6 +156,9 @@ fn open_all(
                         let t0 = Instant::now();
                         match st.catalog.open_registered(&name) {
                             Ok(()) => {
+                                // the routing object, with its views started, so that
+                                // the first request does not make it
+                                let _ = st.get(&name);
                                 tracing::info!(
                                     "  dataset /{name} opened in {:.1?}  →  /{name}/sparql  /{name}/update  /{name}/data",
                                     t0.elapsed()
