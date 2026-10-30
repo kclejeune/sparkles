@@ -3058,7 +3058,7 @@ directory as `views/{name}/view.json`, and the state is checkpointed beside them
 | `storedQuery` | The name of a stored query, in place of `query`. The view follows its current version when the view is attached. |
 | `principal` | The user whose view of the dataset the query reads. The default is the definer. A definer whose grants cover every graph defines a view without a principal, which reads every quad. |
 | `memoryBytes` | The budget of the view's state, 256 MiB by default. A view over its budget is suspended. |
-| `mode`, `provenance`, `maintenance`, `branches`, `keepCommits` | Phase 1 takes only `table`, `none`, `async`, `["main"]` and `0`. Other values are refused with `400 unsupported-option`. |
+| `mode`, `provenance`, `maintenance`, `branches`, `keepCommits` | Phase 1 takes only `table`, `none`, `async`, `["main"]` and `0`. Other values are refused with `400 unsupported-option`. A stored `view.json` with another value is listed as failed with `unsupported-option` and does not run until the view is defined again. |
 
 Unknown members are refused. A query outside the incremental fragment is refused with
 `400 not-incremental` and names the construct: `NOW`, `RAND`, `UUID`, `STRUUID`, `BNODE`,
@@ -3074,8 +3074,8 @@ protects. `ORDER BY` without `LIMIT` does not change a view's rows and is
 ignored. Operators that the circuit cannot maintain run as
 `recompute` nodes, which evaluate their subtree again at each commit that touches it and
 subtract the previous output. Property paths with `*`, `+` or `?`, `LIMIT` and
-`OFFSET`, a dataset clause, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and subqueries
-under `GRAPH ?g` are recompute nodes. The plan in `GET /$/views/{ds}/{name}` marks each
+`OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, and `MINUS`, aggregates,
+`DISTINCT`, `VALUES` and subqueries under `GRAPH ?g` are recompute nodes. The plan in `GET /$/views/{ds}/{name}` marks each
 operator `incremental` or `recompute`, with the reason.
 
 | Method | Path | Needs | Description |

@@ -291,7 +291,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Incremental views are `table` views on `main`, maintained after the commit. There are
   no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node
   or JVM API, no UI, no views per branch, no ordered windows and no provenance per fact.
-  Roadmap item 17.
+  A stored definition that asks for one of these is listed as failed with
+  `unsupported-option` and does not run. Roadmap item 17.
 * Backups and persistent clones carry view definitions, which come back suspended until
   they are resumed. In-memory clones carry no views. Roadmap item 401.
 * Views and live queries on a dataset with RDFS on read or materialized inferences
