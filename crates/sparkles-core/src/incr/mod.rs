@@ -24,6 +24,8 @@ pub mod views;
 pub mod zset;
 
 #[cfg(test)]
+mod definition_tests;
+#[cfg(test)]
 mod runtime_tests;
 #[cfg(test)]
 mod tests;

@@ -143,6 +143,8 @@ struct Capture {
     prefixes: BTreeMap<String, String>,
     /// the source generation's directory, leased, when its files may be shared
     files: Option<(PathBuf, LeaseGuard)>,
+    /// the managed definitions current when the snapshot was taken
+    definitions: Vec<super::DefinitionFile>,
 }
 
 /// A clone's generation, built or shared.
@@ -177,7 +179,10 @@ impl Store {
     /// clone's data before this returns, so the clone serves text queries as soon as it
     /// is opened. `opts.cancel` and `opts.deadline` stop that build too.
     ///
-    /// The writer lock is held only to capture the snapshot; this store is never written.
+    /// The managed definitions current at the snapshot, such as the views, are copied
+    /// paused (see [`super::definitions`]); a clone of a past state copies the current
+    /// ones. The writer lock is held only to capture the snapshot and the definitions;
+    /// this store is never written.
     /// On any error `dir` is left as it was found (removed, or emptied).
     pub fn clone_to(&self, dir: &Path, opts: &CloneOptions) -> Result<CloneReport> {
         let t0 = std::time::Instant::now();
@@ -264,6 +269,9 @@ impl Store {
                 }
             }
         }
+        // the managed definitions come along paused: the clone is a new dataset, whose
+        // views run only once an operator has checked their principals and inputs
+        super::definitions::stage_paused(dir, &cap.definitions, "cloned")?;
         // the branch ordinals the copied blank nodes may carry are not given out again
         let next_ordinal = self.branching.next_ordinal.load(Ordering::Relaxed);
         if next_ordinal > 1 {
@@ -359,7 +367,7 @@ impl Store {
     /// files may be shared.
     fn clone_capture(&self, opts: &CloneOptions) -> Result<Capture> {
         let share = opts.mode != CloneMode::Rebuild && opts.at.is_none();
-        let (snap, next_bnode, lease) = {
+        let (snap, next_bnode, lease, definitions) = {
             let w = self.lock_writer(&crate::guard::WriteOptions {
                 cancel: opts.cancel.clone(),
                 deadline: opts.deadline,
@@ -383,7 +391,10 @@ impl Store {
                 }
                 _ => None,
             };
-            (snap, w.next_bnode, lease)
+            // under the same lock as the snapshot: a definition changed after it is
+            // not the clone's, and neither lock is held while the other is waited for
+            let definitions = self.capture_definitions()?;
+            (snap, w.next_bnode, lease, definitions)
         };
         // from here on, dropping the guard releases the lease
         let files = lease.map(|(dir, no, label, id)| {
@@ -416,6 +427,7 @@ impl Store {
             next_bnode,
             prefixes: self.prefixes(),
             files,
+            definitions,
         })
     }
 

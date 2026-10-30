@@ -230,6 +230,9 @@ pub struct BackupCapture {
     pub next_ordinal: u32,
     /// the dataset's branches other than `main`, which a backup leaves out
     pub branches_omitted: u64,
+    /// the dataset-managed definitions current at `commit`, read under the writer
+    /// lock (see [`super::definitions`])
+    pub definitions: Vec<super::DefinitionFile>,
 }
 
 impl BackupCapture {
@@ -268,6 +271,10 @@ impl BackupCapture {
                 off += n as u64;
             }
             out.sync_all()?;
+        }
+        for d in &self.definitions {
+            let path = super::definitions::stage_file(tmp.path(), &d.path)?;
+            std::fs::write(&path, &d.bytes)?;
         }
         if self.next_ordinal > 1 {
             crate::commit::reserve_branch_ordinals(
@@ -349,7 +356,8 @@ impl Store {
     /// Contract:
     /// * persistent stores only; in-memory stores fail with `Error::Unsupported`;
     /// * the writer mutex is held only to read lengths, flush the delta vocabulary and
-    ///   the commit catalog, clone the prefixes and add the lease (a few system calls;
+    ///   the commit catalog, clone the prefixes and the managed definitions
+    ///   ([`super::definitions`]) and add the lease (a few system calls;
     ///   the files are opened after it); a poisoned store fails with `Error::Poisoned`;
     /// * a commit catalog that cannot be flushed completely fails with
     ///   `Error::Conflict("catalog-lagging: …")` (retryable, `503 catalog-lagging`);
@@ -462,7 +470,7 @@ impl Store {
         };
         control.check()?;
         let t0 = Instant::now();
-        let (snap, next_bnode, head, prefixes) = {
+        let (snap, next_bnode, head, prefixes, definitions) = {
             let w = self.lock_writer(&control)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
@@ -472,6 +480,7 @@ impl Store {
                 w.next_bnode,
                 w.head,
                 self.prefixes.lock().clone(),
+                self.capture_definitions()?,
             )
         };
         let lock_hold = t0.elapsed();
@@ -599,6 +608,7 @@ impl Store {
             branch: self.backup_branch(),
             next_ordinal: self.backup_next_ordinal(),
             branches_omitted: self.backup_omitted(),
+            definitions,
         })
     }
 
@@ -660,6 +670,8 @@ impl Store {
         // opened under the lock: pruning replaces the file, and holds the lock to do it
         let catalog = File::open(root.join("commits.bin"))?;
         let prefixes = self.prefixes.lock().clone();
+        // the definitions current at the head, before the lock lets either change
+        let definitions = self.capture_definitions()?;
         self.failpoint("backup-capture-locked");
         let lease_id = hist.lock().lease(gen_no, label);
         drop(w);
@@ -772,6 +784,7 @@ impl Store {
             branch: self.backup_branch(),
             next_ordinal: self.backup_next_ordinal(),
             branches_omitted: self.backup_omitted(),
+            definitions,
         }))
     }
 
