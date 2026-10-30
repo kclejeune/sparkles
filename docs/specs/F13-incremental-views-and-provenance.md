@@ -520,9 +520,10 @@ for output that was written before a policy changed.
   by administrators, for current and for historical reads, until an administrator
   explicitly declassifies that graph. The declassification is written to the audit log
   with the graph and the administrator. When a read-restricting policy is first installed,
-  views that wrote a marked graph are suspended with the reason `declassify-required`, and
-  the restriction on the graph takes effect before the new policy is visible to any
-  request. Dropping or deleting the view does not lift it.
+  every `graph` view without `declassify` is suspended with the reason
+  `declassify-required`, whether or not it has written its graph yet, and the restriction
+  on marked graphs takes effect before the new policy is visible to any request. Dropping
+  or deleting the view does not lift it.
 - The mark is stored in a versioned dataset file that releases which do not know the
   version refuse to open.
 
