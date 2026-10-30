@@ -517,6 +517,9 @@ links freeze reversibly. Actual Store, State and Set allocations must satisfy ex
 ownership, with raw external Strong and Weak aliases conservatively busy. Refusal restores
 all original slots, caches and weak links before resuming workers, without changing files.
 Removed and retired members remain inventoried until their final resource drop completes.
+Delete and rename refuse at once. Backup replacement retries a refused proof within its
+drain time, because a built-in owner such as a views worker round can hold a short-lived
+strong reference after the drain observed none.
 
 The public Own(Store) and Branch(Arc<Store>) variants retain their payloads and behavior.
 A private bounded empty in-memory Store temporarily parks inaccessible Branch slots during

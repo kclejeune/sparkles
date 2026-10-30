@@ -23,7 +23,8 @@ dataset directory. In-memory branches share runtime ownership without a file loc
 Catalog deletion, persistent rename and backup replacement also prove exclusive runtime
 ownership before publishing directory changes. Raw Strong or Weak aliases to a participating
 DatasetState, branch Store or BranchSet conservatively make disposal busy. Refusal preserves
-the original allocations and files. Release those aliases and retry. Built-in worker and
+the original allocations and files. Release those aliases and retry. An in-place restore
+retries the proof itself until its drain time ends. Built-in worker and
 branch references use revocable links, so idle cached branches can close without changing
 the public StoreHandle variants. Close callbacks run after catalog lookup exclusion ends.
 Callbacks may look up datasets but must defer catalog mutations until disposal returns.
