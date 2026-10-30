@@ -98,12 +98,12 @@ Wave A holds the work that most improves the engine against objective measures.
 * The Stage A lanes of item 17 are items 413 to 417. They deliver the safety net,
   internal circuits, the provenance algebra, reasoner witnesses and the fixed-point
   operator.
-* Small lanes that finish a capability run in free capacity. These are item 48, items 57,
+* Small lanes that finish a capability run in free capacity. These are item 48, items
   277 and 77, and the CSVW and RML conformance gaps in items 235 and 232.
 
 ### Wave B: memory and entities
 
-Wave B starts with item 81 Phase 3, then items 341, 396 and 57 and the remaining C18
+Wave B starts with item 81 Phase 3, then items 341, 396 and 431 and the remaining C18
 work. Item 18 Phase 3 and item 12 follow once the item 17 lanes they need have landed.
 Item 12 needs items 413 and 414, and item 18 Phase 3 needs items 415 and 416.
 
@@ -244,7 +244,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [C01](specs/C01-observability-and-budgets.md#outcome) | 342, 402 | Startup reports a dataset whose derived index is unavailable as degraded, and the progress of a log replay, without losing readiness or access controls. JSON and OTLP include the Phase 2 work, memory-peak and rebuild series with the Prometheus units, labels and histogram semantics. |
 | [C03](specs/C03-graphql/SPEC.md#outcome) | 37 | Complete Phase 2's seeded execution, bounded per-parent windows, nested connections, UI/schema editing and persisted-query controls with differential and visibility tests. Subscriptions are deferred until a workload asks for them, and then use F13. Mutations require the separate scope decision recorded in the Outcome. |
 | [C06](specs/C06-clone-to-sandbox.md#outcome) | 45 | Remote and archive clones preserve a chosen branch/commit's data, stored blank identities, prefixes and configuration while creating correct new lineage. Interrupted, corrupt or cancelled transfers publish no destination. |
-| [C17](specs/C17-agent-memory.md#outcome) | 57, 81 | Dataset-layered scratch expiry works over HTTP and stdio with the configured limits and notifications. Adopt the shared evidence profile with its source, review and independent-support acceptance queries; server model calls use the successor C18 contract. |
+| [C17](specs/C17-agent-memory.md#outcome) | 81, 431 | Scratch branches honor a per-principal limit, warnings before expiry and a keep option, beside the dataset-layered expiry that works over HTTP and stdio. Adopt the shared evidence profile with its source, review and independent-support acceptance queries; server model calls use the successor C18 contract. |
 | [C18](specs/C18-natural-language-questions-and-ingest/SPEC.md#outcome) | 6, 15, 27, 77, 81, 263, 318 | Finish the remaining evaluation matrix, multimodal ingestion, redaction and verified rewrites, and test grounding and VALUES changes against caller-visible data. Publish matching accuracy and latency evidence, preserving clarification for ambiguity and the original secret, budget and citation guarantees. |
 | [C25](specs/C25-evidence-and-assessments.md#outcome) | 81, 395 | Finish Phase 2's authenticated source, reference and claim operations, protected metadata, retained-view resolution, reader admission, review, support ownership and reversible identity decisions. Phase 3 integrates recall, ingestion, reports and maintained analyses, with exact identity, authorization, retry and crash acceptance. |
 | [C27](specs/C27-valid-time-profiles.md#outcome) | 341 | Complete Phase 1 with authenticated availability and backdating refusal through C25 Phase 2 and protected writes. Then add the temporal projection helper, event-time controls and expiry integration with interval, visibility and recovery acceptance. |
@@ -537,7 +537,7 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 54 | **ShEx.** Combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls. | [G02](specs/G02-shex/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 55 | **Completions and OpenAPI.** Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas. This follow-up is outside the completion of formatting, linting and command-line tools. | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 56 | **Legacy MCP resource subscriptions.** | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
-| 57 | **Scratch-branch expiry** as a dataset setting and under stdio. Today only the server's `--mcp-scratch-branch-ttl` sets it. | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
+| 431 | **Scratch-branch limits and warnings.** Add `scratchBranches.maxPerPrincipal` and `scratchBranches.notifyBefore` to the memory settings, a `keep` argument on `create_branch`, and an `admin` route that clears a scratch mark. The brief and the branches resource list the branches that expire within the window, and the `memory.review.pending` event names the ones that hold unreviewed proposals. | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
 | 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. | [F21](specs/F21-ontology-api.md) | L |
 | 74 | **RDF Patch.** Patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
 | 75 | **Access control.** Validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
@@ -664,6 +664,8 @@ linked spec Outcome records how they landed.
 - **398.** Controlled preparation costs: indexed delta-vocabulary lookup, owned-storage accounting and parallel mask writes. [C29](specs/C29-bounded-view-preparation/SPEC.md#outcome)
 
 - **431.** SP²Bench `q11` at 10M, an ascending top-k over plain strings that now reads its column in vocabulary order. [Optimizations](internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations), [SP²Bench](benchmarks/sp2bench/RESULTS.md#comparison-summary)
+
+- **57.** Scratch-branch expiry as the dataset setting `memory.scratchBranches.ttl` and under `sparkles mcp --loc`. The limit per principal, the warnings before deletion and the `keep` option remain under item 431. [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12)
 
 ## Keeping this current
 

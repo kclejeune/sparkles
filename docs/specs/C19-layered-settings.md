@@ -1198,3 +1198,17 @@ patterns, is in
   facts with the mock provider; with `assistant.send` locked to `rows` in the settings
   file, the panel shows the lock and no button; with `ingest` declared `false`, the
   button is replaced by a link to the field; turning it off patches `ingest` only.
+
+**Landed for item 57: `memory.scratchBranches.ttl`.** The `memory` kind gained the
+member `scratchBranches` with the field `ttl`, which sets how long a scratch branch of
+the dataset may sit idle before the MCP server deletes it
+([C17](C17-agent-memory.md#roadmap-follow-ups-2026-10-12)). It needs no registry code
+beyond the member name, so it has the layers, locks, sources and routes of every
+other field, and `sparkles settings set org memory.scratchBranches.ttl=7d` writes it.
+Validation runs with the rest of the effective object. The value is `off` or a duration
+from `1m` to `3650d`, and the server's `--mcp-scratch-branch-ttl` is the default for a
+dataset whose layers do not set it. `memory.json` is format 2 while it holds the member
+and format 1 otherwise. `formats::stamp_settings` chooses the version from the content,
+as it does for `validation.json`, so an older release refuses only the datasets that use
+the setting, with a message that names the newer release. Settings that older releases
+cannot read are otherwise unchanged, and the Outcome of C17 records the tests.

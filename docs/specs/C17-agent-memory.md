@@ -9,8 +9,10 @@
 > and the `agent_memory` prompt. Phase 1c adds a `branch` argument to the MCP tools,
 > tools that list, create, merge and delete branches, scratch branches for graph-limited
 > grants and their optional expiry. The server model calls sketched as Phase 2 in §10
-> were superseded by [C18](C18-natural-language-questions-and-ingest/README.md). Dataset-layered
-> scratch expiry and the shared evidence profile remain under roadmap items 57 and 81.
+> were superseded by [C18](C18-natural-language-questions-and-ingest/README.md). The
+> dataset setting for scratch expiry and expiry under stdio have shipped. The limit per
+> principal, the warnings before deletion and the `keep` option of scratch branches
+> remain under roadmap item 431, and the shared evidence profile under item 81.
 >
 > **User docs:** [API: MCP tools](../API.md#tools) ·
 > [API: Memory writes](../API.md#memory-writes) ·
@@ -1337,8 +1339,8 @@ the MCP request, which keeps one code path as §6 requires.
   per-graph counts and the conflict report.
 - A stored query's tool takes `branch` too, unless the query has a parameter of that
   name.
-- The TTL is a `serve` flag. The matching dataset setting is not built, and `sparkles
-  mcp` over stdio has no expiry.
+- The TTL was a `serve` flag at the time of Phases 1b and 1c. The dataset setting and
+  expiry under stdio came with item 57, recorded below.
 - `create_branch` creates the branch and then marks it. When the mark fails, the branch
   is deleted. A crash between the two leaves an ordinary branch, which the F09 rules
   govern and the expiry never deletes.
@@ -1382,12 +1384,13 @@ endpoint, and the Graph Store endpoints are `gsp-r` and `gsp-rw`.
 ### Roadmap follow-ups (2026-10-12)
 
 **Item 57: scratch-branch expiry as a dataset setting, and expiry under stdio.** Expiry
-of idle scratch branches is the `serve` flag `--mcp-scratch-branch-ttl`, read in
+of idle scratch branches was the `serve` flag `--mcp-scratch-branch-ttl`, read in
 `crates/sparkles-server/src/mcp/http.rs` and run by the background task of
 `mcp/branches.rs`, which counts deletions in
 `sparkles_mcp_scratch_branches_expired_total`. The dataset setting of decision 4 (§13)
-is not built, and `sparkles mcp` over stdio has no expiry (Outcome, deviations of
-Phases 1b and 1c). See the [roadmap](../ROADMAP.md).
+and expiry under `sparkles mcp` over stdio were built for item 57, as the delivery
+record below describes. The design bullets follow, and the ones that are not built are
+tracked under item 431 of the [roadmap](../ROADMAP.md).
 
 - **A dataset setting.** A `scratchBranches` object in the dataset's settings, a field
   of the C19 layers with its usual locks: `ttl` (a duration, or `null` for none),
@@ -1409,6 +1412,63 @@ Phases 1b and 1c). See the [roadmap](../ROADMAP.md).
 - **Keeping a branch.** `create_branch` takes `keep: true` for a branch that should not
   expire, and a caller with `admin` can clear the scratch mark with
   `Store::set_branch_scratch`, which turns it into an ordinary branch.
+
+**Delivered for item 57: the `ttl` setting and expiry under stdio.** The setting is
+`scratchBranches.ttl` of the `memory` settings kind, so its path is
+`memory.scratchBranches.ttl` and it follows the layers, locks and sources of
+[C19](C19-layered-settings.md) with no code of its own. The spec's top-level
+`scratchBranches` object is a member of the memory kind because the memory kind already
+holds the other settings of agent memory, as `retention` and `review` do.
+`MemorySettings::scratch_branches` in `crates/sparkles-server/src/assist.rs` validates
+it with the rest of the kind, and the OpenAPI document describes it under
+`MemorySettings`.
+
+- **Values.** `ttl` is a duration in the units `s`, `m`, `h`, `d`, `w` and `y` from `1m`
+  to `3650d`, or `off`. The server flag accepts any positive duration. A shorter limit
+  for the setting keeps the cadence of the passes at one second or more. A write with
+  another value is refused with `400` and the code `bad-settings`, and a stored value
+  that does not validate leaves the decision to the flag.
+- **Precedence.** A dataset's value overrides the flag, and the flag is the default for
+  datasets without the setting. The spec says `null` means none, but a `null` in a
+  layer removes the member under RFC 7396, which restores the default. `off` is the
+  explicit choice of no expiry for a dataset when the flag sets one. This is the one
+  deviation from the written format.
+- **Where it applies.** `mcp::branches::dataset_ttl` resolves the value, and `sweep`,
+  `list_branches` and `create_branch` call it, so the three agree. `serve --mcp` with
+  `--mcp-allow-update` starts the background task whether or not the flag is set, since
+  a dataset can set its own duration at any time. The task reads the settings at each
+  pass and runs at least four times per shortest duration and at most every minute. The
+  counter `sparkles_mcp_scratch_branches_expired_total` is exported once some dataset
+  has a duration, as it was once the flag was set.
+- **Format.** `memory.json` is format 2 while it holds `scratchBranches` and format 1
+  otherwise, through `formats::stamp_settings`. An older release refuses a dataset with
+  the setting by naming both versions, where it would otherwise fail on the unknown
+  member in a way that reports only a settings error and serves the dataset with empty
+  memory settings.
+- **Stdio.** `sparkles mcp --loc ... --allow-update` runs `mcp::branches::sweep` before
+  it serves, with no default duration, and then every ten minutes through
+  `spawn_expiry_with`, the loop that `serve` runs. The same code deletes the branches,
+  with the same checks for a running task and a named snapshot, and the same audit
+  event. `--no-scratch-expiry` turns it off for a session. Without `--allow-update` the
+  session never writes, so it never expires a branch.
+- **Not built.** `maxPerPrincipal`, `notifyBefore`, the `keep` argument of
+  `create_branch` and the `admin` route that clears a scratch mark remain as designed
+  above, under roadmap item 431.
+
+**Tests for item 57.** `mcp::expiry_tests` checks that a dataset value overrides the
+default in both directions, that `off` keeps branches, that an invalid stored value falls
+back to the default, that a change applies at the next pass, the opening pass and the
+cadence of a stdio session under a clock the test sets, and that a dataset created
+after the task started is covered. `item57_dataset_ttl_sets_the_reported_expiry` in
+`router_tests::mcp::memory_writes` checks `expires` of `create_branch` and
+`list_branches` against the flag and the setting. `a19_idle_scratch_branches_expire`
+runs unchanged. `settings::tests::scratch_branch_ttl_is_a_dataset_setting` checks the
+validation, the sources and the format member of the file, and
+`formats::tests::memory_format_two_needs_scratch_branches` checks the stamp.
+`tests/mcp_stdio.rs` runs `sparkles mcp` as a child process against a database whose
+scratch branch was created in 2020, so the session deletes it before the first call, and
+checks that a read-only session, `--no-scratch-expiry`, a missing setting and `off` keep
+it.
 
 ### Shared memory representation
 

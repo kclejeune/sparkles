@@ -3845,6 +3845,21 @@ level = "write"
 graphs = ["https://example.org/memory/agents/agent-7/*"]
 ```
 
+A dataset can set its own idle time for scratch branches, which overrides the flag for
+that dataset. Set `memory.scratchBranches.ttl` to a duration from `1m` to `3650d`, or to
+`off` to keep the dataset's scratch branches although the flag sets a duration:
+
+```sh
+sparkles settings set org memory.scratchBranches.ttl=7d
+```
+
+The dataset's `memory.json` then has format 2, which an older release refuses with a
+message that names the newer release. `sparkles mcp --loc` applies the setting as well.
+With `--allow-update` it deletes the idle scratch branches of each dataset that has the
+setting when it opens the databases and every ten minutes while the session lasts, and
+`--no-scratch-expiry` turns that off for a session. A session has no default duration,
+so a dataset without the setting never expires its branches there.
+
 MCP calls follow the server's rules. The rate limits of the `query` and `update` classes
 apply per dataset, as for `/{ds}/sparql` and `/{ds}/update`, and the memory budget is the
 smaller of `--mcp-query-memory-mb` and `--query-memory-mb`. A call may ask for up to the
