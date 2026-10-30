@@ -19,6 +19,10 @@ Graph overview groups and facets in the Rust library start a relative timeout on
 for the whole answer, so every binding and caller shares one deadline across the
 overview's queries. GraphQL history selection honors a caller's absolute deadline.
 
+Controlled permission preparation refuses a snapshot that another policy already
+masked, unless the mask is the requested policy's own. A policy that hides no
+triples keeps the existing stricter mask.
+
 Catalog disposal now refuses raw shared state, Store and BranchSet aliases and preserves
 exact owners on refusal. Resident source leases retain real catalog openings without
 changing StoreHandle variants or granting managed-write authority. Built-in close links,

@@ -816,3 +816,48 @@ fn static_nested_guards_preserve_legacy_visibility_without_opaque_providers() {
         assert_eq!(quads(actual.snapshot()), quads(&legacy));
     }
 }
+
+#[test]
+fn a_snapshot_masked_by_another_policy_is_refused() {
+    let store = Store::in_memory(StoreOptions::default());
+    sparkles_core::sparql::update::update(
+        &store,
+        "INSERT DATA { <urn:s> <urn:secret> \"hidden\" ; <urn:visible> \"visible\" }",
+        &Default::default(),
+    )
+    .unwrap();
+    let a = access(vec![(protection(), Graphs::none())], Graphs::All);
+    let b = access(
+        vec![(
+            Protection {
+                name: "other".into(),
+                predicates: Some(vec!["urn:visible".into()]),
+                ..protection()
+            },
+            Graphs::none(),
+        )],
+        Graphs::All,
+    );
+    let masked = a.masked(&store.snapshot()).unwrap();
+    assert_eq!(masked.len(), 1);
+    let preparation = Preparation::new(Control::none(), 16 << 20).unwrap();
+    // Policy B would otherwise be paired with the physical visibility A decided.
+    assert!(matches!(
+        b.masked_controlled(&masked, &preparation),
+        Err(Error::Unsupported(_))
+    ));
+    // A policy that hides no triples keeps the stricter existing mask.
+    let unhidden = GraphAccess::all()
+        .masked_controlled(&masked, &preparation)
+        .unwrap();
+    assert_eq!(unhidden.snapshot().len(), 1);
+    drop(unhidden);
+    // A's own mask is the exact physical view of A.
+    let same = a.masked_controlled(&masked, &preparation).unwrap();
+    assert_eq!(same.snapshot().len(), 1);
+    drop(same);
+    let fresh = b
+        .masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    assert_eq!(fresh.snapshot().len(), 1);
+}

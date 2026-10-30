@@ -204,7 +204,8 @@ A refused call returns no partial view.
 The returned `PreparedView` owns its retained-state reservations and borrows its access
 policy and snapshot to callers. Apply both together, since the physical triple mask
 does not enforce graph restrictions by itself. Keep that owner alive while using the
-prepared view.
+prepared view. A snapshot that another policy already masked is refused unless the
+requested policy hides no triples.
 Independent copies need their own accounting. This cap does not cover subsequent
 query execution or replace the store's accounting for immutable mappings and shared
 caches. Existing query, hidden-quad and pattern-row limits retain their scope.

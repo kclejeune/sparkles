@@ -56,13 +56,10 @@ pub(crate) fn prepare(
         }
     }
     let Some(rules) = access.triples.as_ref().filter(|_| hides) else {
+        // A policy that hides no triples keeps an existing mask, which only hides more.
         preparation.check()?;
         return Ok(PreparedView::new(access, snap.clone(), held));
     };
-    if snap.mask.is_some() {
-        preparation.check()?;
-        return Ok(PreparedView::new(access, snap.clone(), held));
-    }
     for rule in &rules.rules {
         preparation.check()?;
         if rule.read.is_all() {
@@ -75,6 +72,16 @@ pub(crate) fn prepare(
         }
     }
     let (key, key_held) = cache_key(&access, rules, preparation)?;
+    if let Some(mask) = &snap.mask {
+        // A mask left by another policy could show triples this policy hides, so only
+        // this exact policy's own mask can be returned as its prepared view.
+        if !preparation.compare(&mask.key, &key)?.is_eq() {
+            return Err(already_masked());
+        }
+        drop(key_held);
+        preparation.check()?;
+        return Ok(PreparedView::new(access, snap.clone(), held));
+    }
     let existing = snap.counts.prepared_mask_slot(&key, preparation)?;
     if let Some(slot) = &existing {
         let slot = preparation.lock(slot)?;
@@ -108,6 +115,12 @@ pub(crate) fn prepare(
     drop(key_held);
     preparation.check()?;
     Ok(PreparedView::new(access, snapshot, held))
+}
+
+fn already_masked() -> Error {
+    Error::Unsupported(
+        "controlled permission preparation cannot apply a policy to a snapshot masked by another policy".into(),
+    )
 }
 
 fn mask_storage(snap: &Snapshot) -> u64 {
