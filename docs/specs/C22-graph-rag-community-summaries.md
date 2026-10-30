@@ -4,7 +4,7 @@
 >
 > **Phases:** Community builds, cited reports, review, global Ask and memory retrieval
 > are available. Automatic refresh uses the change feed and report digests. Maintenance
-> from an F13 view and reports for distinct audiences remain planned. Evaluation limits
+> from an F13 accumulator and reports for distinct audiences remain planned. Evaluation limits
 > are recorded separately from implementation status.
 >
 > **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime) and
@@ -382,8 +382,12 @@ or at most every ten debounce periods while writes continue, the refresh task:
 4. rewrites the reports of stale leaf communities, then of their ancestors whose stale
    children reach `minChangedFraction` of their children, within `tokensPerDay`.
 
-In Phase 3, the per-community counts of step 1 are an F13 view grouped by community over
-the projection's predicates, so a refresh reads the counts instead of the feed. A commit
+In Phase 3, the per-community counts of step 1 come from an accumulator on an internal F13
+circuit over the projection's predicates (F13 §3.6), so a refresh reads the counts instead
+of the feed. The accumulator counts churn like the counter that step 1 uses today. It is
+not a grouped `COUNT` view, because `gr:member` sits in a guarded graph that a view
+principal cannot read and because a view would net out a fact that is added and removed
+between two refreshes. A commit
 that the feed lists with counts only marks every community stale and schedules a full
 rebuild under the budget, since its changes are not known per community.
 
@@ -671,7 +675,7 @@ and CLI, the Communities tab, the inbox kind, and manual refresh.
 context in `recall` and the brief, `community_reports`, and the evaluation. Several
 configurations per dataset moved to roadmap item 100.
 
-**Phase 3.** Automatic refresh from the change feed, then from an F13 view.
+**Phase 3.** Automatic refresh from the change feed, then from an accumulator on an internal F13 circuit.
 
 ## 11. Acceptance examples
 
@@ -932,7 +936,7 @@ starts a first build or works on a branch, and a run that left pending communiti
 retried once a day without a new commit. Only commits of other kinds than GraphRAG's own
 count as activity, so a refresh never follows its own commit. A failed check or
 refresh is retried after a backoff of two to 64 debounce periods, and one admission lock
-lets only one GraphRAG task of a dataset be listed at a time. Counting from an F13 view waits for roadmap item 17.
+lets only one GraphRAG task of a dataset be listed at a time. Counting with an accumulator on an internal F13 circuit waits for roadmap items 413 and 414.
 
 The Explore overview of U06 is a reader of the reports since 2026-10-23. Its
 `by: {reports}` grouping draws the communities of a level with their titles, statuses

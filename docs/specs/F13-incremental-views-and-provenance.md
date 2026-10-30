@@ -5,8 +5,9 @@
 > **Phases:** Phase 1 provides the incremental core over commits, table views, SSE live
 > queries, checkpoints, the library API, the CLI and recomputation fallbacks. Phase 2's
 > graph views, commit-time maintenance, additional transports and branch views remain
-> planned. Phase 3's per-fact provenance, recursive incremental execution and GraphQL
-> subscriptions remain planned.
+> planned. Phase 3's per-fact provenance and recursive incremental execution remain
+> planned, and GraphQL subscriptions are deferred until a workload asks for them. The
+> remaining work is split into the lanes of roadmap items 413 to 429.
 >
 > **User docs:** [Incremental views](../API.md#incremental-views),
 > [live queries](../API.md#live-queries) and [usage](../USAGE.md#incremental-views).
@@ -119,9 +120,11 @@ PUT /$/views/{ds}/{name}
 | `principal` | a principal name | the caller | Whose view of the dataset the query reads (§6). |
 | `provenance` | `none`, `count`, `why`, `lineage` | `none` | The annotation kept per row (§5). |
 | `maintenance` | `async`, `commit` | `async` | Whether the view is maintained after the commit or inside it (§3.3). |
+| `onFailure` | `suspend`, `reject` | `suspend` | What a failed pass at commit time does (§3.3). |
+| `declassify` | boolean | `false` | Whether a `graph` view may publish data that some readers of its graph cannot read (§6.1). |
 | `branches` | branch names or globs | `["main"]` | The branches with their own state (§7). |
 | `memoryBytes` | bytes | 256 MiB | The budget of the view's state (§8.2). |
-| `keepCommits` | integer | 0 | Diffs kept for reads at past commits (§7.2). |
+| `keepCommits` | integer | 0 | Diffs kept in memory for reads at past commits (§7.2). |
 
 `PUT` compiles the query, reports its plan with each operator marked `incremental` or
 `recompute`, and starts the first evaluation as a task in `/$/tasks`. The answer is `201`
@@ -153,9 +156,10 @@ name. The rows come with their multiplicities, so a view without `DISTINCT` read
 query would. `view:commit ?c` binds the commit the rows reflect. A `table` view's rows are
 not quads and never appear in triple patterns.
 
-A `graph` view's CONSTRUCT output is kept in its named graph. Each maintenance pass
-writes the triples added and removed as one commit of kind `view` by the principal
-`urn:x-sparkles:principal:view:{name}`, with the source commit in its message. The graph
+A `graph` view's CONSTRUCT output is kept in its named graph. Each maintenance round
+writes the triples added and removed by every `graph` view as one commit of kind `view`,
+by the principal `urn:x-sparkles:principal:views`, with the source commit and the names
+of the views in its message. The graph
 is ordinary data: triple patterns read it, history records it, and backups and replicas
 carry it. A write by anyone else to a view's graph is refused with `409 view-graph`.
 
@@ -306,11 +310,24 @@ and costs one hash probe per changed quad, as C03 §13 proposed for subscription
 published. Readers see the commit before the view does, and the view's lag is reported
 in `GET /$/views/{ds}` and the metric `sparkles_view_lag_commits`.
 `maintenance: "commit"` runs the pass inside the write transaction, after the write
-guard of C10 and before the commit is published, so a reader never sees a commit
-without the view. It adds the pass's time to the commit's latency and is refused for
-views whose plan has a `recompute` operator. A `graph` view maintained at commit writes
-its triples in the same commit. An error in such a pass rolls the write back with
-`409 view-maintenance`, which is the behaviour of a guard.
+guard of C10 and before the commit is published, so a reader never sees a commit without
+the view. It adds the pass's time to the commit's latency. A commit with a view
+maintained at commit does not join a group commit of [X09](X09-group-commit-by-default.md)
+and is made durable by itself, because the pass needs the transaction's net changes and
+its result belongs to the same commit. A later change may stage the pass so that
+grouping resumes. A `graph` view maintained at commit writes its triples in the same
+commit.
+
+A view is refused for commit-time maintenance at definition when its plan has a
+`recompute` operator, when the dataset has RDFS on read or materialized inferences, or
+when data-dependent protections apply to its principal, since none of these has a delta
+that the pass can compute inside the transaction.
+
+A pass that fails does not block the write by default. The view is suspended with the
+reason `pass-failed`, the commit is published, and the view is rebuilt after the cause is
+fixed. A view defined with `onFailure: "reject"` instead rolls the write back with
+`409 view-maintenance`, which is the behaviour of a guard. The default keeps one faulty
+view from stopping every write to the dataset.
 
 ### 3.4 Large commits and fallbacks
 
@@ -338,6 +355,18 @@ passes its budget is `suspended` with `over-budget`, and its reads fail with
 `503 view-suspended` until a rebuild with a larger budget. A live query whose state
 passes the per-query budget fails with an `error` event naming the budget.
 
+### 3.6 Internal circuits
+
+The server can attach a circuit that no user defined. An internal circuit has no
+`view.json`, no name in `GET /$/views/{ds}` and no principal. It reads through
+`InternalAccess`, which only server code can construct, and it is never granted to a
+caller. Its sink is either a view's rows or an accumulator that sums a count per key from
+the weights of its output, without keeping the rows. C22's refresh counts the changed
+facts per community with an accumulator on an internal circuit, and the accumulator
+counts churn in the same way as the counter that refresh reads today. It does not use a
+grouped `COUNT` view, which would see a fact that is added and removed in the same round
+as no change.
+
 ## 4. The incremental fragment
 
 ### 4.1 Supported in Phase 1
@@ -363,7 +392,11 @@ operator. The operator iterates a circuit until its change is empty, as DBSP's r
 does, and keeps the iteration's state between commits so that a change propagates only
 as far as it reaches. Deletions in recursion follow the backward/forward approach of the
 reasoner: a candidate fact is kept when another derivation exists, rather than deleted
-and derived again as in DRed. Until Phase 3 a path is a `recompute` node, and fixed-length
+and derived again as in DRed. Derivation counts cannot weight recursive maintenance,
+because a fact in a cycle can support itself, so deletions use backward and forward
+rederivation and not counts. F13 hosts one fixed-point interface, and the reasoner plugs
+its rules into it, so that the property paths of a view and the rules of F16 and F17 share
+the operator. Until Phase 3 a path is a `recompute` node, and fixed-length
 paths and `?`, which are joins and unions, are incremental from Phase 1.
 
 ### 4.4 Ordered windows
@@ -391,8 +424,10 @@ later phase, as `recompute` nodes with their own footprints.
 
 A CONSTRUCT template's blank nodes become fresh nodes per solution. A `graph` view mints
 them deterministically, from a hash of the view's name, the template's blank node label
-and the solution's bindings, as skolem IRIs `urn:x-sparkles:view:{name}:{hash}`. A
-solution that disappears and returns gives the same IRI, and a diff never churns them.
+and the solution's bindings, as skolem IRIs `urn:x-sparkles:view:{name}:{hash}`. The
+hash is taken over the DISTINCT solutions, because a graph is a set and two equal
+solutions would otherwise write one node twice. A solution that disappears and returns
+gives the same IRI, and a diff never churns them.
 
 ## 5. Provenance
 
@@ -410,8 +445,9 @@ counting annotation and are always kept, because maintenance needs them.
 
 Joins combine annotations by product (union of witnesses' quads, pairwise) and unions
 and projections by sum (union of witness sets). Input quads are referenced by a
-`FactId`, a 64-bit hash of the quad's ids, resolved back to the quad through the
-snapshot. A witness set is truncated to the `maxWitnesses` smallest witnesses, and a
+`FactKey`, a 128-bit content hash of the quad's vocabulary keys. Ids change at a
+generation switch and 64 bits would collide at scale, so the key is derived from the
+terms. It is resolved back to the quad through the snapshot. A witness set is truncated to the `maxWitnesses` smallest witnesses, and a
 truncated row says so through `view:witnessesTruncated true`.
 
 ### 5.2 Negation and aggregates
@@ -426,7 +462,9 @@ of them.
 
 ### 5.3 Uses
 
-The provenance of a `graph` view is what F18 needs for derivation trees and for "why
+The reasoner records its witnesses with this algebra and not with a second
+implementation, and it keeps them off unless a protection needs supported visibility
+(F18 §7.1). The provenance of a `graph` view is what F18 needs for derivation trees and for "why
 not?", what C22 records for its summaries' source facts, and what a provenance-aware
 protection of F18 reads to hide a derived triple whose support the caller cannot see.
 The annotation is kept in the operator state and is never written as reifiers, because
@@ -453,6 +491,11 @@ to callers who cannot read its inputs grants them the view by name
 (`view:{name}` in the grant's endpoints), which is an explicit declassification and is
 written to the audit log.
 
+A `graph` view writes its output into a graph that anyone with access to that graph
+reads, whatever the view's principal could read. A `graph` view is therefore refused at
+definition unless its principal reads every quad of the dataset or the definition sets
+`declassify: true`. Setting it is written to the audit log with the definer.
+
 ### 6.2 Live queries
 
 A live query reads as its subscriber. Subscribers with the same query and the same
@@ -473,7 +516,9 @@ grants, or an `error` with `403` when it loses `read`.
 
 ### 7.1 Branches
 
-A view keeps state for each branch its `branches` setting names. A branch created from a
+A view's definition lives in the dataset's settings on the main branch, and its
+`branches` setting names the branches that keep state for it, with globs. A branch has no
+definition of its own. A view keeps state for each branch its `branches` setting names. A branch created from a
 branch with state starts from that state, shared copy-on-write at the checkpoint level
 (§8.4), and diverges with its own commits. A merge commit is maintained as any commit,
 from its net changes. Deleting a branch drops its state. A live query names its branch as
@@ -481,8 +526,9 @@ other reads do, with `?branch=` or the `{ds}@{branch}` dataset name.
 
 ### 7.2 Reads at past commits
 
-A view read with `?at=` at or after the view's oldest kept commit is answered from its
-state and the diffs of `keepCommits`, applied backwards. A read before that evaluates the
+The diffs of `keepCommits` are kept in memory only. They are not checkpointed, and a
+restart drops them. A view read with `?at=` at or after the view's oldest kept commit is
+answered from its state and those diffs, applied backwards. A read before that evaluates the
 view's query at the snapshot, if F06 can still materialize it, and says so with the
 response header `Sparkles-View: evaluated`. A live query with `after=commit:N` replays the
 diffs from `N`, read from the change feed, so a client can follow a query's history from
@@ -542,6 +588,16 @@ from scratch in a task and is `building` meanwhile. Live queries are not persist
 client resumes with `Last-Event-ID` (§2.3). An in-memory dataset keeps view state in
 memory only.
 
+`view.json` carries a format version, and a writer emits the lowest format that holds the
+definition. Format 1 holds the Phase 1 members, format 2 marks a paused definition (F05),
+and format 3 holds the members that Phase 2 adds, which are `graph` views, `commit`
+maintenance, `onFailure`, `declassify`, `branches` beyond the main branch and
+`keepCommits`. A definition is checked against its format when it loads or attaches,
+so a format 1 file that carries a Phase 2 member is refused and not run as an async table
+view. The checkpoint of a fixed-point operator's state needs its own version of
+`VIEW_STATE`, and a reader that does not know a version refuses it and builds the view
+from the data.
+
 ### 8.5 Interaction with other features
 
 - **Replication (F10).** A replica maintains its own views from the commits it applies.
@@ -549,8 +605,9 @@ memory only.
   view itself; the view definition is marked `replicated` there.
 - **Reasoning (C08).** A view over the inferred graph sees the reasoner's commits like any
   other. F16 may move the reasoner's maintenance onto the fixed-point operator of §4.3.
-- **GraphQL (C03).** Phase 3 compiles a subscription document to the batched algebra it
-  already produces and runs it as a live query, replacing the re-run on predicate match.
+- **GraphQL (C03).** Subscriptions are deferred until a workload asks for them. They would
+  compile a subscription document to the batched algebra C03 already produces and run it
+  as a live query, replacing the re-run on predicate match.
 - **Compaction (C13).** Compaction does not change any view's result, so no pass runs.
 - **Backups (F05).** View definitions are backed up with the dataset's settings. State
   is not; a restored dataset rebuilds its views.
@@ -570,8 +627,13 @@ APIs, the UI, views per branch, `keepCommits`, the operators of §4.2, ordered w
 data-dependent protections compiled to views.
 
 **Phase 3.** Provenance annotations with `view:witness` and `view:why`, provenance on
-one-off queries, the fixed-point operator for property paths and rules, and GraphQL
-subscriptions.
+one-off queries, and the fixed-point operator for property paths and rules. GraphQL
+subscriptions are deferred until a workload asks for them.
+
+The phases are delivered as lanes, which roadmap items 413 to 429 track. Three consumers
+need only part of them. The community refresh of C22 needs internal circuits (§3.6), the
+supported visibility of F18 needs the provenance algebra and the reasoner's witnesses, and
+the maintained tables of F17 need the algebra and the fixed-point operator.
 
 ## 10. Acceptance examples
 
@@ -642,6 +704,19 @@ and during a generation switch, followed by an open, must give the oracle's answ
 - Write throughput with 0, 10 and 100 async views and with one view maintained at commit,
   against [X09](X09-group-commit-by-default.md)'s group commit, to show the cost on the writer.
 
+The commit path has these acceptance thresholds, measured with
+`scripts/nsc-writes.sh` and its `--views` option.
+
+- A dataset without views shows no change in commit latency or write throughput beyond
+  noise.
+- A dataset with views maintained asynchronously and subscribers attached adds at most
+  4% to commit latency.
+- A grouped `COUNT` view maintained at commit adds at most 10% to the median commit
+  latency and at most 20% to the p99.
+- The reasoner with witnesses on takes at most 1.5 times the time and 2 times the memory
+  of the same run with witnesses off, and with witnesses off it shows no change beyond
+  noise.
+
 The target is a pass at least 100 times cheaper than re-evaluation for single-quad
 commits on the SNB SF10 views, and no change to write throughput with async views until
 the runtime falls behind.
@@ -650,7 +725,9 @@ the runtime falls behind.
 
 Phase 1 needs nothing new beyond F06's change feed. Phase 2's data-dependent protections
 need Phase 1. Phase 3's provenance is a prerequisite of F18, and its fixed-point operator
-of F16's derived-fact layer if F16 chooses it.
+of F16's derived-fact layer if F16 chooses it. The WebSocket transport uses the `ws`
+feature of axum, which adds `tokio-tungstenite` under the MIT license, and this
+dependency is accepted.
 
 ## 13. Rejected alternatives
 
@@ -689,9 +766,9 @@ of F16's derived-fact layer if F16 chooses it.
    may be enough. The default chosen is no rewriting.
 2. **Disk-backed state.** Large views may need their arrangements on disk. X08's spill
    would serve, and the default chosen is memory with the budget of §3.5.
-3. **Ordering of view commits on replicas and branches with many views.** Each `graph`
-   view writes its own commit, which multiplies commits for datasets with many views. A
-   single commit for all `graph` views of one source commit is the likely answer.
+3. **Ordering of view commits on replicas and branches with many views.** The decision
+   is one `view` commit per maintenance round for all `graph` views (§2.2), which keeps
+   the number of commits independent of the number of views.
 4. **Diff granularity for SELECT without DISTINCT.** A row with multiplicity changes
    from 3 to 2 is reported as `removed` with count 1. Clients that cannot handle
    multiplicities can ask for `DISTINCT`.
@@ -759,7 +836,7 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 **Phase 1 delivered on 2026-10-24.** Phases 2 and 3 are not built, and
-[ROADMAP](../ROADMAP.md) item 17 tracks them.
+[ROADMAP](../ROADMAP.md) item 17 tracks them as items 413 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the

@@ -345,11 +345,13 @@ choice is added as the protection field `inferences`:
 | `"show"` | As `hide_inferences: false`. |
 | `"supported"` | An inferred triple is visible when it has a derivation all of whose asserted leaves the caller can see. |
 
-`"supported"` needs per-fact provenance. With F13 Phase 3, the reasoner's closure is
-maintained with `why` provenance (F13 §5.1): each derived fact keeps up to `maxWitnesses`
-sets of asserted facts (`FactId`s), each of which derives it. For a view and a commit,
+`"supported"` needs per-fact provenance. The reasoner produces the witnesses itself, using
+the provenance algebra of F13 (§5.1) and not a second implementation. They are off unless
+a protection with `"supported"` needs them, so a dataset without such a protection pays
+nothing. With witnesses on, each derived fact keeps up to `maxWitnesses` sets of asserted
+facts (`FactKey`s), each of which derives it. For a view and a commit,
 the hidden derived triples are those of which no kept witness is wholly visible. They are
-found from a reverse index from `FactId` to the derived facts whose witnesses contain it,
+found from a reverse index from `FactKey` to the derived facts whose witnesses contain it,
 starting from the facts the view's mask hides, so the work follows the hidden facts and
 not the closure. The hidden derived triples join the masked snapshot's deletions
 (`Snapshot::mask`, C12b §8), and the mask is cached per view and commit as C12b caches

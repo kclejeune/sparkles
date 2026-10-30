@@ -210,7 +210,7 @@ MCP controls. Verify schema edits and invalidation, stored-only refusal, caller
 visibility and the existing differential query tests. The top-k acceptance counter
 must bound rows produced per parent, rather than only slicing the assembled JSON.
 
-Subscriptions remain conditional on a workload adopting Phase 3 and use F13 under
-item 17. Mutations remain a separately approved design, as §12 and the follow-up
+Subscriptions are deferred under item 37 until a workload asks for them, and then use
+F13 as live queries. Mutations remain a separately approved design, as §12 and the follow-up
 above state. Neither conditional extension can be treated as delivered merely because
 Phase 2 completes, and declining one must be recorded explicitly.
