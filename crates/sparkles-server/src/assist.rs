@@ -102,6 +102,7 @@ pub struct ScratchBranches {
 impl ScratchBranches {
     /// The dataset's choice: `None` leaves the decision to the server flag, `Some(None)`
     /// turns expiry off and `Some(Some(d))` expires after `d`.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn choice(&self) -> Option<Option<Duration>> {
         match self.ttl.as_deref()? {
             SCRATCH_TTL_OFF => Some(None),
