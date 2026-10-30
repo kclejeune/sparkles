@@ -1443,7 +1443,7 @@ design remains part of its original record.
 
 ## Outcome
 
-The embedded Jena engine and typed administration surfaces, including branch relink, are available. Callback, reusable-plan, per-call cost, release and integration follow-ups remain under items 25, 32, 33, 58 and 76.
+The embedded Jena engine and typed administration surfaces, including branch relink, are available. The JVM algorithm handle supports projection list, get, put and delete, query text, query execution, statistics and write-back. Callback, reusable-plan, per-call cost, release and integration follow-ups remain under items 25, 32, 33, 58 and 76.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

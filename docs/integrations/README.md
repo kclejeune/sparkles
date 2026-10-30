@@ -61,6 +61,12 @@ dataset directory. In-memory branches share runtime ownership without a file loc
   The existing JSON methods keep their signatures. It retries as `Retry-After` and
   `RateLimit` direct, and never repeats a write whose outcome is unknown.
 
+The JVM `DatasetGraphSparkles.algorithms()` handle lists, gets, stores and deletes
+named projections. It also builds query text, runs queries, returns statistics and writes
+results. Callers close the returned query execution. Writes use batched commits, so a
+later failure can leave earlier batches committed. Other algorithm surfaces remain under
+roadmap item 8.
+
 The JVM `DatasetGraphSparkles.mappings()` and Node.js `Dataset.mappings` handles list,
 version, store, delete and run mappings. Their `runMapping` methods run mapping text.
 Both return the commit receipt and mapping statistics. The default JVM and Node.js

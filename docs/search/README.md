@@ -218,8 +218,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the two small official example graphs, through `scripts/graphalytics-reference.py`.
   There is no full Graphalytics driver, no run on the larger datasets, no reference check
   of CDLP, LCC or SSSP, and no certification. Roadmap item 8.
-* The UI cannot complete `algo:` names, the JVM binding has no typed algorithm handle,
-  and openCypher procedures wait for an openCypher frontend. Write-back commits through
+* The UI cannot complete `algo:` names, and openCypher procedures wait for an openCypher
+  frontend. Write-back commits through
   the ordinary writer rather than a bulk writer. A write-back run has no deadline unless
   the request or `--update-timeout` gives one. Thread admission has no queue order, so a
   call that needs several threads can wait while one-thread calls take the free slots. A

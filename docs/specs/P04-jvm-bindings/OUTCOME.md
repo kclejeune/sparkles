@@ -22,6 +22,8 @@ The recorded dates and measurements below describe their original delivery stage
 
 ## Outcome
 
+The JVM algorithm handle exposes projection list, get, put and delete, query text, query execution, statistics and write-back. Write-back uses batched commits and can retain earlier batches after a later failure. Further algorithm surfaces and acceptance remain under roadmap item 8.
+
 **Delivered.** The initial implementation landed on 2026-10-03 on Linux x86_64.
 The integration and administration extension below follows on 2026-10-05. The initial
 engine and Jena contract surface includes:
