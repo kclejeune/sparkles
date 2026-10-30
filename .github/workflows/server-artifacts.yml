@@ -3,7 +3,7 @@ name: Server artifact candidates
 
 on:
   push:
-    branches: [main, item59-artifact-acceptance-20261028]
+    branches: [main]
     paths: &paths
       - '.github/workflows/server-artifacts.yml'
       - 'scripts/server-artifact*'

@@ -773,11 +773,10 @@ esac
         _, failure = self.preflight(machine="aarch64")
         self.assertIn("Linux x86_64", failure)
 
-    def test_acceptance_ref_and_resource_limits_are_exact_and_precede_builds(self):
+    def test_main_ref_and_resource_limits_are_exact_and_precede_builds(self):
         workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
         branches = re.search(r"^    branches: \[([^\]]+)\]$", workflow, re.M).group(1)
-        self.assertEqual([value.strip() for value in branches.split(",")],
-                         ["main", "item59-artifact-acceptance-20261028"])
+        self.assertEqual([value.strip() for value in branches.split(",")], ["main"])
         self.assertIn("options: --cpus 4 --memory 14g --memory-swap 14g --pids-limit 2048", workflow)
         self.assertEqual(re.findall(r"timeout-minutes: (\d+)", workflow), ["90", "10"])
         self.assertLess(workflow.index("# BEGIN SERVER ARTIFACT PREFLIGHT"),
