@@ -867,7 +867,17 @@ fn existing_software_bytes_map_only_explicit_family_version_bindings() {
         actual.deployed_exposure,
         Selection::Unknown("NoDeploymentEvidence")
     );
-    assert!(actual.source_digest.starts_with("sha256:"));
+    // The adapter reads the corpus's retained bytes, not a changed copy of them.
+    let manifest = software_inventory_manifest();
+    assert_eq!(
+        actual.source_digest,
+        format!(
+            "sha256:{}",
+            manifest["files"]["synthetic-before.Cargo.lock"]["sha256"]
+                .as_str()
+                .unwrap()
+        )
+    );
     assert!(matches!(
         software_inventory(&bytes, 2, &bindings, &operation).unwrap(),
         Selection::Unknown("UnsupportedMapping")
@@ -1975,4 +1985,62 @@ fn claim_only_regression_source_revision_field_still_requires_description_role()
 #[test]
 fn claim_only_regression_report_relation_requires_description_even_without_role_fields() {
     claim_only_description_refusal(true);
+}
+
+fn software_inventory_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/software-inventory/v1")
+}
+fn software_inventory_manifest() -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(software_inventory_root().join("manifest.json")).unwrap())
+        .unwrap()
+}
+
+/// Every software-inventory file keeps the byte count and SHA-256 its manifest records,
+/// and the manifest lists every file of the corpus except itself.
+#[test]
+fn software_inventory_corpus_matches_its_manifest() {
+    let root = software_inventory_root();
+    let manifest = software_inventory_manifest();
+    let control = Control::none();
+    let check = |path: &std::path::Path, entry: &serde_json::Value| {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(
+            bytes.len() as u64,
+            entry["bytes"].as_u64().unwrap(),
+            "{}",
+            path.display()
+        );
+        let digest = sparkles_core::evidence::Sha256Digest::of_bytes(&bytes, &control).unwrap();
+        assert_eq!(
+            digest.to_string(),
+            format!("sha256:{}", entry["sha256"].as_str().unwrap()),
+            "{}",
+            path.display()
+        );
+    };
+    let raw = manifest["files"].as_object().unwrap();
+    assert!(!raw.is_empty());
+    for (name, entry) in raw {
+        check(&root.join("raw").join(name), entry);
+    }
+    let listed = manifest["resource_files"].as_object().unwrap();
+    for (name, entry) in listed {
+        check(&root.join(name), entry);
+    }
+    let mut pending = vec![root.clone()];
+    let mut found = std::collections::BTreeSet::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let name = path.strip_prefix(&root).unwrap().to_str().unwrap();
+                found.insert(name.replace(std::path::MAIN_SEPARATOR, "/"));
+            }
+        }
+    }
+    found.remove("manifest.json");
+    let listed: std::collections::BTreeSet<_> = listed.keys().cloned().collect();
+    assert_eq!(found, listed);
 }

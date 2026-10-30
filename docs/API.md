@@ -8168,12 +8168,21 @@ directory as `validation.json`. SHACL writes format 2 and also reads format 1 wi
 A copied schema's `copySha256` is checked before the guard is installed or a stored
 source is reused in a settings change. A mismatch or a missing digest in format 3 is an
 error and leaves writes requiring a guard refused. Restore the configured copy or set
-the schema again to replace it. The original-source `sha256` remains informational
-because imported schemas and ShExR sources can have different stored bytes. Format 2
-copies without `copySha256` receive a full validation of the head during installation,
-within `timeoutSeconds`, without trusting persisted baseline counts or typing. Saving
-the configuration again writes format 3. Installation does not rewrite a legacy file.
-Older releases that read only format 2 refuse format 3 databases.
+the schema again to replace it. A settings change that reuses the copy checks it against
+the stored `validation.json`. The `format` and `copySha256` a `PUT` sends do not change
+that check, and the saved configuration records the digest of the verified copy. The
+original-source `sha256` remains informational because imported schemas and ShExR
+sources can have different stored bytes. Older releases that read only format 2 refuse
+format 3 databases.
+
+Format 2 copies without `copySha256` receive a full validation of the head each time the
+dataset opens, within `timeoutSeconds`, without trusting persisted baseline counts or
+typing. The validation holds the dataset's writer lock, so writes wait until it
+finishes. When it exceeds `timeoutSeconds` the guard is not installed and writes stay
+refused. Raise `timeoutSeconds` in the file, or set the schema inline again, to recover.
+Installation does not rewrite a legacy file. Saving the configuration again, including a
+`PUT` that sends the stored `schema` back without `format`, writes format 3 and ends the
+full validation at open.
 
 A schema in graphs works as SHACL shapes graphs do. The schema graphs are never part of
 the data graph, and a `dataGraph` list that names one is a `400`. A write that changes a

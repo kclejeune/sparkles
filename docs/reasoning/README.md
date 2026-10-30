@@ -126,7 +126,9 @@ request or on every write, and the schema report counts what the data holds.
   When a schema is set, its imports are resolved and copied into the database. A copied
   schema's digest is verified before installation or reuse in a settings change. A
   mismatch refuses the guard. Legacy ShEx configurations without a copy digest receive
-  a full validation at installation and gain the digest when their settings are saved.
+  a full validation under the writer lock each time the dataset opens, and a validation
+  that exceeds `timeoutSeconds` leaves writes refused. They gain the digest when their
+  settings are saved, including from the UI's keep-source option.
 * `/$/validation/{ds}`, `sparkles validation` and `serve --validate` configure it in
   `validation.json`. The CLI's `--no-validate` skips it, and writes that bypass
   validation are flagged `unvalidated` in the commit log. If a dataset's guard cannot be

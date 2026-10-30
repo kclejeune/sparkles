@@ -556,12 +556,24 @@ Selected manifests and decision histories drive component resolution, including
 n-ary constraints, conflicts with every causal decision, explicit unknowns and retained
 older views.
 The matcher does not consume authored assignment or conflict rows. Its canonical
-comparison encoder preserves the independently fixed bytes.
+comparison encoder preserves the independently fixed bytes. The replay builds only
+complete views. It refuses a missing mandatory input with `incomplete-input` and has no
+partial diagnostic mode, so its only unknown code is `possible-match` and it never
+emits `unavailable-input`.
 
 Retained source and mandatory selector verification reuse C25 digest and lexical JSON
 helpers. Record caps are checked during ingestion, decoded bytes accumulate across
 deliveries and operation memory, source bytes, cancellation and deadlines remain
-bounded. Refusals produce no comparison artifact or current-pointer update.
+bounded. Refusals produce no comparison artifact or current-pointer update. The memory
+accounting is conservative. The CLI's read buffers, the parsed delivery and the parser
+workspace each charge the same input bytes, about seven times the delivery size before
+its statements are charged. The 256 MiB operation cap therefore refuses deliveries above
+about 36 MiB, below the 64 MiB decoded cap, with `replay-limit`. Roadmap item 396
+retains charging each byte once.
+
+The Cargo.lock adapter test checks its digest against the software-inventory manifest,
+and a separate test recomputes every digest and byte count that manifest records. The
+rest of that corpus awaits independent review under roadmap item 407.
 
 Private evolution helpers compute the fixed rules for occurrence withdrawal, lineage,
 simulated availability, mapping migration and terminal observation selection. The

@@ -1625,6 +1625,29 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     Ok(Some(g))
 }
 
+/// The configuration that verifies a reused schema copy. The copy is trusted only as
+/// the stored `validation.json` describes it, so its format and `copySha256` come from
+/// the stored file and the caller's values for them are ignored. A stored format 2
+/// copy without a digest is accepted as installation accepts it, and the new
+/// configuration then records the digest of that copy.
+fn stored_copy_check(cfg: &ShexValidationConfig, root: &Path) -> Result<ShexValidationConfig> {
+    let stored = read_config_hashed(root)?
+        .map(|(c, _)| c)
+        .filter(|c| c.schema.graphs.is_none() && c.schema.file.is_some())
+        .context("schema: the database keeps no schema copy to reuse; give the schema inline")?;
+    if stored.schema.file != cfg.schema.file {
+        bail!(
+            "schema.file must name the stored copy {:?}, not {:?}",
+            stored.schema.file.as_deref().unwrap_or_default(),
+            cfg.schema.file.as_deref().unwrap_or_default()
+        );
+    }
+    let mut check = cfg.clone();
+    check.format = stored.format;
+    check.schema.copy_sha256 = stored.schema.copy_sha256;
+    Ok(check)
+}
+
 /// The outcome of [`set_config`].
 pub enum SetOutcome {
     /// installed; the validation of the current state
@@ -1637,7 +1660,8 @@ pub enum SetOutcome {
 
 /// Set (or with `None` / mode `off`, remove) the write-time ShEx validation of a store.
 /// The schema is parsed from `cfg.schema.inline` (or, without it, read from the copy an
-/// earlier configuration left in the database), its imports resolved through
+/// earlier configuration left in the database and verified against the stored
+/// configuration's copy digest), its imports resolved through
 /// `resolver` and checked, and copied into the database with the configuration. Runs
 /// under the writer lock: the current state is validated with the new configuration,
 /// and `reject` is refused when an association does not conform, so no write can commit
@@ -1678,7 +1702,7 @@ pub fn set_config(
             let r = root
                 .as_deref()
                 .context("schema: give the schema inline (an in-memory dataset keeps no copy)")?;
-            load_copy(&cfg, r)?
+            load_copy(&stored_copy_check(&cfg, r)?, r)?
         }
     };
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
