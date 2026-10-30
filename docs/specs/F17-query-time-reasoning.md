@@ -840,3 +840,39 @@ negative lower stages, coherent multihead relations and fresh-witness counts. Th
 explanation sample now requires every sampled materialized fact to have a demand
 answer and retains its proof soundness and replay checks. The strengthened checks
 include schema facts rather than allowing missing answers for W3C terms.
+
+
+### Bounded positive feedback evaluation
+
+A cold demand session can evaluate the original rules over a temporary closure when
+schema specialization expands a tiny positive feedback view into thousands of rule
+copies. Eligibility requires at most 64 input triples and 64 distinct program and
+input terms, at most 256 original rules, and an expansion of at least 4,096 rules
+and 32 times the original rule count. A rule has at most 64 combined atoms, builtins
+and heads. At least one input triple consists entirely of constants from the original
+program. Conservative full-closure bounds must fit the remaining memory, derived-fact
+and iteration limits before this route is selected. Other demand sessions keep their
+existing evaluation route.
+
+The admitted rules are positive and cannot construct terms or perform head actions.
+Negation, fresh witnesses, arithmetic and string construction are excluded. Structural
+list terms in input or rule heads also exclude the route. The temporary closure uses
+the ordinary engine and the same cancellation, deadline, memory, derived-fact and
+iteration controls. Its facts remain private to the captured view and session.
+This can retain more intermediate facts than selective demand evaluation, trading
+temporary memory for avoiding the expanded program. It does not persist a
+materialization or implement Phase 2's automatic cost selection.
+
+Explanation search uses first-emission rounds to seed a minimum-depth proof. It then
+checks alternative root instances against the complete closure, including independent
+support that becomes available after the root was first derived. Distinct supported
+premise sets of the same rule count as alternatives. A root-only cycle does not.
+Partial retries retain consumed search budgets and cannot reuse an incomplete round
+ordering as proof of completeness.
+
+The default-budget why-not acceptance fixture retains every returned-hypothesis
+rematerialization assertion and the existing test timeout. The repair passes a 250-case regression matrix and three supplemental proof-metadata
+and eligibility controls. These checks establish bounded completion and explanation correctness.
+They do not establish a current-head latency ratio or the selective-query cost target
+in section 13. Item 190 retains matched Forge measurement, the temporary-closure
+memory tradeoff and any measured control costs before performance acceptance.
