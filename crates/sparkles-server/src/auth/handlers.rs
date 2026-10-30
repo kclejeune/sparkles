@@ -262,8 +262,9 @@ async fn login(
     let b_token = b.token.map(Zeroizing::new);
     let invalid = || failed(json_error(StatusCode::UNAUTHORIZED, "invalid credentials"));
     let client = network(&addr);
-    // A check that overlaps an authority change runs again against the current state.
-    // It is not a failed credential, and the address is charged at most once.
+    // A check that overlaps an authority change runs again, whole, against the
+    // current state. It is not a failed credential, the address is charged at most
+    // once, and one request runs at most AUTH_ATTEMPTS password verifications.
     let mut attempt = 0;
     let (method, raw, log, expires, now) = loop {
         if attempt > 0 {
@@ -277,7 +278,8 @@ async fn login(
             });
             return super::routes::authority_changed_response();
         }
-        // the generation of a token lookup; a password check reports its own
+        // the generation of a token lookup and of `policy`; a password check
+        // reports its own with the policy it verified against
         let mut generation = auth.epoch();
         if generation & 1 != 0 {
             continue;
@@ -289,8 +291,8 @@ async fn login(
                 .check_password_at(user, pw, adm.as_deref(), client.as_ref())
                 .await
             {
-                Ok(Some((_, verified))) => {
-                    generation = verified;
+                Ok(Some(verified)) => {
+                    generation = verified.generation;
                     (
                         Method::Password,
                         Identity {
@@ -300,7 +302,7 @@ async fn login(
                             display_name: None,
                         },
                         None,
-                        now + policy.session_ttl,
+                        now + verified.policy.session_ttl,
                     )
                 }
                 Ok(None) => {
@@ -372,7 +374,8 @@ async fn login(
             Some(id) => format!("token:{id}"),
             None => who.log_name(),
         };
-        let (raw, _) = match auth
+        let token = token_id.clone();
+        let (raw, digest) = match auth
             .sessions
             .create_checked(generation, method, who, token_id, now, expires)
         {
@@ -388,6 +391,15 @@ async fn login(
                 );
             }
         };
+        // The token was revoked after its lookup. Revocation and this check take
+        // the token store's mutex, so a later revocation is ordered after this
+        // login. The next attempt looks the token up again and fails as revoked.
+        if let Some(id) = &token
+            && !auth.tokens.contains(id)
+        {
+            let _ = auth.sessions.remove(&digest);
+            continue;
+        }
         break (method, raw, log, expires, now);
     };
     auth.count_login(method, "ok");
@@ -834,6 +846,13 @@ fn mint(
         policy.max_tokens_per_owner,
         p.access_epoch(),
     ) {
+        // The minting credential was revoked after the check above. Revocation and
+        // this check take the same store mutex, so a later revocation is ordered
+        // after the mint. Nothing minted by a revoked credential is kept.
+        Ok(true) if !auth.credential_live(p) => {
+            let _ = auth.tokens.remove(std::slice::from_ref(&rec.id));
+            return Err(super::routes::authority_changed_response());
+        }
         Ok(true) => {}
         Ok(false) => {
             return Err(json_error(

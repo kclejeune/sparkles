@@ -193,3 +193,180 @@ async fn another_users_login_does_not_reverify_cached_basic_credentials() {
         "only alice's login may verify a password"
     );
 }
+
+/// Run `revoke` once, right after the next stored credential record is copied by
+/// an authentication and before that authentication is accepted.
+fn revoke_after_lookup(s: &AuthServer, revoke: impl FnOnce(&crate::auth::Auth) + Send + 'static) {
+    let mut revoke = Some(revoke);
+    s.auth().hooks.lock().after_lookup = Some(Box::new(move |auth| {
+        if let Some(r) = revoke.take() {
+            r(auth);
+        }
+    }));
+}
+
+/// Mint a token for bob that reads wiki; its secret and id.
+async fn bob_token(s: &AuthServer) -> (String, String) {
+    let r = super::tokens::mint_as(
+        &s.app,
+        &[("authorization", &b("bob"))],
+        r#"{"name":"race","datasets":{"wiki":"read"}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    (
+        j["token"].as_str().unwrap().to_string(),
+        j["id"].as_str().unwrap().to_string(),
+    )
+}
+
+/// A token or session revoked between its lookup and the acceptance of the
+/// authentication is refused, as a credential that was already revoked would be.
+#[tokio::test]
+async fn revocation_during_lookup_refuses_the_request() {
+    let s = build(Fixture::default());
+    let ask = format!("/wiki{ASK}");
+    for basic_password in [false, true] {
+        let (token, id) = bob_token(&s).await;
+        let header = if basic_password {
+            basic("bob", &token)
+        } else {
+            bearer(&token)
+        };
+        assert_eq!(
+            get_as(&s.app, &ask, Some(&header)).await.status,
+            StatusCode::OK
+        );
+        revoke_after_lookup(&s, move |auth| {
+            assert_eq!(auth.tokens.remove(&[id]).unwrap(), 1);
+        });
+        let r = get_as(&s.app, &ask, Some(&header)).await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNAUTHORIZED,
+            "a token revoked during its lookup was accepted: {}",
+            r.text()
+        );
+        s.auth().hooks.lock().after_lookup = None;
+    }
+    let (cookie, _) = password_session(&s, "bob").await;
+    let get = |cookie: String| {
+        let app = s.app.clone();
+        let ask = ask.clone();
+        async move { call(&app, "GET", &ask, &[("cookie", &cookie)], "").await }
+    };
+    assert_eq!(get(cookie.clone()).await.status, StatusCode::OK);
+    // every session ends, as an expiry prune at the end of time does
+    revoke_after_lookup(&s, |auth| auth.sessions.prune(i64::MAX, None).unwrap());
+    let r = get(cookie).await;
+    assert_eq!(
+        r.status,
+        StatusCode::UNAUTHORIZED,
+        "a session revoked during its lookup was accepted: {}",
+        r.text()
+    );
+}
+
+/// A token login whose token is revoked after its lookup opens no session.
+#[tokio::test]
+async fn token_login_revoked_during_lookup_opens_no_session() {
+    let s = build(Fixture {
+        extra: "[session]\ntoken_login = true\n".into(),
+        ..Default::default()
+    });
+    let (token, id) = bob_token(&s).await;
+    revoke_after_lookup(&s, move |auth| {
+        assert_eq!(auth.tokens.remove(&[id]).unwrap(), 1);
+    });
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/auth/login",
+        &[
+            ("content-type", "application/json"),
+            ("origin", s.fixture.public_url),
+        ],
+        &format!(r#"{{"token":"{token}"}}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+    assert!(r.cookie("sparkles_session").is_none());
+    assert_eq!(s.auth().sessions.active(s.auth().now()), 0);
+}
+
+/// A login whose verification overlaps a reload gets the session lifetime of the
+/// policy it was finally verified under.
+#[tokio::test]
+async fn login_across_a_reload_uses_the_new_session_lifetime() {
+    let s = build(Fixture::default());
+    let auth = s.auth();
+    let hold = auth.hold_verifications();
+    let app = s.app.clone();
+    let origin = s.fixture.public_url;
+    let pending = tokio::spawn(async move {
+        call(
+            &app,
+            "POST",
+            "/$/auth/login",
+            &[("content-type", "application/json"), ("origin", origin)],
+            r#"{"user":"bob","password":"bob-pw"}"#,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while auth.argon_load().1 == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the login must be verifying before the reload");
+    s.write_config(&Fixture {
+        extra: "[session]\nttl = \"1h\"\n".into(),
+        ..s.fixture.clone()
+    });
+    auth.reload().unwrap();
+    drop(hold);
+    let r = pending.await.unwrap();
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let set = r.set_cookie("sparkles_session").unwrap();
+    assert!(set.contains("Max-Age=3600"), "{set}");
+}
+
+/// Authority changes that keep overlapping a request cost at most one password
+/// verification for each of its attempts.
+#[tokio::test]
+async fn overlapping_changes_bound_the_verifications_of_one_request() {
+    let s = build(Fixture::default());
+    let auth = s.auth();
+    auth.hooks.lock().after_verify = Some(Box::new(|auth| {
+        drop(auth.hold_authority_update());
+    }));
+    let verified = || metric(&s.app, "sparkles_auth_password_verifications_total");
+    let before = verified().await;
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/auth/login",
+        &[
+            ("content-type", "application/json"),
+            ("origin", s.fixture.public_url),
+        ],
+        r#"{"user":"bob","password":"bob-pw"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.err()["code"], "authority-changed");
+    let login = verified().await - before;
+    let r = get_as(&s.app, &format!("/wiki{ASK}"), Some(&b("bob"))).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    let basic = verified().await - before - login;
+    auth.hooks.lock().after_verify = None;
+    assert_eq!(
+        (login, basic),
+        (
+            u64::from(crate::auth::AUTH_ATTEMPTS),
+            u64::from(crate::auth::AUTH_ATTEMPTS)
+        )
+    );
+}

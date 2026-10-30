@@ -2167,9 +2167,14 @@ They no longer invalidate other principals' cached Basic credentials or streams.
 Logout, back-channel logout, eviction, expiry pruning and token revocation remove only
 the named credentials. Change feeds, live queries and long polls check that their own
 session or token is still stored as well as the generation, so only streams of a
-revoked credential end with `access-changed`. Basic authentication and password login
-that observe a generation change are computed again against the current state, up to
-three attempts, instead of answering `invalid credentials`. A request that still
+revoked credential end with `access-changed`. An authentication is
+accepted only when its session or token is still stored after the lookup. The check and
+the revocation take the same store mutex, so a credential revoked during its lookup is
+refused, and token logins and mints remove what they created from a credential revoked
+meanwhile. Basic authentication and password login that observe a generation change
+are computed again as a whole against the current state, with at most three password
+verifications for each request, instead of answering `invalid credentials`. A login
+takes its session lifetime from the policy its password was verified against. A request that still
 overlaps changes gets `503` with code `authority-changed` and `Retry-After: 1`, which
 does not count against the pre-authentication budget.
 

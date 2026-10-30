@@ -647,6 +647,31 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// A password login verified under one stable authority generation.
+pub struct VerifiedLogin {
+    /// the verified user (the login handler needs only its name, which it sent)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub principal: Principal,
+    /// the generation the verification began and ended in
+    pub generation: u64,
+    /// the policy of that generation
+    pub policy: Arc<Policy>,
+}
+
+/// A test interleaving run inside authentication.
+#[cfg(test)]
+pub type TestHook = Box<dyn FnMut(&Auth) + Send>;
+
+/// Points inside authentication where tests interleave other work.
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestHooks {
+    /// after a stored token or session record was copied, before it is used
+    pub after_lookup: Option<TestHook>,
+    /// after a password verification finished
+    pub after_verify: Option<TestHook>,
+}
+
 /// The auth state of a server: the current policy, the token and session stores, the
 /// login flows in progress and the password machinery.
 pub struct Auth {
@@ -676,6 +701,9 @@ pub struct Auth {
     /// seconds added to the clock (tests)
     clock_offset: AtomicI64,
     untrusted_warned: Mutex<Option<Instant>>,
+    /// interleavings that tests run inside authentication
+    #[cfg(test)]
+    pub hooks: Mutex<TestHooks>,
 }
 
 impl Auth {
@@ -732,6 +760,8 @@ impl Auth {
             metrics: AuthMetrics::default(),
             clock_offset: AtomicI64::new(0),
             untrusted_warned: Mutex::new(None),
+            #[cfg(test)]
+            hooks: Mutex::new(TestHooks::default()),
         })
     }
 
@@ -765,6 +795,20 @@ impl Auth {
     #[cfg(test)]
     pub fn hold_authority_update(&self) -> sparkles::access::authority::AuthorityUpdate<'_> {
         self.authority.begin_update()
+    }
+
+    /// Run a test hook, outside the hooks' own lock.
+    #[cfg(test)]
+    fn run_hook(&self, pick: fn(&mut TestHooks) -> &mut Option<TestHook>) {
+        let taken = pick(&mut self.hooks.lock()).take();
+        if let Some(mut hook) = taken {
+            hook(self);
+            let mut hooks = self.hooks.lock();
+            let slot = pick(&mut hooks);
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        }
     }
 
     /// Password verifications that may wait for a permit.
@@ -1100,6 +1144,8 @@ impl Auth {
             .tokens
             .by_digest(&digest)
             .ok_or(err(Failure::Invalid))?;
+        #[cfg(test)]
+        self.run_hook(|h| &mut h.after_lookup);
         if rec.expires_at() <= now {
             return Err(err(Failure::Expired));
         }
@@ -1337,6 +1383,8 @@ impl Auth {
         let digest = crypto::sha256(raw.as_bytes());
         let now = self.now();
         let s = self.sessions.get(&digest, now, policy.session_idle)?;
+        #[cfg(test)]
+        self.run_hook(|h| &mut h.after_lookup);
         let mut info = PrincipalInfo {
             owner: Some(s.principal.clone()),
             expires: Some(s.ends_at(policy.session_idle)),
@@ -1481,43 +1529,49 @@ impl Auth {
     ) -> Result<Option<Principal>, AuthError> {
         self.check_password_at(user, password, admission, client)
             .await
-            .map(|v| v.map(|(p, _)| p))
+            .map(|v| v.map(|v| v.principal))
     }
 
-    /// Check a password for a UI login, with the stable generation the result
-    /// belongs to. The address is charged before the first verification. A verification that overlaps an authority change runs
-    /// again against the current policy, without a second charge to the address.
-    /// [`Failure::Changed`] means changes kept overlapping it.
+    /// Check a password for a UI login once, under one stable generation. The result
+    /// carries that generation and the policy it was verified against, so the session
+    /// takes its lifetime from the same policy. [`Failure::Changed`] means an authority
+    /// change overlapped the check: the caller owns the retries, so one request runs at
+    /// most [`AUTH_ATTEMPTS`] verifications for its single charge to the address.
     pub async fn check_password_at(
         &self,
         user: &str,
         password: &str,
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
-    ) -> Result<Option<(Principal, u64)>, AuthError> {
-        for attempt in 0..AUTH_ATTEMPTS {
-            if attempt > 0 {
-                authority_backoff(attempt).await;
-            }
-            let generation = self.epoch();
-            if generation & 1 != 0 {
-                continue;
-            }
-            let verified = self
-                .check_password_once(user, password, admission, client)
-                .await?;
-            if self.epoch() == generation {
-                return Ok(verified.map(|p| (p, generation)));
-            }
-        }
-        Err(AuthError {
+    ) -> Result<Option<VerifiedLogin>, AuthError> {
+        let changed = AuthError {
             scheme: "session",
             failure: Failure::Changed,
-        })
+        };
+        let generation = self.epoch();
+        if generation & 1 != 0 {
+            return Err(changed);
+        }
+        // The policy is loaded after an even generation was read. When the same
+        // generation is still current after the verification, no update began in
+        // between, so this is that generation's policy.
+        let policy = self.policy.load_full();
+        let verified = self
+            .check_password_once(&policy, user, password, admission, client)
+            .await?;
+        if self.epoch() != generation {
+            return Err(changed);
+        }
+        Ok(verified.map(|principal| VerifiedLogin {
+            principal,
+            generation,
+            policy,
+        }))
     }
 
     async fn check_password_once(
         &self,
+        policy: &Policy,
         user: &str,
         password: &str,
         admission: Option<&Admission>,
@@ -1530,7 +1584,6 @@ impl Auth {
                 failure: Failure::Limited,
             });
         }
-        let policy = self.policy.load_full();
         let (phc, principal) = match policy.users.get(user) {
             Some(u) => (
                 u.password.clone(),
@@ -1580,6 +1633,8 @@ impl Auth {
         let ok = tokio::task::spawn_blocking(move || verify_password(password.as_bytes(), &phc))
             .await
             .unwrap_or(false);
+        #[cfg(test)]
+        self.run_hook(|h| &mut h.after_verify);
         Ok(if ok { principal } else { None })
     }
 
@@ -2074,13 +2129,12 @@ mod tests {
         std::fs::write(&path, config("read")).unwrap();
         auth.reload().unwrap();
         drop(hold);
-        let (recomputed, generation) = old.await.unwrap().unwrap().unwrap();
+        let overlapped = old.await.unwrap();
         assert_eq!(
-            recomputed.level("wiki"),
-            Some(Level::Read),
+            overlapped.err().map(|e| e.failure),
+            Some(Failure::Changed),
             "old password completion must not escape as issuable session authority"
         );
-        assert_eq!(generation, auth.epoch());
         let current = auth
             .check_password("race", "pw", None, None)
             .await

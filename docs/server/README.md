@@ -102,7 +102,8 @@ Authentication is off by default. Once it is on, access is denied unless a grant
 * Signing in and minting a token add a credential without changing anyone's rights,
   so they leave other users' cached credentials and open streams alone. Logout,
   back-channel logout, session eviction, expiry pruning and token revocation each
-  revoke only the credentials they name. Change feeds, live queries and long polls
+  revoke only the credentials they name. A credential revoked while a request is
+  looking it up is refused, as one revoked earlier would be. Change feeds, live queries and long polls
   opened with such a credential end with `access-changed`, and those of other
   credentials continue. Last-used bookkeeping does not revoke access.
 * Dataset and branch administration emit INFO records under `sparkles::audit` with the

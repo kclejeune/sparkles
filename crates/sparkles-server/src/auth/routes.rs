@@ -1241,6 +1241,11 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             Err(e) if e.failure == Failure::Changed => true,
             // decided before any credential was looked at
             Err(e) if matches!(e.failure, Failure::Limited | Failure::Busy) => false,
+            // A token or session revoked after its record was copied is refused like
+            // one revoked before. Revocation and this check take the same store
+            // mutex, so a revocation is either seen here or ordered after acceptance.
+            // The next attempt looks the credential up again and fails as revoked.
+            Ok(a) => auth.epoch() != epoch || !auth.credential_live(&a.principal),
             _ => auth.epoch() != epoch,
         };
         if changed {
