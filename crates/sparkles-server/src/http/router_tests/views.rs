@@ -282,3 +282,17 @@ async fn views_and_live_queries_run_with_rdfs_on_read() {
     assert_eq!(j["evaluation"], "incremental", "{j}");
     assert!(j.get("evaluationReason").is_none(), "{j}");
 }
+
+/// A read-only server refuses to rebuild a view, which would resume a restored or
+/// cloned view and rewrite its definition (review of item 220).
+#[tokio::test]
+async fn a_read_only_server_refuses_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    drop(st.create("ds", DbType::Mem).unwrap());
+    st.read_only = true;
+    let app = router(Arc::new(st));
+    let r = send(&app, req("POST", "/$/views/ds/v/rebuild", "")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}

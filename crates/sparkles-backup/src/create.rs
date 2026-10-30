@@ -292,6 +292,14 @@ impl Repository {
         let mut files = files;
         // the managed definitions were captured with the data; each is one meta blob,
         // and its entry names its kind and file version
+        // a definition a restore would refuse fails the backup before anything is
+        // uploaded, so no published backup is one that cannot be restored
+        sparkles_core::store::definitions::check_all(&definitions).map_err(|e| {
+            BackupError::new(
+                Code::InvalidRequest,
+                format!("a view definition cannot be backed up: {e}"),
+            )
+        })?;
         let mut defined = std::collections::HashMap::new();
         for d in definitions {
             let known = sparkles_core::formats::definition_kind(d.kind)

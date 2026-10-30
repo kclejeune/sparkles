@@ -587,3 +587,36 @@ async fn fs_repository() {
     .unwrap_err();
     assert_eq!(e.code(), Code::InvalidConfig);
 }
+
+/// A definition that a restore would refuse fails the backup before any manifest is
+/// written, so no backup is published that cannot be restored (review of item 220).
+#[tokio::test]
+async fn an_unrestorable_definition_fails_the_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("ds");
+    make_db(&db);
+    let (repo, _) = memory_repo().await;
+    let view = |bytes: Vec<u8>| sparkles_core::store::DefinitionFile {
+        kind: "view",
+        path: "views/v/view.json".into(),
+        format: 1,
+        bytes: bytes.into(),
+    };
+    let big = format!(
+        r#"{{"format":1,"query":"SELECT * {{ ?s ?p ?o }} #{}"}}"#,
+        "x".repeat(1 << 20)
+    );
+    for (name, bytes) in [
+        ("big", big.into_bytes()),
+        ("schema", br#"{"format":1,"query":123}"#.to_vec()),
+    ] {
+        let mut src = closed_source(&db);
+        src.definitions.push(view(bytes));
+        let e = repo.create(src, &opts(name, "ds")).await.unwrap_err();
+        assert_eq!(e.code(), Code::InvalidRequest, "{name}: {e}");
+        assert_eq!(
+            repo.manifest(name).await.unwrap_err().code(),
+            Code::NoSuchBackup
+        );
+    }
+}

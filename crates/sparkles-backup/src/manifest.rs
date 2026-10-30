@@ -252,7 +252,7 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
 }
 
 /// The largest definition file a reader accepts.
-pub const MAX_DEFINITION_BYTES: u64 = 1 << 20;
+pub use sparkles_core::formats::MAX_DEFINITION_BYTES;
 
 /// A definition entry (`files[i].definition`): announced by `requires`, a meta file of
 /// at most [`MAX_DEFINITION_BYTES`] at its kind's path, and a file version this build
@@ -322,16 +322,13 @@ fn check_definition(
     if d.format == 0 {
         return bad("definition.format", "0 is not a version".into());
     }
-    if d.format > kind.format() {
+    // an entry holds a definition as it runs: a paused file never leaves its dataset
+    if d.format > kind.writes {
         return Err(BackupError::new(
             Code::IncompatibleFormat,
             format!(
                 "{} has {} format {}, written by Sparkles {}; this build reads up to {}: restore it with that release or a later one",
-                f.path,
-                kind.file,
-                d.format,
-                m.server.version,
-                kind.format()
+                f.path, kind.file, d.format, m.server.version, kind.writes
             ),
         ));
     }

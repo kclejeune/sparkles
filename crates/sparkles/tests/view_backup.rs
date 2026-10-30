@@ -153,14 +153,18 @@ fn views_round_trip_paused_until_resumed() {
     let cat = Catalog::open(&data, Default::default()).unwrap();
     let copy = cat.get("copy").unwrap();
     assert_paused(&copy, "restored");
-    let marker = data.join("databases/copy/views/sizes/paused.json");
-    assert!(marker.is_file());
+    // a paused definition is format 2, which releases that do not know pauses refuse
+    let file = data.join("databases/copy/views/sizes/view.json");
+    let format = || -> J {
+        serde_json::from_slice::<J>(&std::fs::read(&file).unwrap()).unwrap()["format"].clone()
+    };
+    assert_eq!(format(), 2);
     for (v, want) in ["sizes", "members"].into_iter().zip(want) {
         copy.views().rebuild(v).unwrap();
         copy.views().wait_built(v, Duration::from_secs(10)).unwrap();
         assert_eq!(rows(&copy, v), want, "{v}");
     }
-    assert!(!marker.exists());
+    assert_eq!(format(), 1);
     assert!(
         copy.views()
             .list()
