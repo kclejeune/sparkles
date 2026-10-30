@@ -651,6 +651,7 @@ linked spec Outcome records how they landed.
 
 - **397.** Native Rust direct mapping controls through conversion and the final atomic load. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
 - **403.** Credential expiry for long-lived reads and fenced OIDC sign-in. [C09](specs/C09-dataset-access-control.md)
+- **432.** DBpedia `births-by-decade` decimal arithmetic and inline date parts, which leave cursor BIND reuse under item 293. [X06](specs/X06-benchmark-coverage.md#decimal-arithmetic-and-inline-date-components)
 
 ## Keeping this current
 
