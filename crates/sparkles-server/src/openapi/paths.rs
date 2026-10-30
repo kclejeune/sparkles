@@ -3910,7 +3910,7 @@ fn auth(p: &mut Paths) {
                 None,
                 json!({ "Set-Cookie": { "description": "The session cookie.", "schema": { "type": "string" } } }),
             )
-            .errors(&[400, 401, 403, 429]),
+            .errors(&[400, 401, 403, 429, 503]),
     );
     p.add(
         op(POST, "/$/auth/logout", "logout", tag, "Sign out")
@@ -3976,7 +3976,7 @@ fn auth(p: &mut Paths) {
             .see("api-tokens")
             .json_body(false, "TokenRequest")
             .json("201", "Minted.", "TokenCreated")
-            .errors(&[400]),
+            .errors(&[400, 409, 503]),
     );
     p.add(
         op(

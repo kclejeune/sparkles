@@ -3114,8 +3114,10 @@ Live queries and views that ask the same question with the same access share one
 circuit. A dataset runs at most `--max-live-queries` live queries, 1,000 by default, and
 `--max-live-queries-per-principal`, 20 by default, for each principal. More are refused
 with `429 too-many-live-queries`. The first evaluation counts against the rate limit as
-a query. A stream ends when the server drains, and with an `access-changed` error when
-the access policy changes, after which the client reconnects under the new grants.
+a query. A stream ends when the server drains. It ends with an `access-changed` error
+when the access policy changes or when the session or token the stream was opened with
+is revoked, and the client then reconnects under the new grants. Other users signing in
+or out do not end it.
 
 ## GraphQL
 
@@ -9605,7 +9607,11 @@ the owner and the number of tokens and sessions that changed.
 Invalid credentials get `401 {"error":"invalid credentials"}`, or `token expired`, with
 `WWW-Authenticate: Bearer realm="sparkles", error="invalid_token"`. When the identity
 provider's keys cannot be fetched to check a JWT, the answer is
-`503 {"error":"identity provider unavailable"}` with `Retry-After`. Browser navigations,
+`503 {"error":"identity provider unavailable"}` with `Retry-After`. An authentication
+that overlaps a policy reload or another change to several principals' rights is checked
+again against the new state. When changes keep overlapping it, the answer is
+`503 {"code":"authority-changed"}` with `Retry-After: 1`. That refusal does not count as
+a failed credential, so it spends none of the address's `preauth` budget. Browser navigations,
 and non-browser clients when users are configured, also get a `Basic` challenge. Missing
 server permissions give `401` to anonymous callers and `403`
 (`{"error":"metrics permission required"}`) to others. A clone needs `admin` on the source

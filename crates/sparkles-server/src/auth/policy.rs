@@ -477,6 +477,16 @@ pub fn token_hash(token: &str) -> String {
     format!("sha256:{}", crypto::sha256_hex(token.as_bytes()))
 }
 
+/// How many times one request authenticates when authority changes overlap it,
+/// before it is refused with a retryable status.
+pub const AUTH_ATTEMPTS: u32 = 3;
+
+/// The pause before authentication attempt `attempt` (from 1), which lets an
+/// exclusive authority update finish.
+pub async fn authority_backoff(attempt: u32) {
+    tokio::time::sleep(Duration::from_millis(2 << attempt)).await;
+}
+
 /// Why authentication failed (metric label `reason`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
@@ -489,10 +499,13 @@ pub enum Failure {
     NotAllowed,
     /// not checked: the client address has no authentication failures left
     Limited,
+    /// not decided: an authority change kept overlapping the authentication, so the
+    /// request is refused for retry without counting as a failed credential
+    Changed,
 }
 
 impl Failure {
-    pub const ALL: [Failure; 8] = [
+    pub const ALL: [Failure; 9] = [
         Failure::Malformed,
         Failure::Invalid,
         Failure::Expired,
@@ -501,6 +514,7 @@ impl Failure {
         Failure::Idp,
         Failure::NotAllowed,
         Failure::Limited,
+        Failure::Changed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -513,6 +527,7 @@ impl Failure {
             Failure::Idp => "idp",
             Failure::NotAllowed => "not_allowed",
             Failure::Limited => "limited",
+            Failure::Changed => "changed",
         }
     }
 }
@@ -538,7 +553,7 @@ pub struct Authenticated {
 #[derive(Default)]
 pub struct AuthMetrics {
     /// `[scheme][reason]` (`FAILURE_SCHEMES` × `Failure::ALL`)
-    pub failures: [[AtomicU64; 8]; 5],
+    pub failures: [[AtomicU64; 9]; 5],
     /// `routes::Denied::ALL`
     pub denied: [AtomicU64; 6],
     /// `[method][result]`: oidc, password, token × ok, denied, error
@@ -745,6 +760,13 @@ impl Auth {
         a.permits.try_acquire_many(a.size as u32).unwrap()
     }
 
+    /// Hold an authority update open (tests: every authentication observes a change
+    /// in progress until it is dropped).
+    #[cfg(test)]
+    pub fn hold_authority_update(&self) -> sparkles::access::authority::AuthorityUpdate<'_> {
+        self.authority.begin_update()
+    }
+
     /// Password verifications that may wait for a permit.
     #[cfg(test)]
     pub fn verification_queue(&self) -> (usize, usize) {
@@ -832,6 +854,25 @@ impl Auth {
     /// mutation is in progress. Lookup callers require one unchanged even value.
     pub fn epoch(&self) -> u64 {
         self.authority.generation()
+    }
+
+    /// Whether the stored credential a principal was authenticated with is still
+    /// stored. Logout, back-channel logout, eviction, pruning and token revocation
+    /// remove one credential each without moving the global generation, so a
+    /// long-lived read bound to that credential checks this as well.
+    pub fn credential_live(&self, p: &Principal) -> bool {
+        if let Some(digest) = &p.info.session
+            && !self.sessions.contains(digest)
+        {
+            return false;
+        }
+        if !p.info.static_token
+            && let Some(id) = p.info.token_id.as_deref()
+            && !self.tokens.contains(id)
+        {
+            return false;
+        }
+        true
     }
 
     /// The configured user `name` as a principal, without a credential, for work the
@@ -1339,13 +1380,15 @@ impl Auth {
         // single-flight slot that a new-generation request could reuse. Checking
         // the actual borrowed policy also prevents capturing a new generation for
         // a policy that authenticate() loaded before the swap.
+        // An overlapping change is not a wrong password: the caller authenticates
+        // again against the current state.
         let generation = self.epoch();
         let current = self.policy.load_full();
         if generation & 1 != 0
             || !std::ptr::eq(policy, current.as_ref())
             || self.epoch() != generation
         {
-            return Err(err(Failure::Invalid));
+            return Err(err(Failure::Changed));
         }
         let mut msg = Zeroizing::new(Vec::with_capacity(user.len() + password.len() + 9));
         msg.extend_from_slice(user.as_bytes());
@@ -1428,6 +1471,7 @@ impl Auth {
 
     /// Check a password for a UI login (no cache; one verification, charged to the
     /// address as a failure before it starts).
+    #[cfg(test)]
     pub async fn check_password(
         &self,
         user: &str,
@@ -1435,10 +1479,51 @@ impl Auth {
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
     ) -> Result<Option<Principal>, AuthError> {
-        let generation = self.epoch();
-        if generation & 1 != 0 {
-            return Ok(None);
+        self.check_password_at(user, password, admission, client)
+            .await
+            .map(|v| v.map(|(p, _)| p))
+    }
+
+    /// Check a password for a UI login, with the stable generation the result
+    /// belongs to. The address is charged before the first verification. A verification that overlaps an authority change runs
+    /// again against the current policy, without a second charge to the address.
+    /// [`Failure::Changed`] means changes kept overlapping it.
+    pub async fn check_password_at(
+        &self,
+        user: &str,
+        password: &str,
+        admission: Option<&Admission>,
+        client: Option<&ClientKey>,
+    ) -> Result<Option<(Principal, u64)>, AuthError> {
+        for attempt in 0..AUTH_ATTEMPTS {
+            if attempt > 0 {
+                authority_backoff(attempt).await;
+            }
+            let generation = self.epoch();
+            if generation & 1 != 0 {
+                continue;
+            }
+            let verified = self
+                .check_password_once(user, password, admission, client)
+                .await?;
+            if self.epoch() == generation {
+                return Ok(verified.map(|p| (p, generation)));
+            }
         }
+        Err(AuthError {
+            scheme: "session",
+            failure: Failure::Changed,
+        })
+    }
+
+    async fn check_password_once(
+        &self,
+        user: &str,
+        password: &str,
+        admission: Option<&Admission>,
+        client: Option<&ClientKey>,
+    ) -> Result<Option<Principal>, AuthError> {
+        // a reservation is taken once per request, so a retry costs nothing more
         if admission.is_some_and(|a| !a.reserve()) {
             return Err(AuthError {
                 scheme: "session",
@@ -1458,13 +1543,8 @@ impl Auth {
             ),
             None => (policy.dummy_hash.clone(), None),
         };
-        let verified = self
-            .verify(Zeroizing::new(password.to_string()), phc, principal, client)
-            .await?;
-        if self.epoch() != generation {
-            return Ok(None);
-        }
-        Ok(verified)
+        self.verify(Zeroizing::new(password.to_string()), phc, principal, client)
+            .await
     }
 
     /// One argon2 run under a permit: `Some(principal)` when the password matches.
@@ -1787,39 +1867,113 @@ mod tests {
         );
     }
 
-    #[test]
-    fn token_revocation_changes_the_real_auth_epoch_without_policy_reload() {
-        let (_directory, auth) = epoch_auth();
-        let record = epoch_token(&auth);
-        auth.tokens.insert(record.clone(), auth.now()).unwrap();
-        let before = auth.epoch();
-        assert_eq!(auth.tokens.remove(&[record.id]).unwrap(), 1);
-        assert_ne!(
-            auth.epoch(),
-            before,
-            "token revocation must invalidate already authenticated grants"
-        );
+    /// A principal authenticated with `token_id` or `session`, as enforce builds it.
+    fn credential_principal(token_id: Option<&str>, session: Option<[u8; 32]>) -> Principal {
+        Principal::new(
+            Kind::User,
+            "epoch-owner",
+            Scheme::Session,
+            Access::of(Grants::default()),
+        )
+        .with_info(PrincipalInfo {
+            token_id: token_id.map(str::to_string),
+            session,
+            ..Default::default()
+        })
     }
 
     #[test]
-    fn session_logout_changes_the_real_auth_epoch_without_policy_reload() {
+    fn token_mint_keeps_the_generation_and_revocation_ends_only_that_token() {
         let (_directory, auth) = epoch_auth();
-        let (_, digest) = auth
-            .sessions
-            .create(
-                Method::Password,
-                epoch_owner(),
-                None,
-                auth.now(),
-                auth.now() + 3600,
-            )
-            .unwrap();
         let before = auth.epoch();
-        assert!(auth.sessions.remove(&digest).unwrap().is_some());
-        assert_ne!(
+        let record = epoch_token(&auth);
+        auth.tokens.insert(record.clone(), auth.now()).unwrap();
+        let other = TokenRecord {
+            id: "tok_epoch_other".into(),
+            hash: token_hash(&new_token()),
+            ..epoch_token(&auth)
+        };
+        auth.tokens.insert(other.clone(), auth.now()).unwrap();
+        assert_eq!(auth.epoch(), before, "minting must not revoke anything");
+        let revoked = credential_principal(Some(&record.id), None);
+        let kept = credential_principal(Some(&other.id), None);
+        assert!(auth.credential_live(&revoked));
+        assert_eq!(auth.tokens.remove(&[record.id]).unwrap(), 1);
+        assert_eq!(
             auth.epoch(),
             before,
-            "session logout must invalidate already authenticated grants"
+            "revoking one token must not invalidate other principals"
+        );
+        assert!(
+            !auth.credential_live(&revoked),
+            "token revocation must end reads bound to that token"
+        );
+        assert!(auth.credential_live(&kept));
+    }
+
+    #[test]
+    fn session_logout_ends_only_that_session() {
+        let (_directory, auth) = epoch_auth();
+        let create = || {
+            auth.sessions
+                .create(
+                    Method::Password,
+                    epoch_owner(),
+                    None,
+                    auth.now(),
+                    auth.now() + 3600,
+                )
+                .unwrap()
+                .1
+        };
+        let before = auth.epoch();
+        let (digest, other) = (create(), create());
+        assert_eq!(auth.epoch(), before, "sign-in must not revoke anything");
+        let revoked = credential_principal(None, Some(digest));
+        let kept = credential_principal(None, Some(other));
+        assert!(auth.sessions.remove(&digest).unwrap().is_some());
+        assert_eq!(
+            auth.epoch(),
+            before,
+            "one logout must not invalidate other principals"
+        );
+        assert!(
+            !auth.credential_live(&revoked),
+            "session logout must end reads bound to that session"
+        );
+        assert!(auth.credential_live(&kept));
+    }
+
+    #[test]
+    fn checked_token_mint_fails_only_after_an_exclusive_update() {
+        let (_directory, auth) = epoch_auth();
+        let original = auth.epoch();
+        let first = epoch_token(&auth);
+        assert!(
+            auth.tokens
+                .insert_within(first, auth.now(), usize::MAX, Some(original))
+                .unwrap()
+        );
+        drop(auth.hold_authority_update());
+        let second = TokenRecord {
+            id: "tok_epoch_second".into(),
+            hash: token_hash(&new_token()),
+            ..epoch_token(&auth)
+        };
+        let error = auth
+            .tokens
+            .insert_within(second.clone(), auth.now(), usize::MAX, Some(original))
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::super::store::AuthorityChanged>()
+                .is_some()
+        );
+        assert!(!auth.tokens.contains(&second.id));
+        assert!(
+            auth.tokens
+                .insert_within(second, auth.now(), usize::MAX, Some(auth.epoch()))
+                .unwrap()
         );
     }
 
@@ -1829,6 +1983,68 @@ mod tests {
         let before = auth.epoch();
         auth.refresh_owner(&epoch_owner());
         assert_eq!(auth.epoch(), before);
+    }
+
+    /// Issuing another user's session neither moves the global generation nor fails
+    /// a correct password login that overlaps it (audit AC-1).
+    #[tokio::test]
+    async fn unrelated_session_creation_does_not_fail_a_correct_concurrent_login() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth-config.toml");
+        let password = hash_password_with("pw", 8, 1, 1).unwrap();
+        std::fs::write(
+            &path,
+            format!("version = 1\n[[users]]\nname = \"race\"\npassword = {password:?}\n"),
+        )
+        .unwrap();
+        let (auth, _) = Auth::open(&path, directory.path()).unwrap();
+        let auth = Arc::new(auth);
+        let policy = auth.policy();
+        auth.password(&policy, "race", "pw", None, None)
+            .await
+            .unwrap();
+        let before = auth.epoch();
+        auth.sessions
+            .create(
+                Method::Password,
+                epoch_owner(),
+                None,
+                auth.now(),
+                auth.now() + 3600,
+            )
+            .unwrap();
+        assert_eq!(
+            auth.epoch(),
+            before,
+            "issuing an unrelated session must not move the global generation"
+        );
+        let hold = auth.hold_verifications();
+        let other = auth.clone();
+        let pending =
+            tokio::spawn(async move { other.check_password("race", "pw", None, None).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while auth.argon_load().1 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // another user signs in while the password is checked
+        auth.sessions
+            .create(
+                Method::Password,
+                epoch_owner(),
+                None,
+                auth.now(),
+                auth.now() + 3600,
+            )
+            .unwrap();
+        drop(hold);
+        let result = pending.await.unwrap().unwrap();
+        assert!(
+            result.is_some(),
+            "a correct password login failed because an unrelated session was created"
+        );
     }
 
     #[tokio::test]
@@ -1847,7 +2063,7 @@ mod tests {
         let hold = auth.hold_verifications();
         let old_auth = auth.clone();
         let old =
-            tokio::spawn(async move { old_auth.check_password("race", "pw", None, None).await });
+            tokio::spawn(async move { old_auth.check_password_at("race", "pw", None, None).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while auth.argon_load().1 == 0 {
                 tokio::task::yield_now().await;
@@ -1858,10 +2074,13 @@ mod tests {
         std::fs::write(&path, config("read")).unwrap();
         auth.reload().unwrap();
         drop(hold);
-        assert!(
-            old.await.unwrap().unwrap().is_none(),
+        let (recomputed, generation) = old.await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            recomputed.level("wiki"),
+            Some(Level::Read),
             "old password completion must not escape as issuable session authority"
         );
+        assert_eq!(generation, auth.epoch());
         let current = auth
             .check_password("race", "pw", None, None)
             .await

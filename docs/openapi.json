@@ -952,7 +952,7 @@
             }
           }
         },
-        "description": "Cancelled, over a concurrency limit, offline, being restored, or the identity provider is unreachable.",
+        "description": "Cancelled, over a concurrency limit, offline, being restored, the identity provider is unreachable, or authentication kept overlapping an authority change (`authority-changed`), which is safe to retry and is not a failed credential.",
         "headers": {
           "Retry-After": {
             "description": "Seconds to wait before trying again.",
@@ -22536,6 +22536,9 @@
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
           "default": {
             "$ref": "#/components/responses/Error"
           }
@@ -23016,6 +23019,12 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
           },
           "default": {
             "$ref": "#/components/responses/Error"

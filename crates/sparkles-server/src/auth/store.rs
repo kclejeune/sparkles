@@ -4,6 +4,19 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
 
+/// An issuance or authentication overlapped an exclusive authority update, so
+/// its result belongs to a generation that no longer holds. The caller retries.
+#[derive(Debug)]
+pub struct AuthorityChanged;
+
+impl std::fmt::Display for AuthorityChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("authorization changed during authentication")
+    }
+}
+
+impl std::error::Error for AuthorityChanged {}
+
 /// Unix seconds.
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()

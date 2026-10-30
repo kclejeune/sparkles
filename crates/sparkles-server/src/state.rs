@@ -617,12 +617,32 @@ impl Limits {
 /// The disclosure guard of a catalog's datasets, which finds a dataset's directory
 /// through the catalog.
 impl AppState {
-    /// Moves whenever the access policy is reloaded (spec C22 §6.3).
+    /// Moves whenever the access policy is reloaded or another change can alter the
+    /// rights of more than one credential (spec C22 §6.3). Issuing a credential and
+    /// revoking one credential leave it unchanged.
     pub fn access_epoch(&self) -> u64 {
         #[cfg(feature = "auth")]
         return self.auth.as_ref().map_or(0, |a| a.epoch());
         #[cfg(not(feature = "auth"))]
         0
+    }
+
+    /// Whether the authority a principal's views were decided under still holds:
+    /// the global generation is unchanged and the session or token it was
+    /// authenticated with has not been revoked. Long-lived reads check it before
+    /// they send more data.
+    pub fn access_current(&self, p: &crate::auth::Principal) -> bool {
+        let Some(epoch) = p.access_epoch() else {
+            return true;
+        };
+        if epoch != self.access_epoch() {
+            return false;
+        }
+        #[cfg(feature = "auth")]
+        if let Some(a) = &self.auth {
+            return a.credential_live(p);
+        }
+        true
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

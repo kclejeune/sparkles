@@ -204,10 +204,10 @@ pub(super) async fn changes(
         graphs,
     };
     let restricted = ask.graphs.is_some();
-    let epoch = p.access_epoch();
     if sse {
-        return Ok(event_stream(st, ds, ask, fmt, epoch).into_response());
+        return Ok(event_stream(st, ds, ask, fmt, p).into_response());
     }
+    let caller = p;
     // subscribe before reading, so a commit made in between wakes the wait
     let mut rx = ds.store.subscribe_commits();
     let mut p = page(&ds, &ask).await?;
@@ -217,11 +217,11 @@ pub(super) async fn changes(
     }
     // the view was decided when the caller was authenticated: a page read after the
     // policy or a disclosure registry changed is not answered (spec C22 §6.3)
-    if epoch.is_some_and(|e| e != st.access_epoch()) {
+    if !st.access_current(&caller) {
         return Err(ApiError(
             StatusCode::CONFLICT,
             json!({
-                "error": "the access policy or a disclosure registry changed; ask again to read under the new rules",
+                "error": "the access policy, a disclosure registry or the caller's credential changed; ask again to read under the new rules",
                 "code": "access-changed",
             }),
         ));
@@ -331,9 +331,10 @@ struct Feed {
     queue: std::collections::VecDeque<Event>,
     until: Instant,
     done: bool,
-    /// the access epoch the caller's view was decided under: a new policy or disclosure
-    /// registry ends the stream before it sends another event (spec C22 §6.3)
-    epoch: Option<u64>,
+    /// the caller, whose view was decided under its authority: a new policy or
+    /// disclosure registry, or the revocation of the caller's own credential, ends
+    /// the stream before it sends another event (spec C22 §6.3)
+    principal: Principal,
     /// the stream ended because access changed
     revoked: bool,
 }
@@ -359,14 +360,14 @@ impl Feed {
         loop {
             // checked before every event, so events read under the old view are dropped
             // also while a terminal page drains its queue
-            if !self.revoked && self.epoch.is_some_and(|e| e != self.st.access_epoch()) {
+            if !self.revoked && !self.st.access_current(&self.principal) {
                 self.revoked = true;
                 self.done = true;
                 self.queue.clear();
                 return Some((
                     Ok(Event::default().event("error").data(
                         json!({
-                            "error": "the access policy or a disclosure registry changed; reconnect to read under the new rules",
+                            "error": "the access policy, a disclosure registry or the caller's credential changed; reconnect to read under the new rules",
                             "code": "access-changed",
                         })
                         .to_string(),
@@ -426,7 +427,7 @@ fn event_stream(
     ds: Arc<Dataset>,
     ask: Ask,
     fmt: DiffFormat,
-    epoch: Option<u64>,
+    principal: Principal,
 ) -> impl IntoResponse {
     let feed = Feed {
         rx: ds.store.subscribe_commits(),
@@ -437,7 +438,7 @@ fn event_stream(
         queue: Default::default(),
         until: Instant::now() + MAX_STREAM,
         done: false,
-        epoch,
+        principal,
         revoked: false,
     };
     let events = futures_util::stream::unfold(feed, Feed::next);

@@ -260,112 +260,135 @@ async fn login(
     };
     let b_password = b.password.map(Zeroizing::new);
     let b_token = b.token.map(Zeroizing::new);
-    let generation = auth.epoch();
-    let policy = auth.policy();
-    let now = auth.now();
     let invalid = || failed(json_error(StatusCode::UNAUTHORIZED, "invalid credentials"));
     let client = network(&addr);
-    let (method, who, token_id, expires) = match (b.user, b_password, b_token) {
-        (Some(user), Some(pw), None) => match auth
-            .check_password(&user, &pw, adm.as_deref(), client.as_ref())
-            .await
-        {
-            Ok(Some(_)) => (
-                Method::Password,
-                Identity {
-                    kind: Kind::User,
-                    name: user,
-                    groups: Vec::new(),
-                    display_name: None,
-                },
-                None,
-                now + policy.session_ttl,
-            ),
-            Ok(None) => {
-                auth.count_login(Method::Password, "denied");
-                auth.count_failure(super::policy::AuthError {
-                    scheme: "session",
-                    failure: Failure::Invalid,
-                });
-                return invalid();
-            }
-            Err(e) if e.failure == Failure::Limited => {
-                auth.count_failure(e);
-                match adm {
-                    Some(Extension(a)) => return a.refusal(),
-                    None => return json_error(StatusCode::TOO_MANY_REQUESTS, "too many failures"),
-                }
-            }
-            Err(_) => {
-                auth.count_login(Method::Password, "error");
-                let mut r = json_error(StatusCode::SERVICE_UNAVAILABLE, "authentication busy");
-                r.headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-                return r;
-            }
-        },
-        (None, None, Some(_)) if !policy.token_login => {
-            // refused before the token is looked at, so the answer says nothing about it
-            return json_error(
-                StatusCode::FORBIDDEN,
-                "signing in with an API token is turned off ([session] token_login)",
-            );
+    // A check that overlaps an authority change runs again against the current state.
+    // It is not a failed credential, and the address is charged at most once.
+    let mut attempt = 0;
+    let (method, raw, log, expires, now) = loop {
+        if attempt > 0 {
+            super::policy::authority_backoff(attempt).await;
         }
-        (None, None, Some(t)) => {
-            let rec = match auth.token_principal(&policy, &t, Scheme::Bearer) {
-                Ok(p) if !p.info.static_token => p
-                    .info
-                    .token_id
-                    .as_deref()
-                    .and_then(|id| auth.tokens.get(id)),
-                _ => None,
-            };
-            let Some(rec) = rec else {
-                // an address without failures left has its unknown tokens refused
-                if let Some(Extension(a)) = &adm
-                    && a.exhausted()
-                {
+        attempt += 1;
+        if attempt > super::policy::AUTH_ATTEMPTS {
+            auth.count_failure(super::policy::AuthError {
+                scheme: "session",
+                failure: Failure::Changed,
+            });
+            return super::routes::authority_changed_response();
+        }
+        // the generation of a token lookup; a password check reports its own
+        let mut generation = auth.epoch();
+        if generation & 1 != 0 {
+            continue;
+        }
+        let policy = auth.policy();
+        let now = auth.now();
+        let (method, who, token_id, expires) = match (&b.user, &b_password, &b_token) {
+            (Some(user), Some(pw), None) => match auth
+                .check_password_at(user, pw, adm.as_deref(), client.as_ref())
+                .await
+            {
+                Ok(Some((_, verified))) => {
+                    generation = verified;
+                    (
+                        Method::Password,
+                        Identity {
+                            kind: Kind::User,
+                            name: user.clone(),
+                            groups: Vec::new(),
+                            display_name: None,
+                        },
+                        None,
+                        now + policy.session_ttl,
+                    )
+                }
+                Ok(None) => {
+                    auth.count_login(Method::Password, "denied");
                     auth.count_failure(super::policy::AuthError {
                         scheme: "session",
-                        failure: Failure::Limited,
+                        failure: Failure::Invalid,
                     });
-                    return a.refusal();
+                    return invalid();
                 }
-                auth.count_login(Method::Token, "denied");
-                auth.count_failure(super::policy::AuthError {
-                    scheme: "session",
-                    failure: Failure::Invalid,
-                });
-                return invalid();
-            };
-            let exp = (now + policy.session_ttl).min(rec.expires_at());
-            (Method::Token, rec.owner.clone(), Some(rec.id.clone()), exp)
-        }
-        _ => return bad("expected {\"user\", \"password\"} or {\"token\"}"),
-    };
-    let log = match &token_id {
-        Some(id) => format!("token:{id}"),
-        None => who.log_name(),
-    };
-    let (raw, _) = match auth
-        .sessions
-        .create_checked(generation, method, who, token_id, now, expires)
-    {
-        Ok(x) => x,
-        Err(e) if e.is::<super::session::SessionGenerationChanged>() => {
-            return json_error(
-                StatusCode::FORBIDDEN,
-                "authorization changed; retry request",
-            );
-        }
-        Err(e) => {
-            tracing::error!("cannot store the session: {e:#}");
-            auth.count_login(method, "error");
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "cannot store the session",
-            );
-        }
+                Err(e) if e.failure == Failure::Changed => continue,
+                Err(e) if e.failure == Failure::Limited => {
+                    auth.count_failure(e);
+                    match adm {
+                        Some(Extension(a)) => return a.refusal(),
+                        None => {
+                            return json_error(StatusCode::TOO_MANY_REQUESTS, "too many failures");
+                        }
+                    }
+                }
+                Err(_) => {
+                    auth.count_login(Method::Password, "error");
+                    let mut r = json_error(StatusCode::SERVICE_UNAVAILABLE, "authentication busy");
+                    r.headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    return r;
+                }
+            },
+            (None, None, Some(_)) if !policy.token_login => {
+                // refused before the token is looked at, so the answer says nothing about it
+                return json_error(
+                    StatusCode::FORBIDDEN,
+                    "signing in with an API token is turned off ([session] token_login)",
+                );
+            }
+            (None, None, Some(t)) => {
+                let rec = match auth.token_principal(&policy, t, Scheme::Bearer) {
+                    Ok(p) if !p.info.static_token => p
+                        .info
+                        .token_id
+                        .as_deref()
+                        .and_then(|id| auth.tokens.get(id)),
+                    _ => None,
+                };
+                let Some(rec) = rec else {
+                    // an address without failures left has its unknown tokens refused
+                    if let Some(Extension(a)) = &adm
+                        && a.exhausted()
+                    {
+                        auth.count_failure(super::policy::AuthError {
+                            scheme: "session",
+                            failure: Failure::Limited,
+                        });
+                        return a.refusal();
+                    }
+                    auth.count_login(Method::Token, "denied");
+                    auth.count_failure(super::policy::AuthError {
+                        scheme: "session",
+                        failure: Failure::Invalid,
+                    });
+                    return invalid();
+                };
+                let exp = (now + policy.session_ttl).min(rec.expires_at());
+                (Method::Token, rec.owner.clone(), Some(rec.id.clone()), exp)
+            }
+            _ => return bad("expected {\"user\", \"password\"} or {\"token\"}"),
+        };
+        let log = match &token_id {
+            Some(id) => format!("token:{id}"),
+            None => who.log_name(),
+        };
+        let (raw, _) = match auth
+            .sessions
+            .create_checked(generation, method, who, token_id, now, expires)
+        {
+            Ok(x) => x,
+            // an authority change completed after the check: check again
+            Err(e) if e.is::<super::store::AuthorityChanged>() => continue,
+            Err(e) => {
+                tracing::error!("cannot store the session: {e:#}");
+                auth.count_login(method, "error");
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cannot store the session",
+                );
+            }
+        };
+        break (method, raw, log, expires, now);
     };
     auth.count_login(method, "ok");
     tracing::info!(target: "sparkles::audit", event = "login", method = method.as_str(), principal = log.as_str(), result = "ok");
@@ -801,10 +824,16 @@ fn mint(
         client,
         last_used: None,
     };
-    match auth
-        .tokens
-        .insert_within(rec.clone(), now, policy.max_tokens_per_owner)
-    {
+    // the minting credential was revoked after this request was authenticated
+    if !auth.credential_live(p) {
+        return Err(super::routes::authority_changed_response());
+    }
+    match auth.tokens.insert_within(
+        rec.clone(),
+        now,
+        policy.max_tokens_per_owner,
+        p.access_epoch(),
+    ) {
         Ok(true) => {}
         Ok(false) => {
             return Err(json_error(
@@ -814,6 +843,10 @@ fn mint(
                     policy.max_tokens_per_owner
                 ),
             ));
+        }
+        // an authority change completed after this request was authenticated
+        Err(e) if e.is::<super::store::AuthorityChanged>() => {
+            return Err(super::routes::authority_changed_response());
         }
         Err(e) => {
             tracing::error!("cannot store the token: {e:#}");

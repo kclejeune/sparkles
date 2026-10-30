@@ -12,6 +12,14 @@ signals remain incomplete.
 
 ### Changed
 
+Signing in, minting a token and expiry pruning no longer move the shared authority
+generation. Concurrent logins of other users succeed, cached Basic credentials stay
+cached, and other users' change feeds, live queries and long polls keep running.
+Logout and token revocation end only the streams of the revoked credential. An
+authentication that keeps overlapping a policy reload now gets `503` with code
+`authority-changed` and `Retry-After: 1` instead of `403` or `401`, and the refusal
+spends none of the pre-authentication budget.
+
 Node graph overviews retain one absolute deadline across their native subqueries
 instead of renewing the timeout for each query.
 

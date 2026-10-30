@@ -93,11 +93,18 @@ Authentication is off by default. Once it is on, access is denied unless a grant
   back-channel logout and optional idle timeouts. API clients can send the provider's JWT
   access tokens, checked against its JWKS with key rotation, and Cloudflare Access
   assertions are verified. Groups map to roles.
-* Requests that overlap a policy or credential change may receive `403` and must
-  retry with current credentials. Token revocation, reissue, session logout and
-  stored group changes invalidate prepared authentication. A password verification
-  that finishes after a reload cannot restore the previous grants in the cache
-  or create a session from them. Last-used bookkeeping does not revoke access.
+* An authentication that overlaps a policy reload, a token reissue or a stored group
+  change is checked again against the new state. When such changes keep overlapping
+  it, the request gets `503` with code `authority-changed` and `Retry-After: 1`. The
+  refusal is not a failed credential and spends none of the `preauth` budget. A
+  password verification that finishes after a reload cannot restore the previous
+  grants in the cache or create a session from them.
+* Signing in and minting a token add a credential without changing anyone's rights,
+  so they leave other users' cached credentials and open streams alone. Logout,
+  back-channel logout, session eviction, expiry pruning and token revocation each
+  revoke only the credentials they name. Change feeds, live queries and long polls
+  opened with such a credential end with `access-changed`, and those of other
+  credentials continue. Last-used bookkeeping does not revoke access.
 * Dataset and branch administration emit INFO records under `sparkles::audit` with the
   existing actor and completed operation identities. Clones record the selected source
   commit after registration, and authorized failures record bounded codes. Continuing

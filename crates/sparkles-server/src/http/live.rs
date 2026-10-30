@@ -128,7 +128,9 @@ struct Stream {
     live: Arc<LiveQuery>,
     coalesce: Duration,
     queue: std::collections::VecDeque<Event>,
-    epoch: Option<u64>,
+    /// the caller, whose views were decided under its authority: a policy change or
+    /// the revocation of its own credential ends the stream
+    principal: Principal,
     done: bool,
     /// an event read while coalescing that does not merge
     pending: Option<LiveEvent>,
@@ -140,10 +142,10 @@ impl Stream {
             if self.st.phase() == crate::obs::Phase::Draining {
                 return None;
             }
-            if self.epoch.is_some_and(|e| e != self.st.access_epoch()) {
+            if !self.st.access_current(&self.principal) {
                 return Some(LiveEvent::Error {
                     code: "access-changed".into(),
-                    message: "the access policy or a disclosure registry changed; reconnect to read under the new rules".into(),
+                    message: "the access policy, a disclosure registry or the caller's credential changed; reconnect to read under the new rules".into(),
                 });
             }
             tokio::select! {
@@ -231,7 +233,6 @@ pub(super) async fn live(
         max_memory_bytes: None,
         principal: (!p.is_local()).then(|| p.rate_key()),
     };
-    let epoch = p.access_epoch();
     let ds2 = ds.clone();
     let live = blocking(move || Ok(ds2.dataset.live_as(&query, access, &o)?)).await?;
     let stream = Stream {
@@ -239,7 +240,7 @@ pub(super) async fn live(
         live: Arc::new(live),
         coalesce,
         queue: Default::default(),
-        epoch,
+        principal: p,
         done: false,
         pending: None,
     };

@@ -158,6 +158,13 @@ impl TokenStore {
         inner.by_id.get(id).cloned()
     }
 
+    /// Whether the token is still stored. Revoking a token removes only that
+    /// credential and its children: streams bound to it check this instead of the
+    /// global generation.
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner.lock().by_id.contains_key(id)
+    }
+
     pub fn get(&self, id: &str) -> Option<TokenRecord> {
         self.inner.lock().by_id.get(id).cloned()
     }
@@ -178,14 +185,26 @@ impl TokenStore {
     /// Store a new record (expired records are pruned on the way).
     #[cfg(test)]
     pub fn insert(&self, rec: TokenRecord, now: i64) -> Result<()> {
-        self.insert_within(rec, now, usize::MAX).map(|_| ())
+        self.insert_within(rec, now, usize::MAX, None).map(|_| ())
     }
 
     /// Store a new record unless its owner already has `max` unexpired tokens; `false`:
-    /// not stored.
-    pub fn insert_within(&self, rec: TokenRecord, now: i64, max: usize) -> Result<bool> {
+    /// not stored. With `original`, the generation the minting request was
+    /// authenticated under, an exclusive authority update completed since then fails
+    /// with [`AuthorityChanged`](super::store::AuthorityChanged) before any change.
+    /// Minting shares the issue fence and leaves the generation unchanged.
+    pub fn insert_within(
+        &self,
+        rec: TokenRecord,
+        now: i64,
+        max: usize,
+        original: Option<u64>,
+    ) -> Result<bool> {
         let digest = super::config::parse_token_hash(&rec.hash).context("token hash")?;
-        let _update = self.authority.begin_update();
+        let issue = self.authority.begin_issue();
+        if original.is_some_and(|original| original != issue.generation()) {
+            return Err(super::store::AuthorityChanged.into());
+        }
         let mut inner = self.inner.lock();
         let mut next = inner.clone();
         prune(&mut next, now);
@@ -203,8 +222,8 @@ impl TokenStore {
     }
 
     /// Remove tokens, and the tokens they minted. Returns how many were removed.
+    /// This revokes only those credentials and leaves the generation unchanged.
     pub fn remove(&self, ids: &[String]) -> Result<usize> {
-        let _update = self.authority.begin_update();
         let mut inner = self.inner.lock();
         let mut gone: Vec<String> = ids.to_vec();
         let mut i = 0;

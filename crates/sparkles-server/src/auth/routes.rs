@@ -847,7 +847,7 @@ pub struct AuthReport {
     /// `none`, `basic`, `bearer`, `session` or `proxy`
     pub scheme: Option<&'static str>,
     pub denied: Option<Denied>,
-    /// `invalid`, `expired`, `malformed`, `busy`, `not_allowed`
+    /// `invalid`, `expired`, `malformed`, `busy`, `not_allowed`, `changed`
     pub error: Option<&'static str>,
 }
 
@@ -857,6 +857,38 @@ pub fn json_error(status: StatusCode, msg: &str) -> Response {
     // the error gets the request id like every other error body
     r.extensions_mut().insert(crate::http::ErrorJson(body));
     r
+}
+
+/// The `503` of a request whose authentication kept overlapping authority changes.
+/// Retrying is safe, and the refusal spends none of the address's failure budget.
+pub fn authority_changed_response() -> Response {
+    let body = json!({
+        "error": "authorization changed during authentication; retry the request",
+        "code": "authority-changed",
+    });
+    let mut r = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body.clone())).into_response();
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    r.extensions_mut().insert(crate::http::ErrorJson(body));
+    r
+}
+
+/// [`authority_changed_response`], counted as a `changed` authentication failure.
+#[cfg(feature = "auth")]
+fn authority_changed(auth: &super::Auth) -> Response {
+    auth.count_failure(super::policy::AuthError {
+        scheme: "session",
+        failure: super::policy::Failure::Changed,
+    });
+    with_report(
+        authority_changed_response(),
+        AuthReport {
+            principal: None,
+            scheme: None,
+            denied: None,
+            error: Some(super::policy::Failure::Changed.as_str()),
+        },
+    )
 }
 
 /// `WWW-Authenticate` challenges of a 401. `Basic` is left out for script fetches (no
@@ -1114,7 +1146,7 @@ pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next:
 
 #[cfg(feature = "auth")]
 async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next) -> Response {
-    use super::policy::Failure;
+    use super::policy::{AUTH_ATTEMPTS, Failure, authority_backoff};
     use std::sync::atomic::Ordering;
     let Some(route) = req
         .extensions()
@@ -1124,29 +1156,6 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         // unmatched: the router's 404, no dataset involved
         return next.run(req).await;
     };
-    // Include every policy-dependent gate, including the local proxy and OAuth
-    // audience checks, in the same before/after authentication handshake.
-    let epoch = st.access_epoch();
-    if epoch & 1 != 0 {
-        return json_error(
-            StatusCode::FORBIDDEN,
-            "authorization changed; retry request",
-        );
-    }
-    let policy = auth.policy();
-    let realm = policy.realm.as_str();
-    let basic = policy.has_users();
-    // at `/$/mcp` as an OAuth protected resource, the resource identifier is an accepted
-    // audience, and a 401 names the metadata
-    let oauth_public = (route == super::oauth::MCP_PATH)
-        .then(|| protected_resource(st, &policy))
-        .flatten()
-        .map(|(public, _)| public);
-    let resource = oauth_public.as_deref().map(super::oauth::resource);
-    let bearer_params = oauth_public
-        .as_deref()
-        .map(|p| super::oauth::bearer_params(p, false))
-        .unwrap_or_default();
     let span = tracing::Span::current();
     let count = |kind: Denied| {
         auth.metrics.denied[Denied::ALL.iter().position(|d| *d == kind).unwrap_or(0)]
@@ -1156,26 +1165,11 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         count(kind);
         with_report(r, report_of(p, Some(kind)))
     };
-
-    // 1. peer, 2. authenticate
+    // 1. peer
     let peer = req
         .extensions()
         .get::<axum::extract::ConnectInfo<super::Peer>>()
         .map(|c| c.0);
-    // identity headers from a local proxy (loopback or the Unix socket) can also come
-    // from a web page that rebinds its DNS name to the server: they need a known `Host`
-    if let Some(r) = local_proxy_gate(st, &policy, peer.as_ref(), &req) {
-        count(Denied::Forbidden);
-        return with_report(
-            r,
-            AuthReport {
-                principal: None,
-                scheme: Some("proxy"),
-                denied: Some(Denied::Forbidden),
-                error: None,
-            },
-        );
-    }
     let admission = req
         .extensions()
         .get::<crate::ratelimit::Admission>()
@@ -1184,108 +1178,167 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<crate::ratelimit::ClientAddr>()
         .map(|c| c.0.network());
-    let authed = match auth
-        .authenticate(
-            req.headers(),
-            peer.as_ref(),
-            admission.as_ref(),
-            client.as_ref(),
-            resource.as_deref(),
-        )
-        .await
-    {
-        Ok(a) => a,
-        Err(mut e) => {
-            // credentials that were checked and failed (not a busy check, this limit's
-            // refusal, or a proxy identity that is not admitted)
-            let failed = matches!(
-                e.failure,
-                Failure::Malformed | Failure::Invalid | Failure::Expired
-            );
-            // an address without failures left has its unknown tokens refused like its
-            // password checks
-            let exhausted = failed && admission.as_ref().is_some_and(|a| a.exhausted());
-            if exhausted {
-                e.failure = Failure::Limited;
+    // 2. authenticate. Include every policy-dependent gate, including the local
+    // proxy and OAuth audience checks, in the same before/after generation
+    // handshake. An authentication that overlaps an authority change runs again
+    // against the current state: its answer under the old state, a success or a
+    // refusal, is never used.
+    let mut attempt = 0;
+    let (epoch, policy, authed) = loop {
+        if attempt > 0 {
+            authority_backoff(attempt).await;
+        }
+        attempt += 1;
+        let last = attempt >= AUTH_ATTEMPTS;
+        let epoch = st.access_epoch();
+        if epoch & 1 != 0 {
+            if last {
+                return authority_changed(auth);
             }
-            auth.count_failure(e);
-            span.record("principal", "-");
-            span.record("auth", e.scheme);
-            let mut r = match e.failure {
-                // the address spent its failures: the pre-authentication limit's 429
-                Failure::Limited => match &admission {
-                    Some(a) => a.refusal(),
-                    None => json_error(StatusCode::TOO_MANY_REQUESTS, "too many failures"),
-                },
-                Failure::Busy => {
-                    let mut r = json_error(StatusCode::SERVICE_UNAVAILABLE, "authentication busy");
-                    r.headers_mut()
-                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-                    r
-                }
-                // the identity provider's keys could not be fetched to check a JWT
-                Failure::Idp => {
-                    let mut r = json_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "identity provider unavailable",
-                    );
-                    r.headers_mut()
-                        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-                    r
-                }
-                Failure::NotAllowed => {
-                    if matches!(
-                        need(&route, req.method(), req.uri(), req.headers()),
-                        Some(Need::Public)
-                    ) {
-                        // public routes stay reachable (the UI shell, health, login)
-                        let a = auth.anonymous_principal();
-                        span.record("principal", "anonymous");
-                        req.extensions_mut().insert(a);
-                        return next.run(req).await;
-                    }
-                    count(Denied::Forbidden);
-                    json_error(StatusCode::FORBIDDEN, "user not allowed")
-                }
-                Failure::Expired => unauthorized(
-                    realm,
-                    req.headers(),
-                    "token expired",
-                    Some("token expired"),
-                    basic,
-                    &bearer_params,
-                ),
-                _ => unauthorized(
-                    realm,
-                    req.headers(),
-                    "invalid credentials",
-                    Some("invalid credentials"),
-                    basic,
-                    &bearer_params,
-                ),
-            };
-            if failed && !exhausted {
-                r.extensions_mut().insert(crate::ratelimit::AuthFailed);
-            }
+            continue;
+        }
+        let policy = auth.policy();
+        let realm = policy.realm.as_str();
+        let basic = policy.has_users();
+        // at `/$/mcp` as an OAuth protected resource, the resource identifier is an
+        // accepted audience, and a 401 names the metadata
+        let oauth_public = (route == super::oauth::MCP_PATH)
+            .then(|| protected_resource(st, &policy))
+            .flatten()
+            .map(|(public, _)| public);
+        let resource = oauth_public.as_deref().map(super::oauth::resource);
+        let bearer_params = oauth_public
+            .as_deref()
+            .map(|p| super::oauth::bearer_params(p, false))
+            .unwrap_or_default();
+        // identity headers from a local proxy (loopback or the Unix socket) can also
+        // come from a web page that rebinds its DNS name to the server: they need a
+        // known `Host`
+        if let Some(r) = local_proxy_gate(st, &policy, peer.as_ref(), &req) {
+            count(Denied::Forbidden);
             return with_report(
                 r,
                 AuthReport {
                     principal: None,
-                    scheme: Some(e.scheme),
-                    denied: None,
-                    error: Some(e.failure.as_str()),
+                    scheme: Some("proxy"),
+                    denied: Some(Denied::Forbidden),
+                    error: None,
                 },
             );
         }
+        let result = auth
+            .authenticate(
+                req.headers(),
+                peer.as_ref(),
+                admission.as_ref(),
+                client.as_ref(),
+                resource.as_deref(),
+            )
+            .await;
+        // An ordinary query must not attach a post-change generation to grants from
+        // before the change, nor refuse credentials the change made valid.
+        let changed = match &result {
+            Err(e) if e.failure == Failure::Changed => true,
+            // decided before any credential was looked at
+            Err(e) if matches!(e.failure, Failure::Limited | Failure::Busy) => false,
+            _ => auth.epoch() != epoch,
+        };
+        if changed {
+            if last {
+                return authority_changed(auth);
+            }
+            continue;
+        }
+        let authed = match result {
+            Ok(a) => a,
+            Err(mut e) => {
+                // credentials that were checked and failed (not a busy check, this limit's
+                // refusal, or a proxy identity that is not admitted)
+                let failed = matches!(
+                    e.failure,
+                    Failure::Malformed | Failure::Invalid | Failure::Expired
+                );
+                // an address without failures left has its unknown tokens refused like its
+                // password checks
+                let exhausted = failed && admission.as_ref().is_some_and(|a| a.exhausted());
+                if exhausted {
+                    e.failure = Failure::Limited;
+                }
+                auth.count_failure(e);
+                span.record("principal", "-");
+                span.record("auth", e.scheme);
+                let mut r = match e.failure {
+                    // the address spent its failures: the pre-authentication limit's 429
+                    Failure::Limited => match &admission {
+                        Some(a) => a.refusal(),
+                        None => json_error(StatusCode::TOO_MANY_REQUESTS, "too many failures"),
+                    },
+                    Failure::Busy => {
+                        let mut r =
+                            json_error(StatusCode::SERVICE_UNAVAILABLE, "authentication busy");
+                        r.headers_mut()
+                            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                        r
+                    }
+                    // the identity provider's keys could not be fetched to check a JWT
+                    Failure::Idp => {
+                        let mut r = json_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "identity provider unavailable",
+                        );
+                        r.headers_mut()
+                            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+                        r
+                    }
+                    Failure::NotAllowed => {
+                        if matches!(
+                            need(&route, req.method(), req.uri(), req.headers()),
+                            Some(Need::Public)
+                        ) {
+                            // public routes stay reachable (the UI shell, health, login)
+                            let a = auth.anonymous_principal();
+                            span.record("principal", "anonymous");
+                            req.extensions_mut().insert(a);
+                            return next.run(req).await;
+                        }
+                        count(Denied::Forbidden);
+                        json_error(StatusCode::FORBIDDEN, "user not allowed")
+                    }
+                    Failure::Expired => unauthorized(
+                        realm,
+                        req.headers(),
+                        "token expired",
+                        Some("token expired"),
+                        basic,
+                        &bearer_params,
+                    ),
+                    _ => unauthorized(
+                        realm,
+                        req.headers(),
+                        "invalid credentials",
+                        Some("invalid credentials"),
+                        basic,
+                        &bearer_params,
+                    ),
+                };
+                if failed && !exhausted {
+                    r.extensions_mut().insert(crate::ratelimit::AuthFailed);
+                }
+                return with_report(
+                    r,
+                    AuthReport {
+                        principal: None,
+                        scheme: Some(e.scheme),
+                        denied: None,
+                        error: Some(e.failure.as_str()),
+                    },
+                );
+            }
+        };
+        break (epoch, policy, authed);
     };
-    // An ordinary query must not attach a post-reload generation to grants from
-    // before the reload. This also covers token/session/group-store changes.
-    if auth.epoch() != epoch {
-        return json_error(
-            StatusCode::FORBIDDEN,
-            "authorization changed; retry request",
-        );
-    }
+    let realm = policy.realm.as_str();
+    let basic = policy.has_users();
     // grants are checked on the branch the request chose
     let branch = req
         .extensions()
