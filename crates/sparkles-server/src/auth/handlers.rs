@@ -248,6 +248,7 @@ async fn login(
     State(st): St,
     adm: Option<Extension<Admission>>,
     addr: Option<Extension<ClientAddr>>,
+    budget: Option<Extension<super::policy::VerifyBudget>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -264,7 +265,9 @@ async fn login(
     let client = network(&addr);
     // A check that overlaps an authority change runs again, whole, against the
     // current state. It is not a failed credential, the address is charged at most
-    // once, and one request runs at most AUTH_ATTEMPTS password verifications.
+    // once, and one request runs at most AUTH_ATTEMPTS password verifications,
+    // counting those the auth middleware ran for its `Authorization` header.
+    let budget = budget.map(|Extension(b)| b).unwrap_or_default();
     let mut attempt = 0;
     let (method, raw, log, expires, now) = loop {
         if attempt > 0 {
@@ -288,7 +291,7 @@ async fn login(
         let now = auth.now();
         let (method, who, token_id, expires) = match (&b.user, &b_password, &b_token) {
             (Some(user), Some(pw), None) => match auth
-                .check_password_at(user, pw, adm.as_deref(), client.as_ref())
+                .check_password_at(user, pw, adm.as_deref(), client.as_ref(), Some(&budget))
                 .await
             {
                 Ok(Some(verified)) => {
@@ -391,6 +394,8 @@ async fn login(
                 );
             }
         };
+        #[cfg(test)]
+        auth.run_hook(|h| &mut h.after_issue);
         // The token was revoked after its lookup. Revocation and this check take
         // the token store's mutex, so a later revocation is ordered after this
         // login. The next attempt looks the token up again and fails as revoked.

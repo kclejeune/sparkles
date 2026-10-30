@@ -1146,7 +1146,7 @@ pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next:
 
 #[cfg(feature = "auth")]
 async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next) -> Response {
-    use super::policy::{AUTH_ATTEMPTS, Failure, authority_backoff};
+    use super::policy::{AUTH_ATTEMPTS, Failure, VerifyBudget, authority_backoff};
     use std::sync::atomic::Ordering;
     let Some(route) = req
         .extensions()
@@ -1183,6 +1183,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     // handshake. An authentication that overlaps an authority change runs again
     // against the current state: its answer under the old state, a success or a
     // refusal, is never used.
+    // The login handler continues with the same budget of password verifications.
+    let budget = VerifyBudget::default();
+    req.extensions_mut().insert(budget.clone());
     let mut attempt = 0;
     let (epoch, policy, authed) = loop {
         if attempt > 0 {
@@ -1233,6 +1236,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                 admission.as_ref(),
                 client.as_ref(),
                 resource.as_deref(),
+                Some(&budget),
             )
             .await;
         // An ordinary query must not attach a post-change generation to grants from

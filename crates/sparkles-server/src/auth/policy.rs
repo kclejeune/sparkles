@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -481,6 +481,26 @@ pub fn token_hash(token: &str) -> String {
 /// before it is refused with a retryable status.
 pub const AUTH_ATTEMPTS: u32 = 3;
 
+/// The password verifications one request may still run, shared by the auth
+/// middleware and the login handler through a request extension. One request runs
+/// at most [`AUTH_ATTEMPTS`] verifications for its single charge to the address,
+/// however its `Authorization` header and its login body divide them. A request
+/// past the budget gets [`Failure::Changed`], since only overlapping authority
+/// changes make a request verify more than twice.
+#[derive(Clone, Default)]
+pub struct VerifyBudget(Arc<AtomicU32>);
+
+impl VerifyBudget {
+    /// Spend one verification; `false` when none is left.
+    pub fn take(&self) -> bool {
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < AUTH_ATTEMPTS).then_some(n + 1)
+            })
+            .is_ok()
+    }
+}
+
 /// The pause before authentication attempt `attempt` (from 1), which lets an
 /// exclusive authority update finish.
 pub async fn authority_backoff(attempt: u32) {
@@ -670,6 +690,8 @@ pub struct TestHooks {
     pub after_lookup: Option<TestHook>,
     /// after a password verification finished
     pub after_verify: Option<TestHook>,
+    /// after a login created its session, before the session is answered
+    pub after_issue: Option<TestHook>,
 }
 
 /// The auth state of a server: the current policy, the token and session stores, the
@@ -799,7 +821,7 @@ impl Auth {
 
     /// Run a test hook, outside the hooks' own lock.
     #[cfg(test)]
-    fn run_hook(&self, pick: fn(&mut TestHooks) -> &mut Option<TestHook>) {
+    pub(super) fn run_hook(&self, pick: fn(&mut TestHooks) -> &mut Option<TestHook>) {
         let taken = pick(&mut self.hooks.lock()).take();
         if let Some(mut hook) = taken {
             hook(self);
@@ -971,6 +993,7 @@ impl Auth {
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
         resource: Option<&str>,
+        budget: Option<&VerifyBudget>,
     ) -> Result<Authenticated, AuthError> {
         let policy = self.policy.load_full();
         let ok = |principal| Authenticated {
@@ -979,7 +1002,7 @@ impl Auth {
         };
         if let Some(v) = h.get(header::AUTHORIZATION) {
             return self
-                .authorization(&policy, v, admission, client, resource)
+                .authorization(&policy, v, admission, client, resource, budget)
                 .await
                 .map(ok);
         }
@@ -1063,6 +1086,7 @@ impl Auth {
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
         resource: Option<&str>,
+        budget: Option<&VerifyBudget>,
     ) -> Result<Principal, AuthError> {
         let malformed = |scheme| AuthError {
             scheme,
@@ -1101,7 +1125,7 @@ impl Auth {
             // Basic-only clients carry a token as the password; the user is ignored
             return self.token_principal(policy, password, Scheme::Basic);
         }
-        self.password(policy, user, password, admission, client)
+        self.password(policy, user, password, admission, client, budget)
             .await
     }
 
@@ -1419,6 +1443,7 @@ impl Auth {
         password: &str,
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
+        budget: Option<&VerifyBudget>,
     ) -> Result<Principal, AuthError> {
         let err = |failure| AuthError {
             scheme: "basic",
@@ -1487,7 +1512,7 @@ impl Auth {
             let (phc, principal, pw) = (phc.clone(), principal.clone(), pw.clone());
             cell.get_or_try_init(|| {
                 ran.store(true, Ordering::Relaxed);
-                async move { self.verify(pw, phc, principal, client).await }
+                async move { self.verify(pw, phc, principal, client, budget).await }
             })
             .await
             .cloned()
@@ -1496,7 +1521,7 @@ impl Auth {
             Ok(Some(p)) => Some(p),
             Ok(None) if ran.load(Ordering::Relaxed) => None,
             // another request's verification failed: a failure costs each request one
-            Ok(None) => self.verify(pw, phc, principal, client).await?,
+            Ok(None) => self.verify(pw, phc, principal, client, budget).await?,
             Err(e) => {
                 self.creds.lock().inflight.remove(&key);
                 return Err(e);
@@ -1527,7 +1552,7 @@ impl Auth {
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
     ) -> Result<Option<Principal>, AuthError> {
-        self.check_password_at(user, password, admission, client)
+        self.check_password_at(user, password, admission, client, None)
             .await
             .map(|v| v.map(|v| v.principal))
     }
@@ -1543,6 +1568,7 @@ impl Auth {
         password: &str,
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
+        budget: Option<&VerifyBudget>,
     ) -> Result<Option<VerifiedLogin>, AuthError> {
         let changed = AuthError {
             scheme: "session",
@@ -1557,7 +1583,7 @@ impl Auth {
         // between, so this is that generation's policy.
         let policy = self.policy.load_full();
         let verified = self
-            .check_password_once(&policy, user, password, admission, client)
+            .check_password_once(&policy, user, password, admission, client, budget)
             .await?;
         if self.epoch() != generation {
             return Err(changed);
@@ -1576,6 +1602,7 @@ impl Auth {
         password: &str,
         admission: Option<&Admission>,
         client: Option<&ClientKey>,
+        budget: Option<&VerifyBudget>,
     ) -> Result<Option<Principal>, AuthError> {
         // a reservation is taken once per request, so a retry costs nothing more
         if admission.is_some_and(|a| !a.reserve()) {
@@ -1596,8 +1623,14 @@ impl Auth {
             ),
             None => (policy.dummy_hash.clone(), None),
         };
-        self.verify(Zeroizing::new(password.to_string()), phc, principal, client)
-            .await
+        self.verify(
+            Zeroizing::new(password.to_string()),
+            phc,
+            principal,
+            client,
+            budget,
+        )
+        .await
     }
 
     /// One argon2 run under a permit: `Some(principal)` when the password matches.
@@ -1607,11 +1640,18 @@ impl Auth {
         phc: String,
         principal: Option<Principal>,
         client: Option<&ClientKey>,
+        budget: Option<&VerifyBudget>,
     ) -> Result<Option<Principal>, AuthError> {
         let busy = AuthError {
             scheme: "basic",
             failure: Failure::Busy,
         };
+        if budget.is_some_and(|b| !b.take()) {
+            return Err(AuthError {
+                scheme: "basic",
+                failure: Failure::Changed,
+            });
+        }
         let a = &self.argon;
         let _client = match client {
             Some(k) => Some(ClientSlot::enter(&a.clients, k, a.per_client).ok_or(busy)?),
@@ -2055,7 +2095,7 @@ mod tests {
         let (auth, _) = Auth::open(&path, directory.path()).unwrap();
         let auth = Arc::new(auth);
         let policy = auth.policy();
-        auth.password(&policy, "race", "pw", None, None)
+        auth.password(&policy, "race", "pw", None, None, None)
             .await
             .unwrap();
         let before = auth.epoch();
@@ -2117,8 +2157,11 @@ mod tests {
         let auth = Arc::new(auth);
         let hold = auth.hold_verifications();
         let old_auth = auth.clone();
-        let old =
-            tokio::spawn(async move { old_auth.check_password_at("race", "pw", None, None).await });
+        let old = tokio::spawn(async move {
+            old_auth
+                .check_password_at("race", "pw", None, None, None)
+                .await
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             while auth.argon_load().1 == 0 {
                 tokio::task::yield_now().await;
@@ -2160,7 +2203,9 @@ mod tests {
         let old_auth = auth.clone();
         let old = tokio::spawn(async move {
             let policy = old_auth.policy();
-            old_auth.password(&policy, "race", "pw", None, None).await
+            old_auth
+                .password(&policy, "race", "pw", None, None, None)
+                .await
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while auth.argon_load().1 == 0 {
@@ -2180,7 +2225,7 @@ mod tests {
         );
         let policy = auth.policy();
         let current = auth
-            .password(&policy, "race", "pw", None, None)
+            .password(&policy, "race", "pw", None, None, None)
             .await
             .unwrap();
         assert_eq!(

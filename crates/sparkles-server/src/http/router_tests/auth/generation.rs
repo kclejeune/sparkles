@@ -268,17 +268,22 @@ async fn revocation_during_lookup_refuses_the_request() {
     );
 }
 
-/// A token login whose token is revoked after its lookup opens no session.
+/// A token login whose token is revoked after its session was created, before the
+/// login answers, removes that session and refuses the login.
 #[tokio::test]
-async fn token_login_revoked_during_lookup_opens_no_session() {
+async fn token_login_revoked_after_issuance_opens_no_session() {
     let s = build(Fixture {
         extra: "[session]\ntoken_login = true\n".into(),
         ..Default::default()
     });
     let (token, id) = bob_token(&s).await;
-    revoke_after_lookup(&s, move |auth| {
-        assert_eq!(auth.tokens.remove(&[id]).unwrap(), 1);
-    });
+    let mut revoke = Some(id);
+    s.auth().hooks.lock().after_issue = Some(Box::new(move |auth| {
+        if let Some(id) = revoke.take() {
+            assert_eq!(auth.sessions.active(auth.now()), 1, "the session exists");
+            assert_eq!(auth.tokens.remove(&[id]).unwrap(), 1);
+        }
+    }));
     let r = call(
         &s.app,
         "POST",
@@ -369,4 +374,58 @@ async fn overlapping_changes_bound_the_verifications_of_one_request() {
             u64::from(crate::auth::AUTH_ATTEMPTS)
         )
     );
+}
+
+/// Basic credentials on a password login share the request's verification budget
+/// with the login itself.
+#[tokio::test]
+async fn basic_headers_and_a_password_login_share_one_verification_budget() {
+    let s = build(Fixture::default());
+    let auth = s.auth();
+    let verified = || metric(&s.app, "sparkles_auth_password_verifications_total");
+    let before = verified().await;
+    // Every verification overlaps an update except the third. The Basic header is
+    // then accepted on the middleware's last attempt, and each verification of the
+    // login body overlaps one.
+    let mut n = 0;
+    auth.hooks.lock().after_verify = Some(Box::new(move |auth| {
+        n += 1;
+        if n != 3 {
+            drop(auth.hold_authority_update());
+        }
+    }));
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/auth/login",
+        &[
+            ("content-type", "application/json"),
+            ("origin", s.fixture.public_url),
+            ("authorization", &b("alice")),
+        ],
+        r#"{"user":"bob","password":"bob-pw"}"#,
+    )
+    .await;
+    auth.hooks.lock().after_verify = None;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.err()["code"], "authority-changed");
+    assert_eq!(
+        verified().await - before,
+        u64::from(crate::auth::AUTH_ATTEMPTS),
+        "one request ran more password verifications than its attempts"
+    );
+    // without overlapping changes the same request signs in
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/auth/login",
+        &[
+            ("content-type", "application/json"),
+            ("origin", s.fixture.public_url),
+            ("authorization", &b("alice")),
+        ],
+        r#"{"user":"bob","password":"bob-pw"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
 }
