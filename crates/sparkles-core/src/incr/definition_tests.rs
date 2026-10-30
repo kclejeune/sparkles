@@ -191,12 +191,13 @@ fn a_clone_carries_paused_definitions_until_resumed() {
         definitions::read_dir(&dst, kind).unwrap(),
         rt.capture_definitions().unwrap()
     );
-    assert_eq!(
-        definitions::read_paused(&dst, "views/v/view.json")
-            .unwrap()
-            .reason,
-        "cloned"
-    );
+    let paused = |dir: &std::path::Path| {
+        super::views::read_all(dir).unwrap()[0]
+            .2
+            .clone()
+            .map(|p| p.reason)
+    };
+    assert_eq!(paused(&dst).as_deref(), Some("cloned"));
     let (c, crt) = open(&dst);
     crt.round(&c);
     let v = crt.get(&c, "v").unwrap();
@@ -221,10 +222,109 @@ fn a_clone_carries_paused_definitions_until_resumed() {
     // the clone's capture records its own definitions, still paused on restore
     assert_eq!(c.backup_capture("b").unwrap().definitions.len(), 1);
     crt.rebuild("v").unwrap();
-    assert!(definitions::read_paused(&dst, "views/v/view.json").is_none());
+    assert_eq!(paused(&dst), None);
     crt.round(&c);
     let v = crt
         .wait_built("v", std::time::Duration::from_secs(10))
         .unwrap();
     assert_eq!(v.rows, 1, "{v:?}");
+}
+
+/// A definition larger than a restore accepts is refused when it is defined, so every
+/// definition a backup captures can be restored (review of item 220, P1).
+#[test]
+fn an_oversized_definition_is_refused_when_defined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (s, rt) = open(tmp.path());
+    let q = format!(
+        "SELECT ?s WHERE {{ ?s <urn:p> ?o }} #{}",
+        "x".repeat(crate::formats::MAX_DEFINITION_BYTES as usize)
+    );
+    let e = rt.put(&s, "v", ViewDef::table(q)).unwrap_err();
+    assert!(e.to_string().contains("larger than"), "{e}");
+    assert!(rt.definitions().is_empty());
+    assert!(!tmp.path().join("views/v").exists());
+}
+
+/// A clone whose definition capture fails releases the history lease it took, so the
+/// source generation is not pinned until the store closes (review of item 220).
+#[test]
+fn a_failed_definition_capture_releases_the_clone_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    {
+        let s = Store::open(&src, StoreOptions::default()).unwrap();
+        s.load(&[crate::io::Source::from_bytes(
+            b"<urn:a> <urn:p> \"1\" .".to_vec(),
+            crate::io::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    }
+    std::fs::create_dir_all(src.join("views/v")).unwrap();
+    std::fs::write(src.join("views/v/view.json"), br#"{"format": 9}"#).unwrap();
+    let s = Store::open(&src, StoreOptions::default()).unwrap();
+    assert!(
+        s.clone_to(&tmp.path().join("c"), &Default::default())
+            .is_err()
+    );
+    let held: Vec<String> = s
+        .history()
+        .generations
+        .iter()
+        .flat_map(|g| g.held_by.iter().map(|h| h.to_string()))
+        .collect();
+    assert!(!held.iter().any(|h| h.starts_with("clone")), "{held:?}");
+}
+
+/// A paused definition is a `view.json` of format 2, which releases from before
+/// item 220 refuse, so they never attach a restored or cloned view that waits for its
+/// checks. Resuming writes format 1 again (review of item 220, P2).
+#[test]
+fn paused_definitions_fence_older_readers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (s, rt) = open(&tmp.path().join("src"));
+    rt.put(&s, "v", ViewDef::table(query(1))).unwrap();
+    let dst = tmp.path().join("clone");
+    s.clone_to(&dst, &Default::default()).unwrap();
+    let file = dst.join("views/v/view.json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(v["format"], 2, "{v}");
+    assert_eq!(v["paused"]["reason"], "cloned", "{v}");
+    assert!(!dst.join("views/v/paused.json").exists());
+    let (c, crt) = open(&dst);
+    crt.rebuild("v").unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(v["format"], 1, "{v}");
+    assert!(v.get("paused").is_none(), "{v}");
+    drop((c, crt));
+    let (c, crt) = open(&dst);
+    crt.round(&c);
+    assert_ne!(
+        crt.get(&c, "v").unwrap().state,
+        ViewState::Suspended {
+            reason: "cloned".into()
+        }
+    );
+}
+
+/// A definition whose contents do not match its kind's schema is refused before a
+/// restore publishes it (review of item 220).
+#[test]
+fn definitions_are_checked_against_their_schema() {
+    let kind = crate::formats::definition_kind("view").unwrap();
+    let p = "views/v/view.json";
+    for bad in [
+        &br#"{"format":1,"query":123}"#[..],
+        br#"{"format":1,"query":"ASK {}","extra":true}"#,
+        br#"{"format":1}"#,
+        br#"{"format":1,"query":"SELECT * {}","provenance":"why"}"#,
+    ] {
+        assert!(
+            definitions::check(kind, p, bad).is_err(),
+            "{}",
+            String::from_utf8_lossy(bad)
+        );
+    }
+    definitions::check(kind, p, br#"{"format":1,"query":"SELECT * { ?s ?p ?o }"}"#).unwrap();
 }

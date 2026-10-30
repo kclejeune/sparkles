@@ -435,6 +435,11 @@ pub struct DefinitionKind {
     pub dir: &'static str,
     /// The definition file inside each definition's directory.
     pub file: &'static str,
+    /// The version written for a definition that runs.
+    pub writes: u32,
+    /// The version of a paused definition: the file with a `paused` member, which
+    /// releases that do not know pauses refuse.
+    pub paused: u32,
 }
 
 impl DefinitionKind {
@@ -451,7 +456,7 @@ impl DefinitionKind {
         crate::stored::valid_name(name).then_some(name)
     }
 
-    /// The version this build writes, and reads up to, from the settings registry.
+    /// The newest version this build reads, from the settings registry.
     pub fn format(&self) -> u32 {
         registered(self.file).writes
     }
@@ -463,7 +468,12 @@ pub const DEFINITIONS: &[DefinitionKind] = &[DefinitionKind {
     id: "view",
     dir: "views",
     file: "view.json",
+    writes: 1,
+    paused: 2,
 }];
+
+/// The largest definition file that is defined, captured and restored.
+pub const MAX_DEFINITION_BYTES: u64 = 1 << 20;
 
 /// The definition kind named `id`.
 pub fn definition_kind(id: &str) -> Option<&'static DefinitionKind> {
@@ -658,10 +668,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphrag.json", 1),
     ds("paths.json", 1),
     ds("forms.json", 1),
-    // a view's definition, `views/NAME/view.json`
-    ds("view.json", 1),
-    // a restored or cloned view that waits for its checks, `views/NAME/paused.json`
-    ds("paused.json", 1),
+    // a view's definition, `views/NAME/view.json`: format 2 is a paused one
+    ds("view.json", 2),
     named(ds("graphrag/state.json", 2), "version"),
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
@@ -975,7 +983,7 @@ mod tests {
         assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
         assert_eq!(VIEW_STATE.writes, crate::incr::persist::FORMAT);
         assert_eq!(
-            crate::incr::views::FORMAT,
+            crate::incr::views::PAUSED_FORMAT,
             settings_file(crate::incr::views::FILE).unwrap().writes
         );
         assert_eq!(
@@ -988,12 +996,12 @@ mod tests {
                 "{} is not registered",
                 d.file
             );
-            assert!(BACKUP_DEFINITION.reads(d.format()), "{}", d.id);
+            assert!(BACKUP_DEFINITION.reads(d.writes), "{}", d.id);
         }
-        assert_eq!(
-            definition_kind("view").unwrap().format(),
-            crate::incr::views::FORMAT
-        );
+        let v = definition_kind("view").unwrap();
+        assert_eq!(v.writes, crate::incr::views::FORMAT);
+        assert_eq!(v.paused, crate::incr::views::PAUSED_FORMAT);
+        assert_eq!(v.format(), v.paused);
         let view = definition_kind("view").unwrap();
         assert_eq!(view.path("sizes"), "views/sizes/view.json");
         assert_eq!(view.name_of("views/sizes/view.json"), Some("sizes"));

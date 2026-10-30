@@ -272,10 +272,8 @@ impl BackupCapture {
             }
             out.sync_all()?;
         }
-        for d in &self.definitions {
-            let path = super::definitions::stage_file(tmp.path(), &d.path)?;
-            std::fs::write(&path, &d.bytes)?;
-        }
+        // synced with their directories, as the other files are
+        super::definitions::write_all(tmp.path(), &self.definitions, None)?;
         if self.next_ordinal > 1 {
             crate::commit::reserve_branch_ordinals(
                 tmp.path(),

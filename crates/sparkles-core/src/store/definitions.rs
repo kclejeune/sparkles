@@ -79,8 +79,9 @@ impl Store {
     }
 }
 
-/// The definitions of `kind` stored under `root`, by name. A definition file of a
-/// version this build does not read refuses the whole capture.
+/// The definitions of `kind` stored under `root`, by name, as they run: a paused
+/// definition is captured without its pause. A definition that this build does not
+/// read, or that does not match its kind's schema, refuses the whole capture.
 pub fn read_dir(root: &Path, kind: &DefinitionKind) -> Result<Vec<DefinitionFile>> {
     let base = root.join(kind.dir);
     let entries = match std::fs::read_dir(&base) {
@@ -102,12 +103,16 @@ pub fn read_dir(root: &Path, kind: &DefinitionKind) -> Result<Vec<DefinitionFile
     let mut out = Vec::with_capacity(names.len());
     for name in names {
         let path = kind.path(&name);
-        let bytes = match std::fs::read(root.join(&path)) {
+        let mut bytes = match std::fs::read(root.join(&path)) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
-        let format = check(kind, &path, &bytes)?;
+        let mut format = check(kind, &path, &bytes)?;
+        if format == kind.paused {
+            bytes = rewrite(kind, &path, &bytes, None)?;
+            format = kind.writes;
+        }
         out.push(DefinitionFile {
             kind: kind.id,
             path,
@@ -118,28 +123,84 @@ pub fn read_dir(root: &Path, kind: &DefinitionKind) -> Result<Vec<DefinitionFile
     Ok(out)
 }
 
-/// The version of definition file `bytes` at `path`: a JSON object whose version this
-/// build reads (`Error::Corrupt` or `Error::Unsupported`, naming `path`, otherwise).
+/// The version of definition file `bytes` at `path`, once it is checked: at most
+/// [`MAX_DEFINITION_BYTES`](crate::formats::MAX_DEFINITION_BYTES), a version this
+/// build reads, and the schema of its kind with options this release supports
+/// (`Error::Corrupt`, `Error::Unsupported` or `Error::Invalid`, naming `path`). The
+/// references a definition makes, such as a view's principal and stored query, are
+/// resolved when it runs, not here.
 pub fn check(kind: &DefinitionKind, path: &str, bytes: &[u8]) -> Result<u32> {
-    let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("{path}: {e}")))?;
-    if !v.is_object() {
-        return Err(Error::Corrupt(format!("{path}: not a JSON object")));
+    let max = crate::formats::MAX_DEFINITION_BYTES;
+    let too_large = || Error::Invalid(format!("{path} is larger than {max} bytes"));
+    // a paused file is a little larger than the definition it holds
+    if bytes.len() as u64 > 2 * max {
+        return Err(too_large());
     }
-    crate::formats::check_settings(kind.file, &v).map_err(|e| match e {
-        Error::Unsupported(m) => Error::Unsupported(format!("{path}: {m}")),
-        Error::Corrupt(m) => Error::Corrupt(format!("{path}: {m}")),
-        e => e,
-    })
+    match kind.id {
+        "view" => {
+            let (def, paused) = crate::incr::views::parse(path, bytes)?;
+            def.check()
+                .map_err(|e| Error::Invalid(format!("{path}: {e}")))?;
+            let running = match paused {
+                Some(_) => crate::incr::views::to_bytes(&def, None)?.len(),
+                None => bytes.len(),
+            };
+            if running as u64 > max {
+                return Err(too_large());
+            }
+            Ok(if paused.is_some() {
+                kind.paused
+            } else {
+                kind.writes
+            })
+        }
+        other => Err(Error::Invalid(format!("unknown definition kind {other:?}"))),
+    }
 }
 
-/// The marker of a restored or cloned definition that waits for its checks
-/// (`DIR/NAME/paused.json`).
-pub const PAUSED_FILE: &str = "paused.json";
+/// Check every definition of a capture before anything of it is published.
+pub fn check_all(defs: &[DefinitionFile]) -> Result<()> {
+    for d in defs {
+        let kind = crate::formats::definition_kind(d.kind)
+            .ok_or_else(|| Error::Invalid(format!("unknown definition kind {:?}", d.kind)))?;
+        if kind.name_of(&d.path).is_none() {
+            return Err(Error::Invalid(format!(
+                "{:?} is not a definition path",
+                d.path
+            )));
+        }
+        let found = check(kind, &d.path, &d.bytes)?;
+        if found != d.format {
+            return Err(Error::Invalid(format!(
+                "{} has format {found}, not {}",
+                d.path, d.format
+            )));
+        }
+    }
+    Ok(())
+}
 
-/// `paused.json`: why a definition restored or cloned into this dataset does not run.
+/// The bytes of definition `bytes` at `path`, paused with `paused` or running.
+fn rewrite(
+    kind: &DefinitionKind,
+    path: &str,
+    bytes: &[u8],
+    paused: Option<&Paused>,
+) -> Result<Vec<u8>> {
+    match kind.id {
+        "view" => {
+            let (def, _) = crate::incr::views::parse(path, bytes)?;
+            crate::incr::views::to_bytes(&def, paused)
+        }
+        other => Err(Error::Invalid(format!("unknown definition kind {other:?}"))),
+    }
+}
+
+/// Why a restored or cloned definition does not run, kept inside its paused file
+/// (format [`DefinitionKind::paused`]). Releases that do not know pauses refuse that
+/// version, so they never run it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Paused {
     /// `restored` or `cloned`
     pub reason: String,
@@ -148,11 +209,22 @@ pub struct Paused {
     pub time: Option<String>,
 }
 
-/// Write `defs` under `root`, which is not published yet, each beside a `paused.json`
-/// with `reason`. Every directory is created here, and a path that already exists or
-/// is not a plain directory is refused, so nothing is written through a link.
-pub fn stage_paused(root: &Path, defs: &[DefinitionFile], reason: &str) -> Result<()> {
-    let paused = paused_bytes(reason)?;
+impl Paused {
+    pub fn now(reason: &str) -> Paused {
+        Paused {
+            reason: reason.to_string(),
+            time: Some(crate::builder::now_rfc3339()),
+        }
+    }
+}
+
+/// Write `defs` under `root`, which is not published yet: paused with `reason`, or as
+/// they are without one. Every directory is created here, and a path that already
+/// exists or is not a plain directory is refused, so nothing is written through a
+/// link. The files and every directory up to `root` are synced.
+pub fn write_all(root: &Path, defs: &[DefinitionFile], reason: Option<&str>) -> Result<()> {
+    let paused = reason.map(Paused::now);
+    let mut dirs = std::collections::BTreeSet::new();
     for d in defs {
         let kind = crate::formats::definition_kind(d.kind)
             .ok_or_else(|| Error::Invalid(format!("unknown definition kind {:?}", d.kind)))?;
@@ -163,38 +235,37 @@ pub fn stage_paused(root: &Path, defs: &[DefinitionFile], reason: &str) -> Resul
             )));
         }
         let file = stage_file(root, &d.path)?;
-        write_new(&file, &d.bytes)?;
-        let marker = file.with_file_name(PAUSED_FILE);
-        write_new(&marker, &paused)?;
-        super::sync_dir(file.parent().expect("a definition has a directory"))?;
+        match &paused {
+            Some(p) => write_new(&file, &rewrite(kind, &d.path, &d.bytes, Some(p))?)?,
+            None => write_new(&file, &d.bytes)?,
+        }
+        let mut dir = file.parent();
+        while let Some(x) = dir.filter(|x| x.starts_with(root) && *x != root) {
+            dirs.insert(x.to_path_buf());
+            dir = x.parent();
+        }
+    }
+    // deepest first, so that each entry is durable before its parent's
+    for d in dirs.iter().rev() {
+        super::sync_dir(d)?;
     }
     if !defs.is_empty() {
-        for kind in crate::formats::DEFINITIONS {
-            let dir = root.join(kind.dir);
-            if dir.is_dir() {
-                super::sync_dir(&dir)?;
-            }
-        }
+        super::sync_dir(root)?;
     }
     Ok(())
 }
 
-fn paused_bytes(reason: &str) -> Result<Vec<u8>> {
-    crate::formats::settings_to_vec(
-        PAUSED_FILE,
-        &Paused {
-            reason: reason.to_string(),
-            time: Some(crate::builder::now_rfc3339()),
-        },
-    )
-}
-
-/// Pause the definition at `path` under `root`, which is not published yet: write its
-/// `paused.json` with `reason`, which must not exist.
+/// Pause the definition at `path` under `root`, which is not published yet: rewrite it
+/// atomically as its paused version with `reason`.
 pub fn pause(root: &Path, path: &str, reason: &str) -> Result<()> {
-    let marker = root.join(path).with_file_name(PAUSED_FILE);
-    write_new(&marker, &paused_bytes(reason)?)?;
-    super::sync_dir(marker.parent().expect("a definition has a directory"))
+    let kind = crate::formats::DEFINITIONS
+        .iter()
+        .find(|k| k.name_of(path).is_some())
+        .ok_or_else(|| Error::Invalid(format!("{path:?} is not a definition path")))?;
+    let file = root.join(path);
+    let bytes = std::fs::read(&file)?;
+    let paused = rewrite(kind, path, &bytes, Some(&Paused::now(reason)))?;
+    super::write_atomic(&file, &paused)
 }
 
 /// Create the directories of relative path `rel` under `root`, refusing any that exists
@@ -242,41 +313,13 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The paused marker of the definition at `path` (`DIR/NAME/FILE`) under `root`, if
-/// one is there. A marker that cannot be read, such as one of a newer version, still
-/// pauses the definition, with the reason `paused`.
-pub fn read_paused(root: &Path, path: &str) -> Option<Paused> {
-    let marker = root.join(path).with_file_name(PAUSED_FILE);
-    let bytes = match std::fs::read(marker) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => Vec::new(),
-    };
-    Some(
-        crate::formats::settings_from_slice(PAUSED_FILE, &bytes).unwrap_or(Paused {
-            reason: "paused".into(),
-            time: None,
-        }),
-    )
-}
-
-/// Remove the paused marker of the definition at `path` under `root`.
-pub fn clear_paused(root: &Path, path: &str) -> Result<()> {
-    match std::fs::remove_file(root.join(path).with_file_name(PAUSED_FILE)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn view(name: &str, q: &str) -> DefinitionFile {
         let bytes =
-            crate::formats::settings_to_vec("view.json", &crate::incr::views::ViewDef::table(q))
-                .unwrap();
+            crate::incr::views::to_bytes(&crate::incr::views::ViewDef::table(q), None).unwrap();
         DefinitionFile {
             kind: "view",
             path: format!("views/{name}/view.json"),
@@ -289,22 +332,31 @@ mod tests {
     fn staged_definitions_read_back_paused() {
         let tmp = tempfile::tempdir().unwrap();
         let defs = vec![view("a", "SELECT * { ?s ?p ?o }"), view("b", "ASK {}")];
-        stage_paused(tmp.path(), &defs, "restored").unwrap();
+        write_all(tmp.path(), &defs, Some("restored")).unwrap();
         let kind = crate::formats::definition_kind("view").unwrap();
+        // a capture holds them as they run, without the pause
         assert_eq!(read_dir(tmp.path(), kind).unwrap(), defs);
-        let p = read_paused(tmp.path(), "views/a/view.json").unwrap();
-        assert_eq!(p.reason, "restored");
-        // an unreadable marker still pauses
-        let marker = tmp.path().join("views/b/paused.json");
-        std::fs::write(&marker, br#"{"format": 7, "reason": "later"}"#).unwrap();
-        assert_eq!(
-            read_paused(tmp.path(), "views/b/view.json").unwrap().reason,
-            "paused"
+        let all = crate::incr::views::read_all(tmp.path()).unwrap();
+        assert!(
+            all.iter()
+                .all(|(_, _, p)| p.as_ref().unwrap().reason == "restored")
         );
-        clear_paused(tmp.path(), "views/a/view.json").unwrap();
-        assert!(read_paused(tmp.path(), "views/a/view.json").is_none());
+        let raw = std::fs::read(tmp.path().join("views/a/view.json")).unwrap();
+        assert_eq!(check(kind, "views/a/view.json", &raw).unwrap(), kind.paused);
         // staging the same definition again never overwrites it
-        assert!(stage_paused(tmp.path(), &defs[..1], "restored").is_err());
+        assert!(write_all(tmp.path(), &defs[..1], Some("restored")).is_err());
+        // a copy without a reason holds the bytes as captured
+        let copy = tmp.path().join("copy");
+        std::fs::create_dir(&copy).unwrap();
+        write_all(&copy, &defs, None).unwrap();
+        assert_eq!(
+            std::fs::read(copy.join("views/b/view.json")).unwrap(),
+            &*defs[1].bytes
+        );
+        // a restore pauses a downloaded definition in place
+        pause(&copy, "views/b/view.json", "restored").unwrap();
+        let raw = std::fs::read(copy.join("views/b/view.json")).unwrap();
+        assert_eq!(check(kind, "views/b/view.json", &raw).unwrap(), kind.paused);
     }
 
     #[cfg(unix)]
@@ -315,12 +367,12 @@ mod tests {
         let root = tmp.path().join("root");
         std::fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("views")).unwrap();
-        let e = stage_paused(&root, &[view("a", "ASK {}")], "restored").unwrap_err();
+        let e = write_all(&root, &[view("a", "ASK {}")], Some("restored")).unwrap_err();
         assert!(e.to_string().contains("not a plain directory"), "{e}");
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         let mut bad = view("a", "ASK {}");
         bad.path = "views/../../x/view.json".into();
-        assert!(stage_paused(tmp.path(), &[bad], "restored").is_err());
+        assert!(write_all(tmp.path(), &[bad], Some("restored")).is_err());
         assert!(stage_file(tmp.path(), "a/../b").is_err());
     }
 

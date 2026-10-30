@@ -367,6 +367,8 @@ struct ViewEntry {
     /// why the view could not be attached (its query, its principal)
     error: Option<String>,
     checkpointed: u64,
+    /// restored or cloned and not resumed: its `view.json` is the paused format
+    paused: bool,
 }
 
 #[derive(Default)]
@@ -653,10 +655,9 @@ impl Runtime {
         if let Some(r) = &root {
             match views::read_all(r) {
                 Ok(defs) => {
-                    for (name, def) in defs {
+                    for (name, def, paused) in defs {
                         // a restored or cloned view waits until it is resumed
-                        let suspended = definitions::read_paused(r, &views_path(&name))
-                            .map(|p| paused_reason(&p));
+                        let suspended = paused.as_ref().map(paused_reason);
                         reg.views.insert(
                             name,
                             ViewEntry {
@@ -666,6 +667,7 @@ impl Runtime {
                                 suspended,
                                 error: None,
                                 checkpointed: 0,
+                                paused: paused.is_some(),
                             },
                         );
                     }
@@ -1571,6 +1573,15 @@ impl Runtime {
             ));
         }
         def.check()?;
+        // what a backup can restore: a larger definition is refused here, not there
+        let size = views::to_bytes(&def, None)?.len() as u64;
+        let max = crate::formats::MAX_DEFINITION_BYTES;
+        if size > max {
+            return Err(super::error(
+                "invalid-view",
+                format!("the definition is {size} bytes, larger than {max}"),
+            ));
+        }
         let host = self.host()?;
         let text = Self::view_text(host.as_ref(), &def)?;
         let q = self.parse(host.as_ref(), &text)?;
@@ -1585,10 +1596,9 @@ impl Runtime {
         let mut reg = self.reg.lock();
         self.broken(&reg)?;
         self.sync_inference(&mut reg, host.as_ref());
+        // a new definition is the operator's: it runs, and no longer waits for a check
         if let Some(root) = &self.root {
             views::write(root, name, &def)?;
-            // a new definition is the operator's: it no longer waits for a check
-            definitions::clear_paused(root, &views_path(name))?;
         }
         if let Some(old) = reg.views.remove(name)
             && let Some(c) = old.cell
@@ -1605,6 +1615,7 @@ impl Runtime {
                 suspended: None,
                 error: None,
                 checkpointed: 0,
+                paused: false,
             },
         );
         *self.defs.write() = Self::defs_of(&reg);
@@ -1642,8 +1653,13 @@ impl Runtime {
         let Some(e) = reg.views.get_mut(name) else {
             return Err(super::error("view-not-found", format!("no view {name:?}")));
         };
-        if let Some(root) = &self.root {
-            definitions::clear_paused(root, &views_path(name))?;
+        // a resumed view's definition is written as it runs, durably, before the
+        // suspension is lifted
+        if e.paused {
+            if let Some(root) = &self.root {
+                views::write(root, name, &e.def)?;
+            }
+            e.paused = false;
         }
         e.suspended = None;
         e.error = None;
@@ -1752,7 +1768,7 @@ impl Runtime {
     fn defs_of(reg: &Registry) -> Defs {
         let mut files = Vec::with_capacity(reg.views.len());
         for (name, e) in &reg.views {
-            match crate::formats::settings_to_vec(views::FILE, &e.def) {
+            match views::to_bytes(&e.def, None) {
                 Ok(bytes) => files.push(DefinitionFile {
                     kind: "view",
                     path: views_path(name),

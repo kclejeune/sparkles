@@ -194,6 +194,8 @@ impl Store {
             )));
         }
         let cap = self.clone_capture(opts)?;
+        // a definition the clone could not open is refused before anything is written
+        super::definitions::check_all(&cap.definitions)?;
         std::fs::create_dir_all(dir)?;
         let mut guard = CleanDir {
             dir,
@@ -271,7 +273,7 @@ impl Store {
         }
         // the managed definitions come along paused: the clone is a new dataset, whose
         // views run only once an operator has checked their principals and inputs
-        super::definitions::stage_paused(dir, &cap.definitions, "cloned")?;
+        super::definitions::write_all(dir, &cap.definitions, Some("cloned"))?;
         // the branch ordinals the copied blank nodes may carry are not given out again
         let next_ordinal = self.branching.next_ordinal.load(Ordering::Relaxed);
         if next_ordinal > 1 {
@@ -375,6 +377,10 @@ impl Store {
                 ..Default::default()
             })?;
             let snap = self.snapshot();
+            // under the same lock as the snapshot: a definition changed after it is
+            // not the clone's. Read before the lease is taken, so that a failure
+            // leaves no lease behind.
+            let definitions = self.capture_definitions()?;
             let lease = match (&self.root, &self.history) {
                 // a linked generation's base files are its upstream's: rebuilt
                 (Some(root), Some(h))
@@ -391,9 +397,6 @@ impl Store {
                 }
                 _ => None,
             };
-            // under the same lock as the snapshot: a definition changed after it is
-            // not the clone's, and neither lock is held while the other is waited for
-            let definitions = self.capture_definitions()?;
             (snap, w.next_bnode, lease, definitions)
         };
         // from here on, dropping the guard releases the lease
