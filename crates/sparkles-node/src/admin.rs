@@ -8,7 +8,6 @@ mod algo_stats_probe;
 mod algo_stats_tests;
 #[cfg(test)]
 mod graph_groups_tests;
-mod mapping_control;
 fn value<T: Serialize>(v: T) -> sparkles::Result<Value> {
     serde_json::to_value(v).map_err(|e| EngineError::invalid(e.to_string()))
 }
@@ -248,13 +247,29 @@ fn mapping_kind(a: &Value) -> sparkles::Result<Option<sparkles::mapping::Mapping
         })
         .transpose()
 }
-fn mapping_options(a: &Value, ctl: &sparkles::task::Control) -> sparkles::mapping::RunOptions {
-    let ctl = ctl.clone();
+/// Conversion options. The write options carry the operation's cancellation and
+/// deadline through conversion and the final load.
+fn mapping_options(a: &Value) -> sparkles::mapping::RunOptions {
     sparkles::mapping::RunOptions {
         base: a["base"].as_str().map(String::from),
-        check: Some(Arc::new(move || ctl.check())),
         ..Default::default()
     }
+}
+/// The write options of a mapping run, with the operation's absolute deadline.
+fn mapping_write(
+    v: &Value,
+    a: &Value,
+    ctl: &sparkles::task::Control,
+) -> sparkles::Result<sparkles::guard::WriteOptions> {
+    let mut write = write_options(v, ctl.cancel.flag())?;
+    write.deadline = ctl.deadline;
+    if let Some(author) = a["author"].as_str() {
+        write.author = Some(author.into());
+    }
+    if let Some(message) = a["message"].as_str() {
+        write.message = Some(message.into());
+    }
+    Ok(write)
 }
 fn optional_number(a: &Value, key: &str) -> sparkles::Result<Option<u64>> {
     if a[key].is_null() {
@@ -680,17 +695,13 @@ fn run_admin(
         }
         "mappings.delete" => value(ds.mappings().delete(text(a, "name")?, optional_number(a, "ifVersion")?)?)?,
         "mappings.run" => {
-            let mut write = write_options(v, flag.clone())?;
-            write.author = a["author"].as_str().map(Into::into);
-            write.message = a["message"].as_str().map(Into::into);
-            let r = ds.mappings().run(text(a, "name")?, optional_number(a, "version")?, &mapping_inputs(a)?, &mapping_options(a, ctl), a["replace"].as_bool().unwrap_or(false), &write)?;
+            let write = mapping_write(v, a, ctl)?;
+            let r = ds.mappings().run(text(a, "name")?, optional_number(a, "version")?, &mapping_inputs(a)?, &mapping_options(a), a["replace"].as_bool().unwrap_or(false), &write)?;
             json!({"receipt": r.receipt, "stats": r.stats})
         }
         "runMapping" => {
-            let mut write = write_options(v, ctl.cancel.flag())?;
-            // Retain the operation's absolute deadline across conversion and load.
-            write.deadline = ctl.deadline;
-            let r = mapping_control::run(ds, text(a, "text")?, mapping_kind(a)?, &mapping_inputs(a)?, &mapping_options(a, ctl), a["graph"].as_str(), &write)?;
+            let write = mapping_write(v, a, ctl)?;
+            let r = ds.run_mapping_with(text(a, "text")?, mapping_kind(a)?, &mapping_inputs(a)?, &mapping_options(a), a["graph"].as_str(), &write)?;
             json!({"receipt": r.receipt, "stats": r.stats})
         }
         "queries.list" => value(ds.queries().list())?,

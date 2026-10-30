@@ -62,7 +62,10 @@ fn counting() -> (RunOptions, Arc<AtomicU64>) {
     )
 }
 
-fn stopped() -> Vec<(&'static str, WriteOptions, fn(&Error) -> bool)> {
+/// A named stopped control and the refusal it must produce.
+type Stopped = (&'static str, WriteOptions, fn(&Error) -> bool);
+
+fn stopped() -> Vec<Stopped> {
     let past = Instant::now()
         .checked_sub(Duration::from_millis(1))
         .unwrap();

@@ -710,3 +710,43 @@ mappings:
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('mapping runs keep the operation deadline while the writer is held', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sparkles-mapping-deadline-'));
+  try {
+    await writeFile(join(dir, 'people.csv'), 'id,name\n1,Ann\n');
+    const mapping = `prefixes:
+  ex: http://ex.org/
+mappings:
+  person:
+    sources:
+      - [people.csv~csv]
+    s: ex:person/$(id)
+    po:
+      - [ex:name, $(name)]
+`;
+    const ds = t.resource(Dataset.memory());
+    await ds.mappings.put('people', mapping);
+    const held = await ds.beginTransaction();
+    for (const run of [
+      () => ds.mappings.run('people', { directory: dir, timeout: 100 }),
+      () => ds.runMapping(mapping, { directory: dir, timeout: 100 }),
+    ]) {
+      const started = performance.now();
+      await assert.rejects(run(), QueryTimeoutError);
+      // The refusal comes from the operation's own budget, not from the holder.
+      assert.ok(performance.now() - started < 5000);
+    }
+    await held.rollback();
+    assert.equal(await ds.count(), 0n);
+    assert.equal(await ds.mappings.lastRun('people'), null);
+    const done = await ds.mappings.run('people', { directory: dir, timeout: 30000 });
+    assert.equal(done.receipt.committed, true);
+    assert.equal(
+      (await ds.runMapping(mapping, { directory: dir, timeout: 30000 })).stats.quads,
+      1n,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
