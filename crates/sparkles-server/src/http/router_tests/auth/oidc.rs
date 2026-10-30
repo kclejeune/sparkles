@@ -590,3 +590,36 @@ fn oidc_needs_a_public_url() {
     .unwrap_err();
     assert!(e.to_string().contains("HS256"), "{e}");
 }
+
+/// A reload that lands between the provider exchange and session creation is not
+/// bypassed: the callback decides again under the new policy, and the session takes
+/// the new lifetime.
+#[tokio::test]
+async fn callback_racing_a_reload_issues_under_the_new_policy() {
+    let (s, _m) = oidc_server().await;
+    let reloaded = config_text(&Fixture {
+        extra: format!("{}\n[session]\nttl = \"1h\"\n", s.fixture.extra),
+        ..s.fixture.clone()
+    });
+    let path = s.config.clone();
+    let mut reload = true;
+    s.auth().hooks.lock().before_issue = Some(Box::new(move |auth| {
+        if std::mem::take(&mut reload) {
+            std::fs::write(&path, &reloaded).unwrap();
+            auth.reload().unwrap();
+        }
+    }));
+    let (r, cookie) = full_login(&s).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.text());
+    assert_eq!(r.header("location"), "/ui/datasets");
+    let set = r.set_cookie("sparkles_session").unwrap();
+    assert!(
+        set.contains("Max-Age=3600"),
+        "a session was issued under the replaced policy: {set}"
+    );
+    let who = call(&s.app, "GET", "/$/whoami", &[("cookie", &cookie)], "")
+        .await
+        .json();
+    assert_eq!(who["principal"]["name"], "alice@example.org");
+    assert_eq!(s.auth().sessions.active(s.auth().now()), 1);
+}

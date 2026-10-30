@@ -82,6 +82,7 @@ describe('return paths and login links', () => {
   });
   it('explains login errors', () => {
     expect(loginErrorMessage('not_allowed')).toMatch(/not allowed/);
+    expect(loginErrorMessage('changed')).toMatch(/try again/);
     expect(loginErrorMessage(null)).toBeNull();
     expect(loginErrorMessage('weird')).toBe('Sign-in failed.');
   });

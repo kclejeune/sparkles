@@ -1188,7 +1188,7 @@ session expires, redirects the same way.
 - a user and password form when `password` is listed.
 
 The forms post to `/$/auth/login` and then navigate to `return_to`, which must start with
-`/ui/`. The `?error=` codes (`state`, `idp`, `idp_unavailable`, `not_allowed`) show a
+`/ui/`. The `?error=` codes (`state`, `idp`, `idp_unavailable`, `not_allowed`, `changed`) show a
 plain message, such as "Your account is not allowed to use this server". Proxy
 principals never see this page.
 
@@ -2173,10 +2173,24 @@ the revocation take the same store mutex, so a credential revoked during its loo
 refused, and token logins and mints remove what they created from a credential revoked
 meanwhile. Basic authentication and password login that observe a generation change
 are computed again as a whole against the current state, with at most three password
-verifications for each request across the auth middleware and the login handler, instead of answering `invalid credentials`. A login
-takes its session lifetime from the policy its password was verified against. A request that still
-overlaps changes gets `503` with code `authority-changed` and `Retry-After: 1`, which
-does not count against the pre-authentication budget.
+verifications for each request across the auth middleware and the login handler,
+instead of answering `invalid credentials`. A login takes its session lifetime from the
+policy its password was verified against. A request that still overlaps changes gets
+`503` with code `authority-changed` and `Retry-After: 1`, which does not count against
+the pre-authentication budget.
+
+Long-lived reads also end when their credential expires (roadmap item 403). The
+principal records its credential's expiry at authentication: a token's end, a provider
+assertion's `exp`, or a session's absolute lifetime or idle timeout, whichever comes
+first. An open stream does not renew a session. Change feeds, live queries and long
+polls compare that instant with the clock before they send more data, which costs no
+store lookup. Quiet change feeds and long polls wake at the expiry, and live queries
+check it at their one-second tick and again for each event they read. The OIDC
+callback now decides admission and the session lifetime under a policy loaded after
+the provider exchange, and creates the session under the shared issue fence with that
+policy's generation. A reload completing in between makes it decide again, up to three
+attempts, and repeated overlaps answer `/ui/login?error=changed` without counting as a
+failed credential.
 
 **Deviations from the spec.**
 

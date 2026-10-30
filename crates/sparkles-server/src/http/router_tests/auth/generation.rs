@@ -429,3 +429,93 @@ async fn basic_headers_and_a_password_login_share_one_verification_budget() {
     .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
 }
+
+/// Open a change feed and a live query on wiki with the request headers `h`.
+async fn open_both(
+    s: &AuthServer,
+    h: &[(&str, &str)],
+) -> (
+    (axum::body::BodyDataStream, String),
+    (axum::body::BodyDataStream, String),
+) {
+    let after = head(&s.state, "wiki");
+    let feed = open_stream(s, &format!("/wiki/changes?after={after}"), h).await;
+    let live_uri = format!(
+        "/wiki/live?query={}",
+        "SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Ax%3Ap%3E%20%3Fo%20%7D"
+    );
+    let mut live = open_stream(s, &live_uri, h).await;
+    let mut live_buf = String::new();
+    assert_eq!(next_event(&mut live, &mut live_buf).await.0, "snapshot");
+    ((feed, String::new()), (live, live_buf))
+}
+
+/// After the credential's expiry, the next commit ends both streams with
+/// `access-changed` instead of sending it.
+async fn expect_ended(
+    s: &AuthServer,
+    streams: &mut (
+        (axum::body::BodyDataStream, String),
+        (axum::body::BodyDataStream, String),
+    ),
+    n: u32,
+) {
+    let r = update_as(&s.app, "wiki", &b("alice"), &insert(n)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (body, buf) in [&mut streams.0, &mut streams.1] {
+        let (event, data) = next_event(body, buf).await;
+        assert_eq!(
+            event, "error",
+            "an expired credential kept streaming: {data}"
+        );
+        assert!(data.contains("access-changed"), "{data}");
+    }
+}
+
+/// Streams opened with a session end when the session reaches its absolute
+/// lifetime or its idle timeout, and streams of a token end when it expires.
+#[tokio::test]
+async fn streams_end_when_their_credential_expires() {
+    // the absolute lifetime of a session: twelve hours by default
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let mut streams = open_both(&s, &[("cookie", &cookie)]).await;
+    s.auth().advance(43_200);
+    expect_ended(&s, &mut streams, 1).await;
+
+    // the idle timeout of a session that a stream does not renew
+    let s = build(Fixture {
+        extra: "[session]\nidle_timeout = \"10m\"\n".into(),
+        ..Default::default()
+    });
+    let (cookie, _) = password_session(&s, "bob").await;
+    let mut streams = open_both(&s, &[("cookie", &cookie)]).await;
+    s.auth().advance(600);
+    expect_ended(&s, &mut streams, 2).await;
+
+    // a minted token
+    let s = build(Fixture::default());
+    let r = super::tokens::mint_as(
+        &s.app,
+        &[("authorization", &b("bob"))],
+        r#"{"name":"short","datasets":{"wiki":"read"},"expiresIn":"1d"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let token = bearer(r.json()["token"].as_str().unwrap());
+    let mut streams = open_both(&s, &[("authorization", &token)]).await;
+    s.auth().advance(86_399);
+    // one second before its expiry the token still streams
+    let r = update_as(&s.app, "wiki", &b("alice"), &insert(3)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        next_event(&mut streams.0.0, &mut streams.0.1).await.0,
+        "commit"
+    );
+    assert_eq!(
+        next_event(&mut streams.1.0, &mut streams.1.1).await.0,
+        "diff"
+    );
+    s.auth().advance(1);
+    expect_ended(&s, &mut streams, 4).await;
+}

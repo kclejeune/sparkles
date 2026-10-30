@@ -564,8 +564,9 @@ async fn oidc_callback(
         );
         tracing::info!(target: "sparkles::audit", event = "login", method = "oidc", result = code);
         let mut r = login_error(code);
-        // a forged or replayed state, or a code the provider refused
-        if failure != Failure::NotAllowed {
+        // a forged or replayed state, or a code the provider refused; an authority
+        // change that kept overlapping the sign-in is not a failed credential
+        if !matches!(failure, Failure::NotAllowed | Failure::Changed) {
             r.extensions_mut().insert(AuthFailed);
         }
         r.headers_mut().append(
@@ -629,11 +630,7 @@ async fn oidc_callback(
     if groups_claim.is_some() {
         auth.refresh_owner(&who);
     }
-    if !policy.admitted(&who.name, &who.groups) {
-        return fail(Failure::NotAllowed, "not_allowed");
-    }
     let log = who.log_name();
-    let expires = now + policy.session_ttl;
     let text = |k: &str| {
         claims
             .get(k)
@@ -641,19 +638,47 @@ async fn oidc_callback(
             .filter(|v| v.len() <= 256)
             .map(str::to_string)
     };
-    let (raw, digest) = match auth.sessions.create_oidc(
-        Method::Oidc,
-        who,
-        None,
-        now,
-        expires,
-        text("sid"),
-        text("sub"),
-    ) {
-        Ok(x) => x,
-        Err(e) => {
-            tracing::error!("cannot store the session: {e:#}");
-            return fail(Failure::Idp, "idp");
+    // The provider exchange awaited the network, so admission and the session
+    // lifetime are decided under a policy loaded afterwards. The session is created
+    // under the shared issue fence only if no authority update completed since that
+    // policy was loaded, as for a password login; otherwise the decision is made
+    // again under the new policy.
+    let mut attempt = 0;
+    let (raw, digest, expires) = loop {
+        if attempt > 0 {
+            super::policy::authority_backoff(attempt).await;
+        }
+        attempt += 1;
+        if attempt > super::policy::AUTH_ATTEMPTS {
+            return fail(Failure::Changed, "changed");
+        }
+        let generation = auth.epoch();
+        if generation & 1 != 0 {
+            continue;
+        }
+        let policy = auth.policy();
+        if !policy.admitted(&who.name, &who.groups) {
+            return fail(Failure::NotAllowed, "not_allowed");
+        }
+        let expires = now + policy.session_ttl;
+        #[cfg(test)]
+        auth.run_hook(|h| &mut h.before_issue);
+        match auth.sessions.create_oidc(
+            Method::Oidc,
+            who.clone(),
+            None,
+            now,
+            expires,
+            text("sid"),
+            text("sub"),
+            Some(generation),
+        ) {
+            Ok((raw, digest)) => break (raw, digest, expires),
+            Err(e) if e.is::<super::store::AuthorityChanged>() => continue,
+            Err(e) => {
+                tracing::error!("cannot store the session: {e:#}");
+                return fail(Failure::Idp, "idp");
+            }
         }
     };
     auth.sessions.set_id_token(digest, id_token);

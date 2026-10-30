@@ -123,6 +123,14 @@ fn commit_param(v: &str) -> Option<u64> {
     v.strip_prefix("commit:").unwrap_or(v).trim().parse().ok()
 }
 
+/// The error that ends a stream whose caller's access changed or ended.
+fn access_changed() -> LiveEvent {
+    LiveEvent::Error {
+        code: "access-changed".into(),
+        message: "the access policy, a disclosure registry or the caller's credential changed or expired; reconnect to read under the new rules".into(),
+    }
+}
+
 struct Stream {
     st: Arc<AppState>,
     live: Arc<LiveQuery>,
@@ -143,13 +151,16 @@ impl Stream {
                 return None;
             }
             if !self.st.access_current(&self.principal) {
-                return Some(LiveEvent::Error {
-                    code: "access-changed".into(),
-                    message: "the access policy, a disclosure registry or the caller's credential changed; reconnect to read under the new rules".into(),
-                });
+                return Some(access_changed());
             }
             tokio::select! {
-                e = self.live.recv() => return e,
+                e = self.live.recv() => {
+                    // an event read after the access ended is not sent
+                    if e.is_some() && !self.st.access_current(&self.principal) {
+                        return Some(access_changed());
+                    }
+                    return e;
+                }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }

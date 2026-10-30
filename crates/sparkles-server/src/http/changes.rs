@@ -212,7 +212,13 @@ pub(super) async fn changes(
     let mut rx = ds.store.subscribe_commits();
     let mut p = page(&ds, &ask).await?;
     if p.commits.is_empty() && !wait.is_zero() {
-        wait_for_commit(&st, &ds, &mut rx, after, Instant::now() + wait).await;
+        // a wait ends no later than the caller's credential, which then answers
+        // `access-changed` below
+        let mut until = Instant::now() + wait;
+        if let Some(deadline) = st.access_deadline(&caller) {
+            until = until.min(deadline + Duration::from_secs(1));
+        }
+        wait_for_commit(&st, &ds, &mut rx, after, until).await;
         p = page(&ds, &ask).await?;
     }
     // the view was decided when the caller was authenticated: a page read after the
@@ -221,7 +227,7 @@ pub(super) async fn changes(
         return Err(ApiError(
             StatusCode::CONFLICT,
             json!({
-                "error": "the access policy, a disclosure registry or the caller's credential changed; ask again to read under the new rules",
+                "error": "the access policy, a disclosure registry or the caller's credential changed or expired; ask again to read under the new rules",
                 "code": "access-changed",
             }),
         ));
@@ -367,7 +373,7 @@ impl Feed {
                 return Some((
                     Ok(Event::default().event("error").data(
                         json!({
-                            "error": "the access policy, a disclosure registry or the caller's credential changed; reconnect to read under the new rules",
+                            "error": "the access policy, a disclosure registry or the caller's credential changed or expired; reconnect to read under the new rules",
                             "code": "access-changed",
                         })
                         .to_string(),
@@ -429,6 +435,12 @@ fn event_stream(
     fmt: DiffFormat,
     principal: Principal,
 ) -> impl IntoResponse {
+    // A quiet stream wakes when its credential expires, a second after its last
+    // valid instant, and ends with `access-changed` before reading on.
+    let mut until = Instant::now() + MAX_STREAM;
+    if let Some(deadline) = st.access_deadline(&principal) {
+        until = until.min(deadline + Duration::from_secs(1));
+    }
     let feed = Feed {
         rx: ds.store.subscribe_commits(),
         st,
@@ -436,7 +448,7 @@ fn event_stream(
         ask,
         fmt,
         queue: Default::default(),
-        until: Instant::now() + MAX_STREAM,
+        until,
         done: false,
         principal,
         revoked: false,

@@ -141,6 +141,8 @@ export function loginErrorMessage(code: string | null | undefined): string | nul
       return 'The identity provider cannot be reached right now. Try again in a moment.';
     case 'not_allowed':
       return 'Your account is not allowed to use this server.';
+    case 'changed':
+      return "The server's sign-in settings changed during the sign-in. Please try again.";
     default:
       return 'Sign-in failed.';
   }

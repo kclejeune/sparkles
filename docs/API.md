@@ -3122,9 +3122,11 @@ circuit. A dataset runs at most `--max-live-queries` live queries, 1,000 by defa
 `--max-live-queries-per-principal`, 20 by default, for each principal. More are refused
 with `429 too-many-live-queries`. The first evaluation counts against the rate limit as
 a query. A stream ends when the server drains. It ends with an `access-changed` error
-when the access policy changes or when the session or token the stream was opened with
-is revoked, and the client then reconnects under the new grants. Other users signing in
-or out do not end it.
+when the access policy changes, or when the session or token the stream was opened with
+is revoked or expires, and the client then reconnects under the new grants. A session
+expires at its lifetime or at its idle timeout, counted from the request that opened
+the stream, since a stream does not renew the session. Other users signing in or out do
+not end it.
 
 ## GraphQL
 
@@ -10042,7 +10044,8 @@ routes return `404`. `token` is listed only when `session.token_login` is on.
   algorithms, `iss`, `aud`, `azp`, `exp`, `iat` and `nonce`. It reads the name and groups,
   from UserInfo when the ID token lacks them, and checks admission. It then answers `303`
   to `return_to` with a session cookie. Failures go to
-  `/ui/login?error=state|idp|idp_unavailable|not_allowed`.
+  `/ui/login?error=state|idp|idp_unavailable|not_allowed|changed`. The code `changed`
+  means policy reloads kept overlapping the sign-in, and the user can sign in again.
 * `POST /$/auth/logout` returns `{"redirect": url | null}`. The URL is the provider's
   end-session URL for OIDC sessions, and `proxy.logout_url` for proxy users, or
   `/cdn-cgi/access/logout` with `[cloudflare_access]`.
