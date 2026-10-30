@@ -249,12 +249,58 @@ organization, place, event and aggregate-observation examples with exact query
 answers, retained source bytes and explicit unknowns. They can be loaded and queried
 with the existing RDF, SHACL and SPARQL interfaces.
 
-Roadmap item 396 retains bounded offline reference replay and selected source
-mappings. Resolution and projection fixtures are declared expected states. They do
-not compute matches or authenticate decisions. Live ingestion, review and protected
-records require C25 managed operations. Authenticated availability, durable publication
-and maintained results depend on the C27, C26 and F22 runtime contracts. Synthetic
-count examples define no operational health policy or connector.
+The private [offline example](../../crates/sparkles/examples/shared_entity_replay.rs)
+computes resolution from explicit view manifests, entities, proposals and selected
+review declarations. It preserves historical decision inputs, reports conflicts across
+entire connected components and leaves undecided matches unknown. Authored assignment and conflict rows
+are excluded from matching. Representatives belong to the selected view and do not
+assert logical equality.
+
+Run the comparison CLI from the repository root with explicit local deliveries.
+
+```sh
+mbx run --locked -p sparkles --example shared_entity_replay -- \
+  --view urn:example:a01:A12:pair --scope urn:example:a01:A12 \
+  --rdf ttl=testsuite/entity-representation/v1/valid/common.ttl \
+  --rdf ttl=testsuite/entity-representation/v1/valid/resolution.ttl \
+  --rdf ttl=crates/sparkles/resources/entity-representation/v1/policies/default.ttl \
+  --source urn:example:a01:r1=testsuite/entity-representation/v1/raw/r1.json \
+  --deadline-ms 10000
+```
+
+The CLI accepts Turtle, N-Triples, TriG and N-Quads through `ttl`, `nt`, `trig` and
+`nq` format names. It checks retained source digests and mandatory evidence selectors
+reached through selected records and their domain dependencies. `--reference` adds
+an explicit selector check. Replay refusals produce a stable code before comparison
+bytes are emitted. The tool performs no network fetch, file discovery, dataset write
+or current-pointer update.
+
+Default limits are 10,000 entities, 20,000 descriptions, 50,000 claims, 20,000 decisions
+and 50,000 relations. Decoded deliveries share a 64 MiB invocation cap, retained source
+files have a 16 MiB cap each and operation memory is capped at 256 MiB. The
+`--limit-entities`, `--limit-descriptions`, `--limit-claims`, `--limit-decisions`,
+`--limit-relations`, `--limit-decoded`, `--limit-source` and `--limit-memory` flags
+accept lower caps. Supply byte limits as integer byte counts. `--deadline-ms` sets a
+relative deadline, and private helpers also honor the shared cancellation control. A
+refusal emits no
+partial comparison.
+
+Private helpers compute the fixed rule for occurrence withdrawal, source lineage groups,
+simulated availability cutoffs, mapping migrations and terminal observation revisions.
+The availability rule accepts canonical fixed-width UTC timestamps. The observation
+adapter supports reported positive occurrences in the declared synthetic series and
+selects its unique terminal source revision. Unsupported headers or rules refuse or
+remain explicit unknowns. The separate Cargo.lock version 4 adapter checks supplied
+family and version bindings against the existing software-inventory bytes. These
+bindings do not establish release, build, artifact or deployment evidence. The CLI
+emits resolution comparisons, while these evolution and mapping helpers are exercised
+through the [replay tests](../../crates/sparkles/tests/shared_entity_replay.rs).
+
+All review and availability declarations in this reference remain simulated. A
+separately supplied public scope demonstrates isolation without implementing real
+authorization. Roadmap item 396 retains managed integration with actual C25 review and
+protected records, C27 authenticated availability, C26 durable publication and F22
+freshness. Synthetic count examples define no operational health policy or connector.
 
 ### Community reports (GraphRAG)
 
