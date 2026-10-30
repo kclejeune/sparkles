@@ -60,7 +60,9 @@ impl StoredMappings {
     /// commit once, then record the run. With `replace`, the run replaces every graph the
     /// mapping's graph maps write in that commit, which needs constant graph maps. `o`
     /// carries the commit message (by default `mapping NAME (version V)`), the author,
-    /// the deadline and a precondition. CSVW metadata and templates map CSV files, which
+    /// the deadline and a precondition. Its cancellation sources and deadline also stop
+    /// conversion, together with `opts.check`, and the run is recorded only after the
+    /// loader publishes its commit. CSVW metadata and templates map CSV files, which
     /// a load converts with them (see [`crate::tabular`]).
     pub fn run(
         &self,
@@ -81,6 +83,8 @@ impl StoredMappings {
                 kind.name()
             )));
         }
+        // The write controls stop conversion too, as for a direct run.
+        o.check()?;
         let m = mapping::parse(&stored.definition.text, kind, None)?;
         let graphs = if replace {
             Some(m.constant_graphs().ok_or_else(|| {
@@ -91,7 +95,9 @@ impl StoredMappings {
         } else {
             None
         };
-        let (tmp, stats) = mapping::to_nquads_file(&m, inputs, opts, None)?;
+        let controlled = with_write_controls(opts, o);
+        let (tmp, stats) = mapping::to_nquads_file(&m, inputs, &controlled, None)?;
+        o.check()?;
         let mut o = o.clone();
         if o.message.is_none() {
             o.message = Some(format!("mapping {name} (version {})", stored.version.version).into());
@@ -112,6 +118,23 @@ impl StoredMappings {
         )?;
         Ok(MappingRun { receipt, stats })
     }
+}
+
+/// Conversion options that also stop on the write controls of `write`. The result
+/// keeps every field of `opts` and still calls its own conversion callback. Sources
+/// call the check at their existing periodic checkpoints.
+fn with_write_controls(opts: &RunOptions, write: &crate::guard::WriteOptions) -> RunOptions {
+    let mut conversion = opts.clone();
+    let previous = opts.check.clone();
+    let write = write.clone();
+    conversion.check = Some(std::sync::Arc::new(move || {
+        write.check()?;
+        if let Some(check) = &previous {
+            check()?;
+        }
+        Ok(())
+    }));
+    conversion
 }
 
 /// What [`Dataset::run_mapping`] did: the commit's receipt and the run's counts.
@@ -190,21 +213,7 @@ impl Dataset {
             .transpose()
             .map_err(|e| Error::invalid(e.to_string()))?;
         let m = mapping::parse(text, kind, None)?;
-        // Compose once, preserving every structured flag and the independent
-        // conversion callback. Sources keep their existing periodic checkpoints.
-        let controlled = write.map(|write| {
-            let mut conversion = opts.clone();
-            let previous = opts.check.clone();
-            let write = write.clone();
-            conversion.check = Some(std::sync::Arc::new(move || {
-                write.check()?;
-                if let Some(check) = &previous {
-                    check()?;
-                }
-                Ok(())
-            }));
-            conversion
-        });
+        let controlled = write.map(|write| with_write_controls(opts, write));
         let opts = controlled.as_ref().unwrap_or(opts);
         if controlled.is_some()
             && let Some(check) = &opts.check
