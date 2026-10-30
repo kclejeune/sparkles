@@ -216,6 +216,16 @@ fn short(t: &Term) -> String {
     t.to_string()
 }
 
+/// Which rows of a range of the derived tier [`Session::export_rows`] returns.
+#[derive(Clone, Copy)]
+enum Rows {
+    All,
+    /// the facts of the schema vocabulary
+    Schema,
+    /// the others
+    Instances,
+}
+
 /// Which position of a demand its seeds bind.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Seeded {
@@ -292,10 +302,14 @@ pub(crate) struct Session {
     compact_round_overflow: bool,
     /// the magic predicates of every program of the session
     hidden: FxHashSet<u64>,
-    /// the schema the rules were specialized to, and its rows in the derived tier, which
-    /// go out only to the demands that can read them
+    /// the schema vocabulary, and the rows of the derived tier that the schema pass gave.
+    /// The schema facts among those rows go out only to the demands that can read them.
+    /// The instance facts the pass derived on the way go out with the next derivation
+    /// like any other, since the query's program finds them already held and does not
+    /// derive them again.
     closed: Option<demand::Closed>,
     schema_rows: Option<(usize, usize)>,
+    schema_instance_rows: Option<(usize, usize)>,
     /// the rows the lower stages of the schema pass derived, the facts its `noValue`
     /// builtins read, which go out with the next derivation like any other
     lower_rows: Option<(usize, usize)>,
@@ -375,6 +389,7 @@ impl Session {
             hidden: FxHashSet::default(),
             closed: None,
             schema_rows: None,
+            schema_instance_rows: None,
             lower_rows: None,
             cached: Vec::new(),
             reports: Vec::new(),
@@ -783,6 +798,7 @@ impl Session {
         if self.exported == schema_from {
             self.exported = schema_to;
             self.schema_rows = Some((lower_end, schema_to));
+            self.schema_instance_rows = Some((lower_end, schema_to));
             if lower_end > schema_from {
                 self.lower_rows = Some((schema_from, lower_end));
             }
@@ -962,6 +978,18 @@ impl Session {
         &self.budget
     }
 
+    /// Whether `t` is a fact of the schema vocabulary, which only the demands that
+    /// [`Session::reads_schema`] can read.
+    fn schema_fact(&self, t: &[u64; 3]) -> bool {
+        self.closed.as_ref().is_some_and(|c| {
+            c.closes(&Atom {
+                s: Slot::Const(t[0]),
+                p: Slot::Const(t[1]),
+                o: Slot::Const(t[2]),
+            })
+        })
+    }
+
     /// Whether demand `d` can read facts of the schema.
     fn reads_schema(&self, d: usize) -> bool {
         let Some(c) = &self.closed else {
@@ -1041,19 +1069,25 @@ impl Session {
     /// The derived facts not returned yet, without magic facts and facts RDF cannot state.
     fn export(&mut self, out: &mut Derived) {
         let end = self.graph.as_ref().expect("graph made").derived().len();
-        self.export_rows(self.exported, end, out);
+        self.export_rows(self.exported, end, Rows::All, out);
         self.exported = end;
     }
 
     /// The derived facts of rows `lo` to `hi` of the derived tier, as [`export`] returns
     /// them.
-    fn export_rows(&mut self, lo: usize, hi: usize, out: &mut Derived) {
+    fn export_rows(&mut self, lo: usize, hi: usize, which: Rows, out: &mut Derived) {
         let g = self.graph.as_ref().expect("graph made");
         let rows = g.derived();
         let mut chunk: Vec<[u64; 3]> = Vec::new();
         for t in &rows[lo..hi] {
             if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
                 continue;
+            }
+            match which {
+                Rows::All => {}
+                Rows::Schema if !self.schema_fact(t) => continue,
+                Rows::Instances if self.schema_fact(t) => continue,
+                Rows::Schema | Rows::Instances => {}
             }
             for &x in t {
                 if Id(x).tag() == Tag::Local && self.locals_sent.insert(x) {
@@ -1378,13 +1412,24 @@ impl ReasoningSession for Session {
             self.ensure_program()?;
             self.ensure_graph()?;
             if let Some((lo, hi)) = self.lower_rows.take() {
-                self.export_rows(lo, hi, &mut out);
+                self.export_rows(lo, hi, Rows::All, &mut out);
             }
-            if let Some((lo, hi)) = self.schema_rows
-                && misses.iter().any(|(d, _, _)| self.reads_schema(*d))
-            {
-                self.schema_rows = None;
-                self.export_rows(lo, hi, &mut out);
+            if let Some((lo, hi)) = self.schema_instance_rows.take() {
+                self.export_rows(lo, hi, Rows::Instances, &mut out);
+            }
+            if let Some((lo, hi)) = self.schema_rows {
+                if misses.iter().any(|(d, _, _)| self.reads_schema(*d)) {
+                    self.schema_rows = None;
+                    self.export_rows(lo, hi, Rows::Schema, &mut out);
+                } else {
+                    // a withheld fact is one that no demand of this derivation can read
+                    debug_assert!(
+                        self.graph.as_ref().expect("graph made").derived()[lo..hi]
+                            .iter()
+                            .filter(|t| self.schema_fact(t))
+                            .all(|t| misses.iter().all(|(d, _, _)| !self.matches(*d, t)))
+                    );
+                }
             }
             let program = self.program.as_ref().expect("prepared");
             let stage = &program.stages[0];

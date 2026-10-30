@@ -1335,3 +1335,195 @@ fn fresh_schema_unreached_generators_keep_result_tables() {
     assert_eq!(rows(&uncached), rows(&first));
     assert_eq!(uncached.ctx.reasoning.as_ref().unwrap().report.cached, 0);
 }
+
+/// Demand and materialization give the same rows for `text` over `ttl` under OWL RL,
+/// with the cold schema pass and with its cached table.
+fn owl_rl_matches_materialization(ttl: &str, text: &str) {
+    let input = store(ttl);
+    materialize(&input, &Profile::OwlRl, &ReasonOptions::default()).unwrap();
+    let want = rows(&run(&input, text, &materialized()));
+    assert!(!want.is_empty(), "the oracle has answers for {text}");
+    let qr = reasoner(&Profile::OwlRl);
+    for no_cache in [true, false, false] {
+        let mut options = demand(&qr);
+        options.no_cache = no_cache;
+        assert_eq!(
+            rows(&run(&input, text, &options)),
+            want,
+            "{text} (no_cache {no_cache})"
+        );
+    }
+}
+
+/// An instance whose class is a subclass of `owl:Class` is derived to be a class. The
+/// derived declaration does not hide the instance's other types, here one that class
+/// equality gives.
+#[test]
+fn derived_meta_type_keeps_equal_class_instances() {
+    owl_rl_matches_materialization(
+        "ex:C2 owl:sameAs ex:C0 .
+         ex:i0 a ex:C2 .
+         ex:C2 rdfs:subClassOf owl:Class .",
+        "SELECT ?a { ?a rdf:type ex:C0 }",
+    );
+}
+
+/// A class equivalence read through a subproperty chain types both classes by the
+/// range, while one of them is also derived to be a class of classes.
+#[test]
+fn derived_meta_type_keeps_range_types_of_schema_terms() {
+    owl_rl_matches_materialization(
+        "ex:C1 owl:equivalentClass ex:C3 .
+         ex:C1 rdfs:subClassOf owl:Class .
+         owl:equivalentClass rdfs:subPropertyOf ex:p0 .
+         ex:p0 rdfs:range ex:C3 .",
+        "SELECT ?a { ?a rdf:type ex:C3 }",
+    );
+}
+
+/// A triple of a small view that is mostly schema: W3C classes of classes and
+/// properties as types, superclasses, domains and ranges, schema predicates as
+/// subproperties and as subjects of `rdfs:subPropertyOf`, and `owl:sameAs` between
+/// classes, properties and individuals.
+fn schema_heavy_triple(r: &mut Rng) -> String {
+    let c = |r: &mut Rng| format!("ex:C{}", r.below(4));
+    let p = |r: &mut Rng| format!("ex:p{}", r.below(4));
+    let i = |r: &mut Rng| format!("ex:i{}", r.below(6));
+    let meta = |r: &mut Rng| {
+        [
+            "owl:Class",
+            "owl:TransitiveProperty",
+            "owl:SymmetricProperty",
+            "rdf:Property",
+            "owl:FunctionalProperty",
+            "owl:ObjectProperty",
+            "rdfs:Class",
+        ][r.below(7)]
+        .to_string()
+    };
+    let schema = |r: &mut Rng| {
+        [
+            "rdfs:subClassOf",
+            "rdfs:subPropertyOf",
+            "rdf:type",
+            "owl:sameAs",
+            "rdfs:domain",
+            "rdfs:range",
+            "owl:inverseOf",
+            "owl:equivalentClass",
+            "owl:equivalentProperty",
+        ][r.below(9)]
+        .to_string()
+    };
+    let any = |r: &mut Rng| match r.below(3) {
+        0 => format!("ex:C{}", r.below(4)),
+        1 => format!("ex:p{}", r.below(4)),
+        _ => format!("ex:i{}", r.below(6)),
+    };
+    match r.below(20) {
+        0 => format!("{} rdfs:subClassOf {}", c(r), c(r)),
+        1 => format!("{} rdfs:subPropertyOf {}", p(r), p(r)),
+        2 => format!("{} rdfs:domain {}", p(r), c(r)),
+        3 => format!("{} rdfs:range {}", p(r), c(r)),
+        4 | 16 => format!("{} a {}", i(r), c(r)),
+        5 | 6 => format!("{} {} {}", i(r), p(r), any(r)),
+        7 => format!("{} owl:sameAs {}", any(r), any(r)),
+        8 => format!("{} rdfs:range {}", p(r), meta(r)),
+        9 => format!("{} rdfs:domain {}", p(r), meta(r)),
+        10 => format!("{} rdfs:subPropertyOf {}", p(r), schema(r)),
+        11 => format!("{} rdfs:subClassOf {}", c(r), meta(r)),
+        12 => format!("{} a {}", any(r), meta(r)),
+        13 => format!("{} owl:inverseOf {}", p(r), p(r)),
+        14 => format!("{} owl:equivalentProperty {}", p(r), p(r)),
+        15 => format!("{} owl:equivalentClass {}", c(r), c(r)),
+        17 => format!("{} {} {}", any(r), p(r), any(r)),
+        18 => format!("{} rdfs:subPropertyOf {}", schema(r), p(r)),
+        _ => format!("{} {} {}", any(r), schema(r), any(r)),
+    }
+}
+
+/// A one-pattern query over the terms of [`schema_heavy_triple`].
+fn schema_heavy_pattern(r: &mut Rng) -> String {
+    let term = |r: &mut Rng, v: &str| -> String {
+        match r.below(5) {
+            0 | 1 => format!("?{v}"),
+            2 => format!("ex:C{}", r.below(4)),
+            3 => format!("ex:p{}", r.below(4)),
+            _ => format!("ex:i{}", r.below(6)),
+        }
+    };
+    let p = match r.below(14) {
+        0 => "?pp".to_string(),
+        1..=4 => format!("ex:p{}", r.below(4)),
+        5 => "rdfs:subClassOf".into(),
+        6 => "rdfs:subPropertyOf".into(),
+        7 => "owl:sameAs".into(),
+        8 => "rdfs:domain".into(),
+        9 => "owl:inverseOf".into(),
+        _ => "rdf:type".into(),
+    };
+    let s = term(r, "a");
+    let o = if p == "rdf:type" && r.below(2) == 0 {
+        [
+            "owl:Class",
+            "owl:TransitiveProperty",
+            "rdf:Property",
+            "owl:SymmetricProperty",
+            "rdfs:Class",
+            "owl:FunctionalProperty",
+        ][r.below(6)]
+        .to_string()
+    } else {
+        term(r, "b")
+    };
+    format!("{s} {p} {o}")
+}
+
+/// For small schema-heavy views, the solutions under `demand` equal those over an OWL RL
+/// materialization. Some of these views make equality expand into a large closure, so
+/// each query has a deadline: a query past it is counted and skipped, and the others
+/// must agree.
+#[test]
+fn schema_heavy_demand_answers_like_materialization() {
+    let seeds: Vec<u64> = match std::env::var("SCHEMA_HEAVY_SEEDS") {
+        Ok(v) => v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
+        Err(_) => SCHEMA_HEAVY_SEEDS.to_vec(),
+    };
+    let deadline = std::time::Duration::from_secs(5);
+    let (mut checked, mut skipped) = (0usize, 0usize);
+    for seed in seeds {
+        let mut r = Rng(seed * 6_700_417 + 3);
+        let mut ttl = String::new();
+        for _ in 0..25 {
+            ttl.push_str(&format!("{} .\n", schema_heavy_triple(&mut r)));
+        }
+        let s = store(&ttl);
+        materialize(&s, &Profile::OwlRl, &ReasonOptions::default())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e:#}"));
+        let qr = reasoner(&Profile::OwlRl);
+        for _ in 0..8 {
+            let q = format!("SELECT DISTINCT * {{ {} }}", schema_heavy_pattern(&mut r));
+            let want = rows(&run(&s, &q, &materialized()));
+            let mut options = demand(&qr);
+            options.timeout = Some(deadline);
+            match query(s.snapshot(), &q, &options) {
+                Ok(got) => {
+                    checked += 1;
+                    assert_eq!(rows(&got), want, "seed {seed}: {q}\n{ttl}");
+                }
+                Err(sparkles_core::Error::Timeout) => skipped += 1,
+                Err(e) => panic!("seed {seed}: {q}: {e}\n{ttl}"),
+            }
+        }
+    }
+    eprintln!("schema-heavy differential: {checked} queries agree, {skipped} past the deadline");
+    assert!(
+        checked >= 2 * skipped,
+        "{checked} checked, {skipped} skipped"
+    );
+}
+
+/// The seeds of [`schema_heavy_demand_answers_like_materialization`]: views whose queries
+/// finish within the deadline in a development build, among them 16 and 25, which found
+/// the derived meta type cases above. `SCHEMA_HEAVY_SEEDS=1,2,3` runs others.
+const SCHEMA_HEAVY_SEEDS: &[u64] = &[1, 3, 9, 15, 16, 17, 18, 24, 25];
