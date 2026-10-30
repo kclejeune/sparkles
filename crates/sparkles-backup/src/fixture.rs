@@ -204,6 +204,7 @@ pub async fn put_backup(repo: &Repository, root: &Path, name: &str) -> Manifest 
             size: data.len() as u64,
             sha256: blob::blob_id(&data),
             blobs,
+            definition: None,
         });
     }
     let m = Manifest {
@@ -242,6 +243,7 @@ pub async fn put_backup(repo: &Repository, root: &Path, name: &str) -> Manifest 
         },
         encryption: None,
         branches_omitted: 0,
+        requires: Vec::new(),
     };
     put_manifest(repo, &m).await;
     m

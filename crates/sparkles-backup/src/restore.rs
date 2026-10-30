@@ -117,6 +117,10 @@ impl Repository {
     ///    length and SHA-256 before writing it (a mismatch is fetched again up to 2
     ///    times, then fails with `checksum mismatch in blob <id> (<path>)`), then each
     ///    file's own `sha256`; files are created with `create_new` inside `tmp` only;
+    ///    definition files (`views/NAME/view.json`) are staged in directories created
+    ///    there, must parse with the file version their entry names, and get a
+    ///    `paused.json` with the reason `restored` (definitions of an unknown kind that
+    ///    are not required are skipped);
     /// 3. the identity rule (`o.identity`, `o.id_in_use`, `o.in_place_head`;
     ///    `409 duplicate-dataset-id`), with `sparkles_core::commit::reidentify` for `new`;
     /// 4. fsync every file and directory; write `restore.json` ([`crate::RestoreRecord`]);
@@ -193,6 +197,9 @@ impl Repository {
             self.marker.piece_bytes,
             sparkles_core::formats::READABLE_INDEX_FORMATS,
         )?;
+        // definitions of an unknown kind that are not required are left out
+        let mut m = m;
+        m.files = manifest::restored_files(&m);
         let keep = identity_rule(&m, o)?;
         check_free_space(
             tmp,
@@ -325,12 +332,21 @@ impl Repository {
             let (dir, m) = (dir.to_path_buf(), m.clone());
             Arc::new(
                 blocking(move || {
-                    if m.files.iter().any(|f| f.path.contains('/')) {
+                    if m.files
+                        .iter()
+                        .any(|f| f.definition.is_none() && f.path.contains('/'))
+                    {
                         std::fs::create_dir(dir.join(&m.generation))?;
                     }
                     let mut out = Vec::with_capacity(m.files.len());
                     for f in &m.files {
-                        let p = dir.join(&f.path);
+                        let p = if f.definition.is_some() {
+                            // nested directories, created here and never through a link
+                            sparkles_core::store::definitions::stage_file(&dir, &f.path)
+                                .map_err(|e| BackupError::invalid_backup("files", e))?
+                        } else {
+                            dir.join(&f.path)
+                        };
                         let file = OpenOptions::new().write(true).create_new(true).open(&p)?;
                         out.push((p, file));
                     }
@@ -390,6 +406,29 @@ impl Repository {
                     )
                     .into());
                 }
+            }
+            // each definition is one this build reads, of the version its entry names,
+            // and comes back paused until its principal and inputs are checked
+            for (i, f) in m.files.iter().enumerate() {
+                let Some(d) = &f.definition else { continue };
+                let kind = sparkles_core::formats::definition_kind(&d.kind)
+                    .expect("restored_files keeps known kinds");
+                let bytes = std::fs::read(dir.join(&f.path))?;
+                let found = sparkles_core::store::definitions::check(kind, &f.path, &bytes)
+                    .map_err(|e| match e {
+                        sparkles_core::Error::Unsupported(msg) => {
+                            BackupError::new(Code::IncompatibleFormat, msg)
+                        }
+                        e => BackupError::invalid_backup(&format!("files[{i}]"), e),
+                    })?;
+                if found != d.format {
+                    return Err(BackupError::invalid_backup(
+                        &format!("files[{i}].definition.format"),
+                        format!("{} has format {found}, not {}", f.path, d.format),
+                    )
+                    .into());
+                }
+                sparkles_core::store::definitions::pause(&dir, &f.path, "restored")?;
             }
             let current = std::fs::read(dir.join("CURRENT"))?;
             if String::from_utf8_lossy(&current).trim() != m.generation {

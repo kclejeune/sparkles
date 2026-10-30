@@ -1236,8 +1236,20 @@ fn backups(put: &mut dyn FnMut(&str, J)) {
                 "size": int(),
                 "sha256": string(),
                 "blobs": array(obj(&["id", "size"], json!({ "id": string(), "size": int() }))),
+                "definition": doc(
+                    obj(
+                        &["kind", "format"],
+                        json!({ "kind": string(), "format": int(), "required": boolean() }),
+                    ),
+                    "A dataset-managed definition, such as `views/{name}/view.json`: its kind, the version of the definition file, and whether a reader that does not know the kind must refuse the backup (absent: true). Absent for data and settings files.",
+                    "backup-types",
+                ),
             }),
         )),
+    );
+    f.insert(
+        "requires".into(),
+        json!({ "type": "array", "items": string(), "description": "Manifest features a reader must know to restore the backup, such as `definitions` when files carry a definition. Absent when the backup needs none." }),
     );
     f.insert(
         "stats".into(),

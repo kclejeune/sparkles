@@ -35,6 +35,9 @@ pub struct Source {
     pub next_ordinal: u32,
     /// the dataset's branches other than `main`, which the backup leaves out
     pub branches_omitted: u64,
+    /// the managed definitions captured with the data (see
+    /// `sparkles_core::store::definitions`)
+    pub definitions: Vec<sparkles_core::store::DefinitionFile>,
 }
 
 impl From<BackupCapture> for Source {
@@ -52,6 +55,7 @@ impl From<BackupCapture> for Source {
             branch: c.branch,
             next_ordinal: c.next_ordinal,
             branches_omitted: c.branches_omitted,
+            definitions: c.definitions,
         }
     }
 }
