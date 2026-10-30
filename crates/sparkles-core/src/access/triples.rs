@@ -27,6 +27,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(super) mod controlled;
+
 /// The graph of materialized inferences.
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";

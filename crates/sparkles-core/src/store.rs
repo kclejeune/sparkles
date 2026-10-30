@@ -59,6 +59,7 @@ mod partial;
 mod patch_apply;
 #[cfg(test)]
 mod preflight_tests;
+mod preparation;
 mod preview;
 mod quota;
 mod replay;
@@ -352,7 +353,7 @@ impl Delta {
     }
 
     /// Take `q`, which is not in the base, out of the inserted quads.
-    fn remove_inserted(&mut self, q: &[Id; 4]) {
+    pub(crate) fn remove_inserted(&mut self, q: &[Id; 4]) {
         let mut removed = false;
         for perm in Perm::ALL {
             removed |= self.ins[perm.index()].remove(&perm.to_key(q));

@@ -862,6 +862,17 @@ impl DeltaVocab {
         Ok(result)
     }
 
+    pub(crate) fn with_prepared<R>(
+        &self,
+        preparation: &crate::access::Preparation,
+        f: impl FnOnce(&AppendVocab) -> Result<R>,
+    ) -> Result<R> {
+        let guard = preparation.read_lock(&self.inner)?;
+        let result = f(&guard)?;
+        preparation.check()?;
+        Ok(result)
+    }
+
     #[cfg(test)]
     pub(crate) fn write_guard_for_test(&self) -> parking_lot::RwLockWriteGuard<'_, AppendVocab> {
         self.inner.write()

@@ -4,7 +4,9 @@
 >
 > **Phases:** Additive bounded history reads come first, followed by controlled
 > permission preparation and adoption by callers that require an operation limit.
-> Phase 1 provides bounded historical snapshots. Phases 2 and 3 remain open.
+> Phase 1 provides bounded historical snapshots. Phase 2 supports controlled masks
+> and the built-in disclosure guard without protection-pattern planning. The remaining
+> Phase 2 work and Phase 3 caller adoption stay open.
 
 ## Goals
 
@@ -152,7 +154,42 @@ rebuilding a live index. A pruned branch-time selector whose commit cannot be re
 returns `HistoryGone` with an absent sequence and its original time selector. Time
 inheritance is allowed only strictly before the proven fork time.
 
-Phase 2's controlled permission masks and guard providers remain open. Phase 3's
-guarded Dataset and query adoption, C25 exact references and U02 physical-reader
-adoption remain under item 395. The trusted history handles do not provide managed
-write authority, source authenticity or a complete query preparation limit.
+Phase 2 adds `GraphAccess::masked_controlled` and a shared `Preparation` for graph,
+predicate, class and subclass rules. Cancellation, absolute deadlines and a request
+memory cap cover policy binding, caller attributes, provider exemptions, physical
+scans, term reconstruction, class closure, hidden-key ordering and mask construction.
+The same context checks cached results and lock waits. `with_no_wait(true)` refuses
+an already held preparation lock. Failure returns no view and installs no partial
+mask. Existing entry points retain their established behavior.
+
+A `PreparedView` keeps the bound access policy, physical triple mask and retained-state
+reservations together. Consumers must apply its graph policy while reading its
+snapshot. The snapshot alone does not enforce graph restrictions. Its accessors
+borrow that owner. Independent raw clones and caller-owned copies need separate
+accounting. The cap covers conservative peak
+working storage and retained delta, policy and mask allocations, including spare
+container capacity. It does not replace immutable index mappings, shared store cache
+accounting or query execution limits.
+
+`GuardDecision::exempt_controlled` is an additive provider contract. Its default
+returns `Unsupported` without invoking the legacy callback. The built-in GraphRAG
+disclosure guard supports this contract with controlled index reads, digest checking,
+typed footprint parsing and exact policy coverage. A cold controlled call keeps its
+index local. A compatible existing index can be reused after retained-state admission.
+These checks preserve disclosure visibility; they confer no source authenticity or
+managed-write authority.
+
+Protection-pattern planning remains explicitly unsupported on this bounded entry
+point. It cannot call the existing unbounded parser or planner and claim the result
+satisfies the cap. The remaining pattern work and Phase 3 guarded Dataset and query
+adoption, C25 exact references and U02 readers remain under item 395. The physical
+history handles and controlled permission helper do not provide an end-to-end query
+preparation limit for those callers.
+
+Controlled preparation accepts extra checks, conservative workspace admission and
+temporary allocations. Delta vocabulary lookup may scan borrowed entries, and a cold
+disclosure call builds a request-local index. Local unoptimized diagnostics compare
+identical cold and cached inputs, verify equal RDF answers or exemptions and record
+elapsed time. The core diagnostic also observes allocation with the existing moving
+test allocator. These diagnostics do not establish release performance. Item 398
+tracks release measurements and cost reduction before broader caller adoption.

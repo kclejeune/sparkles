@@ -30,6 +30,8 @@ use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+mod controlled;
+
 /// The footprint format this server reads and writes.
 pub const FOOTPRINT_VERSION: u32 = 1;
 /// The pattern that names every guarded graph.
@@ -674,6 +676,14 @@ struct Decide {
 impl GuardDecision for Decide {
     fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String> {
         self.guard.index(snap).proven(&self.view)
+    }
+
+    fn exempt_controlled(
+        &self,
+        snap: &Arc<Snapshot>,
+        preparation: &sparkles::access::Preparation,
+    ) -> sparkles::Result<sparkles::access::Exemptions> {
+        controlled::exempt(&self.guard, snap, &self.view, preparation)
     }
 }
 

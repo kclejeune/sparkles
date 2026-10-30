@@ -1212,6 +1212,172 @@ impl Vocab {
         Ok(out)
     }
 
+    /// Request-controlled reconstruction. The callback borrows admitted scratch.
+    pub(crate) fn get_with_controlled<T>(
+        &self,
+        id: u64,
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> crate::error::Result<Option<T>> {
+        checkpoint("starting vocabulary reconstruction")?;
+        if id >= self.len {
+            return Ok(None);
+        }
+        let b = id as usize / FC_BLOCK;
+        let mut result = None;
+        self.scan_block_controlled(
+            b,
+            1 << (id as usize % FC_BLOCK),
+            &mut reserve,
+            &mut checkpoint,
+            |_, key| {
+                result = Some(f(key));
+                Ok(false)
+            },
+        )?;
+        Ok(result)
+    }
+
+    fn scan_block_controlled(
+        &self,
+        b: usize,
+        wanted: u32,
+        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
+        checkpoint: &mut impl FnMut(&'static str) -> crate::error::Result<()>,
+        mut each: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        let _timer = ioacct::timer(Phase::VocabRead);
+        let data = self.data.as_slice();
+        let mut position = self.block_offset(b);
+        let count = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+        let wanted = wanted & ((1u32 << count) - 1);
+        if wanted == 0 {
+            return Ok(());
+        }
+        let last = 31 - wanted.leading_zeros() as usize;
+        let mut key = Vec::new();
+        let read_entry = |position: &mut usize, first| {
+            if self.fsst.is_some() {
+                self.entry::<true>(data, position, first)
+            } else {
+                self.entry::<false>(data, position, first)
+            }
+        };
+        let mut entry = read_entry(&mut position, true);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
+        for at in 0..=last {
+            checkpoint("reconstructing vocabulary entry")?;
+            let id = (b * FC_BLOCK + at) as u64;
+            let next = (at < last).then(|| read_entry(&mut position, false));
+            let need = lookahead(wanted, at, next);
+            key.truncate(entry.shared.min(need));
+            if need > entry.shared {
+                let prefix = key.len();
+                let coded = entry.coded.then(|| {
+                    self.fsst
+                        .as_ref()
+                        .expect("coded vocabulary metadata")
+                        .table(id)
+                });
+                let suffix = &data[entry.start..entry.start + entry.len];
+                let add = if need == usize::MAX {
+                    if let Some(table) = coded {
+                        table.measure_controlled(
+                            suffix,
+                            |length| reserve(prefix.saturating_add(length)),
+                            checkpoint,
+                        )?
+                    } else {
+                        entry.len
+                    }
+                } else {
+                    (need - entry.shared).min(entry.most())
+                };
+                let total = prefix
+                    .checked_add(add)
+                    .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
+                if total > key.capacity() {
+                    reserve(total)?;
+                    key.try_reserve_exact(total - key.len()).map_err(|_| {
+                        crate::error::Error::invalid("vocabulary allocation failed")
+                    })?;
+                    if key.capacity() != total {
+                        return Err(crate::error::Error::invalid(
+                            "unsupported vocabulary scratch capacity",
+                        ));
+                    }
+                }
+                if let Some(table) = coded {
+                    table.decode_controlled(suffix, add, &mut key, checkpoint)?;
+                } else {
+                    for chunk in suffix[..suffix.len().min(add)].chunks(1024) {
+                        key.extend_from_slice(chunk);
+                        checkpoint("copying vocabulary suffix")?;
+                    }
+                }
+            }
+            if wanted >> at & 1 == 1 && !each(at, &key)? {
+                break;
+            }
+            if let Some(next) = next {
+                entry = next;
+            }
+        }
+        checkpoint("completed vocabulary reconstruction")
+    }
+
+    pub(crate) fn find_with_controlled(
+        &self,
+        key: &[u8],
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+    ) -> crate::error::Result<std::result::Result<u64, u64>> {
+        let (mut lo, mut hi) = (0usize, self.num_blocks());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if compare_prepared_bytes(self.block_first(mid), key, &mut checkpoint)?.is_le() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            checkpoint("completed vocabulary search")?;
+            return Ok(Err(0));
+        }
+        let b = lo - 1;
+        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
+        // The scanner owns the mutable checkpoint; comparisons borrow the same
+        // callback through a RefCell only for the duration of each nonnested call.
+        let check = std::cell::RefCell::new(&mut checkpoint);
+        self.scan_block_controlled(
+            b,
+            ALL_KEYS,
+            &mut reserve,
+            &mut |phase| check.borrow_mut()(phase),
+            |at, actual| {
+                Ok(
+                    match compare_prepared_bytes(actual, key, &mut |phase| {
+                        check.borrow_mut()(phase)
+                    })? {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => {
+                            result = Ok((b * FC_BLOCK + at) as u64);
+                            false
+                        }
+                        std::cmp::Ordering::Greater => {
+                            result = Err((b * FC_BLOCK + at) as u64);
+                            false
+                        }
+                    },
+                )
+            },
+        )?;
+        Ok(result)
+    }
+
     /// A serializer that already prefetched these blocks does not need dense hints
     /// or a per-block bitmap check on its decode's hot path.
     #[inline]
@@ -2209,6 +2375,26 @@ pub struct AppendVocab {
     key_bytes: usize,
 }
 
+fn compare_prepared_bytes(
+    left: &[u8],
+    right: &[u8],
+    checkpoint: &mut impl FnMut(&'static str) -> crate::error::Result<()>,
+) -> crate::error::Result<std::cmp::Ordering> {
+    let common = left.len().min(right.len());
+    for (left, right) in left[..common]
+        .chunks(1024)
+        .zip(right[..common].chunks(1024))
+    {
+        checkpoint("comparing vocabulary bytes")?;
+        let order = left.cmp(right);
+        if !order.is_eq() {
+            return Ok(order);
+        }
+    }
+    checkpoint("completed vocabulary comparison")?;
+    Ok(left.len().cmp(&right.len()))
+}
+
 impl AppendVocab {
     pub fn len(&self) -> u64 {
         self.keys.len() as u64
@@ -2225,6 +2411,32 @@ impl AppendVocab {
         }
         self.map.get(key).copied()
     }
+    /// Controlled lookup avoids hashing an arbitrarily long live or cold key.
+    /// This opt-in scan trades lookup latency for cooperative polling without
+    /// allocating another persistent index or changing the ordinary hash path.
+    pub(crate) fn find_prepared(
+        &self,
+        key: &[u8],
+        limit: u64,
+        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+    ) -> crate::error::Result<Option<u64>> {
+        for (id, candidate) in self
+            .keys
+            .iter()
+            .take(limit.min(self.len()) as usize)
+            .enumerate()
+        {
+            checkpoint("searching delta vocabulary")?;
+            if candidate.len() == key.len()
+                && compare_prepared_bytes(candidate, key, &mut checkpoint)?.is_eq()
+            {
+                return Ok(Some(id as u64));
+            }
+        }
+        checkpoint("completed delta vocabulary search")?;
+        Ok(None)
+    }
+
     pub fn insert(&mut self, key: &[u8]) -> (u64, bool) {
         if let Some(index) = &mut self.cold {
             let hash = cold::fingerprint(key);
@@ -3341,6 +3553,183 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn controlled_fsst_reconstruction_observes_controls_inside_length_and_decode() {
+        use crate::Error;
+        use crate::access::Preparation;
+        use crate::task::{Control, Progress};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::{Duration, Instant};
+        let keys: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("\"{i} {}", "payload words ".repeat(12_000)).into_bytes())
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        write_codec(dir.path(), &keys, true);
+        let v = Vocab::open(dir.path()).unwrap();
+        let mut position = v.block_offset(0);
+        v.entry::<true>(v.data.as_slice(), &mut position, true);
+        let entry = v.entry::<true>(v.data.as_slice(), &mut position, false);
+        assert!(
+            entry.coded && entry.len > 2048,
+            "fixture must traverse actual long FSST suffix"
+        );
+        for phase in ["measuring vocabulary suffix", "decoding vocabulary suffix"] {
+            for deadline_mode in [false, true] {
+                let seen = Arc::new(AtomicBool::new(false));
+                let observed = seen.clone();
+                let control = Control::none();
+                let cancel = control.cancel.clone();
+                let deadline = deadline_mode.then(|| Instant::now() + Duration::from_millis(100));
+                let preparation = Preparation::new(
+                    Control {
+                        deadline,
+                        progress: Progress::new(move |_, message| {
+                            if message == phase && !observed.swap(true, Ordering::SeqCst) {
+                                if let Some(deadline) = deadline {
+                                    while let Some(left) =
+                                        deadline.checked_duration_since(Instant::now())
+                                    {
+                                        std::thread::park_timeout(left);
+                                    }
+                                } else {
+                                    cancel.cancel();
+                                }
+                            }
+                        }),
+                        ..control
+                    },
+                    16 << 20,
+                )
+                .unwrap();
+                let published = std::cell::Cell::new(false);
+                let result = v.get_with_controlled(
+                    1,
+                    |_| Ok(()),
+                    |phase| preparation.checkpoint(phase),
+                    |_| published.set(true),
+                );
+                assert!(
+                    seen.load(Ordering::SeqCst),
+                    "missing checkpoint inside {phase}"
+                );
+                assert!(!published.get());
+                assert!(if deadline_mode {
+                    matches!(result, Err(Error::Timeout))
+                } else {
+                    matches!(result, Err(Error::Cancelled))
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_vocabulary_matches_old_search_and_decoding_for_both_codecs() {
+        let mut keys: Vec<Vec<u8>> = (0..90)
+            .map(|i| {
+                format!(
+                    "\"{i:05} {}",
+                    "payload words ".repeat(if i % 7 == 0 { 3000 } else { 1 })
+                )
+                .into_bytes()
+            })
+            .collect();
+        keys.extend((0..90).map(|i| {
+            format!(
+                "<urn:{i:05}:{}",
+                "iri ".repeat(if i % 11 == 0 { 2000 } else { 1 })
+            )
+            .into_bytes()
+        }));
+        keys.sort();
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let vocab = Vocab::open(dir.path()).unwrap();
+            for (id, key) in keys.iter().enumerate() {
+                let capacity = std::cell::Cell::new(0);
+                let actual = vocab
+                    .get_with_controlled(
+                        id as u64,
+                        |bytes| {
+                            capacity.set(capacity.get().max(bytes));
+                            Ok(())
+                        },
+                        |_| Ok(()),
+                        |bytes| {
+                            assert!(bytes.len() <= capacity.get());
+                            bytes.to_vec()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(actual.as_ref(), Some(key));
+                assert_eq!(
+                    vocab
+                        .find_with_controlled(key, |_| Ok(()), |_| Ok(()))
+                        .unwrap(),
+                    vocab.find(key)
+                );
+                let mut absent = key.clone();
+                absent.push(0);
+                assert_eq!(
+                    vocab
+                        .find_with_controlled(&absent, |_| Ok(()), |_| Ok(()))
+                        .unwrap(),
+                    vocab.find(&absent)
+                );
+            }
+            assert_eq!(
+                vocab
+                    .get_with_controlled(
+                        u64::MAX,
+                        |_| panic!("absent allocation"),
+                        |_| Ok(()),
+                        |_| ()
+                    )
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_fsst_low_cap_refuses_during_length_before_decode_or_allocation() {
+        use std::cell::Cell;
+        let keys: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("\"{i} {}", "payload words ".repeat(12_000)).into_bytes())
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        write_codec(dir.path(), &keys, true);
+        let vocab = Vocab::open(dir.path()).unwrap();
+        let largest = Cell::new(0);
+        let decoded = Cell::new(false);
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 32 << 10).unwrap();
+        let mut workspace = preparation.reserve(0).unwrap();
+        let result = vocab.get_with_controlled(
+            1,
+            |bytes| {
+                largest.set(largest.get().max(bytes));
+                workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256))
+            },
+            |phase| {
+                if phase == "decoding vocabulary suffix" {
+                    decoded.set(true);
+                }
+                Ok(())
+            },
+            |_| panic!("refused key published"),
+        );
+        assert!(matches!(result, Err(crate::Error::BudgetExceeded(_))));
+        assert!(!decoded.get());
+        assert!(
+            largest.get() < keys[1].len() / 2,
+            "whole suffix measured before admission refusal"
+        );
     }
 
     /// A damaged shared-prefix length in the entry after a key does not make a checked

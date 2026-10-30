@@ -226,6 +226,13 @@ Catalog disposal checks shared runtime ownership and preserves original owners o
 The [integration guide](../integrations/README.md#libraries-and-bindings) describes raw
 Strong and Weak aliases. These lifetime checks grant no read permission or durable retention.
 
+The Rust controlled permission helper can prepare graph, predicate and class masks
+and the built-in disclosure guard under one memory cap and `Control`. It explicitly
+refuses unsupported providers and protection-pattern planning. C25 exact-reference
+resolution and guarded Dataset queries still require caller adoption under
+[item 395](../ROADMAP.md). A prepared visibility view provides no source authenticity,
+managed-write authority or proof that an unavailable reference is absent.
+
 Source revisions, renditions and passages retain exact identities and digests. Claim
 occurrences describe a proposition with an RDF 1.2 triple term without asserting it.
 Evidence links distinguish support, contradiction and mention. Declared lineage stays

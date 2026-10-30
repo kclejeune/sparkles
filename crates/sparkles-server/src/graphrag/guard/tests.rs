@@ -372,3 +372,272 @@ fn a_view_resolved_before_a_commit_sees_the_new_footprint() {
         .unwrap();
     assert!(!v.bound(&s.snapshot()).read.allows_iri(REPORTS));
 }
+
+fn controlled_exemptions(
+    g: &Arc<Guard>,
+    snap: &Arc<Snapshot>,
+    v: &GraphAccess,
+    p: &sparkles::access::Preparation,
+) -> sparkles::Result<Vec<String>> {
+    let output = Decide {
+        guard: g.clone(),
+        view: v.clone(),
+    }
+    .exempt_controlled(snap, p)?;
+    let mut values: Vec<_> = output.iter().map(str::to_string).collect();
+    values.sort();
+    Ok(values)
+}
+
+#[test]
+fn controlled_provider_matches_real_guard_for_cold_and_cached_footprints_and_callers() {
+    use sparkles::access::Preparation;
+    use sparkles::task::Control;
+    let c = caller("reports", &["north", "south"]);
+    let p = protection(
+        "salary",
+        Some("?s <http://ex/owner> ?user . ?s <http://ex/group> ?group"),
+    );
+    let fp = footprint(
+        Some(&view(&[A], std::slice::from_ref(&p), c.clone())),
+        &[A],
+        &c,
+    );
+    let wide = footprint(Some(&view(&[A, B], &[], c.clone())), &[A, B], &c);
+    let mut two = with_footprint(&fp);
+    for q in wide.quads(REPORTS) {
+        two.push_str(&nq(&q));
+    }
+    let forged = with_footprint(&fp).replacen("\\\"version\\\":1", "\\\"version\\\":2", 1);
+    let mut newer = fp.clone();
+    newer.version = FOOTPRINT_VERSION + 1;
+    let missing = format!(
+        "<{REPORTS}> {{ <urn:r> <{}> <urn:missing> . }}",
+        gr("disclosure")
+    );
+    let mut duplicate_literal = with_footprint(&fp);
+    duplicate_literal.push_str(&format!(
+        "<{DISCLOSURE_GRAPH}> {{ <{}> <{}> \"other\" . }}",
+        fp.iri(),
+        gr("footprint")
+    ));
+    let mut matching = c.clone();
+    matching.groups = vec!["south".into(), "north".into(), "north".into()];
+    let readers = [
+        reader(&[A, REPORTS]),
+        reader(&[A, B, REPORTS]),
+        reader(&[B, REPORTS]),
+        view(&[A, REPORTS], std::slice::from_ref(&p), matching),
+        view(
+            &[A, REPORTS],
+            std::slice::from_ref(&p),
+            caller("different", &["north", "south"]),
+        ),
+        GraphAccess::all(),
+    ];
+    for trig in [
+        with_footprint(&fp),
+        two,
+        forged,
+        with_footprint(&newer),
+        missing,
+        duplicate_literal,
+    ] {
+        let s = store(&trig);
+        let snap = s.snapshot();
+        for v in &readers {
+            let mut expected = Guard::new().index(&snap).proven(v);
+            expected.sort();
+            for warm in [false, true] {
+                let guard = Arc::new(Guard::new());
+                if warm {
+                    guard.index(&snap);
+                }
+                let actual = controlled_exemptions(
+                    &guard,
+                    &snap,
+                    v,
+                    &Preparation::new(Control::none(), 32 << 20).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "warm={warm}");
+            }
+        }
+        assert_eq!(s.snapshot().commit, snap.commit);
+    }
+}
+
+#[test]
+fn controlled_guarded_access_uses_actual_provider_without_changing_write_permissions() {
+    use sparkles::access::Preparation;
+    use sparkles::task::Control;
+    let c = caller("reports", &[]);
+    let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    let s = store(&with_footprint(&fp));
+    let g = Arc::new(Guard::new());
+    let access = apply(
+        GraphAccess::graphs(graphs(&[A, REPORTS]), graphs(&[A, REPORTS])),
+        Some(&g),
+    );
+    let old = Arc::new(access.clone()).bound(&s.snapshot());
+    let prepared = access
+        .masked_controlled(
+            &s.snapshot(),
+            &Preparation::new(Control::none(), 16 << 20).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(prepared.access(), old.as_ref());
+    assert!(prepared.access().read.allows_iri(REPORTS));
+    assert!(prepared.access().write.allows_iri(A));
+    assert!(!prepared.access().write.allows_iri(REPORTS));
+    assert!(std::ptr::eq(prepared.snapshot(), s.snapshot().as_ref()));
+}
+
+#[test]
+fn controlled_provider_cache_caps_and_real_lock_wait_observe_controls_before_release() {
+    use sparkles::access::Preparation;
+    use sparkles::task::{Control, Progress};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let c = caller("reports", &[]);
+    let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    let s = store(&with_footprint(&fp));
+    let snap = s.snapshot();
+    let v = reader(&[A, REPORTS]);
+    let guard = Arc::new(Guard::new());
+    guard.index(&snap);
+    let low = controlled_exemptions(
+        &guard,
+        &snap,
+        &v,
+        &Preparation::new(Control::none(), 256).unwrap(),
+    );
+    assert!(
+        matches!(low, Err(sparkles::Error::BudgetExceeded(ref budget)) if budget.limit == 256 && budget.requested == 257)
+    );
+    for mode in 0..3 {
+        let held = guard.indexes.lock();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let control = Control {
+            progress: Progress::new(move |_, message| {
+                if message == "waiting for view preparation" {
+                    let _ = entered_tx.try_send(());
+                }
+            }),
+            deadline: (mode == 1).then(|| Instant::now() + Duration::from_millis(300)),
+            ..Control::none()
+        };
+        let deadline = control.deadline;
+        let cancel = control.cancel.clone();
+        let g = guard.clone();
+        let snap = snap.clone();
+        let view = v.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let prep = Preparation::new(control, 16 << 20)
+                .unwrap()
+                .with_no_wait(mode == 2);
+            done_tx
+                .send(controlled_exemptions(&g, &snap, &view, &prep))
+                .unwrap();
+        });
+        let entered = if mode != 2 {
+            entered_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        } else {
+            true
+        };
+        if mode == 0 {
+            cancel.cancel();
+        }
+        if let Some(deadline) = deadline {
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                std::thread::park_timeout(remaining);
+            }
+        }
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        worker.join().unwrap();
+        assert!(entered);
+        let result =
+            result.expect("provider did not settle while its real index mutex stayed held");
+        match mode {
+            0 => assert!(matches!(result, Err(sparkles::Error::Cancelled))),
+            1 => assert!(matches!(result, Err(sparkles::Error::Timeout))),
+            _ => assert!(
+                matches!(result, Err(sparkles::Error::Invalid(ref message)) if message.contains("no_wait"))
+            ),
+        }
+    }
+}
+
+#[test]
+fn controlled_disclosure_row_temporaries_release_before_the_next_row() {
+    use sparkles::access::Preparation;
+    use sparkles::task::Control;
+    let c = caller("reports", &[]);
+    let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    let mut data = with_footprint(&fp);
+    for row in 0..12_000 {
+        data.push_str(&format!(
+            "<{REPORTS}> {{ <urn:report:{row}> <{}> <{}> . }}\n",
+            gr("disclosure"),
+            fp.iri()
+        ));
+    }
+    let s = store(&data);
+    s.compact().unwrap();
+    let g = Arc::new(Guard::new());
+    let result = controlled_exemptions(
+        &g,
+        &s.snapshot(),
+        &reader(&[A, REPORTS]),
+        &Preparation::new(Control::none(), 2 << 20).unwrap(),
+    );
+    assert_eq!(result.unwrap(), vec![REPORTS.to_string()]);
+}
+
+#[test]
+#[ignore = "local controlled provider latency diagnostic"]
+fn controlled_provider_preparation_cost_diagnostic() {
+    use sparkles::access::Preparation;
+    use sparkles::task::Control;
+    use std::time::Instant;
+    let c = caller("reports", &[]);
+    let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    for rows in [100, 2000] {
+        let mut data = with_footprint(&fp);
+        for row in 0..rows {
+            data.push_str(&format!(
+                "<{REPORTS}> {{ <urn:r{row}> <{}> <{}> . }}\n",
+                gr("disclosure"),
+                fp.iri()
+            ));
+        }
+        let s = store(&data);
+        s.compact().unwrap();
+        let snapshot = s.snapshot();
+        let access = reader(&[A, REPORTS]);
+        for warm in [false, true] {
+            for round in 0..5 {
+                let old = Guard::new();
+                let controlled = Arc::new(Guard::new());
+                if warm {
+                    old.index(&snapshot);
+                    controlled.index(&snapshot);
+                }
+                let start = Instant::now();
+                let mut expected = old.index(&snapshot).proven(&access);
+                let old_ns = start.elapsed().as_nanos();
+                expected.sort();
+                let p = Preparation::new(Control::none(), 16 << 20).unwrap();
+                let start = Instant::now();
+                let actual = controlled_exemptions(&controlled, &snapshot, &access, &p).unwrap();
+                let controlled_ns = start.elapsed().as_nanos();
+                assert_eq!(actual, expected);
+                eprintln!(
+                    "provider cost rows={rows} warm={warm} round={round} legacy_ns={old_ns} controlled_ns={controlled_ns}"
+                );
+            }
+        }
+    }
+}

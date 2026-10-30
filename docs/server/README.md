@@ -193,8 +193,37 @@ link partially complete specs to their remaining work and acceptance criteria.
 
 ### Read-view preparation limits
 
-Existing query execution, hidden-quad and pattern-row limits do not provide a shared
-request-scoped memory cap across historical replay and permission preparation.
-[C29](../specs/C29-bounded-view-preparation/README.md), roadmap item 395, adds those
-controlled reads and caller adoption. A bounded caller must refuse unsupported or
-excessive preparation rather than weaken the requested policy or select another state.
+Rust callers can prepare graph, predicate and class permission masks with
+`GraphAccess::masked_controlled` and one `Preparation`. Its `Control` carries
+cancellation and an absolute deadline through binding, scans, vocabulary decoding,
+class closure, ordering and supported providers. The request memory cap covers
+conservative temporary peaks and retained delta, policy and mask storage. Cached
+results must fit it too. `with_no_wait(true)` refuses a preparation lock that is held.
+A refused call returns no partial view.
+
+The returned `PreparedView` owns its retained-state reservations and borrows its access
+policy and snapshot to callers. Apply both together, since the physical triple mask
+does not enforce graph restrictions by itself. Keep that owner alive while using the
+prepared view.
+Independent copies need their own accounting. This cap does not cover subsequent
+query execution or replace the store's accounting for immutable mappings and shared
+caches. Existing query, hidden-quad and pattern-row limits retain their scope.
+
+Providers implement `GuardDecision::exempt_controlled` to share these controls and
+reservations. The default returns `Unsupported` without running the legacy callback.
+The built-in GraphRAG disclosure guard supports controlled preparation, including cold
+index reads, footprint digest checking and exact coverage. It builds a temporary local
+index on a cold call and can reuse an existing compatible index after admission.
+
+Arbitrary protection-pattern planning remains unsupported by the bounded helper.
+Guarded Dataset queries, C25 exact references and U02 readers still need adoption under
+[C29](../specs/C29-bounded-view-preparation/README.md), roadmap item 395. These helpers
+provide no managed-write authority, source authenticity or complete HTTP query
+preparation limit. Bounded callers must propagate refusal without weakening the policy
+or selecting another state.
+
+Controlled dictionary lookup and mask preparation incur additional checks and temporary
+allocations. Delta vocabulary lookup may scan retained entries, and a cold disclosure
+call rebuilds its local index. These costs belong to the opt-in preparation helper.
+[Item 398](../ROADMAP.md) tracks release measurements and reductions before broader
+caller adoption.

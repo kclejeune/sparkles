@@ -2700,6 +2700,119 @@ impl PermIndex {
         Ok(true)
     }
 
+    /// A permission preparation reads one admitted segment at a time. Cache access
+    /// is nonblocking; contention causes a controlled local decode, never a wait
+    /// inside the shared cache. Dense-reader hints do not enlarge the segment.
+    pub(crate) fn for_each_prepared(
+        &self,
+        cache: &BlockCache,
+        lo: &Key,
+        hi: &Key,
+        preparation: &crate::access::Preparation,
+        mut each: impl FnMut(&Block, usize, usize) -> Result<bool>,
+    ) -> Result<()> {
+        preparation.check()?;
+        let (b0, b1) = self.key_block_range(lo, hi);
+        for b in b0..b1 {
+            preparation.check()?;
+            let (s0, s1) = self.segs.as_ref().map_or((0, 1), |directory| {
+                let n = directory.count(b);
+                (
+                    partition(n, |s| directory.first_key(b, s) <= *lo).saturating_sub(1),
+                    partition(n, |s| directory.first_key(b, s) <= *hi).max(1),
+                )
+            });
+            for part in s0..s1 {
+                let segment = self.segs.as_ref().map(|_| part);
+                let rows = segment.map_or(self.blocks[b].rows as usize, |s| {
+                    let (start, end) = self.segment_rows(b, s);
+                    end - start
+                });
+                let workspace = (rows as u64).saturating_mul(52).saturating_add(1024);
+                // This reservation participates in the caller's single ledger.
+                let _held = preparation.reserve(workspace)?;
+                let options = preparation.history_options();
+                let limit = crate::history::ReadLimit {
+                    options: &options,
+                    memory: Some(workspace),
+                    held: 0,
+                };
+                let mut scratch = Vec::new();
+                let mut columns = std::array::from_fn(|_| empty_col());
+                for (column, output) in columns.iter_mut().enumerate() {
+                    preparation.check()?;
+                    let cache_key =
+                        cache.key(self, b, column, segment.map_or(WHOLE, |s| s as u32 + 1));
+                    if let Ok(Some(cached)) = cache.cache.try_get(&cache_key) {
+                        cache.count_hits(1);
+                        *output = cached;
+                        continue;
+                    }
+                    let metadata = &self.blocks[b];
+                    let mut offset = usize::try_from(metadata.offset)
+                        .ok()
+                        .and_then(|base| {
+                            metadata.col_len[..column]
+                                .iter()
+                                .try_fold(base, |sum, length| sum.checked_add(*length as usize))
+                        })
+                        .ok_or_else(|| Error::Corrupt("prepared column offset overflow".into()))?;
+                    let mut length = metadata.col_len[column] as usize;
+                    if let (Some(s), Some(directory)) = (segment, &self.segs) {
+                        let mut before = 0usize;
+                        for prior in 0..s {
+                            preparation.check()?;
+                            before = before
+                                .checked_add(directory.frame_len(b, prior, column))
+                                .ok_or_else(|| {
+                                    Error::Corrupt("prepared segment offset overflow".into())
+                                })?;
+                        }
+                        let frame = directory.frame_len(b, s, column);
+                        if before.checked_add(frame).is_none_or(|end| end > length) {
+                            return Err(Error::Corrupt(
+                                "prepared segment ends past its column".into(),
+                            ));
+                        }
+                        offset = offset.checked_add(before).ok_or_else(|| {
+                            Error::Corrupt("prepared segment offset overflow".into())
+                        })?;
+                        length = frame;
+                    }
+                    let end = offset
+                        .checked_add(length)
+                        .ok_or_else(|| Error::Corrupt("prepared column length overflow".into()))?;
+                    let frame = self
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get(offset..end))
+                        .ok_or_else(|| {
+                            Error::Corrupt("prepared column ends past the index".into())
+                        })?;
+                    *output =
+                        decode_point_column_limited(frame, rows, &mut scratch, &limit, workspace)
+                            .map_err(|error| preparation.sanitize(error))?;
+                    crate::ioacct::column_decoded(self.perm, rows, length);
+                    preparation.check()?;
+                    if cache.fill {
+                        let _ = cache.cache.try_insert(cache_key, output.clone());
+                    }
+                }
+                let block = Block {
+                    cols: columns,
+                    rows,
+                };
+                let (start, end) = block.key_range(lo, hi);
+                preparation.check()?;
+                if start < end && !each(&block, start, end)? {
+                    preparation.check()?;
+                    return Ok(());
+                }
+            }
+        }
+        preparation.check()
+    }
+
     /// Bounded point lookup for historical replay. Fresh local scratch avoids the
     /// ordinary decoder's unaccounted thread-local buffer; cache identity is shared.
     pub(crate) fn contains_limited(

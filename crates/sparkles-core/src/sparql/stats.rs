@@ -206,6 +206,52 @@ impl CountCache {
         s
     }
 
+    pub(crate) fn prepared_mask_slot(
+        &self,
+        key: &str,
+        preparation: &crate::access::Preparation,
+    ) -> Result<Option<MaskSlot>> {
+        let slots = preparation.lock(&self.masks)?;
+        for (stored, slot) in slots.iter() {
+            if preparation.compare(stored, key)?.is_eq() {
+                return Ok(Some(slot.clone()));
+            }
+        }
+        preparation.check()?;
+        Ok(None)
+    }
+
+    /// Only complete successful masks enter the cache. Controlled cold builders
+    /// may race, but never install an empty slot or evict other views on refusal.
+    pub(crate) fn cache_prepared_mask(
+        &self,
+        key: String,
+        value: Arc<Snapshot>,
+        preparation: &crate::access::Preparation,
+    ) -> Result<()> {
+        // Keep standard HashMap hashing and any relocation bounded. Large keys
+        // still produce exact views and can reuse old entries through the
+        // controlled comparison path; a cold result simply skips this cache.
+        if key.len() > 4096 {
+            return preparation.check();
+        }
+        let _workspace = preparation.reserve(32 << 10)?;
+        let mut slots = preparation.lock(&self.masks)?;
+        if slots.len() >= 64 {
+            return preparation.check();
+        }
+        for stored in slots.keys() {
+            preparation.check()?;
+            if stored.len() > 4096 || preparation.compare(stored, &key)?.is_eq() {
+                return preparation.check();
+            }
+        }
+        slots.try_reserve(1).map_err(|_| preparation.exhausted())?;
+        preparation.check()?;
+        slots.insert(key, Arc::new(Mutex::new(Some(value))));
+        Ok(())
+    }
+
     /// The correction of the pattern table of `scope` for the delta of `snap`, worked out
     /// by `compute` once per snapshot. An error (a cancelled query) is not kept.
     pub(crate) fn pattern_correction(

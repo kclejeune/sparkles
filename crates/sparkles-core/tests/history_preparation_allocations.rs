@@ -518,3 +518,197 @@ fn backward_nonempty_whole_column_base_is_admitted_before_decode() {
         "read/refusal modified durable bytes"
     );
 }
+
+/// Permission scans must admit decode and mask work before allocating them, just
+/// as retained replay does. Reuse this binary's existing moving/counting allocator.
+#[test]
+fn controlled_permissions_refuse_before_oversized_scan_and_mask_allocations() {
+    use sparkles_core::access::{
+        Caller, GraphAccess, Graphs, Limits, Preparation, Protection, Rule, TripleRules,
+    };
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::task::Control;
+    use std::sync::Arc;
+    let _serial = MEASURE_LOCK.lock().unwrap();
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for row in 0..6000 {
+        data.push_str(&format!("<urn:s{row}> <urn:secret> <urn:o> .\n"));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    store.compact().unwrap();
+    let snap = store.snapshot();
+    for classes in [None, Some(vec!["urn:Class".into()])] {
+        let view = GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "secret".into(),
+                        predicates: Some(vec!["urn:s*".into()]),
+                        classes,
+                        subclasses: true,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        );
+        let cap = 32 << 10;
+        let preparation = Preparation::new(Control::none(), cap).unwrap();
+        let (result, largest, allocated) = measure(|| view.masked_controlled(&snap, &preparation));
+        assert!(
+            matches!(result, Err(Error::BudgetExceeded(ref budget)) if budget.kind == sparkles_core::BudgetKind::Memory && budget.limit == cap && budget.requested == cap + 1)
+        );
+        assert!(
+            largest <= cap as usize,
+            "oversized allocation occurred before refusal: {largest}"
+        );
+        // This refused call performs only its small policy/key work. Its cumulative
+        // caller allocation also bounds its newly owned peak, without subtracting
+        // pre-window or other-thread frees.
+        assert!(
+            allocated <= cap as usize,
+            "oversized preparation occurred before refusal: {allocated}"
+        );
+        assert_eq!(store.snapshot().commit, snap.commit);
+        assert_eq!(store.snapshot().len(), 6000);
+    }
+}
+
+/// An opt-in local cost diagnostic. The allocator and cold/warm stores are held
+/// fixed across the two entry points. Published performance results use the
+/// repository benchmark workflow; this produces private raw acceptance evidence.
+#[test]
+#[ignore = "local preparation allocation and latency diagnostic"]
+fn controlled_permission_preparation_cost_diagnostic() {
+    use sparkles_core::access::{
+        Caller, GraphAccess, Graphs, Limits, Preparation, Protection, Rule, TripleRules,
+    };
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::task::Control;
+    use std::{collections::BTreeMap, sync::Arc, time::Instant};
+    let _lock = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let view = GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::none(),
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(Protection {
+                    name: "secret".into(),
+                    predicates: Some(vec!["urn:secret".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: BTreeMap::new(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    );
+    for rows in [1000, 6000] {
+        let data = (0..rows)
+            .map(|row| {
+                format!(
+                    "<urn:s{row}> <{}> <urn:o> .\n",
+                    if row % 2 == 0 {
+                        "urn:secret"
+                    } else {
+                        "urn:visible"
+                    }
+                )
+            })
+            .collect::<String>();
+        for warm in [false, true] {
+            for round in 0..3 {
+                let build = || {
+                    let store = Store::in_memory(StoreOptions::default());
+                    store
+                        .load(&[Source::from_bytes(
+                            data.as_bytes().to_vec(),
+                            RdfFormat::NTriples,
+                            None,
+                        )])
+                        .unwrap();
+                    store.compact().unwrap();
+                    store
+                };
+                let old = build();
+                let bounded = build();
+                if warm {
+                    view.masked(&old.snapshot()).unwrap();
+                    view.masked_controlled(
+                        &bounded.snapshot(),
+                        &Preparation::new(Control::none(), 64 << 20).unwrap(),
+                    )
+                    .unwrap();
+                }
+                eprintln!("cost scenario rows={rows} warm={warm} round={round} path=legacy");
+                let ((legacy, old_ns), old_largest, old_total) = measure(|| {
+                    let start = Instant::now();
+                    let result = view.masked(&old.snapshot()).unwrap();
+                    (result, start.elapsed().as_nanos())
+                });
+                let preparation = Preparation::new(Control::none(), 64 << 20).unwrap();
+                eprintln!("cost scenario rows={rows} warm={warm} round={round} path=controlled");
+                let ((prepared, new_ns), new_largest, new_total) = measure(|| {
+                    let start = Instant::now();
+                    let result = view
+                        .masked_controlled(&bounded.snapshot(), &preparation)
+                        .unwrap();
+                    (result, start.elapsed().as_nanos())
+                });
+                assert_eq!(prepared.snapshot().len(), legacy.len());
+                assert_eq!(prepared.snapshot().len(), rows / 2);
+                let render = |snapshot: &sparkles_core::store::Snapshot| {
+                    let mut lines = snapshot
+                        .scan_keys(sparkles_core::index::Perm::Spo, &[])
+                        .unwrap()
+                        .iter()
+                        .map(|quad| {
+                            quad.iter()
+                                .map(|id| {
+                                    snapshot
+                                        .term(sparkles_core::id::Id(*id))
+                                        .map(|term| term.to_string())
+                                        .unwrap_or_else(|| {
+                                            format!("{:?}", sparkles_core::id::Id(*id))
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect::<Vec<_>>();
+                    lines.sort();
+                    lines
+                };
+                assert_eq!(render(prepared.snapshot()), render(&legacy));
+                // The preceding allocation attribution lines carry actual peak
+                // above the pre-call live baseline, including moving reallocs.
+                eprintln!(
+                    "cost sample rows={rows} warm={warm} round={round} legacy_ns={old_ns} controlled_ns={new_ns} legacy_largest={old_largest} controlled_largest={new_largest} legacy_total={old_total} controlled_total={new_total}"
+                );
+            }
+        }
+    }
+}

@@ -12,8 +12,10 @@
 //! only the visible triples.
 
 pub mod authority;
+mod preparation;
 pub mod source;
 pub mod triples;
+pub use preparation::{Exemptions, Preparation, PreparedView, Reservation};
 pub use triples::{Caller, Limits, Mask, Protection, Rule, TripleRules};
 
 use crate::error::{Error, Result};
@@ -87,6 +89,22 @@ pub struct GraphGuard {
 pub trait GuardDecision: Send + Sync {
     /// The exempt graph IRIs for `snap`.
     fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String>;
+
+    /// Prepare exemptions under the request's shared budget and controls.
+    ///
+    /// Providers must reserve their temporary and returned storage before growing
+    /// it and poll the same preparation through their work and lock waits. The
+    /// default refuses without calling the uncontrolled compatibility method.
+    fn exempt_controlled(
+        &self,
+        _snap: &Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<Exemptions> {
+        preparation.check()?;
+        Err(Error::Unsupported(
+            "guard provider does not support controlled view preparation".into(),
+        ))
+    }
 }
 
 /// A shared [`GuardDecision`], compared and hashed by identity.
@@ -489,6 +507,22 @@ impl GraphAccess {
             Some(t) if snap.mask.is_none() => triples::masked(self, t, snap),
             _ => Ok(snap.clone()),
         }
+    }
+
+    /// Prepare this policy and its mask under one request's controls and cap.
+    /// Use both the returned policy and its physical snapshot. Graph restrictions
+    /// remain in the policy and are not enforced by the snapshot alone.
+    /// Graph, predicate and class rules use the same allowance as controlled guard
+    /// providers. Protection patterns currently refuse with [`Error::Unsupported`]
+    /// because their planner does not provide the complete preparation contract.
+    /// Keep the returned owner while using its borrowed view. This cap covers view
+    /// preparation; query execution requires its own limits.
+    pub fn masked_controlled(
+        &self,
+        snap: &Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<PreparedView> {
+        triples::controlled::prepare(self, snap, preparation)
     }
 
     /// The error of a write outside the write graphs.

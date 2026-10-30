@@ -294,6 +294,69 @@ impl Table {
         n
     }
 
+    /// Controlled opt-in decoder. Old decoder paths retain their optimized loops.
+    pub(super) fn measure_controlled(
+        &self,
+        codes: &[u8],
+        mut admit: impl FnMut(usize) -> Result<()>,
+        checkpoint: &mut impl FnMut(&'static str) -> Result<()>,
+    ) -> Result<usize> {
+        let (mut at, mut length, mut since_check) = (0usize, 0usize, 0usize);
+        while at < codes.len() {
+            let code = codes[at];
+            let (bytes, consumed) = if code == ESCAPE {
+                (usize::from(at + 1 < codes.len()), 2)
+            } else {
+                (self.lens[code as usize] as usize, 1)
+            };
+            length = length
+                .checked_add(bytes)
+                .ok_or_else(|| Error::invalid("vocabulary suffix overflows"))?;
+            at += consumed;
+            since_check += consumed;
+            if since_check >= 1024 {
+                // Admit incrementally, so a low cap refuses before a full long scan.
+                admit(length)?;
+                checkpoint("measuring vocabulary suffix")?;
+                since_check = 0;
+            }
+        }
+        admit(length)?;
+        checkpoint("finishing vocabulary measurement")?;
+        Ok(length)
+    }
+
+    pub(super) fn decode_controlled(
+        &self,
+        codes: &[u8],
+        max: usize,
+        output: &mut Vec<u8>,
+        checkpoint: &mut impl FnMut(&'static str) -> Result<()>,
+    ) -> Result<()> {
+        let limit = output.len().saturating_add(max).min(output.capacity());
+        let (mut at, mut since_check) = (0usize, 0usize);
+        while at < codes.len() && output.len() < limit {
+            let code = codes[at];
+            if code == ESCAPE {
+                if let Some(&byte) = codes.get(at + 1) {
+                    output.push(byte);
+                }
+                at += 2;
+                since_check += 2;
+            } else {
+                let length = (self.lens[code as usize] as usize).min(limit - output.len());
+                output.extend_from_slice(&self.syms[code as usize][..length]);
+                at += 1;
+                since_check += 1;
+            }
+            if since_check >= 1024 {
+                checkpoint("decoding vocabulary suffix")?;
+                since_check = 0;
+            }
+        }
+        checkpoint("finishing vocabulary decode")
+    }
+
     /// Whether `codes` is a valid code sequence of this table: every code has a symbol
     /// and no escape ends it.
     pub fn valid(&self, codes: &[u8]) -> bool {
