@@ -695,6 +695,8 @@ pub struct TestHooks {
     /// after an OIDC callback's provider exchange and policy checks, before its
     /// session is created
     pub before_issue: Option<TestHook>,
+    /// when a live query starts coalescing events
+    pub coalescing: Option<TestHook>,
 }
 
 /// The auth state of a server: the current policy, the token and session stores, the
@@ -824,7 +826,7 @@ impl Auth {
 
     /// Run a test hook, outside the hooks' own lock.
     #[cfg(test)]
-    pub(super) fn run_hook(&self, pick: fn(&mut TestHooks) -> &mut Option<TestHook>) {
+    pub(crate) fn run_hook(&self, pick: fn(&mut TestHooks) -> &mut Option<TestHook>) {
         let taken = pick(&mut self.hooks.lock()).take();
         if let Some(mut hook) = taken {
             hook(self);

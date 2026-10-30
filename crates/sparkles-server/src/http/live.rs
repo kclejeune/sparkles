@@ -168,6 +168,14 @@ impl Stream {
 
     async fn next(mut self) -> Option<(Result<Event, std::convert::Infallible>, Stream)> {
         loop {
+            // Checked before every event, so the rest of a paged snapshot and events
+            // read or merged under an access that has since ended are dropped.
+            if !self.done && !self.st.access_current(&self.principal) {
+                self.queue.clear();
+                self.pending = None;
+                self.done = true;
+                self.queue.extend(events(&access_changed()));
+            }
             if let Some(e) = self.queue.pop_front() {
                 return Some((Ok(e), self));
             }
@@ -181,9 +189,19 @@ impl Stream {
             if !self.coalesce.is_zero()
                 && matches!(e, LiveEvent::Diff { .. } | LiveEvent::Value { .. })
             {
+                #[cfg(all(test, feature = "auth"))]
+                if let Some(a) = &self.st.auth {
+                    a.run_hook(|h| &mut h.coalescing);
+                }
                 let until = Instant::now() + self.coalesce;
+                // Waits at most a second at a time, so an access that ends while
+                // diffs are merged ends the stream instead of sending them.
                 while let Some(left) = until.checked_duration_since(Instant::now()) {
-                    match tokio::time::timeout(left, self.live.recv()).await {
+                    if !self.st.access_current(&self.principal) {
+                        break;
+                    }
+                    let tick = left.min(Duration::from_secs(1));
+                    match tokio::time::timeout(tick, self.live.recv()).await {
                         Ok(Some(next)) => match e.merge(&next) {
                             Some(m) => e = m,
                             None => {
@@ -191,8 +209,13 @@ impl Stream {
                                 break;
                             }
                         },
-                        Ok(None) | Err(_) => break,
+                        Ok(None) => break,
+                        Err(_) => {}
                     }
+                }
+                // the check at the top of the loop sends the error instead
+                if !self.st.access_current(&self.principal) {
+                    continue;
                 }
                 // a merge that cancels out sends nothing
                 if let LiveEvent::Diff { removed, added, .. } = &e

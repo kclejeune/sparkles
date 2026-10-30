@@ -519,3 +519,78 @@ async fn streams_end_when_their_credential_expires() {
     s.auth().advance(1);
     expect_ended(&s, &mut streams, 4).await;
 }
+
+/// A hook that moves the auth clock `secs` forward the first time it runs, and
+/// signals `ran`.
+fn advance_once(secs: i64, ran: Arc<tokio::sync::Notify>) -> crate::auth::TestHook {
+    let mut once = true;
+    Box::new(move |auth| {
+        if std::mem::take(&mut once) {
+            auth.advance(secs);
+            ran.notify_one();
+        }
+    })
+}
+
+/// A live query that is coalescing diffs when its session expires sends no merged
+/// diff.
+#[tokio::test]
+async fn live_coalescing_sends_nothing_merged_after_expiry() {
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let q = "SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Ax%3Ap%3E%20%3Fo%20%7D";
+    let mut live = open_stream(
+        &s,
+        &format!("/wiki/live?query={q}&coalesceMs=60000"),
+        &[("cookie", &cookie)],
+    )
+    .await;
+    let mut buf = String::new();
+    assert_eq!(next_event(&mut live, &mut buf).await.0, "snapshot");
+    // the session expires while the first diff waits to be merged with more
+    let ran = Arc::new(tokio::sync::Notify::new());
+    s.auth().hooks.lock().coalescing = Some(advance_once(43_200, ran.clone()));
+    let r = update_as(&s.app, "wiki", &b("alice"), &insert(1)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let (event, data) = tokio::join!(next_event(&mut live, &mut buf), async {
+        ran.notified().await;
+        let r = update_as(&s.app, "wiki", &b("alice"), &insert(2)).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    })
+    .0;
+    assert_eq!(event, "error", "a diff was merged after expiry: {data}");
+    assert!(data.contains("access-changed"), "{data}");
+}
+
+/// The rest of a paged live-query snapshot is not sent after its session expires.
+#[tokio::test]
+async fn live_snapshot_pages_stop_at_expiry() {
+    let q = "SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Ax%3Ap%3E%20%3Fo%20%7D";
+    let s = build(Fixture::default());
+    let rows: String = (0..10_001)
+        .map(|i| format!("<urn:x:r{i}> <urn:x:p> \"{i}\" .\n"))
+        .collect();
+    s.state
+        .get("wiki")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            rows.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let (cookie, _) = password_session(&s, "bob").await;
+    let mut live = open_stream(&s, &format!("/wiki/live?query={q}"), &[("cookie", &cookie)]).await;
+    let mut buf = String::new();
+    let (event, data) = next_event(&mut live, &mut buf).await;
+    assert_eq!(event, "snapshot");
+    assert!(
+        data.contains("\"more\":true"),
+        "the fixture needs two pages"
+    );
+    s.auth().advance(43_200);
+    let (event, data) = next_event(&mut live, &mut buf).await;
+    assert_eq!(event, "error", "a snapshot page was sent after expiry");
+    assert!(data.contains("access-changed"), "{data}");
+}
