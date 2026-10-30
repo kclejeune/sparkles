@@ -28,6 +28,9 @@ pub fn publish_new(
 ) -> Result<Dataset, BackupError> {
     st.check_reservation(&reservation)
         .map_err(|e| BackupError::internal(e.to_string()))?;
+    // A refused registration must not follow a published directory.
+    st.check_manageable()
+        .map_err(|e| BackupError::new(Code::DatasetBusy, e.to_string()))?;
     let name = reservation.name().to_string();
     let _span = tracing::info_span!("restore.swap", "db.namespace" = name.as_str()).entered();
     let databases = st

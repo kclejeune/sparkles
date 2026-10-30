@@ -92,6 +92,8 @@ impl super::Catalog {
         reservation: super::Reservation,
         restored: &Path,
     ) -> crate::Result<crate::Dataset> {
+        // A close callback's refusal keeps the staged directory and its error kind.
+        self.check_manageable()?;
         super::swap::publish_new(self, reservation, restored).map_err(crate::backup::error)
     }
     #[doc(hidden)]

@@ -1285,6 +1285,8 @@ impl Catalog {
     ) -> Result<(Dataset, crate::store::CloneReport)> {
         ctl.check()?;
         self.check_reservation(&r)?;
+        // Refuse before the copy publishes a directory that adopt could not register.
+        self.check_manageable()?;
         let kind = req.kind.unwrap_or(if ds.store().root().is_some() {
             DatasetKind::Persistent
         } else {

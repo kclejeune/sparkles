@@ -132,7 +132,8 @@ A dataset close callback that calls a catalog management method during a delete,
 or in-place restore now gets a `catalog-disposing` conflict at once instead of waiting
 forever on the catalog's management lock. The new `Catalog::defer` queues such a call to run
 on the same thread once the disposing call has released the catalog. Deferred calls are
-kept only in memory, and a panicking one is logged without stopping the others.
+kept only in memory, and a panicking one is logged without stopping the others. A
+reserved clone or restore publication refused this way changes no files.
 
 A close callback that panics during catalog delete or rename no longer drops the dataset
 from `config.json` on the next save. The dataset stays registered and closed until the

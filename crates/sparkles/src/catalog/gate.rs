@@ -41,6 +41,10 @@ enum Mark {
     /// The thread runs a multi-step operation, such as an in-place restore, whose
     /// deferred work waits until the whole operation returns.
     Batch,
+    /// The thread runs the operations it deferred. Management calls that those
+    /// operations make, and operations they defer, leave new work to this loop
+    /// instead of starting a nested one, so a chain of deferrals uses constant stack.
+    Draining,
 }
 
 thread_local! {
@@ -125,8 +129,10 @@ impl Catalog {
         })
     }
     /// Refuse, without taking the lock, a management call that [`manage`](Self::manage)
-    /// would refuse. Entry points that change state before they take the lock call it
-    /// first, so a refusal leaves everything as it was.
+    /// would refuse. Entry points that change files or other state before they take the
+    /// lock call it first, so a refusal leaves everything as it was. The answer cannot
+    /// change before such a call takes the lock, because only the current thread's own
+    /// scopes change it and they are balanced within the call.
     pub(crate) fn check_manageable(&self) -> Result<()> {
         // Holding covers callbacks of datasets that a management call drops, such as
         // a deleted in-memory dataset, which also run under the lock.
@@ -178,7 +184,8 @@ impl Catalog {
     /// in memory, so a crash or a panic that unwinds the disposing call loses them.
     /// Callbacks must therefore be idempotent and must not rely on a deferred
     /// operation for durability. A deferred operation that panics is logged, and the
-    /// operations queued after it still run.
+    /// operations queued after it still run. Operations that a deferred operation
+    /// defers run in the same loop, so a long chain needs no extra stack.
     pub fn defer(&self, op: impl FnOnce(&Catalog) + Send + 'static) {
         if marked(&self.inner, None) {
             self.inner
@@ -192,10 +199,43 @@ impl Catalog {
     }
 }
 
-/// Run the operations that this thread deferred on the catalog. During an unwind they
-/// are dropped, since running them could abort the process.
+/// Removes the draining mark of a drain loop, also when the loop unwinds, without
+/// starting another drain.
+struct DrainMark(usize);
+impl Drop for DrainMark {
+    fn drop(&mut self) {
+        MARKS.with_borrow_mut(|marks| {
+            if let Some(at) = marks
+                .iter()
+                .rposition(|&(k, m)| k == self.0 && m == Mark::Draining)
+            {
+                marks.remove(at);
+            }
+        });
+    }
+}
+
+/// Drop a caught panic payload. A payload whose destructor panics again is
+/// forgotten, so the drain keeps its panic isolation.
+fn drop_payload(payload: Box<dyn std::any::Any + Send>) {
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload)));
+    if let Err(again) = dropped {
+        tracing::error!(
+            target: "sparkles::catalog",
+            "the panic payload of a deferred catalog operation panicked when dropped; it is leaked"
+        );
+        std::mem::forget(again);
+    }
+}
+
+/// Run the operations that this thread deferred on the catalog, in a loop that also
+/// runs whatever they defer. During an unwind they are dropped, since running them
+/// could abort the process.
 fn run_deferred(catalog: &Catalog) {
     let me = std::thread::current().id();
+    let key = key(&catalog.inner);
+    MARKS.with_borrow_mut(|marks| marks.push((key, Mark::Draining)));
+    let _draining = DrainMark(key);
     loop {
         let ops: Vec<Deferred> = {
             let mut queue = catalog.inner.manage.deferred.lock();
@@ -229,6 +269,7 @@ fn run_deferred(catalog: &Catalog) {
                     panic = %message,
                     "a deferred catalog operation panicked"
                 );
+                drop_payload(payload);
             }
         }
     }

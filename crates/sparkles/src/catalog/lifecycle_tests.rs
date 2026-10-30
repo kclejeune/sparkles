@@ -1138,4 +1138,135 @@ mod callback_management {
         assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(cat.get("other").is_some());
     }
+
+    #[test]
+    fn a_long_deferral_chain_drains_in_constant_stack() {
+        const LINKS: usize = 20_000;
+        fn link(
+            left: usize,
+            ran: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> impl FnOnce(&Catalog) + Send {
+            move |c: &Catalog| {
+                ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if left > 0 {
+                    c.defer(link(left - 1, ran));
+                }
+                // A management call whose guard drops inside the drain.
+                c.save().unwrap();
+            }
+        }
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = ran.clone();
+        let worker = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                let cat = Catalog::memory(Default::default());
+                let batch = cat.batch_scope();
+                cat.defer(link(LINKS - 1, counted));
+                drop(batch);
+            })
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), LINKS);
+    }
+
+    #[test]
+    fn a_panic_payload_whose_destructor_panics_stays_contained() {
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                panic!("payload destructor");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        install(&ds, &cat, |c| {
+            c.defer(|_| std::panic::panic_any(Bomb));
+            c.defer(|c| {
+                c.create("other", &Default::default()).unwrap();
+            });
+        });
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        assert!(cat.get("other").is_some());
+    }
+
+    /// A reservation that a close callback uses once.
+    fn take_once(r: Reservation) -> impl Fn() -> Option<Reservation> + Send + Sync + 'static {
+        let slot = parking_lot::Mutex::new(Some(r));
+        move || slot.lock().take()
+    }
+
+    #[test]
+    fn a_refused_reserved_clone_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        cat.create("src", &Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        let reservation = take_once(cat.reserve("copy", ReservationKind::Clone, "t").unwrap());
+        let seen = Seen::default();
+        let s = seen.clone();
+        install(&ds, &cat, move |c| {
+            let r = reservation().expect("one close");
+            *s.lock() = Some(
+                c.clone_reserved("src", r, &Default::default(), &Default::default())
+                    .map(drop),
+            );
+        });
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        assert_disposing(&seen);
+        let databases = dir.path().join("databases");
+        assert!(!databases.join("copy").exists());
+        assert!(
+            std::fs::read_dir(&databases).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clone-")),
+            "no staged copy remains"
+        );
+        assert!(cat.reserved_by("copy").is_none());
+        cat.clone_dataset("src", "copy", &Default::default(), &Default::default())
+            .unwrap();
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn a_refused_restore_publication_keeps_its_staging_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        let staged = dir.path().join("databases").join(".restore-x-1");
+        let id = Store::open(&staged, Default::default())
+            .unwrap()
+            .dataset_id();
+        let reservation = take_once(cat.reserve("x", ReservationKind::Restore, "1").unwrap());
+        let seen = Seen::default();
+        let s = seen.clone();
+        let path = staged.clone();
+        install(&ds, &cat, move |c| {
+            let r = reservation().expect("one close");
+            *s.lock() = Some(c.publish_restored(r, &path).map(drop));
+        });
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        let seen = seen.lock().take().expect("the close callback ran");
+        assert!(
+            matches!(&seen, Err(Error::Conflict(m)) if m.contains("catalog-disposing")),
+            "{seen:?}"
+        );
+        assert!(
+            staged.join("CURRENT").exists(),
+            "the staging directory stays"
+        );
+        assert!(!dir.path().join("databases").join("x").exists());
+        assert!(cat.reserved_by("x").is_none());
+        let r = cat.reserve("x", ReservationKind::Restore, "2").unwrap();
+        assert_eq!(cat.publish_restored(r, &staged).unwrap().dataset_id(), id);
+    }
 }
