@@ -118,8 +118,10 @@ pub struct IdRange {
 /// inline decimals of one scale, inline doubles of one sign, the IRIs of the base
 /// vocabulary) id order is value order, so the piece is read from its best end in
 /// geometrically growing steps, and only its best `k` rows (with their ties) are kept.
-/// Every other piece (vocabulary literals, delta terms, blank nodes, NaN, dates…) is read
-/// whole. The candidates are ranked by
+/// In ascending order, the literals of the base vocabulary are read from their low end
+/// too, until the prefixes of the last one read can no longer win (see
+/// [`TopKPiece::lexical`]). Every other piece (delta terms, blank nodes, NaN, dates…) is
+/// read whole. The candidates are ranked by
 /// the generic ORDER BY in the generic plan's row order, so ties break identically; a
 /// piece stops once the `k`-th candidate is strictly better than any of its unread
 /// values.
@@ -153,6 +155,15 @@ pub struct TopKPiece {
     /// `Some(true)`: larger ids are larger values, `Some(false)`: smaller values (inline
     /// negative doubles); `None`: ids say nothing about value order
     pub mono: Option<bool>,
+    /// The piece holds literals of the base vocabulary, read in ascending order from its
+    /// low end. Their keys are `"`, the lexical form and a 0xFF byte, then any language
+    /// tag or datatype, so ids follow the lexical forms except that a lexical form sorts
+    /// after the forms it is a proper prefix of. A plain string read after the k-th
+    /// candidate, a plain string itself, is therefore either greater than every string
+    /// read or a proper prefix of the last one, and those prefixes are looked up in the
+    /// vocabulary. A literal of another kind ranks after every plain string. When the
+    /// k-th candidate is not a plain string, the rest of the piece is read whole.
+    pub lexical: bool,
 }
 
 /// The query of a vector search.
@@ -4588,11 +4599,13 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
 /// booleans, dates, blank nodes). Within a `Some` segment distinct ids are distinct
 /// values.
 ///
-/// `iris` is the inclusive id range of the base vocabulary's IRIs, when it has any. The
-/// base vocabulary is sorted by key, and an IRI's key is `<` followed by the IRI's UTF-8
-/// bytes, so these ids are in the order of the IRIs' code points, which is the order
-/// ORDER BY gives IRIs. IRIs that updates added have delta ids and stay unordered.
-fn value_order_segments(iris: Option<(u64, u64)>) -> Vec<(u64, u64, Option<bool>)> {
+/// `terms` are sorted, disjoint, inclusive id ranges of the base vocabulary that get
+/// segments of their own, with their order. The base vocabulary is sorted by key, and an
+/// IRI's key is `<` followed by the IRI's UTF-8 bytes, so the ids of its IRIs are in the
+/// order of the IRIs' code points, which is the order ORDER BY gives IRIs. Its literals
+/// form a segment of their own without value order (see [`TopKPiece::lexical`]). Terms
+/// that updates added have delta ids and stay unordered.
+fn value_order_segments(terms: &[(u64, u64, Option<bool>)]) -> Vec<(u64, u64, Option<bool>)> {
     use crate::id::{PAYLOAD_BITS, PAYLOAD_MASK, TAG_BITS};
     let id = |tag: Tag, payload: u64| Id::new(tag, payload).0;
     let half = 1u64 << (PAYLOAD_BITS - 1);
@@ -4616,15 +4629,18 @@ fn value_order_segments(iris: Option<(u64, u64)>) -> Vec<(u64, u64, Option<bool>
         ),
     ];
     // blank nodes, the base vocabulary, delta and local terms
-    let (terms_lo, terms_hi) = (id(Tag::BNode, 0), id(Tag::Decimal, 0) - 1);
-    match iris {
-        Some((lo, hi)) if terms_lo < lo && lo <= hi && hi < terms_hi => {
-            out.push((terms_lo, lo - 1, None));
-            out.push((lo, hi, Some(true)));
-            out.push((hi + 1, terms_hi, None));
+    let (mut at, end) = (id(Tag::BNode, 0), id(Tag::Decimal, 0) - 1);
+    for &(lo, hi, order) in terms {
+        if lo < at || hi < lo || hi >= end {
+            continue;
         }
-        _ => out.push((terms_lo, terms_hi, None)),
+        if lo > at {
+            out.push((at, lo - 1, None));
+        }
+        out.push((lo, hi, order));
+        at = hi + 1;
     }
+    out.push((at, end, None));
     // inline decimals: 4-bit scale, then a 56-bit two's complement mantissa
     const MANTISSA: u32 = 56;
     for scale in 0..16u64 {
@@ -4646,13 +4662,54 @@ fn value_order_segments(iris: Option<(u64, u64)>) -> Vec<(u64, u64, Option<bool>
     out
 }
 
+/// Rows of a literal piece whose values decide whether it is read from the low end.
+const LEXICAL_PROBE_ROWS: usize = 32;
+
+/// Whether the first rows of `scan` with order-column ids in `[lo, hi]` hold plain strings
+/// of the base vocabulary. A piece of base-vocabulary literals read from its low end
+/// stops early only when the k-th candidate is a plain string. When it is a literal of
+/// another kind, the rest of the piece is read whole after the first step, so the
+/// planner keeps the plain sort for columns that do not start with plain strings, such
+/// as language-tagged labels. Only the plan depends on this check.
+fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> bool {
+    let col = scan.prefix.len();
+    let bound = |id: u64, fill: u64| {
+        let mut key = crate::index::pad(&scan.prefix, fill);
+        key[col] = id;
+        key
+    };
+    let mut ids = Vec::with_capacity(LEXICAL_PROBE_ROWS);
+    let read = ctx
+        .snap
+        .scan_between(scan.perm, bound(lo, 0), bound(hi, u64::MAX), |chunk| {
+            match chunk {
+                crate::store::Chunk::Block(b, s, e) => {
+                    let e = e.min(s + LEXICAL_PROBE_ROWS - ids.len());
+                    ids.extend_from_slice(&b.cols[col][s..e]);
+                }
+                crate::store::Chunk::Row(k) => ids.push(k[col]),
+            }
+            Ok(ids.len() < LEXICAL_PROBE_ROWS)
+        });
+    let vocab = &ctx.snap.generation.vocab;
+    read.is_ok()
+        && !ids.is_empty()
+        && ids.iter().all(|&id| {
+            Id(id).tag() == Tag::Vocab
+                && vocab.get(Id(id).payload()).is_some_and(|k| {
+                    k.first() == Some(&b'"') && k.last() == Some(&crate::id::KEY_SEP)
+                })
+        })
+}
+
 /// What placing the read steps at the best end of a monotone [`OrderedTopK`] piece costs,
 /// in rows read (see [`ordered_topk`]).
 const TOPK_EDGE_ROWS: f64 = (crate::index::BLOCK_ROWS / 8) as f64;
 
 #[cfg(test)]
 thread_local! {
-    /// tests: choose [`OrderedTopK`] whenever it applies, whatever it costs
+    /// tests: choose [`OrderedTopK`] whenever it applies, whatever it costs, and read
+    /// every literal piece in ascending order from its low end
     pub(crate) static FORCE_ORDERED_TOPK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -4742,8 +4799,17 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         key
     };
     let sel = FILTER_SELECTIVITY.powi(filter.len() as i32);
-    let (lo, hi) = ctx.snap.iri_prefix_range("");
-    let segments = value_order_segments((lo < hi).then(|| (lo.0, hi.0 - 1)));
+    // the base vocabulary's literals, then its IRIs, each an inclusive id range
+    let vocab = &ctx.snap.generation.vocab;
+    let mut terms = Vec::new();
+    for (key, order) in [(&b"\""[..], None), (&b"<"[..], Some(true))] {
+        let (lo, hi) = vocab.prefix_range(key);
+        if lo < hi {
+            terms.push((Id::vocab(lo).0, Id::vocab(hi - 1).0, order));
+        }
+    }
+    let literals = terms.first().filter(|t| t.2.is_none()).map(|t| (t.0, t.1));
+    let segments = value_order_segments(&terms);
     let (mut pieces, mut total, mut read) = (Vec::new(), 0.0, 0.0);
     for d in &domain {
         for &(lo, hi, mono) in &segments {
@@ -4772,8 +4838,14 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
             } else {
                 sel * FILTER_SELECTIVITY
             };
+            // ascending, the literals of the base vocabulary are read from the low end
+            // when they look like plain strings there
+            let lexical = asc
+                && literals.is_some_and(|(a, b)| a <= lo && hi <= b)
+                && (force_ordered_topk() || plain_strings_first(ctx, &scan, lo, hi));
             read += match mono {
                 Some(_) => rows.min(TOPK_EDGE_ROWS + k as f64 / sel),
+                None if lexical => rows.min(TOPK_EDGE_ROWS + k as f64 / sel),
                 None => rows,
             };
             pieces.push(TopKPiece {
@@ -4781,6 +4853,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
                 hi,
                 exact: d.exact,
                 mono,
+                lexical,
             });
         }
     }
@@ -4790,7 +4863,10 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
     let desc = format!(
         "{desc} | {} limit {k} [{} of {} id pieces in value order]",
         n.desc,
-        pieces.iter().filter(|p| p.mono.is_some()).count(),
+        pieces
+            .iter()
+            .filter(|p| p.mono.is_some() || p.lexical)
+            .count(),
         pieces.len(),
     );
     let seeks = 4.0 * pieces.len() as f64;

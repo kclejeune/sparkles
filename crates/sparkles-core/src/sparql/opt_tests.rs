@@ -1147,6 +1147,132 @@ fn ordered_top_k_is_chosen_when_it_reads_less() {
     }
 }
 
+/// Literals read in ascending order from the low end of the base vocabulary, where a
+/// lexical form sorts after the forms it is a proper prefix of: the empty string, chains
+/// of prefixes, multi-byte characters, and plain strings mixed with language-tagged
+/// strings, other datatypes, numbers, IRIs and blank nodes, before and after updates
+/// that add strings with delta ids. Every answer is the full sort's, and a column of
+/// plain strings is read from its low end, not whole.
+#[test]
+fn ordered_top_k_reads_strings_from_the_low_end() {
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let stems = [
+        "", "a", "ab", "abc", "abd", "ab c", "b", "ba", "é", "e\u{301}", "日", "日本", "~",
+        "a\u{7f}",
+    ];
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    for i in 0..4000u64 {
+        let r = next();
+        let stem = stems[(r % stems.len() as u64) as usize];
+        let lex = if (r >> 8) & 3 == 0 {
+            stem.to_string()
+        } else {
+            format!("{stem}{}", (r >> 10) % 50)
+        };
+        let o = match (r >> 20) % 9 {
+            0 => format!("\"{lex}\"@en"),
+            1 => format!("\"{lex}\"^^ex:dt"),
+            2 => format!("\"0{}\"^^xsd:integer", (r >> 30) % 20),
+            3 => format!("{}", (r >> 30) % 20),
+            4 => format!("<http://ex.org/{}>", (r >> 30) % 30),
+            5 => format!("_:b{}", (r >> 30) % 5),
+            _ => format!("\"{lex}\""),
+        };
+        let tag = ["en", "de"][(r >> 40) as usize % 2];
+        ttl.push_str(&format!(
+            "ex:s{i} ex:str \"{lex}\" ; ex:mix {o} ; ex:lang \"{lex}\"@{tag} .\n"
+        ));
+        // ex:big holds enough plain strings for the planner to prefer the ordered scan,
+        // and ex:labels as many language-tagged strings
+        for j in 0..5 {
+            let tail = if j == 0 { String::new() } else { j.to_string() };
+            ttl.push_str(&format!(
+                "ex:s{i} ex:big \"{lex}{tail}\" ; ex:labels \"{lex}{tail}\"@{tag} .\n"
+            ));
+        }
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    let plain = |s: &Store| -> Vec<String> {
+        let r = run(s, "SELECT ?v WHERE { ?s ex:str ?v }", Optimizations::NONE);
+        let mut v: Vec<String> = r
+            .rows()
+            .into_iter()
+            .map(|row| match &row[0] {
+                Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for round in 0..2 {
+        let strings = plain(&s);
+        for p in ["str", "mix", "lang"] {
+            for (dir, limit, offset) in [
+                ("", 10, 0),
+                ("", 10, 50),
+                ("", 1, 0),
+                ("", 37, 300),
+                ("", 60, 2000),
+                ("DESC", 10, 5),
+                ("", 500, 3600),
+            ] {
+                let q = format!(
+                    "SELECT ?v ?s WHERE {{ ?s ex:{p} ?v }} ORDER BY {dir}(?v) LIMIT {limit} OFFSET {offset}"
+                );
+                let r = topk_check(&s, &q);
+                assert!(has_op(&r.plan, "IndexTopK"), "{q}");
+                if p == "str" && dir.is_empty() {
+                    let got: Vec<String> = r
+                        .rows()
+                        .into_iter()
+                        .map(|row| match &row[0] {
+                            Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
+                            other => panic!("{other:?}"),
+                        })
+                        .collect();
+                    let end = (offset + limit).min(strings.len());
+                    assert_eq!(got, strings[offset.min(end)..end], "round {round}: {q}");
+                }
+            }
+        }
+        // the planner picks the ordered scan for a column of plain strings on its own,
+        // and it reads the low end and the prefixes of the last string read
+        for (limit, offset) in [(10, 50), (1, 0), (20, 100)] {
+            let q = format!(
+                "SELECT ?v WHERE {{ ?s ex:big ?v }} ORDER BY ?v LIMIT {limit} OFFSET {offset}"
+            );
+            let fast = run(&s, &q, Optimizations::ALL);
+            let slow = run(&s, &q, without_ordered_topk());
+            assert_eq!(fast.rows(), slow.rows(), "{q}");
+            let read = topk_rows_read(&fast.plan);
+            assert!(read.is_some_and(|n| n < 1500), "{q}: {read:?}");
+            // labels do not start with plain strings: the plain sort stays
+            let q = q.replace("ex:big", "ex:labels");
+            let r = run(&s, &q, Optimizations::ALL);
+            assert!(!has_op(&r.plan, "IndexTopK"), "{q}");
+            assert_eq!(r.rows(), run(&s, &q, without_ordered_topk()).rows(), "{q}");
+        }
+        // plain strings with delta ids, among them prefixes of base strings and the
+        // smallest string of all
+        update(
+            &s,
+            "INSERT DATA { ex:n1 ex:str \"\" , \"a\" , \"ab1\" , \"!\" , \"zz\" . \
+             ex:n2 ex:mix \"!\" , \"!\"@en , \"\" . ex:n3 ex:lang \"!\"@en } ; \
+             DELETE WHERE { ?s ex:str \"a1\" }",
+        );
+    }
+}
+
 /// IRIs whose order differs from the order of their keys' bytes under other encodings
 /// (a prefix of another IRI, `/`, `#` and `-` against `>`, case, multi-byte characters),
 /// mixed with blank nodes, literals and numbers, and IRIs that updates add with delta ids

@@ -3097,6 +3097,107 @@ struct TopKRun {
     want: usize,
     /// no unread row of the piece can be among the first k
     done: bool,
+    /// a piece of base-vocabulary literals read in ascending order, whose ids follow
+    /// their lexical forms except for prefixes (see [`TopKPiece::lexical`])
+    lexical: bool,
+    /// ids of a lexical piece above `lo` whose rows were read already
+    extra: Vec<u64>,
+    /// rank the candidates again before the next step (prefixes were just read)
+    hold: bool,
+}
+
+/// What the k-th candidate proves about the unread ids of a lexical [`TopKRun`].
+enum Lexical {
+    /// none of them can be among the first k
+    Done,
+    /// read the piece on
+    Step,
+    /// these ids, proper prefixes of the last one read, can still win: read their rows
+    Read(Vec<u64>),
+    /// the k-th candidate is a literal that strings of any order beat: read the rest of
+    /// the piece whole
+    Whole,
+}
+
+/// The [`Lexical`] verdict on a lexical run, after a step, for the k-th candidate `kth`.
+///
+/// The ids `[lo, last]` of the piece have been read. An unread literal's key is greater
+/// than the last one's, so an unread plain string is either greater than the last
+/// lexical form, with no prefix relation, or a proper prefix of it. With a plain string
+/// as the k-th candidate that is not greater than the last lexical form, only those
+/// prefixes can still win, and each is a vocabulary lookup. An unread literal of another
+/// kind ranks after every plain string.
+fn lexical_check(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    run: &TopKRun,
+    kth: Option<&Value>,
+) -> Result<Lexical> {
+    let s = match kth {
+        None | Some(Value::BNode(_) | Value::Iri(_)) => return Ok(Lexical::Done),
+        Some(Value::Str(s)) => s,
+        // an unread plain string would beat it. The k-th candidate only improves, so a
+        // run that looked up prefixes for a plain string never gets here.
+        Some(_) if run.extra.is_empty() => return Ok(Lexical::Whole),
+        Some(_) => return Ok(Lexical::Step),
+    };
+    let vocab = &ctx.snap.generation.vocab;
+    let last = run.lo - 1;
+    let Some(key) = vocab.get(Id(last).payload()) else {
+        return Ok(Lexical::Step);
+    };
+    let lex = match key.split_first() {
+        Some((b'"', rest)) => match rest.iter().position(|&b| b == crate::id::KEY_SEP) {
+            Some(end) => &rest[..end],
+            None => return Ok(Lexical::Step),
+        },
+        _ => return Ok(Lexical::Step),
+    };
+    if s.as_bytes() > lex {
+        return Ok(Lexical::Step);
+    }
+    let Ok(lex) = std::str::from_utf8(lex) else {
+        return Ok(Lexical::Step);
+    };
+    let scan = &spec.scan;
+    let bound = |v: u64, fill: u64| {
+        let mut k = pad(&scan.prefix, fill);
+        k[scan.prefix.len()] = v;
+        k
+    };
+    let mut read = Vec::new();
+    let mut probe = Vec::with_capacity(lex.len() + 2);
+    // the proper prefixes, shortest first: once one is greater than the k-th
+    // candidate, so are the longer ones
+    for (end, _) in lex.char_indices() {
+        let p = &lex[..end];
+        if p > &**s {
+            break;
+        }
+        probe.clear();
+        probe.push(b'"');
+        probe.extend_from_slice(p.as_bytes());
+        probe.push(crate::id::KEY_SEP);
+        let Ok(at) = vocab.find(&probe) else {
+            continue;
+        };
+        let id = Id::vocab(at).0;
+        if id <= last || id > run.hi || run.extra.contains(&id) {
+            continue;
+        }
+        if ctx
+            .snap
+            .count_between(scan.perm, bound(id, 0), bound(id, u64::MAX))?
+            > 0
+        {
+            read.push(id);
+        }
+    }
+    Ok(if read.is_empty() {
+        Lexical::Done
+    } else {
+        Lexical::Read(read)
+    })
 }
 
 /// Rows of an [`OrderedTopK`] scan whose order-column ids lie in `[lo, hi]`, in key order,
@@ -3219,6 +3320,22 @@ fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -
         (run.lo, edge)
     };
     let (mut part, scanned) = topk_read(ctx, spec, a, b, run.exact, vars)?;
+    if run.lexical {
+        // the prefixes read out of order are not read again, and the ids say nothing
+        // about which rows can be cut
+        run.done |= b == run.hi;
+        run.lo = b.saturating_add(1);
+        run.want = run.want.saturating_mul(4);
+        if !run.extra.is_empty() {
+            let keep: Vec<bool> = part.cols[0]
+                .iter()
+                .map(|id| !run.extra.contains(&id.0))
+                .collect();
+            part.filter_rows(&keep);
+        }
+        run.kept.append(part);
+        return Ok(scanned);
+    }
     if run.best_high {
         run.done |= a == run.lo;
         run.hi = a.saturating_sub(1);
@@ -3675,15 +3792,18 @@ pub(super) fn ordered_topk(
     for p in &spec.pieces {
         match p.mono {
             // the pieces without value order are read whole
-            None => whole.push(p),
-            Some(up) => runs.push(TopKRun {
+            None if !p.lexical => whole.push(p),
+            mono => runs.push(TopKRun {
                 lo: p.lo,
                 hi: p.hi,
                 exact: p.exact,
-                best_high: up != spec.asc,
+                best_high: mono.is_some_and(|up| up != spec.asc),
                 kept: Table::new(vars.clone()),
                 want: spec.k.max(16).saturating_mul(2),
                 done: false,
+                lexical: mono.is_none(),
+                extra: Vec::new(),
+                hold: false,
             }),
         }
     }
@@ -3705,6 +3825,9 @@ pub(super) fn ordered_topk(
     loop {
         ctx.check()?;
         for run in runs.iter_mut().filter(|r| !r.done) {
+            if std::mem::take(&mut run.hold) {
+                continue;
+            }
             scanned += topk_step(ctx, spec, run, &vars)?;
         }
         // the candidates in the generic plan's row order, ranked by the generic ORDER BY
@@ -3717,18 +3840,56 @@ pub(super) fn ordered_topk(
         cand.sorted.clear();
         cand.sort_by_vars(&spec.tie_order);
         let (top, _) = order_by(ctx, cand, &keys, Some(spec.k), &mut ExprReport::default())?;
+        // rows that a check reads are ranked before the answer is taken
+        let mut rerank = false;
         if top.len() == spec.k {
             // a piece is finished once the k-th row is strictly better than its best
             // unread value, and so than every unread value
             let kth = ctx.value(top.cols[0][spec.k - 1]);
             for run in runs.iter_mut().filter(|r| !r.done) {
+                if run.lexical {
+                    match lexical_check(ctx, spec, run, kth.as_ref())? {
+                        Lexical::Done => run.done = true,
+                        Lexical::Step => {}
+                        Lexical::Read(ids) => {
+                            for id in ids {
+                                let (t, n) = topk_read(ctx, spec, id, id, run.exact, &vars)?;
+                                scanned += n;
+                                run.kept.append(t);
+                                run.extra.push(id);
+                            }
+                            run.hold = true;
+                        }
+                        Lexical::Whole => {
+                            let piece = super::plan::TopKPiece {
+                                lo: run.lo,
+                                hi: run.hi,
+                                exact: run.exact,
+                                mono: None,
+                                lexical: false,
+                            };
+                            let best = if ctx.is_cursor() && heap_eligible(ctx) {
+                                cursor_topk_rest(ctx, spec, &vars, &[&piece], &mut scanned)?
+                            } else {
+                                topk_rest(ctx, spec, &vars, &[&piece], &mut scanned)?
+                            };
+                            let Some(best) = best else {
+                                return Ok(None);
+                            };
+                            run.kept.append(best);
+                            run.done = true;
+                            rerank = true;
+                        }
+                    }
+                    continue;
+                }
                 let best = Id(if run.best_high { run.hi } else { run.lo });
                 if order_cmp(kth.as_ref(), ctx.value(best).as_ref()) == better {
                     run.done = true;
                 }
             }
         }
-        if runs.iter().all(|r| r.done) {
+        if !rerank && runs.iter().all(|r| r.done) {
             drop(held);
             return Ok(Some((top.project(out), scanned)));
         }

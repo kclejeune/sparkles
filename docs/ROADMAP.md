@@ -660,6 +660,8 @@ linked spec Outcome records how they landed.
 
 - **398.** Controlled preparation costs: indexed delta-vocabulary lookup, owned-storage accounting and parallel mask writes. [C29](specs/C29-bounded-view-preparation/SPEC.md#outcome)
 
+- **431.** SP²Bench `q11` at 10M, an ascending top-k over plain strings that now reads its column in vocabulary order. [Optimizations](internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations), [SP²Bench](benchmarks/sp2bench/RESULTS.md#comparison-summary)
+
 ## Keeping this current
 
 Update this document when an item ships, changes tier or gets a new spec. A new known gap
