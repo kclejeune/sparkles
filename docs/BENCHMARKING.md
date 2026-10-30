@@ -779,8 +779,8 @@ relative A/B comparison does not have to wait for a quiet local machine. It need
 `nsc` CLI, logged in to the workspace. A and B are git revisions or paths to `sparkles`
 binaries. The script builds each revision locally before it creates the instance,
 from a `git archive` of the revision, and caches the binary in `~/.cache/sparkles-nsc`
-(`SPARKLES_NSC_CACHE`). The cache keys a binary by its commit alone and builds with
-whatever compilers the shell provides, so run it inside `nix develop`. The dataset comes
+(`SPARKLES_NSC_CACHE`). The build uses whatever compilers the shell provides, so run it
+inside `nix develop`. The dataset comes
 from `scripts/gen-data.py` and is cached there as zstd. The queries are those of
 `scripts/bench.sh` except `export-500k`.
 
