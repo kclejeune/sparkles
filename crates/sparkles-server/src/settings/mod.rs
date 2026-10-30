@@ -144,6 +144,7 @@ pub static MEMORY: Kind = Kind {
         "consolidation",
         "retention",
         "review",
+        "scratchBranches",
     ],
     removable: &[],
     shared: false,

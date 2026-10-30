@@ -11039,6 +11039,17 @@
               "after"
             ],
             "type": "object"
+          },
+          "scratchBranches": {
+            "additionalProperties": false,
+            "description": "When idle scratch branches expire. Written as `format` 2 of `memory.json`.",
+            "properties": {
+              "ttl": {
+                "description": "How long a scratch branch may sit idle before the server deletes it, from `1m` to `3650d`, such as `24h`. `off` keeps the dataset's scratch branches even when the server's `--mcp-scratch-branch-ttl` sets a duration. Without it, the server flag decides. A dataset with this member needs a release that reads `memory.json` format 2.",
+                "type": "string"
+              }
+            },
+            "type": "object"
           }
         },
         "type": "object"

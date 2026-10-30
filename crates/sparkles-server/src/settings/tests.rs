@@ -844,3 +844,100 @@ async fn path_finder_defaults_are_a_dataset_setting() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert!(v.to_string().contains("not an absolute IRI"), "{v}");
 }
+
+/// `memory.scratchBranches.ttl` (item 57): declared or changed at runtime, validated,
+/// and kept in `memory.json`, whose format member is 2 only while the file holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn scratch_branch_ttl_is_a_dataset_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        json!({"datasets": {"wiki": {"memory": {"scratchBranches": {"ttl": "12h"}}}}}).to_string(),
+    )
+    .unwrap();
+    let st = state(&dir.path().join("data"), Some(&f));
+    st.create("wiki", DbType::Persistent).unwrap();
+    st.create("plain", DbType::Persistent).unwrap();
+    let app = crate::http::router(st.clone());
+    let (_, v, _) = send(&app, req("GET", "/$/settings/wiki/memory", None)).await;
+    assert_eq!(v["effective"]["scratchBranches"]["ttl"], "12h", "{v}");
+    assert_eq!(v["sources"]["scratchBranches.ttl"], "declared", "{v}");
+    let (_, v, _) = send(&app, req("GET", "/$/settings/plain/memory", None)).await;
+    assert!(v["effective"].get("scratchBranches").is_none(), "{v}");
+    // values out of range, in the wrong unit or not durations are refused
+    for bad in ["", "0s", "30s", "3651d", "abc", "-1h", "1.5", "12 parsecs"] {
+        let (s, v, _) = send(
+            &app,
+            req(
+                "PATCH",
+                "/$/settings/plain/memory",
+                Some(json!({"scratchBranches": {"ttl": bad}})),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}: {v}");
+        assert!(
+            v.to_string().contains("scratchBranches.ttl"),
+            "{bad:?}: {v}"
+        );
+    }
+    let (s, v, _) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/plain/memory",
+            Some(json!({"scratchBranches": {"ttl": 3600}})),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, v, _) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/plain/memory",
+            Some(json!({"scratchBranches": {"limit": "1h"}})),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let plain = st.get("plain").unwrap();
+    let file = plain.store.root().unwrap().join("memory.json");
+    assert!(!file.exists(), "a refused write stores nothing");
+    // a good value is kept in the file as format 2
+    for ok in ["1m", "24h", "3650d", "2w", "off"] {
+        let (s, v, _) = send(
+            &app,
+            req(
+                "PATCH",
+                "/$/settings/plain/memory",
+                Some(json!({"scratchBranches": {"ttl": ok}})),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{ok}: {v}");
+        assert_eq!(v["effective"]["scratchBranches"]["ttl"], ok, "{v}");
+    }
+    let stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(
+        stored,
+        json!({"format": 2, "scratchBranches": {"ttl": "off"}})
+    );
+    // a release that reads format 1 only refuses the file by its version
+    sparkles::formats::check_settings("memory.json", &stored).unwrap();
+    // without the member the file goes back to format 1, which older releases read
+    let (s, v, _) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/plain/memory",
+            Some(json!({"scratchBranches": null, "agentGraphs": ["urn:x:a/*"]})),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(stored["format"], 1, "{stored}");
+    assert!(stored.get("scratchBranches").is_none(), "{stored}");
+}
