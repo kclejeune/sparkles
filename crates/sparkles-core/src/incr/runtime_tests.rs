@@ -1695,3 +1695,182 @@ fn unsupported_options_on_disk_do_not_run() {
     );
     rt.close(&s);
 }
+
+/// The views of the crash tests: a group, an optional, a negation and a distinct.
+const CRASH_VIEWS: &[(&str, &str)] = &[
+    ("team-sizes", TEAM_SIZES),
+    (
+        "ages",
+        "SELECT ?p ?t ?a WHERE { ?p org:memberOf ?t OPTIONAL { ?p :age ?a } }",
+    ),
+    (
+        "stayed",
+        "SELECT ?p WHERE { ?p org:memberOf ?t MINUS { ?p :left true } }",
+    ),
+    ("teams", "SELECT DISTINCT ?t WHERE { ?p org:memberOf ?t }"),
+];
+
+/// The env var that names the crash a child process runs, and its directory.
+const CRASH_CHILD: &str = "SPARKLES_VIEW_CRASH_CHILD";
+const CRASH_DIR: &str = "SPARKLES_VIEW_CRASH_DIR";
+/// The exit code of a child that stopped where its crash was injected.
+const CRASHED: i32 = 86;
+
+/// Stop the process now, as a crash would: no destructor runs, so nothing is
+/// closed, flushed or checkpointed.
+fn crash(_: &Store) {
+    std::process::exit(CRASHED);
+}
+
+/// Define the crash views, build them and checkpoint them, then commit a few changes
+/// that their next pass has to apply.
+fn crash_setup(s: &Store, rt: &Runtime) {
+    load(s);
+    for (name, query) in CRASH_VIEWS {
+        rt.put(s, name, ViewDef::table(q(query))).unwrap();
+    }
+    rt.round(s);
+    rt.checkpoint(s);
+    upd(s, "INSERT DATA { :d org:memberOf :t2 . :d :age 20 }");
+    upd(s, "INSERT DATA { :b :left true }");
+    upd(s, "DELETE DATA { :a org:memberOf :t1 }");
+}
+
+/// The crash `name` of a child process: each runs up to its crash and stops there.
+fn crash_child(name: &str, dir: &std::path::Path) {
+    let s = persistent(dir, true);
+    let rt = runtime(&s, Some(dir.to_path_buf()));
+    crash_setup(&s, &rt);
+    match name {
+        // the commits are durable and no pass ran
+        "after-commit" => crash(&s),
+        // the pass applied the commits in memory and nothing was checkpointed
+        "pass-applied" => {
+            s.set_failpoint("view-pass-applied", Some(Arc::new(crash)));
+            rt.round(&s);
+        }
+        // a checkpoint's file is written and not yet renamed into place
+        "checkpoint-written" => {
+            rt.round(&s);
+            s.set_failpoint("view-checkpoint-written", Some(Arc::new(crash)));
+            rt.checkpoint(&s);
+        }
+        // a compaction built the new generation and has not switched to it
+        "compact-built" | "compact-before-current" => {
+            rt.round(&s);
+            rt.checkpoint(&s);
+            upd(&s, "INSERT DATA { :e org:memberOf :t3 }");
+            let fp: &'static str = if name == "compact-built" {
+                "compact-built"
+            } else {
+                "compact-before-current"
+            };
+            s.set_failpoint(fp, Some(Arc::new(crash)));
+            s.compact().unwrap();
+        }
+        // the switch finished and the views' first pass after it is applied in
+        // memory, with their state moved to the new generation's ids
+        "pass-after-switch" => {
+            s.compact().unwrap();
+            upd(&s, "INSERT DATA { :e org:memberOf :t3 }");
+            s.set_failpoint("view-pass-applied", Some(Arc::new(crash)));
+            rt.round(&s);
+        }
+        other => panic!("no crash {other}"),
+    }
+    panic!("the crash {name} was not reached");
+}
+
+/// Run crash `name` in a child process, then open the dataset and check that every
+/// view gives the oracle's answer, at once and after a further commit.
+fn crash_and_recover(test: &str, name: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CRASH_CHILD, name)
+        .env(CRASH_DIR, dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("crash child {name} did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(CRASHED),
+        "crash child {name} did not stop at its crash: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    // every view loads its newest complete checkpoint and applies the commits since
+    let st = rt.stats(&s);
+    assert_eq!(
+        st.loaded,
+        CRASH_VIEWS.len() as u64,
+        "{name}: checkpoints loaded"
+    );
+    assert_eq!(st.resets, 0, "{name}: no view was evaluated again");
+    let check = |what: &str| {
+        for (view, query) in CRASH_VIEWS {
+            assert_eq!(
+                read(&rt, &s, view, None).unwrap(),
+                oracle(&s, query, None),
+                "{name}: view {view} {what}"
+            );
+        }
+    };
+    check("after the open");
+    upd(&s, "INSERT DATA { :f org:memberOf :t1 . :c :left true }");
+    rt.round(&s);
+    check("after a further commit");
+    // the next checkpoint leaves no file of the interrupted one behind
+    rt.checkpoint(&s);
+    for (view, _) in CRASH_VIEWS {
+        let state = dir.path().join("views").join(view).join("main");
+        let names: Vec<String> = std::fs::read_dir(&state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|n| n.ends_with(".bin")),
+            "{name}: view {view} keeps {names:?}"
+        );
+        assert_eq!(names.len(), 1, "{name}: view {view} keeps {names:?}");
+    }
+    rt.close(&s);
+}
+
+/// Spec F13 §11 recovery tests: a crash between a commit and its pass, during a
+/// checkpoint and during a generation switch, followed by an open, gives the oracle's
+/// answer. Each crash runs in a child process that stops with no cleanup.
+#[test]
+fn views_recover_from_crashes() {
+    const TEST: &str = "incr::runtime_tests::views_recover_from_crashes";
+    if let Ok(name) = std::env::var(CRASH_CHILD) {
+        let dir = std::env::var(CRASH_DIR).expect("the crash directory");
+        crash_child(&name, std::path::Path::new(&dir));
+        return;
+    }
+    for name in [
+        "after-commit",
+        "pass-applied",
+        "checkpoint-written",
+        "compact-built",
+        "compact-before-current",
+        "pass-after-switch",
+    ] {
+        crash_and_recover(TEST, name);
+    }
+}

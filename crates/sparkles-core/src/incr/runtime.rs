@@ -1236,6 +1236,9 @@ impl Runtime {
                 return true;
             }
         }
+        // the pass is applied in memory and not yet checkpointed (a test hook; it must
+        // not call the runtime, whose locks the pass holds)
+        store.failpoint("view-pass-applied");
         if d.complete && st.circuit.applied > from + 1 && from > 0 && st.views > 0 {
             tracing::debug!(
                 target: "sparkles::incr::runtime",
@@ -1396,7 +1399,6 @@ impl Runtime {
             .iter()
             .filter_map(|(n, e)| Some((n.clone(), e.cell.clone()?, e.checkpointed)))
             .collect();
-        let _ = store;
         for (name, cell, done) in todo {
             // under the state lock, which a switch of the inference takes to replace the
             // circuit
@@ -1412,7 +1414,7 @@ impl Runtime {
                 continue;
             };
             let r = st.circuit.encode(&snap).and_then(|body| {
-                persist::write(
+                persist::write_with(
                     &views::dir(&root, &name).join(BRANCH),
                     &persist::Header {
                         dataset: self.dataset,
@@ -1420,6 +1422,7 @@ impl Runtime {
                         fingerprint: st.fingerprint(cell.key),
                     },
                     &body,
+                    || store.failpoint("view-checkpoint-written"),
                 )
             });
             drop(st);
