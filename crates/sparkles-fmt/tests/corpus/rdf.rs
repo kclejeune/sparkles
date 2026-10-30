@@ -125,7 +125,7 @@ fn manifest_cases(path: &Path, lang: Language) -> Vec<RdfCase> {
         Language::TriG => "TestTrig",
         Language::NTriples => "TestNTriples",
         Language::NQuads => "TestNQuads",
-        Language::Sparql | Language::JsonLd => return Vec::new(),
+        Language::Sparql | Language::JsonLd | Language::Shaclc => return Vec::new(),
     };
     // the directory's base IRI: relative IRIs in evaluation inputs resolve against it
     let test_base = g

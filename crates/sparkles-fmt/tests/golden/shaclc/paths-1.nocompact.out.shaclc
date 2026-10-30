@@ -1,0 +1,11 @@
+PREFIX ex: <http://example.com/ns#>
+
+shape ex:S {
+  ^ex:parent/ex:child* [0..*] .
+  (ex:a|ex:b)+/ex:c? IRI|Literal .
+  ex:p|ex:q xsd:string .
+  ex:r xsd:string|xsd:integer [1..1] .
+  ex:s ex:t|ex:u hasValue=ex:x|!in=[ex:y ex:z] .
+  <http://example.com/ns#full> <http://example.com/ns#Type> .
+  <relative> <Type> .
+}

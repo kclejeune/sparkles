@@ -1,0 +1,10 @@
+PREFIX ex: <http://example.com/ns#>
+shape ex:S {
+  ex:address { ex:city xsd:string [1..1] . ex:street { ex:name xsd:string . } [0..1] . } [0..1] .
+  ex:a { ex:b IRI . } | { ex:c IRI . } .
+  ex:d IRI {
+    # a comment inside
+    ex:e IRI .
+  } [1..1] maxLength=1 .
+  ex:f !{ ex:g IRI . } .
+}

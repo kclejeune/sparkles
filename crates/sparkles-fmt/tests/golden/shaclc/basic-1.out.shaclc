@@ -1,0 +1,26 @@
+# Person shapes
+# second line
+
+BASE <http://example.com/ns>
+IMPORTS <http://example.com/person-ontology>
+PREFIX ex: <http://example.com/ns#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX unused: <http://example.com/unused#>
+
+shape ex:PersonShape -> ex:Person ex:Human {
+  closed=true ignoredProperties=[rdf:type ex:other] .
+  ex:ssn xsd:string [0..1] pattern="^\\d{3}-\\d{2}-\\d{4}$" . # the ssn
+
+  ex:worksFor IRI [0..*] {
+    ex:name xsd:string [1..1] .
+  } .
+  !minLength=2|maxLength=9 .
+  @ex:Other .
+  ex:a|ex:b/ex:c* xsd:string|xsd:integer|xsd:date [1..*] .
+}
+
+shapeClass ex:Person {}
+
+shape ex:Empty {
+  # nothing here
+}

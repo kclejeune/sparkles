@@ -171,6 +171,8 @@ impl<'s, F: Fn(NodeId) -> bool> Walk<'_, 's, F> {
         let text = tree.token_text(t);
         let label = match tree.token_kind(t) {
             TokenKind::PnameNs | TokenKind::PnameLn => text.split_once(':').map(|p| p.0.into()),
+            // SHACLC's `@ex:Shape`
+            TokenKind::AtPname => text[1..].split_once(':').map(|p| p.0.into()),
             TokenKind::IriRef if !verbatim && self.opts.compact_iris => {
                 super::compact_iri(text, self.scope, t)
                     .and_then(|p| p.split_once(':').map(|p| p.0.to_string()))

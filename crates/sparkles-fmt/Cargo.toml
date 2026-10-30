@@ -1,6 +1,6 @@
 [package]
 name = "sparkles-fmt"
-description = "Opinionated, comment-preserving formatter for SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD"
+description = "Opinionated, comment-preserving formatter for SPARQL, Turtle, TriG, N-Triples, N-Quads, JSON-LD and SHACLC"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,6 +18,8 @@ oxrdf.workspace = true
 oxsdatatypes.workspace = true
 # BASE resolution of the IRIs in a query's pattern (`pattern`)
 oxiri.workspace = true
+# the reference parser and the lossless lexer of SHACLC
+sparkles-shaclc.workspace = true
 # the reference parser of JSON-LD (strict JSON)
 json-event-parser.workspace = true
 # the sorted runs the line formats spill to disk

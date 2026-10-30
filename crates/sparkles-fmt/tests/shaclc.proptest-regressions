@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7b683f47f8c6905b20b39de76b89d7f21afc6365f1f2293c8b7c05117ca8aa1b # shrinks to doc = "PREFIX ex: <http://example.com/ns#>\nPREFIX : <http://example.com/colon#>\nPREFIX unused: <http://example.com/unused#>\nBASE <http://example.com/base/>\nshape ex:a { (ex:a|ex:a)+ ex:a [1..*] [1..*] .\nex:a/^ex:a/^ex:a  .\nex:a/ex:a/ex:a hasValue=ex:a|ex:a ex:a hasValue=ex:a|ex:a . }\nshape ex:a { @ex:a .\n^ex:a/ex:a/ex:a { ex:a/ex:a class=ex:a|{  } . }|IRI @ex:b-c|{ @ex: . } .\n(:d*|(ex:a*)?)+ ex:a|IRI . }", width = 100, prune = true, align = true, at = Index(13042944162919802576), own_line = false
+cc 3c617e6fee9c401a4fadf5a43f1bfba51916c448e55443654fc73bbc2aca1e5c # shrinks to doc = "PREFIX ex: <http://example.com/ns#>\nPREFIX : <http://example.com/colon#>\nPREFIX unused: <http://example.com/unused#>\nBASE <http://example.com/base/>\nshape <rel> {  }", width = 30, prune = true, align = false, at = Index(2459565876494606883), own_line = true

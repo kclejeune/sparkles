@@ -81,7 +81,9 @@ pub fn parse(text: &str, lang: Language) -> Result<Vec<Quad>, FormatError> {
             .for_slice(body)
             .collect::<Result<Vec<Quad>, _>>()
             .map_err(positioned),
-        Language::Sparql | Language::JsonLd => Err(FormatError::unsupported_language(lang)),
+        Language::Sparql | Language::JsonLd | Language::Shaclc => {
+            Err(FormatError::unsupported_language(lang))
+        }
     }
 }
 

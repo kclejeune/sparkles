@@ -1,0 +1,12 @@
+# header
+
+PREFIX ex: <http://example.com/ns#>
+PREFIX unused: <http://example.com/unused#> # kept, it has a comment
+PREFIX other: <http://example.com/other#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+shape ex:S -> other:Thing {
+  ex:p xsd:string .
+  ex:q @<http://example.com/ns#T> .
+  @ex:T .
+}

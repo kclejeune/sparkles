@@ -102,6 +102,14 @@ pub enum TokenKind {
     PipeRBrace,
     /// `:` between a JSON key and its value (JSON only)
     Colon,
+    /// `@` before an IRI reference: a SHACLC shape reference (SHACLC only)
+    At,
+    /// `@ex:Shape`, a SHACLC shape reference (SHACLC only)
+    AtPname,
+    /// `..` in a SHACLC count (SHACLC only)
+    DotDot,
+    /// `->` in a SHACLC shape header (SHACLC only)
+    Arrow,
     /// one character no terminal starts with
     Unknown,
     /// the end of the input (empty)
@@ -171,6 +179,8 @@ pub enum LexMode {
     Turtle,
     /// JSON ([`crate::jsonld::lex`])
     Json,
+    /// SHACL Compact Syntax ([`crate::shaclc::lex`])
+    Shaclc,
 }
 
 /// Tokenize `src` (at most `u32::MAX` bytes). A leading BOM belongs to no token; the
@@ -178,6 +188,9 @@ pub enum LexMode {
 pub fn lex(src: &str, mode: LexMode) -> Vec<Token> {
     if mode == LexMode::Json {
         return crate::jsonld::lex::lex(src);
+    }
+    if mode == LexMode::Shaclc {
+        return crate::shaclc::lex::lex(src);
     }
     let mut out = Vec::with_capacity(src.len() / 4 + 1);
     let mut pos = if src.starts_with('\u{feff}') { 3 } else { 0 };

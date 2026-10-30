@@ -1,0 +1,47 @@
+PREFIX ex: <http://example.com/ns#>
+PREFIX unused: <http://u/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+shape ex:S {
+  ex:aVeryLongPropertyName
+    xsd:string
+    [1..1]
+    pattern="^[a-z]+$"
+    minLength=3
+    maxLength=40
+    message="Too long or short" .
+  ex:p
+    xsd:string # about type
+    [1..1] . # about count
+  # before q
+  ex:q
+    in=[
+      ex:alpha
+      ex:beta
+      ex:gamma
+      ex:delta
+      ex:epsilon
+      ex:zeta
+      ex:eta
+      ex:theta
+      ex:iota
+      ex:kappa
+    ] .
+  closed=true
+    ignoredProperties=[ex:a ex:b]
+    languageIn=["en" "de"]
+    nodeKind=sh:IRI
+    severity=sh:Warning .
+  ex:r
+    xsd:string
+      |xsd:integer
+      |ex:aVeryLongClassNameNumberOne
+      |ex:aVeryLongClassNameNumberTwo
+      |ex:Three
+    [1..1] .
+  ex:n {
+    ex:m xsd:string .
+  } | ex:class [1..1] .
+  # trailing dangling
+}
+# end comment

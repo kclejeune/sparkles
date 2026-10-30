@@ -5839,6 +5839,7 @@ dependencies = [
  "rayon",
  "spargebra",
  "sparkles-fmt",
+ "sparkles-shaclc",
  "thiserror 2.0.21",
  "toml",
  "unicode-width",
