@@ -17,8 +17,9 @@ impl Graph {
     /// Group the instances of a class, or of a group an earlier answer named, and count
     /// the edges between the groups, to their sibling groups and to the other classes.
     /// The queries run at `req.at` (the head when `None`) with the dataset's query
-    /// defaults and the view, budgets, deadline and cancellation of `opts`. The answer is
-    /// the JSON object that API.md describes under "Graph overview".
+    /// defaults and the view, budgets, deadline and cancellation of `opts`. A timeout in
+    /// `opts` starts once and bounds the whole answer. The answer is the JSON object
+    /// that API.md describes under "Graph overview".
     ///
     /// ```
     /// use sparkles::Dataset;
@@ -39,7 +40,9 @@ impl Graph {
     pub fn groups(&self, req: &GroupsRequest, opts: &QueryOptions) -> Result<serde_json::Value> {
         let store = self.ds.store();
         req.check_branch(&store.branch_name())?;
-        let opts = self.ds.with_query_defaults(opts);
+        let defaults = self.ds.with_query_defaults(opts);
+        // the history read and every query share one deadline
+        let opts = crate::overview::one_deadline(&defaults)?;
         let snap = match &req.at {
             None => store.snapshot(),
             Some(at) => {
@@ -57,8 +60,8 @@ impl Graph {
     /// variable by ranges or values of their properties (spec U11 §3.2), with each facet
     /// filtered by the brushes on the other facets. The queries run at `req.at` (the head
     /// when `None`) with the dataset's query defaults and the view, budgets, deadline and
-    /// cancellation of `opts`. The answer is the JSON object that API.md describes under
-    /// "Facets".
+    /// cancellation of `opts`. A timeout in `opts` starts once and bounds the whole
+    /// answer. The answer is the JSON object that API.md describes under "Facets".
     ///
     /// ```
     /// use sparkles::Dataset;
@@ -79,7 +82,9 @@ impl Graph {
     /// ```
     pub fn facets(&self, req: &FacetsRequest, opts: &QueryOptions) -> Result<serde_json::Value> {
         let store = self.ds.store();
-        let opts = self.ds.with_query_defaults(opts);
+        let defaults = self.ds.with_query_defaults(opts);
+        // the history read and every query share one deadline
+        let opts = crate::overview::one_deadline(&defaults)?;
         let snap = match &req.at {
             None => store.snapshot(),
             Some(at) => {

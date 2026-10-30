@@ -284,11 +284,28 @@ fn check_pair(within: &Within, by: &By) -> Result<()> {
     }
 }
 
+/// `opts` with its relative timeout turned into one absolute deadline, the earlier of
+/// that timeout from now and `opts.deadline`. An overview runs many queries, and each
+/// query would otherwise start the timeout again.
+pub(crate) fn one_deadline(opts: &QueryOptions) -> Result<std::borrow::Cow<'_, QueryOptions>> {
+    let Some(timeout) = opts.timeout else {
+        return Ok(std::borrow::Cow::Borrowed(opts));
+    };
+    let relative = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::invalid("query timeout is too large"))?;
+    let mut anchored = opts.clone();
+    anchored.timeout = None;
+    anchored.deadline = Some(opts.deadline.map_or(relative, |d| d.min(relative)));
+    Ok(std::borrow::Cow::Owned(anchored))
+}
+
 /// The answer to `req` at snapshot `snap`, as the JSON object that API.md describes
 /// under "Graph overview", with the snapshot's `commit`. `req.at` is not read: the
 /// caller chose the snapshot, and with it the branch, which
 /// [`GroupsRequest::check_branch`] checks for a request that reads reports.
 pub fn groups_at(snap: Arc<Snapshot>, req: &GroupsRequest, opts: &QueryOptions) -> Result<J> {
+    let opts = &*one_deadline(opts)?;
     let commit = snap.commit;
     let run = groups::Run { snap, opts };
     let mut answer = if req.reads_reports() {

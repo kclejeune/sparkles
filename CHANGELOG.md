@@ -15,6 +15,10 @@ signals remain incomplete.
 Node graph overviews retain one absolute deadline across their native subqueries
 instead of renewing the timeout for each query.
 
+Graph overview groups and facets in the Rust library start a relative timeout once
+for the whole answer, so every binding and caller shares one deadline across the
+overview's queries. GraphQL history selection honors a caller's absolute deadline.
+
 Catalog disposal now refuses raw shared state, Store and BranchSet aliases and preserves
 exact owners on refusal. Resident source leases retain real catalog openings without
 changing StoreHandle variants or granting managed-write authority. Built-in close links,

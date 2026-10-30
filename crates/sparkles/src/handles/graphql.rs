@@ -87,7 +87,14 @@ impl GraphQl {
         let store = self.ds.store();
         let history = HistoryOptions {
             cancel: opts.query.cancel.clone(),
-            deadline: opts.query.timeout.map(|t| Instant::now() + t),
+            // the earlier of the caller's deadline and its timeout from now
+            deadline: opts
+                .query
+                .timeout
+                .and_then(|t| Instant::now().checked_add(t))
+                .into_iter()
+                .chain(opts.query.deadline)
+                .min(),
         };
         let resolve = |at: Option<&At>| match at {
             None => Ok(store.snapshot()),
