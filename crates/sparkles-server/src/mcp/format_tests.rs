@@ -53,6 +53,18 @@ async fn formats_like_sparkles_fmt() {
         r["text"].as_str().unwrap().contains("\"@id\": \"urn:a\""),
         "{r}"
     );
+    // SHACL Compact Syntax
+    let shc = "prefix ex: <http://ex.org/>\nshape ex:S -> ex:C{ex:p IRI[1..1].}";
+    let r = c
+        .structured("format", json!({"text": shc, "language": "shaclc"}))
+        .await;
+    assert_eq!(r["language"], "shaclc");
+    assert_eq!(r["changed"], true);
+    assert_eq!(r["text"], formatted(shc, sparkles_fmt::Language::Shaclc));
+    assert!(
+        r["text"].as_str().unwrap().contains("ex:p IRI [1..1] ."),
+        "{r}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

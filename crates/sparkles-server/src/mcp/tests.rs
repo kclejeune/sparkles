@@ -587,7 +587,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             "format",
             json!({"type":"object","additionalProperties":false,"required":["text"],"properties":{
                 "text": {"type":"string","minLength":1,"maxLength":1048576,"description":"The document to format"},
-                "language": {"enum":["sparql","turtle","trig","ntriples","nquads","jsonld"],"description":"Detected from the text when left out (N-Triples reads as Turtle)"},
+                "language": {"enum":["sparql","turtle","trig","ntriples","nquads","jsonld","shaclc"],"description":"Detected from the text when left out (N-Triples reads as Turtle)"},
                 "options": {"type":"object","description":"Style options, as in .sparklesfmt.toml but in camelCase: lineWidth, indentWidth, sort, prunePrefixes, directiveStyle, prefixGroups, typeShorthand, compactIris, quoteStyle, operatorPosition, turtleLayout, alignValues"},
                 "timeoutSeconds": to}}),
         ),

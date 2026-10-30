@@ -67,7 +67,14 @@ export function parseQuery(text: string, options: ParseOptions = {}) {
 export function parseUpdate(text: string, options: ParseOptions = {}) {
   return helper<string>('parseUpdate', { text, ...options });
 }
-export type FormatLanguage = 'sparql' | 'turtle' | 'trig' | 'ntriples' | 'nquads' | 'jsonld';
+export type FormatLanguage =
+  | 'sparql'
+  | 'turtle'
+  | 'trig'
+  | 'ntriples'
+  | 'nquads'
+  | 'jsonld'
+  | 'shaclc';
 export interface FormatOptions {
   lineWidth?: number;
   indentWidth?: number;

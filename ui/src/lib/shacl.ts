@@ -17,6 +17,11 @@ export function shapesMediaType(syntax: ShaclSyntax): string {
   return syntax === 'shaclc' ? 'text/shaclc' : 'text/turtle';
 }
 
+/** The language the formatter is asked for: the syntax of the shapes. */
+export function shapesFormatLanguage(syntax: ShaclSyntax): 'turtle' | 'shaclc' {
+  return syntax === 'shaclc' ? 'shaclc' : 'turtle';
+}
+
 /** The editor's label for a syntax. */
 export function shapesLabel(syntax: ShaclSyntax): string {
   return syntax === 'shaclc' ? 'Shapes graph (SHACLC)' : 'Shapes graph (Turtle)';

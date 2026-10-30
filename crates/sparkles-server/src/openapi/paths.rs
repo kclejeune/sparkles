@@ -2645,7 +2645,7 @@ fn format_and_mcp(p: &mut Paths) {
         "sort",
     ];
     let mut o = op(POST, "/$/format", "format", "Formatting", "Format SPARQL or RDF")
-        .doc("Formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads or JSON-LD document. A JSON body gets a `FormatResult`. A raw body is answered with the formatted text in the same media type. `--format-endpoint` may limit or turn off the route.")
+        .doc("Formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACL Compact Syntax (SHACLC) document. A JSON body gets a `FormatResult`. A raw body is answered with the formatted text in the same media type. `--format-endpoint` may limit or turn off the route.")
         .see("formatting")
         .query("language", sref("FormatLanguage"), "The language of a raw body when its media type does not say.");
     for name in options {
@@ -2659,6 +2659,7 @@ fn format_and_mcp(p: &mut Paths) {
         "application/n-triples",
         "application/n-quads",
         "application/ld+json",
+        "text/shaclc",
         "text/plain",
     ];
     let mut body = Map::new();

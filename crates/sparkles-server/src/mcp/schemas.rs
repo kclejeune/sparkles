@@ -799,14 +799,14 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "format",
             "Format SPARQL or RDF",
-            "Format a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads or JSON-LD with the formatter of `sparkles fmt`. Returns the formatted text, whether it changed, and warnings with their line and column. Only valid documents are formatted: a syntax error comes back with its line and column. Reads no dataset and writes nothing.",
+            "Format a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACL Compact Syntax (SHACLC) with the formatter of `sparkles fmt`. Returns the formatted text, whether it changed, and warnings with their line and column. Only valid documents are formatted: a syntax error comes back with its line and column. Reads no dataset and writes nothing.",
             json!({"type":"object","additionalProperties":false,"required":["text"],"properties":{
                 "text": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"The document to format"},
-                "language": {"enum":["sparql","turtle","trig","ntriples","nquads","jsonld"],"description":"Detected from the text when left out (N-Triples reads as Turtle)"},
+                "language": {"enum":["sparql","turtle","trig","ntriples","nquads","jsonld","shaclc"],"description":"Detected from the text when left out (N-Triples reads as Turtle)"},
                 "options": {"type":"object","description":"Style options, as in .sparklesfmt.toml but in camelCase: lineWidth, indentWidth, sort, prunePrefixes, directiveStyle, prefixGroups, typeShorthand, compactIris, quoteStyle, operatorPosition, turtleLayout, alignValues"},
                 "timeoutSeconds": to(cfg)}}),
             Some(json!({"type":"object","required":["language","changed","text","warnings"],"properties":{
-                "language":{"enum":["sparql","turtle","trig","ntriples","nquads","jsonld"]},
+                "language":{"enum":["sparql","turtle","trig","ntriples","nquads","jsonld","shaclc"]},
                 "changed":{"type":"boolean"},
                 "text":{"type":"string"},
                 "warnings":{"type":"array","items":{"type":"object","required":["code","message","line","column"],"properties":{
