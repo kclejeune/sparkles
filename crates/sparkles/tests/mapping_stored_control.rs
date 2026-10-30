@@ -126,20 +126,35 @@ fn stopped_stored_run_refuses_before_conversion() {
 }
 
 #[test]
-fn stored_run_stopped_during_conversion_commits_nothing() {
+fn stored_run_stopped_during_conversion_stops_at_the_next_checkpoint() {
     let (_dir, inputs) = input(200_000);
+    // An unstopped run of the same input reaches every conversion checkpoint.
+    let (baseline, total) = counting();
+    stored(MAPPING)
+        .mappings()
+        .run(
+            "m",
+            None,
+            &inputs,
+            &baseline,
+            false,
+            &WriteOptions::default(),
+        )
+        .unwrap();
+    let total = total.load(Ordering::SeqCst);
+    assert!(total >= 2, "the input reaches only {total} checkpoints");
+
     let ds = stored(MAPPING);
     let flag = Arc::new(AtomicBool::new(false));
-    let (opts, calls) = counting();
-    let trip = flag.clone();
-    let seen = calls.clone();
+    let calls = Arc::new(AtomicU64::new(0));
+    let (trip, seen) = (flag.clone(), calls.clone());
+    // The caller's callback sets the write options' flag at its first checkpoint and
+    // never refuses itself, so only the write controls can stop conversion.
     let opts = RunOptions {
         check: Some(Arc::new(move || {
-            // Stop through the write options once conversion has begun.
-            if seen.load(Ordering::SeqCst) >= 1 {
-                trip.store(true, Ordering::SeqCst);
-            }
-            opts.check.as_ref().unwrap()()
+            seen.fetch_add(1, Ordering::SeqCst);
+            trip.store(true, Ordering::SeqCst);
+            Ok(())
         })),
         ..Default::default()
     };
@@ -152,6 +167,9 @@ fn stored_run_stopped_during_conversion_commits_nothing() {
         .run("m", None, &inputs, &opts, false, &write)
         .unwrap_err();
     assert!(matches!(error, Error::Cancelled), "{error}");
+    // The next checkpoint refuses before the callback runs again. A run that ignored
+    // the write controls during conversion would reach all of them and refuse later.
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "of {total} checkpoints");
     assert!(ds.is_empty());
     assert!(ds.mappings().last_run("m").is_none());
 }

@@ -175,9 +175,11 @@ Tests and conformance:
   and JVM structured administration tests cover mapping revisions, runs and refusals.
   `crates/sparkles/tests/mapping_stored_control.rs` checks that a cancelled or expired
   stored run refuses before conversion in add and replace modes, that a stop during
-  conversion commits nothing, and that an unstopped run publishes and records its run.
-  The Node administration tests check that both mapping runs time out within their
-  own budget while another transaction holds the writer.
+  conversion takes effect at the next conversion checkpoint and commits nothing, and
+  that an unstopped run publishes and records its run.
+  The Node administration tests check that the native deadline and the package
+  timeout each stop both mapping runs during conversion, and that both runs time out
+  at writer admission while another transaction holds the writer.
   `crates/sparkles/tests/mapping_native_control.rs` covers native conversion checks
   and bounds, every supplied cancellation source, actual final writer waits and
   unchanged state on refusal. Writer-acquisition and committed callbacks latch the
