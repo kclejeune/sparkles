@@ -606,12 +606,17 @@ async fn an_unrestorable_definition_fails_the_backup() {
         r#"{{"format":1,"query":"SELECT * {{ ?s ?p ?o }} #{}"}}"#,
         "x".repeat(1 << 20)
     );
-    for (name, bytes) in [
-        ("big", big.into_bytes()),
-        ("schema", br#"{"format":1,"query":123}"#.to_vec()),
+    let paused = br#"{"format":2,"query":"SELECT * { ?s ?p ?o }","paused":{"reason":"restored"}}"#;
+    for (name, bytes, format) in [
+        ("big", big.into_bytes(), 1),
+        ("schema", br#"{"format":1,"query":123}"#.to_vec(), 1),
+        // a paused definition from a caller's source: a restore accepts format 1 only
+        ("paused", paused.to_vec(), 2),
     ] {
         let mut src = closed_source(&db);
-        src.definitions.push(view(bytes));
+        let mut d = view(bytes);
+        d.format = format;
+        src.definitions.push(d);
         let e = repo.create(src, &opts(name, "ds")).await.unwrap_err();
         assert_eq!(e.code(), Code::InvalidRequest, "{name}: {e}");
         assert_eq!(

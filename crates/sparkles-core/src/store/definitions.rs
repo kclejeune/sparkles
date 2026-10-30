@@ -158,7 +158,9 @@ pub fn check(kind: &DefinitionKind, path: &str, bytes: &[u8]) -> Result<u32> {
     }
 }
 
-/// Check every definition of a capture before anything of it is published.
+/// Check every definition of a capture before anything of it is published: each is
+/// one a restore accepts, which includes holding its kind's running format. A paused
+/// definition, such as one a caller's own source supplies, is refused.
 pub fn check_all(defs: &[DefinitionFile]) -> Result<()> {
     for d in defs {
         let kind = crate::formats::definition_kind(d.kind)
@@ -170,6 +172,12 @@ pub fn check_all(defs: &[DefinitionFile]) -> Result<()> {
             )));
         }
         let found = check(kind, &d.path, &d.bytes)?;
+        if found != kind.writes {
+            return Err(Error::Invalid(format!(
+                "{} has format {found}; a capture holds definitions as they run, at format {}",
+                d.path, kind.writes
+            )));
+        }
         if found != d.format {
             return Err(Error::Invalid(format!(
                 "{} has format {found}, not {}",
