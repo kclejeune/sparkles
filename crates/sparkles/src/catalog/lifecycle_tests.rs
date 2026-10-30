@@ -891,3 +891,251 @@ fn boot_refuses_only_a_registered_root_without_directory_or_current() {
         assert_eq!(again.refused().len(), 1);
     }
 }
+
+/// Close callbacks that manage the catalog from inside a disposal.
+mod callback_management {
+    use super::*;
+    use crate::guard::{Candidate, CommitGuard, ValidationSummary};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    type Action = Box<dyn Fn(&Catalog) + Send + Sync>;
+    struct CallbackGuard {
+        catalog: Catalog,
+        action: Action,
+    }
+    impl CommitGuard for CallbackGuard {
+        fn check(&self, _: &Candidate<'_>) -> crate::Result<ValidationSummary> {
+            unreachable!("installed after the final write")
+        }
+        fn describe(&self) -> String {
+            "close callback that manages the catalog".into()
+        }
+        fn close(&self, _: &crate::commit::CommitInfo, _: &crate::store::Snapshot) {
+            (self.action)(&self.catalog);
+        }
+    }
+    fn install(ds: &Dataset, cat: &Catalog, action: impl Fn(&Catalog) + Send + Sync + 'static) {
+        ds.store().set_guard(Some(Arc::new(CallbackGuard {
+            catalog: cat.clone(),
+            action: Box::new(action),
+        })));
+    }
+    /// Run `f` on another thread so that a deadlock fails as a timeout.
+    fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("a catalog call from a close callback must not wait on its own disposal")
+    }
+    type Seen = Arc<parking_lot::Mutex<Option<crate::Result<()>>>>;
+    fn create_other(seen: &Seen) -> impl Fn(&Catalog) + Send + Sync + 'static {
+        let seen = seen.clone();
+        move |c: &Catalog| {
+            *seen.lock() = Some(c.create("other", &Default::default()).map(drop));
+        }
+    }
+    fn assert_disposing(seen: &Seen) {
+        let seen = seen.lock().take().expect("the close callback ran");
+        assert!(
+            matches!(&seen, Err(Error::Conflict(m)) if m.starts_with("catalog-disposing")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn delete_refuses_management_from_its_close_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        let seen = Seen::default();
+        install(&ds, &cat, create_other(&seen));
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        assert_disposing(&seen);
+        assert!(cat.get("other").is_none());
+        assert!(cat.get("source").is_none());
+    }
+
+    #[test]
+    fn rename_refuses_management_from_its_close_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        let seen = Seen::default();
+        install(&ds, &cat, create_other(&seen));
+        drop(ds);
+        let worker = cat.clone();
+        bounded(move || worker.rename("source", "moved").map(drop)).unwrap();
+        assert_disposing(&seen);
+        assert!(cat.get("other").is_none());
+        assert!(cat.get("moved").is_some());
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn restore_swap_refuses_management_from_its_close_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        let seen = Seen::default();
+        install(&ds, &cat, create_other(&seen));
+        drop(ds);
+        let restored = dir.path().join("databases").join(".restore-source-1");
+        let id = Store::open(&restored, Default::default())
+            .unwrap()
+            .dataset_id();
+        let worker = cat.clone();
+        let swapped = bounded(move || {
+            super::super::swap::replace_with(
+                &worker,
+                "source",
+                &restored,
+                "1",
+                false,
+                Duration::from_secs(5),
+            )
+            .map(|ds| ds.dataset_id())
+            .map_err(|e| e.to_string())
+        });
+        assert_eq!(swapped.unwrap(), id);
+        assert_disposing(&seen);
+        assert!(cat.get("other").is_none());
+    }
+
+    #[test]
+    fn management_from_another_thread_waits_for_the_disposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx = parking_lot::Mutex::new(tx);
+        install(&ds, &cat, move |c| {
+            let (started, waiting) = mpsc::channel();
+            let other = c.clone();
+            let tx = tx.lock().clone();
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let _ = tx.send(other.create("other", &Default::default()).map(drop));
+            });
+            waiting.recv().unwrap();
+            // The other thread now waits for the management lock that this
+            // disposal holds.
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        let created = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(created.is_ok(), "{created:?}");
+        assert!(cat.get("other").is_some());
+    }
+
+    #[test]
+    fn deferred_management_runs_after_the_disposal_returns_its_lock() {
+        for rename in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+            let ds = cat.create("source", &Default::default()).unwrap();
+            let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = gone.clone();
+            install(&ds, &cat, move |c| {
+                let seen = seen.clone();
+                c.defer(move |c| {
+                    seen.store(
+                        c.get("source").is_none(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    c.create("other", &Default::default()).unwrap();
+                });
+            });
+            drop(ds);
+            let worker = cat.clone();
+            bounded(move || {
+                if rename {
+                    worker.rename("source", "moved").map(drop)
+                } else {
+                    worker.delete("source").map(drop)
+                }
+            })
+            .unwrap();
+            assert!(cat.get("other").is_some(), "rename={rename}");
+            assert!(gone.load(std::sync::atomic::Ordering::SeqCst));
+            drop(cat);
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert!(reopened.get("other").is_some());
+            assert_eq!(reopened.get("moved").is_some(), rename);
+        }
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn deferred_management_runs_after_a_restore_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        install(&ds, &cat, |c| {
+            c.defer(|c| {
+                // The swap has published the restored dataset by now.
+                assert!(c.get("source").is_some());
+                c.create("other", &Default::default()).unwrap();
+            });
+        });
+        drop(ds);
+        let restored = dir.path().join("databases").join(".restore-source-1");
+        drop(Store::open(&restored, Default::default()).unwrap());
+        let worker = cat.clone();
+        bounded(move || {
+            super::super::swap::replace_with(
+                &worker,
+                "source",
+                &restored,
+                "1",
+                false,
+                Duration::from_secs(5),
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert!(cat.get("other").is_some());
+    }
+
+    #[test]
+    fn a_panicking_deferred_operation_does_not_stop_later_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        install(&ds, &cat, |c| {
+            c.defer(|_| std::panic::panic_any("deferred-op-payload"));
+            c.defer(|c| {
+                c.create("other", &Default::default()).unwrap();
+            });
+        });
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        assert!(cat.get("other").is_some());
+        assert!(cat.get("source").is_none());
+    }
+
+    #[test]
+    fn deferral_outside_management_runs_at_once() {
+        let cat = Catalog::memory(Default::default());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        cat.defer(move |c| {
+            let memory = CreateDataset {
+                kind: DatasetKind::Memory,
+                geo: None,
+            };
+            c.create("other", &memory).unwrap();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(cat.get("other").is_some());
+    }
+}

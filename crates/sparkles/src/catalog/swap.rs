@@ -111,6 +111,8 @@ pub(crate) fn replace_with(
         "sparkles.task" = task
     )
     .entered();
+    // Operations that close callbacks defer run once the whole swap returns.
+    let _batch = st.batch_scope();
     let _restoring = if st.restoring_by(name).as_deref() == Some(task) {
         None
     } else {
@@ -123,7 +125,10 @@ pub(crate) fn replace_with(
     while st.get(name).is_some_and(|d| d.in_use_without_self()) && t0.elapsed() < drain {
         std::thread::sleep(Duration::from_millis(5));
     }
-    let Some(old) = st.detach_for_swap(name) else {
+    let detached = st
+        .detach_for_swap(name)
+        .map_err(|e| BackupError::new(Code::DatasetBusy, e.to_string()))?;
+    let Some(old) = detached else {
         return Err(match st.get(name) {
             Some(_) => BackupError::new(
                 Code::NotManaged,
@@ -196,7 +201,11 @@ pub(crate) fn replace_with(
         }
         #[cfg(test)]
         close_hook(CloseStage::Proof, attempt);
-        match old.close_for_disposal(|| {}) {
+        let closed = {
+            let _disposing = st.disposal_scope();
+            old.close_for_disposal(|| {})
+        };
+        match closed {
             Ok(reasoning) => break reasoning,
             Err(refused) => {
                 old = refused.dataset;

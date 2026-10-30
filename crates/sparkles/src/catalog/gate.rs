@@ -1,0 +1,235 @@
+//! The catalog's management lock and the operations that close callbacks defer.
+//!
+//! Every management call takes one lock. Disposal runs dataset close callbacks on the
+//! thread that disposes, sometimes while that thread holds the lock, so a callback that
+//! called back into management would wait on itself. A thread-local record of the
+//! catalogs that the current thread manages or disposes turns that call into an
+//! immediate refusal instead. Callbacks queue such work with [`Catalog::defer`], and the
+//! queue runs on the same thread once the outermost management call or disposal of
+//! that catalog on the thread has released the lock.
+//!
+//! The lock order is the management lock, then `entries`, then `detached` or `refused`.
+//! The queue's mutex is a leaf that is never held while an operation runs.
+
+use super::{Catalog, Inner};
+use crate::{Error, Result};
+use parking_lot::{Mutex, MutexGuard};
+use std::cell::RefCell;
+use std::thread::ThreadId;
+
+type Deferred = Box<dyn FnOnce(&Catalog) + Send>;
+
+pub(crate) struct ManageGate {
+    lock: Mutex<()>,
+    deferred: Mutex<Vec<(ThreadId, Deferred)>>,
+}
+impl ManageGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            deferred: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// The thread holds the management lock.
+    Holding,
+    /// The thread runs close callbacks of a dataset that the catalog disposes.
+    Disposing,
+    /// The thread runs a multi-step operation, such as an in-place restore, whose
+    /// deferred work waits until the whole operation returns.
+    Batch,
+}
+
+thread_local! {
+    /// The catalogs, by `Inner` address, that this thread manages or disposes.
+    static MARKS: RefCell<Vec<(usize, Mark)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn key(inner: &Inner) -> usize {
+    std::ptr::from_ref(inner) as usize
+}
+fn marked(inner: &Inner, mark: Option<Mark>) -> bool {
+    let key = key(inner);
+    MARKS.with_borrow(|marks| {
+        marks
+            .iter()
+            .any(|&(k, m)| k == key && mark.is_none_or(|mark| m == mark))
+    })
+}
+
+/// A mark that this thread pushed. Dropping it removes the mark and, when it was the
+/// last one for its catalog, runs the operations this thread deferred.
+struct Marked<'a> {
+    catalog: &'a Catalog,
+    mark: Mark,
+}
+impl<'a> Marked<'a> {
+    fn push(catalog: &'a Catalog, mark: Mark) -> Self {
+        MARKS.with_borrow_mut(|marks| marks.push((key(&catalog.inner), mark)));
+        Self { catalog, mark }
+    }
+}
+impl Drop for Marked<'_> {
+    fn drop(&mut self) {
+        let key = key(&self.catalog.inner);
+        let last = MARKS.with_borrow_mut(|marks| {
+            if let Some(at) = marks.iter().rposition(|&(k, m)| k == key && m == self.mark) {
+                marks.remove(at);
+            }
+            !marks.iter().any(|&(k, _)| k == key)
+        });
+        if last {
+            run_deferred(self.catalog);
+        }
+    }
+}
+
+/// Holds the management lock of a catalog. The lock is released before the mark, so
+/// deferred operations run without it.
+pub(crate) struct ManageGuard<'a> {
+    lock: Option<MutexGuard<'a, ()>>,
+    _mark: Marked<'a>,
+}
+impl Drop for ManageGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+    }
+}
+
+/// Marks the current thread as disposing a dataset of the catalog while close
+/// callbacks run.
+pub(crate) struct DisposalScope<'a> {
+    _mark: Marked<'a>,
+}
+/// Postpones the operations deferred on this thread until a multi-step operation
+/// returns, without refusing its own management calls.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub(crate) struct BatchScope<'a> {
+    _mark: Marked<'a>,
+}
+
+impl Catalog {
+    /// Take the management lock. A call on a thread that is disposing a dataset of
+    /// this catalog, or that already holds the lock, is refused at once with a
+    /// `catalog-disposing` conflict, because only the call itself could release the
+    /// lock it would wait for.
+    pub(crate) fn manage(&self) -> Result<ManageGuard<'_>> {
+        self.check_manageable()?;
+        let lock = self.inner.manage.lock.lock();
+        Ok(ManageGuard {
+            lock: Some(lock),
+            _mark: Marked::push(self, Mark::Holding),
+        })
+    }
+    /// Refuse, without taking the lock, a management call that [`manage`](Self::manage)
+    /// would refuse. Entry points that change state before they take the lock call it
+    /// first, so a refusal leaves everything as it was.
+    pub(crate) fn check_manageable(&self) -> Result<()> {
+        // Holding covers callbacks of datasets that a management call drops, such as
+        // a deleted in-memory dataset, which also run under the lock.
+        if marked(&self.inner, Some(Mark::Disposing)) || marked(&self.inner, Some(Mark::Holding)) {
+            return Err(Error::Conflict(
+                "catalog-disposing: a dataset close callback cannot manage the catalog while \
+                 this thread disposes or manages it; queue the operation with Catalog::defer"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+    /// Take the management lock for an internal step that must not fail. The caller
+    /// guarantees that this thread neither holds the lock nor runs a disposal, for
+    /// example by calling [`check_manageable`](Self::check_manageable) first.
+    pub(crate) fn manage_internal(&self) -> ManageGuard<'_> {
+        debug_assert!(
+            !marked(&self.inner, Some(Mark::Disposing))
+                && !marked(&self.inner, Some(Mark::Holding)),
+            "internal catalog management from a disposal or under the lock"
+        );
+        let lock = self.inner.manage.lock.lock();
+        ManageGuard {
+            lock: Some(lock),
+            _mark: Marked::push(self, Mark::Holding),
+        }
+    }
+    pub(crate) fn disposal_scope(&self) -> DisposalScope<'_> {
+        DisposalScope {
+            _mark: Marked::push(self, Mark::Disposing),
+        }
+    }
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    pub(crate) fn batch_scope(&self) -> BatchScope<'_> {
+        BatchScope {
+            _mark: Marked::push(self, Mark::Batch),
+        }
+    }
+
+    /// Run a catalog operation once the current thread's management of this catalog
+    /// returns. A dataset close callback that runs while the catalog deletes, renames
+    /// or restores a dataset cannot call [`create`](Self::create),
+    /// [`delete`](Self::delete), [`rename`](Self::rename) or another management
+    /// method, which refuse with a `catalog-disposing` conflict. It defers the call
+    /// instead. The operation then runs on the same thread after the disposing call has
+    /// released the management lock and before that call returns.
+    ///
+    /// Outside such a call, the operation runs at once. Deferred operations live only
+    /// in memory, so a crash or a panic that unwinds the disposing call loses them.
+    /// Callbacks must therefore be idempotent and must not rely on a deferred
+    /// operation for durability. A deferred operation that panics is logged, and the
+    /// operations queued after it still run.
+    pub fn defer(&self, op: impl FnOnce(&Catalog) + Send + 'static) {
+        if marked(&self.inner, None) {
+            self.inner
+                .manage
+                .deferred
+                .lock()
+                .push((std::thread::current().id(), Box::new(op)));
+        } else {
+            op(self);
+        }
+    }
+}
+
+/// Run the operations that this thread deferred on the catalog. During an unwind they
+/// are dropped, since running them could abort the process.
+fn run_deferred(catalog: &Catalog) {
+    let me = std::thread::current().id();
+    loop {
+        let ops: Vec<Deferred> = {
+            let mut queue = catalog.inner.manage.deferred.lock();
+            let (mine, others) = std::mem::take(&mut *queue)
+                .into_iter()
+                .partition::<Vec<_>, _>(|(id, _)| *id == me);
+            *queue = others;
+            mine.into_iter().map(|(_, op)| op).collect()
+        };
+        if ops.is_empty() {
+            return;
+        }
+        if std::thread::panicking() {
+            tracing::error!(
+                target: "sparkles::catalog",
+                dropped = ops.len(),
+                "deferred catalog operations were dropped because the call that queued them unwound"
+            );
+            return;
+        }
+        for op in ops {
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(catalog)));
+            if let Err(payload) = ran {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".into());
+                tracing::error!(
+                    target: "sparkles::catalog",
+                    panic = %message,
+                    "a deferred catalog operation panicked"
+                );
+            }
+        }
+    }
+}

@@ -527,11 +527,16 @@ proof. It has zero cache budgets, grants no authority and is destroyed before di
 publication. Main stays in its original Own payload. Close uses storage proportional to
 the resident state and opening inventory. Terminal links wake workers before destructors,
 and catalog lookup exclusion ends before callbacks or checkpoints. Catalog mutation remains
-serialized, so callbacks must defer management operations until disposal returns. Members
-closed during unwinding retain the existing behavior that skips clean-close checkpoints.
-Family admission and the real root process lease still span required resource shutdown,
-including a captured callback panic. Allowing catalog mutation from close callbacks remains
-an item 81 lifecycle gap.
+serialized. A management call from a close callback on the disposing thread is refused at
+once with a `catalog-disposing` conflict instead of waiting on the lock its own disposal
+holds. Callbacks queue such calls with `Catalog::defer`, which runs them on the same thread
+after the delete, rename or restore releases the lock and before it returns. Each deferred
+call runs under its own panic boundary, so a panic is logged and later calls still run.
+Deferred calls live only in memory and are lost if the disposing call unwinds or the
+process stops, so callbacks must be idempotent. Management calls from other threads still
+wait for the lock. Members closed during unwinding retain the existing behavior that skips
+clean-close checkpoints. Family admission and the real root process lease still span
+required resource shutdown, including a captured callback panic.
 A precommit panic restores the same graph and catalog entry before propagating its
 original payload. A delete or rename keeps the dataset registered as closed while its
 runtime closes, so a callback panic after the close commits leaves it in `config.json` for
