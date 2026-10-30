@@ -182,6 +182,9 @@ impl ErrorContext<'_> {
             Error::HistoryUnsupported(m) => ToolError::new("unknown-commit", 410, m),
             // the branch API's errors keep their codes (`no-such-branch`, `head-moved`, …)
             Error::Branch(b) => ToolError::new(b.code, b.status(), b.message.clone()),
+            // the managed-graph boundary's codes (`profile-managed-graph`, …)
+            Error::Managed(m) => ToolError::new(m.code, m.status(), m.message.clone())
+                .hint("nothing was written: managed graphs change only through their profile's operations"),
             Error::Cancelled => ToolError::new("internal", 500, "call cancelled: server shutting down"),
             e => {
                 tracing::error!(request_id = self.request_id, "MCP tool call failed: {e}");

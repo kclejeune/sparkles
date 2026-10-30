@@ -432,8 +432,9 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 /// Dataset capabilities supported by this reader (1: legacy, 2: branches,
 /// 3: relinked generations with an immutable base overlay, 4: framed delta
 /// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
-/// see [`crate::store::wal`]). [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 5;
+/// see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
+/// [`crate::managed`]). [`crate::formats::DATASET`] lists them.
+pub const DATASET_READER: u32 = 6;
 fn legacy_reader() -> u32 {
     1
 }
@@ -451,6 +452,12 @@ fn parse_dataset(bytes: &[u8]) -> Result<DatasetFile> {
 /// Share version refusal with the bounded read-only decoder. This check grants
 /// no profile authority and does not publish or raise any reader requirement.
 fn check_dataset_value(v: &serde_json::Value) -> Result<()> {
+    check_dataset_value_as(v, DATASET_READER)
+}
+
+/// [`check_dataset_value`] as a build that reads up to dataset reader `reader` applies
+/// it, so tests can show what an older release does with a dataset.
+pub(crate) fn check_dataset_value_as(v: &serde_json::Value, reader: u32) -> Result<()> {
     let member = |name: &str| -> Result<u64> {
         match v.get(name) {
             None | Some(serde_json::Value::Null) => Ok(1),
@@ -461,7 +468,7 @@ fn check_dataset_value(v: &serde_json::Value) -> Result<()> {
     };
     let format = member("format")?;
     let minimum_reader = member("minimumReader")?;
-    if format != 1 || minimum_reader > u64::from(DATASET_READER) {
+    if format != 1 || minimum_reader > u64::from(reader) {
         let by = v
             .get("writtenBy")
             .and_then(|w| w.as_str())
@@ -472,7 +479,7 @@ fn check_dataset_value(v: &serde_json::Value) -> Result<()> {
         return Err(Error::Unsupported(format!(
             "dataset.json{by} has format {format} and requires reader {minimum_reader}; Sparkles {} reads format 1 up to reader {}. Open the database with a newer release",
             crate::formats::SPARKLES_VERSION,
-            DATASET_READER
+            reader
         )));
     }
     Ok(())
@@ -587,6 +594,17 @@ pub fn check_dataset_compatibility(root: &Path) -> Result<()> {
 /// Publish the minimum reader needed by branches before publishing their table.
 pub(crate) fn require_branch_reader(root: &Path) -> Result<()> {
     require_reader(root, 2)
+}
+
+/// The bytes of a `dataset.json` with its `minimumReader` raised to at least `reader`,
+/// for a copy that holds files that reader needs.
+pub(crate) fn with_reader(bytes: &[u8], reader: u32) -> Result<Vec<u8>> {
+    let mut ds = parse_dataset(bytes)?;
+    if ds.minimum_reader >= reader {
+        return Ok(bytes.to_vec());
+    }
+    ds.minimum_reader = reader;
+    Ok(serde_json::to_vec_pretty(&ds).unwrap())
 }
 
 pub(crate) fn require_reader(root: &Path, reader: u32) -> Result<()> {

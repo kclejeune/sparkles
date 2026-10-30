@@ -829,6 +829,9 @@ impl From<Error> for ApiError {
             Error::Branch(b) => {
                 StatusCode::from_u16(b.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
+            Error::Managed(m) => {
+                StatusCode::from_u16(m.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            }
             Error::Component(c) if c.component == "views" => views::status(&c.code),
             // query-time reasoning past a limit, or with rules it cannot evaluate
             Error::Component(c)
@@ -849,6 +852,7 @@ impl From<Error> for ApiError {
             Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Patch(p) => json!({ "error": msg, "code": p.kind.code() }),
             Error::Branch(b) => branches::error_body(&b),
+            Error::Managed(m) => json!({ "error": m.message, "code": m.code }),
             Error::Component(c) if c.component == "views" => {
                 json!({ "error": c.message, "code": c.code })
             }
@@ -5853,6 +5857,8 @@ mod forms_tests;
 mod history_tests;
 #[cfg(test)]
 mod limits_tests;
+#[cfg(test)]
+mod managed_tests;
 #[cfg(test)]
 mod nesting_tests;
 #[cfg(test)]

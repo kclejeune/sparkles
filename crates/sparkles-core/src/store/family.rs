@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 /// Retained last by each store and branch set, after their owned resources.
 pub(crate) struct Family {
     pub(crate) gate: Arc<FamilyGate>,
+    /// The managed-graph registry every member admits its commits against (see
+    /// [`crate::managed`]). One registry serves main and every branch, including those
+    /// created before it was enabled, so they cannot diverge.
+    pub(crate) managed: arc_swap::ArcSwapOption<crate::managed::ManagedState>,
     _owner_lock: Option<Arc<super::ProcessLock>>,
 }
 
@@ -22,6 +26,7 @@ impl Family {
     pub(crate) fn new(owner_lock: Option<Arc<super::ProcessLock>>) -> Arc<Self> {
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
+            managed: arc_swap::ArcSwapOption::empty(),
             _owner_lock: owner_lock,
         })
     }

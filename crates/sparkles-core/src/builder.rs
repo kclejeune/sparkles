@@ -364,6 +364,8 @@ pub struct Builder {
     hot: hotkeys::HotKeys,
     /// the quads taken from sources, as vocabulary keys, when a caller wants them
     tap: Option<ChangeTap>,
+    /// the managed graphs a source quad must not be in (see [`crate::managed`])
+    fence: Option<crate::managed::GraphFence>,
 }
 
 /// The quads that a build takes from its sources, as vocabulary keys, up to a cap. The
@@ -415,7 +417,15 @@ impl Builder {
             tmp_bytes: Default::default(),
             phases: Mutex::new((iostat::Phases::start(), iostat::Phases::start())),
             tap: None,
+            fence: None,
         })
+    }
+
+    /// Refuse the build when a source gives a quad in one of the graphs `fence` names,
+    /// the graphs that a profile manages (see [`crate::managed`]).
+    pub(crate) fn with_graph_fence(mut self, fence: crate::managed::GraphFence) -> Self {
+        self.fence = Some(fence);
+        self
     }
 
     /// Collect the quads that [`add_source`](Self::add_source) takes, as keys, unless
@@ -1423,7 +1433,14 @@ impl Encoder<'_> {
         let o = self.term(&q.object);
         let g = match &q.graph_name {
             GraphName::DefaultGraph => Id::DEFAULT_GRAPH.0,
-            GraphName::NamedNode(n) => self.iri(n.as_str()),
+            GraphName::NamedNode(n) => {
+                if let Some(fence) = &self.b.fence
+                    && fence.contains(n.as_str())
+                {
+                    return Err(crate::managed::protected(n.as_str()));
+                }
+                self.iri(n.as_str())
+            }
             GraphName::BlankNode(b) => Id::bnode(self.scope.get(b.as_str(), &self.b.next_bnode)).0,
         };
         self.quads.push([s, p, o, g]);

@@ -585,6 +585,16 @@ fn release_stale_holds(dir: &Path, table: &mut TableFile, broken: &HashSet<uuid:
 }
 
 impl BranchSet {
+    /// The dataset root the set belongs to.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether the set's branches live in memory.
+    pub(crate) fn is_memory(&self) -> bool {
+        self.memory
+    }
+
     pub(crate) fn memory(
         dataset_id: uuid::Uuid,
         opts: &StoreOptions,

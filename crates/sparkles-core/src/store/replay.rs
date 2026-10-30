@@ -115,6 +115,8 @@ impl Store {
             let ins = changes.iter().filter(|c| c.1).count() as u64;
             report.inserted += ins;
             report.deleted += changes.len() as u64 - ins;
+            // a replay is refused at the first commit that changes a managed graph
+            tgt.admit_managed_keys(changes.iter().map(|(k, _)| &*k[0]))?;
             if preview {
                 report.replayed.push(ReplayedCommit {
                     from,
@@ -257,6 +259,7 @@ impl Store {
                 }
             }
             txn.check_requested_all()?;
+            target.admit_managed_log(&before, &txn.log[start..], None)?;
             txn.opts.check()?;
             let precondition = super::preview::precondition_on(&before, &txn.opts);
             let validation = match target.run_guard(

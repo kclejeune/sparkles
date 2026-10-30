@@ -52,6 +52,9 @@ mod link;
 mod lock;
 #[cfg(test)]
 mod lock_tests;
+mod managed;
+#[cfg(test)]
+mod managed_tests;
 mod mem_history;
 #[cfg(test)]
 mod memory_branch_tests;
@@ -1998,6 +2001,10 @@ impl Store {
         // root writer runs, agreeing with the physical tree migrate --check inspects.
         if ctx.is_none() {
             crate::formats::check_dataset_tree(root)?;
+            // the dataset's managed-graph registry, which its branches share
+            if let Some(state) = managed::load_dir(root) {
+                family.managed.store(Some(Arc::new(state)));
+            }
         } else {
             commit::check_dataset_compatibility(root)?;
             crate::formats::check_dataset_dir(root)?;
@@ -4692,6 +4699,8 @@ impl Store {
             writable: Default::default(),
             force: false,
             merge: None,
+            managed: None,
+            stamp: None,
         }
     }
 
@@ -5100,9 +5109,20 @@ impl Store {
         bulk: Option<BulkCommit>,
         check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
     ) -> Result<(u64, Receipt)> {
-        if let Some(b) = &bulk {
-            self.check_protected(b.kind)?;
-        }
+        // A bulk commit's graphs: those it drops are checked here, and its sources
+        // are checked quad by quad while the build reads them.
+        let fence = match &bulk {
+            Some(b) => {
+                self.check_protected(b.kind)?;
+                self.admit_managed_ids(snap, drop_graphs.iter().copied(), None)?;
+                if extra.is_empty() {
+                    None
+                } else {
+                    self.managed_fence()?
+                }
+            }
+            None => None,
+        };
         let started = std::time::Instant::now();
         let before = snap.len();
         // the head state before a bulk commit, whose changes the change log records
@@ -5186,6 +5206,9 @@ impl Store {
             let mut builder = Builder::new(&dir, bopts)?;
             if let Some(i) = interrupt.clone() {
                 builder = builder.with_interrupt(i);
+            }
+            if let Some(f) = fence.clone() {
+                builder = builder.with_graph_fence(f);
             }
             if let Some(cap) = change_cap {
                 builder = builder.with_change_tap(cap);
@@ -5895,6 +5918,10 @@ pub struct WriteTxn<'s> {
     force: bool,
     /// the merge record written with the commit
     merge: Option<branching::MergeRec>,
+    /// the capability to change one owner's managed graphs ([`Self::set_managed`])
+    managed: Option<crate::managed::ManagedWrite>,
+    /// the commit time fixed by [`Self::managed_stamp`]
+    stamp: Option<i64>,
 }
 
 impl Drop for WriteTxn<'_> {
@@ -5947,6 +5974,61 @@ impl WriteTxn<'_> {
         } else {
             access.check_write(&self.view(), g)
         }
+    }
+
+    /// Let this transaction change the managed graphs of the capability's owner (see
+    /// [`crate::managed`]), before it changes anything. A transaction that started
+    /// from a speculative group-commit state waits for that state to be durable and
+    /// starts again from it. Its commit is then never grouped with others, so that
+    /// [`managed_stamp`](Self::managed_stamp) names it exactly, and large inserts go
+    /// through the delta instead of a rebuild. A capability of another dataset, or of a
+    /// registry that has changed since it was made, is refused at the commit.
+    pub fn set_managed(&mut self, managed: crate::managed::ManagedWrite) -> Result<()> {
+        if self.managed.is_some() {
+            return Err(Error::invalid(
+                "this transaction already carries a managed-write capability",
+            ));
+        }
+        if self.is_dirty() || self.force || self.merge.is_some() {
+            return Err(Error::invalid(
+                "a managed-write capability is set before the transaction changes anything",
+            ));
+        }
+        // A managed commit starts from the durable head, never from a state that group
+        // commit has written but not yet synced: its stamp then names a commit after a
+        // durable predecessor.
+        if self.guard.staged.is_some() {
+            self.store.drain_group(&mut self.guard, Some(&self.opts))?;
+            self.base = self.store.snapshot();
+            self.delta = self.base.delta.clone();
+            self.mark = self.base.generation.dvocab.mark();
+            self.start_bnode = self.guard.next_bnode;
+        }
+        self.managed = Some(managed);
+        Ok(())
+    }
+
+    /// The managed-write capability this transaction carries.
+    pub fn managed(&self) -> Option<&crate::managed::ManagedWrite> {
+        self.managed.as_ref()
+    }
+
+    /// The sequence number and the time in milliseconds of the commit this transaction
+    /// makes, fixed now so that a typed writer can record them in the commit itself.
+    /// Valid only with a capability ([`set_managed`](Self::set_managed)): the commit
+    /// is then published alone, right after the head this transaction holds, with
+    /// exactly this time. Calling it again returns the same values.
+    pub fn managed_stamp(&mut self) -> Result<(u64, i64)> {
+        if self.managed.is_none() {
+            return Err(Error::invalid(
+                "a commit is stamped only by a transaction with a managed-write capability",
+            ));
+        }
+        let head = self.guard.head;
+        let ts = *self
+            .stamp
+            .get_or_insert_with(|| self.store.commit_time(&head));
+        Ok((head.seq + 1, ts))
     }
 
     /// The graph view of this transaction's writes, if it does not cover every graph.
@@ -6349,7 +6431,10 @@ impl WriteTxn<'_> {
         }
         // a write whose quads protections check goes through the delta, so that the
         // state it leaves can be checked before the commit
-        if (quads.len() as u64) < self.store.opts.bulk_threshold || self.requested.is_some() {
+        if (quads.len() as u64) < self.store.opts.bulk_threshold
+            || self.requested.is_some()
+            || self.managed.is_some()
+        {
             for q in quads {
                 self.insert(q)?;
             }
@@ -6421,6 +6506,19 @@ impl WriteTxn<'_> {
         }
         self.check_requested_all()
             .map_err(|e| self.store.after_refusal(e, Some(&self.opts)))?;
+        // The managed-graph boundary: before the dry run, so that a preview shows the
+        // refusal, and whatever the validation options or the merge record say.
+        // The base snapshot decodes the terms this transaction added, which its
+        // generation's update vocabulary holds.
+        if self.is_dirty() || self.force {
+            self.store
+                .admit_managed_log(&self.base, &self.log, self.managed.as_ref())
+                .and_then(|()| {
+                    self.store
+                        .admit_managed_ids(&self.base, self.bulk.iter().map(|q| q[3]), None)
+                })
+                .map_err(|e| self.store.after_refusal(e, Some(&self.opts)))?;
+        }
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
         if self.bulk.is_empty() {
@@ -6498,7 +6596,10 @@ impl WriteTxn<'_> {
             Err(None) => return false,
             Err(Some(why)) => Some(why),
             Ok(()) if !self.bulk.is_empty() => Some(Fallback::Bulk),
-            Ok(()) if self.force || self.merge.is_some() => Some(Fallback::Kind),
+            // a managed commit is stamped with the sequence number after the head
+            Ok(()) if self.force || self.merge.is_some() || self.managed.is_some() => {
+                Some(Fallback::Kind)
+            }
             Ok(()) if self.wal_bytes() > group::MAX_BYTES => Some(Fallback::Size),
             Ok(()) if self.net_ins == 0 && self.net_del == 0 => Some(Fallback::Noop),
             Ok(()) => None,
@@ -6818,7 +6919,7 @@ impl WriteTxn<'_> {
         let head = self.guard.head;
         CommitInfo {
             seq: head.seq + 1,
-            timestamp_ms: self.store.commit_time(&head),
+            timestamp_ms: self.stamp.unwrap_or_else(|| self.store.commit_time(&head)),
             kind: self.kind,
             inserted: self.net_ins,
             deleted: self.net_del,

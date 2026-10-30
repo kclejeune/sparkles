@@ -5,8 +5,8 @@
 
 pub use sparkles_core::{
     access, algo, annotations, branch, builder, check, codec, commit, disk, error, explain,
-    formats, geo, guard, history, id, incr, index, io, ioacct, jena_formats, mapping, migrate,
-    nesting, outbound, patch, patterns, preview, schema, sparql, spill, store, stored,
+    formats, geo, guard, history, id, incr, index, io, ioacct, jena_formats, managed, mapping,
+    migrate, nesting, outbound, patch, patterns, preview, schema, sparql, spill, store, stored,
     stored_mappings, tabular, task, text, trix, validation, vector, vocab, xsd,
 };
 

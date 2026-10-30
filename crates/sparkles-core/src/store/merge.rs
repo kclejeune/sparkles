@@ -699,6 +699,9 @@ impl Store {
             report.up_to_date = true;
             return Ok(Step::Done(MergeOutcome::UpToDate(report)));
         }
+        // Merges get no exemption from the managed-graph boundary. A preview reports
+        // the refusal that the commit would meet.
+        tgt.admit_managed_keys(plan.changes.keys().map(|k| &*k[0]))?;
         if preview {
             o.progress.report(1.0, "previewed");
             return Ok(Step::Done(MergeOutcome::Merged(report)));
