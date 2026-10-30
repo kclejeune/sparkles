@@ -121,7 +121,7 @@ PUT /$/views/{ds}/{name}
 | `provenance` | `none`, `count`, `why`, `lineage` | `none` | The annotation kept per row (§5). |
 | `maintenance` | `async`, `commit` | `async` | Whether the view is maintained after the commit or inside it (§3.3). |
 | `onFailure` | `suspend`, `reject` | `suspend` | What a failed pass at commit time does (§3.3). |
-| `declassify` | boolean | `false` | Whether a `graph` view may publish data that some readers of its output graph cannot read (§6.1). |
+| `declassify` | boolean | `false` | Releases a `graph` view's output to whoever can read the output graph. A view on a dataset with read restrictions needs it (§6.1). |
 | `branches` | branch names or globs | `["main"]` | The branches with their own state (§7). |
 | `memoryBytes` | bytes | 256 MiB | The budget of the view's state (§8.2). |
 | `keepCommits` | integer | 0 | Diffs kept in memory for reads at past commits (§7.2). |
@@ -361,13 +361,16 @@ The server can attach a circuit that no user defined. An internal circuit has no
 `view.json`, no name in `GET /$/views/{ds}` and no principal. It reads through
 `InternalAccess`, which only server code can construct, and it is never granted to a
 caller. Its sink is either a view's rows or an accumulator that keeps a count per key and not
-the rows. For each commit the accumulator adds the magnitude of every change event of the
-circuit's output, the sum of the absolute weights per key, and it records that sum before
-the changes of different commits can cancel. A fact that is added by one commit and
-removed by the next counts 2, and a deletion counts 1, which is what the feed-based
-counter that C22's refresh reads today produces. C22's refresh counts the changed facts
-per community with such an accumulator. It does not use a grouped `COUNT` view, whose
-rows hold the net weights and so lose the churn.
+the rows. Changes cancel inside a Z-set, both across commits and within one commit, so a
+commit that removes one fact and adds another for the same community would cancel at a
+circuit projected to the community key. The circuit therefore keeps the changed fact's
+identity, the key columns and the fact's own columns, through to the sink. For each commit
+the sink sums the absolute weight per key and fact, then totals it per key, and it records
+the total before the changes of later commits can cancel it. A fact added by one commit and
+removed by the next counts 2, a deletion counts 1, and a replacement within one commit
+counts 2, which is what the feed-based counter that C22's refresh reads today produces.
+C22's refresh counts the changed facts per community with such an accumulator. It does
+not use a grouped `COUNT` view, whose rows hold the net weights and so lose the churn.
 
 ## 4. The incremental fragment
 
@@ -494,19 +497,25 @@ to callers who cannot read its inputs grants them the view by name
 written to the audit log.
 
 A `graph` view writes its output into a graph that anyone with access to that graph
-reads, whatever the view's principal could read. A principal that reads every quad can
-still copy protected facts into a graph that more people read, so the test is on the
-readers of the output and not on the view's principal. A `graph` view needs
-`declassify: true` unless every principal able to read its output graph can also read
-every graph and predicate that its query can touch. Setting `declassify` is written to
-the audit log with the definer, and it is the graph-view counterpart of the `view:{name}`
-grant, which declassifies a table view for the callers it names.
+reads, whatever the view's principal could read. The rule is deliberately conservative,
+because a check of grant sets cannot account for protections of single triples (C12b), for
+protections that depend on the data, such as a subject class or a caller-bound pattern, or
+for output that was written before a policy changed.
 
-The rule is evaluated at `PUT` and again on each access-policy reload. A `PUT` that fails
-it without `declassify: true` is refused with `403 declassify-required`. A view that
-stops satisfying it after a reload, and was not declassified, is suspended with the
-reason `declassify-required` and no longer runs, rather than left publishing data to
-readers who could not see it.
+- On a dataset whose access policy restricts reads in any way, a `graph` view always
+  needs `declassify: true`. A `PUT` without it is refused with `403 declassify-required`.
+- A dataset with no read restrictions needs no declassification, because every reader can
+  already read every input.
+- Declassification states that the view's output is releasable to whoever can read the
+  output graph, now and after later policy changes. The audit log records the view, its
+  query, the output graph and the principal who declassified it. It is the graph-view
+  counterpart of the `view:{name}` grant, which declassifies a table view for the callers
+  it names.
+- When a read-restricting policy is first installed while `graph` views without
+  `declassify` exist, those views are suspended with the reason `declassify-required`.
+  Their output graphs become unreadable to everyone except administrators until an
+  administrator declassifies the view or drops it. This takes effect before the new policy
+  is visible to any request, and it covers historical reads of those graphs.
 
 ### 6.2 Live queries
 

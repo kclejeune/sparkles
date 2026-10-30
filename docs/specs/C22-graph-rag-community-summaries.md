@@ -384,7 +384,7 @@ or at most every ten debounce periods while writes continue, the refresh task:
 
 In Phase 3, the per-community counts of step 1 come from an accumulator on an internal F13
 circuit over the projection's predicates (F13 §3.6), so a refresh reads the counts instead
-of the feed. The accumulator adds the magnitude of each change per commit, so an addition and a later removal count 2 and a deletion counts 1, as the counter that step 1 uses today does. It is
+of the feed. The circuit keeps each changed fact's identity to the sink, which sums the absolute weight per key and fact and then per key. An addition and a later removal count 2, a replacement within one commit counts 2 and a deletion counts 1, as the counter that step 1 uses today does. It is
 not a grouped `COUNT` view, because `gr:member` sits in a guarded graph that a view
 principal cannot read and because a view would net out a fact that is added and removed
 between two refreshes. A commit
