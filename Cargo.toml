@@ -130,6 +130,14 @@ debug = "line-tables-only"
 opt-level = 2
 debug = false
 
+# OWL demand tests evaluate large generated programs even on small fixtures.
+# Use basic optimization in dev/test builds while keeping assertions and
+# checked arithmetic for the same semantic and budget tests.
+[profile.dev.package.sparkles-reasoner]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
+
 # The formatter's browser build (scripts/build-fmt-wasm.sh, nix/fmt-wasm.nix) is built for
 # size: opt-level "z", one codegen unit, fat LTO, no debug info, symbols stripped.
 [profile.fmt-wasm]

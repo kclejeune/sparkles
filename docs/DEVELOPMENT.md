@@ -237,6 +237,19 @@ failure. `.config/nextest.toml` holds these settings. Debug builds keep line tab
 so backtraces have file and line numbers but a debugger cannot show variables. Set
 `CARGO_PROFILE_DEV_DEBUG=true` for full debug information.
 
+`sparkles-reasoner` uses optimization level 1 in development and inherited test
+profiles. Line tables, debug assertions and overflow checks remain enabled. Its
+randomized demand and explanation tests still execute their complete profiles,
+seeds, samples and proof checks under the ten-minute case limit. Basic optimization
+adds compilation work and separate cache artifacts. [Item 190](ROADMAP.md) tracks
+that development-build tradeoff alongside the remaining reasoning costs.
+
+For reasoner debugging with unoptimized code and full variable information, run:
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=true mbx test -p sparkles-reasoner --config 'profile.dev.package.sparkles-reasoner.opt-level=0'
+```
+
 The server crate has no library target, so its unit-test binary and the binary that its
 integration tests run each compile the whole crate. In a debug build each of those rustc
 processes peaks at about 10 GB, mostly while it collects monomorphized items, and a
