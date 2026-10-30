@@ -33,9 +33,15 @@ The runtime retains root exclusion through required resource shutdown.
 After runtime close commits, an I/O failure can reopen the existing dataset through a
 fresh runtime. Recovery verifies its original UUID and existing CURRENT before opening.
 If a delete cannot synchronize its rollback, the catalog leaves the dataset unavailable
-and reports the retained data path. Unresolved moved bytes use the existing `.kept-`
-convention and catalog startup does not remove them. Restore publication verifies the
-restored identity separately from the original identity required for rollback.
+and reports the retained data path. Unresolved moved bytes stay in
+`databases/.kept-<name>-<token>` and catalog startup does not remove them. Startup refuses
+only a registered dataset whose directory or CURRENT file is missing. It serves the other
+datasets, keeps the refused one registered and names its expected path in the refusal.
+Moving the retained directory back to that path and restarting recovers the dataset.
+A close callback that panics after the runtime close commits leaves the dataset
+registered and closed, and the next catalog open reopens it. Restore publication
+verifies the restored identity separately from the original identity required for
+rollback.
 
 `sparkles::managed_source::ResidentSourceOwner` retains the catalog's actual Dataset and
 an exact resident branch Store. Core `ArcSourceOwner` supports direct Arc-backed callers.

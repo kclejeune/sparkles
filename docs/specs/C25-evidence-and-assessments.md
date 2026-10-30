@@ -530,13 +530,17 @@ Family admission and the real root process lease still span required resource sh
 including a captured callback panic. Allowing catalog mutation from close callbacks remains
 an item 81 lifecycle gap.
 A precommit panic restores the same graph and catalog entry before propagating its
-original payload. Live unmatched detached openings refuse without being upgraded into
+original payload. A delete or rename keeps the dataset registered as closed while its
+runtime closes, so a callback panic after the close commits leaves it in `config.json` for
+the next catalog open. Live unmatched detached openings refuse without being upgraded into
 close-owned Arcs, and a final drop witness keeps a moved-out Store value busy.
 Later I/O failure recovers through a fresh existing-only opening rather than reviving
 closed links. Recovery checks a known original UUID before and under process exclusion
 and cannot create a missing root or empty generation. A failed delete move is synchronized
 back before reopen, or remains unavailable with its original bytes and reported path.
-Uncertain moved data uses the existing retained `.kept-` convention. Restore publication
+Uncertain moved data uses the existing retained `.kept-<name>-<token>` convention.
+Catalog startup refuses only a registered root that lacks its directory or CURRENT,
+names the expected path and serves the other datasets. Restore publication
 checks the restored identity separately from original-identity rollback. Existing roots
 without a known expected UUID retain the supported legacy metadata upgrade only when
 CURRENT already exists.
