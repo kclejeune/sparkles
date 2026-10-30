@@ -944,8 +944,10 @@ run and +0.4% to +0.9% in a repeat, within the noise of the measurement. The tab
 
 The JVM algorithm handle exposes eight operations: projection list, get, put and
 delete, query text, query execution, statistics and write-back. Write-back retains
-committed batches if a later batch fails. Further JVM algorithm surfaces and acceptance
-remain under roadmap item 8. See the [JVM outcome](P04-jvm-bindings/OUTCOME.md).
+committed batches if a later batch fails. Its statistics inside a transaction run
+through a copy of the library's statistics code, and the Node.js and Python statistics
+read only the head. Roadmap item 8 tracks one library implementation for the
+bindings, together with further JVM algorithm surfaces and acceptance. See the [JVM outcome](P04-jvm-bindings/OUTCOME.md).
 
 **Not built.**
 * The full Graphalytics benchmark harness. A

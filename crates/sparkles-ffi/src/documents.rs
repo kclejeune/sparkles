@@ -2,8 +2,6 @@
 //! nested field. The Java surface uses Jena's JSON trees and typed outer records.
 use crate::{ErrorKind, FfiDataset, FfiError, FfiOperation, FfiReadTxn, FfiResult, FfiWriteTxn};
 use std::sync::Arc;
-#[path = "mapping_control.rs"]
-mod mapping_control;
 pub(crate) fn encode<T: serde::Serialize>(value: &T) -> FfiResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| FfiError::new(ErrorKind::Invalid, e.to_string()))
 }
@@ -146,11 +144,11 @@ fn mapping_kind(kind: Option<&str>) -> FfiResult<Option<sparkles::mapping::Mappi
     })
     .transpose()
 }
-fn mapping_opts(input: &MappingInputs, operation: &FfiOperation) -> sparkles::mapping::RunOptions {
-    let control = operation.control.clone();
+/// Conversion options. The write options carry the operation's cancellation and
+/// deadline through conversion and the final load.
+fn mapping_opts(input: &MappingInputs) -> sparkles::mapping::RunOptions {
     sparkles::mapping::RunOptions {
         base: input.base.clone(),
-        check: Some(Arc::new(move || control.check())),
         ..Default::default()
     }
 }
@@ -235,7 +233,7 @@ impl FfiDataset {
             &name,
             request.version,
             &mapping_inputs(&request.inputs)?,
-            &mapping_opts(&request.inputs, &operation),
+            &mapping_opts(&request.inputs),
             request.replace,
             &write,
         )?;
@@ -256,12 +254,11 @@ impl FfiDataset {
             deadline: operation.control.deadline,
             ..Default::default()
         };
-        let r = mapping_control::run(
-            &self.inner.ds,
+        let r = self.inner.ds.run_mapping_with(
             &text,
             mapping_kind(kind.as_deref())?,
             &mapping_inputs(&input)?,
-            &mapping_opts(&input, &operation),
+            &mapping_opts(&input),
             graph.as_deref(),
             &write,
         )?;

@@ -368,7 +368,9 @@ permissions, preconditions, validation, preview settings and commit metadata. Fa
 before publication changes no committed data, and cancellation or expiry after the
 last published commit does not change its successful receipt. The original
 `Dataset::run_mapping` signature and `RunOptions` fields remain available, with the
-opaque callback retaining its conversion-only scope.
+opaque callback retaining its conversion-only scope. Stored runs through
+`StoredMappings::run` apply the cancellation sources and deadline of their write
+options to conversion in the same way.
 
 ### 5.2 SQL sources
 
@@ -946,7 +948,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230 and 232 to 239. Native Rust `Dataset::run_mapping_with` carries complete structured write options through direct mapping conversion and final load while preserving the existing `run_mapping` and `RunOptions` APIs. Virtual graphs remain under item 43.
+Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230, 232 to 239 and 404. Native Rust `Dataset::run_mapping_with` carries complete structured write options through direct mapping conversion and final load while preserving the existing `run_mapping` and `RunOptions` APIs, and stored runs apply the same controls to conversion. Python mapping runs have no cancellation or timeout, which is item 404. Virtual graphs remain under item 43.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

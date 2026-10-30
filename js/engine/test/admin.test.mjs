@@ -35,6 +35,7 @@ import {
   InvalidInputError,
   QueryTimeoutError,
 } from '../dist/index.js';
+import { native } from '../dist/native.js';
 const temp = () => mkdtemp(join(tmpdir(), 'sparkles-node-admin-'));
 for (const mode of ['compute-cancel', 'compute-timeout', 'slot-cancel', 'slot-timeout']) {
   test(
@@ -706,6 +707,135 @@ mappings:
     await rejected;
     await held.rollback();
     await assert.rejects(mappings.list());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Another transaction holds the binding's writer permit, so these runs time out at
+// binding admission before any mapping code runs.
+test(
+  'mapping runs time out at writer admission while another transaction holds the writer',
+  { timeout: 60000 },
+  async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'sparkles-mapping-deadline-'));
+    try {
+      await writeFile(join(dir, 'people.csv'), 'id,name\n1,Ann\n');
+      const mapping = `prefixes:
+  ex: http://ex.org/
+mappings:
+  person:
+    sources:
+      - [people.csv~csv]
+    s: ex:person/$(id)
+    po:
+      - [ex:name, $(name)]
+`;
+      const ds = t.resource(Dataset.memory());
+      await ds.mappings.put('people', mapping);
+      const held = await ds.beginTransaction();
+      for (const run of [
+        () => ds.mappings.run('people', { directory: dir, timeout: 100 }),
+        () => ds.runMapping(mapping, { directory: dir, timeout: 100 }),
+      ]) {
+        // The holder never ends during the wait, so only the operation's budget refuses.
+        await assert.rejects(run(), QueryTimeoutError);
+      }
+      await held.rollback();
+      assert.equal(await ds.count(), 0n);
+      assert.equal(await ds.mappings.lastRun('people'), null);
+      const done = await ds.mappings.run('people', { directory: dir, timeout: 30000 });
+      assert.equal(done.receipt.committed, true);
+      assert.equal(
+        (await ds.runMapping(mapping, { directory: dir, timeout: 30000 })).stats.quads,
+        1n,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+// The package's own timer stops a call through its cancellation flag. These calls go
+// to the native dataset directly with a flag that is never set, so only the deadline
+// that the addon derives from the timeout and passes to the mapping can refuse them.
+// The input takes far longer than the timeout to convert, and the same calls without
+// a timeout succeed. Whether the deadline passes during admission or conversion, a
+// correct addon refuses, so the outcome does not depend on the host's speed. The
+// library tests check that the deadline stops conversion at its next checkpoint.
+test(
+  'the native mapping timeout reaches the mapping write options',
+  { timeout: 120000 },
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'sparkles-mapping-conversion-'));
+    try {
+      const rows = ['id,name'];
+      for (let i = 0; i < 400000; i++) rows.push(`${i},n${i}`);
+      await writeFile(join(dir, 'people.csv'), rows.join('\n') + '\n');
+      const text = `prefixes:
+  ex: http://ex.org/
+mappings:
+  person:
+    sources:
+      - [people.csv~csv]
+    s: ex:person/$(id)
+    po:
+      - [ex:name, $(name)]
+`;
+      const admin = (ds, op, args, options = {}) =>
+        ds.admin(op, JSON.stringify(args), JSON.stringify(options), new native.Cancellation());
+      const runs = [
+        ['mappings.run', { name: 'people', directory: dir }],
+        ['runMapping', { text, directory: dir }],
+      ];
+      const ds = native.NativeDataset.memory('{}');
+      await admin(ds, 'mappings.put', { name: 'people', text });
+      for (const [op, args] of runs)
+        await assert.rejects(admin(ds, op, args, { timeout: 50 }), /time/i, op);
+      assert.equal(JSON.parse(await admin(ds, 'info', {})).quads, '0');
+      assert.equal(JSON.parse(await admin(ds, 'mappings.lastRun', { name: 'people' })), null);
+      for (const [op, args] of runs) {
+        const control = native.NativeDataset.memory('{}');
+        await admin(control, 'mappings.put', { name: 'people', text });
+        const run = JSON.parse(await admin(control, op, args));
+        assert.equal(run.receipt.committed, true, op);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+// Through the package, the timer stops the call through the cancellation flag that
+// the mapping write options carry into conversion.
+test('the package mapping timeout refuses both mapping runs', { timeout: 120000 }, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sparkles-mapping-conversion-'));
+  try {
+    const rows = ['id,name'];
+    for (let i = 0; i < 400000; i++) rows.push(`${i},n${i}`);
+    await writeFile(join(dir, 'people.csv'), rows.join('\n') + '\n');
+    const mapping = `prefixes:
+  ex: http://ex.org/
+mappings:
+  person:
+    sources:
+      - [people.csv~csv]
+    s: ex:person/$(id)
+    po:
+      - [ex:name, $(name)]
+`;
+    const ds = t.resource(Dataset.memory());
+    await ds.mappings.put('people', mapping);
+    await assert.rejects(
+      ds.mappings.run('people', { directory: dir, timeout: 50 }),
+      QueryTimeoutError,
+    );
+    await assert.rejects(
+      ds.runMapping(mapping, { directory: dir, timeout: 50 }),
+      QueryTimeoutError,
+    );
+    assert.equal(await ds.count(), 0n);
+    assert.equal(await ds.mappings.lastRun('people'), null);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

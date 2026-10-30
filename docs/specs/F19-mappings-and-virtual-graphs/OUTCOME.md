@@ -92,11 +92,15 @@ roadmap item 43.
   has `Dataset::mappings`, `StoredMappings::run` and `Dataset::run_mapping`, and Python
   has `Dataset.mappings` and `Dataset.run_mapping`. The JVM and Node.js bindings also
   expose stored mapping handles and direct mapping runs. Their default builds do not
-  enable SQLite or Parquet sources. The binding runs carry cancellation and deadlines
-  through conversion and the final load. Native Rust `Dataset::run_mapping_with`
-  accepts complete `WriteOptions` through both steps. The original `run_mapping`
-  signature and exhaustive `RunOptions` constructions remain compatible, and the
-  opaque callback retains its conversion-only scope.
+  enable SQLite or Parquet sources. Native Rust `Dataset::run_mapping_with` accepts
+  complete `WriteOptions` through conversion and the final load, and
+  `StoredMappings::run` applies the cancellation sources and deadline of its write
+  options to conversion in the same way. The JVM and Node.js direct runs call
+  `run_mapping_with`, and their stored runs pass the operation's cancellation and
+  absolute deadline as write options. The original `run_mapping` signature and
+  exhaustive `RunOptions` constructions remain compatible, and the opaque callback
+  retains its conversion-only scope. Python mapping runs take no cancellation token
+  or timeout, which is roadmap item 404.
 
 Decisions this spec left open, made during implementation:
 
@@ -169,8 +173,14 @@ Tests and conformance:
   `http/router_tests/mappings.rs` covers the routes, A11 and the `connections` kind, and
   `crates/sparkles-py/tests/test_mappings.py` covers Python. The Node administration
   and JVM structured administration tests cover mapping revisions, runs and refusals.
-  `crates/sparkles/tests/mapping_binding_control.rs` checks cancellation and deadlines
-  at conversion and the final writer for the two binding adapters.
+  `crates/sparkles/tests/mapping_stored_control.rs` checks that a cancelled or expired
+  stored run refuses before conversion in add and replace modes, that a stop during
+  conversion takes effect at the next conversion checkpoint and commits nothing, and
+  that an unstopped run publishes and records its run.
+  The Node administration tests check that the native timeout reaches the write
+  options of both mapping runs, that the package timeout refuses both runs without a
+  commit, and that both runs time out at writer admission while another transaction
+  holds the writer.
   `crates/sparkles/tests/mapping_native_control.rs` covers native conversion checks
   and bounds, every supplied cancellation source, actual final writer waits and
   unchanged state on refusal. Writer-acquisition and committed callbacks latch the
