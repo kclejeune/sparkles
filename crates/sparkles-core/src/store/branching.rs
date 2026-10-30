@@ -443,7 +443,7 @@ pub(crate) enum SetRef {
     /// the dataset's own store owns the set
     Owner(Arc<BranchSet>),
     /// a branch store
-    Member(Weak<BranchSet>),
+    Member(Arc<super::lifecycle::WeakLink<BranchSet>>),
 }
 
 /// What a store knows about branches.
@@ -475,7 +475,7 @@ impl Branching {
 /// What a branch store is opened with.
 pub(crate) struct OpenCtx {
     pub ident: Ident,
-    pub set: Weak<BranchSet>,
+    pub set: Arc<super::lifecycle::WeakLink<BranchSet>>,
     pub cache: Arc<BlockCache>,
     pub quota: Arc<quota::Quota>,
     pub protected: bool,
@@ -489,6 +489,16 @@ pub(crate) struct OpenCtx {
 
 type MemoryBases = HashMap<(uuid::Uuid, u64), (CommitInfo, Arc<Snapshot>)>;
 
+pub(super) struct Opening {
+    pub(super) store: Weak<Store>,
+    pub(super) complete: Weak<()>,
+}
+impl Opening {
+    fn finished(&self) -> bool {
+        self.store.strong_count() == 0 && self.complete.strong_count() == 0
+    }
+}
+
 /// The branches of one persistent or in-memory dataset.
 pub struct BranchSet {
     memory: bool,
@@ -500,7 +510,8 @@ pub struct BranchSet {
     quota: Arc<quota::Quota>,
     table: Mutex<TableFile>,
     /// open branch stores (not `main`)
-    stores: Mutex<HashMap<uuid::Uuid, Arc<Store>>>,
+    pub(super) stores: Mutex<HashMap<uuid::Uuid, Arc<Store>>>,
+    pub(super) openings: Mutex<HashMap<usize, Opening>>,
     /// serializes the opening of branch stores
     opening: Mutex<()>,
     /// merge records by the id of the branch that made the merge commit
@@ -512,7 +523,7 @@ pub struct BranchSet {
     /// the dataset's own store's current state, whose generation a linked branch shares
     /// cached blocks with
     main_current: Mutex<Weak<ArcSwap<Snapshot>>>,
-    me: Weak<BranchSet>,
+    pub(super) me: Arc<super::lifecycle::WeakLink<BranchSet>>,
     /// Outlive all resident member resources without owning the main Store.
     family: Arc<family::Family>,
 }
@@ -591,12 +602,13 @@ impl BranchSet {
             quota,
             table: Mutex::new(TableFile::new(dataset_id)),
             stores: Default::default(),
+            openings: Default::default(),
             opening: Mutex::new(()),
             merges: Default::default(),
             broken: Default::default(),
             unlinked: AtomicBool::new(false),
             main_current: Default::default(),
-            me: me.clone(),
+            me: super::lifecycle::WeakLink::new(me.clone()),
             family,
         })
     }
@@ -694,12 +706,13 @@ impl BranchSet {
             quota,
             table: Mutex::new(table),
             stores: Default::default(),
+            openings: Default::default(),
             opening: Mutex::new(()),
             merges: Default::default(),
             broken: Mutex::new(broken),
             unlinked: AtomicBool::new(false),
             main_current: Mutex::new(Weak::new()),
-            me: me.clone(),
+            me: super::lifecycle::WeakLink::new(me.clone()),
             family,
         }))
     }
@@ -785,6 +798,9 @@ impl BranchSet {
                 .retain(|key, _| needed.contains(key));
         }
         // retired stores too: branches created from them read their files
+        let Some(_use) = self.me.enter() else {
+            return;
+        };
         let stores: Vec<Arc<Store>> = self.stores.lock().values().cloned().collect();
         main.install_branch_holds(self);
         for s in stores {
@@ -792,8 +808,24 @@ impl BranchSet {
         }
     }
 
+    fn register_opening(&self, store: &Arc<Store>) {
+        let mut openings = self.openings.lock();
+        openings.retain(|_, opening| !opening.finished());
+        openings.insert(
+            Arc::as_ptr(store) as usize,
+            Opening {
+                store: Arc::downgrade(store),
+                complete: Arc::downgrade(&store._close_complete),
+            },
+        );
+    }
+
     /// The open store of branch `id` (not `main`), opening it if needed.
     pub(crate) fn open_store(&self, id: uuid::Uuid) -> Result<Arc<Store>> {
+        let _use = self
+            .me
+            .enter()
+            .ok_or_else(|| branch::no_such_branch(&id.to_string()))?;
         if let Some(s) = self.stores.lock().get(&id) {
             return Ok(s.clone());
         }
@@ -854,12 +886,16 @@ impl BranchSet {
             ctx,
         )?);
         store.branching.retired.store(retired, Ordering::Relaxed);
+        self.register_opening(&store);
         self.stores.lock().insert(id, store.clone());
         Ok(store)
     }
 
     /// The open stores of the listed branches (not `main`, nor retired branches).
     pub fn open_stores(&self) -> Vec<Arc<Store>> {
+        let Some(_use) = self.me.enter() else {
+            return Vec::new();
+        };
         self.stores
             .lock()
             .values()
@@ -1343,6 +1379,66 @@ impl Store {
     pub fn branch_set(&self) -> Option<Arc<BranchSet>> {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         self.branching.set()
+    }
+
+    /// Nonblocking/polled counterpart for controlled lifetime composition.
+    #[doc(hidden)]
+    pub fn try_branch_set(
+        &self,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<Arc<BranchSet>>> {
+        options.check()?;
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        let set = match &self.branching.set {
+            SetRef::None => None,
+            SetRef::Owner(set) => Some(set.clone()),
+            SetRef::Member(link) => link.upgrade_controlled(options)?,
+        };
+        options.check()?;
+        Ok(set)
+    }
+
+    /// Clone an exact already resident listed branch, without opening any store.
+    ///
+    /// Main is not owned by the branch set and is never returned. This supplies
+    /// ownership only, not read authority. Controlled callers must retain the
+    /// actual main owner separately and revalidate authorization before use.
+    pub fn try_resident_branch(
+        &self,
+        id: uuid::Uuid,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<Arc<Store>>> {
+        options.check()?;
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        let Some(set) = self.try_branch_set(options)? else {
+            return Ok(None);
+        };
+        options.check()?;
+        let _use = loop {
+            options.check()?;
+            match set.me.try_enter() {
+                Ok(Some(permit)) => {
+                    options.check()?;
+                    break permit;
+                }
+                Ok(None) => return Ok(None),
+                Err(Error::WriterBusy) if !options.no_wait => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let table = crate::access::source::lock(&set.table, options)?;
+        if table.by_id(id).is_none() {
+            return Ok(None);
+        }
+        let stores = crate::access::source::lock(&set.stores, options)?;
+        let store = stores
+            .get(&id)
+            .filter(|store| !store.branching.retired.load(Ordering::Acquire))
+            .cloned();
+        options.check()?;
+        Ok(store)
     }
 
     /// Put the holds that `set`'s table places on this store into its history state.
@@ -1955,6 +2051,7 @@ impl Store {
         bases.insert((owner_id, root.seq), (resolved.commit, snap));
         bases.insert((id, root.seq), (root, store.snapshot()));
         drop(bases);
+        set.register_opening(&store);
         set.stores.lock().insert(id, store.clone());
         drop(t);
         self.branching
@@ -2730,5 +2827,68 @@ mod branch_file_format_tests {
         ));
         std::fs::write(dir.path().join(BRANCH_FILE), body(None)).unwrap();
         assert_eq!(read_branch_file(dir.path()).unwrap().unwrap().name, "dev");
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::guard::WriteOptions;
+    use std::time::Instant;
+
+    fn no_wait() -> WriteOptions {
+        WriteOptions {
+            no_wait: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resident_source_lookup_honors_each_lock_and_retired_membership() {
+        let main = Store::in_memory(Default::default());
+        let info = main.create_branch("member", &Default::default()).unwrap();
+        let set = main.branching.set().unwrap();
+        let table = set.table.lock();
+        assert!(matches!(
+            main.try_resident_branch(info.id, &no_wait()),
+            Err(Error::WriterBusy)
+        ));
+        let expired = WriteOptions {
+            deadline: Some(Instant::now() + std::time::Duration::from_millis(20)),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        assert!(matches!(
+            main.try_resident_branch(info.id, &expired),
+            Err(Error::Timeout)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(table);
+        let stores = set.stores.lock();
+        assert!(matches!(
+            main.try_resident_branch(info.id, &no_wait()),
+            Err(Error::WriterBusy)
+        ));
+        drop(stores);
+        assert!(
+            main.try_resident_branch(main.branch_id(), &no_wait())
+                .unwrap()
+                .is_none()
+        );
+        let store = main
+            .try_resident_branch(info.id, &no_wait())
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.branch_id(), info.id);
+        // Simulate the interval after table publication and before the retired flag.
+        let mut table = set.table.lock();
+        let entry = table.branches.pop().unwrap();
+        table.retired.push(entry);
+        drop(table);
+        assert!(
+            main.try_resident_branch(info.id, &no_wait())
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -3,8 +3,7 @@
 //! The allocation is the identity; a dataset UUID cannot prove that two stores
 //! belong to the same opening. It owns no Store or BranchSet, so retaining the
 //! root process lock through detached members cannot create an ownership cycle.
-//! Future admission providers must reuse this gate. Exclusive admission remains
-//! test-only until the separately reviewed family closing protocol consumes it.
+//! Future admission providers must reuse this gate. Exclusive close admission refuses active writers and pending publication.
 
 use crate::guard::WriteOptions;
 use crate::{Error, Result};
@@ -48,7 +47,6 @@ pub(crate) struct FamilyPermit {
 }
 
 /// Exclusive family admission. Dropping it allows the next queued admission or writers.
-#[cfg(test)]
 pub(crate) struct AdmissionPermit {
     gate: Arc<FamilyGate>,
 }
@@ -61,6 +59,16 @@ impl AdmissionPermit {
 }
 
 impl FamilyGate {
+    /// Closing never waits or drains while catalog ownership is excluded.
+    pub(crate) fn try_admit(self: &Arc<Self>) -> Result<AdmissionPermit> {
+        let mut state = self.state.try_lock().ok_or(Error::WriterBusy)?;
+        if state.admitted || state.writers != 0 || !state.admissions.is_empty() {
+            return Err(Error::WriterBusy);
+        }
+        state.admitted = true;
+        Ok(AdmissionPermit { gate: self.clone() })
+    }
+
     #[cfg(test)]
     pub(crate) fn waiting_admissions(&self) -> usize {
         self.state.lock().admissions.len()
@@ -200,7 +208,6 @@ impl Drop for FamilyPermit {
     }
 }
 
-#[cfg(test)]
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
         self.gate.state.lock().admitted = false;

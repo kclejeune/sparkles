@@ -502,11 +502,48 @@ settings enter the same gate before their branch locks. Store resources and bran
 locks are destroyed before the final root lease. A retained persistent member or
 branch set can therefore outlive main without releasing process exclusion early.
 
-Exclusive admission is exercised only by internal tests. This prerequisite provides
-no production protocol for closing a family or constructor closing authority. Facade ownership
-and public Store method signatures remain unchanged. Operational observation, managed
-admission, privacy visibility and durable source ownership for Jobs remain separate
-dependencies of the runtime phases.
+The resident source ownership prerequisite supplies core SourceOwner and ArcSourceOwner
+and the facade ResidentSourceOwner. A facade lease retains the catalog's original Dataset,
+including its Own(Store) payload, and an exact already resident branch Arc. It opens no
+cold branch and constructs no branch Dataset or Runtime. Getters borrow the retained
+values once before operation exclusion. The exact opening and private family identity
+are checked separately from stored UUIDs. This is a lifetime bridge, not authorization,
+routing authenticity, protected publication or durable retention.
+
+Catalog deletion, persistent rename and backup replacement now use a final reversible
+runtime close proof before filesystem publication. Nonblocking admission on the existing
+family gate refuses active writers and Pending group publication. Built-in state and set
+links freeze reversibly. Actual Store, State and Set allocations must satisfy exclusive
+ownership, with raw external Strong and Weak aliases conservatively busy. Refusal restores
+all original slots, caches and weak links before resuming workers, without changing files.
+Removed and retired members remain inventoried until their final resource drop completes.
+
+The public Own(Store) and Branch(Arc<Store>) variants retain their payloads and behavior.
+A private bounded empty in-memory Store temporarily parks inaccessible Branch slots during
+proof. It has zero cache budgets, grants no authority and is destroyed before directory
+publication. Main stays in its original Own payload. Close uses storage proportional to
+the resident state and opening inventory. Terminal links wake workers before destructors,
+and catalog lookup exclusion ends before callbacks or checkpoints. Catalog mutation remains
+serialized, so callbacks must defer management operations until disposal returns. Members
+closed during unwinding retain the existing behavior that skips clean-close checkpoints.
+Family admission and the real root process lease still span required resource shutdown,
+including a captured callback panic. Allowing catalog mutation from close callbacks remains
+an item 81 lifecycle gap.
+A precommit panic restores the same graph and catalog entry before propagating its
+original payload. Live unmatched detached openings refuse without being upgraded into
+close-owned Arcs, and a final drop witness keeps a moved-out Store value busy.
+Later I/O failure recovers through a fresh existing-only opening rather than reviving
+closed links. Recovery checks a known original UUID before and under process exclusion
+and cannot create a missing root or empty generation. A failed delete move is synchronized
+back before reopen, or remains unavailable with its original bytes and reported path.
+Uncertain moved data uses the existing retained `.kept-` convention. Restore publication
+checks the restored identity separately from original-identity rollback. Existing roots
+without a known expected UUID retain the supported legacy metadata upgrade only when
+CURRENT already exists.
+
+These checks establish runtime closure only. Durable source holds and consumer release,
+managed reader admission, operational observation, privacy visibility, protected typed
+writes and C25/C26 consumer composition remain separate dependencies.
 
 All 14 ownership tests pass without optional features and with `text,geo`. The
 control for retained members also passes in a separate exact run. Another 131 tests

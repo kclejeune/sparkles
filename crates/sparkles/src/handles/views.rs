@@ -28,7 +28,9 @@ use crate::dataset::{DatasetState, StoreHandle};
 use crate::error::{Error, Result};
 use crate::incr::{Host, Inference, Kind, LiveOptions, LiveQuery, PlanNode, ViewDef, ViewInfo};
 use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Weak;
 use std::time::Duration;
 
 /// The dataset's views (from [`Dataset::views`]).
@@ -40,7 +42,7 @@ pub struct Views {
 /// What the embedded library tells the runtime: every principal reads every quad,
 /// the dataset's prefixes apply and stored queries resolve from its catalog.
 struct LibraryHost {
-    state: Weak<DatasetState>,
+    state: crate::dataset::StateReference,
 }
 
 impl Host for LibraryHost {
@@ -91,14 +93,14 @@ pub fn inference(state: &DatasetState) -> Option<Inference> {
 /// Answers `SERVICE view:read` for a dataset's queries.
 #[derive(Debug)]
 pub(crate) struct Source {
-    pub(crate) state: Weak<DatasetState>,
+    pub(crate) state: crate::dataset::StateReference,
 }
 
 impl ViewSource for Source {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
         let state = self
             .state
-            .upgrade()
+            .try_upgrade()?
             .ok_or_else(|| Error::invalid("the dataset is closed"))?;
         start(&state, None);
         let rt = state.views.clone();
@@ -116,10 +118,10 @@ pub(crate) fn start(state: &Arc<DatasetState>, host: Option<Arc<dyn Host>>) {
     state.views_worker.get_or_init(|| {
         if !state.views.has_host() {
             state.views.set_host(Arc::new(LibraryHost {
-                state: Arc::downgrade(state),
+                state: state.reference.clone(),
             }));
         }
-        let weak = Arc::downgrade(state);
+        let weak = state.reference.clone();
         let name = format!("sparkles-views-{}", state.name.as_deref().unwrap_or("ds"));
         let name: String = name.chars().take(15).collect();
         // The last Dataset handle closes the runtime before releasing its state.

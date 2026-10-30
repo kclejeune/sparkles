@@ -219,6 +219,13 @@ The result keeps explicit requirements for references needing authorized runtime
 resolution. JSON selection uses the named lexical UTF-8 method and preserves exact
 retained value bytes. These local helpers provide no authenticated write or receipt.
 
+Trusted Rust adapters can retain actual catalog openings with
+`sparkles::managed_source::ResidentSourceOwner`. The lease keeps the original Dataset
+and resident branch alive without resolving a fresh name or opening a cold branch.
+Catalog disposal checks shared runtime ownership and preserves original owners on refusal.
+The [integration guide](../integrations/README.md#libraries-and-bindings) describes raw
+Strong and Weak aliases. These lifetime checks grant no read permission or durable retention.
+
 Source revisions, renditions and passages retain exact identities and digests. Claim
 occurrences describe a proposition with an RDF 1.2 triple term without asserting it.
 Evidence links distinguish support, contradiction and mention. Declared lineage stays

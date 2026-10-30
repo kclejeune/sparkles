@@ -12,6 +12,13 @@ signals remain incomplete.
 
 ### Changed
 
+Catalog disposal now refuses raw shared state, Store and BranchSet aliases and preserves
+exact owners on refusal. Resident source leases retain real catalog openings without
+changing StoreHandle variants or granting managed-write authority. Built-in close links,
+member drop witnesses and final family admission protect rename, delete and backup swaps.
+Recovery checks existing roots and original identities, and uncertain delete moves retain
+their original bytes instead of creating an empty replacement.
+
 The successful dataset rename response is described under OpenAPI's `application/json`
 media type. Its `name` and `renamedFrom` fields and wire behavior are unchanged.
 

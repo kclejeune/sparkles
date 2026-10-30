@@ -22,6 +22,7 @@ pub mod evidence;
 pub mod fmt;
 pub mod forms;
 pub mod handles;
+pub mod managed_source;
 pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;

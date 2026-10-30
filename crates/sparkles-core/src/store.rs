@@ -45,6 +45,8 @@ mod group_model;
 mod history_limited;
 mod history_query;
 pub mod keyset;
+#[doc(hidden)]
+pub mod lifecycle;
 mod link;
 mod lock;
 #[cfg(test)]
@@ -1429,6 +1431,8 @@ pub struct Store {
     /// which prefix names loaded data may bind (spec C20 §3.4), set by the server
     prefix_filter: Mutex<Option<PrefixFilter>>,
     dataset_id: uuid::Uuid,
+    /// Process-local identity of this exact store opening, never a disk capability.
+    opening: uuid::Uuid,
     /// `forkedFrom` of an in-memory clone (a persistent one keeps it in `dataset.json`)
     forked_mem: Option<ForkedFrom>,
     catalog: Arc<Mutex<Catalog>>,
@@ -1487,8 +1491,10 @@ pub struct Store {
     /// Fields drop in declaration order. Only the family root lease follows this.
     _lock: Option<Arc<ProcessLock>>,
     /// Keep the root process lock through member resources and their own lock.
-    /// This must remain last, including when a member outlives the main Store.
+    /// Only the non-resource completion witness follows this family lease.
     family: Arc<family::Family>,
+    // Final non-resource witness: strong-zero Store may still be dropping fields.
+    _close_complete: Arc<()>,
 }
 
 pub(crate) const WAL_INSERT: u8 = 1;
@@ -1639,7 +1645,46 @@ pub(crate) const WAL_COMMIT: u8 = 3;
 pub(crate) const WAL_HEADER: u8 = 0x89;
 pub(crate) const WAL_REC: usize = 1 + 32;
 
+#[derive(Clone, Copy)]
+enum OpenMode {
+    Create,
+    Existing(Option<uuid::Uuid>),
+}
+
+fn check_existing_root(root: &Path, expected: Option<uuid::Uuid>) -> Result<()> {
+    if !std::fs::metadata(root)?.is_dir() {
+        return Err(Error::Corrupt(
+            "existing dataset root is not a directory".into(),
+        ));
+    }
+    let id = commit::read_dataset_file(root)?;
+    if let Some(expected) = expected
+        && id != Some(expected)
+    {
+        return Err(Error::Corrupt(format!(
+            "existing dataset identity is missing or differs from expected {expected}"
+        )));
+    }
+    // Unknown legacy roots may still receive the existing supported metadata
+    // upgrade, but an actual CURRENT must already exist. Known recovery cannot
+    // migrate or substitute an identity. Neither path creates an empty root.
+    if !std::fs::metadata(root.join("CURRENT"))?.is_file() {
+        return Err(Error::Corrupt(
+            "existing dataset is missing its CURRENT file".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Store {
+    pub(crate) fn same_source_family(&self, other: &Store) -> bool {
+        Arc::ptr_eq(&self.family, &other.family)
+    }
+
+    pub(crate) fn source_opening(&self) -> uuid::Uuid {
+        self.opening
+    }
+
     /// A fresh in-memory store (Jena `DatasetGraphFactory.createTxnMem()` equivalent).
     pub fn in_memory(opts: StoreOptions) -> Store {
         let root = CommitInfo {
@@ -1755,7 +1800,9 @@ impl Store {
             prefix_filter: Mutex::new(None),
             _lock: None,
             family: family.clone(),
+            _close_complete: Arc::new(()),
             dataset_id,
+            opening: uuid::Uuid::new_v4(),
             forked_mem: forked_from,
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
             annotations: Mutex::new(crate::annotations::Annotations::memory(opts.commit_digests)),
@@ -1815,7 +1862,24 @@ impl Store {
                 root.display()
             )));
         }
-        Self::open_inner(root, opts, None)
+        Self::open_inner(root, opts, None, OpenMode::Create)
+    }
+
+    /// Open only an existing root, optionally requiring its original dataset UUID.
+    /// Missing recovery files refuse without creating a root or empty generation.
+    /// Identity is checked again under actual process exclusion before recovery.
+    #[doc(hidden)]
+    pub fn open_existing(
+        root: &Path,
+        opts: StoreOptions,
+        expected: Option<uuid::Uuid>,
+    ) -> Result<Store> {
+        if branching::read_branch_file(root)?.is_some() {
+            return Err(crate::branch::invalid_branch(
+                "an existing dataset root cannot be a member branch",
+            ));
+        }
+        Self::open_inner(root, opts, None, OpenMode::Existing(expected))
     }
 
     /// Open the store of a branch (by the dataset's [`BranchSet`]).
@@ -1824,13 +1888,14 @@ impl Store {
         opts: StoreOptions,
         ctx: branching::OpenCtx,
     ) -> Result<Store> {
-        Self::open_inner(root, opts, Some(ctx))
+        Self::open_inner(root, opts, Some(ctx), OpenMode::Create)
     }
 
     fn open_inner(
         root: &Path,
         opts: StoreOptions,
         ctx: Option<branching::OpenCtx>,
+        mode: OpenMode,
     ) -> Result<Store> {
         // A database whose migration stopped part way is refused, before this open
         // creates the directory a missing root would get, and again under the lock
@@ -1839,7 +1904,10 @@ impl Store {
             crate::migrate::check_not_pending(root)?;
         }
         commit::check_dataset_compatibility(root)?;
-        std::fs::create_dir_all(root)?;
+        match mode {
+            OpenMode::Create => std::fs::create_dir_all(root)?,
+            OpenMode::Existing(expected) => check_existing_root(root, expected)?,
+        }
         let lock = Arc::new(lock_dir(root)?);
         if ctx.is_none() {
             crate::migrate::check_not_pending(root)?;
@@ -1848,6 +1916,9 @@ impl Store {
         // migration renames, after which only file identity detects the stale lock.
         // Branch roots follow the same identity rule under their parent's exclusion.
         verify_database_lock(root, &lock)?;
+        if let OpenMode::Existing(expected) = mode {
+            check_existing_root(root, expected)?;
+        }
         // Declare both leases before opening resources, so failed construction also
         // destroys those resources before releasing root process exclusion.
         let family = ctx.as_ref().map_or_else(
@@ -1864,6 +1935,11 @@ impl Store {
         }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
+            if matches!(mode, OpenMode::Existing(_)) {
+                return Err(Error::Corrupt(
+                    "existing dataset lost CURRENT before recovery".into(),
+                ));
+            }
             refuse_generations_without_current(root)?;
             // a new database: its id, an empty generation holding the root commit, the
             // catalog, and CURRENT last (the commit point of the creation)
@@ -2205,7 +2281,9 @@ impl Store {
             prefix_filter: Mutex::new(None),
             _lock: Some(lock.clone()),
             family: family.clone(),
+            _close_complete: Arc::new(()),
             dataset_id,
+            opening: uuid::Uuid::new_v4(),
             forked_mem: None,
             catalog: Arc::new(Mutex::new(catalog)),
             annotations: Mutex::new(annotations),

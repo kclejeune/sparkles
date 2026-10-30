@@ -128,8 +128,52 @@ pub(crate) fn replace_with(
             format!("/{name} is an in-memory dataset"),
         ));
     };
-    // closing the store releases its `sparkles.lock`
-    drop(old);
+    // A restore intentionally publishes another identity. Read only its scalar
+    // identity before closing the old graph; the existing-only opener validates
+    // the complete header and the same UUID under its process lock later.
+    #[derive(serde::Deserialize)]
+    struct RestoredIdentity {
+        id: uuid::Uuid,
+    }
+    let restored_id = (|| {
+        let file = match std::fs::File::open(restored.join("dataset.json")) {
+            Ok(file) => file,
+            // Genuine legacy CURRENT roots have no header. The existing-only
+            // opener retains their supported metadata upgrade, without ever
+            // creating a missing root or empty generation.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        serde_json::from_reader::<_, RestoredIdentity>(std::io::BufReader::new(file))
+            .map(|header| Some(header.id))
+            .map_err(std::io::Error::other)
+    })();
+    let restored_id = match restored_id {
+        Ok(id) => id,
+        Err(error) => {
+            st.reinsert(name, old);
+            return Err(io("reading restored identity from", restored, error));
+        }
+    };
+    // Drain is only a preflight. The final nonblocking proof must also exclude
+    // raw Strong/Weak Store and BranchSet aliases before directory publication.
+    match old.close_for_disposal(|| {}) {
+        Ok(reasoning) => {
+            if let Some(detached) = st.inner.detached.lock().get_mut(name) {
+                detached.reasoning = reasoning;
+            }
+        }
+        Err(refused) => {
+            st.reinsert(name, refused.dataset);
+            if let Some(panic) = refused.panic {
+                std::panic::resume_unwind(panic);
+            }
+            return Err(BackupError::new(
+                Code::DatasetBusy,
+                "the source family still has live owners; the dataset is unchanged",
+            ));
+        }
+    }
     // the storage quota is the operator's, not the backup's: the restored dataset keeps
     // the one it replaces
     let quota = root.join(crate::store::QUOTA_FILE);
@@ -162,7 +206,7 @@ pub(crate) fn replace_with(
     if let Err(e) = sync_dir(&databases) {
         tracing::warn!(target: "sparkles::backup", "syncing {}: {e:#}", databases.display());
     }
-    match st.reattach(name) {
+    match st.reattach_expected(name, restored_id) {
         Ok(ds) => {
             let cleanup = if keep_replaced {
                 let kept = databases.join(format!("{KEPT_PREFIX}{name}-{task}"));

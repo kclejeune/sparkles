@@ -19,7 +19,7 @@ pub const RESTORE_PREFIX: &str = ".restore-";
 /// Prefix of the replaced directory of an in-place restore: `.replaced-<ds>-<task>`.
 pub const REPLACED_PREFIX: &str = ".replaced-";
 /// Prefix of a replaced directory kept with `keepReplaced`: `.kept-<ds>-<task>`.
-pub const KEPT_PREFIX: &str = ".kept-";
+pub const KEPT_PREFIX: &str = super::KEPT_PREFIX;
 
 /// The dataset name of `.replaced-<ds>-<task>` (the task id is numeric).
 pub fn replaced_dataset(file_name: &str) -> Option<&str> {

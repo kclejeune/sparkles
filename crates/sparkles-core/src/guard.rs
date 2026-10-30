@@ -36,7 +36,10 @@ pub trait CommitGuard: Send + Sync {
     /// Called when the store closes cleanly, under the writer lock, with the head commit
     /// and the snapshot that shows it, so a guard can keep what it knows of the head for
     /// the next open. It must not call a method of the store that takes the writer lock,
-    /// and its failures are its own to log.
+    /// and its failures are its own to log. During catalog disposal it may look up
+    /// datasets, but it must defer catalog mutations until disposal returns. Members
+    /// closed during unwinding can skip this clean-close checkpoint; required
+    /// resource shutdown and root exclusion still apply.
     fn close(&self, _head: &CommitInfo, _snapshot: &Snapshot) {}
     /// Called after a compaction published `new`, which holds the data of `old` with
     /// renumbered terms, while the writer lock is still held. A guard that keeps ids

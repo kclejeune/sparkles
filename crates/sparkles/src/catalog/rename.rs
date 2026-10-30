@@ -15,7 +15,7 @@ struct Intent {
     id: Uuid,
 }
 
-pub(super) fn prepare(dir: &Path, from: &str, to: &str, id: Uuid) -> Result<()> {
+pub(super) fn check_prepare(dir: &Path, from: &str) -> Result<()> {
     if dir.join(INTENT).exists() {
         return Err(Error::Conflict(
             "an unfinished dataset rename needs recovery".into(),
@@ -28,6 +28,12 @@ pub(super) fn prepare(dir: &Path, from: &str, to: &str, id: Uuid) -> Result<()> 
     {
         return Err(Error::Corrupt("renamed dataset is not registered".into()));
     }
+    Ok(())
+}
+
+pub(super) fn prepare(dir: &Path, from: &str, to: &str, id: Uuid) -> Result<()> {
+    check_prepare(dir, from)?;
+    fail_point(FAIL_PREPARE_WRITE)?;
     let intent = Intent {
         from: from.into(),
         to: to.into(),
@@ -101,13 +107,15 @@ pub(super) fn recover(dir: &Path) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static CRASH_AFTER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    static FAIL_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    pub(super) static FAIL_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 /// A failure after the directory moved, which the rename rolls back.
 pub(super) const FAIL_AFTER_MOVE: u8 = 1;
 /// A failure to reopen the store while rolling back.
 pub(super) const FAIL_ROLLBACK_REOPEN: u8 = 2;
+/// Refuse intent publication after a successful actual ownership close.
+pub(super) const FAIL_PREPARE_WRITE: u8 = 3;
 
 /// Fail like an I/O error would at `_point` in tests. Unlike [`crash_point`], the
 /// rename handles the error as it handles a real one.

@@ -76,7 +76,36 @@ pub struct Dataset {
 }
 
 /// Shared only by Dataset handles, never by the views worker or its host.
-pub(crate) struct DatasetLifetime(std::sync::Weak<DatasetState>);
+pub(crate) struct DatasetLifetime(StateReference);
+
+/// Built-in weak reference to one exact state allocation, never a permission.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct StateReference {
+    pub(crate) link: Arc<crate::store::lifecycle::WeakLink<DatasetState>>,
+}
+impl StateReference {
+    pub fn upgrade(&self) -> Option<Arc<DatasetState>> {
+        self.link.upgrade()
+    }
+    pub fn try_upgrade(&self) -> Result<Option<Arc<DatasetState>>> {
+        self.link.try_upgrade()
+    }
+    pub(crate) fn strong_count(&self) -> usize {
+        self.link.strong_count()
+    }
+    pub(crate) fn as_ptr(&self) -> *const DatasetState {
+        self.link.address() as *const DatasetState
+    }
+}
+
+mod lifecycle;
+
+/// Original ownership returned before any precommit panic is propagated.
+pub(crate) struct RefusedClose {
+    pub(crate) dataset: Dataset,
+    pub(crate) panic: Option<Box<dyn std::any::Any + Send>>,
+}
 
 impl Drop for DatasetLifetime {
     fn drop(&mut self) {
@@ -139,7 +168,8 @@ impl From<StoreOptions> for DatasetOptions {
 #[doc(hidden)]
 pub struct DatasetState {
     pub(crate) branches: Mutex<BTreeMap<String, Dataset>>,
-    pub(crate) branch_handles: Mutex<Vec<std::sync::Weak<DatasetState>>>,
+    pub(crate) branch_handles: Mutex<Vec<StateReference>>,
+    pub(crate) reference: StateReference,
     pub(crate) closure_cache_triples: usize,
     pub(crate) pool: Option<Arc<crate::sparql::pool::QueryPool>>,
     pub store: StoreHandle,
@@ -348,7 +378,10 @@ impl Dataset {
             StoreHandle::Branch(_) => None,
         };
         let views = crate::incr::Runtime::open(views_root, store.dataset_id(), opts.views.clone());
-        let inner = Arc::new(DatasetState {
+        let inner = Arc::new_cyclic(|weak| DatasetState {
+            reference: StateReference {
+                link: crate::store::lifecycle::WeakLink::new(weak.clone()),
+            },
             views,
             views_worker: std::sync::OnceLock::new(),
             branches: Mutex::new(BTreeMap::new()),
@@ -373,7 +406,7 @@ impl Dataset {
             store,
         });
         Dataset {
-            _lifetime: Arc::new(DatasetLifetime(Arc::downgrade(&inner))),
+            _lifetime: Arc::new(DatasetLifetime(inner.reference.clone())),
             inner,
             alias: None,
         }
@@ -392,8 +425,11 @@ impl Dataset {
         handles.iter().any(|weak| {
             let cached = branches
                 .values()
-                .any(|ds| std::ptr::eq(Arc::as_ptr(&ds.inner), weak.as_ptr()));
-            weak.strong_count() > usize::from(cached)
+                .filter(|ds| std::ptr::eq(Arc::as_ptr(&ds.inner), weak.as_ptr()))
+                .count();
+            // Counts only avoid a conservative preflight false positive. The
+            // final close still requires exact unique owning allocations.
+            weak.strong_count() > cached
         })
     }
 
@@ -421,6 +457,18 @@ impl Dataset {
     /// The shared state, for hosts that keep a weak reference to it.
     pub fn inner_state(&self) -> &Arc<DatasetState> {
         &self.inner
+    }
+    /// A built-in weak lifetime reference which preserves exact opening identity.
+    #[doc(hidden)]
+    pub fn state_reference(&self) -> StateReference {
+        self.inner.reference.clone()
+    }
+
+    pub(crate) fn close_for_disposal(
+        self,
+        release_entries: impl FnOnce(),
+    ) -> std::result::Result<Option<ReasoningRecord>, RefusedClose> {
+        lifecycle::close(self, release_entries)
     }
 
     /// The name a catalog or a server gave the dataset, if any.
@@ -705,7 +753,7 @@ impl Dataset {
             pool: state.pool.clone(),
             algo_projections: Some(state.algo.clone()),
             views: Some(Arc::new(crate::handles::views::Source {
-                state: Arc::downgrade(&self.inner),
+                state: self.inner.reference.clone(),
             })),
             defaults_applied: true,
             ..Default::default()

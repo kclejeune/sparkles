@@ -12,6 +12,7 @@
 //! only the visible triples.
 
 pub mod authority;
+pub mod source;
 pub mod triples;
 pub use triples::{Caller, Limits, Mask, Protection, Rule, TripleRules};
 

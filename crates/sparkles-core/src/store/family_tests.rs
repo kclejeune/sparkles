@@ -50,6 +50,36 @@ fn memory_members_share_one_opening_without_a_family_cycle() {
 }
 
 #[test]
+fn source_identity_rejects_another_family_with_identical_stored_uuids() {
+    use crate::access::source::{ArcSourceOwner, SampledSource, Target};
+    let main = Arc::new(Store::in_memory(Default::default()));
+    let mut foreign = Store::in_memory(Default::default());
+    foreign.dataset_id = main.dataset_id();
+    let owner = ArcSourceOwner::new(main.clone(), Arc::new(foreign));
+    let target = Target {
+        dataset: main.dataset_id(),
+        branch: main.branch_id(),
+    };
+    assert!(SampledSource::sample(&owner, target).is_err());
+    main.create_branch("member", &Default::default()).unwrap();
+    let member = main.branch("member").unwrap().shared().unwrap();
+    let owner = ArcSourceOwner::new(main.clone(), member.clone());
+    let target = Target {
+        dataset: main.dataset_id(),
+        branch: member.branch_id(),
+    };
+    let sampled = SampledSource::sample(&owner, target).unwrap();
+    assert!(sampled.observes(main.as_ref(), member.as_ref()));
+    let mut foreign_member = Store::in_memory(Default::default());
+    foreign_member.dataset_id = member.dataset_id();
+    foreign_member.branching.ident = member.branching.ident.clone();
+    let foreign_owner = ArcSourceOwner::new(main.clone(), Arc::new(foreign_member));
+    assert!(SampledSource::sample(&foreign_owner, target).is_err());
+    let reversed = ArcSourceOwner::new(member.clone(), main.clone());
+    assert!(SampledSource::sample(&reversed, target).is_err());
+}
+
+#[test]
 fn lazy_persistent_members_reuse_only_the_current_opening_identity() {
     let directory = tempfile::tempdir().unwrap();
     let main = Store::open(directory.path(), Default::default()).unwrap();

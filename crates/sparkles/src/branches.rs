@@ -17,6 +17,12 @@ impl Dataset {
     /// is this dataset itself. Branch operations (create, merge, delete) are made on
     /// the dataset that owns the branches, the one [`Dataset::open`] returned.
     pub fn branch(&self, name: &str) -> Result<Dataset> {
+        let _use = self
+            .inner
+            .reference
+            .link
+            .enter()
+            .ok_or_else(|| crate::Error::invalid("the dataset is closed"))?;
         if name == crate::branch::MAIN {
             return Ok(self.clone());
         }
@@ -83,7 +89,7 @@ impl Dataset {
         self.state()
             .branch_handles
             .lock()
-            .push(std::sync::Arc::downgrade(&ds.inner));
+            .push(ds.state_reference());
         branches.insert(name.to_string(), ds.clone());
         Ok(ds)
     }
@@ -227,6 +233,12 @@ impl Dataset {
     /// Rename branch `name` to `new` (see
     /// [`Store::rename_branch`](crate::store::Store::rename_branch)).
     pub fn rename_branch(&self, name: &str, new: &str) -> Result<BranchInfo> {
+        let _use = self
+            .inner
+            .reference
+            .link
+            .enter()
+            .ok_or_else(|| crate::Error::invalid("the dataset is closed"))?;
         let info = self.store().rename_branch(name, new)?;
         let mut branches = self.state().branches.lock();
         if let Some(ds) = branches.remove(name) {
@@ -238,6 +250,12 @@ impl Dataset {
     /// Delete branch `name` with options, which can re-parent the branches created from
     /// it (see [`Store::delete_branch_with`](crate::store::Store::delete_branch_with)).
     pub fn delete_branch_with(&self, name: &str, o: &crate::branch::DeleteOptions) -> Result<()> {
+        let _use = self
+            .inner
+            .reference
+            .link
+            .enter()
+            .ok_or_else(|| crate::Error::invalid("the dataset is closed"))?;
         self.store().delete_branch_with(name, o)?;
         self.state().branches.lock().remove(name);
         Ok(())
@@ -258,6 +276,12 @@ impl Dataset {
 
     /// Delete branch `name`, also with unmerged commits when `force`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
+        let _use = self
+            .inner
+            .reference
+            .link
+            .enter()
+            .ok_or_else(|| crate::Error::invalid("the dataset is closed"))?;
         self.store().delete_branch(name, force)?;
         self.state().branches.lock().remove(name);
         Ok(())

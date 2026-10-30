@@ -20,6 +20,30 @@ a branch Store or BranchSet. Removed and retired branch stores keep the same lea
 until their resources are destroyed. Release those owners before reopening the
 dataset directory. In-memory branches share runtime ownership without a file lock.
 
+Catalog deletion, persistent rename and backup replacement also prove exclusive runtime
+ownership before publishing directory changes. Raw Strong or Weak aliases to a participating
+DatasetState, branch Store or BranchSet conservatively make disposal busy. Refusal preserves
+the original allocations and files. Release those aliases and retry. Built-in worker and
+branch references use revocable links, so idle cached branches can close without changing
+the public StoreHandle variants. Close callbacks run after catalog lookup exclusion ends.
+Callbacks may look up datasets but must defer catalog mutations until disposal returns.
+Members closed during unwinding can skip checkpoints that require a clean close.
+The runtime retains root exclusion through required resource shutdown.
+
+After runtime close commits, an I/O failure can reopen the existing dataset through a
+fresh runtime. Recovery verifies its original UUID and existing CURRENT before opening.
+If a delete cannot synchronize its rollback, the catalog leaves the dataset unavailable
+and reports the retained data path. Unresolved moved bytes use the existing `.kept-`
+convention and catalog startup does not remove them. Restore publication verifies the
+restored identity separately from the original identity required for rollback.
+
+`sparkles::managed_source::ResidentSourceOwner` retains the catalog's actual Dataset and
+an exact resident branch Store. Core `ArcSourceOwner` supports direct Arc-backed callers.
+Their getters borrow existing openings and do not open cold branches. These leases provide
+lifetime and identity only. Read authorization, authenticated managed writes and durable
+source holds remain separate requirements. Runtime ownership checks do not authorize
+removal of source bytes required by a durable consumer.
+
 * The embedded Rust API is `sparkles::Dataset`, with a fluent query builder in
   `sparkles::querybuilder` ([USAGE.md](../USAGE.md#embedding-the-library),
   [P06](../specs/P06-library-admin-api.md)). Opening a dataset installs its write-time

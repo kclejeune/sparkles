@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value as J, json};
 use sparkles::access::GraphAccess;
 use sparkles::incr::{Host, ViewDef};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The status of an error of the views by its code.
@@ -39,7 +39,7 @@ struct ServerHost {
     auth: Option<Arc<crate::auth::Auth>>,
     #[cfg(feature = "auth")]
     dataset: String,
-    state: Weak<sparkles::dataset::DatasetState>,
+    state: sparkles::dataset::StateReference,
 }
 
 impl Host for ServerHost {
@@ -107,7 +107,7 @@ pub(crate) fn start(st: &AppState, name: &str, ds: &sparkles::Dataset) {
         auth: st.auth.clone(),
         #[cfg(feature = "auth")]
         dataset: name.to_string(),
-        state: Arc::downgrade(ds.inner_state()),
+        state: ds.state_reference(),
     }));
 }
 

@@ -16,9 +16,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod lifecycle_tests;
 mod rename;
 #[cfg(feature = "backup")]
 mod restore;
+#[cfg(test)]
+mod source_tests;
 #[cfg(feature = "backup")]
 pub use restore::RESTORE_PREFIX;
 #[cfg(feature = "backup")]
@@ -160,6 +164,7 @@ struct RegistryEntry {
 /// What `config.json` keeps for a persistent dataset whose store is closed while the
 /// catalog works on its directory, so that saves made meanwhile keep it registered.
 struct Detached {
+    id: Option<Uuid>,
     reasoning: Option<crate::reasoning::ReasoningRecord>,
 }
 
@@ -261,7 +266,12 @@ impl Catalog {
                     e.name
                 )));
             }
-            let ds = match catalog.open_dataset(&e.name, e.kind, None) {
+            let opened = if e.kind == DatasetKind::Persistent {
+                catalog.open_existing_dataset(&e.name, None)
+            } else {
+                catalog.open_dataset(&e.name, e.kind, None)
+            };
+            let ds = match opened {
                 Ok(ds) => ds,
                 // A dataset in a format this release does not read is refused alone: it
                 // stays registered and closed, and the catalog serves the others.
@@ -276,6 +286,7 @@ impl Catalog {
                     catalog.inner.detached.lock().insert(
                         e.name.clone(),
                         Detached {
+                            id: None,
                             reasoning: e.reasoning,
                         },
                     );
@@ -436,6 +447,41 @@ impl Catalog {
             .find(|e| e.dataset.dataset_id() == id)
             .map(|e| e.dataset.clone())
     }
+
+    /// Clone an already registered dataset by exact identity with controlled waiting.
+    /// This never opens a dataset and grants no permission to read it.
+    pub fn try_get_by_id(
+        &self,
+        id: Uuid,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<Dataset>> {
+        loop {
+            options.check()?;
+            let entries = if options.no_wait {
+                self.inner.entries.try_read()
+            } else {
+                self.inner
+                    .entries
+                    .try_read_for(std::time::Duration::from_millis(10))
+            };
+            if let Some(entries) = entries {
+                options.check()?;
+                let mut dataset = None;
+                for entry in entries.values() {
+                    options.check()?;
+                    if entry.dataset.dataset_id() == id {
+                        dataset = Some(entry.dataset.clone());
+                        break;
+                    }
+                }
+                options.check()?;
+                return Ok(dataset);
+            }
+            if options.no_wait {
+                return Err(Error::WriterBusy);
+            }
+        }
+    }
     fn database_dir(&self, name: &str) -> Result<PathBuf> {
         self.dir()
             .map(|d| d.join("databases").join(name))
@@ -468,6 +514,15 @@ impl Catalog {
                 opts,
             ),
         }
+    }
+    /// Registered and recovery roots cannot acquire create semantics.
+    fn open_existing_dataset(&self, name: &str, expected: Option<Uuid>) -> Result<Dataset> {
+        let mut opts = self.dataset_options(name);
+        if let Some(caches) = &self.inner.caches {
+            opts.store.shared = Some(caches.scope());
+        }
+        let store = Store::open_existing(&self.database_dir(name)?, opts.store.clone(), expected)?;
+        Ok(Dataset::from_store_with(store, opts))
     }
     fn available(&self, name: &str, check_directory: bool) -> Result<()> {
         check_name(name)?;
@@ -556,48 +611,145 @@ impl Catalog {
                     "dataset /{name} is reserved by task {holder}"
                 )));
             }
-            let entry = {
-                let mut map = self.inner.entries.write();
-                let Some(entry) = map.get(name) else {
-                    return Ok(false);
-                };
-                if entry.kind == DatasetKind::Persistent
-                    && !entry.attached
-                    && entry.dataset.in_use()
-                {
-                    return Err(Error::Conflict(format!(
-                        "dataset /{name} still has live handles"
-                    )));
-                }
-                map.remove(name).expect("checked")
+            let mut map = Some(self.inner.entries.write());
+            let Some(entry) = map.as_ref().expect("entries").get(name) else {
+                return Ok(false);
             };
-            if let Err(e) = self.save_locked() {
-                self.inner.entries.write().insert(name.into(), entry);
-                return Err(e);
+            let managed = entry.kind == DatasetKind::Persistent && !entry.attached;
+            if managed && entry.dataset.in_use() {
+                return Err(Error::Conflict(format!(
+                    "dataset /{name} still has live handles"
+                )));
             }
-            if entry.kind == DatasetKind::Persistent && !entry.attached {
+            #[cfg(test)]
+            lifecycle_tests::before_close_hook();
+            let entry = map
+                .as_mut()
+                .expect("entries")
+                .remove(name)
+                .expect("checked");
+            if managed {
                 let root = entry.dataset.store().root().map(Path::to_path_buf);
-                // The handle was the last one, so dropping it closes the store.
-                drop(entry);
-                match root {
-                    Some(root) => Some(move_to_trash(&root)?),
-                    None => None,
+                let id = entry.dataset.dataset_id();
+                let reasoning = match entry.dataset.close_for_disposal(|| drop(map.take())) {
+                    Ok(reasoning) => reasoning,
+                    Err(refused) => {
+                        let dataset = refused.dataset;
+                        map.as_mut()
+                            .expect("refusal retains entries exclusion")
+                            .insert(
+                                name.into(),
+                                Entry {
+                                    dataset,
+                                    kind: entry.kind,
+                                    attached: entry.attached,
+                                },
+                            );
+                        drop(map.take());
+                        if let Some(panic) = refused.panic {
+                            std::panic::resume_unwind(panic);
+                        }
+                        return Err(Error::Conflict(format!(
+                            "dataset /{name} still has live handles"
+                        )));
+                    }
+                };
+                if let Err(error) = self.save_locked() {
+                    return Err(self.reopen_closed_locked(name, id, reasoning, error));
+                }
+                match root.map(|root| move_to_trash(&root)).transpose() {
+                    Ok(trash) => trash,
+                    Err(failure) => {
+                        return Err(if failure.reopen {
+                            self.reopen_closed_locked(name, id, reasoning, failure.error)
+                        } else {
+                            self.keep_closed_locked(name, id, reasoning, failure.error)
+                        });
+                    }
                 }
             } else {
+                drop(map);
+                if let Err(error) = self.save_locked() {
+                    self.inner.entries.write().insert(name.into(), entry);
+                    return Err(error);
+                }
                 None
             }
         };
         delete_hook();
         if let Some(trash) = trash
-            && let Err(e) = std::fs::remove_dir_all(&trash)
+            && let Err(error) = std::fs::remove_dir_all(&trash)
         {
-            tracing::warn!(
-                "removing {}: {e} (the next open of the catalog removes it)",
-                trash.display()
-            );
+            tracing::warn!(path=%trash.display(), %error,
+                "deleted dataset cleanup failed; trash is retried on catalog open and retained paths require operator recovery");
         }
         Ok(true)
     }
+
+    /// An irrevocably closed state is never revived on later I/O refusal.
+    fn reopen_closed_locked(
+        &self,
+        name: &str,
+        id: Uuid,
+        reasoning: Option<crate::reasoning::ReasoningRecord>,
+        error: Error,
+    ) -> Error {
+        let retained_reasoning = reasoning.clone();
+        self.inner.detached.lock().insert(
+            name.into(),
+            Detached {
+                id: Some(id),
+                reasoning,
+            },
+        );
+        match self.reattach_locked(name, Some(id)) {
+            Ok(()) => match self.save_locked() {
+                Ok(()) => error,
+                Err(save) => Error::Corrupt(format!(
+                    "{error}; reopening /{name} succeeded but restoring its registry failed: {save}"
+                )),
+            },
+            Err(reopen) => self.keep_closed_locked(
+                name,
+                id,
+                retained_reasoning,
+                Error::Corrupt(format!(
+                    "{error}; reopening /{name} after close failed: {reopen}"
+                )),
+            ),
+        }
+    }
+
+    /// Keep original identity unavailable when a move cannot be synchronized
+    /// back. The retained source path is in `error`; no constructor runs here.
+    fn keep_closed_locked(
+        &self,
+        name: &str,
+        id: Uuid,
+        reasoning: Option<crate::reasoning::ReasoningRecord>,
+        error: Error,
+    ) -> Error {
+        let message =
+            format!("{error}; original dataset {id} remains closed and requires recovery");
+        self.inner.detached.lock().insert(
+            name.into(),
+            Detached {
+                id: Some(id),
+                reasoning,
+            },
+        );
+        self.inner
+            .refused
+            .lock()
+            .insert(name.into(), message.clone());
+        match self.save_locked() {
+            Ok(()) => Error::Corrupt(message),
+            Err(save) => Error::Corrupt(format!(
+                "{message}; retaining its registry entry also failed: {save}"
+            )),
+        }
+    }
+
     /// Rename an alias, retaining its UUID. Persistent datasets must have no live
     /// handles, including branch handles, so that the old store can be closed.
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset> {
@@ -606,8 +758,9 @@ impl Catalog {
         if self.reserved_by(from).is_some() {
             return Err(Error::Conflict(format!("dataset /{from} is reserved")));
         }
+        let mut map = Some(self.inner.entries.write());
         let mut entry = {
-            let mut map = self.inner.entries.write();
+            let map = map.as_mut().expect("entries");
             let entry = map
                 .get(from)
                 .ok_or_else(|| Error::NotFound(format!("no dataset /{from}")))?;
@@ -621,9 +774,15 @@ impl Catalog {
                     "dataset /{from} still has live handles"
                 )));
             }
+            if entry.kind == DatasetKind::Persistent {
+                rename::check_prepare(self.dir().expect("persistent catalog"), from)?;
+            }
+            #[cfg(test)]
+            lifecycle_tests::before_close_hook();
             map.remove(from).expect("checked")
         };
         if entry.kind == DatasetKind::Memory {
+            drop(map);
             entry.dataset.alias = Some(Arc::from(to));
             self.inner.entries.write().insert(to.into(), entry);
             if let Err(e) = self.save_locked() {
@@ -635,15 +794,35 @@ impl Catalog {
             return Ok(self.get(to).expect("renamed"));
         }
         let dir = self.dir().expect("persistent catalog");
-        let reasoning = entry.dataset.reasoning_record();
-        if let Err(e) = rename::prepare(dir, from, to, entry.dataset.dataset_id()) {
-            self.inner.entries.write().insert(from.into(), entry);
-            return Err(e);
+        let id = entry.dataset.dataset_id();
+        let reasoning = match entry.dataset.close_for_disposal(|| drop(map.take())) {
+            Ok(reasoning) => reasoning,
+            Err(refused) => {
+                let dataset = refused.dataset;
+                map.as_mut()
+                    .expect("refusal retains entries exclusion")
+                    .insert(
+                        from.into(),
+                        Entry {
+                            dataset,
+                            kind: entry.kind,
+                            attached: entry.attached,
+                        },
+                    );
+                drop(map.take());
+                if let Some(panic) = refused.panic {
+                    std::panic::resume_unwind(panic);
+                }
+                return Err(Error::Conflict(format!(
+                    "dataset /{from} still has live handles"
+                )));
+            }
+        };
+        if let Err(error) = rename::prepare(dir, from, to, id) {
+            return Err(self.roll_back_rename(from, to, id, reasoning, error));
         }
         let old = self.database_dir(from)?;
         let new = self.database_dir(to)?;
-        // The handle was the last one, so dropping it closes the store.
-        drop(entry);
         rename::crash_point(1)?;
         let moved = std::fs::rename(&old, &new);
         if moved.is_ok() {
@@ -653,10 +832,11 @@ impl Catalog {
             sync_dir(old.parent().expect("database parent"))?;
             rename::fail_point(rename::FAIL_AFTER_MOVE)?;
             // Publish the reopened store only once the registry names it.
-            let ds = self.open_dataset(to, DatasetKind::Persistent, None)?;
+            let ds = self.open_existing_dataset(to, Some(id))?;
             self.inner.detached.lock().insert(
                 to.into(),
                 Detached {
+                    id: Some(id),
                     reasoning: ds.reasoning_record(),
                 },
             );
@@ -674,7 +854,7 @@ impl Catalog {
             Ok(())
         });
         if let Err(e) = result {
-            return Err(self.roll_back_rename(from, to, reasoning, e));
+            return Err(self.roll_back_rename(from, to, id, reasoning, e));
         }
         rename::crash_point(3)?;
         rename::finish(dir)?;
@@ -687,6 +867,7 @@ impl Catalog {
         &self,
         from: &str,
         to: &str,
+        id: Uuid,
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         err: Error,
     ) -> Error {
@@ -703,7 +884,7 @@ impl Catalog {
                 .map(|r| r.name.clone())
                 .ok_or_else(|| Error::Corrupt("renamed dataset is unregistered".into()))?;
             rename::fail_point(rename::FAIL_ROLLBACK_REOPEN)?;
-            self.reattach_locked(&name)
+            self.reattach_locked(&name, Some(id))
         })();
         match reopened {
             Ok(()) => err,
@@ -712,10 +893,13 @@ impl Catalog {
                     Some(r) => (r.name, r.reasoning),
                     None => (from.to_string(), reasoning),
                 };
-                self.inner
-                    .detached
-                    .lock()
-                    .insert(name.clone(), Detached { reasoning });
+                self.inner.detached.lock().insert(
+                    name.clone(),
+                    Detached {
+                        id: Some(id),
+                        reasoning,
+                    },
+                );
                 Error::Corrupt(format!(
                     "renaming /{from} to /{to} failed: {err}; reopening the dataset failed too: \
                      {again}. config.json still registers it as /{name}, and opening the \
@@ -777,7 +961,7 @@ impl Catalog {
         let _g = self.inner.manage.lock();
         self.check_reservation(&reservation)?;
         let name = reservation.name();
-        let ds = self.open_dataset(name, DatasetKind::Persistent, None);
+        let ds = self.open_existing_dataset(name, None);
         let result = ds.and_then(|ds| {
             self.inner.entries.write().insert(
                 name.into(),
@@ -984,6 +1168,7 @@ impl Catalog {
         self.inner.detached.lock().insert(
             name.into(),
             Detached {
+                id: Some(ds.dataset_id()),
                 reasoning: ds.reasoning_record(),
             },
         );
@@ -1006,14 +1191,37 @@ impl Catalog {
     #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub(crate) fn reattach(&self, name: &str) -> Result<Dataset> {
         let _g = self.inner.manage.lock();
-        self.reattach_locked(name)?;
+        self.reattach_locked(name, None)?;
         Ok(self.get(name).expect("reattached"))
     }
-    fn reattach_locked(&self, name: &str) -> Result<()> {
+    #[cfg(feature = "backup")]
+    fn reattach_expected(&self, name: &str, expected: Option<Uuid>) -> Result<Dataset> {
+        let _g = self.inner.manage.lock();
         if self.get(name).is_some() {
             return Err(Error::Conflict(format!("dataset '{name}' already exists")));
         }
-        let ds = self.open_dataset(name, DatasetKind::Persistent, None)?;
+        // This is an intentional restore, so None means a genuine legacy
+        // restored root, never a fallback to the replaced dataset's identity.
+        let dataset = self.open_existing_dataset(name, expected)?;
+        self.publish_reattached(name, dataset);
+        Ok(self.get(name).expect("reattached"))
+    }
+    fn reattach_locked(&self, name: &str, expected: Option<Uuid>) -> Result<()> {
+        if self.get(name).is_some() {
+            return Err(Error::Conflict(format!("dataset '{name}' already exists")));
+        }
+        let expected = expected.or_else(|| {
+            self.inner
+                .detached
+                .lock()
+                .get(name)
+                .and_then(|detached| detached.id)
+        });
+        let ds = self.open_existing_dataset(name, expected)?;
+        self.publish_reattached(name, ds);
+        Ok(())
+    }
+    fn publish_reattached(&self, name: &str, ds: Dataset) {
         self.inner.entries.write().insert(
             name.into(),
             Entry {
@@ -1024,7 +1232,6 @@ impl Catalog {
         );
         self.inner.detached.lock().remove(name);
         self.inner.refused.lock().remove(name);
-        Ok(())
     }
 }
 
@@ -1099,14 +1306,85 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<ProcessLock> {
 }
 /// Prefix of a deleted dataset's directory while it is being removed.
 const TRASH_PREFIX: &str = ".deleted-";
+// Existing retained-restore convention: unresolved moves are never trash.
+pub(super) const KEPT_PREFIX: &str = ".kept-";
+struct DeleteMoveError {
+    error: Error,
+    reopen: bool,
+}
 
-/// Rename a deleted dataset's directory aside, so that its name is free at once and
-/// removing its files needs no lock.
-fn move_to_trash(root: &Path) -> Result<PathBuf> {
+const DELETE_BEFORE_MOVE: u8 = 1;
+const DELETE_STAGE_SYNC: u8 = 2;
+const DELETE_ROLLBACK_MOVE: u8 = 3;
+const DELETE_ROLLBACK_SYNC: u8 = 4;
+#[cfg(test)]
+thread_local! {
+    static DELETE_FAIL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+fn delete_fail_point(point: u8) -> Result<()> {
+    #[cfg(test)]
+    if DELETE_FAIL.get() & (1 << point) != 0 {
+        return Err(std::io::Error::other(format!("injected delete stage {point}")).into());
+    }
+    #[cfg(not(test))]
+    let _ = point;
+    Ok(())
+}
+
+/// Keep the actual moved source across uncertain directory synchronization.
+/// Only synchronized original-name removal may become disposable trash.
+fn move_to_trash(root: &Path) -> std::result::Result<PathBuf, DeleteMoveError> {
     let parent = root.parent().expect("database parent");
-    let trash = parent.join(format!("{TRASH_PREFIX}{}", Uuid::new_v4()));
-    std::fs::rename(root, &trash)?;
-    sync_dir(parent)?;
+    let token = Uuid::new_v4();
+    let kept = parent.join(format!("{KEPT_PREFIX}{token}"));
+    delete_fail_point(DELETE_BEFORE_MOVE).map_err(|error| DeleteMoveError {
+        error,
+        reopen: true,
+    })?;
+    std::fs::rename(root, &kept).map_err(|error| DeleteMoveError {
+        error: error.into(),
+        reopen: true,
+    })?;
+    let synchronized = delete_fail_point(DELETE_STAGE_SYNC).and_then(|()| sync_dir(parent));
+    if let Err(error) = synchronized {
+        let restored = delete_fail_point(DELETE_ROLLBACK_MOVE)
+            .and_then(|()| std::fs::rename(&kept, root).map_err(Error::from));
+        if let Err(rollback) = restored {
+            return Err(DeleteMoveError {
+                error: Error::Corrupt(format!(
+                    "deletion could not synchronize: {error}; restoring {} failed: {rollback}; original bytes remain at {}",
+                    root.display(),
+                    kept.display()
+                )),
+                reopen: false,
+            });
+        }
+        if let Err(rollback) =
+            delete_fail_point(DELETE_ROLLBACK_SYNC).and_then(|()| sync_dir(parent))
+        {
+            return Err(DeleteMoveError {
+                error: Error::Corrupt(format!(
+                    "deletion could not synchronize: {error}; original bytes returned to {} but rollback sync failed: {rollback}",
+                    root.display()
+                )),
+                reopen: false,
+            });
+        }
+        return Err(DeleteMoveError {
+            error,
+            reopen: true,
+        });
+    }
+    // Registry removal and original-name removal are durable. Remaining names
+    // concern cleanup, not the acknowledged dataset identity.
+    let trash = parent.join(format!("{TRASH_PREFIX}{token}"));
+    if let Err(error) = std::fs::rename(&kept, &trash) {
+        tracing::warn!(path=%kept.display(), %error, "deleted dataset remains at its retained cleanup path");
+        return Ok(kept);
+    }
+    if let Err(error) = sync_dir(parent) {
+        tracing::warn!(path=%trash.display(), %error, "deleted dataset cleanup rename was not synchronized");
+    }
     Ok(trash)
 }
 
