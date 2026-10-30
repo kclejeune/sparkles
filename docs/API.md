@@ -163,8 +163,12 @@ cores and at most 4. The datasets of `--mem`, `--loc` and `--fuseki-config` are 
 once the registered ones are open, and the startup steps that name datasets, such as
 `--text`, `--geo`, `--validate` and `--rdfs`, run after that. Meanwhile each dataset
 still to open is listed with `"state": "opening"`, and a request to it answers `503`
-with `Retry-After: 5` and the code `dataset-opening`. Creating, renaming, deleting or
-restoring a dataset under the name of one that is opening is refused.
+with `Retry-After: 5` and the code `dataset-opening`. A dataset that startup attaches,
+or that one of those steps names, stays `opening` until startup has finished, so no
+request reads or writes it before its configuration is installed. Creating, renaming,
+deleting or restoring a dataset under the name of one that is opening, or of one that
+startup attaches, is refused with `409` or `503`. A request that arrives while a
+dataset is published finds it open or opening, never missing.
 
 A registered dataset that fails to open stays registered and closed, and startup
 continues with the others. Its state is `failed`, with `error` and `errorKind`, and a
@@ -185,8 +189,11 @@ datasets under `refusedDatasets` with their `kind`, and the ones still opening u
 same `404` for an opening or failed dataset as for a missing one.
 `sparkles_datasets{state}` counts the datasets that are open, opening and failed.
 
-A shutdown during startup opens no more datasets and waits for those that are opening.
-The others stay registered and open at the next start.
+A shutdown during startup stops it as soon as the shutdown begins, before the requests
+in flight drain. Startup opens no more datasets and runs no more steps, and the server
+waits for the datasets opening at that moment before it exits. The others stay
+registered and open at the next start. [USAGE.md](USAGE.md#endpoints-and-operations)
+describes which endpoint each health check uses.
 
 ### Shutdown
 

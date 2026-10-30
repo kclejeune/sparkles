@@ -49,6 +49,9 @@ sts=$(yq 'select(.kind == "StatefulSet")' <<< "$out")
 [[ $(yq '.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem' <<< "$sts") == true ]] || fail "open: read-only root"
 [[ $(yq '.spec.template.spec.containers[0].readinessProbe.httpGet.path' <<< "$sts") == '/$/ready' ]] || fail "open: readiness"
 [[ $(yq '.spec.template.spec.containers[0].startupProbe.failureThreshold' <<< "$sts") == 360 ]] || fail "open: startup budget"
+# a slow or degraded start is live: only readiness waits for the datasets
+[[ $(yq '.spec.template.spec.containers[0].startupProbe.httpGet.path' <<< "$sts") == '/$/ping' ]] || fail "open: startup probe"
+[[ $(yq '.spec.template.spec.containers[0].livenessProbe.httpGet.path' <<< "$sts") == '/$/ping' ]] || fail "open: liveness probe"
 [[ $(yq '.spec.template.spec.volumes[] | select(.name == "tmp") | has("emptyDir")' <<< "$sts") == true ]] || fail "open: /tmp volume"
 [[ $(yq '.spec.template.spec.volumes[] | select(.name == "config") | .configMap.name' <<< "$sts") == t-sparkles ]] || fail "open: config volume"
 if yq '.spec.template.spec.containers[0].volumeMounts[] | select(.name == "config") | has("subPath")' <<< "$sts" | grep -q true; then

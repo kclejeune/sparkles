@@ -91,8 +91,8 @@ and an open server (`server.allowOpenNetwork=true`).
 | `podDisruptionBudget.maxUnavailable` | `0` | With one pod, this blocks node drains. |
 | `resources` | requests 500m and 1Gi, limit 4Gi | |
 | `probes.scheme` | `HTTP` | `HTTPS` with `--tls-cert`. |
-| `probes.startup` | every 5 s, 360 failures | 30 minutes to open the datasets. |
-| `probes.readiness` | every 10 s, 3 failures | `GET /$/ready`. |
+| `probes.startup` | every 5 s, 360 failures | `GET /$/ping`, which answers once the process listens and before its datasets open. |
+| `probes.readiness` | every 10 s, 3 failures | `GET /$/ready`, which waits for the datasets and fails while one is failed unless `--ready-ignore-failed` is set. |
 | `probes.liveness` | every 30 s, 4 failures | `GET /$/ping`. |
 | `nodeSelector`, `tolerations`, `affinity` | | |
 | `extraVolumes`, `extraVolumeMounts` | `[]` | Such as a backup directory. |

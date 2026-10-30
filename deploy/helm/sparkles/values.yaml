@@ -250,8 +250,11 @@ resources:
 probes:
   # -- HTTPS when `server.extraArgs` turns on `--tls-cert`.
   scheme: HTTP
-  # -- Allows `failureThreshold × periodSeconds` for opening the datasets at start
-  # (30 minutes by default), during which the other probes wait.
+  # -- `GET /$/ping` until the process listens, within `failureThreshold ×
+  # periodSeconds`. The server listens before its datasets open, so the readiness probe
+  # (`GET /$/ready`) is what waits for them, and a slow or degraded start is never
+  # restarted. Add `--ready-ignore-failed` to `server.extraArgs` to keep a server with
+  # a failed dataset in the Service.
   startup:
     periodSeconds: 5
     failureThreshold: 360

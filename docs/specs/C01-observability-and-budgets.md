@@ -1040,8 +1040,18 @@ API.md](../API.md#startup) is the reference.
   affected readiness. `Catalog::open` itself still fails as a whole on any other
   failure.
 - `--mem`, `--loc` and `--fuseki-config` datasets are attached after the registered ones
-  open, and report `opening` until then. A failure to attach one still stops the
-  server, as does any other failed startup step, because these are explicit arguments.
+  open, and report `opening` until then. `Catalog::expect` takes their names before the
+  listener accepts a request, so an administrator cannot create, rename or restore a
+  dataset into one, and `Catalog::attach_expected` hands the name to startup's attach.
+  A failure to attach one still stops the server, as does any other failed startup
+  step, because these are explicit arguments.
+- A dataset that a startup step names (`--text`, `--geo`, `--validate`, `--rdfs`) or
+  that startup attaches stays `opening` for requests until every step has run, so no
+  request reads it or writes it before its configuration is installed. Startup's own
+  steps see it.
+- A dataset leaves the catalog's opening set only after it is published or refused, and
+  a request's lookup looks again after the state checks, so a request that straddles
+  the publication finds the dataset open or opening, never missing.
   A `--text`, `--geo`, `--validate` or `--rdfs` step for a failed dataset is skipped and
   logged.
 - `/$/ready`, `/$/ready/{ds}` and `GET /$/server` show the states only for datasets the
@@ -1049,10 +1059,17 @@ API.md](../API.md#startup) is the reference.
   caller without access gets the `404` of a missing dataset. `/$/server` gains
   `openingDatasets`, and `refusedDatasets` gains `kind`. `sparkles_datasets{state}`
   counts the states, and the JSON snapshot gains `status` and `datasetStates`.
-- A shutdown during startup opens no more datasets, waits for the ones opening, and
-  leaves the rest registered for the next start.
+- A shutdown stops startup when it begins, before the requests drain: startup opens no
+  more datasets and runs no more steps. The server waits for the ones opening once the
+  requests have drained, and the rest stay registered for the next start.
 - `/$/ping` answers before the datasets open, so the benchmark and test scripts that
-  waited for it now wait for `/$/ready`.
+  waited for it now wait for `/$/ready`. The maintainer kept the conservative readiness
+  default and settled the probe model. Liveness and a startup check that waits for the
+  process use `/$/ping`, readiness uses `/$/ready`, and a deployment with several
+  datasets that should keep serving sets `--ready-ignore-failed` and checks datasets
+  with `/$/ready/{ds}`. The Helm chart's startup probe moved from `/$/ready` to `/$/ping`,
+  because a degraded server never became ready and Kubernetes restarted it once the
+  startup allowance ran out.
 - Not built: the per-dataset `degraded(reason)` state for an unavailable full-text,
   vector or spatial index, and replay progress in the dataset's state. Item 402 tracks
   them.
