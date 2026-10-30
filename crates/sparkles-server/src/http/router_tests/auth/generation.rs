@@ -429,3 +429,209 @@ async fn basic_headers_and_a_password_login_share_one_verification_budget() {
     .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
 }
+
+/// Open a change feed and a live query on wiki with the request headers `h`.
+async fn open_both(
+    s: &AuthServer,
+    h: &[(&str, &str)],
+) -> (
+    (axum::body::BodyDataStream, String),
+    (axum::body::BodyDataStream, String),
+) {
+    let after = head(&s.state, "wiki");
+    let feed = open_stream(s, &format!("/wiki/changes?after={after}"), h).await;
+    let live_uri = format!(
+        "/wiki/live?query={}",
+        "SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Ax%3Ap%3E%20%3Fo%20%7D"
+    );
+    let mut live = open_stream(s, &live_uri, h).await;
+    let mut live_buf = String::new();
+    assert_eq!(next_event(&mut live, &mut live_buf).await.0, "snapshot");
+    ((feed, String::new()), (live, live_buf))
+}
+
+/// After the credential's expiry, the next commit ends both streams with
+/// `access-changed` instead of sending it.
+async fn expect_ended(
+    s: &AuthServer,
+    streams: &mut (
+        (axum::body::BodyDataStream, String),
+        (axum::body::BodyDataStream, String),
+    ),
+    n: u32,
+) {
+    let r = update_as(&s.app, "wiki", &b("alice"), &insert(n)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (body, buf) in [&mut streams.0, &mut streams.1] {
+        let (event, data) = next_event(body, buf).await;
+        assert_eq!(
+            event, "error",
+            "an expired credential kept streaming: {data}"
+        );
+        assert!(data.contains("access-changed"), "{data}");
+    }
+}
+
+/// Streams opened with a session end when the session reaches its absolute
+/// lifetime or its idle timeout, and streams of a token end when it expires.
+#[tokio::test]
+async fn streams_end_when_their_credential_expires() {
+    // the absolute lifetime of a session: twelve hours by default
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let mut streams = open_both(&s, &[("cookie", &cookie)]).await;
+    s.auth().advance(43_200);
+    expect_ended(&s, &mut streams, 1).await;
+
+    // the idle timeout of a session that a stream does not renew
+    let s = build(Fixture {
+        extra: "[session]\nidle_timeout = \"10m\"\n".into(),
+        ..Default::default()
+    });
+    let (cookie, _) = password_session(&s, "bob").await;
+    let mut streams = open_both(&s, &[("cookie", &cookie)]).await;
+    s.auth().advance(600);
+    expect_ended(&s, &mut streams, 2).await;
+
+    // a minted token
+    let s = build(Fixture::default());
+    let r = super::tokens::mint_as(
+        &s.app,
+        &[("authorization", &b("bob"))],
+        r#"{"name":"short","datasets":{"wiki":"read"},"expiresIn":"1d"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let token = bearer(r.json()["token"].as_str().unwrap());
+    let mut streams = open_both(&s, &[("authorization", &token)]).await;
+    s.auth().advance(86_399);
+    // one second before its expiry the token still streams
+    let r = update_as(&s.app, "wiki", &b("alice"), &insert(3)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        next_event(&mut streams.0.0, &mut streams.0.1).await.0,
+        "commit"
+    );
+    assert_eq!(
+        next_event(&mut streams.1.0, &mut streams.1.1).await.0,
+        "diff"
+    );
+    s.auth().advance(1);
+    expect_ended(&s, &mut streams, 4).await;
+}
+
+/// A hook that moves the auth clock `secs` forward the first time it runs, and
+/// signals `ran`.
+fn advance_once(secs: i64, ran: Arc<tokio::sync::Notify>) -> crate::auth::TestHook {
+    let mut once = true;
+    Box::new(move |auth| {
+        if std::mem::take(&mut once) {
+            auth.advance(secs);
+            ran.notify_one();
+        }
+    })
+}
+
+/// A live query that is coalescing diffs when its session expires sends no merged
+/// diff.
+#[tokio::test]
+async fn live_coalescing_sends_nothing_merged_after_expiry() {
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let q = "SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Ax%3Ap%3E%20%3Fo%20%7D";
+    let mut live = open_stream(
+        &s,
+        &format!("/wiki/live?query={q}&coalesceMs=60000"),
+        &[("cookie", &cookie)],
+    )
+    .await;
+    let mut buf = String::new();
+    assert_eq!(next_event(&mut live, &mut buf).await.0, "snapshot");
+    // the session expires while the first diff waits to be merged with more
+    let ran = Arc::new(tokio::sync::Notify::new());
+    s.auth().hooks.lock().coalescing = Some(advance_once(43_200, ran.clone()));
+    let r = update_as(&s.app, "wiki", &b("alice"), &insert(1)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let (event, data) = tokio::join!(next_event(&mut live, &mut buf), async {
+        ran.notified().await;
+        let r = update_as(&s.app, "wiki", &b("alice"), &insert(2)).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    })
+    .0;
+    assert_eq!(event, "error", "a diff was merged after expiry: {data}");
+    assert!(data.contains("access-changed"), "{data}");
+}
+
+/// The rest of a paged live-query snapshot is not sent after its session expires.
+#[tokio::test]
+async fn live_snapshot_pages_stop_at_expiry() {
+    let q = "SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Ax%3Ap%3E%20%3Fo%20%7D";
+    let s = build(Fixture::default());
+    let rows: String = (0..10_001)
+        .map(|i| format!("<urn:x:r{i}> <urn:x:p> \"{i}\" .\n"))
+        .collect();
+    s.state
+        .get("wiki")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            rows.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let (cookie, _) = password_session(&s, "bob").await;
+    let mut live = open_stream(&s, &format!("/wiki/live?query={q}"), &[("cookie", &cookie)]).await;
+    let mut buf = String::new();
+    let (event, data) = next_event(&mut live, &mut buf).await;
+    assert_eq!(event, "snapshot");
+    assert!(
+        data.contains("\"more\":true"),
+        "the fixture needs two pages"
+    );
+    s.auth().advance(43_200);
+    let (event, data) = next_event(&mut live, &mut buf).await;
+    assert_eq!(event, "error", "a snapshot page was sent after expiry");
+    assert!(data.contains("access-changed"), "{data}");
+}
+
+/// A change feed or long poll waiting through a quiet period ends at its
+/// credential's expiry by the auth clock, without a commit to wake it.
+#[tokio::test]
+async fn quiet_waits_end_at_expiry_by_the_auth_clock() {
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let after = head(&s.state, "wiki");
+    let mut feed = open_stream(
+        &s,
+        &format!("/wiki/changes?after={after}"),
+        &[("cookie", &cookie)],
+    )
+    .await;
+    let mut buf = String::new();
+    let ran = Arc::new(tokio::sync::Notify::new());
+    s.auth().hooks.lock().waiting = Some(advance_once(43_200, ran));
+    let (event, data) = next_event(&mut feed, &mut buf).await;
+    assert_eq!(event, "error", "{data}");
+    assert!(data.contains("access-changed"), "{data}");
+
+    let s = build(Fixture::default());
+    let (cookie, _) = password_session(&s, "bob").await;
+    let after = head(&s.state, "wiki");
+    let ran = Arc::new(tokio::sync::Notify::new());
+    s.auth().hooks.lock().waiting = Some(advance_once(43_200, ran));
+    let r = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(
+            &s.app,
+            "GET",
+            &format!("/wiki/changes?after={after}&wait=60"),
+            &[("cookie", &cookie)],
+            "",
+        ),
+    )
+    .await
+    .expect("a long poll must end at its credential's expiry");
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.err()["code"], "access-changed");
+}

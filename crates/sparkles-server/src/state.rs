@@ -628,9 +628,11 @@ impl AppState {
     }
 
     /// Whether the authority a principal's views were decided under still holds:
-    /// the global generation is unchanged and the session or token it was
-    /// authenticated with has not been revoked. Long-lived reads check it before
-    /// they send more data.
+    /// the global generation is unchanged, and the session or token it was
+    /// authenticated with has neither expired nor been revoked. Long-lived reads
+    /// check it before they send more data. The expiry is the instant recorded when
+    /// the principal was authenticated, including a session's idle timeout, so the
+    /// check reads the clock rather than a store.
     pub fn access_current(&self, p: &crate::auth::Principal) -> bool {
         let Some(epoch) = p.access_epoch() else {
             return true;
@@ -640,7 +642,7 @@ impl AppState {
         }
         #[cfg(feature = "auth")]
         if let Some(a) = &self.auth {
-            return a.credential_live(p);
+            return !a.credential_expired(p) && a.credential_live(p);
         }
         true
     }

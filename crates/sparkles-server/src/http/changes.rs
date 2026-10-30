@@ -121,11 +121,20 @@ async fn wait_for_commit(
     rx: &mut tokio::sync::watch::Receiver<u64>,
     after: u64,
     until: Instant,
+    principal: &Principal,
 ) {
+    #[cfg(all(test, feature = "auth"))]
+    if let Some(a) = &st.auth {
+        a.run_hook(|h| &mut h.waiting);
+    }
     loop {
+        // The caller's access is checked on every tick against the auth clock, so a
+        // credential that expires or is revoked during a quiet wait ends it within a
+        // second, also when the clock moves forward in the meantime.
         if ds.store.snapshot().commit > after
             || Instant::now() >= until
             || st.phase() == crate::obs::Phase::Draining
+            || !st.access_current(principal)
         {
             return;
         }
@@ -212,7 +221,10 @@ pub(super) async fn changes(
     let mut rx = ds.store.subscribe_commits();
     let mut p = page(&ds, &ask).await?;
     if p.commits.is_empty() && !wait.is_zero() {
-        wait_for_commit(&st, &ds, &mut rx, after, Instant::now() + wait).await;
+        // a wait ends when the caller's access does, which answers `access-changed`
+        // below
+        let until = Instant::now() + wait;
+        wait_for_commit(&st, &ds, &mut rx, after, until, &caller).await;
         p = page(&ds, &ask).await?;
     }
     // the view was decided when the caller was authenticated: a page read after the
@@ -221,7 +233,7 @@ pub(super) async fn changes(
         return Err(ApiError(
             StatusCode::CONFLICT,
             json!({
-                "error": "the access policy, a disclosure registry or the caller's credential changed; ask again to read under the new rules",
+                "error": "the access policy, a disclosure registry or the caller's credential changed or expired; ask again to read under the new rules",
                 "code": "access-changed",
             }),
         ));
@@ -367,7 +379,7 @@ impl Feed {
                 return Some((
                     Ok(Event::default().event("error").data(
                         json!({
-                            "error": "the access policy, a disclosure registry or the caller's credential changed; reconnect to read under the new rules",
+                            "error": "the access policy, a disclosure registry or the caller's credential changed or expired; reconnect to read under the new rules",
                             "code": "access-changed",
                         })
                         .to_string(),
@@ -387,7 +399,15 @@ impl Feed {
             match page(&self.ds, &self.ask).await {
                 Ok(p) if p.commits.is_empty() => {
                     let (after, until) = (self.ask.after, self.until);
-                    wait_for_commit(&self.st, &self.ds, &mut self.rx, after, until).await;
+                    wait_for_commit(
+                        &self.st,
+                        &self.ds,
+                        &mut self.rx,
+                        after,
+                        until,
+                        &self.principal,
+                    )
+                    .await;
                 }
                 Ok(p) => {
                     for c in &p.commits {

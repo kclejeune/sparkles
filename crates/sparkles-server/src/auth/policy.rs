@@ -692,6 +692,13 @@ pub struct TestHooks {
     pub after_verify: Option<TestHook>,
     /// after a login created its session, before the session is answered
     pub after_issue: Option<TestHook>,
+    /// after an OIDC callback's provider exchange and policy checks, before its
+    /// session is created
+    pub before_issue: Option<TestHook>,
+    /// when a change feed or long poll starts waiting for a commit
+    pub waiting: Option<TestHook>,
+    /// when a live query starts coalescing events
+    pub coalescing: Option<TestHook>,
 }
 
 /// The auth state of a server: the current policy, the token and session stores, the
@@ -821,7 +828,7 @@ impl Auth {
 
     /// Run a test hook, outside the hooks' own lock.
     #[cfg(test)]
-    pub(super) fn run_hook(&self, pick: fn(&mut TestHooks) -> &mut Option<TestHook>) {
+    pub(crate) fn run_hook(&self, pick: fn(&mut TestHooks) -> &mut Option<TestHook>) {
         let taken = pick(&mut self.hooks.lock()).take();
         if let Some(mut hook) = taken {
             hook(self);
@@ -920,6 +927,14 @@ impl Auth {
     /// mutation is in progress. Lookup callers require one unchanged even value.
     pub fn epoch(&self) -> u64 {
         self.authority.generation()
+    }
+
+    /// Whether the credential a principal was authenticated with has reached the
+    /// expiry recorded at authentication: a token's or provider assertion's end, or
+    /// a session's absolute lifetime or idle timeout, whichever came first. An open
+    /// stream does not renew a session.
+    pub fn credential_expired(&self, p: &Principal) -> bool {
+        p.info.expires.is_some_and(|e| self.now() >= e)
     }
 
     /// Whether the stored credential a principal was authenticated with is still

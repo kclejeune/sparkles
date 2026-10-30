@@ -292,7 +292,7 @@ impl SessionStore {
         now: i64,
         expires: i64,
     ) -> Result<(String, [u8; 32])> {
-        self.create_oidc(method, principal, token_id, now, expires, None, None)
+        self.create_oidc(method, principal, token_id, now, expires, None, None, None)
     }
 
     /// Create from one original successful authentication generation. The
@@ -323,7 +323,10 @@ impl SessionStore {
     }
 
     /// Start an OIDC session, remembering the provider's `sid` and `sub` for
-    /// back-channel logout.
+    /// back-channel logout. With `original_generation`, the generation whose policy
+    /// admitted the identity, it fails like
+    /// [`create_checked`](Self::create_checked) when an exclusive authority update
+    /// completed since then.
     #[allow(clippy::too_many_arguments)]
     pub fn create_oidc(
         &self,
@@ -334,6 +337,7 @@ impl SessionStore {
         expires: i64,
         sid: Option<String>,
         sub: Option<String>,
+        original_generation: Option<u64>,
     ) -> Result<(String, [u8; 32])> {
         self.create_session(
             SessionCreation {
@@ -345,7 +349,7 @@ impl SessionStore {
                 sid,
                 sub,
             },
-            None,
+            original_generation,
         )
     }
 
@@ -802,6 +806,7 @@ mod tests {
                 200,
                 Some(sid.into()),
                 Some(sub.into()),
+                None,
             )
             .unwrap()
             .1

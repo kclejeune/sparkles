@@ -12,6 +12,11 @@ signals remain incomplete.
 
 ### Changed
 
+Change feeds, live queries and long polls end with `access-changed` when the session
+or token they were opened with expires, including a session's idle timeout. OIDC
+sign-ins decide admission and the session lifetime under the policy current after the
+provider exchange and create the session only if no reload completed meanwhile.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.

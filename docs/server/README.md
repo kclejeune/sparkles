@@ -103,9 +103,15 @@ Authentication is off by default. Once it is on, access is denied unless a grant
   so they leave other users' cached credentials and open streams alone. Logout,
   back-channel logout, session eviction, expiry pruning and token revocation each
   revoke only the credentials they name. A credential revoked while a request is
-  looking it up is refused, as one revoked earlier would be. Change feeds, live queries and long polls
-  opened with such a credential end with `access-changed`, and those of other
-  credentials continue. Last-used bookkeeping does not revoke access.
+  looking it up is refused, as one revoked earlier would be. Change feeds, live
+  queries and long polls opened with such a credential end with `access-changed`,
+  and those of other credentials continue. They also end when their session or
+  token expires, including a session's idle timeout, since an open stream does not
+  renew the session. Last-used bookkeeping does not revoke access.
+* An OIDC sign-in decides admission and the session lifetime under the policy that
+  is current after the provider exchange, and creates the session only if no reload
+  completed since. Otherwise it decides again, and after repeated overlaps it returns
+  to the sign-in page with the error `changed`.
 * Dataset and branch administration emit INFO records under `sparkles::audit` with the
   existing actor and completed operation identities. Clones record the selected source
   commit after registration, and authorized failures record bounded codes. Continuing
