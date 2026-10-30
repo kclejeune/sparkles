@@ -4,6 +4,10 @@
 
 Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. Remaining Phase 1 source and administration gaps are tracked under items 230 to 239, and virtual graphs remain under item 43.
 
+Native Rust direct mapping runs accept structured write controls through
+`Dataset::run_mapping_with`, including conversion and the final atomic load. The
+existing direct method and conversion option fields remain compatible.
+
 ## Documents
 
 * [Design and acceptance](SPEC.md).

@@ -93,9 +93,10 @@ roadmap item 43.
   has `Dataset.mappings` and `Dataset.run_mapping`. The JVM and Node.js bindings also
   expose stored mapping handles and direct mapping runs. Their default builds do not
   enable SQLite or Parquet sources. The binding runs carry cancellation and deadlines
-  through conversion and the final load. The Rust `Dataset::run_mapping` conversion
-  check does not reach its final load. Roadmap item 397 adds structured cancellation
-  and deadlines through both steps.
+  through conversion and the final load. Native Rust `Dataset::run_mapping_with`
+  accepts complete `WriteOptions` through both steps. The original `run_mapping`
+  signature and exhaustive `RunOptions` constructions remain compatible, and the
+  opaque callback retains its conversion-only scope.
 
 Decisions this spec left open, made during implementation:
 
@@ -170,6 +171,12 @@ Tests and conformance:
   and JVM structured administration tests cover mapping revisions, runs and refusals.
   `crates/sparkles/tests/mapping_binding_control.rs` checks cancellation and deadlines
   at conversion and the final writer for the two binding adapters.
+  `crates/sparkles/tests/mapping_native_control.rs` covers native conversion checks
+  and bounds, every supplied cancellation source, actual final writer waits and
+  unchanged state on refusal. Writer-acquisition and committed callbacks latch the
+  exact phases for cancellation and deadline checks. The native tests retain
+  preconditions, graph authority, previews, commit messages, old exhaustive option
+  literals and successful receipts after publication.
 * The W3C CSVW test suite is not vendored, which is roadmap item 235.
 
 Measurements:

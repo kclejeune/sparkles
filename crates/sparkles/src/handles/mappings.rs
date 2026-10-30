@@ -131,6 +131,7 @@ impl Dataset {
     /// default graph's triples in `graph` when one is given. The kind is read from the
     /// text when `kind` is `None`. Sources are read from `inputs`, one at a time, and
     /// the quads go through a temporary N-Quads file, so a failed run commits nothing.
+    /// Use [`Self::run_mapping_with`] for structured controls through the final load.
     pub fn run_mapping(
         &self,
         text: &str,
@@ -139,6 +140,38 @@ impl Dataset {
         opts: &RunOptions,
         graph: Option<&str>,
     ) -> Result<MappingRun> {
+        self.run_mapping_impl(text, kind, inputs, opts, graph, None)
+    }
+
+    /// Run a direct mapping with structured write controls. The conversion callback
+    /// and write controls both apply during conversion, and the final load uses `o`.
+    /// The original conversion callback remains conversion-only. Use `o.cancel`,
+    /// `o.cancellation` and `o.deadline` for controls that also cover the writer wait.
+    /// Once the loader publishes its commit, cancellation cannot retract success.
+    pub fn run_mapping_with(
+        &self,
+        text: &str,
+        kind: Option<MappingKind>,
+        inputs: &Inputs,
+        opts: &RunOptions,
+        graph: Option<&str>,
+        o: &crate::guard::WriteOptions,
+    ) -> Result<MappingRun> {
+        self.run_mapping_impl(text, kind, inputs, opts, graph, Some(o))
+    }
+
+    fn run_mapping_impl(
+        &self,
+        text: &str,
+        kind: Option<MappingKind>,
+        inputs: &Inputs,
+        opts: &RunOptions,
+        graph: Option<&str>,
+        write: Option<&crate::guard::WriteOptions>,
+    ) -> Result<MappingRun> {
+        if let Some(write) = write {
+            write.check()?;
+        }
         let kind = match kind.or_else(|| mapping::detect(text)) {
             Some(k @ (MappingKind::Rml | MappingKind::Yarrrml)) => k,
             Some(_) => {
@@ -157,8 +190,43 @@ impl Dataset {
             .transpose()
             .map_err(|e| Error::invalid(e.to_string()))?;
         let m = mapping::parse(text, kind, None)?;
+        // Compose once, preserving every structured flag and the independent
+        // conversion callback. Sources keep their existing periodic checkpoints.
+        let controlled = write.map(|write| {
+            let mut conversion = opts.clone();
+            let previous = opts.check.clone();
+            let write = write.clone();
+            conversion.check = Some(std::sync::Arc::new(move || {
+                write.check()?;
+                if let Some(check) = &previous {
+                    check()?;
+                }
+                Ok(())
+            }));
+            conversion
+        });
+        let opts = controlled.as_ref().unwrap_or(opts);
+        if controlled.is_some()
+            && let Some(check) = &opts.check
+        {
+            check()?;
+        }
         let (tmp, stats) = mapping::to_nquads_file(&m, inputs, opts, None)?;
-        let receipt = self.load_sources_receipt(vec![mapping::source(&tmp, g, "mapping")])?;
+        if controlled.is_some()
+            && let Some(check) = &opts.check
+        {
+            check()?;
+        }
+        let sources = vec![mapping::source(&tmp, g, "mapping")];
+        let receipt = match write {
+            Some(write) => {
+                self.store()
+                    .load_with(&sources, crate::commit::CommitKind::Load, write)?
+            }
+            None => self.load_sources_receipt(sources)?,
+        };
+        // The loader owns the publication boundary. A later stop cannot turn a
+        // published commit into an apparent refusal.
         Ok(MappingRun { receipt, stats })
     }
 

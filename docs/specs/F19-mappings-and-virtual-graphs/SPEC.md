@@ -361,6 +361,15 @@ validation, dry runs, quotas, timeouts and cancellation apply unchanged. The C05
 measured this path at about a quarter of a load's time, and the alternative of a
 `Source` that holds the converter remains open there.
 
+Native Rust callers pass structured write options through `Dataset::run_mapping_with`.
+Their cancellation sources and deadline apply during conversion and final writer
+admission, together with the existing conversion callback. The loader retains graph
+permissions, preconditions, validation, preview settings and commit metadata. Failure
+before publication changes no committed data, and cancellation or expiry after the
+last published commit does not change its successful receipt. The original
+`Dataset::run_mapping` signature and `RunOptions` fields remain available, with the
+opaque callback retaining its conversion-only scope.
+
 ### 5.2 SQL sources
 
 A logical table becomes a derived table: `rr:tableName t` reads `SELECT <columns> FROM
@@ -937,7 +946,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230 and 232 to 239. Item 397 carries structured native Rust cancellation and deadlines through direct mapping conversion and final load. Virtual graphs remain under item 43.
+Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230 and 232 to 239. Native Rust `Dataset::run_mapping_with` carries complete structured write options through direct mapping conversion and final load while preserving the existing `run_mapping` and `RunOptions` APIs. Virtual graphs remain under item 43.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

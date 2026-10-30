@@ -65,8 +65,20 @@ The JVM `DatasetGraphSparkles.mappings()` and Node.js `Dataset.mappings` handles
 version, store, delete and run mappings. Their `runMapping` methods run mapping text.
 Both return the commit receipt and mapping statistics. The default JVM and Node.js
 packages do not enable SQLite or Parquet mapping sources. Their direct and stored runs
-carry cancellation and deadlines through conversion and the final load. The Rust
-`Dataset::run_mapping` conversion check does not reach its final load. Roadmap item 397.
+carry cancellation and deadlines through conversion and the final load.
+
+Native Rust callers use `Dataset::run_mapping_with` with `guard::WriteOptions` for
+controls that cover conversion and the final load. The complete write options retain
+all cancellation sources, the deadline, graph permissions, preconditions, preview
+settings and commit metadata. Checks run at conversion boundaries and existing reader
+checkpoints, and the loader applies the same controls while acquiring the writer and
+before publication. A refusal leaves committed data unchanged. A stop requested after
+the loader publishes does not retract the successful receipt.
+
+The existing `Dataset::run_mapping` signature and `mapping::RunOptions` fields remain
+unchanged. `RunOptions.check` remains a conversion-only callback and is also honored
+by the controlled variant. Use the structured write options for cancellation or a
+deadline that must reach the final writer wait.
 
 The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) identifies the
 covered package roots and version rules. HTTP and standard CLI development-baseline
