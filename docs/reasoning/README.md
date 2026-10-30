@@ -44,7 +44,10 @@ request or on every write, and the schema report counts what the data holds.
   equality between schema terms. Programs containing `makeTemp` run in one ordinary
   demand program with their normal lower stages. Derived tables are cached per snapshot
   and view, and `maxDerived`, the deadline and the memory budget bound them. Tables that
-  contain generated blank nodes are not cached. EXPLAIN shows a `Derive` node per pattern.
+  contain generated blank nodes are not cached. A tiny positive feedback view whose
+  schema expansion creates thousands of rules can use a bounded temporary closure of
+  the original rules. This retains intermediate facts within the session and uses the
+  same resource limits. EXPLAIN shows a `Derive` node per pattern.
 * `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
   RDFS on read or the demand engine ([API.md](../API.md#explanations),
   [F18](../specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded
@@ -197,7 +200,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Analysis caps keep memory bounded and leave unproven relations for ordinary demand.
   Programs containing `makeTemp` forgo schema specialization and reuse. Implicit fact
   replay can allocate a temporary generator term before refusing an old output.
-  Roadmap item 190 covers these costs and measurement. The
+  A bounded temporary closure can avoid a large schema expansion for a tiny positive
+  feedback view, but can retain more intermediate facts than selective evaluation.
+  Structural list terms, negation and term-generating rules exclude this route.
+  Roadmap item 190 covers these costs and matched Forge measurement. The
   [recorded demand measurements](../specs/F17-query-time-reasoning.md#outcome) identify
   their source revision and do not establish current-head performance.
 * The derived-table cache's budget accounting is item 192. DESCRIBE is refused under

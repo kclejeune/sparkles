@@ -1054,3 +1054,242 @@ fn blank_head_rules_do_not_claim_complete_abduction() {
     assert!(hypotheses.is_empty());
     assert!(!complete);
 }
+
+#[test]
+fn compact_dense_type_full_materialization_control() {
+    let started = std::time::Instant::now();
+    let s = store(
+        "ex:ann ex:owns ex:rex . rdf:type rdfs:domain owl:SymmetricProperty . ex:Pet rdf:type ex:rex .",
+    );
+    materialize(&s, &Profile::OwlRl, &ReasonOptions::default()).unwrap();
+    let target = [ex("rex"), a(), ex("Pet")];
+    assert!(holds(&s, Some(INFERRED_GRAPH), &target));
+    eprintln!(
+        "A3_SYMMETRIC full_materialization done {:?} inferred={}",
+        started.elapsed(),
+        graph_triples(&s, Some(INFERRED_GRAPH)).len()
+    );
+}
+
+#[test]
+fn compact_dense_type_demand_preserves_sound_replay() {
+    let started = std::time::Instant::now();
+    let s = store(
+        "ex:ann ex:owns ex:rex . rdf:type rdfs:domain owl:SymmetricProperty . ex:Pet rdf:type ex:rex .",
+    );
+    let target = [ex("rex"), a(), ex("Pet")];
+    let explained = demand(
+        &s,
+        &Profile::OwlRl,
+        target.clone(),
+        &ExplainOptions::default(),
+    );
+    let Explained::Found { trees, .. } = explained else {
+        panic!("{explained:?}")
+    };
+    assert!(!trees.is_empty());
+    for tree in &trees {
+        assert_eq!(tree.triple, target);
+        sound(&s, tree, &mut Vec::new());
+        replay(tree, &Profile::OwlRl.rules().unwrap());
+    }
+    eprintln!("A3_SYMMETRIC demand done {:?}", started.elapsed());
+}
+
+#[test]
+fn compact_positive_proofs_keep_minimum_depth_and_multiple_top_rules() {
+    let profile = Profile::Rules(format!(
+        "{}
+@prefix ex: <http://ex.org/> .
+[r-long1: (?s ex:p ?o) -> (?s ex:x ?o)]
+[r-long2: (?s ex:x ?o) -> (?s ex:q ?o)]
+[r-short: (?s ex:p ?o) -> (?s ex:q ?o)]",
+        include_str!("../rules/owl-rl.rules")
+    ));
+    let s = store("ex:s ex:p ex:o . rdf:type rdfs:subPropertyOf rdf:type .");
+    let target = [ex("s"), ex("q"), ex("o")];
+    let (one, one_more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions::default(),
+    ));
+    assert_eq!(one.len(), 1);
+    assert!(one_more);
+    assert_eq!(one[0].depth, 1);
+    assert_eq!(one[0].rule.as_ref().unwrap().name, "r-short");
+    sound(&s, &one[0], &mut Vec::new());
+    replay(&one[0], &profile.rules().unwrap());
+    let (many, _) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions {
+            max_trees: 2,
+            ..ExplainOptions::default()
+        },
+    ));
+    let names: BTreeSet<_> = many
+        .iter()
+        .filter_map(|tree| tree.rule.as_ref().map(|rule| rule.name.as_str()))
+        .collect();
+    assert_eq!(names, BTreeSet::from(["r-long2", "r-short"]));
+    for tree in &many {
+        assert_eq!(tree.triple, target);
+        sound(&s, tree, &mut Vec::new());
+        replay(tree, &profile.rules().unwrap());
+    }
+    materialize(&s, &profile, &ReasonOptions::default()).unwrap();
+    assert!(holds(&s, Some(INFERRED_GRAPH), &target));
+}
+
+#[test]
+fn compact_root_exclusion_keeps_late_independent_alternative() {
+    let profile = Profile::Rules(format!(
+        "{}\n@prefix ex: <http://ex.org/> .\n[r-short: (?s ex:p ?o) -> (?s ex:q ?o)]\n[early: (?s ex:q ?o) -> (?s ex:x ?o)]\n[late1: (?s ex:p ?o) -> (?s ex:u ?o)]\n[late2: (?s ex:u ?o) -> (?s ex:v ?o)]\n[late3: (?s ex:v ?o) -> (?s ex:x ?o)]\n[alt: (?s ex:x ?o) -> (?s ex:q ?o)]",
+        include_str!("../rules/owl-rl.rules")
+    ));
+    let s = store("ex:s ex:p ex:o . rdf:type rdfs:subPropertyOf rdf:type .");
+    let target = [ex("s"), ex("q"), ex("o")];
+    let (one, one_more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions::default(),
+    ));
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].depth, 1);
+    assert_eq!(one[0].rule.as_ref().unwrap().name, "r-short");
+    assert!(one_more);
+    let (many, more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions {
+            max_trees: 2,
+            ..ExplainOptions::default()
+        },
+    ));
+    let names: BTreeSet<_> = many
+        .iter()
+        .filter_map(|tree| tree.rule.as_ref().map(|rule| rule.name.as_str()))
+        .collect();
+    assert_eq!(names, BTreeSet::from(["alt", "r-short"]));
+    assert!(!more);
+    for tree in one.iter().chain(&many) {
+        assert_eq!(tree.triple, target);
+        sound(&s, tree, &mut Vec::new());
+        replay(tree, &profile.rules().unwrap());
+    }
+}
+
+#[test]
+fn compact_root_cycles_do_not_advertise_an_independent_alternative() {
+    let profile = Profile::Rules(format!(
+        "{}\n@prefix ex: <http://ex.org/> .\n[r-short: (?s ex:p ?o) -> (?s ex:q ?o)]\n[cycle1: (?s ex:q ?o) -> (?s ex:x ?o)]\n[cycle2: (?s ex:x ?o) -> (?s ex:q ?o)]",
+        include_str!("../rules/owl-rl.rules")
+    ));
+    let s = store("ex:s ex:p ex:o . rdf:type rdfs:subPropertyOf rdf:type .");
+    let target = [ex("s"), ex("q"), ex("o")];
+    let (one, more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions::default(),
+    ));
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].depth, 1);
+    assert_eq!(one[0].rule.as_ref().unwrap().name, "r-short");
+    assert!(!more);
+    sound(&s, &one[0], &mut Vec::new());
+    replay(&one[0], &profile.rules().unwrap());
+}
+
+#[test]
+fn compact_first_round_alternatives_keep_more_metadata() {
+    let profile = Profile::Rules(format!(
+        "{}\n@prefix ex: <http://ex.org/> .\n[first: (?s ex:p ?o) -> (?s ex:q ?o)]\n[second: (?s ex:p ?o) -> (?s ex:q ?o)]",
+        include_str!("../rules/owl-rl.rules")
+    ));
+    let s = store("ex:s ex:p ex:o . rdf:type rdfs:subPropertyOf rdf:type .");
+    let target = [ex("s"), ex("q"), ex("o")];
+    let (one, more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions::default(),
+    ));
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].depth, 1);
+    assert!(more);
+    let (many, more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions {
+            max_trees: 2,
+            ..ExplainOptions::default()
+        },
+    ));
+    let names: BTreeSet<_> = many
+        .iter()
+        .filter_map(|tree| tree.rule.as_ref().map(|rule| rule.name.as_str()))
+        .collect();
+    assert_eq!(names, BTreeSet::from(["first", "second"]));
+    assert!(!more);
+    for tree in one.iter().chain(&many) {
+        assert_eq!(tree.triple, target);
+        sound(&s, tree, &mut Vec::new());
+        replay(tree, &profile.rules().unwrap());
+    }
+}
+
+#[test]
+fn compact_same_rule_distinct_supports_count_as_distinct_instances() {
+    let profile = Profile::Rules(format!(
+        "{}\n@prefix ex: <http://ex.org/> .\n[choose: (?s ex:edge ?m), (?m ex:edge ?o) -> (?s ex:q ?o)]",
+        include_str!("../rules/owl-rl.rules")
+    ));
+    let s = store(
+        "ex:s ex:edge ex:a . ex:a ex:edge ex:o . ex:s ex:edge ex:b . ex:b ex:edge ex:o . rdf:type rdfs:subPropertyOf rdf:type .",
+    );
+    let target = [ex("s"), ex("q"), ex("o")];
+    let (one, more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions::default(),
+    ));
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].depth, 1);
+    assert!(more);
+    let (many, more) = trees(demand(
+        &s,
+        &profile,
+        target.clone(),
+        &ExplainOptions {
+            max_trees: 2,
+            ..ExplainOptions::default()
+        },
+    ));
+    assert_eq!(many.len(), 2);
+    assert!(!more);
+    let middles: Vec<_> = many
+        .iter()
+        .map(|tree| {
+            assert_eq!(tree.rule.as_ref().unwrap().name, "choose");
+            tree.bindings
+                .iter()
+                .find(|(name, _)| name == "m")
+                .unwrap()
+                .1
+                .clone()
+        })
+        .collect();
+    assert!(middles.contains(&ex("a")) && middles.contains(&ex("b")));
+    for tree in one.iter().chain(&many) {
+        assert_eq!(tree.triple, target);
+        sound(&s, tree, &mut Vec::new());
+        replay(tree, &profile.rules().unwrap());
+    }
+}
