@@ -166,7 +166,9 @@ A `PreparedView` keeps the bound access policy, physical triple mask and retaine
 reservations together. Consumers must apply its graph policy while reading its
 snapshot. The snapshot alone does not enforce graph restrictions. Its accessors
 borrow that owner. Independent raw clones and caller-owned copies need separate
-accounting. The cap covers conservative peak
+accounting. An input snapshot that is already masked is accepted only when its mask
+belongs to the requested policy or the policy hides no triples, and any other masked
+input returns `Unsupported`. The cap covers conservative peak
 working storage and retained delta, policy and mask allocations, including spare
 container capacity. It does not replace immutable index mappings, shared store cache
 accounting or query execution limits.

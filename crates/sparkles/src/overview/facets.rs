@@ -665,6 +665,7 @@ pub fn round_edges(lo: f64, hi: f64, bins: usize, integral: bool) -> Option<Vec<
 /// "Facets", with the snapshot's `commit`. `req.at` is not read: the caller chose the
 /// snapshot.
 pub fn facets_at(snap: Arc<Snapshot>, req: &FacetsRequest, opts: &QueryOptions) -> Result<J> {
+    let opts = &*super::one_deadline(opts)?;
     let commit = snap.commit;
     let set = set_pattern(&req.within, opts)?;
     let ctx = Ctx {

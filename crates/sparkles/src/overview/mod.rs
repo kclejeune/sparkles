@@ -284,11 +284,35 @@ fn check_pair(within: &Within, by: &By) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // The relative timeout and absolute deadline of each overview query on this thread.
+    static QUERY_BOUNDS: std::cell::RefCell<Vec<(Option<std::time::Duration>, Option<std::time::Instant>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `opts` with its relative timeout turned into one absolute deadline, the earlier of
+/// that timeout from now and `opts.deadline`. An overview runs many queries, and each
+/// query would otherwise start the timeout again.
+pub(crate) fn one_deadline(opts: &QueryOptions) -> Result<std::borrow::Cow<'_, QueryOptions>> {
+    let Some(timeout) = opts.timeout else {
+        return Ok(std::borrow::Cow::Borrowed(opts));
+    };
+    let relative = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::invalid("query timeout is too large"))?;
+    let mut anchored = opts.clone();
+    anchored.timeout = None;
+    anchored.deadline = Some(opts.deadline.map_or(relative, |d| d.min(relative)));
+    Ok(std::borrow::Cow::Owned(anchored))
+}
+
 /// The answer to `req` at snapshot `snap`, as the JSON object that API.md describes
 /// under "Graph overview", with the snapshot's `commit`. `req.at` is not read: the
 /// caller chose the snapshot, and with it the branch, which
 /// [`GroupsRequest::check_branch`] checks for a request that reads reports.
 pub fn groups_at(snap: Arc<Snapshot>, req: &GroupsRequest, opts: &QueryOptions) -> Result<J> {
+    let opts = &*one_deadline(opts)?;
     let commit = snap.commit;
     let run = groups::Run { snap, opts };
     let mut answer = if req.reads_reports() {
@@ -300,4 +324,100 @@ pub fn groups_at(snap: Arc<Snapshot>, req: &GroupsRequest, opts: &QueryOptions) 
         o.insert("commit".into(), commit.into());
     }
     Ok(answer)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    type Bounds = Vec<(Option<Duration>, Option<Instant>)>;
+
+    /// The bounds of every query `run` makes, and the instants around the call.
+    fn recorded(run: impl FnOnce() -> Result<J>) -> (Bounds, Instant, Instant) {
+        QUERY_BOUNDS.with(|b| b.borrow_mut().clear());
+        let before = Instant::now();
+        run().unwrap();
+        let after = Instant::now();
+        let bounds = QUERY_BOUNDS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        (bounds, before, after)
+    }
+
+    /// Every query has no relative timeout and the same deadline, within `range`.
+    fn assert_one_deadline(bounds: &Bounds, range: std::ops::RangeInclusive<Instant>) {
+        assert!(
+            bounds.len() >= 2,
+            "the fixture needs several overview queries"
+        );
+        let deadline = bounds[0].1.expect("an absolute deadline");
+        assert!(range.contains(&deadline));
+        for &(timeout, each) in bounds {
+            assert_eq!(timeout, None, "a query received the relative timeout again");
+            assert_eq!(each, Some(deadline), "queries received different deadlines");
+        }
+    }
+
+    fn dataset() -> crate::Dataset {
+        let ds = crate::Dataset::memory();
+        ds.update(
+            "INSERT DATA { <urn:a> a <urn:T> ; <urn:p> 1 ; <urn:r> <urn:x> ; <urn:q> <urn:b> . \
+             <urn:c> a <urn:T> ; <urn:p> 2 ; <urn:r> <urn:y> . <urn:b> a <urn:U> }",
+        )
+        .unwrap();
+        ds
+    }
+
+    #[test]
+    fn every_overview_query_shares_one_absolute_deadline() {
+        let ds = dataset();
+        let timeout = Duration::from_secs(3600);
+        let opts = QueryOptions {
+            timeout: Some(timeout),
+            no_cache: true,
+            ..Default::default()
+        };
+        let groups = GroupsRequest::from_json(
+            &serde_json::json!({"within": {"class": "urn:T"}, "by": {"property": "urn:r"}}),
+        )
+        .unwrap();
+        let facets = FacetsRequest::from_json(&serde_json::json!({
+            "within": {"class": "urn:T"},
+            "facets": [{"property": "urn:p"}],
+            "filters": [{"property": "urn:p", "range": [0, 3]}],
+        }))
+        .unwrap();
+        let snap = ds.store().snapshot();
+        let runs: [&dyn Fn() -> Result<J>; 4] = [
+            &|| ds.graph().groups(&groups, &opts),
+            &|| ds.graph().facets(&facets, &opts),
+            &|| groups_at(snap.clone(), &groups, &opts),
+            &|| facets_at(snap.clone(), &facets, &opts),
+        ];
+        for run in runs {
+            let (bounds, before, after) = recorded(run);
+            assert_one_deadline(&bounds, before + timeout..=after + timeout);
+        }
+        // an earlier caller deadline wins over the relative timeout
+        let early = Instant::now() + Duration::from_secs(60);
+        let opts = QueryOptions {
+            deadline: Some(early),
+            ..opts
+        };
+        let (bounds, _, _) = recorded(|| groups_at(snap.clone(), &groups, &opts));
+        assert_one_deadline(&bounds, early..=early);
+    }
+
+    #[test]
+    fn one_deadline_keeps_options_without_a_timeout_and_refuses_overflow() {
+        let opts = QueryOptions::default();
+        assert!(matches!(
+            one_deadline(&opts).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let huge = QueryOptions {
+            timeout: Some(Duration::MAX),
+            ..Default::default()
+        };
+        assert!(matches!(one_deadline(&huge), Err(Error::Invalid(_))));
+    }
 }

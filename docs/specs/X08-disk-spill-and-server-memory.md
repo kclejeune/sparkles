@@ -1482,6 +1482,10 @@ ramfs, where spilled state would take memory, and warns on a network file system
   proceed. Infallible scalar decoding and interning retain their sticky failures.
   Successful decoding reservations keep the same high-water estimate and original
   memory owners, and irreducible query or server-pool exhaustion still refuses.
+  This recovery covers keys that are a variable or evaluate to a stored id. A key
+  expression such as `STR(?s)` decodes its arguments through infallible scalar
+  evaluation, so a decoding refusal inside it stops the query instead of retrying a
+  smaller piece.
 * Runs store ids only. The merge decodes each frame's keys into `SortKey`s as it reads
   the frame, instead of storing sort classes in the run, which keeps the format to plain
   id columns. A key that is a pure expression is evaluated again on each frame, so its
