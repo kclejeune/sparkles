@@ -56,6 +56,8 @@ mod update;
 mod validate;
 
 #[cfg(test)]
+mod expiry_tests;
+#[cfg(test)]
 mod tests;
 
 use crate::auth::{Level, Principal};
@@ -164,6 +166,12 @@ pub struct McpArgs {
     /// as https://sparql.example.org (without it the tool is not offered)
     #[arg(long, value_name = "URL")]
     pub ui_url: Option<String>,
+    /// Do not delete idle scratch branches in this session. With --allow-update the
+    /// session otherwise deletes the scratch branches that a dataset's
+    /// `memory.scratchBranches.ttl` setting calls idle, when it opens and every ten
+    /// minutes
+    #[arg(long)]
+    pub no_scratch_expiry: bool,
 }
 
 /// Limits and switches of the MCP tools.
@@ -192,7 +200,8 @@ pub struct McpConfig {
     /// how long a tool call of a client that supports tasks may run before it becomes a
     /// task that the client polls
     pub task_after: Duration,
-    /// delete scratch branches idle for longer than this (`None`: never)
+    /// delete scratch branches idle for longer than this, in datasets whose
+    /// `memory.scratchBranches.ttl` setting says nothing (`None`: never)
     pub scratch_ttl: Option<Duration>,
     /// the base URL of the UI that `share_query` links to (`sparkles mcp --ui-url`)
     pub ui_url: Option<String>,
@@ -606,10 +615,21 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         },
         ..McpConfig::default()
     };
-    let server = McpServer::new(st, cfg);
+    let expire = args.allow_update && !args.no_scratch_expiry;
+    let server = McpServer::new(st.clone(), cfg);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(crate::THREAD_STACK)
         .enable_all()
         .build()?;
+    if expire {
+        // an idle scratch branch goes before the first call, then every ten minutes
+        branches::expire_for_stdio(
+            &st,
+            rt.handle(),
+            branches::STDIO_EVERY,
+            Arc::new(branches::now_ms),
+            None,
+        );
+    }
     rt.block_on(adapter::serve_stdio(server))
 }

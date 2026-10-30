@@ -701,6 +701,65 @@ async fn a19_idle_scratch_branches_expire() {
     assert!(Flags::parse_from(args).mcp.conf(&st).is_err());
 }
 
+/// Item 57: the dataset's `memory.scratchBranches.ttl` decides the `expires` that
+/// `create_branch` and `list_branches` return, over the server's flag, and `off` returns
+/// none. A server without the flag follows the setting alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn item57_dataset_ttl_sets_the_reported_expiry() {
+    let expires_after = |j: &serde_json::Value| -> Option<i64> {
+        let ms = |k: &str| {
+            chrono::DateTime::parse_from_rfc3339(j[k].as_str()?)
+                .ok()
+                .map(|t| t.timestamp_millis())
+        };
+        Some(ms("expires")? - ms("created")?)
+    };
+    for flag in [&["--mcp-scratch-branch-ttl", "1h"][..], &[][..]] {
+        let mut args = vec!["--mcp-allow-update"];
+        args.extend_from_slice(flag);
+        let s = mem_server(&args);
+        let ds = s.state.get("mem").unwrap();
+        let set = |ttl: Option<&str>| {
+            let v = match ttl {
+                Some(t) => json!({"scratchBranches": {"ttl": t}}),
+                None => json!({}),
+            };
+            crate::assist::write_file(&s.state, &ds, "memory.json", &v).unwrap();
+        };
+        let expiry = |name: &'static str| {
+            let app = s.app.clone();
+            async move {
+                let r = tool(&app, "create_branch", json!({ "name": name }), &[]).await;
+                assert_eq!(r["isError"], false, "{r}");
+                let created = expires_after(&r["structuredContent"]);
+                let r = tool(&app, "list_branches", json!({}), &[]).await;
+                let listed = r["structuredContent"]["branches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|b| b["name"] == name)
+                    .map(|b| b["expires"].as_str().map(str::to_string))
+                    .unwrap();
+                (created, listed)
+            }
+        };
+        let hours = |h: i64| Some(h * 3_600_000);
+        set(None);
+        let (created, listed) = expiry("b1").await;
+        // no setting: the flag, or no expiry without one
+        assert_eq!(created, if flag.is_empty() { None } else { hours(1) });
+        assert_eq!(listed.is_some(), !flag.is_empty());
+        set(Some("3h"));
+        let (created, listed) = expiry("b2").await;
+        assert_eq!(created, hours(3));
+        assert!(listed.is_some());
+        set(Some("off"));
+        let (created, listed) = expiry("b3").await;
+        assert_eq!(created, None);
+        assert_eq!(listed, None);
+    }
+}
+
 /// The `branch` argument of the read tools: a branch's data, an unknown branch, and an
 /// invalid name.
 #[tokio::test(flavor = "multi_thread")]
