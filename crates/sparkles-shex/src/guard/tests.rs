@@ -1562,19 +1562,15 @@ fn schema_copy_digest_is_required_and_cannot_be_bypassed_by_settings_edits() {
         let (g, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
         let mut config = g.config().clone();
         config.schema.copy_sha256 = expected;
-        let before = std::fs::read(root.join(CONFIG_FILE)).unwrap();
-        let error = set_config(&s, Some(config.clone()), &NoImports)
-            .err()
-            .unwrap();
-        assert!(
-            format!("{error:#}").contains("schema.copySha256"),
-            "{error:#}"
+        // A settings change verifies the copy against the stored digest and records
+        // that digest again, whatever digest the caller sent.
+        let (g, _) = installed(set_config(&s, Some(config.clone()), &NoImports).unwrap());
+        let digest = sha256_hex(&std::fs::read(root.join(SHEX_SCHEMA_SHEXC_FILE)).unwrap());
+        assert_eq!(
+            g.config().schema.copy_sha256.as_deref(),
+            Some(digest.as_str())
         );
-        assert_eq!(std::fs::read(root.join(CONFIG_FILE)).unwrap(), before);
-        assert!(Arc::ptr_eq(
-            &s.guard().unwrap(),
-            &(g.clone() as Arc<dyn CommitGuard>)
-        ));
+        assert_eq!(stored_config(&root)["schema"]["copySha256"], digest);
         // Reopening a malformed configuration is refused with no installed guard.
         drop(g);
         drop(s);
@@ -2018,5 +2014,91 @@ fn bulk_schema_preview_preserves_the_committed_grandfather_baseline() {
         if preview {
             assert_eq!(serde_json::to_value(guard.status()).unwrap(), before);
         }
+    }
+}
+
+/// Rewrite a stored copied-schema configuration as format 2 without a copy digest.
+fn make_legacy(root: &Path) {
+    let mut legacy = stored_config(root);
+    legacy["format"] = 2.into();
+    legacy["schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("copySha256");
+    std::fs::write(root.join(CONFIG_FILE), serde_json::to_vec(&legacy).unwrap()).unwrap();
+}
+
+/// The settings a client sends back to keep the stored source: the stored
+/// configuration, a changed report limit, and `format` as the caller chose it (`None`
+/// removes it, so the current format applies as the HTTP handler fills it).
+fn kept(g: &ShexGuard, format: Option<u32>) -> ShexValidationConfig {
+    let mut j = serde_json::to_value(g.config()).unwrap();
+    j.as_object_mut().unwrap().remove("format");
+    j["reportLimit"] = 50.into();
+    j["format"] = format.unwrap_or(CONFIG_FORMAT).into();
+    serde_json::from_value(j).unwrap()
+}
+
+/// A legacy configuration can be saved again by keeping its source, with or
+/// without `format`, and is then written as format 3 with a verified copy digest.
+#[test]
+fn legacy_schema_copy_is_upgraded_when_its_source_is_kept() {
+    for format in [None, Some(2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = loaded(&root);
+        let (g, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+        drop(g);
+        drop(s);
+        make_legacy(&root);
+        let s = open(&root);
+        let g = install(&s).unwrap().unwrap();
+        let (g, _) = installed(set_config(&s, Some(kept(&g, format)), &NoImports).unwrap());
+        let stored = stored_config(&root);
+        assert_eq!(stored["format"], CONFIG_FORMAT, "{format:?}");
+        assert_eq!(stored["reportLimit"], 50);
+        let copy = std::fs::read(root.join(SHEX_SCHEMA_SHEXC_FILE)).unwrap();
+        assert_eq!(stored["schema"]["copySha256"], sha256_hex(&copy));
+        assert_eq!(
+            g.config().schema.copy_sha256.as_deref(),
+            Some(sha256_hex(&copy).as_str())
+        );
+        drop(g);
+        drop(s);
+        let s = open(&root);
+        install(&s).unwrap().unwrap();
+    }
+}
+
+/// A reused copy is checked against the stored configuration. A caller cannot
+/// pass a tampered copy by supplying its digest or by claiming format 2.
+#[test]
+fn reused_schema_copy_is_verified_against_the_stored_configuration() {
+    for bypass in ["tampered digest", "format 2"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = loaded(&root);
+        let (g, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+        let tampered = SCHEMA.replace("xsd:string", "xsd:boolean");
+        std::fs::write(root.join(SHEX_SCHEMA_SHEXC_FILE), &tampered).unwrap();
+        let mut c = kept(&g, None);
+        match bypass {
+            "tampered digest" => c.schema.copy_sha256 = Some(sha256_hex(tampered.as_bytes())),
+            _ => {
+                c.format = 2;
+                c.schema.copy_sha256 = None;
+            }
+        }
+        let before = std::fs::read(root.join(CONFIG_FILE)).unwrap();
+        let error = set_config(&s, Some(c), &NoImports).err().expect(bypass);
+        assert!(
+            format!("{error:#}").contains("schema.copySha256"),
+            "{bypass}: {error:#}"
+        );
+        assert_eq!(std::fs::read(root.join(CONFIG_FILE)).unwrap(), before);
+        assert!(Arc::ptr_eq(
+            &s.guard().unwrap(),
+            &(g.clone() as Arc<dyn CommitGuard>)
+        ));
     }
 }

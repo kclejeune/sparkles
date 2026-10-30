@@ -1362,18 +1362,28 @@ that version before opening the database.
 Loading a copied schema checks its copy digest before parsing or trusting baseline
 counts or persisted typing. A mismatched digest, or a missing digest in format 3,
 refuses installation and leaves the store requiring a guard. Reusing the stored source
-in a settings change performs the same check. Inline replacements recompute their copy
-digest from the resolved stored representation. Schema graphs have no copy digest.
+in a settings change performs the same check against the stored configuration's format
+and copy digest. The format and digest a caller sends are ignored for that check, so a
+caller cannot pass a changed copy by sending its digest or by claiming format 2. A
+stored format 2 copy without a digest is accepted as installation accepts it, and the
+saved configuration records the digest of that copy. Inline replacements recompute their
+copy digest from the resolved stored representation. Schema graphs have no copy digest.
 
 A format 2 copy without a copy digest receives a full validation of the stable head
 under the writer lock at installation. Its runtime baseline and typing come from that
 validation, without reading the old cached state. This preserves warn, strict reject
 and grandfather behavior, including existing violations. Parse and timeout failures
 leave the guard uninstalled and the saved files unchanged. Installation leaves legacy
-configuration files unchanged, and saving their settings upgrades them to format 3.
+configuration files unchanged, so the full validation repeats at every open and holds
+the writer lock while it runs. A legacy dataset whose validation exceeds
+`timeoutSeconds` stays unwritable until the timeout is raised or the schema is set
+inline again. Saving the settings, including the keep-source path that sends no
+`format`, upgrades the file to format 3 and ends the repeated validation.
 
 Regressions cover changed copies with saved baseline and typing files, missing and
-malformed digests, failed source reuse that retains the installed guard, legacy cached
+malformed digests, failed source reuse that retains the installed guard, source reuse
+that ignores caller-supplied digests and formats, legacy upgrade through a `PUT` without
+`format`, legacy cached
 state and validation failures, original-source provenance for converted and imported
 schemas, relative base IRIs, prefix preservation, memory copies, clones and reopen.
 

@@ -449,3 +449,42 @@ async fn schema_in_a_graph() {
     // carol still has no name; dan conforms under the raised maximum
     assert_eq!(j["status"]["baseline"]["blocking"], 1, "{j}");
 }
+
+/// A legacy format 2 copy is saved again as format 3 by a PUT that keeps the stored
+/// schema and omits `format`, as the UI's keep-source path does.
+#[tokio::test]
+async fn legacy_copy_is_upgraded_by_a_formatless_keep_source_put() {
+    let (dir, st, app) = server(|_| {}).await;
+    fix_carol(&app).await;
+    let r = put_config(&app, &shex(SCHEMA, MAP)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let root = st.get("v").unwrap().store.root().unwrap().to_path_buf();
+    drop(app);
+    drop(st);
+    let path = root.join("validation.json");
+    let mut legacy: J = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    legacy["format"] = 2.into();
+    legacy["schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("copySha256");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let st = state(dir.path(), |_| {});
+    let app = router(st.clone());
+    let config = get(&app, "/$/validation/v").await.json()["config"].clone();
+    assert_eq!(config["format"], 2);
+    let keep = json!({"language": "shex", "mode": "warn", "schema": config["schema"],
+        "shapeMap": config["shapeMap"]});
+    let r = put_config(&app, &keep).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let stored: J = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["format"], 3);
+    assert_eq!(stored["mode"], "warn");
+    assert_eq!(
+        stored["schema"]["copySha256"],
+        sparkles::guard::config::sha256_hex(
+            &std::fs::read(root.join(SHEX_SCHEMA_SHEXC_FILE)).unwrap()
+        )
+    );
+}
