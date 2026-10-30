@@ -132,8 +132,9 @@ with the plan, or `400` with the reason the query cannot be a view. `GET
 /$/views/{ds}` lists the views with their state: `building`, `current`, `behind` with
 the commits it lags, `suspended` with a reason such as `over-budget`, or `failed`.
 `DELETE` removes the view and its state, and for a `graph` view leaves the graph in place
-unless `?dropGraph=true`. `POST /$/views/{ds}/{name}/rebuild` evaluates the view again
-from scratch. Defining and deleting views needs the dataset's `admin` grant.
+unless `?dropGraph=true`. Neither choice releases the graph, because the mark of
+undeclassified view output stays with the graph and its history (§6.1). `POST
+/$/views/{ds}/{name}/rebuild` evaluates the view again from scratch. Defining and deleting views needs the dataset's `admin` grant.
 
 `sparkles views --loc DB list|get|put|delete|rebuild|explain` does the same on a local
 store or, with `--url`, on a server. A stored query of C16 can be made a view by
@@ -511,11 +512,19 @@ for output that was written before a policy changed.
   query, the output graph and the principal who declassified it. It is the graph-view
   counterpart of the `view:{name}` grant, which declassifies a table view for the callers
   it names.
-- When a read-restricting policy is first installed while `graph` views without
-  `declassify` exist, those views are suspended with the reason `declassify-required`.
-  Their output graphs become unreadable to everyone except administrators until an
-  administrator declassifies the view or drops it. This takes effect before the new policy
-  is visible to any request, and it covers historical reads of those graphs.
+- A `graph` view without `declassify` marks its output graph as undeclassified view
+  output when the view first writes that graph. The mark belongs to the graph and not to
+  the view. It stays after the view is deleted, whether or not `?dropGraph=true` removes
+  the graph, and it applies to the graph's history as well as its current state.
+- While an access policy that restricts reads is in force, a marked graph is readable only
+  by administrators, for current and for historical reads, until an administrator
+  explicitly declassifies that graph. The declassification is written to the audit log
+  with the graph and the administrator. When a read-restricting policy is first installed,
+  views that wrote a marked graph are suspended with the reason `declassify-required`, and
+  the restriction on the graph takes effect before the new policy is visible to any
+  request. Dropping or deleting the view does not lift it.
+- The mark is stored in a versioned dataset file that releases which do not know the
+  version refuse to open.
 
 ### 6.2 Live queries
 
