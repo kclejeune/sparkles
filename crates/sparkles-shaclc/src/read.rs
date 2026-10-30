@@ -1,9 +1,9 @@
 //! The SHACLC parser: the grammar and production rules of the SHACL Compact Syntax,
 //! building the triples directly (see spec G03 §4).
 
-use super::lex::{Spanned, Tok, tokenize};
-use super::{Document, SyntaxError, is_datatype_iri, node_param, property_param};
+use crate::lex::{Spanned, Tok, tokenize};
 use crate::vocab::{SH_NS, owl, rdf, rdfs, sh};
+use crate::{Document, SyntaxError, is_datatype_iri, node_param, property_param};
 use oxiri::Iri;
 use oxrdf::vocab::xsd;
 use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple};

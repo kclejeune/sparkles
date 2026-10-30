@@ -10,7 +10,7 @@
 //! `maxListLength` and `uniqueMembers` to both parameter lists.
 //!
 //! ```
-//! let doc = sparkles_shacl::compact::parse(
+//! let doc = sparkles_shaclc::parse(
 //!     "PREFIX ex: <http://ex.org/>
 //!      shape ex:PersonShape -> ex:Person {
 //!          ex:name xsd:string [1..1] .
@@ -19,12 +19,13 @@
 //! )
 //! .unwrap();
 //! assert_eq!(doc.graph.len(), 7);
-//! let text = sparkles_shacl::compact::write(&doc.graph, &doc.prefixes).unwrap();
+//! let text = sparkles_shaclc::write(&doc.graph, &doc.prefixes).unwrap();
 //! assert!(text.contains("ex:name xsd:string [1..1] ."));
 //! ```
 
 mod lex;
 mod read;
+mod vocab;
 mod write;
 
 use oxrdf::{Graph, Triple};

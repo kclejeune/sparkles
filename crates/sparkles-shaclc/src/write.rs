@@ -2,9 +2,9 @@
 //! claims each triple a compact construct produces, and fails when a triple is left
 //! unclaimed, so a written document always reads back to the same graph.
 
-use super::read::STANDARD_PREFIXES;
-use super::{NODE_PARAMS, NotCompact, PROPERTY_PARAMS, is_datatype_iri};
+use crate::read::STANDARD_PREFIXES;
 use crate::vocab::{SH_NS, owl, rdf, rdfs, sh};
+use crate::{NODE_PARAMS, NotCompact, PROPERTY_PARAMS, is_datatype_iri};
 use oxrdf::vocab::xsd;
 use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};

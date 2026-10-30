@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 sparkles-core.workspace = true
+sparkles-shaclc.workspace = true
 oxrdf.workspace = true
 oxiri.workspace = true
 oxrdfio.workspace = true

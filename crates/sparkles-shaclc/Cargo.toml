@@ -1,0 +1,17 @@
+[package]
+name = "sparkles-shaclc"
+description = "The SHACL Compact Syntax (SHACLC): reader, writer and lossless lexer, without the validator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Only the RDF term types, so the formatter (crates/sparkles-fmt) can use the reader as its
+# reference parser and still build for wasm32-unknown-unknown. The validator re-exports
+# this crate as `sparkles_shacl::compact`.
+[dependencies]
+oxrdf.workspace = true
+oxiri.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+oxrdfio.workspace = true

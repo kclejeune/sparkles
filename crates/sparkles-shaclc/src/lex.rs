@@ -1,7 +1,7 @@
 //! The SHACLC lexer: Turtle's terms (IRIs, prefixed names, strings, numbers, language
 //! tags) plus the punctuation and the bare words of the compact syntax.
 
-use super::SyntaxError;
+use crate::SyntaxError;
 
 /// A token. Bare words are keywords, parameter names, node kinds and booleans; which
 /// one is decided by the parser from the position.
