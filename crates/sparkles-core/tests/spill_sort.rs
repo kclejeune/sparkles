@@ -369,6 +369,93 @@ fn impure_keys_spill_with_the_values_their_runs_sorted() {
 }
 
 #[test]
+fn spilled_volatile_keys_are_evaluated_once_across_sort_pieces() {
+    use sparkles_core::sparql::extensions::{
+        ExtensionRegistry, ScalarContext, ScalarDescriptor, Volatility,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const ROWS: usize = 6_000;
+    const KEY: &str = "urn:test:spill-key-once";
+    let s = store(ROWS);
+    let expected = query(s.snapshot(),
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(<http://www.w3.org/2001/XMLSchema#integer>(STRAFTER(STR(?s), \"urn:s:\"))) ?s",
+        &Default::default()).unwrap().rows();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut descriptor = ScalarDescriptor::new(
+        KEY,
+        1..=1,
+        move |_: &ScalarContext<'_>, arguments: &[Term]| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let Term::NamedNode(subject) = &arguments[0] else {
+                panic!("real subject IRI")
+            };
+            let number = subject
+                .as_str()
+                .strip_prefix("urn:s:")
+                .unwrap()
+                .parse::<i64>()
+                .unwrap();
+            Ok(oxrdf::Literal::from(-number).into())
+        },
+    )
+    .unwrap();
+    descriptor.volatility = Volatility::Volatile;
+    let mut registry = ExtensionRegistry::builder();
+    registry.register_scalar(descriptor).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let opts = QueryOptions {
+        max_memory_bytes: Some(MEMORY),
+        spill: Some(spill.clone()),
+        extensions: Some(registry.build()),
+        ..Default::default()
+    };
+    let q = format!("SELECT ?s ?o WHERE {{ ?s <urn:p> ?o }} ORDER BY (<{KEY}>(?s)) ?s");
+    let mut cursor = select_cursor(s.snapshot(), &q, &opts, &cursor_options()).unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = cursor.next_batch().unwrap() {
+        for row in 0..batch.len() {
+            rows.push(batch.row(row).unwrap());
+        }
+    }
+    assert_eq!(rows, expected);
+    assert_eq!(calls.load(Ordering::SeqCst), ROWS);
+    assert_eq!(cursor.status(), CursorStatus::Complete);
+    assert!(cursor.stats().mem_peak_bytes <= MEMORY);
+    let plan = cursor.plan_json().unwrap();
+    let runs = plan
+        .split("\"spillRuns\":")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next())
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("no spillRuns in {plan}"));
+    assert!(runs >= 2, "{plan}");
+    drop(cursor);
+    assert!(spill.written_bytes() > 0);
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
+#[test]
+fn irreducible_impure_key_memory_still_refuses_and_cleans_up() {
+    let s = store(12_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let error = run(
+        &s,
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY (UUID()) ?s",
+        1 << 20,
+        Some(spill.clone()),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory));
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
+#[test]
 fn cancelled_spilled_sorts_remove_their_files() {
     let s = store(60_000);
     let tmp = tempfile::tempdir().unwrap();

@@ -1382,7 +1382,7 @@ fn cursor_values(
                 charge.resize(bytes)?;
             }
         }
-        vals[row] = ctx.value(unique[row]);
+        vals[row] = ctx.cursor_value_checked(unique[row])?;
     }
     ctx.check()?;
     drop(pairs);
@@ -1464,5 +1464,95 @@ mod tests {
             assert_eq!(impurity(&e), None);
             assert_eq!(eligible(&[&e]).unwrap(), Some(1));
         }
+    }
+
+    fn cursor_with_late_longer_local_key() -> (std::sync::Arc<Ctx>, Table, [Id; 2]) {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 16 << 20;
+        let short = ctx.intern_value(&super::super::value::Value::Str("s".into()));
+        let long = ctx.intern_value(&super::super::value::Value::Str("long".into()));
+        assert_eq!((short.tag(), long.tag()), (Tag::Local, Tag::Local));
+        let var = ctx.var("key");
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        let mut table = Table::new(vec![var]);
+        table.cols[0] = vec![short; MIN_ROWS];
+        table.cols[0][MIN_ROWS - 1] = long;
+        table.len = MIN_ROWS;
+        (ctx, table, [short, long])
+    }
+
+    #[test]
+    fn a_refused_order_decode_leaves_the_cursor_healthy_for_a_smaller_trial() {
+        // Measure actual admitted column/decode ownership in a separate real
+        // cursor; do not duplicate the bulk decoder's estimate in the fixture.
+        let (measure, measured_table, [short, long]) = cursor_with_late_longer_local_key();
+        assert!(measure.value(short).is_some());
+        let before_long = measure.live_bytes();
+        assert!(measure.value(long).is_some());
+        let increment = measure.live_bytes() - before_long;
+        assert_eq!(increment, 24);
+        let column = cursor_variable_values(
+            &measure,
+            &measured_table,
+            &Expr::Var(measured_table.vars[0]),
+        )
+        .unwrap()
+        .unwrap();
+        let column_bytes = column._charge.as_ref().unwrap().bytes();
+        drop(column);
+        drop(measure);
+
+        let (ctx, table, [short, _]) = cursor_with_late_longer_local_key();
+        let input = ctx.charge(table.mem_bytes()).unwrap();
+        assert!(ctx.value(short).is_some());
+        let trial_storage = ctx.charge(ctx.memory_room() - column_bytes).unwrap();
+        let before_trial = ctx.live_bytes();
+        let result = cursor_variable_values(&ctx, &table, &Expr::Var(table.vars[0]));
+        assert!(matches!(result, Err(crate::Error::BudgetExceeded(b))
+            if b.kind == crate::BudgetKind::Memory && b.limit == 16 << 20 && b.requested == (16 << 20) + increment));
+        assert_eq!(
+            ctx.live_bytes(),
+            before_trial,
+            "refused column leaked trial ownership"
+        );
+        assert!(
+            ctx.check_cursor_memory().is_ok(),
+            "recoverable ORDER decoding poisoned the cursor before its smaller trial"
+        );
+        drop(trial_storage);
+        let values = cursor_variable_values(&ctx, &table, &Expr::Var(table.vars[0]))
+            .unwrap()
+            .unwrap();
+        for row in 0..table.len {
+            let expected = if row + 1 == table.len { "long" } else { "s" };
+            assert_eq!(
+                values.get(row).as_ref().unwrap().to_term(),
+                oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(expected))
+            );
+        }
+        drop(values);
+        drop(input);
+        assert!(ctx.check_cursor_memory().is_ok());
+        assert!(ctx.mem_peak() <= 16 << 20);
+    }
+
+    #[test]
+    fn infallible_decode_failure_stays_sticky_after_other_storage_releases() {
+        let (ctx, _, [short, long]) = cursor_with_late_longer_local_key();
+        assert!(ctx.value(short).is_some());
+        let storage = ctx.charge(ctx.memory_room() - 8).unwrap();
+        assert!(ctx.value(long).is_none());
+        assert!(
+            matches!(ctx.check_cursor_memory(), Err(crate::Error::BudgetExceeded(b))
+            if b.kind == crate::BudgetKind::Memory)
+        );
+        drop(storage);
+        assert!(
+            matches!(ctx.check_cursor_memory(), Err(crate::Error::BudgetExceeded(b))
+            if b.kind == crate::BudgetKind::Memory)
+        );
     }
 }

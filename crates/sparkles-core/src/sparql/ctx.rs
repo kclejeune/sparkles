@@ -1351,29 +1351,14 @@ impl Ctx {
         }
     }
 
-    fn retain_cursor_decode_bytes(&self, bytes: u64) -> bool {
-        let result = self
-            .memory()
-            .owner(self.grant.as_ref())
-            .and_then(|owner| self.memory().reserve(&owner, self.mem_limit, bytes, true));
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                self.fail_cursor(&error);
-                false
-            }
-        }
-    }
-
-    /// Reserve a conservative high-water estimate for transient term decoding.
-    /// Cursor evaluation does not retain the eager per-ID value cache.
-    pub(super) fn cursor_decode(&self, bytes: usize) -> bool {
+    /// Admit transient decoding for an explicitly fallible operation. A refused
+    /// sort trial can release its storage and try a smaller piece; it must not
+    /// poison the cursor as an infallible scalar evaluation would.
+    pub(super) fn cursor_decode_checked(&self, bytes: usize) -> Result<()> {
         let Some(memory) = &self.cursor_memory else {
-            return true;
+            return Ok(());
         };
-        // Planning and serial pulls need only one value's envelope. A Rayon
-        // evaluation may hold a value on every worker plus the caller; admit
-        // that larger envelope only when parallel decoding actually starts.
+        self.check_cursor_memory()?;
         let workers = if rayon::current_thread_index().is_some() {
             rayon::current_num_threads() as u64 + 1
         } else {
@@ -1384,17 +1369,29 @@ impl Ctx {
             .saturating_add(1024)
             .saturating_mul(workers);
         if memory.decoded_reserved.load(Ordering::Acquire) >= need {
-            return self.check_cursor_memory().is_ok();
+            return self.check_cursor_memory();
         }
         let mut peak = memory.decode_peak.lock();
         if need > *peak {
-            if !self.retain_cursor_decode_bytes(need - *peak) {
-                return false;
-            }
+            let owner = self.memory().owner(self.grant.as_ref())?;
+            self.memory()
+                .reserve(&owner, self.mem_limit, need - *peak, true)?;
             *peak = need;
             memory.decoded_reserved.store(need, Ordering::Release);
         }
-        self.check_cursor_memory().is_ok()
+        self.check_cursor_memory()
+    }
+
+    /// Reserve the same high-water envelope for an infallible scalar caller.
+    /// Its failure must stay sticky so an expression cannot become unbound.
+    pub(super) fn cursor_decode(&self, bytes: usize) -> bool {
+        match self.cursor_decode_checked(bytes) {
+            Ok(()) => true,
+            Err(error) => {
+                self.fail_cursor(&error);
+                false
+            }
+        }
     }
 
     /// The row limit of intermediate results.
@@ -2084,6 +2081,34 @@ impl Ctx {
     #[inline(never)]
     fn column_value(&self, payload: u64) -> Option<Value> {
         self.snap.generation.vocab.numeric()?.get(payload).value()
+    }
+
+    /// Decode an ORDER value without latching a recoverable trial refusal.
+    /// Inline and numeric-column values keep their existing paths. Dictionary
+    /// reconstruction and admitted decoding retain the same owner and charges.
+    pub(super) fn cursor_value_checked(&self, id: Id) -> Result<Option<Value>> {
+        debug_assert!(self.is_cursor());
+        self.check_cursor_memory()?;
+        let decode = |key: &[u8]| -> Result<Value> {
+            self.cursor_decode_checked(key.len())?;
+            Ok(Value::from_key(key))
+        };
+        match id.tag() {
+            Tag::Vocab => {
+                if let Some(value) = self.column_value(id.payload()) {
+                    return Ok(Some(value));
+                }
+                self.with_cursor_vocab_key(id.payload(), decode)?
+                    .transpose()
+            }
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(id.payload()).map(decode).transpose()),
+            Tag::Local => self.with_local_key(id.payload(), decode).transpose(),
+            _ => Ok(self.value(id)),
+        }
     }
 
     /// Decode an id into a value, with a per-query cache.

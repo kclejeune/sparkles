@@ -1477,6 +1477,11 @@ ramfs, where spilled state would take memory, and warns on a network file system
   pieces that the room left at that moment should hold, and a piece that still fails its
   budget is tried again at half its size while the input stays buffered. Estimates of
   the in-memory sort's footprint proved unreliable, and retrying a piece is not.
+* Explicit ORDER column decoders return transient memory refusals without poisoning
+  the cursor, so the existing smaller-piece retry can release its trial storage and
+  proceed. Infallible scalar decoding and interning retain their sticky failures.
+  Successful decoding reservations keep the same high-water estimate and original
+  memory owners, and irreducible query or server-pool exhaustion still refuses.
 * Runs store ids only. The merge decodes each frame's keys into `SortKey`s as it reads
   the frame, instead of storing sort classes in the run, which keeps the format to plain
   id columns. A key that is a pure expression is evaluated again on each frame, so its

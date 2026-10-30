@@ -6196,7 +6196,7 @@ fn cursor_key_rows(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        let value = eval(
+        let value = match eval(
             e,
             &Row {
                 table: t,
@@ -6207,10 +6207,11 @@ fn cursor_key_rows(
             ctx,
         )
         .ok()
-        .and_then(|v| match v {
-            Val::Id(id) => ctx.value(id),
-            Val::V(v) | Val::Dec(_, v) => Some(v),
-        });
+        {
+            Some(Val::Id(id)) => ctx.cursor_value_checked(id)?,
+            Some(Val::V(v) | Val::Dec(_, v)) => Some(v),
+            None => None,
+        };
         let payload = match &value {
             Some(Value::Iri(s) | Value::BNode(s) | Value::Str(s)) => s.len() as u64 + 64,
             Some(Value::Lang(s, lang) | Value::LangDir(s, lang, _)) => {
