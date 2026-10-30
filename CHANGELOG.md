@@ -20,6 +20,13 @@ authentication that keeps overlapping a policy reload now gets `503` with code
 `authority-changed` and `Retry-After: 1` instead of `403` or `401`, and the refusal
 spends none of the pre-authentication budget.
 
+Backups and persistent clones carry the views' definitions, captured under the store's
+writer lock with the data. Manifest entries name each definition's kind and file
+version, and the manifest requires the `definitions` feature, which older releases
+refuse to restore while still verifying and collecting such backups. Restored and
+cloned views stay suspended until a rebuild resumes them. Restores refuse unsafe,
+duplicate, unknown or damaged definition entries before publishing.
+
 Node graph overviews retain one absolute deadline across their native subqueries
 instead of renewing the timeout for each query.
 

@@ -290,7 +290,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node
   or JVM API, no UI, no views per branch, no ordered windows and no provenance per fact.
   Roadmap item 17.
-* Backups and clones do not carry view definitions. Roadmap item 220.
+* Backups and persistent clones carry view definitions, which come back suspended until
+  they are resumed. In-memory clones carry no views. Roadmap item 401.
 * Views and live queries on a dataset with RDFS on read or materialized inferences
   evaluate the whole query again at each commit that touches them, rather than
   maintaining it incrementally. Roadmap item 221.
@@ -319,7 +320,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 73](../ROADMAP.md), [item 220](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 232](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 235](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 293](../ROADMAP.md).
+The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 73](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 232](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 235](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

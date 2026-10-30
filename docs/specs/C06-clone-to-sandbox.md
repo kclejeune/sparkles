@@ -678,4 +678,6 @@ Roadmap item 45 owns the remaining cross-server and archive cloning through
 Its acceptance compares a chosen source branch and commit with the remote and archive
 copies, including quads, stored blank identities, prefixes, configuration and
 `forkedFrom` lineage. Cancellation, truncation and digest mismatches must publish no
-destination. Item 220 separately extends recovery to nested managed definitions.
+destination. A persistent clone carries the source's view definitions paused, as
+[F05](F05-snapshot-repositories/OUTCOME.md#recovery-of-managed-definitions) records, and
+item 401 tracks them for in-memory clones.

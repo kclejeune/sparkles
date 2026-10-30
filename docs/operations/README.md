@@ -138,6 +138,11 @@ callers and records the selected numeric user in its receipt.
 * A restore goes to a new dataset or replaces one in place, follows dataset-id rules, and
   runs an integrity check before publishing. During an in-place swap, requests get `503`
   with `Retry-After`. Backups can be verified at three levels.
+* Backups and persistent clones carry the view definitions, captured under the writer
+  lock with the data. Restored and cloned views stay suspended until an operator
+  resumes them, which checks their principal and stored query again. A restore refuses
+  definition entries with unsafe or duplicate paths, unknown required kinds or versions,
+  and missing or corrupt blobs before it publishes the dataset.
 * Lifecycle policies run on cron or `every` schedules in an IANA time zone, with catch-up,
   retention and two-phase GC, and can run offline against a stopped catalog. Lease locks
   use the storage server's clock, so several servers and the CLI can share a repository.

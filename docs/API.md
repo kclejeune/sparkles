@@ -3077,7 +3077,12 @@ checkpoint is loaded and the commits after it are applied from the change log or
 history. When neither covers them, the view is evaluated again and is `building`
 meanwhile. A checkpoint in a format this release does not read is left in place and the
 view is built from the data. An in-memory dataset keeps view state in memory only.
-Backups and clones do not carry view definitions in Phase 1.
+Backups and persistent clones carry the view definitions but not their checkpoints. A
+restored or cloned view is suspended with the reason `restored` or `cloned`, answers
+reads with `503 view-suspended`, and stays suspended across restarts until
+`POST /$/views/{ds}/{name}/rebuild` or a new definition resumes it. The view then
+resolves its principal and its stored query under the server's current policy, and is
+`failed` when either no longer resolves. In-memory clones carry no views.
 
 `sparkles views --loc DB list|get|put|delete|rebuild|explain` manages the views of a
 database directory or, with `--server`, of a server (see
@@ -4864,11 +4869,18 @@ changed meaning. `sparkles backup` works on repositories directly and calls no r
   dataset has them
 * `reasoning.json`, unless its inferences were made at a later commit than the captured
   one
+* the view definitions (`views/{name}/view.json`), read under the writer lock with the
+  captured commit, so each backup holds the definitions that were current at that
+  commit. Each entry names its kind and file version in `definition`, and the manifest
+  then lists `definitions` in `requires`. Older releases refuse to restore such a
+  backup, and still verify it and keep its blobs during garbage collection.
 
 The full-text index is left out and rebuilt when the restored dataset opens
 (`derived.text.rebuildOnRestore`). Older index generations, named snapshots and the
 retention window (`history.json`) are left out too. Point-in-time reads of a restored
-dataset therefore reach back only to the start of the backup's generation.
+dataset therefore reach back only to the start of the backup's generation. View
+checkpoints are left out as well. A restored view is suspended until it is resumed, as
+[Incremental views](#incremental-views) describes.
 
 **In-memory datasets.** An in-memory dataset has no files to copy, so its backup builds
 them first. The task takes a snapshot of the head commit under the writer lock and writes

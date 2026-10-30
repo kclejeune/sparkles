@@ -1758,7 +1758,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Per-dataset repository backups, restore, verification and policies are available, with optional encrypted repositories through F11. Whole-server capture, repository transfer, retained-history and managed-definition recovery remain under items 61, 65 and 220.
+Per-dataset repository backups, restore, verification and policies are available, with optional encrypted repositories through F11. Backups and persistent clones carry view definitions, which come back paused. Whole-server capture, repository transfer and retained history remain under items 61 and 65, and in-memory clones of views under item 401.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)
