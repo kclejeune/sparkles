@@ -350,6 +350,8 @@ impl Edges {
 
 impl Run<'_> {
     pub(super) fn select(&self, q: &str) -> Result<Rows> {
+        #[cfg(test)]
+        super::QUERY_BOUNDS.with(|b| b.borrow_mut().push((self.opts.timeout, self.opts.deadline)));
         let r =
             crate::sparql::query_with_plan(self.snap.clone(), q, self.opts).map_err(|f| f.error)?;
         Ok(Rows {
