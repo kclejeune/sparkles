@@ -218,29 +218,39 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the two small official example graphs, through `scripts/graphalytics-reference.py`.
   There is no full Graphalytics driver, no run on the larger datasets, no reference check
   of CDLP, LCC or SSSP, and no certification. Roadmap item 8.
-* The UI cannot complete `algo:` names, and openCypher procedures wait for an openCypher
-  frontend. Write-back commits through
+* The UI cannot complete `algo:` names, and openCypher procedures wait for the openCypher
+  frontend of item 20, which belongs to additional query languages. Write-back commits through
   the ordinary writer rather than a bulk writer. A write-back run has no deadline unless
   the request or `--update-timeout` gives one. Thread admission has no queue order, so a
   call that needs several threads can wait while one-thread calls take the free slots. A
   background view-only run reports progress by phase only. Roadmap item 8.
 * Betweenness requires finite, strictly positive edge weights, while SSSP accepts zero
-  weights and PageRank non-negative ones. Roadmap item 79.
+  weights and PageRank non-negative ones. Roadmap item 79, an optional extension outside
+  the completion of paths and graph algorithms.
 * Weighted betweenness refuses a distance addition that cannot keep a strict increase at
   `f64` precision and refuses non-finite distances. Accepted distances and path counts are
   approximate, including rounded path ties, and sampling checks only the selected source
-  searches. Roadmap item 80.
+  searches. Roadmap item 80, an optional extension outside the completion of paths and graph
+  algorithms.
 
 
 ### GeoSPARQL
 
 * EPSG codes come from a table of proj4 definitions rather than the EPSG database, and
   the library includes the table only with its `geo-epsg` feature. Geographic CRSs on
-  datums other than WGS 84, grid-based datum shifts, and curved GML segments or solids
-  are not supported, and Helmert datum shifts are approximate. Roadmap item 24.
-* Geometry constructions return 2D results. Unions of crossing lines keep the covered
-  points but do not split the lines at each crossing, unlike Jena's JTS engine. Roadmap
-  item 70.
+  datums other than WGS 84, grid-based datum shifts and curved GML segments are not
+  supported, and Helmert datum shifts are approximate. Roadmap item 24 adds exact
+  Helmert shifts, other geographic datums, opt-in grid shifts from operator-supplied grid
+  files that still refuse when a needed grid is missing, and curved segments densified
+  within a stated tolerance.
+* A nearest-neighbour search takes its query geometry as a constant and cannot bind it per
+  row, and QLever's `spatialSearch:` syntax, metric-property rewrites and polygon
+  approximations beyond the cell grid are missing. Roadmap item 24.
+* Sparkles does not support GML solids, 3D constructions or exact arithmetic on curves,
+  and geometry constructions return 2D results. Unions of crossing lines keep the covered
+  points but do not split the lines at each crossing, unlike Jena's JTS engine, and
+  Sparkles has no Jena-compatible mode. [COMPARISON.md](../COMPARISON.md#geosparql) lists
+  where results differ from Jena.
 
 ## Configuration and usage
 
@@ -260,7 +270,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 8](../ROADMAP.md), [item 23](../ROADMAP.md), [item 24](../ROADMAP.md), [item 34](../ROADMAP.md), [item 35](../ROADMAP.md), [item 70](../ROADMAP.md), [item 79](../ROADMAP.md), [item 80](../ROADMAP.md), [item 82](../ROADMAP.md), [item 250](../ROADMAP.md), [item 251](../ROADMAP.md), [item 275](../ROADMAP.md), [item 277](../ROADMAP.md).
+The remaining work described above refers to [item 8](../ROADMAP.md), [item 20](../ROADMAP.md), [item 23](../ROADMAP.md), [item 24](../ROADMAP.md), [item 34](../ROADMAP.md), [item 35](../ROADMAP.md), [item 79](../ROADMAP.md), [item 80](../ROADMAP.md), [item 82](../ROADMAP.md), [item 250](../ROADMAP.md), [item 251](../ROADMAP.md), [item 275](../ROADMAP.md), [item 277](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

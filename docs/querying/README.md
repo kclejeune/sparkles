@@ -266,7 +266,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 * Sparkles lacks ARQ's JavaScript functions, `afn:context`, the Leviathan `lfn:` library
   and the `JSON` query form, and `afn:collation` orders by code point instead of by
-  locale. Roadmap item 69.
+  locale. Roadmap item 69, a lower-priority extension outside the completion of Server and
+  Fuseki integration.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
