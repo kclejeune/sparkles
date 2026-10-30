@@ -62,7 +62,7 @@ datasets = {{ bad = "read", slow = "read" }}
             require_all: false,
             before_open: Some(gate.hook()),
         },
-        |_| Ok(()),
+        |_, _| Ok(()),
         |e| panic!("fatal: {e}"),
     );
     gate.wait_entered("slow");

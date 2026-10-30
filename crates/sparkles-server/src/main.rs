@@ -3171,45 +3171,53 @@ fn run() -> Result<()> {
                     .collect();
                 startup::hold(&st, &attach, &configured)?;
             }
-            let after_open = move |st: &Arc<state::AppState>| -> Result<()> {
-                for m in mem {
-                    st.attach_expected(m.trim_start_matches('/'), state::DbType::Mem, None)?;
-                }
-                for l in loc {
-                    let (name, path) = l.split_once('=').context("--loc expects NAME=PATH")?;
-                    st.attach_expected(
-                        name.trim_start_matches('/'),
-                        state::DbType::Persistent,
-                        Some(std::path::Path::new(path)),
-                    )?;
-                }
-                // a step for a dataset that failed to open is left out: the dataset is
-                // reported failed, and the step runs at a start that opens it
-                let open = |flag: &str, spec: &str| {
-                    let name = startup::step_dataset(spec);
-                    let failed = st.catalog.refusal(name).is_some();
-                    if failed {
-                        tracing::error!("{flag} {spec}: skipped, /{name} did not open");
+            let after_open =
+                move |st: &Arc<state::AppState>, stop: &startup::StopFlag| -> Result<()> {
+                    // a shutdown starts no further step: `stop.check()` before each
+                    for m in mem {
+                        stop.check()?;
+                        st.attach_expected(m.trim_start_matches('/'), state::DbType::Mem, None)?;
                     }
-                    !failed
+                    for l in loc {
+                        stop.check()?;
+                        let (name, path) = l.split_once('=').context("--loc expects NAME=PATH")?;
+                        st.attach_expected(
+                            name.trim_start_matches('/'),
+                            state::DbType::Persistent,
+                            Some(std::path::Path::new(path)),
+                        )?;
+                    }
+                    // a step for a dataset that failed to open is left out: the dataset is
+                    // reported failed, and the step runs at a start that opens it
+                    let open = |flag: &str, spec: &str| {
+                        let name = startup::step_dataset(spec);
+                        let failed = st.catalog.refusal(name).is_some();
+                        if failed {
+                            tracing::error!("{flag} {spec}: skipped, /{name} did not open");
+                        }
+                        !failed
+                    };
+                    for t in text.iter().filter(|t| open("--text", t)) {
+                        stop.check()?;
+                        enable_text_for(st, t)?;
+                    }
+                    for g in geo.iter().filter(|g| open("--geo", g)) {
+                        stop.check()?;
+                        geo::enable_for(st, g)?;
+                    }
+                    for v in validate.iter().filter(|v| open("--validate", v)) {
+                        stop.check()?;
+                        validate_at_startup(st, v)?;
+                    }
+                    for r in rdfs.iter().filter(|r| open("--rdfs", r)) {
+                        stop.check()?;
+                        rdfs::configure(st, r)?;
+                    }
+                    if let Some(f) = &fuseki {
+                        fuseki_config::start(st, f, stop)?;
+                    }
+                    Ok(())
                 };
-                for t in text.iter().filter(|t| open("--text", t)) {
-                    enable_text_for(st, t)?;
-                }
-                for g in geo.iter().filter(|g| open("--geo", g)) {
-                    geo::enable_for(st, g)?;
-                }
-                for v in validate.iter().filter(|v| open("--validate", v)) {
-                    validate_at_startup(st, v)?;
-                }
-                for r in rdfs.iter().filter(|r| open("--rdfs", r)) {
-                    rdfs::configure(st, r)?;
-                }
-                if let Some(f) = &fuseki {
-                    fuseki_config::start(st, f)?;
-                }
-                Ok(())
-            };
             // Rayon starts its query pool on first use, and every query asks for its size.
             // Started there, the first query paid for reading the cgroup CPU limits and
             // spawning a thread per core, which made a cold point lookup several times

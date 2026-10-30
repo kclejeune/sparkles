@@ -56,12 +56,14 @@ pub struct Startup {
 /// Open `pending`, the registered datasets of [`AppState::deferred`], then run `then`
 /// (the startup steps that need the datasets open), then mark the server ready. A
 /// fatal error, from `then` or from a failed dataset under `require_all`, goes to
-/// `fatal`, which should stop the server.
+/// `fatal`, which should stop the server. `then` gets the flag that a shutdown sets
+/// and checks it with [`StopFlag::check`] before each step, so a shutdown starts no
+/// further step. An error that `then` returns once the flag is set is not fatal.
 pub fn spawn(
     st: Arc<AppState>,
     pending: Vec<String>,
     options: Options,
-    then: impl FnOnce(&Arc<AppState>) -> anyhow::Result<()> + Send + 'static,
+    then: impl FnOnce(&Arc<AppState>, &StopFlag) -> anyhow::Result<()> + Send + 'static,
     fatal: impl FnOnce(anyhow::Error) + Send + 'static,
 ) -> Startup {
     let stop = Arc::new(AtomicBool::new(false));
@@ -87,8 +89,11 @@ pub fn spawn(
                 return;
             }
             // the later steps see the datasets that startup holds back from requests
-            if let Err(e) = with_access(|| then(&st)) {
-                fatal(e);
+            let flag = StopFlag(stopping.clone());
+            if let Err(e) = with_access(|| then(&st, &flag)) {
+                if !flag.stopped() {
+                    fatal(e);
+                }
                 return;
             }
             if stopping.load(Ordering::SeqCst) {
@@ -113,6 +118,22 @@ pub fn spawn(
 /// Tells startup to stop: [`begin_shutdown`] sets it.
 #[derive(Clone)]
 pub struct StopFlag(Arc<AtomicBool>);
+
+impl StopFlag {
+    /// Whether a shutdown has started.
+    pub fn stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// An error once a shutdown has started, so a startup step returns before it
+    /// starts the next one.
+    pub fn check(&self) -> anyhow::Result<()> {
+        if self.stopped() {
+            anyhow::bail!("startup stopped: the server is shutting down");
+        }
+        Ok(())
+    }
+}
 
 /// What the server does first when a shutdown starts, before it drains its requests:
 /// readiness reports `draining`, and startup opens no more datasets and runs no more
@@ -181,6 +202,21 @@ pub(crate) static LOOKUP_HOOKS: parking_lot::Mutex<
 #[cfg(test)]
 pub(crate) fn lookup_hook(name: &str) {
     let hook = LOOKUP_HOOKS.lock().get(name).cloned();
+    if let Some(h) = hook {
+        h()
+    }
+}
+
+/// Hooks that run at the end of a startup step for a dataset, by dataset name: so far
+/// after each data load of `--fuseki-config`.
+#[cfg(test)]
+pub(crate) static STEP_HOOKS: parking_lot::Mutex<
+    std::collections::BTreeMap<String, Arc<dyn Fn() + Send + Sync>>,
+> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn step_hook(name: &str) {
+    let hook = STEP_HOOKS.lock().get(name).cloned();
     if let Some(h) = hook {
         h()
     }

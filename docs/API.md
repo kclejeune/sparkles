@@ -190,8 +190,9 @@ same `404` for an opening or failed dataset as for a missing one.
 `sparkles_datasets{state}` counts the datasets that are open, opening and failed.
 
 A shutdown during startup stops it as soon as the shutdown begins, before the requests
-in flight drain. Startup opens no more datasets and runs no more steps, and the server
-waits for the datasets opening at that moment before it exits. The others stay
+in flight drain. Startup opens no more datasets and starts no further step, such as the
+next `--fuseki-config` data load, and the server waits for the datasets and the step in
+progress at that moment before it exits. The others stay
 registered and open at the next start. [USAGE.md](USAGE.md#endpoints-and-operations)
 describes which endpoint each health check uses.
 

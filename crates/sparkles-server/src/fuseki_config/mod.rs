@@ -339,8 +339,14 @@ pub fn for_serve(path: &Path, data_dir: &Path, own_auth: bool) -> Result<ServeAd
 
 /// After the datasets are attached: load the data files of in-memory datasets, and
 /// materialize the inferences of datasets that have none recorded yet.
-pub fn start(st: &std::sync::Arc<crate::state::AppState>, add: &ServeAdditions) -> Result<()> {
+/// A shutdown (`stop`) starts no further load or materialization.
+pub fn start(
+    st: &std::sync::Arc<crate::state::AppState>,
+    add: &ServeAdditions,
+    stop: &crate::startup::StopFlag,
+) -> Result<()> {
     for (name, path, graph) in &add.data {
+        stop.check()?;
         let ds = st
             .get(name)
             .with_context(|| format!("--fuseki-config: no dataset /{name}"))?;
@@ -354,9 +360,12 @@ pub fn start(st: &std::sync::Arc<crate::state::AppState>, add: &ServeAdditions) 
             )
             .with_context(|| format!("--fuseki-config: loading {} into /{name}", path.display()))?;
         tracing::info!("fuseki-config: loaded {} into /{name}", path.display());
+        #[cfg(test)]
+        crate::startup::step_hook(name);
     }
     #[cfg(feature = "reasoning")]
     for (name, r, rules) in &add.reason {
+        stop.check()?;
         let ds = st
             .get(name)
             .with_context(|| format!("--fuseki-config: no dataset /{name}"))?;

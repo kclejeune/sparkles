@@ -43,7 +43,7 @@ fn options(gate: Option<&Arc<Gate>>, threads: usize) -> startup::Options {
     }
 }
 
-fn eventually(what: &str, f: impl Fn() -> bool) {
+fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     let t0 = std::time::Instant::now();
     while !f() {
         assert!(t0.elapsed() < Duration::from_secs(30), "timed out: {what}");
@@ -117,7 +117,7 @@ async fn the_listener_answers_while_a_slow_dataset_opens_and_a_bad_one_degrades_
         st.clone(),
         pending,
         options(Some(&gate), 2),
-        |_| Ok(()),
+        |_, _| Ok(()),
         |e| panic!("fatal: {e}"),
     );
     gate.wait_entered("slow");
@@ -232,7 +232,7 @@ async fn ready_ignore_failed_reports_ready_while_degraded() {
         st.clone(),
         pending,
         options(None, 2),
-        |_| Ok(()),
+        |_, _| Ok(()),
         |e| panic!("fatal: {e}"),
     );
     eventually("ready phase", || st.phase() == crate::obs::Phase::Ready);
@@ -260,7 +260,7 @@ fn require_all_datasets_stops_startup_at_a_failure() {
             require_all: true,
             ..options(None, 2)
         },
-        |_| panic!("the later steps ran"),
+        |_, _| panic!("the later steps ran"),
         move |e| tx.send(format!("{e:#}")).unwrap(),
     );
     let e = rx.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -281,7 +281,7 @@ fn a_failed_later_step_is_fatal_and_the_server_never_becomes_ready() {
         st.clone(),
         pending,
         options(None, 1),
-        |_| anyhow::bail!("--text: no dataset nope"),
+        |_, _| anyhow::bail!("--text: no dataset nope"),
         move |e| tx.send(format!("{e:#}")).unwrap(),
     );
     assert!(
@@ -306,7 +306,7 @@ async fn a_shutdown_stops_the_opening_before_requests_drain() {
         st.clone(),
         pending,
         options(Some(&gate), 1),
-        |_| panic!("the later steps ran after a shutdown"),
+        |_, _| panic!("the later steps ran after a shutdown"),
         |e| panic!("fatal: {e}"),
     );
     let stop = opening.stop_flag();
@@ -426,7 +426,7 @@ async fn startup_configuration_is_installed_before_a_dataset_serves() {
         st.clone(),
         pending,
         options(Some(&gate), 2),
-        move |st| crate::write_validation::validate_at_startup(st, &spec).map(drop),
+        move |st, _| crate::write_validation::validate_at_startup(st, &spec).map(drop),
         |e| panic!("fatal: {e}"),
     );
     let (st2, gate2) = (st.clone(), gate.clone());
@@ -489,7 +489,7 @@ async fn names_that_startup_attaches_are_reserved() {
         st.clone(),
         pending,
         options(Some(&gate), 2),
-        |st| st.attach_expected("scratch", DbType::Mem, None).map(drop),
+        |st, _| st.attach_expected("scratch", DbType::Mem, None).map(drop),
         |e| panic!("fatal: {e}"),
     );
     let (st2, gate2) = (st.clone(), gate.clone());
@@ -556,7 +556,7 @@ fn a_lookup_that_straddles_publication_finds_the_dataset() {
         st.clone(),
         pending,
         options(Some(&gate), 1),
-        |_| Ok(()),
+        |_, _| Ok(()),
         |e| panic!("fatal: {e}"),
     );
     gate.wait_entered("straddle");
@@ -583,4 +583,58 @@ fn a_lookup_that_straddles_publication_finds_the_dataset() {
         "the straddling lookup missed the dataset"
     );
     opening.stop_and_join();
+}
+
+/// A shutdown that starts during a later startup step, here the first data load of
+/// `--fuseki-config`, starts no further step: the second load never runs, the error
+/// it leaves is not fatal, and the held dataset is never released to requests.
+#[test]
+fn a_shutdown_during_a_later_step_starts_no_further_step() {
+    let dir = data_dir(&[], false);
+    let (first, second) = (dir.path().join("first.nt"), dir.path().join("second.nt"));
+    std::fs::write(&first, "<urn:first> <urn:p> \"1\" .\n").unwrap();
+    std::fs::write(&second, "<urn:second> <urn:p> \"2\" .\n").unwrap();
+    let (st, pending) = deferred(dir.path(), false);
+    startup::hold(&st, &[("stepstop".to_string(), DbType::Mem)], &[]).unwrap();
+    let add = crate::fuseki_config::ServeAdditions {
+        data: vec![
+            ("stepstop".into(), first, None),
+            ("stepstop".into(), second, None),
+        ],
+        ..Default::default()
+    };
+    // the first load ends with a shutdown, as one that a signal starts meanwhile
+    let stop = Arc::new(parking_lot::Mutex::new(None::<startup::StopFlag>));
+    let (st2, stop2) = (st.clone(), stop.clone());
+    startup::STEP_HOOKS.lock().insert(
+        "stepstop".into(),
+        Arc::new(move || {
+            let flag = stop2.lock().clone().expect("the stop flag");
+            startup::begin_shutdown(&st2, &flag);
+        }),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let opening = startup::spawn(
+        st.clone(),
+        pending,
+        options(None, 1),
+        move |st, stop| {
+            ready_rx.recv().unwrap();
+            st.attach_expected("stepstop", DbType::Mem, None)?;
+            crate::fuseki_config::start(st, &add, stop)
+        },
+        move |e| tx.send(format!("{e:#}")).unwrap(),
+    );
+    *stop.lock() = Some(opening.stop_flag());
+    ready_tx.send(()).unwrap();
+    eventually("startup gives up", || opening.is_finished());
+    opening.stop_and_join();
+    startup::STEP_HOOKS.lock().remove("stepstop");
+    assert!(rx.try_recv().is_err(), "a shutdown made the stop fatal");
+    // the first load finished, and the second never started
+    let held = st.catalog.get("stepstop").unwrap();
+    assert_eq!(held.store().snapshot().len(), 1);
+    assert!(st.get("stepstop").is_none(), "startup released the dataset");
+    assert_eq!(st.phase(), crate::obs::Phase::Draining);
 }
