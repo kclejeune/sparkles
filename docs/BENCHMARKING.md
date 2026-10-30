@@ -789,8 +789,10 @@ for each archived source tree. The build and binary copy hold one target lease, 
 collection cannot remove the executable before it is staged. Revision builds accept
 feature flags and `--locked`, `--offline` or `--frozen`. Configuration files, target
 selectors and output overrides are refused. Supply a prebuilt binary when a comparison
-needs other settings. The commit-only binary cache still requires manual
-invalidation when compiler or feature settings change.
+needs other settings. The binary cache keys each entry by commit and by the SHA-256 of
+the `--cargo-args` text, and a default build keeps the plain commit key. An entry is
+reused only when its `build.txt` records the same cargo arguments, and an entry without
+that record is rebuilt. Compiler changes still require removing the entry by hand.
 
 ```sh
 mise run bench:nsc main my-branch                                   # 1.05M triples, every query
