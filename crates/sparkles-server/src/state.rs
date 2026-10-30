@@ -20,6 +20,13 @@ pub use sparkles::reasoning::{
     AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
 };
 
+/// What [`AppState::lookup`] finds.
+pub enum Lookup {
+    Open(Arc<Dataset>),
+    Unavailable(Unavailable),
+    Missing,
+}
+
 /// Why a declared dataset does not serve (spec C01 §4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Unavailable {
@@ -413,9 +420,14 @@ pub struct AppState {
     /// whether a server with a dataset that failed to open still reports ready
     /// (`serve --ready-ignore-failed`; spec C01 §4.1)
     pub ready_ignore_failed: bool,
-    /// the datasets of `serve --mem`, `--loc` and `--fuseki-config` that startup has not
-    /// attached yet; the catalog keeps the registered ones that wait to open
+    /// the datasets whose startup has not finished: those of `serve --mem`, `--loc` and
+    /// `--fuseki-config` until they are attached, and those that startup configures
+    /// (`--text`, `--geo`, `--validate`, `--rdfs`, data files) until it has; requests
+    /// find them opening meanwhile (see [`crate::startup`])
     pub startup_pending: Mutex<BTreeMap<String, DbType>>,
+    /// whether `startup_pending` may hold names, so that lookups skip its lock after
+    /// startup
+    holding: AtomicBool,
     /// authentication and authorization (`serve --auth-config`); `None`: open
     pub auth: Option<Arc<crate::auth::Auth>>,
     /// browser origins that may call the API cross-origin, without credentials
@@ -773,6 +785,7 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             ready_ignore_failed: false,
             startup_pending: Default::default(),
+            holding: AtomicBool::new(false),
             auth: None,
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
@@ -845,6 +858,7 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             ready_ignore_failed: false,
             startup_pending: Default::default(),
+            holding: AtomicBool::new(false),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             views_options: Default::default(),
@@ -1011,16 +1025,60 @@ impl AppState {
 
     /// Why the dataset `name`, which [`get`](Self::get) does not find, cannot serve:
     /// it is still opening, or it failed to open. `None` for a name nothing declares.
+    /// The catalog records a dataset's final state before it stops listing it as
+    /// opening, so the checks run in that order.
     pub fn unavailable(&self, name: &str) -> Option<Unavailable> {
-        if self.catalog.is_opening(name) || self.startup_pending.lock().contains_key(name) {
+        if self.catalog.is_opening(name) {
             return Some(Unavailable::Opening);
         }
-        self.catalog.refusal(name).map(Unavailable::Failed)
+        if let Some(r) = self.catalog.refusal(name) {
+            return Some(Unavailable::Failed(r));
+        }
+        if self.catalog.is_expected(name) || self.held(name) {
+            return Some(Unavailable::Opening);
+        }
+        None
+    }
+
+    /// The dataset `name` for a request: open, unavailable, or missing. A dataset that
+    /// is published between the two lookups is found by a second one, so a request
+    /// that straddles its opening never gets a missing dataset.
+    pub fn lookup(&self, name: &str) -> Lookup {
+        if let Some(ds) = self.get(name) {
+            return Lookup::Open(ds);
+        }
+        #[cfg(test)]
+        crate::startup::lookup_hook(name);
+        if let Some(u) = self.unavailable(name) {
+            return Lookup::Unavailable(u);
+        }
+        match self.get(name) {
+            Some(ds) => Lookup::Open(ds),
+            None => Lookup::Missing,
+        }
     }
 
     /// Whether `name` is a dataset of this server, open or not.
     pub fn declared(&self, name: &str) -> bool {
-        self.get(name).is_some() || self.unavailable(name).is_some()
+        !matches!(self.lookup(name), Lookup::Missing)
+    }
+
+    /// Whether startup still holds `name` back from requests.
+    fn held(&self, name: &str) -> bool {
+        self.holding.load(Ordering::SeqCst) && self.startup_pending.lock().contains_key(name)
+    }
+
+    /// Hold `name` back from requests until [`release_startup`](Self::release_startup):
+    /// it answers as opening.
+    pub fn hold_for_startup(&self, name: &str, kind: DbType) {
+        self.startup_pending.lock().insert(name.to_string(), kind);
+        self.holding.store(true, Ordering::SeqCst);
+    }
+
+    /// Serve every dataset that startup held back.
+    pub fn release_startup(&self) {
+        self.startup_pending.lock().clear();
+        self.holding.store(false, Ordering::SeqCst);
     }
 
     /// The datasets that do not serve yet, by name: the registered ones that wait to
@@ -1032,15 +1090,18 @@ impl AppState {
             .into_iter()
             .map(|n| (n, DbType::Persistent, Unavailable::Opening))
             .collect();
+        let refusals = self.catalog.refusals();
         out.extend(
             self.startup_pending
                 .lock()
                 .iter()
+                .filter(|(n, _)| {
+                    !refusals.iter().any(|(r, _)| r == *n) && !self.catalog.is_opening(n)
+                })
                 .map(|(n, k)| (n.clone(), *k, Unavailable::Opening)),
         );
         out.extend(
-            self.catalog
-                .refusals()
+            refusals
                 .into_iter()
                 .map(|(n, r)| (n, DbType::Persistent, Unavailable::Failed(r))),
         );
@@ -1050,6 +1111,10 @@ impl AppState {
 
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {
         if self.leaving.lock().contains(name) {
+            return None;
+        }
+        // startup's own steps see the datasets it holds back from requests
+        if self.held(name) && !crate::startup::has_access() {
             return None;
         }
         let dataset = self.catalog.get(name)?;
@@ -1135,6 +1200,29 @@ impl AppState {
             ..Default::default()
         });
         self.catalog.attach(name, source)?;
+        Ok(self.get(name).expect("attached"))
+    }
+    /// [`attach`](Self::attach) under a name that startup took with
+    /// [`sparkles::Catalog::expect`].
+    pub fn attach_expected(
+        &self,
+        name: &str,
+        kind: DbType,
+        loc: Option<&Path>,
+    ) -> Result<Arc<Dataset>> {
+        let source = match kind {
+            DbType::Memory => sparkles::catalog::Attach::Memory,
+            DbType::Persistent => sparkles::catalog::Attach::Directory(
+                loc.map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.data_dir.join("databases").join(name)),
+            ),
+        };
+        self.catalog.set_defaults(sparkles::DatasetOptions {
+            store: self.store_opts.clone(),
+            closure_cache_triples: self.reason_cache_triples,
+            ..Default::default()
+        });
+        self.catalog.attach_expected(name, source)?;
         Ok(self.get(name).expect("attached"))
     }
     /// Mark `name` as leaving until the guard drops. A second delete or rename of the

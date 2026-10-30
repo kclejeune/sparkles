@@ -3146,43 +3146,47 @@ fn run() -> Result<()> {
                 // the embedding workers of datasets whose vector indexes compute vectors
                 vector::spawn_embedders(st.clone());
             }
-            // the datasets of --mem, --loc and --fuseki-config, which startup attaches after
-            // the registered ones open, answer as opening meanwhile
+            // Before the listener accepts a request: the datasets of --mem, --loc and
+            // --fuseki-config, which startup attaches after the registered ones open, and
+            // the datasets that startup configures answer as opening until startup has
+            // finished, and the catalog refuses the attached names to everyone else.
             {
-                let mut p = st.startup_pending.lock();
-                for m in &mem {
-                    p.insert(m.trim_start_matches('/').to_string(), state::DbType::Mem);
-                }
+                let mut attach: Vec<(String, state::DbType)> = mem
+                    .iter()
+                    .map(|m| (m.trim_start_matches('/').to_string(), state::DbType::Mem))
+                    .collect();
                 for l in &loc {
                     let (name, _) = l.split_once('=').context("--loc expects NAME=PATH")?;
-                    p.insert(
+                    attach.push((
                         name.trim_start_matches('/').to_string(),
                         state::DbType::Persistent,
-                    );
+                    ));
                 }
+                let configured: Vec<String> = text
+                    .iter()
+                    .chain(&geo)
+                    .chain(&validate)
+                    .chain(&rdfs)
+                    .map(|s| startup::step_dataset(s).to_string())
+                    .collect();
+                startup::hold(&st, &attach, &configured)?;
             }
             let after_open = move |st: &Arc<state::AppState>| -> Result<()> {
                 for m in mem {
-                    let name = m.trim_start_matches('/');
-                    let r = st.attach(name, state::DbType::Mem, None);
-                    st.startup_pending.lock().remove(name);
-                    r?;
+                    st.attach_expected(m.trim_start_matches('/'), state::DbType::Mem, None)?;
                 }
                 for l in loc {
                     let (name, path) = l.split_once('=').context("--loc expects NAME=PATH")?;
-                    let name = name.trim_start_matches('/');
-                    let r = st.attach(
-                        name,
+                    st.attach_expected(
+                        name.trim_start_matches('/'),
                         state::DbType::Persistent,
                         Some(std::path::Path::new(path)),
-                    );
-                    st.startup_pending.lock().remove(name);
-                    r?;
+                    )?;
                 }
                 // a step for a dataset that failed to open is left out: the dataset is
                 // reported failed, and the step runs at a start that opens it
                 let open = |flag: &str, spec: &str| {
-                    let name = spec.split('=').next().unwrap_or("").trim_start_matches('/');
+                    let name = startup::step_dataset(spec);
                     let failed = st.catalog.refusal(name).is_some();
                     if failed {
                         tracing::error!("{flag} {spec}: skipped, /{name} did not open");
@@ -3346,17 +3350,14 @@ fn run() -> Result<()> {
                 // the listener is bound: open the datasets, then finish startup and
                 // become ready (spec C01 §4.1)
                 let notify = fatal_notify.clone();
-                *startup_slot.lock() = Some(startup::spawn(
-                    st.clone(),
-                    pending,
-                    open_options,
-                    after_open,
-                    move |e| {
+                let opening =
+                    startup::spawn(st.clone(), pending, open_options, after_open, move |e| {
                         tracing::error!("startup failed, stopping: {e:#}");
                         *fatal.lock() = Some(e);
                         notify.notify_one();
-                    },
-                ));
+                    });
+                let stop_opening = opening.stop_flag();
+                *startup_slot.lock() = Some(opening);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
                 let (draining_tx, draining) = tokio::sync::oneshot::channel();
@@ -3365,7 +3366,8 @@ fn run() -> Result<()> {
                         _ = shutdown_signal() => {}
                         _ = fatal_notify.notified() => {}
                     }
-                    st2.set_phase(obs::Phase::Draining);
+                    // before the requests drain: startup opens no more datasets
+                    startup::begin_shutdown(&st2, &stop_opening);
                     // open MCP streams would hold the shutdown up
                     #[cfg(feature = "mcp")]
                     if let Some(m) = &st2.mcp {

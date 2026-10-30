@@ -694,9 +694,7 @@ async fn restoring_guard(
         || (route == Some("/$/datasets/{ds}") && req.method() == axum::http::Method::DELETE)
     {
         // a dataset that is opening or failed to open cannot be renamed or deleted
-        if st.catalog.get(&ds).is_none()
-            && let Some(u) = st.unavailable(&ds)
-        {
+        if let crate::state::Lookup::Unavailable(u) = st.lookup(&ds) {
             return unavailable_error(&ds, &u).into_response();
         }
         return next.run(req).await;
@@ -720,7 +718,7 @@ async fn restoring_guard(
         // (its readiness route reports the state itself)
         Ok((None, _))
             if route != Some("/$/ready/{ds}")
-                && let Some(u) = st.unavailable(&ds) =>
+                && let crate::state::Lookup::Unavailable(u) = st.lookup(&ds) =>
         {
             unavailable_error(&ds, &u).into_response()
         }
@@ -917,10 +915,16 @@ impl From<anyhow::Error> for ApiError {
 pub(crate) type ApiResult<T = Response> = Result<T, ApiError>;
 
 pub(crate) fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
-    let ds = st.get(name).ok_or_else(|| match st.unavailable(name) {
-        Some(u) => unavailable_error(name, &u),
-        None => err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")),
-    })?;
+    let ds = match st.lookup(name) {
+        crate::state::Lookup::Open(ds) => ds,
+        crate::state::Lookup::Unavailable(u) => return Err(unavailable_error(name, &u)),
+        crate::state::Lookup::Missing => {
+            return Err(err(
+                StatusCode::NOT_FOUND,
+                format!("no such dataset: /{name}"),
+            ));
+        }
+    };
     // the branch the request chose (`?branch=`, `/{ds}@{branch}/…`)
     match branches::current() {
         Some(b) if b != sparkles::branch::MAIN => Ok(st.branch_dataset(&ds, &b)?),

@@ -2435,10 +2435,10 @@ pub async fn ready_dataset(
     axum::Extension(p): axum::Extension<crate::auth::Principal>,
 ) -> Response {
     let (status, server_ok) = server_status(&st);
-    let (ok, entry) = match st.get(&name) {
-        Some(d) => (server_ok, dataset_ready_for(&d, &p)),
-        None => match st.unavailable(&name) {
-            Some(u) => {
+    let (ok, entry) = match st.lookup(&name) {
+        crate::state::Lookup::Open(d) => (server_ok, dataset_ready_for(&d, &p)),
+        found => match found {
+            crate::state::Lookup::Unavailable(u) => {
                 let kind = st
                     .startup_pending
                     .lock()
@@ -2447,7 +2447,7 @@ pub async fn ready_dataset(
                     .unwrap_or(DbType::Persistent);
                 (false, unavailable_ready(&name, kind, &u, &p))
             }
-            None => {
+            _ => {
                 return (
                     StatusCode::NOT_FOUND,
                     axum::Json(json!({ "error": format!("no such dataset: /{name}") })),

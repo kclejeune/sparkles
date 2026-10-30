@@ -86,10 +86,15 @@ pub fn spawn(
                 ));
                 return;
             }
-            if let Err(e) = then(&st) {
+            // the later steps see the datasets that startup holds back from requests
+            if let Err(e) = with_access(|| then(&st)) {
                 fatal(e);
                 return;
             }
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            st.release_startup();
             if st.mark_ready() {
                 let (status, ready) = crate::obs::server_status(&st);
                 tracing::info!(
@@ -105,7 +110,94 @@ pub fn spawn(
     }
 }
 
+/// Tells startup to stop: [`begin_shutdown`] sets it.
+#[derive(Clone)]
+pub struct StopFlag(Arc<AtomicBool>);
+
+/// What the server does first when a shutdown starts, before it drains its requests:
+/// readiness reports `draining`, and startup opens no more datasets and runs no more
+/// steps. The datasets opening now finish, and the server waits for them once the
+/// requests have drained ([`Startup::stop_and_join`]).
+pub fn begin_shutdown(st: &AppState, stop: &StopFlag) {
+    st.set_phase(crate::obs::Phase::Draining);
+    stop.0.store(true, Ordering::SeqCst);
+}
+
+thread_local! {
+    static ACCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread runs startup's own steps, which see the datasets that startup
+/// holds back from requests.
+pub fn has_access() -> bool {
+    ACCESS.get()
+}
+
+fn with_access<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ACCESS.set(false);
+        }
+    }
+    ACCESS.set(true);
+    let _reset = Reset;
+    f()
+}
+
+/// Hold back from requests, until startup has finished, the datasets that startup
+/// attaches (`attach`, which the catalog reserves now) and those it configures
+/// (`configured`, by name). Each answers as opening meanwhile, so no request reads or
+/// writes it before its configuration is installed.
+pub fn hold(
+    st: &AppState,
+    attach: &[(String, crate::state::DbType)],
+    configured: &[String],
+) -> anyhow::Result<()> {
+    for (name, kind) in attach {
+        st.catalog.expect(name)?;
+        st.hold_for_startup(name, *kind);
+    }
+    for name in configured {
+        if !st.startup_pending.lock().contains_key(name) {
+            st.hold_for_startup(name, crate::state::DbType::Persistent);
+        }
+    }
+    Ok(())
+}
+
+/// The dataset a startup step such as `--text NAME[=CONFIG]` names.
+pub fn step_dataset(spec: &str) -> &str {
+    spec.split('=').next().unwrap_or("").trim_start_matches('/')
+}
+
+/// Hooks that run in [`AppState::lookup`] between its first miss and the state checks,
+/// by dataset name (each test uses names of its own).
+#[cfg(test)]
+pub(crate) static LOOKUP_HOOKS: parking_lot::Mutex<
+    std::collections::BTreeMap<String, Arc<dyn Fn() + Send + Sync>>,
+> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn lookup_hook(name: &str) {
+    let hook = LOOKUP_HOOKS.lock().get(name).cloned();
+    if let Some(h) = hook {
+        h()
+    }
+}
+
 impl Startup {
+    /// The flag that [`begin_shutdown`] sets.
+    pub fn stop_flag(&self) -> StopFlag {
+        StopFlag(self.stop.clone())
+    }
+
+    /// Whether startup has finished or given up.
+    #[cfg(test)]
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+
     /// Open no more datasets, and wait for the ones opening now. A dataset left
     /// unopened stays registered and opens at the next start.
     pub fn stop_and_join(mut self) {

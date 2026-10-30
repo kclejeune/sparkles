@@ -293,11 +293,15 @@ fn a_failed_later_step_is_fatal_and_the_server_never_becomes_ready() {
     assert_eq!(st.phase(), crate::obs::Phase::Starting);
 }
 
-#[test]
-fn a_shutdown_during_the_opening_waits_for_it_and_keeps_every_dataset_registered() {
+/// The production ordering of a shutdown: the server begins it (`begin_shutdown`, as
+/// the shutdown future does) while a long request holds the drain open. Startup opens
+/// no more datasets from that moment, not only once the drain has finished, and the
+/// datasets left unopened stay registered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_stops_the_opening_before_requests_drain() {
     let dir = data_dir(&["a", "b", "c"], false);
     let (st, pending) = deferred(dir.path(), false);
-    let gate = Gate::holding(&["a"]);
+    let gate = Gate::holding(&["a", "b", "c"]);
     let opening = startup::spawn(
         st.clone(),
         pending,
@@ -305,18 +309,83 @@ fn a_shutdown_during_the_opening_waits_for_it_and_keeps_every_dataset_registered
         |_| panic!("the later steps ran after a shutdown"),
         |e| panic!("fatal: {e}"),
     );
-    gate.wait_entered("a");
-    // the server drains, then stops the opening
-    st.set_phase(crate::obs::Phase::Draining);
-    let joined = std::thread::spawn(move || opening.stop_and_join());
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(!joined.is_finished(), "the shutdown did not wait for /a");
+    let stop = opening.stop_flag();
+    let gate_a = gate.clone();
+    tokio::task::spawn_blocking(move || gate_a.wait_entered("a"))
+        .await
+        .unwrap();
+
+    // a request that holds the drain open until the test lets it finish
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let (e2, f2) = (entered.clone(), finish.clone());
+    let app = Router::new()
+        .route(
+            "/test/hold",
+            axum::routing::get(move || {
+                let (e, f) = (e2.clone(), f2.clone());
+                async move {
+                    e.notify_one();
+                    f.notified().await;
+                    "done"
+                }
+            }),
+        )
+        .merge(router(st.clone()));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let st2 = st.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            l,
+            app.into_make_service_with_connect_info::<crate::auth::Peer>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = rx.await;
+            startup::begin_shutdown(&st2, &stop);
+        })
+        .await
+        .unwrap();
+    });
+    let held = tokio::spawn(async move {
+        reqwest::get(format!("{base}/test/hold"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    });
+    entered.notified().await;
+    tx.send(()).unwrap();
+    let st3 = st.clone();
+    tokio::task::spawn_blocking(move || {
+        eventually("draining", || st3.phase() == crate::obs::Phase::Draining)
+    })
+    .await
+    .unwrap();
+    assert!(
+        !server.is_finished(),
+        "the request no longer holds the drain"
+    );
+
+    // /a finishes opening, and no other dataset starts while the drain goes on
     gate.release("a");
-    joined.join().unwrap();
-    // the dataset that was opening finished, and no other one started
-    assert!(st.get("a").is_some());
+    let opening = tokio::task::spawn_blocking(move || {
+        eventually("startup gives up", || opening.is_finished());
+        opening
+    })
+    .await
+    .unwrap();
     assert!(!gate.entered("b") && !gate.entered("c"));
+    assert!(st.get("a").is_some());
     assert_eq!(st.catalog.opening(), ["b", "c"]);
+    assert!(!server.is_finished());
+
+    finish.notify_one();
+    assert_eq!(held.await.unwrap(), "done");
+    server.await.unwrap();
+    opening.stop_and_join();
     assert_eq!(st.phase(), crate::obs::Phase::Draining);
     drop(st);
     // the next start opens all of them
@@ -324,4 +393,193 @@ fn a_shutdown_during_the_opening_waits_for_it_and_keeps_every_dataset_registered
     for n in ["a", "b", "c"] {
         assert_eq!(st.get(n).unwrap().store.snapshot().len(), 1, "{n}");
     }
+}
+
+/// A dataset that startup configures (here with `--validate`) answers as opening until
+/// the configuration is installed, so no write reaches it unvalidated while another
+/// dataset still opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_configuration_is_installed_before_a_dataset_serves() {
+    let dir = data_dir(&["cfg", "slow"], false);
+    let conf = dir.path().join("reject.json");
+    std::fs::write(
+        dir.path().join("shapes.ttl"),
+        "<urn:S> a <http://www.w3.org/ns/shacl#NodeShape> ; \
+         <http://www.w3.org/ns/shacl#targetClass> <http://ex.org/P> ; \
+         <http://www.w3.org/ns/shacl#property> [ \
+         <http://www.w3.org/ns/shacl#path> <http://ex.org/name> ; \
+         <http://www.w3.org/ns/shacl#minCount> 1 ] .",
+    )
+    .unwrap();
+    std::fs::write(
+        &conf,
+        r#"{"mode": "reject", "shapes": {"source": "shapes.ttl"}}"#,
+    )
+    .unwrap();
+    let (st, pending) = deferred(dir.path(), false);
+    startup::hold(&st, &[], &["cfg".to_string()]).unwrap();
+    let app = router(st.clone());
+    let gate = Gate::holding(&["slow"]);
+    let spec = format!("cfg={}", conf.display());
+    let opening = startup::spawn(
+        st.clone(),
+        pending,
+        options(Some(&gate), 2),
+        move |st| crate::write_validation::validate_at_startup(st, &spec).map(drop),
+        |e| panic!("fatal: {e}"),
+    );
+    let (st2, gate2) = (st.clone(), gate.clone());
+    tokio::task::spawn_blocking(move || {
+        gate2.wait_entered("slow");
+        eventually("cfg opens", || st2.catalog.get("cfg").is_some());
+    })
+    .await
+    .unwrap();
+    let invalid = "INSERT DATA { <urn:x> a <http://ex.org/P> }";
+    let update = |body: &str| {
+        Request::post("/cfg/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    // open in the catalog, but not served before its validation is installed
+    let r = send(&app, update(invalid)).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.json()["code"], "dataset-opening");
+    let r = send(
+        &app,
+        Request::get("/$/ready/cfg").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(r.json()["datasets"][0]["state"], "opening", "{}", r.text());
+    assert_eq!(st.catalog.get("cfg").unwrap().store().snapshot().len(), 1);
+
+    gate.release("slow");
+    let st2 = st.clone();
+    tokio::task::spawn_blocking(move || {
+        eventually("ready", || st2.phase() == crate::obs::Phase::Ready)
+    })
+    .await
+    .unwrap();
+    let r = send(&app, update(invalid)).await;
+    assert!(r.status.is_client_error(), "{} {}", r.status, r.text());
+    let r = send(
+        &app,
+        update("INSERT DATA { <urn:y> a <http://ex.org/P> ; <http://ex.org/name> \"y\" }"),
+    )
+    .await;
+    assert!(r.status.is_success(), "{} {}", r.status, r.text());
+    opening.stop_and_join();
+}
+
+/// The names that startup attaches (`--mem`, `--loc`, `--fuseki-config`) are taken
+/// before requests arrive: an administrator cannot create or rename a dataset into
+/// one, and startup still attaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn names_that_startup_attaches_are_reserved() {
+    let dir = data_dir(&["a", "slow"], false);
+    let (st, pending) = deferred(dir.path(), false);
+    startup::hold(&st, &[("scratch".to_string(), DbType::Mem)], &[]).unwrap();
+    // a registered name cannot be attached as well
+    assert!(startup::hold(&st, &[("a".to_string(), DbType::Mem)], &[]).is_err());
+    let app = router(st.clone());
+    let gate = Gate::holding(&["slow"]);
+    let opening = startup::spawn(
+        st.clone(),
+        pending,
+        options(Some(&gate), 2),
+        |st| st.attach_expected("scratch", DbType::Mem, None).map(drop),
+        |e| panic!("fatal: {e}"),
+    );
+    let (st2, gate2) = (st.clone(), gate.clone());
+    tokio::task::spawn_blocking(move || {
+        gate2.wait_entered("slow");
+        eventually("a opens", || st2.get("a").is_some());
+    })
+    .await
+    .unwrap();
+    let r = send(
+        &app,
+        Request::post("/$/datasets?dbName=scratch&dbType=mem")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let r = send(
+        &app,
+        Request::post("/$/datasets/a/rename")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name": "scratch"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let r = send(
+        &app,
+        Request::get("/scratch/sparql?query=ASK%7B%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.json()["code"], "dataset-opening");
+
+    gate.release("slow");
+    let st2 = st.clone();
+    tokio::task::spawn_blocking(move || {
+        eventually("ready", || st2.phase() == crate::obs::Phase::Ready)
+    })
+    .await
+    .unwrap();
+    let r = send(
+        &app,
+        Request::get("/scratch/sparql?query=ASK%7B%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(st.get("a").is_some());
+    opening.stop_and_join();
+}
+
+/// A lookup that misses a dataset just before startup publishes it still finds it:
+/// the request gets the dataset, never a missing one.
+#[test]
+fn a_lookup_that_straddles_publication_finds_the_dataset() {
+    let dir = data_dir(&["straddle"], false);
+    let (st, pending) = deferred(dir.path(), false);
+    let gate = Gate::holding(&["straddle"]);
+    let opening = startup::spawn(
+        st.clone(),
+        pending,
+        options(Some(&gate), 1),
+        |_| Ok(()),
+        |e| panic!("fatal: {e}"),
+    );
+    gate.wait_entered("straddle");
+    let once = std::sync::atomic::AtomicBool::new(false);
+    let (st2, gate2) = (st.clone(), gate.clone());
+    startup::LOOKUP_HOOKS.lock().insert(
+        "straddle".into(),
+        Arc::new(move || {
+            if once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // the first lookup missed: the dataset is published, and leaves the
+            // opening state, before the lookup goes on
+            gate2.release("straddle");
+            eventually("published", || {
+                st2.catalog.get("straddle").is_some() && !st2.catalog.is_opening("straddle")
+            });
+        }),
+    );
+    let found = st.lookup("straddle");
+    startup::LOOKUP_HOOKS.lock().remove("straddle");
+    assert!(
+        matches!(found, crate::state::Lookup::Open(_)),
+        "the straddling lookup missed the dataset"
+    );
+    opening.stop_and_join();
 }
