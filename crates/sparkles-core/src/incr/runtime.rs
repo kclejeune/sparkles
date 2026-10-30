@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-const COMPILER: &str = "f13-phase1-2";
+const COMPILER: &str = "f13-phase1-3";
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
 /// The most rows a circuit's diff history keeps for resumed live queries.
@@ -2364,7 +2364,11 @@ mod compiler_tests {
     /// holds, so it needs a new `COMPILER` and a new row here: a state checkpointed by
     /// the old compiler is then refused by its fingerprint and the view is built
     /// again, instead of being decoded into the wrong operators.
-    const VERSIONS: &[(&str, &str)] = &[("f13-phase1-2", "650d426b8dbb3bb3")];
+    const VERSIONS: &[(&str, &str)] = &[
+        ("f13-phase1-2", "650d426b8dbb3bb3"),
+        // a GRAPH inside GRAPH compiles to a recompute node
+        ("f13-phase1-3", "650d426b8dbb3bb3"),
+    ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or
     /// whitespace.

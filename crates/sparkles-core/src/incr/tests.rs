@@ -621,6 +621,35 @@ fn edge_cases_follow_the_oracle() {
                 "DELETE DATA { GRAPH :g { :a :p 1 } }",
             ],
         ),
+        // a GRAPH inside GRAPH ?g: ?g ranges over every named graph, whatever the
+        // inner GRAPH reads, so a graph the inner pattern never reads changes it
+        (
+            "SELECT ?g ?h ?o WHERE { GRAPH ?g { GRAPH ?h { ?s :p ?o } } }",
+            &[
+                "INSERT DATA { GRAPH :h { :a :p 1 } }",
+                "INSERT DATA { GRAPH :x { :a :other 1 } }",
+                "INSERT DATA { GRAPH :x { :b :p 2 } }",
+                "DELETE DATA { GRAPH :x { :a :other 1 . :b :p 2 } }",
+            ],
+        ),
+        (
+            "SELECT ?g ?s WHERE { GRAPH ?g { ?s :q ?o GRAPH :h { ?s :p ?x } } }",
+            &[
+                "INSERT DATA { GRAPH :h { :a :p 1 } }",
+                "INSERT DATA { GRAPH :x { :a :q 1 } }",
+                "INSERT DATA { :a :q 2 }",
+                "DELETE DATA { GRAPH :x { :a :q 1 } }",
+            ],
+        ),
+        // a GRAPH inside a constant GRAPH reads only while the outer graph exists
+        (
+            "SELECT ?h ?o WHERE { GRAPH :x { GRAPH ?h { ?s :p ?o } } }",
+            &[
+                "INSERT DATA { GRAPH :h { :a :p 1 } }",
+                "INSERT DATA { GRAPH :x { :b :q 1 } }",
+                "DELETE DATA { GRAPH :x { :b :q 1 } }",
+            ],
+        ),
         // a template's blank node is one node per occurrence of a solution
         (
             "CONSTRUCT { [] :p ?o } WHERE { ?s :v ?o }",
