@@ -4,7 +4,7 @@ use super::ctx::{Ctx, TermKind};
 use super::fnlib;
 use super::table::{Table, VarId};
 use super::value::{EvalResult, Num, NumOp, TypeError, Value, arith, compare, equals};
-use crate::id::Id;
+use crate::id::{Id, Tag};
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, NamedNode, Term};
 use oxsdatatypes::*;
@@ -1270,6 +1270,26 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             }
         }
         F::Year | F::Month | F::Day | F::Hours | F::Minutes | F::Seconds | F::Timezone | F::Tz => {
+            // An inline date or dateTime holds its components, which would otherwise
+            // be written as text, parsed and recomputed from the timeline.
+            if let Some(Expr::Var(var)) = args.first()
+                && let id = row.get(*var)
+                && matches!(id.tag(), Tag::Date | Tag::DateTime)
+            {
+                let (y, mo, d, h, mi) = crate::id::date_time_fields(id.payload());
+                let time = id.tag() == Tag::DateTime;
+                let int = |i: i64| Some(Val::V(Value::Integer(i.into())));
+                if let Some(v) = match f {
+                    F::Year => int(y),
+                    F::Month => int(mo.into()),
+                    F::Day => int(d.into()),
+                    F::Hours => int(if time { h.into() } else { 0 }),
+                    F::Minutes => int(if time { mi.into() } else { 0 }),
+                    _ => None,
+                } {
+                    return Ok(v);
+                }
+            }
             let v = a0()?;
             let (y, mo, d, h, mi, se, tz) = match &*v {
                 Value::DateTime(dt) => (
