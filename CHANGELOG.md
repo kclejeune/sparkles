@@ -22,6 +22,12 @@ member drop witnesses and final family admission protect rename, delete and back
 Recovery checks existing roots and original identities, and uncertain delete moves retain
 their original bytes instead of creating an empty replacement.
 
+A close callback that panics during catalog delete or rename no longer drops the dataset
+from `config.json` on the next save. The dataset stays registered and closed until the
+catalog reopens. Catalog startup refuses only a registered dataset whose directory or
+CURRENT file is missing and serves the others. Retained delete bytes are named
+`.kept-<name>-<token>`.
+
 Spilled ORDER BY can retry a smaller sort piece after a transient decoding reservation
 fails. Infallible expression failures still stop the query, and memory caps stay enforced.
 

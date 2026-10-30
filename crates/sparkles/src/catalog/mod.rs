@@ -267,6 +267,20 @@ impl Catalog {
                 )));
             }
             let opened = if e.kind == DatasetKind::Persistent {
+                // A registered root that lost its directory or CURRENT is refused
+                // alone, so that the catalog serves the others and nothing recreates it.
+                if let Some(msg) = catalog.missing_registered_root(&e.name)? {
+                    tracing::error!(target: "sparkles::catalog", "{msg}");
+                    catalog.inner.detached.lock().insert(
+                        e.name.clone(),
+                        Detached {
+                            id: None,
+                            reasoning: e.reasoning,
+                        },
+                    );
+                    catalog.inner.refused.lock().insert(e.name, msg);
+                    continue;
+                }
                 catalog.open_existing_dataset(&e.name, None)
             } else {
                 catalog.open_dataset(&e.name, e.kind, None)
@@ -515,6 +529,27 @@ impl Catalog {
             ),
         }
     }
+    /// Why a registered persistent dataset cannot be opened in place, when its root
+    /// directory or its CURRENT file is missing.
+    fn missing_registered_root(&self, name: &str) -> Result<Option<String>> {
+        let root = self.database_dir(name)?;
+        let missing = match std::fs::symlink_metadata(&root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "its directory is missing",
+            Err(e) => return Err(e.into()),
+            Ok(_) => match std::fs::symlink_metadata(root.join("CURRENT")) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    "its directory has no CURRENT file"
+                }
+                Err(e) => return Err(e.into()),
+                Ok(_) => return Ok(None),
+            },
+        };
+        Ok(Some(format!(
+            "dataset \"{name}\" is not served: {missing} at {}. Bytes that an interrupted \
+             delete could not put back remain in databases/{KEPT_PREFIX}{name}-<token>",
+            root.display()
+        )))
+    }
     /// Registered and recovery roots cannot acquire create semantics.
     fn open_existing_dataset(&self, name: &str, expected: Option<Uuid>) -> Result<Dataset> {
         let mut opts = self.dataset_options(name);
@@ -631,7 +666,12 @@ impl Catalog {
             if managed {
                 let root = entry.dataset.store().root().map(Path::to_path_buf);
                 let id = entry.dataset.dataset_id();
-                let reasoning = match entry.dataset.close_for_disposal(|| drop(map.take())) {
+                self.hold_closing_locked(name, &entry.dataset);
+                let closed = entry.dataset.close_for_disposal(|| drop(map.take()));
+                // A committed close that unwinds out of this call leaves the dataset
+                // registered and closed, never absent from what later saves write.
+                self.inner.detached.lock().remove(name);
+                let reasoning = match closed {
                     Ok(reasoning) => reasoning,
                     Err(refused) => {
                         let dataset = refused.dataset;
@@ -684,6 +724,20 @@ impl Catalog {
                 "deleted dataset cleanup failed; trash is retried on catalog open and retained paths require operator recovery");
         }
         Ok(true)
+    }
+
+    /// Keep a managed dataset registered while its runtime closes, as an in-place
+    /// restore does. If a close callback panics after the close commits, the unwind
+    /// leaves this record, so later saves keep the dataset in `config.json` and the
+    /// name stays unavailable until the next [`Catalog::open`] reopens it.
+    fn hold_closing_locked(&self, name: &str, dataset: &Dataset) {
+        self.inner.detached.lock().insert(
+            name.into(),
+            Detached {
+                id: Some(dataset.dataset_id()),
+                reasoning: dataset.reasoning_record(),
+            },
+        );
     }
 
     /// An irrevocably closed state is never revived on later I/O refusal.
@@ -795,7 +849,11 @@ impl Catalog {
         }
         let dir = self.dir().expect("persistent catalog");
         let id = entry.dataset.dataset_id();
-        let reasoning = match entry.dataset.close_for_disposal(|| drop(map.take())) {
+        self.hold_closing_locked(from, &entry.dataset);
+        let closed = entry.dataset.close_for_disposal(|| drop(map.take()));
+        // As in delete, only an unwinding committed close keeps this record.
+        self.inner.detached.lock().remove(from);
+        let reasoning = match closed {
             Ok(reasoning) => reasoning,
             Err(refused) => {
                 let dataset = refused.dataset;
@@ -1336,7 +1394,12 @@ fn delete_fail_point(point: u8) -> Result<()> {
 fn move_to_trash(root: &Path) -> std::result::Result<PathBuf, DeleteMoveError> {
     let parent = root.parent().expect("database parent");
     let token = Uuid::new_v4();
-    let kept = parent.join(format!("{KEPT_PREFIX}{token}"));
+    // The dataset name lets an operator match retained bytes to a refused entry.
+    let name = root
+        .file_name()
+        .expect("dataset directory")
+        .to_string_lossy();
+    let kept = parent.join(format!("{KEPT_PREFIX}{name}-{token}"));
     delete_fail_point(DELETE_BEFORE_MOVE).map_err(|error| DeleteMoveError {
         error,
         reopen: true,

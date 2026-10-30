@@ -563,9 +563,30 @@ fn failed_delete_rollback_keeps_original_bytes_unavailable_without_a_new_root() 
         assert_eq!(store.snapshot().len(), 1);
         drop(store);
         if point == DELETE_ROLLBACK_MOVE {
-            // Catalog boot may refuse the missing registered root, but it must
-            // neither invent it nor garbage-collect existing kept source bytes.
-            assert!(Catalog::open(dir.path(), Default::default()).is_err());
+            assert!(
+                bytes
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{KEPT_PREFIX}source-")),
+                "{bytes:?}"
+            );
+            // Boot refuses only the missing registered root. It neither invents it
+            // nor garbage-collects the kept source bytes.
+            let booted = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert!(booted.get("source").is_none());
+            let refused = booted.refused();
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].0, "source");
+            assert!(
+                refused[0].1.contains(&root.display().to_string()),
+                "{refused:?}"
+            );
+            assert!(matches!(
+                booted.create("source", &Default::default()),
+                Err(Error::Conflict(_))
+            ));
+            drop(booted);
             assert!(!root.exists());
             assert!(bytes.exists());
             std::fs::rename(&bytes, &root).unwrap();
@@ -737,4 +758,136 @@ fn precommit_panic_restores_original_graph_before_propagation() {
     drop(child);
     drop(restored);
     assert!(cat.delete("source").unwrap());
+}
+
+/// A close callback that panics after the runtime close commits.
+struct PanickingClose;
+impl crate::guard::CommitGuard for PanickingClose {
+    fn check(
+        &self,
+        _: &crate::guard::Candidate<'_>,
+    ) -> crate::Result<crate::guard::ValidationSummary> {
+        unreachable!("installed after the final write")
+    }
+    fn describe(&self) -> String {
+        "post-commit close panic".into()
+    }
+    fn close(&self, _: &crate::commit::CommitInfo, _: &crate::store::Snapshot) {
+        std::panic::panic_any("post-commit-close-panic");
+    }
+}
+
+#[test]
+fn post_commit_close_panic_keeps_the_dataset_registered_across_later_saves() {
+    for rename in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        ds.update("INSERT DATA { <urn:a> <urn:p> 1 }").unwrap();
+        let id = ds.dataset_id();
+        ds.store().set_guard(Some(Arc::new(PanickingClose)));
+        drop(ds);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if rename {
+                cat.rename("source", "target").map(|_| true)
+            } else {
+                cat.delete("source")
+            }
+        }));
+        let payload = result.unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"post-commit-close-panic")
+        );
+        // The catalog keeps serving, as a server does after a caught handler panic.
+        assert!(cat.get("source").is_none());
+        assert!(matches!(
+            cat.create("source", &Default::default()),
+            Err(Error::Conflict(_))
+        ));
+        cat.create("other", &Default::default()).unwrap();
+        drop(cat);
+        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+        let source = reopened
+            .get("source")
+            .unwrap_or_else(|| panic!("rename={rename}: dataset was unregistered"));
+        assert_eq!(source.dataset_id(), id);
+        assert_eq!(source.len(), 1);
+        assert!(reopened.get("target").is_none());
+        assert!(reopened.get("other").is_some());
+    }
+}
+
+#[test]
+fn refused_close_removes_the_closing_registration() {
+    for rename in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        // A raw Weak alias makes the ownership proof refuse after the preflight.
+        let weak = Arc::downgrade(ds.inner_state());
+        drop(ds);
+        let refused = if rename {
+            cat.rename("source", "target").map(|_| true)
+        } else {
+            cat.delete("source")
+        };
+        assert!(
+            matches!(refused, Err(Error::Conflict(_))),
+            "{:?}",
+            refused.err()
+        );
+        assert!(!cat.inner.detached.lock().contains_key("source"));
+        assert!(cat.get("source").is_some());
+        drop(weak);
+        if rename {
+            cat.rename("source", "target").unwrap();
+            assert!(cat.get("target").is_some());
+            assert!(cat.inner.detached.lock().is_empty());
+        } else {
+            assert!(cat.delete("source").unwrap());
+            assert!(cat.inner.detached.lock().is_empty());
+        }
+        drop(cat);
+        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.get("target").is_some(), rename);
+        assert!(reopened.get("source").is_none());
+    }
+}
+
+#[test]
+fn boot_refuses_only_a_registered_root_without_directory_or_current() {
+    for lose_current in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        cat.create("a", &Default::default()).unwrap();
+        cat.create("b", &Default::default()).unwrap();
+        drop(cat);
+        let root = dir.path().join("databases").join("a");
+        if lose_current {
+            std::fs::remove_file(root.join("CURRENT")).unwrap();
+        } else {
+            std::fs::rename(&root, dir.path().join("databases/.kept-a-x")).unwrap();
+        }
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(cat.get("b").is_some());
+        assert!(cat.get("a").is_none());
+        let refused = cat.refused();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, "a");
+        assert!(
+            refused[0].1.contains(&root.display().to_string()),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            cat.create("a", &Default::default()),
+            Err(Error::Conflict(_))
+        ));
+        // Later saves keep the refused entry registered.
+        cat.create("c", &Default::default()).unwrap();
+        drop(cat);
+        assert_eq!(root.exists(), lose_current, "boot must not recreate a root");
+        let again = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(again.refused().len(), 1);
+    }
 }
