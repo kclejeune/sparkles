@@ -265,8 +265,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 ### SPARQL and formats
 
 * Sparkles lacks ARQ's JavaScript functions, `afn:context`, the Leviathan `lfn:` library
-  and the `JSON` query form, and `afn:collation` orders by code point instead of by
-  locale. Roadmap item 69, a lower-priority extension outside the completion of Server and
+  the `JSON` query form, ARQ's `EXISTS { … }` group element and `AGG` with more than one
+  argument. `afn:print` and `afn:execTime` print nothing, and `afn:collation` orders by
+  code point instead of by locale. Roadmap item 69, a lower-priority extension outside the completion of Server and
   Fuseki integration.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.

@@ -592,7 +592,7 @@ for them.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 69 | **ARQ extras.** JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form and locale collation. This lower-priority extension is outside the completion path of server and Fuseki integration. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M each |
+| 69 | **ARQ extras.** JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form, ARQ's `EXISTS { … }` group element, `AGG` with more than one argument, printing in `afn:print` and `afn:execTime`, and locale collation. This lower-priority extension is outside the completion path of server and Fuseki integration. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M each |
 | 70 | **Jena-compatible GeoSPARQL mode.** Not adopted. Sparkles keeps the answers that [COMPARISON.md](COMPARISON.md#geosparql) describes, and the number stays listed so that it is not reused. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 
 ## Completed
