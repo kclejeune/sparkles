@@ -139,6 +139,9 @@ environment and saved credentials remain under the same item.
 * Python async administration and bulk operations remain under roadmap item 58.
   The available async surface covers queries, updates, bounded cursors and transactions.
 * JVM functions registered in Java run through ARQ. Roadmap item 25.
+* The server and CLI need the host's system CA certificates, even for loopback commands
+  such as `sparkles ping`, because the HTTP client loads them when it starts. Minimal
+  images such as bare Debian leave them out. Roadmap item 59.
 
 ## Configuration and usage
 

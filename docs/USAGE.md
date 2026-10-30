@@ -106,6 +106,10 @@ without a migration path, so keep backups of anything you cannot regenerate.
 
 Linux is the primary production server platform. The CLI also supports macOS for
 local administration, imports, queries and encrypted backup operations.
+A Linux host needs the system CA certificates, the `ca-certificates` package on Debian,
+Ubuntu and Rocky Linux. The built-in HTTP client loads them when it starts, even for a
+loopback command such as `sparkles ping`, and minimal container images often leave them
+out.
 
 ```sh
 sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
