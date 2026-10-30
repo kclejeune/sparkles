@@ -381,7 +381,7 @@ fn a_stamp_names_the_commit_exactly() {
             for i in 1..4 {
                 let s = &s;
                 scope.spawn(move || {
-                    upd(&s, &format!("INSERT DATA {{ <urn:x{i}> <urn:p> {i} }}")).unwrap();
+                    upd(s, &format!("INSERT DATA {{ <urn:x{i}> <urn:p> {i} }}")).unwrap();
                 });
             }
             while s.writers_waiting() < 3 {
@@ -509,7 +509,7 @@ fn an_unenforceable_registry_refuses_writes_and_keeps_reads() {
         let dev = s.branch("dev").unwrap();
         for store in [&s, &*dev] {
             let r = upd(
-                &store,
+                store,
                 "INSERT DATA { GRAPH <urn:free> { <urn:x> <urn:p> 1 } }",
             );
             assert_eq!(managed_code(r), "managed-unavailable", "{what}");
