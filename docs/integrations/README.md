@@ -101,10 +101,13 @@ The JVM `DatasetGraphSparkles.mappings()` and Node.js `Dataset.mappings` handles
 version, store, delete and run mappings. Their `runMapping` methods run mapping text.
 Both return the commit receipt and mapping statistics. The default JVM and Node.js
 packages do not enable SQLite or Parquet mapping sources. Their direct and stored runs
-carry cancellation and deadlines through conversion and the final load.
+carry cancellation and deadlines through conversion and the final load. Python
+`Dataset.run_mapping` and `Dataset.mappings.run` take no cancellation token or
+timeout, and Ctrl-C does not stop them.
 
 Native Rust callers use `Dataset::run_mapping_with` with `guard::WriteOptions` for
-controls that cover conversion and the final load. The complete write options retain
+controls that cover conversion and the final load. `StoredMappings::run` applies the
+cancellation sources and deadline of its write options to conversion in the same way. The complete write options retain
 all cancellation sources, the deadline, graph permissions, preconditions, preview
 settings and commit metadata. Checks run at conversion boundaries and existing reader
 checkpoints, and the loader applies the same controls while acquiring the writer and
@@ -142,6 +145,7 @@ environment and saved credentials remain under the same item.
   workflows build for Linux on x86_64 and arm64 and for macOS on Apple silicon only, with
   no Windows or Intel macOS packages, and Linux is the platform tested locally. The JVM
   library has no musl build. Roadmap item 58.
+* Python mapping runs cannot be cancelled and have no timeout. Roadmap item 404.
 * Python async administration and bulk operations remain under roadmap item 58.
   The available async surface covers queries, updates, bounded cursors and transactions.
 * JVM functions registered in Java run through ARQ. Roadmap item 25.
