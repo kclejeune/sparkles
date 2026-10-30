@@ -1284,6 +1284,22 @@ impl Graph {
         self.base.is_some() && lo < self.offset && hi > 0
     }
 
+    /// The number of predicates of the in-memory rows.
+    pub fn predicate_count(&self) -> usize {
+        self.by_p.iter().map(|m| m.len()).sum()
+    }
+
+    /// Calls `f` with each predicate of an in-memory row from row `lo` on.
+    pub fn predicates_since(&self, lo: u32, mut f: impl FnMut(u64)) {
+        for m in &self.by_p {
+            for (&p, rows) in m {
+                if rows.last().is_some_and(|&r| r >= lo) {
+                    f(p);
+                }
+            }
+        }
+    }
+
     /// Number of triples with predicate `p` in `[lo, hi)` (an upper bound for the base
     /// tier).
     pub fn count_p(&self, p: u64, lo: u32, hi: u32) -> usize {

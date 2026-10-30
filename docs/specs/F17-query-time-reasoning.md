@@ -915,3 +915,17 @@ table holds every fact the first session had derived when its lower stages finis
 which can be many more facts than a selective query derives. Tables whose facts hold a
 blank node a rule made are not kept.
 
+### Planning by predicate
+
+The semi-naive engine indexes a program's rules by the constant predicates of their
+atoms. After the first iteration it plans only the rules with an atom whose predicate has
+a row among the iteration's new rows, together with the rules that have an atom of a
+variable predicate or a builtin that reads facts outside its atoms. The predicates with
+new rows come from the graph's predicate index rather than from the rows themselves. A demand program
+guards nearly every rule with a magic predicate of its own, so most rules have no new
+facts in a given iteration, and a full scan of the program dominated planning. The
+planned tasks are the same as without the index. A property test compares them on random
+programs, graphs and row ranges. An iteration whose new rows include the base tier still
+plans every rule, since the base tier's predicates are not listed, and so does a graph
+with more predicates than the program has atoms, where a scan of the rules is cheaper.
+

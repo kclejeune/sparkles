@@ -1565,6 +1565,147 @@ type Done = (usize, Vec<Triple>, Held, Option<anyhow::Error>);
 /// `limits.budget` before it grows. The first charge past the limit stops the
 /// iteration's other work items at their next check and fails the run with the rule
 /// that was being evaluated.
+/// The rules of a program by the constant predicates of their atoms, so that a
+/// semi-naive iteration plans only the rules an atom of which can read the iteration's
+/// new facts. A rule with an atom of a variable predicate, or with a builtin that reads
+/// facts outside its atoms, is planned in every iteration, as it is without the index.
+pub(crate) struct RuleIndex {
+    by_pred: FxHashMap<u64, Vec<usize>>,
+    always: Vec<usize>,
+    /// the atoms of every rule, which a full scan reads
+    atoms: usize,
+}
+
+impl RuleIndex {
+    pub(crate) fn new(rules: &[CRule]) -> RuleIndex {
+        let mut by_pred: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        let mut always = Vec::new();
+        for (ri, r) in rules.iter().enumerate() {
+            if r.atoms.iter().any(|a| !matches!(a.p, Slot::Const(_)))
+                || implicit_fact_reads(r).next().is_some()
+            {
+                always.push(ri);
+                continue;
+            }
+            for a in &r.atoms {
+                if let Slot::Const(p) = a.p {
+                    let rules = by_pred.entry(p).or_default();
+                    if rules.last() != Some(&ri) {
+                        rules.push(ri);
+                    }
+                }
+            }
+        }
+        let atoms = rules.iter().map(|r| r.atoms.len()).sum();
+        RuleIndex {
+            by_pred,
+            always,
+            atoms,
+        }
+    }
+
+    /// The rules, in order, that an iteration over the new rows from `ds` on may plan:
+    /// those with an atom whose predicate one of the rows has. `None` when every rule
+    /// is to be planned: when the rows include the base tier, whose predicates are not
+    /// listed, or when the graph has more predicates than the program has atoms, so that
+    /// a scan of the rules costs less than a scan of the predicates.
+    pub(crate) fn candidates(&self, g: &Graph, ds: u32) -> Option<Vec<usize>> {
+        if ds < g.offset() || g.predicate_count() > self.atoms {
+            return None;
+        }
+        let mut out = self.always.clone();
+        g.predicates_since(ds, |p| {
+            if let Some(rules) = self.by_pred.get(&p) {
+                out.extend_from_slice(rules);
+            }
+        });
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+}
+
+/// The plans of an iteration over the new rows `[ds, de)`: of every rule, or of the rules
+/// `candidates` names, which must hold every rule that has a plan.
+pub(crate) fn plan_iteration(
+    g: &Graph,
+    rules: &[CRule],
+    naive: bool,
+    ds: u32,
+    de: u32,
+    candidates: Option<&[usize]>,
+) -> Vec<(usize, Vec<Step>)> {
+    let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
+    // a join with an atom whose constant predicate has no rows in its range is empty
+    let empty = |r: &CRule, ranges: &[(u32, u32)], g: &Graph| {
+        r.atoms.iter().zip(ranges).any(|(a, &(lo, hi))| match a.p {
+            Slot::Const(p) => g.count_p(p, lo, hi) == 0,
+            _ => lo >= hi,
+        })
+    };
+    let all: Vec<usize>;
+    let candidates = match candidates {
+        Some(c) => c,
+        None => {
+            all = (0..rules.len()).collect();
+            &all
+        }
+    };
+    for &ri in candidates {
+        let r = &rules[ri];
+        if naive {
+            // naive evaluation over the base data (old = ∅)
+            let ranges = vec![(0, de); r.atoms.len()];
+            if empty(r, &ranges, g) {
+                continue;
+            }
+            if let Some(p) = plan(r, &ranges, Some(g)) {
+                tasks.push((ri, p));
+            }
+            continue;
+        }
+        // An uncovered listForAll also reads positive facts outside the
+        // atoms. A relevant implicit delta must reconsider the whole body;
+        // one full plan covers its ordinary atom deltas as well.
+        let implicit_delta = implicit_fact_delta(g, r, ds, de);
+        if implicit_delta {
+            let ranges = vec![(0, de); r.atoms.len()];
+            if !empty(r, &ranges, g)
+                && let Some(p) = plan(r, &ranges, Some(g))
+            {
+                tasks.push((ri, p));
+            }
+            continue;
+        }
+        // semi-naive: atom d reads the delta, atoms before it the old rows, atoms
+        // after it everything
+        for d in 0..r.atoms.len() {
+            let a = &r.atoms[d];
+            let has_delta = match a.p {
+                Slot::Const(p) => g.count_p(p, ds, de) > 0,
+                _ => de > ds,
+            };
+            if !has_delta {
+                continue;
+            }
+            let ranges: Vec<(u32, u32)> = (0..r.atoms.len())
+                .map(|i| match i.cmp(&d) {
+                    std::cmp::Ordering::Less => (0, ds),
+                    std::cmp::Ordering::Equal => (ds, de),
+                    std::cmp::Ordering::Greater => (0, de),
+                })
+                .collect();
+            if empty(r, &ranges, g) {
+                continue;
+            }
+            if let Some(p) = plan(r, &ranges, Some(g)) {
+                tasks.push((ri, p));
+            }
+        }
+    }
+    tasks
+}
+
 pub(crate) fn run(
     g: &mut Graph,
     rules: &[CRule],
@@ -1596,6 +1737,7 @@ pub(crate) fn run_observed(
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
     };
+    let index = RuleIndex::new(rules);
     let mut iteration = 0usize;
     let (mut ds, mut de) = (start.unwrap_or(0).min(base_len), base_len);
     let memory = |e: MemoryExceeded, iteration: usize| -> anyhow::Error {
@@ -1627,65 +1769,9 @@ pub(crate) fn run_observed(
         }
         // ---- plans for this iteration
         let t_iter = std::time::Instant::now();
-        let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
-        // a join with an atom whose constant predicate has no rows in its range is empty
-        let empty = |r: &CRule, ranges: &[(u32, u32)], g: &Graph| {
-            r.atoms.iter().zip(ranges).any(|(a, &(lo, hi))| match a.p {
-                Slot::Const(p) => g.count_p(p, lo, hi) == 0,
-                _ => lo >= hi,
-            })
-        };
-        for (ri, r) in rules.iter().enumerate() {
-            if iteration == 0 && start.is_none() {
-                // naive evaluation over the base data (old = ∅)
-                let ranges = vec![(0, de); r.atoms.len()];
-                if empty(r, &ranges, g) {
-                    continue;
-                }
-                if let Some(p) = plan(r, &ranges, Some(g)) {
-                    tasks.push((ri, p));
-                }
-                continue;
-            }
-            // An uncovered listForAll also reads positive facts outside the
-            // atoms. A relevant implicit delta must reconsider the whole body;
-            // one full plan covers its ordinary atom deltas as well.
-            let implicit_delta = implicit_fact_delta(g, r, ds, de);
-            if implicit_delta {
-                let ranges = vec![(0, de); r.atoms.len()];
-                if !empty(r, &ranges, g)
-                    && let Some(p) = plan(r, &ranges, Some(g))
-                {
-                    tasks.push((ri, p));
-                }
-                continue;
-            }
-            // semi-naive: atom d reads the delta, atoms before it the old rows, atoms
-            // after it everything
-            for d in 0..r.atoms.len() {
-                let a = &r.atoms[d];
-                let has_delta = match a.p {
-                    Slot::Const(p) => g.count_p(p, ds, de) > 0,
-                    _ => de > ds,
-                };
-                if !has_delta {
-                    continue;
-                }
-                let ranges: Vec<(u32, u32)> = (0..r.atoms.len())
-                    .map(|i| match i.cmp(&d) {
-                        std::cmp::Ordering::Less => (0, ds),
-                        std::cmp::Ordering::Equal => (ds, de),
-                        std::cmp::Ordering::Greater => (0, de),
-                    })
-                    .collect();
-                if empty(r, &ranges, g) {
-                    continue;
-                }
-                if let Some(p) = plan(r, &ranges, Some(g)) {
-                    tasks.push((ri, p));
-                }
-            }
-        }
+        let naive = iteration == 0 && start.is_none();
+        let candidates = if naive { None } else { index.candidates(g, ds) };
+        let tasks = plan_iteration(g, rules, naive, ds, de, candidates.as_deref());
         for (ri, p) in &tasks {
             let (s, o) = index_needs(&rules[*ri], p);
             if s {
@@ -2068,5 +2154,94 @@ mod tests {
             kept.push(b);
         }
         assert_eq!(held.bytes(), 1_000 * slot);
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn slot(r: &mut Rng, nvars: usize, preds: bool) -> Slot {
+        match r.below(6) {
+            0 if preds => Slot::Any,
+            0..=2 => Slot::Var(r.below(nvars as u64) as usize),
+            _ if preds => Slot::Const(100 + r.below(12)),
+            _ => Slot::Const(1 + r.below(8)),
+        }
+    }
+
+    fn rule(r: &mut Rng) -> CRule {
+        let nvars = 1 + r.below(4) as usize;
+        let atoms = (0..r.below(4))
+            .map(|_| Atom {
+                s: slot(r, nvars, false),
+                p: if r.below(5) == 0 {
+                    slot(r, nvars, true)
+                } else {
+                    Slot::Const(100 + r.below(12))
+                },
+                o: slot(r, nvars, false),
+            })
+            .collect();
+        CRule {
+            name: "random".into(),
+            nvars,
+            atoms,
+            builtins: Vec::new(),
+            head: vec![CHead::Triple(
+                Slot::Var(0),
+                Slot::Const(100 + r.below(12)),
+                Slot::Var(0),
+            )],
+        }
+    }
+
+    /// For random programs, graphs and new-row ranges, an iteration plans the same tasks
+    /// over the rules the index names as over every rule.
+    #[test]
+    fn indexed_planning_equals_planning_every_rule() {
+        let (mut planned, mut skipped) = (0, 0);
+        for seed in 1..=300u64 {
+            let mut r = Rng(seed * 7_919 + 1);
+            let rules: Vec<CRule> = (0..1 + r.below(40)).map(|_| rule(&mut r)).collect();
+            let index = RuleIndex::new(&rules);
+            let mut g = Graph::default();
+            let n = r.below(200);
+            g.add_batch((0..n).map(|_| [1 + r.below(8), 100 + r.below(12), 1 + r.below(8)]));
+            let len = g.len();
+            let ds = r.below(len as u64 + 1) as u32;
+            let de = ds + r.below((len - ds) as u64 + 1) as u32;
+            for naive in [false, true] {
+                let candidates = if naive {
+                    None
+                } else {
+                    index.candidates(&g, ds)
+                };
+                let indexed = plan_iteration(&g, &rules, naive, ds, de, candidates.as_deref());
+                let every = plan_iteration(&g, &rules, naive, ds, de, None);
+                planned += every.len();
+                skipped += candidates.as_ref().map_or(0, |c| rules.len() - c.len());
+                assert_eq!(
+                    format!("{indexed:?}"),
+                    format!("{every:?}"),
+                    "seed {seed}, rows {ds}..{de} of {len}"
+                );
+            }
+        }
+        // the cases plan tasks, and the index leaves rules out
+        assert!(planned > 1_000 && skipped > 1_000, "{planned} {skipped}");
     }
 }
