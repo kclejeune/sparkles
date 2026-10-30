@@ -45,6 +45,7 @@ mod query_defaults;
 mod reasoning;
 mod rename;
 mod sd;
+mod startup;
 mod tabular;
 mod tasks;
 mod views;

@@ -35,6 +35,7 @@ mod refused;
 mod rename;
 mod server_settings;
 mod sessions;
+mod startup;
 mod tasks;
 mod tokens;
 pub(super) mod triples;

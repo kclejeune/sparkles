@@ -744,7 +744,7 @@ impl Server {
             port,
         };
         let t0 = std::time::Instant::now();
-        while s.request("GET", "/$/ping", "", "").map(|r| r.0) != Some(200) {
+        while s.request("GET", "/$/ready", "", "").map(|r| r.0) != Some(200) {
             assert!(
                 t0.elapsed() < Duration::from_secs(30),
                 "server did not start"

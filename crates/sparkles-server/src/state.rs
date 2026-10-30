@@ -20,6 +20,37 @@ pub use sparkles::reasoning::{
     AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
 };
 
+/// Why a declared dataset does not serve (spec C01 §4.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unavailable {
+    /// still opening at startup; a retry can pass
+    Opening,
+    /// failed to open, or closed for recovery, with the reason
+    Failed(sparkles::catalog::Refusal),
+}
+
+impl Unavailable {
+    pub fn state(&self) -> &'static str {
+        match self {
+            Unavailable::Opening => "opening",
+            Unavailable::Failed(_) => "failed",
+        }
+    }
+}
+
+/// What a caller that is not a server administrator reads as the reason a dataset is
+/// refused, since the full message names the data directory.
+pub fn redacted_refusal(kind: &str) -> &'static str {
+    match kind {
+        "unsupported-format" => {
+            "this release does not read the dataset's files; a server administrator can see why in the server log or in GET /$/server"
+        }
+        _ => {
+            "the dataset could not be opened; a server administrator can see why in the server log or in GET /$/server"
+        }
+    }
+}
+
 /// What Fuseki's direct Graph Store naming allows on a dataset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectMode {
@@ -379,6 +410,12 @@ pub struct AppState {
     /// rate and concurrency limits (`None`: no limits, the default)
     pub rate_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
     phase: AtomicU8,
+    /// whether a server with a dataset that failed to open still reports ready
+    /// (`serve --ready-ignore-failed`; spec C01 §4.1)
+    pub ready_ignore_failed: bool,
+    /// the datasets of `serve --mem`, `--loc` and `--fuseki-config` that startup has not
+    /// attached yet; the catalog keeps the registered ones that wait to open
+    pub startup_pending: Mutex<BTreeMap<String, DbType>>,
     /// authentication and authorization (`serve --auth-config`); `None`: open
     pub auth: Option<Arc<crate::auth::Auth>>,
     /// browser origins that may call the API cross-origin, without credentials
@@ -668,7 +705,40 @@ impl AppState {
         let mut options: sparkles::CatalogOptions = store_opts.clone().into();
         options.memory.pool_bytes = pool_bytes;
         let catalog = sparkles::Catalog::open(data_dir, options)?;
-        let state = AppState {
+        Ok(AppState::with_catalog(
+            data_dir,
+            catalog,
+            store_opts,
+            default_timeout,
+        ))
+    }
+
+    /// [`with_memory`](Self::with_memory) without opening the registered persistent
+    /// datasets, which are returned in registry order. The catalog lists them as
+    /// opening until [`crate::startup`] opens them (spec C01 §4.1, Phase 2).
+    pub fn deferred(
+        data_dir: &Path,
+        store_opts: StoreOptions,
+        default_timeout: std::time::Duration,
+        pool_bytes: Option<u64>,
+    ) -> Result<(AppState, Vec<String>)> {
+        std::fs::create_dir_all(data_dir.join("databases"))?;
+        let mut options: sparkles::CatalogOptions = store_opts.clone().into();
+        options.memory.pool_bytes = pool_bytes;
+        let (catalog, pending) = sparkles::Catalog::open_deferred(data_dir, options)?;
+        Ok((
+            AppState::with_catalog(data_dir, catalog, store_opts, default_timeout),
+            pending,
+        ))
+    }
+
+    fn with_catalog(
+        data_dir: &Path,
+        catalog: sparkles::Catalog,
+        store_opts: StoreOptions,
+        default_timeout: std::time::Duration,
+    ) -> AppState {
+        AppState {
             data_dir: data_dir.to_path_buf(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
             projections: Default::default(),
@@ -701,6 +771,8 @@ impl AppState {
             metrics: crate::obs::Metrics::new(true, 100),
             rate_limit: None,
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
+            ready_ignore_failed: false,
+            startup_pending: Default::default(),
             auth: None,
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
@@ -730,8 +802,7 @@ impl AppState {
             notifier: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
-        };
-        Ok(state)
+        }
     }
 
     /// State without a data directory or registry, for embedded use (`sparkles mcp`):
@@ -772,6 +843,8 @@ impl AppState {
             access_log: false,
             metrics: crate::obs::Metrics::new(false, 100),
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
+            ready_ignore_failed: false,
+            startup_pending: Default::default(),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             views_options: Default::default(),
@@ -922,6 +995,57 @@ impl AppState {
 
     pub fn set_phase(&self, p: crate::obs::Phase) {
         self.phase.store(p as u8, Ordering::SeqCst);
+    }
+
+    /// Move from `Starting` to `Ready`, unless the server began to drain meanwhile.
+    pub fn mark_ready(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                crate::obs::Phase::Starting as u8,
+                crate::obs::Phase::Ready as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Why the dataset `name`, which [`get`](Self::get) does not find, cannot serve:
+    /// it is still opening, or it failed to open. `None` for a name nothing declares.
+    pub fn unavailable(&self, name: &str) -> Option<Unavailable> {
+        if self.catalog.is_opening(name) || self.startup_pending.lock().contains_key(name) {
+            return Some(Unavailable::Opening);
+        }
+        self.catalog.refusal(name).map(Unavailable::Failed)
+    }
+
+    /// Whether `name` is a dataset of this server, open or not.
+    pub fn declared(&self, name: &str) -> bool {
+        self.get(name).is_some() || self.unavailable(name).is_some()
+    }
+
+    /// The datasets that do not serve yet, by name: the registered ones that wait to
+    /// open, with those startup has not attached, and the ones that failed to open.
+    pub fn unavailable_datasets(&self) -> Vec<(String, DbType, Unavailable)> {
+        let mut out: Vec<(String, DbType, Unavailable)> = self
+            .catalog
+            .opening()
+            .into_iter()
+            .map(|n| (n, DbType::Persistent, Unavailable::Opening))
+            .collect();
+        out.extend(
+            self.startup_pending
+                .lock()
+                .iter()
+                .map(|(n, k)| (n.clone(), *k, Unavailable::Opening)),
+        );
+        out.extend(
+            self.catalog
+                .refusals()
+                .into_iter()
+                .map(|(n, r)| (n, DbType::Persistent, Unavailable::Failed(r))),
+        );
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {

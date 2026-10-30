@@ -1456,7 +1456,21 @@ pub fn render_prometheus(st: &AppState) -> String {
         "gauge",
         "Whether the server is ready to serve requests (1) or not (0).",
     );
-    let _ = writeln!(o, "sparkles_ready {}", u8::from(ready(st).0));
+    let _ = writeln!(o, "sparkles_ready {}", u8::from(server_status(st).1));
+    family(
+        &mut o,
+        "sparkles_datasets",
+        "gauge",
+        "Declared datasets by state: open, opening, or failed to open.",
+    );
+    let states = dataset_states(st);
+    for (state, n) in [
+        ("open", states.0),
+        ("opening", states.1),
+        ("failed", states.2),
+    ] {
+        let _ = writeln!(o, "sparkles_datasets{{state=\"{state}\"}} {n}");
+    }
 
     family(
         &mut o,
@@ -2164,11 +2178,18 @@ pub fn metrics_json(st: &AppState) -> J {
         .iter()
         .map(|op| (op.as_str().to_string(), st.metrics.active(*op).into()))
         .collect();
+    let (status, states) = (server_status(st), dataset_states(st));
     json!({
         "formatVersion": 1,
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSeconds": st.started.elapsed().as_secs_f64(),
-        "ready": ready(st).0,
+        "ready": status.1,
+        "status": status.0,
+        "datasetStates": {
+            "open": states.0,
+            "opening": states.1,
+            "failed": states.2,
+        },
         "processResidentBytes": resident_bytes(),
         "io": sparkles::ioacct::IoSnapshot::now().report(),
         "limits": st.limits.json(st.default_timeout),
@@ -2249,7 +2270,7 @@ pub fn metrics_router(st: Arc<AppState>) -> axum::Router {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Phase {
-    /// datasets are being opened; not serving yet
+    /// the listener answers, and datasets are being opened
     Starting = 0,
     Ready = 1,
     /// shutting down: finishing requests in flight
@@ -2303,22 +2324,78 @@ fn dataset_ready(d: &crate::state::Dataset) -> J {
     v
 }
 
+/// The numbers of declared datasets that are open, opening and failed.
+fn dataset_states(st: &AppState) -> (usize, usize, usize) {
+    let opening = st.catalog.opening().len() + st.startup_pending.lock().len();
+    (
+        st.catalog.list().len(),
+        opening,
+        st.catalog.refusals().len(),
+    )
+}
+
+/// The server's readiness status and whether it is ready (spec C01 §4.1). A server whose
+/// startup finished is `degraded` while a dataset failed to open, and is then not ready
+/// unless `--ready-ignore-failed` is set.
+pub fn server_status(st: &AppState) -> (&'static str, bool) {
+    match st.phase() {
+        Phase::Ready if st.catalog.refusals().is_empty() => ("ready", true),
+        Phase::Ready => ("degraded", st.ready_ignore_failed),
+        p => (p.as_str(), false),
+    }
+}
+
+/// The `ReadyInfo` entry of a dataset that is opening or failed to open. Only a server
+/// administrator reads the reason of a failure, which names paths.
+fn unavailable_ready(
+    name: &str,
+    kind: DbType,
+    u: &crate::state::Unavailable,
+    p: &crate::auth::Principal,
+) -> J {
+    let mut v = json!({
+        "name": name,
+        "type": kind,
+        "state": u.state(),
+        "ready": false,
+    });
+    if let crate::state::Unavailable::Failed(r) = u {
+        v["error"] = if p.has(crate::auth::ServerPerm::ServerAdmin) {
+            r.message.clone().into()
+        } else {
+            crate::state::redacted_refusal(r.kind).into()
+        };
+        v["errorKind"] = r.kind.into();
+    }
+    v
+}
+
 /// Whether the server is ready, and its `ReadyInfo` document, listing the datasets the
-/// caller may read (all of them with `metrics`).
+/// caller may read (all of them with `metrics`), open or not.
 fn ready_for(st: &AppState, p: &crate::auth::Principal) -> (bool, J) {
-    let phase = st.phase();
+    let (status, ok) = server_status(st);
     let all = p.has(crate::auth::ServerPerm::Metrics);
-    let datasets: Vec<J> = st
+    let mut datasets: Vec<(String, J)> = st
         .datasets()
         .values()
         .filter(|d| all || p.can(&d.name, crate::auth::Level::Read))
-        .map(|d| dataset_ready_for(d, p))
+        .map(|d| (d.name.clone(), dataset_ready_for(d, p)))
         .collect();
-    let ok = phase == Phase::Ready;
+    datasets.extend(
+        st.unavailable_datasets()
+            .into_iter()
+            .filter(|(n, _, _)| all || p.can(n, crate::auth::Level::Read))
+            .map(|(n, k, u)| {
+                let v = unavailable_ready(&n, k, &u, p);
+                (n, v)
+            }),
+    );
+    datasets.sort_by(|a, b| a.0.cmp(&b.0));
+    let datasets: Vec<J> = datasets.into_iter().map(|(_, v)| v).collect();
     (
         ok,
         json!({
-            "status": phase.as_str(),
+            "status": status,
             "ready": ok,
             "uptimeSeconds": st.started.elapsed().as_secs(),
             "datasets": datasets,
@@ -2340,10 +2417,6 @@ fn ready_response(ok: bool, body: J) -> Response {
         .into_response()
 }
 
-fn ready(st: &AppState) -> (bool, J) {
-    ready_for(st, &crate::auth::Principal::local())
-}
-
 /// `GET /$/ready`: 200 when ready, else 503; the body is always `ReadyInfo`.
 pub async fn ready_endpoint(
     State(st): State<Arc<AppState>>,
@@ -2361,20 +2434,33 @@ pub async fn ready_dataset(
     Path(name): Path<String>,
     axum::Extension(p): axum::Extension<crate::auth::Principal>,
 ) -> Response {
-    let Some(d) = st.get(&name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            axum::Json(json!({ "error": format!("no such dataset: /{name}") })),
-        )
-            .into_response();
+    let (status, server_ok) = server_status(&st);
+    let (ok, entry) = match st.get(&name) {
+        Some(d) => (server_ok, dataset_ready_for(&d, &p)),
+        None => match st.unavailable(&name) {
+            Some(u) => {
+                let kind = st
+                    .startup_pending
+                    .lock()
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(DbType::Persistent);
+                (false, unavailable_ready(&name, kind, &u, &p))
+            }
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(json!({ "error": format!("no such dataset: /{name}") })),
+                )
+                    .into_response();
+            }
+        },
     };
-    let phase = st.phase();
-    let ok = phase == Phase::Ready;
     let body = json!({
-        "status": phase.as_str(),
+        "status": status,
         "ready": ok,
         "uptimeSeconds": st.started.elapsed().as_secs(),
-        "datasets": [dataset_ready_for(&d, &p)],
+        "datasets": [entry],
     });
     ready_response(ok, body)
 }

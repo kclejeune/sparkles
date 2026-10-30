@@ -137,7 +137,7 @@ for round in $(seq "$ROUNDS"); do
         --loc bench=work/store --port "$PORT" --timeout 600 --no-access-log $sflags > "$R/server-$run.log" 2>&1 &
       SPID=$!
       for _ in $(seq 300); do
-        curl -sf -o /dev/null "localhost:$PORT/\$/ping" && break
+        curl -sf -o /dev/null "localhost:$PORT/\$/ready" && break
         kill -0 "$SPID" 2> /dev/null || fail "server $v exited, see server-$run.log"
         sleep 0.1
       done

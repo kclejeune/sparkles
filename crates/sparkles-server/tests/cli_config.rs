@@ -233,6 +233,13 @@ fn port(range: std::ops::Range<u16>) -> u16 {
 }
 
 /// A GET on the server, returning the body.
+/// Whether the server on `port` answers `GET /$/ready` with `200`: it listens before its
+/// datasets open.
+fn ready(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+        && get(port, "/$/ready", "application/json").starts_with("HTTP/1.0 200")
+}
+
 fn get(port: u16, path: &str, accept: &str) -> String {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
@@ -280,7 +287,7 @@ fn serve_from_a_fuseki_configuration() {
         .spawn()
         .unwrap();
     let t0 = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !ready(port) {
         if let Ok(Some(status)) = child.try_wait() {
             let mut e = String::new();
             child.stderr.take().unwrap().read_to_string(&mut e).unwrap();
@@ -346,7 +353,7 @@ fn serve_sh_starts() {
             .spawn()
             .unwrap();
         let t0 = Instant::now();
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        while !ready(port) {
             if let Ok(Some(status)) = child.try_wait() {
                 let mut e = String::new();
                 child.stderr.take().unwrap().read_to_string(&mut e).unwrap();

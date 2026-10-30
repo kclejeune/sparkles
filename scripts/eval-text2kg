@@ -200,7 +200,7 @@ def serve(args, dbs, tmp):
     client = Client(f"http://127.0.0.1:{port}")
     for _ in range(300):
         try:
-            with urllib.request.urlopen(f"{client.base}/$/ping", timeout=5):
+            with urllib.request.urlopen(f"{client.base}/$/ready", timeout=5):
                 return proc, client
         except Exception:
             if proc.poll() is not None:

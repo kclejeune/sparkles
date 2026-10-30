@@ -102,7 +102,7 @@ fi
 SPID=$!
 trap 'kill $SPID 2> /dev/null || true; wait $SPID 2> /dev/null || true' EXIT
 for _ in $(seq 600); do
-  curl -sf "http://127.0.0.1:$PORT/\$/ping" > /dev/null && break
+  curl -sf "http://127.0.0.1:$PORT/\$/ready" > /dev/null && break
   sleep 0.1
 done
 # the index is mapped from its file when the store opens

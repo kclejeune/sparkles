@@ -177,7 +177,7 @@ start() {
         --port "$p" --timeout "$SERVER_TIMEOUT" ${SPARKLES_ARGS:-} > "$STORE/sparkles.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
-      ready="localhost:$p/\$/ping"
+      ready="localhost:$p/\$/ready"
       ;;
     jena)
       # Jena's scripts prefer JAVA_HOME over the JDK that the nixpkgs wrapper puts on PATH,

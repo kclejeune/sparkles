@@ -39,7 +39,7 @@ impl Server {
             .unwrap();
         let mut s = Server { child, port };
         let t0 = Instant::now();
-        while s.call("GET", "/$/ping", None).0 != 200 {
+        while s.call("GET", "/$/ready", None).0 != 200 {
             // a server that could not bind the port leaves it to whatever holds it
             assert!(
                 s.child.try_wait().unwrap().is_none(),

@@ -738,10 +738,10 @@ fn server(p: &mut Paths) {
     );
     p.add(
         op(GET, "/$/ready", "ready", "Server", "Readiness check")
-            .doc("`200` when the server is ready and `503` otherwise, both with `ReadyInfo`. Without `metrics`, only readable datasets are listed.")
+            .doc("`200` when the server is ready and `503` otherwise, both with `ReadyInfo`. The server is `starting` while datasets open and `degraded` when one failed to open, which is not ready unless `--ready-ignore-failed` is set. Without `metrics`, only readable datasets are listed.")
             .see("server")
             .json("200", "Ready.", "ReadyInfo")
-            .json("503", "Starting or draining.", "ReadyInfo"),
+            .json("503", "Starting, degraded or draining.", "ReadyInfo"),
     );
     p.add(
         op(

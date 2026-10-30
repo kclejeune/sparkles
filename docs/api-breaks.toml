@@ -1,3 +1,50 @@
 # Exact reviewed differences only. See DEVELOPMENT.md#api-compatibility.
 schema_version = 1
-entry = []
+
+[[entry]]
+baseline = "bootstrap-7c533eaa9042"
+target = "0.1.0"
+surface = "http"
+identity = "GET /$/ready"
+pointer = "/paths/~1$~1ready/get/responses/200/content/application~1json/schema/properties/status/enum"
+rule = "enum-incompatible"
+severity = "break"
+reason = "Readiness reports the degraded status that spec C01 reserved, for a server whose dataset failed to open."
+changelog = "unreleased-compatibility"
+disposition = "development"
+
+[[entry]]
+baseline = "bootstrap-7c533eaa9042"
+target = "0.1.0"
+surface = "http"
+identity = "GET /$/ready"
+pointer = "/paths/~1$~1ready/get/responses/503/content/application~1json/schema/properties/status/enum"
+rule = "enum-incompatible"
+severity = "break"
+reason = "Readiness reports the degraded status that spec C01 reserved, for a server whose dataset failed to open."
+changelog = "unreleased-compatibility"
+disposition = "development"
+
+[[entry]]
+baseline = "bootstrap-7c533eaa9042"
+target = "0.1.0"
+surface = "http"
+identity = "GET /$/ready/{ds}"
+pointer = "/paths/~1$~1ready~1{ds}/get/responses/200/content/application~1json/schema/properties/status/enum"
+rule = "enum-incompatible"
+severity = "break"
+reason = "Readiness reports the degraded status that spec C01 reserved, for a server whose dataset failed to open."
+changelog = "unreleased-compatibility"
+disposition = "development"
+
+[[entry]]
+baseline = "bootstrap-7c533eaa9042"
+target = "0.1.0"
+surface = "http"
+identity = "GET /$/ready/{ds}"
+pointer = "/paths/~1$~1ready~1{ds}/get/responses/503/content/application~1json/schema/properties/status/enum"
+rule = "enum-incompatible"
+severity = "break"
+reason = "Readiness reports the degraded status that spec C01 reserved, for a server whose dataset failed to open."
+changelog = "unreleased-compatibility"
+disposition = "development"

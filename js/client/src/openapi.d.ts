@@ -2200,7 +2200,7 @@ export interface paths {
         };
         /**
          * Readiness check
-         * @description `200` when the server is ready and `503` otherwise, both with `ReadyInfo`. Without `metrics`, only readable datasets are listed.
+         * @description `200` when the server is ready and `503` otherwise, both with `ReadyInfo`. The server is `starting` while datasets open and `degraded` when one failed to open, which is not ready unless `--ready-ignore-failed` is set. Without `metrics`, only readable datasets are listed.
          */
         get: operations["ready"];
         put?: never;
@@ -8228,9 +8228,14 @@ export interface components {
         ReadyInfo: {
             datasets: {
                 deltaQuads?: number;
+                /** @description Why a failed dataset did not open. Only a server administrator reads the whole message, which names paths. */
+                error?: string;
+                /** @enum {string} */
+                errorKind?: "unsupported-format" | "missing" | "corrupt" | "io" | "locked" | "invalid" | "recovery" | "error";
                 generation?: string;
                 name: string;
                 ready: boolean;
+                /** @description `open`, `opening` while startup opens it, or `failed` when it did not open. */
                 state: string;
                 /** @enum {string} */
                 type: "persistent" | "mem";
@@ -8238,7 +8243,7 @@ export interface components {
             }[];
             ready: boolean;
             /** @enum {string} */
-            status: "starting" | "ready" | "draining";
+            status: "starting" | "ready" | "draining" | "degraded";
             uptimeSeconds: number;
         };
         /** @description A reasoning run: the profile, its rules and extras, and the input graphs. */
@@ -8877,10 +8882,14 @@ export interface components {
                 }[];
             };
             limits?: components["schemas"]["Limits"];
+            /** @description The datasets the caller may read that startup has not opened yet. */
+            openingDatasets?: string[];
             readOnly: boolean;
             refusedDatasets?: {
+                /** @enum {string} */
+                kind?: "unsupported-format" | "missing" | "corrupt" | "io" | "locked" | "invalid" | "recovery" | "error";
                 name: string;
-                /** @description Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths. */
+                /** @description Why the dataset is registered but not served, such as an index format this release does not read or files that do not open. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths. */
                 reason: string;
             }[];
             /** @description Fuseki's name for `startedAt`. */
@@ -10410,7 +10419,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Cancelled, over a concurrency limit, offline, being restored, or the identity provider is unreachable. */
+        /** @description Cancelled, over a concurrency limit, offline, being restored, the identity provider is unreachable, or authentication kept overlapping an authority change (`authority-changed`), which is safe to retry and is not a failed credential. */
         Unavailable: {
             headers: {
                 /** @description Seconds to wait before trying again. */
@@ -11144,6 +11153,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -11339,6 +11349,8 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -15749,7 +15761,7 @@ export interface operations {
                     "application/json": components["schemas"]["ReadyInfo"];
                 };
             };
-            /** @description Starting or draining. */
+            /** @description Starting, degraded or draining. */
             503: {
                 headers: {
                     [name: string]: unknown;

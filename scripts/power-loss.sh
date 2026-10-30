@@ -128,7 +128,7 @@ start_server() { # <store>
     --min-free-disk-mb "${MIN_FREE_MB:-64}" $SERVE_FLAGS > "$WORK/server.log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 300); do
-    curl -sf "http://127.0.0.1:$PORT/\$/ping" > /dev/null 2>&1 && return 0
+    curl -sf "http://127.0.0.1:$PORT/\$/ready" > /dev/null 2>&1 && return 0
     kill -0 "$SPID" 2> /dev/null || die "the server exited, see $WORK/server.log"
     sleep 0.1
   done

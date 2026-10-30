@@ -144,7 +144,7 @@ start_server() { # <variant> <epoch>
     --loc bench="stores/$1" --port "$PORT" --timeout 600 --no-access-log $SERVE_ARGS $extra > "$R/server-$2-$1.log" 2>&1 &
   SPID=$!
   for _ in $(seq 300); do
-    curl -sf -o /dev/null "localhost:$PORT/\$/ping" && return
+    curl -sf -o /dev/null "localhost:$PORT/\$/ready" && return
     kill -0 "$SPID" 2> /dev/null || fail "server $1 exited, see server-$2-$1.log"
     sleep 0.1
   done

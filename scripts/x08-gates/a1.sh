@@ -37,7 +37,7 @@ run_case() { # <datasets> <cache-mb> <suite 0|1> <rep>
     --timeout 600 --no-access-log > "$O/server-$n-$mb-$suite-$rep.log" 2>&1 &
   SPID=$!
   for _ in $(seq 600); do
-    curl -sf -o /dev/null "localhost:$PORT/\$/ping" && break
+    curl -sf -o /dev/null "localhost:$PORT/\$/ready" && break
     sleep 0.1
   done
   if [ "$suite" = 1 ]; then

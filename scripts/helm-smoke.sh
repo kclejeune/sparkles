@@ -72,7 +72,7 @@ k port-forward "svc/$release-sparkles" "$port:3030" > /dev/null 2>&1 &
 pf=$!
 base="http://127.0.0.1:$port"
 for _ in $(seq 1 50); do
-  curl -fsS "$base/\$/ping" > /dev/null 2>&1 && break
+  curl -fsS "$base/\$/ready" > /dev/null 2>&1 && break
   sleep 0.2
 done
 

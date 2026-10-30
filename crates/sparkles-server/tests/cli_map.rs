@@ -498,6 +498,7 @@ fn stored_mappings_on_a_server() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    wait_ready(port);
     let url = format!("http://127.0.0.1:{port}");
     expect(d, &["dataset", "create", "ds", "--server", &url], 0);
     let at = ["--server", url.as_str(), "--dataset", "ds"];
@@ -535,4 +536,26 @@ fn stored_mappings_on_a_server() {
     assert!(out(&o).contains("\"quads\": 8"), "{}", out(&o));
     run(with(&["map", "delete", "people"]), 0);
     run(with(&["map", "get", "people"]), 1);
+}
+
+/// Wait until the server on `port` answers `GET /$/ready` with `200`: it listens before
+/// its datasets open.
+fn wait_ready(port: u16) {
+    use std::io::{Read as _, Write as _};
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = write!(c, "GET /$/ready HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+            let mut buf = String::new();
+            let _ = c.read_to_string(&mut buf);
+            if buf.starts_with("HTTP/1.0 200") || buf.starts_with("HTTP/1.1 200") {
+                return;
+            }
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "the server never became ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }

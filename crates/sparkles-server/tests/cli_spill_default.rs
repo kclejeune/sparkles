@@ -49,7 +49,7 @@ impl Server {
             port,
         };
         let t0 = Instant::now();
-        while s.get("/$/ping").0 != 200 {
+        while s.get("/$/ready").0 != 200 {
             assert!(
                 t0.elapsed() < Duration::from_secs(30),
                 "server did not start"

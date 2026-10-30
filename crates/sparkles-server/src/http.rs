@@ -534,6 +534,16 @@ impl ApiError {
             StatusCode::SERVICE_UNAVAILABLE if budget == Some(BudgetKind::ServerMemory) => {
                 Some(Outcome::Budget)
             }
+            // a dataset that does not serve yet is an error of the server, not a
+            // cancelled request
+            StatusCode::SERVICE_UNAVAILABLE
+                if matches!(
+                    self.1.get("code").and_then(J::as_str),
+                    Some("dataset-opening" | "dataset-failed")
+                ) =>
+            {
+                None
+            }
             StatusCode::SERVICE_UNAVAILABLE => Some(Outcome::Cancelled),
             StatusCode::INSUFFICIENT_STORAGE if budget.is_some() => Some(Outcome::Budget),
             _ => None,
@@ -562,12 +572,16 @@ impl ApiError {
         }
         // only a refusal that a retry can pass says when to retry: a request larger than
         // the whole pool answers 507 without it
-        let behind = body.get("code").and_then(J::as_str) == Some("view-behind");
-        if (budget == Some(BudgetKind::ServerMemory) || behind)
+        let code = body.get("code").and_then(J::as_str);
+        if (budget == Some(BudgetKind::ServerMemory) || code == Some("view-behind"))
             && self.0 == StatusCode::SERVICE_UNAVAILABLE
         {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        if code == Some("dataset-opening") && self.0 == StatusCode::SERVICE_UNAVAILABLE {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
         }
         resp.extensions_mut().insert(ErrorJson(body));
         resp
@@ -679,6 +693,12 @@ async fn restoring_guard(
     if route == Some("/$/datasets/{ds}/rename")
         || (route == Some("/$/datasets/{ds}") && req.method() == axum::http::Method::DELETE)
     {
+        // a dataset that is opening or failed to open cannot be renamed or deleted
+        if st.catalog.get(&ds).is_none()
+            && let Some(u) = st.unavailable(&ds)
+        {
+            return unavailable_error(&ds, &u).into_response();
+        }
         return next.run(req).await;
     }
     #[cfg(test)]
@@ -695,6 +715,14 @@ async fn restoring_guard(
                 && route.is_some_and(|r| r.starts_with("/{ds}")) =>
         {
             fuseki::offline_response(&ds)
+        }
+        // a dataset that startup has not opened, or that failed to open, answers 503
+        // (its readiness route reports the state itself)
+        Ok((None, _))
+            if route != Some("/$/ready/{ds}")
+                && let Some(u) = st.unavailable(&ds) =>
+        {
+            unavailable_error(&ds, &u).into_response()
         }
         Ok(held) => {
             let resp = next.run(req).await;
@@ -889,13 +917,39 @@ impl From<anyhow::Error> for ApiError {
 pub(crate) type ApiResult<T = Response> = Result<T, ApiError>;
 
 pub(crate) fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
-    let ds = st
-        .get(name)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))?;
+    let ds = st.get(name).ok_or_else(|| match st.unavailable(name) {
+        Some(u) => unavailable_error(name, &u),
+        None => err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")),
+    })?;
     // the branch the request chose (`?branch=`, `/{ds}@{branch}/…`)
     match branches::current() {
         Some(b) if b != sparkles::branch::MAIN => Ok(st.branch_dataset(&ds, &b)?),
         _ => Ok(ds),
+    }
+}
+
+/// The `503` of a request to a dataset that is still opening (`dataset-opening`, with
+/// `Retry-After`) or that failed to open (`dataset-failed`, with the failure's `kind`).
+/// The reason itself names paths, so it is only in `GET /$/server` and `/$/ready` for
+/// server administrators.
+pub(crate) fn unavailable_error(name: &str, u: &crate::state::Unavailable) -> ApiError {
+    match u {
+        crate::state::Unavailable::Opening => err_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dataset-opening",
+            format!("dataset /{name} is opening; retry later"),
+        ),
+        crate::state::Unavailable::Failed(r) => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "error": format!(
+                    "dataset /{name} failed to open: {}",
+                    crate::state::redacted_refusal(r.kind)
+                ),
+                "code": "dataset-failed",
+                "kind": r.kind,
+            }),
+        ),
     }
 }
 
@@ -4061,10 +4115,6 @@ pub(crate) fn redact_dataset_info(info: &mut J) {
     }
 }
 
-/// What a caller that is not a server administrator reads as the reason a dataset is
-/// refused, since the full message names the data directory.
-const REFUSED_REASON_REDACTED: &str = "this release does not read the dataset's files; a server administrator can see why in the server log or in GET /$/server";
-
 /// `GET /$/server`; anonymous callers (with auth) do not get the version and limits.
 async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
     let mut doc = json!({
@@ -4089,22 +4139,33 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
         // it. The reason names paths, so only a server administrator gets it whole. A
         // server without auth answers as the local principal, which administers it.
         let admin = p.has(ServerPerm::ServerAdmin);
+        let sees = |name: &str| admin || p.level_any_branch(name).is_some_and(|l| l >= Level::Read);
         let refused: Vec<J> = st
             .catalog
-            .refused()
+            .refusals()
             .into_iter()
-            .filter(|(name, _)| admin || p.level_any_branch(name).is_some_and(|l| l >= Level::Read))
-            .map(|(name, reason)| {
+            .filter(|(name, _)| sees(name))
+            .map(|(name, r)| {
                 let reason = if admin {
-                    reason
+                    r.message
                 } else {
-                    REFUSED_REASON_REDACTED.to_string()
+                    crate::state::redacted_refusal(r.kind).to_string()
                 };
-                json!({ "name": name, "reason": reason })
+                json!({ "name": name, "reason": reason, "kind": r.kind })
             })
             .collect();
         if !refused.is_empty() {
             doc["refusedDatasets"] = refused.into();
+        }
+        // the datasets that startup has not opened yet (spec C01 §4.1)
+        let opening: Vec<J> = st
+            .unavailable_datasets()
+            .into_iter()
+            .filter(|(name, _, u)| *u == crate::state::Unavailable::Opening && sees(name))
+            .map(|(name, _, _)| name.into())
+            .collect();
+        if !opening.is_empty() {
+            doc["openingDatasets"] = opening.into();
         }
     }
     Json(doc)

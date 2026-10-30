@@ -998,7 +998,7 @@ pub fn dataset_denial(
     if p.is_anonymous() {
         return Some(authentication_required(st, p, headers));
     }
-    if have.is_none() || st.get(ds).is_none() {
+    if have.is_none() || !st.declared(ds) {
         let r = json_error(StatusCode::NOT_FOUND, &format!("no such dataset: /{ds}"));
         return Some(with_report(r, report_of(p, Some(Denied::Hidden))));
     }
@@ -1484,7 +1484,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                 }
                 // a branch the grants do not cover answers as one that does not exist;
                 // everyone who sees the dataset knows its main exists
-                let visible = st.get(&ds).is_some() && p.level_any_branch(&ds).is_some();
+                let visible = st.declared(&ds) && p.level_any_branch(&ds).is_some();
                 if have.is_none() && visible {
                     match branch.as_deref() {
                         Some(b) if b != sparkles::branch::MAIN => {
@@ -1505,7 +1505,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                         }
                     }
                 }
-                if have.is_none() || st.get(&ds).is_none() {
+                if have.is_none() || !st.declared(&ds) {
                     // the same body as the handlers' own 404
                     let msg = format!("no such dataset: /{ds}");
                     let r = json_error(StatusCode::NOT_FOUND, &msg);
