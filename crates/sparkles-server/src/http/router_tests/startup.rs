@@ -398,6 +398,7 @@ async fn a_shutdown_stops_the_opening_before_requests_drain() {
 /// A dataset that startup configures (here with `--validate`) answers as opening until
 /// the configuration is installed, so no write reaches it unvalidated while another
 /// dataset still opens.
+#[cfg(feature = "shacl")]
 #[tokio::test(flavor = "multi_thread")]
 async fn startup_configuration_is_installed_before_a_dataset_serves() {
     let dir = data_dir(&["cfg", "slow"], false);
