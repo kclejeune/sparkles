@@ -206,6 +206,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   tiny positive feedback view, but can retain more intermediate facts than selective
   evaluation.
   Structural list terms, negation and term-generating rules exclude this route.
+  The facts of the equality stages, which do not depend on the query, are kept once per
+  view in the derived-table cache. This trades memory for time, since the table can hold
+  many more facts than a selective query derives.
   On small views where `owl:sameAs` relates classes and properties, a demand can take
   much longer than materializing the view, because equality is read through the
   `eq-rep-*` rules rather than representatives. Roadmap items 9 and 190.

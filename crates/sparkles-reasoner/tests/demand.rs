@@ -1527,3 +1527,63 @@ fn schema_heavy_demand_answers_like_materialization() {
 /// finish within the deadline in a development build, among them 16 and 25, which found
 /// the derived meta type cases above. `SCHEMA_HEAVY_SEEDS=1,2,3` runs others.
 const SCHEMA_HEAVY_SEEDS: &[u64] = &[1, 3, 9, 15, 16, 17, 18, 24, 25];
+
+/// The equality stages' table is kept per view: the graphs a caller reads and the commit
+/// choose it, and the answers equal those of a session that asks for no tables.
+#[test]
+fn equality_table_respects_graph_visibility_and_commits() {
+    use sparkles_core::access::{GraphAccess, GraphRule, Graphs};
+    use std::sync::Arc;
+    let inputs = Inputs {
+        data_graphs: vec![
+            sparkles_reasoner::GraphRef::Default,
+            sparkles_reasoner::GraphRef::Named("http://ex.org/hidden".into()),
+        ],
+        ..Inputs::default()
+    };
+    let qr = QueryReasoner::new(Profile::OwlRl, &Extras::default(), inputs).unwrap();
+    let s = store("ex:a owl:sameAs ex:b . ex:b a ex:C .");
+    s.load(&[Source::from_bytes(
+        format!("{PREFIXES} GRAPH <http://ex.org/hidden> {{ ex:c owl:sameAs ex:b . }}")
+            .into_bytes(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let q = "SELECT ?x { ?x a ex:C }";
+    let all = vec![
+        "<http://ex.org/a>",
+        "<http://ex.org/b>",
+        "<http://ex.org/c>",
+    ];
+    let mut visible = demand(&qr);
+    visible.graphs = Some(Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["default"], &[])),
+        Graphs::none(),
+    )));
+    let mut uncached = demand(&qr);
+    uncached.no_cache = true;
+    for _ in 0..2 {
+        assert_eq!(rows(&run(&s, q, &demand(&qr))), all);
+        assert_eq!(rows(&run(&s, q, &uncached)), all);
+        assert_eq!(
+            rows(&run(&s, q, &visible)),
+            vec!["<http://ex.org/a>", "<http://ex.org/b>"]
+        );
+    }
+    let pinned = s.snapshot();
+    sparkles_core::sparql::update::update(
+        &s,
+        "DELETE DATA { <http://ex.org/a> <http://www.w3.org/2002/07/owl#sameAs> <http://ex.org/b> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(rows(&run(&s, q, &visible)), vec!["<http://ex.org/b>"]);
+        assert_eq!(
+            rows(&run(&s, q, &demand(&qr))),
+            vec!["<http://ex.org/b>", "<http://ex.org/c>"]
+        );
+    }
+    assert_eq!(rows(&query(pinned, q, &demand(&qr)).unwrap()), all);
+}

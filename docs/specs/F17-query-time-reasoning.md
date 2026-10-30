@@ -893,3 +893,25 @@ and eligibility controls. These checks establish bounded completion and explanat
 They do not establish a current-head latency ratio or the selective-query cost target
 in section 13. Item 190 retains matched Forge measurement, the temporary-closure
 memory tradeoff and any measured control costs before performance acceptance.
+
+
+### Equality stage table
+
+When rules derive and read `owl:sameAs`, a demand program ends with equality stages that
+derive `owl:sameAs` with the free adornment, whatever the query asks (§3.5). The first
+session over a cacheable view keeps every derived fact its graph holds once these lower
+stages finish in the derived-table cache. Later sessions over the same view add those
+facts and skip the equality stages. The key is the view, the rules' digest and whether the
+program rewrites linear recursion. Explanation sessions keep the rules' linear recursion
+and so keep a table of their own. The kept facts include the premises of every fact the
+equality stages derived, so an explanation over cached facts still finds well-founded
+trees. A session whose graph holds facts from outside the view, such as why-not hypotheses
+or GeoSPARQL default geometries, neither reads nor fills the table. Like the schema table,
+the equality table is a property of the view, and `no_cache` does not bypass it.
+
+The table is charged to the derived-table cache's capacity, and the facts a session adds
+from it are charged to the session's memory budget. This trades memory for time. A view's
+table holds every fact the first session had derived when its lower stages finished,
+which can be many more facts than a selective query derives. Tables whose facts hold a
+blank node a rule made are not kept.
+

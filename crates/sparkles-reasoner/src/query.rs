@@ -313,6 +313,14 @@ pub(crate) struct Session {
     /// the rows the lower stages of the schema pass derived, the facts its `noValue`
     /// builtins read, which go out with the next derivation like any other
     lower_rows: Option<(usize, usize)>,
+    /// whether the equality stages of the program may read and fill the table cache:
+    /// the program is specialized to the schema, its view is cacheable, and no fact was
+    /// added to the session's graph from outside the view
+    equality_cacheable: bool,
+    /// the facts of the equality stages were read from the table cache
+    cached_equality: bool,
+    /// a fact was added to the session's graph from outside the view
+    added_facts: bool,
     /// tables read from the cache
     cached: Vec<Arc<Table>>,
     reports: Vec<DemandReport>,
@@ -391,6 +399,9 @@ impl Session {
             schema_rows: None,
             schema_instance_rows: None,
             lower_rows: None,
+            equality_cacheable: false,
+            cached_equality: false,
+            added_facts: false,
             cached: Vec::new(),
             reports: Vec::new(),
             seeds: Vec::new(),
@@ -548,9 +559,32 @@ impl Session {
     fn run_lower(&mut self, pre: bool, what: &str) -> Result<()> {
         let program = if pre { &self.pre } else { &self.program };
         let stages = program.as_ref().map_or(0, |p| p.stages.len());
+        // the equality stages come last, and do not depend on the query: their facts are
+        // read from the table cache, or kept there once they are derived
+        let equality = if pre {
+            None
+        } else {
+            program
+                .as_ref()
+                .and_then(|p| p.stages.iter().position(|s| s.equality))
+                .filter(|&e| e > 0)
+                .and_then(|e| self.equality_key().map(|k| (e, k)))
+        };
+        if let Some((_, key)) = &equality
+            && let Some(t) = tables::get(key)
+        {
+            let facts = self.remap(&t)?;
+            let g = self.graph.as_mut().expect("graph made");
+            g.try_add_batch(facts)
+                .map_err(|e| memory_error(e, "the equality stages"))?;
+            self.cached_equality = true;
+        }
         for si in (1..stages).rev() {
             let program = if pre { &self.pre } else { &self.program };
             let stage = &program.as_ref().expect("prepared").stages[si];
+            if !pre && self.cached_equality && stage.equality {
+                continue;
+            }
             let g = self.graph.as_mut().expect("graph made");
             if let Some(p) = stage.only_if
                 && g.count_p(p, 0, g.len()) == 0
@@ -562,7 +596,61 @@ impl Session {
             g.try_add_batch(seeds).map_err(|e| memory_error(e, what))?;
             self.run(pre, si, start, what)?;
         }
+        if let Some((_, key)) = equality
+            && !self.cached_equality
+        {
+            self.cache_equality(key);
+        }
         Ok(())
+    }
+
+    /// The table cache's key of the facts of the equality stages, when they may be
+    /// cached: those of a program specialized to the schema of a cacheable view, whose
+    /// graph holds the view's facts alone. Explanation sessions, which keep linear
+    /// recursion as the rules state it, derive other intermediate facts and keep a key
+    /// of their own.
+    fn equality_key(&self) -> Option<tables::Key> {
+        if !self.equality_cacheable || self.added_facts {
+            return None;
+        }
+        Some(tables::Key {
+            view: self.schema_view.clone()?,
+            digest: self.shared.digest,
+            demand: format!("equality|{}", self.rewrite_linear),
+            seeds: (0, 0),
+        })
+    }
+
+    /// Keep every derived fact of the session's graph in the table cache, after its
+    /// lower stages: they include the premises of each fact the equality stages derived,
+    /// so that an explanation in a session that reads the table still finds them. Magic
+    /// facts are left out, and nothing is kept when a rule made a blank node.
+    fn cache_equality(&self, key: tables::Key) {
+        let g = self.graph.as_ref().expect("graph made");
+        let mut facts: Vec<[u64; 3]> = Vec::new();
+        let mut keys: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        for t in g.derived() {
+            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+                continue;
+            }
+            for &x in t {
+                if Id(x).tag() == Tag::Local && seen.insert(x) {
+                    match self.terms.local(x) {
+                        Some(LocalTerm::Key(k)) => keys.push((x, k.clone())),
+                        _ => return,
+                    }
+                }
+            }
+            facts.push(*t);
+        }
+        tables::put(
+            key,
+            Arc::new(Table {
+                chunks: vec![Arc::new(facts)],
+                keys,
+            }),
+        );
     }
 
     fn hide(&mut self, preds: &FxHashSet<u64>) {
@@ -708,6 +796,8 @@ impl Session {
             return Ok(());
         }
         self.specialized = true;
+        self.equality_cacheable = false;
+        self.cached_equality = false;
         if self.compact_done {
             let program = demand::compact_roots(&self.terms, &self.keys)
                 .map_err(|e| memory_error(e, "compact demand roots"))?;
@@ -893,6 +983,7 @@ impl Session {
         self.hide(&program.magic_preds);
         self.program = Some(program);
         self.lower_done = false;
+        self.equality_cacheable = true;
         Ok(())
     }
 
@@ -922,6 +1013,7 @@ impl Session {
     /// materialization adds.
     pub(crate) fn add_facts(&mut self, facts: Vec<Triple>) -> Result<()> {
         self.make_graph()?;
+        self.added_facts = true;
         let g = self.graph.as_mut().expect("graph made");
         g.try_add_batch(facts)
             .map_err(|e| memory_error(e, "the facts of an explanation"))?;
@@ -1865,5 +1957,133 @@ mod compact_tests {
                 "control profile {name} bypassed the compact plan"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod equality_cache_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    fn store(ttl: &str) -> Store {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                format!(
+                    "@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . {ttl}"
+                )
+                .into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store
+    }
+
+    fn session(reasoner: &QueryReasoner, store: &Store) -> Session {
+        Session::new(
+            reasoner.shared.clone(),
+            SessionRequest {
+                snap: store.snapshot(),
+                readable: None,
+                stop: Arc::new(|| Ok(())),
+                max_memory: None,
+                no_cache: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn types_of_c() -> Demand {
+        Demand {
+            s: DemandTerm::Var,
+            p: DemandTerm::Const(Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned())),
+            o: DemandTerm::Const(Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "http://ex.org/C",
+            ))),
+        }
+    }
+
+    fn holds(session: &Session, s: &str) -> bool {
+        let id = |t: &str| {
+            session
+                .terms
+                .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(t)))
+        };
+        let t = [
+            id(s),
+            id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            id("http://ex.org/C"),
+        ];
+        session.graph().is_some_and(|g| g.contains(&t))
+    }
+
+    /// The equality stages run in the first session of a view and are read from the table
+    /// cache in the next, with the same facts. The sessions ask for no result tables,
+    /// which would answer the demand without a derivation, but `no_cache` does not
+    /// bypass the view's equality table, as it does not bypass the schema table.
+    #[test]
+    fn equality_stages_are_read_from_the_cache_in_later_sessions() {
+        let store = store("ex:a owl:sameAs ex:b . ex:b a ex:C . ex:unrelated ex:p ex:x .");
+        let reasoner =
+            QueryReasoner::new(Profile::OwlRl, &Extras::default(), Inputs::default()).unwrap();
+        let mut first = session(&reasoner, &store);
+        first.derive_all(&[types_of_c()]).unwrap();
+        assert!(!first.cached_equality);
+        assert!(holds(&first, "http://ex.org/a"));
+        for _ in 0..2 {
+            let mut next = session(&reasoner, &store);
+            next.derive_all(&[types_of_c()]).unwrap();
+            assert!(next.cached_equality);
+            assert!(holds(&next, "http://ex.org/a"));
+        }
+        // an explanation session keeps a table of its own
+        let mut explaining = reasoner
+            .explain_session(
+                SessionRequest {
+                    snap: store.snapshot(),
+                    readable: None,
+                    stop: Arc::new(|| Ok(())),
+                    max_memory: None,
+                    no_cache: false,
+                },
+                true,
+            )
+            .unwrap();
+        explaining.derive_all(&[types_of_c()]).unwrap();
+        assert!(!explaining.cached_equality);
+    }
+
+    /// A session whose graph holds facts from outside the view, as a why-not hypothesis
+    /// adds them, neither reads nor fills the equality table.
+    #[test]
+    fn added_facts_bypass_the_equality_table() {
+        let store = store("ex:a owl:sameAs ex:b . ex:b a ex:C .");
+        let reasoner =
+            QueryReasoner::new(Profile::OwlRl, &Extras::default(), Inputs::default()).unwrap();
+        let mut hypothesis = session(&reasoner, &store);
+        let id = |t: &str| {
+            hypothesis
+                .terms
+                .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(t)))
+        };
+        let extra = [
+            id("http://ex.org/z"),
+            id("http://www.w3.org/2002/07/owl#sameAs"),
+            id("http://ex.org/a"),
+        ];
+        hypothesis.add_facts(vec![extra]).unwrap();
+        hypothesis.derive_all(&[types_of_c()]).unwrap();
+        assert!(!hypothesis.cached_equality);
+        assert!(holds(&hypothesis, "http://ex.org/z"));
+        let mut plain = session(&reasoner, &store);
+        plain.derive_all(&[types_of_c()]).unwrap();
+        assert!(!plain.cached_equality, "the hypothesis filled no table");
+        assert!(!holds(&plain, "http://ex.org/z"));
+        let mut next = session(&reasoner, &store);
+        next.derive_all(&[types_of_c()]).unwrap();
+        assert!(next.cached_equality);
+        assert!(!holds(&next, "http://ex.org/z"));
     }
 }

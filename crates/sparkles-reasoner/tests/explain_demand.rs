@@ -1293,3 +1293,24 @@ fn compact_same_rule_distinct_supports_count_as_distinct_instances() {
         replay(tree, &profile.rules().unwrap());
     }
 }
+
+/// A second explanation on the same view reads the equality stages' facts from the
+/// table cache, and its trees are as sound and replay as the first's.
+#[test]
+fn explanations_from_cached_equality_facts_are_sound() {
+    let s = store(
+        "ex:a owl:sameAs ex:b . ex:b owl:sameAs ex:c . ex:c a ex:C . ex:C rdfs:subClassOf ex:D .",
+    );
+    let p = Profile::OwlRl;
+    let t = [ex("a"), a(), ex("D")];
+    let first = trees(demand(&s, &p, t.clone(), &ExplainOptions::default()));
+    for _ in 0..2 {
+        let (ts, more) = trees(demand(&s, &p, t.clone(), &ExplainOptions::default()));
+        assert_eq!(ts.len(), first.0.len());
+        assert_eq!(more, first.1);
+        for d in &ts {
+            sound(&s, d, &mut Vec::new());
+            replay(d, &p.rules().unwrap());
+        }
+    }
+}
