@@ -215,7 +215,9 @@ The built-in GraphRAG disclosure guard supports controlled preparation, includin
 index reads, footprint digest checking and exact coverage. It builds a temporary local
 index on a cold call and can reuse an existing compatible index after admission.
 
-Arbitrary protection-pattern planning remains unsupported by the bounded helper.
+Arbitrary protection-pattern planning and unresolved providers nested in triple rules
+or protection graph definitions remain unsupported by the bounded helper. Static
+nested guards remain supported.
 Guarded Dataset queries, C25 exact references and U02 readers still need adoption under
 [C29](../specs/C29-bounded-view-preparation/README.md), roadmap item 395. These helpers
 provide no managed-write authority, source authenticity or complete HTTP query

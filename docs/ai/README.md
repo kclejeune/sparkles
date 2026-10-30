@@ -228,7 +228,8 @@ Strong and Weak aliases. These lifetime checks grant no read permission or durab
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly
-refuses unsupported providers and protection-pattern planning. C25 exact-reference
+refuses unsupported providers, unresolved providers nested in retained rules and
+protection-pattern planning. C25 exact-reference
 resolution and guarded Dataset queries still require caller adoption under
 [item 395](../ROADMAP.md). A prepared visibility view provides no source authenticity,
 managed-write authority or proof that an unavailable reference is absent.

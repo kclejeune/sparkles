@@ -179,10 +179,15 @@ index local. A compatible existing index can be reused after retained-state admi
 These checks preserve disclosure visibility; they confer no source authenticity or
 managed-write authority.
 
+Unresolved guard providers nested inside a triple rule or protection graph definition
+also return `Unsupported`. Legacy binding leaves these providers unresolved, and their
+opaque retained state cannot be admitted through the top-level provider contract.
+Static nested guards remain supported.
+
 Protection-pattern planning remains explicitly unsupported on this bounded entry
 point. It cannot call the existing unbounded parser or planner and claim the result
-satisfies the cap. The remaining pattern work and Phase 3 guarded Dataset and query
-adoption, C25 exact references and U02 readers remain under item 395. The physical
+satisfies the cap. The remaining pattern and nested-provider accounting work and Phase 3 guarded Dataset
+and query adoption, C25 exact references and U02 readers remain under item 395. The physical
 history handles and controlled permission helper do not provide an end-to-end query
 preparation limit for those callers.
 

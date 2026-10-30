@@ -670,3 +670,149 @@ fn retained_policy_capacities_include_all_owned_container_families() {
         );
     }
 }
+
+#[test]
+fn retained_nested_provider_state_refuses_without_callbacks_or_a_returned_owner() {
+    use sparkles_core::access::Exemptions;
+    use std::sync::atomic::AtomicBool;
+    struct Opaque {
+        calls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        controlled: bool,
+        _payload: Vec<u8>,
+    }
+    impl Drop for Opaque {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    impl GuardDecision for Opaque {
+        fn exempt(&self, _: &Arc<Snapshot>) -> Vec<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }
+        fn exempt_controlled(
+            &self,
+            _: &Arc<Snapshot>,
+            p: &Preparation,
+        ) -> sparkles_core::Result<Exemptions> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.controlled {
+                Exemptions::new(p)
+            } else {
+                Err(Error::Unsupported("legacy-only fixture provider".into()))
+            }
+        }
+    }
+    let store = Store::in_memory(StoreOptions::default());
+    for location in 0..3 {
+        for controlled in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let provider = Arc::new(Opaque {
+                calls: calls.clone(),
+                dropped: dropped.clone(),
+                controlled,
+                _payload: vec![1; 1 << 20],
+            });
+            let nested = Graphs::All.guarded_by("urn:guarded:*", Decider(provider.clone()));
+            let mut p = protection();
+            let (read, write) = match location {
+                0 => (Graphs::All, nested),
+                1 => (nested, Graphs::none()),
+                _ => {
+                    p.graphs = Some(nested);
+                    (Graphs::All, Graphs::none())
+                }
+            };
+            let access = GraphAccess::with_triples(
+                Graphs::All,
+                Graphs::All,
+                TripleRules {
+                    rules: vec![Rule {
+                        protection: Arc::new(p),
+                        read,
+                        write,
+                    }],
+                    caller: Caller::default(),
+                    limits: Limits::default(),
+                },
+            );
+            // Existing binding deliberately leaves these nested guards unresolved.
+            assert!(Arc::ptr_eq(
+                Arc::new(access.clone())
+                    .bound(&store.snapshot())
+                    .triples
+                    .as_ref()
+                    .unwrap(),
+                access.triples.as_ref().unwrap()
+            ));
+            let result = access.masked_controlled(
+                &store.snapshot(),
+                &Preparation::new(Control::none(), 64 << 10).unwrap(),
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "opaque nested provider state retained under small cap at location {location}"
+            );
+            drop(access);
+            drop(provider);
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "refusal kept an opaque provider owner"
+            );
+        }
+    }
+}
+
+#[test]
+fn static_nested_guards_preserve_legacy_visibility_without_opaque_providers() {
+    use sparkles_core::access::{GraphGuard, GraphRule};
+    let store = fixture();
+    for location in 0..3 {
+        let nested = Graphs::Only(GraphRule {
+            default_graph: true,
+            patterns: vec!["urn:*".into()],
+            guards: vec![GraphGuard {
+                pattern: "urn:g*".into(),
+                exempt: vec!["urn:g1".into()],
+                decide: None,
+            }],
+            ..GraphRule::default()
+        });
+        let mut p = protection();
+        let (read, write) = match location {
+            0 => (Graphs::All, nested),
+            1 => (nested, Graphs::none()),
+            _ => {
+                p.graphs = Some(nested);
+                (Graphs::All, Graphs::none())
+            }
+        };
+        let access = GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(p),
+                    read,
+                    write,
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        );
+        let legacy = access.masked(&store.snapshot()).unwrap();
+        let snapshot = store.snapshot();
+        let cold = Arc::new(Snapshot {
+            counts: Default::default(),
+            ..(*snapshot).clone()
+        });
+        let actual = access
+            .masked_controlled(&cold, &Preparation::new(Control::none(), 16 << 20).unwrap())
+            .unwrap();
+        assert_eq!(actual.access(), &access);
+        assert_eq!(quads(actual.snapshot()), quads(&legacy));
+    }
+}

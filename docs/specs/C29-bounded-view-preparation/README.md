@@ -6,7 +6,8 @@ policy when replay, caches or derived masks need substantial work.
 
 Phase 1 provides capped Store snapshots and trusted Dataset history handles, including
 retained branch origins. Phase 2 adds controlled graph, predicate and class masks and
-the built-in disclosure guard. Protection-pattern planning and guarded caller adoption
+the built-in disclosure guard. Protection-pattern planning, retained nested-provider
+accounting and guarded caller adoption
 remain under roadmap item 395. Item 398 tracks controlled preparation costs before
 broader caller adoption.
 

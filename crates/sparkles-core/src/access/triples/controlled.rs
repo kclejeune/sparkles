@@ -144,6 +144,15 @@ fn graphs_bytes(graphs: &Graphs, preparation: &Preparation) -> Result<u64> {
     }
     for guard in &rule.guards {
         preparation.check()?;
+        // Legacy binding leaves guards in triple/protection graph definitions
+        // unresolved. Retaining their opaque provider Arc would bypass admission;
+        // invoking or clearing it here would change that established policy.
+        if guard.decide.is_some() {
+            return Err(Error::Unsupported(
+                "controlled permission preparation cannot retain unresolved nested guard providers"
+                    .into(),
+            ));
+        }
         bytes = bytes
             .saturating_add(guard.pattern.capacity() as u64)
             .saturating_add(128)
