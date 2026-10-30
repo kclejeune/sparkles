@@ -12,7 +12,7 @@
 > were superseded by [C18](C18-natural-language-questions-and-ingest/README.md). The
 > dataset setting for scratch expiry and expiry under stdio have shipped. The limit per
 > principal, the warnings before deletion and the `keep` option of scratch branches
-> remain under roadmap item 431, and the shared evidence profile under item 81.
+> remain under roadmap item 435, and the shared evidence profile under item 81.
 >
 > **User docs:** [API: MCP tools](../API.md#tools) ·
 > [API: Memory writes](../API.md#memory-writes) ·
@@ -1390,7 +1390,7 @@ of idle scratch branches was the `serve` flag `--mcp-scratch-branch-ttl`, read i
 `sparkles_mcp_scratch_branches_expired_total`. The dataset setting of decision 4 (§13)
 and expiry under `sparkles mcp` over stdio were built for item 57, as the delivery
 record below describes. The design bullets follow, and the ones that are not built are
-tracked under item 431 of the [roadmap](../ROADMAP.md).
+tracked under item 435 of the [roadmap](../ROADMAP.md).
 
 - **A dataset setting.** A `scratchBranches` object in the dataset's settings, a field
   of the C19 layers with its usual locks: `ttl` (a duration, or `null` for none),
@@ -1453,7 +1453,7 @@ it with the rest of the kind, and the OpenAPI document describes it under
   session never writes, so it never expires a branch.
 - **Not built.** `maxPerPrincipal`, `notifyBefore`, the `keep` argument of
   `create_branch` and the `admin` route that clears a scratch mark remain as designed
-  above, under roadmap item 431.
+  above, under roadmap item 435.
 
 **Tests for item 57.** `mcp::expiry_tests` checks that a dataset value overrides the
 default in both directions, that `off` keeps branches, that an invalid stored value falls

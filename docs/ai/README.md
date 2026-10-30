@@ -174,7 +174,7 @@ support ownership and dependent freshness remain under items 81 and 340.
 
 Idle scratch branches expire after the dataset's `memory.scratchBranches.ttl`, over HTTP
 and in a `sparkles mcp --loc --allow-update` session. A limit per principal, warnings
-before a branch expires and a way to keep one branch remain under item 431.
+before a branch expires and a way to keep one branch remain under item 435.
 
 ### Document ingestion
 
