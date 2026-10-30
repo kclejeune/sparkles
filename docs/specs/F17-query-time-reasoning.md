@@ -820,6 +820,14 @@ The abstract model admits its workspace before allocating and falls back to the
 conservative proof at its fact or binding cap. Input failures, cancellation, deadlines
 and memory exhaustion fail the derivation.
 
+The schema pass can derive instance facts on the way to schema facts, for example the
+types of an instance whose class is a subclass of `owl:Class`. The query's program finds
+those facts already held and does not derive them again. They therefore go out with the
+next derivation of any demand. Only facts of the schema vocabulary wait for a demand that
+can read them, and a debug assertion checks that no demand of the derivation could match
+a withheld fact. Before this, a demand such as `?x rdf:type ex:C0` lost answers whenever
+the schema pass had derived them.
+
 An uncovered `listForAll` reads positive facts outside its explicit rule atoms. New
 facts for those reads reconsider the rule, and a replay emits heads only when that
 particular match used a new explicit fact or an actual bound list-member fact. This
@@ -840,6 +848,12 @@ negative lower stages, coherent multihead relations and fresh-witness counts. Th
 explanation sample now requires every sampled materialized fact to have a demand
 answer and retains its proof soundness and replay checks. The strengthened checks
 include schema facts rather than allowing missing answers for W3C terms.
+A schema-heavy random differential compares demand with OWL RL materialization on
+small views that make W3C classes of classes and properties, schema predicates and
+equality between schema terms follow from instance facts. Its queries have a five-second
+deadline. A query past the deadline is counted and skipped, since equality between
+schema terms can expand the demand program far beyond the closure (roadmap items 9
+and 190).
 
 
 ### Bounded positive feedback evaluation

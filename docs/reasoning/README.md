@@ -206,6 +206,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   tiny positive feedback view, but can retain more intermediate facts than selective
   evaluation.
   Structural list terms, negation and term-generating rules exclude this route.
+  On small views where `owl:sameAs` relates classes and properties, a demand can take
+  much longer than materializing the view, because equality is read through the
+  `eq-rep-*` rules rather than representatives. Roadmap items 9 and 190.
   Roadmap item 190 covers these costs and matched Forge measurement. The
   [recorded demand measurements](../specs/F17-query-time-reasoning.md#outcome) identify
   their source revision and do not establish current-head performance.
