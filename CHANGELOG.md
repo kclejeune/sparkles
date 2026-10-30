@@ -12,6 +12,9 @@ signals remain incomplete.
 
 ### Changed
 
+Node graph overviews retain one absolute deadline across their native subqueries
+instead of renewing the timeout for each query.
+
 Catalog disposal now refuses raw shared state, Store and BranchSet aliases and preserves
 exact owners on refusal. Resident source leases retain real catalog openings without
 changing StoreHandle variants or granting managed-write authority. Built-in close links,

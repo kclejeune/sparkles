@@ -6,6 +6,8 @@ use sparkles::history::{At, SnapshotOptions};
 mod algo_stats_probe;
 #[cfg(test)]
 mod algo_stats_tests;
+#[cfg(test)]
+mod graph_groups_tests;
 mod mapping_control;
 fn value<T: Serialize>(v: T) -> sparkles::Result<Value> {
     serde_json::to_value(v).map_err(|e| EngineError::invalid(e.to_string()))
@@ -659,7 +661,10 @@ fn run_admin(
         )?)?,
         "graph.groups" => {
             let req = sparkles::overview::GroupsRequest::from_json(&a["request"])?;
-            ds.graph().groups(&req, &query_options(v, flag)?)?
+            let mut opts = query_options(v, flag)?;
+            // Every overview query shares the administration operation's deadline.
+            opts.deadline = ctl.deadline;
+            ds.graph().groups(&req, &opts)?
         }
         "mappings.list" => value(ds.mappings().list().into_iter().map(|(name, stored, last)| json!({"name": name, "kind": stored.definition.kind, "description": stored.definition.description, "version": stored.version, "lastRun": last})).collect::<Vec<_>>())?,
         "mappings.get" => value(ds.mappings().get(text(a, "name")?, optional_number(a, "version")?))?,
