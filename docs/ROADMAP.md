@@ -1,10 +1,11 @@
 # Roadmap
 
-This roadmap prioritizes completion of the capabilities marked partially complete and
-their adopted release contracts. AI memory and knowledge mapping and a production-ready
-RDF engine have a slight lead, while evidence-backed software supply-chain applications
-advance in parallel. New features enter the delivery path when a concrete use case or
-an adopted dependency requires them. A separate analyst workbench follows these goals.
+This roadmap prioritizes making Sparkles the best graph database by objective measures.
+These are correctness, conformance, performance, robustness and the standard features.
+Embedded agent memory and entity representation follow, and applications built on top of
+Sparkles, such as the supply-chain pilot, come after them. New features enter the delivery
+path when a concrete use case or an adopted dependency requires them. A separate analyst
+workbench follows these goals.
 
 Existing storage, query, reasoning, search, security and recovery capabilities retain
 their required phases and acceptance gates. Close competitive results can be accepted
@@ -71,24 +72,72 @@ ordered by their tier alone.
 
 ## Delivery priorities
 
+The goal comes first. Sparkles should be the best graph database by objective measures,
+which are correctness, conformance, performance, robustness and the standard features.
+Embedded agent memory in C17 and C18 comes second, and shared entity representation in
+A01 and C25 comes third. Applications built on top of Sparkles, such as the cyber and
+public-health supply-chain pilot, come after these. The engine supplies generic
+primitives, and domain adapters and matching logic stay application work rather than
+engine infrastructure.
+
 Complete named spec phases and their acceptance gates. A parent capability remains
 partially complete while adopted requirements remain. Building an application on a
-usable subset does not waive those requirements. Within the completion program, put
-correctness, recovery, bounded resources and source identity ahead of unrelated feature
-expansion. The parallel delivery streams are shared AI knowledge, engine completion and
-production, and application acceptance. Their common evidence, history, authorization,
-execution and recovery contracts have one implementation. Domain adapters and matching
-logic remain application work rather than duplicate engine infrastructure.
+usable subset does not waive those requirements. Correctness, recovery, bounded
+resources and source identity go ahead of unrelated feature expansion.
+
+### Wave A: engine quality
+
+Wave A holds the work that most improves the engine against objective measures.
+
+* Competitive benchmark losses come first. The order is SP²Bench `q11`, DBpedia
+  births-by-decade, then BSBM Explore `q7` and `q8` and BI `q3`, as
+  [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records them. Durable commits and
+  mixed-load writes follow through items 86, 111, 112 and 171, and cold point lookups
+  through item 4.
+* Streaming execution and spill follow through items 7 and 93.
+* The Stage A lanes of item 17 are items 413 to 417. They deliver the safety net,
+  internal circuits, the provenance algebra, reasoner witnesses and the fixed-point
+  operator.
+* Small lanes that finish a capability run in free capacity. These are item 48, items 90,
+  57, 277 and 77, and the CSVW and RML conformance gaps in items 235 and 232.
+
+### Wave B: memory and entities
+
+Wave B starts with item 81 Phase 3, then items 341, 396 and 57 and the remaining C18
+work. Item 18 Phase 3 and item 12 follow once the item 17 lanes they need have landed.
+Item 12 needs items 413 and 414, and item 18 Phase 3 needs items 415 and 416.
+
+### Production readiness
+
+Production readiness runs alongside both waves. It covers items 60, 59 and 58 for the
+API policy, server artifacts and packages, item 61 for backups and item 65 for
+encryption, together with items 402 and 400. Item 64 and the adopted phases of 65 close
+startup and key workflows.
+
+### Deferred
+
+Items 339 and 340 for durable jobs and maintained analyses, item 100 for report
+configurations, the supply-chain application, item 20 for openCypher, item 72 for JSON
+query languages and item 344 for ChatGPT-plan model access wait for the work above. A
+prerequisite can bring one of them forward when a concrete use case needs it.
+
+### Sequencing
+
+Write-path competitive work goes before the commit-time maintenance lane of item 17,
+which is item 421, because both change the commit path. Item 421 then measures its cost
+against the improved baseline.
+
+### Acceptance by milestone
 
 | Milestone | Work | Acceptance |
 |---|---|---|
 | Reliable baseline | Close confirmed correctness failures and retain qualified measurements. | The integration passes its required review, tests, conformance and performance gates. |
+| Production readiness | Items 58–60 complete packages, server artifacts and compatibility policy. Item 64 and the adopted phases of 65 close startup and key workflows. | Installed artifacts, supported platforms, upgrade and recovery tests pass before a release is cut. |
+| Shared capability completion | Close the relevant search, path, view, reasoning, explanation, validation, API and visualization phases from the completion paths below. | The declared scope passes its correctness, visibility, recovery and measured resource gates. |
+| Trusted sources and resumable work | Item 81 delivers C25 Phases 1–2, and item 341 delivers C27 Phase 1. Item 339 delivers C26 Phase 1 when it is taken up. Backups and clones already carry view definitions paused, and C26 extends that to jobs and deliveries. | Source revisions and decisions retain their identity and evidence. Interrupted work resumes safely, and restored external work stays paused. |
 | Shared entity representation | Bounded private offline replay and selected fixture mappings are available over the entity, identifier, resolution and evolution resources. Item 396 retains authenticated managed integration. | Independent query fixtures preserve source claims through conflicting identifiers, merge and split decisions, source correction and mapping migrations. |
-| Trusted sources and resumable work | Item 81 delivers C25 Phases 1–2, item 339 delivers C26 Phase 1, and item 341 delivers C27 Phase 1. Backups and clones already carry view definitions paused, and C26 extends that to jobs and deliveries. | Source revisions and decisions retain their identity and evidence. Interrupted work resumes safely, and restored external work stays paused. |
-| Production readiness | Items 58–60 complete packages, server artifacts and compatibility policy. Item 64 and the adopted phases of 65 close startup and key workflows. This work runs alongside feature completion. | Installed artifacts, supported platforms, upgrade and recovery tests pass before a release is cut. |
 | Reproducible assessments | Item 340 delivers F22 Phase 1 after C25's typed records and C26's fenced publication are available. Full recomputation is the initial execution model. | Inputs, outputs and methods are reproducible. New matching data, source withdrawals, expiry and authorization changes invalidate affected results. |
 | Unattended operation | Complete C26 Phase 2 and F22 Phase 2, including temporal scheduling. Item 100 supplies guarded report configurations when distinct audiences are required. | Fenced database publication rejects stale attempts and duplicate accepted database effects. External delivery is at least once with stable event IDs, so receivers deduplicate repeated deliveries. Recovery preserves current authorization. |
-| Shared capability completion | Close the relevant search, path, view, reasoning, explanation, validation, API and visualization phases from the completion paths below. | The declared scope passes its correctness, visibility, recovery and measured resource gates. |
 | Full partial-feature completion | Finish the other adopted partial-feature phases and release contracts, including explicitly scheduled large phases. | Required feature, compatibility, packaging and operational acceptance are complete before release. |
 
 Item 396 defines shared entities and domain mappings without duplicating C25 review
@@ -105,10 +154,10 @@ visibility follow their explicit prerequisites. Initial analyses use full recomp
 and authorized projections, with the required freshness and access checks. Exact retained
 references use item 395 for bounded history and permission preparation.
 
-Optimize measured ingestion, dependency joins, paths, refresh and retrieval costs when
-they prevent the accepted workflow from meeting its resource or latency goals. Preserve
-durability, cancellation and visibility. Broader competitive refreshes and small
-benchmark costs remain tracked without driving this delivery sequence.
+Optimize measured ingestion, dependency joins, paths, refresh and retrieval costs, and
+the competitive losses that Wave A lists. Preserve durability, cancellation and
+visibility. Broader competitive refreshes that do not name a recorded loss remain
+tracked without driving this delivery sequence.
 
 Existing partial UI and profiling contracts remain in the completion program and can
 follow the shared knowledge and production phases. New query-by-example, notebook,
@@ -118,7 +167,7 @@ not delay independent core phases, and retain their declared dependencies.
 
 Virtual graphs in F19 and replication in F10 are substantial later phases of partial
 specs. They remain visible completion work with explicit phase boundaries. They are not
-prerequisites for the first memory or deterministic inventory/advisory workflow.
+prerequisites for the first memory workflow.
 
 ## Tracks and decisions
 
@@ -127,10 +176,10 @@ not to every extension in a spec or to phases that have already shipped.
 
 | Track | Open items | Specs |
 |---|---|---|
-| **Performance** | 1 refreshes the evidence while 7, 86 and 4 address their remaining gates. Item 93 controls the spill default, and 111, 112 and 171 close the indexed group-commit gates. | X06, X08 Phase 2, X09 Phase 4, X07 |
-| **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 17, while 20 supplies openCypher before its algorithm procedures can finish. | F14, C22, F13, F01 |
-| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 17 Phase 3 precedes 19 Phase 3 and 18 Phase 3, while existing explanations remain available. | F16, F17, F13, F18 |
-| **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses 17. | C25, C26, A01, F22, C27, C22b |
+| **Performance** | 1 refreshes the evidence while 7, 86 and 4 address their remaining gates. Item 93 controls the spill default, and 111, 112 and 171 close the indexed group-commit gates. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
+| **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 413 and 414. | F14, C22, F13 |
+| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. | F16, F17, F13, F18 |
+| **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses the lanes of item 17. | C25, C26, A01, F22, C27, C22b |
 
 The following dependencies describe the remaining phase contracts. Independent work can
 proceed in parallel, including full recomputation of maintained analyses before later
@@ -140,15 +189,29 @@ incremental execution exists.
 flowchart LR
     E["81 · Shared evidence"] --> A["340 · Maintained analyses"]
     J["339 · Durable jobs and delivery"] --> A
-    I["17 · F13 Phase 2 views"] --> R["12 · View-based report refresh"]
-    I --> P["17 · F13 Phase 3 provenance and recursion"]
-    P --> T["19 · F17 Phase 3 maintained tables"]
-    P --> V["18 · F18 Phase 3 supported visibility"]
+    L0["413 · Safety net and load checks"] --> L1["414 · Internal circuits"]
+    L0 --> L2["415 · Provenance algebra"]
+    L2 --> L3["416 · Reasoner witnesses"]
+    L2 --> L4["417 · Fixed-point operator"]
+    L0 --> R["12 · View-based report refresh"]
+    L1 --> R
+    L2 --> V["18 · F18 Phase 3 supported visibility"]
+    L3 --> V
     E --> V
-    C["20 · openCypher"] --> G["8 · Algorithm procedures"]
+    L2 --> T["19 · F17 Phase 3 maintained tables"]
+    L4 --> T
+    W["write-path competitive work"] --> L8["421 · Commit-time table views"]
+    P222["222 · View access by grant containment"] --> L11["424 · MCP"]
+    P222 --> L13["426 · UI"]
+    P223["223 · Parallel view passes"] --> L14["427 · Per-branch views and keepCommits"]
     B["280 · Replication decisions"] --> D["66 · Replicas and recovery"]
     D --> S["66 · Synchronous replication and fenced failover"]
 ```
+
+Item 226 goes with item 414, because the change ring is copied for every commit once an
+internal circuit consumes it. Item 223 comes before item 427, and item 222 comes before
+items 424 and 426. The other item 17 lanes in Stage B and Stage C depend on item 413 and
+are listed in the [lane table](#lanes-of-item-17).
 
 Item 19 Phase 2 does not wait for F13 Phase 3. Its `auto` mode must account for the
 materialization states available when it lands. Item 100 Phase 1's report configurations
@@ -179,29 +242,29 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | Spec | Remaining items | Exit condition |
 |---|---|---|
 | [C01](specs/C01-observability-and-budgets.md#outcome) | 64, 342 | Startup exposes opening, failed and degraded states without losing readiness or access controls. JSON and OTLP include the Phase 2 work, memory-peak and rebuild series with the Prometheus units, labels and histogram semantics. |
-| [C03](specs/C03-graphql/SPEC.md#outcome) | 37, 17 | Complete Phase 2's seeded execution, bounded per-parent windows, nested connections, UI/schema editing and persisted-query controls with differential and visibility tests. Subscriptions follow F13 when adopted, while mutations require the separate scope decision recorded in the Outcome. |
+| [C03](specs/C03-graphql/SPEC.md#outcome) | 37 | Complete Phase 2's seeded execution, bounded per-parent windows, nested connections, UI/schema editing and persisted-query controls with differential and visibility tests. Subscriptions are deferred until a workload asks for them, and then use F13. Mutations require the separate scope decision recorded in the Outcome. |
 | [C06](specs/C06-clone-to-sandbox.md#outcome) | 45 | Remote and archive clones preserve a chosen branch/commit's data, stored blank identities, prefixes and configuration while creating correct new lineage. Interrupted, corrupt or cancelled transfers publish no destination. |
 | [C17](specs/C17-agent-memory.md#outcome) | 57, 81 | Dataset-layered scratch expiry works over HTTP and stdio with the configured limits and notifications. Adopt the shared evidence profile with its source, review and independent-support acceptance queries; server model calls use the successor C18 contract. |
 | [C18](specs/C18-natural-language-questions-and-ingest/SPEC.md#outcome) | 6, 15, 27, 77, 81, 90, 263, 318 | Finish the remaining evaluation matrix, multimodal ingestion, redaction and verified rewrites, and test grounding and VALUES changes against caller-visible data. Publish matching accuracy and latency evidence, preserving clarification for ambiguity and the original secret, budget and citation guarantees. |
 | [C25](specs/C25-evidence-and-assessments.md#outcome) | 81, 395 | Finish Phase 2's authenticated source, reference and claim operations, protected metadata, retained-view resolution, reader admission, review, support ownership and reversible identity decisions. Phase 3 integrates recall, ingestion, reports and maintained analyses, with exact identity, authorization, retry and crash acceptance. |
 | [C27](specs/C27-valid-time-profiles.md#outcome) | 341 | Complete Phase 1 with authenticated availability and backdating refusal through C25 Phase 2 and protected writes. Then add the temporal projection helper, event-time controls and expiry integration with interval, visibility and recovery acceptance. |
 | [C21](specs/C21-outbound-notifications.md#outcome) | 46 | Add email, the administration UI and complete backup-failure coverage. A slow destination cannot delay another channel, and delivery tests retain retry, outbound, secret and disabled-channel guarantees. |
-| [C22](specs/C22-graph-rag-community-summaries.md#outcome) | 12, 100, 260, 261, 262, 264 | Add F13 view-based refresh counting, finish person-checked and broader-corpus evaluation, and validate global-question routing and schema-order decisions. Multiple report configurations follow C22b under 100, retaining shared spending and disclosure controls. |
+| [C22](specs/C22-graph-rag-community-summaries.md#outcome) | 12, 100, 260, 261, 262, 264 | Add refresh counting with an accumulator on an internal F13 circuit, finish person-checked and broader-corpus evaluation, and validate global-question routing and schema-order decisions. Multiple report configurations follow C22b under 100, retaining shared spending and disclosure controls. |
 | [F03](specs/F03-full-text-search/SPEC.md#outcome) | 23, 35, 50, 250, 251 | Complete online changes, uncommitted and historical search, multi-field documents and the named analyzer parity gaps. Verify tokens against the adopted Lucene references and preserve restricted-view scoring and query correctness across rebuilds and pins. |
 | [F04](specs/F04-vector-search.md#outcome) | 34, 82 | Deliver the chosen quantization modes, result caching and statistics. Measure catch-up, worker sizing and binary16 recall on all named distance distributions, and verify cancellation, version invalidation and memory ownership. |
 | [F05](specs/F05-snapshot-repositories/SPEC.md#outcome) | 61, 65, 401 | Restore whole-server and multi-dataset runs with consistent, versioned definitions and paused external work. Complete repository transfer, chunking adoption, optional retained-history capture and storage-retention controls, proving restored retained commits and preserving older backup readers. |
 | [F06](specs/F06-snapshots-and-point-in-time.md#outcome) | 23, 52, 395 | Complete pin rebasing, per-quad periods, graph feeds, expired-state reconstruction and settings history, with full-text reads at pins supplied by 23. Compare historical answers and diffs with fresh reconstruction through compaction and retention boundaries. Add bounded replay and permission preparation through item 395. |
-| [F07](specs/F07-path-search.md#outcome) | 20, 275, 276, 277 | Add openCypher integration, length-bounded weighted search and bidirectional tied shortest paths with the reference path/cost tests. Resolve or explicitly disposition the measured control costs without weakening visit budgets or zero-weight semantics. |
+| [F07](specs/F07-path-search.md#outcome) | 275, 276, 277 | Add length-bounded weighted search and bidirectional tied shortest paths with the reference path/cost tests. Resolve or explicitly disposition the measured control costs without weakening visit budgets or zero-weight semantics. |
 | [F09](specs/F09-branches-and-merges.md#outcome) | 45 | Finish relink from the remote CLI and remote/archive cloning. Compare relink identities and clone contents with offline operations, including chosen commits, lineage, cancellation and corrupt-transfer refusal. |
 | [F10](specs/F10-replication.md#outcome) | 74, 280, 66 | Settle the replication contract before implementing replicas, bootstrap, archives, promotion, synchronous acknowledgement and fenced failover. Test exact primary identities, stream gaps, restart and declared data-loss guarantees, and separately complete multi-transaction patch and blank-node semantics. |
 | [F11](specs/F11-encryption-at-rest.md#outcome) | 61, 65, 58, 59 | Finish key workflows and recovery, Phase 2 chunking and write-only age-recipient repositories, then live-file and derived-index encryption. Pass the remaining phase acceptance for provider outages, read-authority separation, rotation, locked states and format compatibility. Standard builds include repository encryption with protected keys on Linux and macOS; later phases remain open. |
-| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
-| [F14](specs/F14-graph-algorithms.md#outcome) | 8, 20, 36, 79, 80 | Finish Graphalytics acceptance, completion, background progress, remaining algorithm surfaces and C23/openCypher integration. Define and independently validate the proposed broader weighted-betweenness domains before extending them, retaining exact refusal boundaries until then. |
+| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 413–430, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
+| [F14](specs/F14-graph-algorithms.md#outcome) | 8 | Finish Graphalytics acceptance, completion, background progress and the remaining algorithm surfaces. The C23 writer is item 36 and openCypher procedures are item 20, and each belongs to its own capability. Items 79 and 80 extend weighted betweenness as optional work, and the exact refusal boundaries stand until a broader domain is defined and independently validated. |
 | [F16](specs/F16-materialization-at-scale.md#outcome) | 9, 113 | Deliver the separate derived layer, canonical equality representatives and the remaining barrier-free and incremental-equality execution. Re-run the scale, differential, datatype and kept-closure memory gates, and settle the named small-change costs with matched measurements. |
 | [F17](specs/F17-query-time-reasoning.md#outcome) | 19, 190, 192, 193 | Finish automatic cost selection, hybrid rules, OWL 2 QL, settings and client surfaces, then F13-maintained tables and provenance. Close Phase 1's cache accounting, DESCRIBE and per-query costs with demand/materialization equivalence tests. |
 | [F18](specs/F18-explanations-and-entailment-diffs.md#outcome) | 18, 285, 286 | Add F13-backed supported visibility and reviewed-only derivations, result-cell actions and the explicitly extended unbound why-not contract. Compare filtered answers with fresh derivation after support withdrawal and policy changes, including multiple supports and truncated witnesses. |
 | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | 43, 230, 232, 233, 234, 235, 236, 237, 238, 239, 404 | Finish the named source, UI/task, conformance, function and term-identity gaps before claiming Phase 1 complete. Phase 2 virtual graphs must match materialized SPARQL answers with pushdown, access, cancellation and source-failure behavior tested. |
-| [G01](specs/G01-geosparql/SPEC.md#outcome) | 24, 70 | Complete per-row nearest-neighbour joins, the named geometry/CRS limits and spatial syntax. Keep intentional default divergences explicit, and validate any optional Jena-compatible mode against its declared answers rather than changing the default silently. |
+| [G01](specs/G01-geosparql/SPEC.md#outcome) | 24 | Complete per-row nearest-neighbour joins, QLever's spatial syntax, metric-property rewrites, polygon approximations, datum shifts and curved GML segments as item 24 lists them. Keep intentional default divergences explicit, since item 70's Jena-compatible mode is not adopted. |
 | [G02](specs/G02-shex/SPEC.md#outcome) | 54 | Complete combined guards, graph-plus-file schemas and CLI outbound controls with the adopted ShEx conformance and incremental/full equivalence tests. Unsupported reference syntax remains a stated language boundary rather than a claim of universal ShEx parity. |
 | [G03](specs/G03-shaclc.md#outcome) | 48 | Add a lossless SHACLC parser and comment-preserving formatter across CLI, HTTP and editor, retaining semantic round trips and existing constraint tests. The separately listed SHACL 1.2 draft constraints are outside the adopted node-expression phase. |
 | [P01](specs/P01-python-bindings.md#outcome) | 32, 33, 40, 58 | Complete release/platform and further async administration and bulk coverage, reusable plans and the remaining bounded per-call and footprint assessment. Validate package installation and the Python API suite on the claimed runtimes while preserving cancellation, term identity and snapshots. |
@@ -222,6 +285,24 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [U07](specs/U07-data-quality-and-schema-diagram.md#outcome) | 31, 120, 121 | Build per-commit quality records, backfill, introducing-commit search and the schema diagram. Move overlays to the retained record and verify focus-scoped fix previews against the complete candidate validation result. |
 | [U08](specs/U08-visual-query-builder.md#outcome) | 101 | Add Phase 3's union, graph, values, minus and not-exists editing plus overview entry. Preserve text outside edited spans, shared undo, stable layout and round trips for locked syntax. |
 | [U11](specs/U11-linked-views.md#outcome) | 140, 141, 142 | Finish the named colouring, date-facet, mobile, keyboard and branch gaps, and settle persisted/filtered projection choices. Pass the GPU frame-time and lasso gates with linked selection and caller visibility preserved. |
+
+### Scope decisions for partially complete capabilities
+
+These decisions fix what completes four capabilities in the [capability matrix](FEATURES.md#capability-status).
+
+* Formatting, linting and command-line tools complete with item 48 alone. Items 55 and 73 are
+  follow-ups outside that capability.
+* Paths and graph algorithms complete with items 8, 275, 276 and 277. OpenCypher
+  procedures belong to item 20 under additional query languages, and the C23 writer belongs
+  to item 36 under batched updates and triggers. The weighted-betweenness extensions in
+  items 79 and 80 are optional and outside the completion path.
+* Server and Fuseki integration completes with items 76, 38, 51, 37 and 39. Item 37
+  excludes subscriptions, and item 51 excludes `shortest(…)` evaluation, which ARQ does not
+  evaluate either. Item 69 adds the ARQ extensions that it lists as a lower-priority
+  extension outside the completion path.
+* GeoSPARQL completes with item 24. Item 70's Jena-compatible mode is not adopted, and
+  exact arithmetic on curves, GML solids, 3D constructions and splitting lines at crossings
+  are not part of the capability.
 
 ## Tier 1: now
 
@@ -251,21 +332,51 @@ continues within its caller-visible evidence and measured-latency scope.
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 17 | **Incremental computation core.** Phase 2 adds `graph` views, maintenance inside the commit, the WebSocket, MCP, the Node and JVM APIs, the UI, views per branch, `keepCommits`, ordered windows and data-dependent protections compiled to views. Phase 3 adds provenance per fact, recursion and GraphQL subscriptions. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
-| 18 | **Explanations.** Provenance-aware protections with `reviewedOnly` over derived facts. Demand derivation trees, bounded why-not searches, entailment diffs and minimal justifications are available. Phase 3 needs F13. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
+| 17 | **Incremental computation core.** This umbrella item is split into one item per lane, items 413 to 429, so that each lane has its own size and dependencies. Item 17 is complete when all of its lanes are. The [lane table](#lanes-of-item-17) lists them. GraphQL subscriptions are deferred under item 37 until a workload asks for them. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
+| 18 | **Explanations.** Provenance-aware protections with `reviewedOnly` over derived facts. Demand derivation trees, bounded why-not searches, entailment diffs and minimal justifications are available. Phase 3 needs the provenance algebra and reasoner witnesses of items 415 and 416. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
 | 23 | **Full-text parity.** Online enabling and reconfiguring, search after uncommitted writes, and historical search remain. The analyzers that follow Lucene's and the dictionary analyzers are built. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
-| 24 | **GeoSPARQL.** k-NN with a query geometry bound per row, better polygon approximations than the cell grid and QLever's spatial syntax. The geometry limits to lift are datums other than WGS 84, grid-based and exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 24 | **GeoSPARQL completion.** Add per-row nearest-neighbour joins that run at least 50 times faster than the generic plan, QLever's `spatialSearch:` syntax, metric-property rewrites and polygon approximations in a versioned index format. Add exact Helmert datum shifts and geographic CRSs on datums other than WGS 84, opt-in grid-based shifts from operator-supplied grid files that still refuse when a needed grid is missing, and curved GML segments read by densifying arcs into line segments within a stated tolerance. Exact arithmetic on curves, GML solids, 3D constructions and splitting lines at crossings are not adopted. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | L | Medium |
 | 21 | **Editing forms generated from SHACL shapes.** Complete atomic nested changes and browser editing from the Rust library's pooled read models, plus list and `sh:or`/`sh:xone` editors. Complete blank-named graph contexts and admission for model sources, complex nested paths, remaining target and query producers and controlled reader integration through item 395. | [U02](specs/U02-shape-driven-forms/SPEC.md#outcome) | M–L | Medium–high |
 | 100 | **Reports for distinct audiences.** Planned named GraphRAG configurations have separate principals, projections, guarded reports and review histories, with an explicit default and shared dataset spending limits. | [C22b](specs/C22b-report-configurations.md) | M | High |
 | 65 | **Encryption.** Finish key workflows, Vault/cloud KMS and recovery export, then Phase 2 write-only age-recipient repositories and age identities. Phase 3 live-dataset and Phase 4 derived-index encryption follow; item 61 owns the shared chunking gate. A delayed initializer with the wrong key should remove its own leftover intent, and the marker-attachment branches should share one helper. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
 | 7 | **Batch-oriented execution and disk spill.** The full-scale spill matrix passes, while execution follow-ups and the default decision remain under item 93. Spill stays opt-in, and several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
-| 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress, remaining algorithm surfaces, the C23 writer and openCypher procedures remain. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
+| 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress, remaining algorithm surfaces, and the remaining algorithm surfaces remain. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
 | 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. Representatives would also let derivation on demand read equality without the `eq-rep-*` rules. Today a demand on a small view where `owl:sameAs` relates classes and properties can take much longer than materializing the whole view. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
-| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes from an F13 view remains planned and waits for item 17. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
+| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit remains planned and waits for items 413 and 414. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 14 | **Compaction and operation progress.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. Shared controlled load and compaction progress must also reach the Node callbacks without weakening cancellation or memory budgets. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#operation-progress) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 86 | **Group commit for indexed datasets.** The p90 of spatial serial inserts at 10.5M misses its gate. The spatial reader gate at 1.05M is not established, because the ordinary writer missed the schedule lag requirement. Items 111, 112 and 171 follow up. | [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets) | M–L | Medium–high |
 | 113 | **Small changes and undos over a kept closure.** Changes of 100 triples at 16 threads and undos at 1 thread remain slower than before the F16 follow-up, and a profile of the full run should find or rule out a cost of about 5%. The options are an opt-in in-memory index of the input facts, charged to the memory budget, and per-thread counters in the block cache. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
+
+### Lanes of item 17
+
+Stage A makes the incremental core safe and supplies what items 12, 18 and 19 need.
+Items 12, 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 12 needs
+items 413 and 414, item 18 Phase 3 needs items 415 and 416, and item 19 Phase 3 needs
+items 415 and 417. Stage B delivers the rest of Phase 2. Stage C delivers view
+provenance. The F13 spec records the design decisions that the lanes follow. Items that
+affect the write path measure with the `--views none|async:N|commit:Q|graph:N` option of
+`scripts/nsc-writes.sh` that item 414 adds.
+
+| # | Item | Spec | Size | Depends on |
+|---|---|---|---|---|
+| 413 | **Safety net and load checks.** Apply `ViewDef::check()` when a view loads or attaches, so a format 1 `view.json` that carries graph, commit, branch or `keepCommits` members is refused and no longer runs silently as an async table view. Add the `COMPILER` version bump test and reduce the complexity of `runtime.rs`. | [F13](specs/F13-incremental-views-and-provenance.md#84-persistence) | S–M | None |
+| 414 | **Internal circuits.** Let the server attach circuits that no user defined, with an accumulator sink and a server-only `InternalAccess`. The accumulator keeps each changed fact's identity to the sink, which sums the absolute weight per key and fact and then per key, so an addition followed by a removal counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the existing feed-based counter does. Item 12 counts per-community changes with one. Tests cover churn across commits, a same-commit replacement and deletion-only workloads against that counter. Item 226 goes with this lane, and the lane adds the `--views none\|async:N\|commit:Q\|graph:N` option to `scripts/nsc-writes.sh` so that write-path gates can measure views. | [F13](specs/F13-incremental-views-and-provenance.md#36-internal-circuits), [C22](specs/C22-graph-rag-community-summaries.md#5-refresh) | S–M | 413 |
+| 415 | **Provenance algebra.** Add the `count`, `lineage` and `why` annotations with a 128-bit `FactKey` over vocabulary keys and bounded witness sets. | [F13](specs/F13-incremental-views-and-provenance.md#5-provenance) | S–M | 413 |
+| 416 | **Reasoner witnesses.** Record witnesses in the reasoner with F13's algebra, off unless a protection needs supported visibility, and define how witness sets converge under truncation. | [F18](specs/F18-explanations-and-entailment-diffs.md#71-protections) | M | 415 |
+| 417 | **Fixed-point operator.** Host one fixed-point interface in F13 with a reasoner plug-in, maintain property paths with `+` and `*` through backward and forward rederivation, and add `VIEW_STATE` format 2 for its state. | [F13](specs/F13-incremental-views-and-provenance.md#43-added-in-phase-3), [F17](specs/F17-query-time-reasoning.md#63-kept-current-phase-3) | M | 415 |
+| 418 | **Aggregates and correlated EXISTS.** Maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`, `HAVING` and correlated `EXISTS` instead of recomputing them. | [F13](specs/F13-incremental-views-and-provenance.md#42-added-in-phase-2) | M | 413 |
+| 419 | **Ordered windows.** Keep `ORDER BY` with `LIMIT` and `OFFSET` as a window with a reserve, and report row positions in live diffs. | [F13](specs/F13-incremental-views-and-provenance.md#44-ordered-windows) | S–M | 413 |
+| 420 | **Asynchronous graph views.** Add `graph` views with `view.json` format 3, the `View` commit kind, reserved graphs and skolem IRIs over distinct solutions. On a dataset that restricts reads, a graph view always needs `declassify: true` with an audit record naming the view, its query, the output graph and the declassifying principal. A view without it marks its output graph when it first writes it. The mark stays with the graph and its history after the view is deleted, with or without `dropGraph`, and under a read-restricting policy only administrators read a marked graph until one declassifies the graph with an audit record. Installing such a policy first suspends every undeclassified graph view, including one that has not written its graph, and applies the restriction before the policy is visible. The mark lives in a versioned dataset file that older releases refuse, and this item defines the format. Tests read a populated output graph across the policy transition, cover a C12b protection that hides an input triple, cover a view with no output yet, and delete the view with and without `dropGraph` before checking that current and historical reads are refused to non-administrators. This is the graph-view counterpart of the `view:{name}` grant of item 222. | [F13](specs/F13-incremental-views-and-provenance.md#22-reading-a-view) | M | 413 |
+| 421 | **Commit-time table views.** Maintain table views inside the commit with a defined position relative to the WAL, a fall back from group commit, and suspension on failure by default. Write-path competitive work goes first. | [F13](specs/F13-incremental-views-and-provenance.md#33-maintenance-passes) | L | 413 and the write-path work of items 86, 111, 112 and 171 |
+| 422 | **Commit-time graph views.** Write a graph view's triples in the commit that caused them. | [F13](specs/F13-incremental-views-and-provenance.md#33-maintenance-passes) | M | 420, 421 |
+| 423 | **WebSocket transport.** Serve live queries over WebSocket with axum's `ws` feature and include item 224's server-wide limit of live queries. | [F13](specs/F13-incremental-views-and-provenance.md#12-dependencies) | M | 413 |
+| 424 | **MCP views.** Add `watch_query`, `list_views` and `read_view` to the MCP server. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | S–M | 222 |
+| 425 | **Node and JVM view APIs.** Expose views and live queries in the Node and JVM bindings. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | M | 413 |
+| 426 | **Views in the UI.** Add view management and live results to the web UI. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | M | 222 |
+| 427 | **Per-branch views and `keepCommits`.** Keep state per branch with defined fork semantics, and keep recent diffs in memory only for reads at past commits. | [F13](specs/F13-incremental-views-and-provenance.md#7-branches-and-history) | M | 223 |
+| 428 | **Data-dependent protections as views.** Compile protections that depend on data into views, so a live reader no longer recomputes its whole query. | [F13](specs/F13-incremental-views-and-provenance.md#62-live-queries) | L | 417 |
+| 429 | **View provenance.** Add `view:witness` and `view:why`, and provenance on one-off queries, together with item 221's views over inferred data. | [F13](specs/F13-incremental-views-and-provenance.md#53-uses) | M | 415, 417 |
 
 ### Remaining work for item 7
 
@@ -290,7 +401,7 @@ capability work above. Each phase keeps its declared prerequisites and acceptanc
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 and adds `why` provenance on tables for F18. Items 190, 192 and 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
+| 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 after items 415 and 417, and adds `why` provenance on tables for F18. Items 190, 192 and 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
 | 25 | **Query extension completion.** Dynamic dispatch, foreign callbacks, batching, additional aggregate arities and measurements remain, including native Java dispatch beside ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 
 ## Tier 4: worth doing, not urgent
@@ -306,7 +417,7 @@ of canvas features.
 | 6 | **Ask evaluation on public benchmarks.** Runs of local and OpenAI-compatible models and an evaluation with independent roles remain, and LC-QuAD 2.0 waits for a Wikidata load from the full dump. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 27 | **Live query profiling and verified rewrites.** The static plan overlay is available. The running-query registry, live operator progress and hotspot views remain planned, followed by C18 Phase 6's result-equivalent rewrite suggestions and their integration in the live plan. | [U04](specs/U04-live-query-profiling.md), [C18](specs/C18-natural-language-questions-and-ingest/README.md) Phase 6 | M |
 | 28 | **Query by example** and Bloom-style search phrases. | [U03](specs/U03-query-by-example.md) | M |
-| 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance. | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL |
+| 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance. This item belongs to the additional query languages capability and is outside the completion path of paths and graph algorithms. | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL |
 | 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes. | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 344 | **ChatGPT-plan model access.** Planned Sign in with ChatGPT connections let a caller use eligible plan access through the Responses API. Account-bound credentials, refresh, usage-limit handling and explicit provider selection preserve existing data and spending controls. | [C28](specs/C28-chatgpt-model-access.md) | M–L |
 | 29 | **Rendering very large graphs.** Phase 3 adds server layouts, the binary transfer format and GPU frame-rate tests. | [U06](specs/U06-large-graph-rendering.md#outcome) | M |
@@ -315,8 +426,8 @@ of canvas features.
 | 32 | **Parameterized reusable plans.** | [X10](specs/X10-reusable-query-plans.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12) | L |
 | 34 | **Vector quantization** and vector-result caching. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M |
 | 35 | **Multi-field full-text entity documents.** | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
-| 36 | **Batched updates and commit triggers.** | [C23](specs/C23-batched-updates-and-triggers.md) | M |
-| 37 | **GraphQL completion.** Child queries seeded with engine IDs, per-parent top-k, nested connections, the UI/schema editor and persisted queries with their MCP controls remain. Subscriptions use F13 when adopted, while mutations retain their separate scope decision. | [C03](specs/C03-graphql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
+| 36 | **Batched updates and commit triggers,** including the C23 writer that graph algorithms use. This item belongs to the batched updates and triggers capability. | [C23](specs/C23-batched-updates-and-triggers.md) | M |
+| 37 | **GraphQL completion.** Child queries seeded with engine IDs, per-parent top-k, nested connections, the UI/schema editor and persisted queries with their MCP controls remain. Subscriptions are deferred until a workload asks for them, and then use F13 as a live query. Mutations retain their separate scope decision. | [C03](specs/C03-graphql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 38 | **SERVICE enhancer.** A slice-aware cache, cache functions, a disk cache and parallel requests. | [G10](specs/G10-service-enhancer.md#roadmap-follow-ups-2026-10-12) | M |
 | 39 | **Stored updates,** multi-value parameters and private stored queries. | [C16](specs/C16-stored-queries.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 41 | **Embedding conveniences.** Text input in Similar, chunk offsets kept beside vectors, and NixOS embedding settings. | [F08](specs/F08-embeddings-on-write.md#roadmap-follow-ups-2026-10-12) | S |
@@ -328,7 +439,7 @@ of canvas features.
 | 82 | **Cheaper vector catch-up and measured half-precision recall.** Catch-up should scan only new rows, binary16 recall needs measuring on Euclidean and offset dot-product data, and a measurement should pick the worker pool. A test should cancel a carry. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 250 | **Chinese segmentation after SmartChineseAnalyzer,** and Kuromoji's normal and extended modes and user dictionaries for `ja-dict` and `ko-dict`. `zh-dict` segments by jieba's frequencies today. `ja-dict` and `ko-dict` should also cut a run of unknown characters inside a surrogate pair where Lucene does, which they do before the pair. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 251 | **Analyzers for the other languages of jena-text,** such as Greek, Arabic, Persian and Hindi, that reproduce Lucene's tokens as the analyzers for nine languages do. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
-| 222 | **View access by grant containment.** A caller reads a view only with full access or the principal's exact access. Containment of grant sets, a cache per caller and view, and a `view:{name}` grant that declassifies a view with an audit record are not built. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
+| 222 | **View access by grant containment.** A caller reads a view only with full access or the principal's exact access. Containment of grant sets, a cache per caller and view, and a `view:{name}` grant that declassifies a view with an audit record are not built. Item 222 comes before items 424 and 426. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
 | 342 | **Metrics parity for JSON and OTLP.** Add the Phase 2 produced-row, query-memory-peak and rebuild counters and histograms to the JSON snapshot and OTLP export. Preserve Prometheus units, labels, reset rules and dataset visibility, with cross-format tests. | [C01](specs/C01-observability-and-budgets.md#metrics-parity) | S |
 | 403 | **Credential expiry for long-lived reads and fenced OIDC sign-in.** Change feeds, live queries and long polls end when their session or token is revoked, but not when it expires. OIDC callbacks create sessions without comparing the authority generation their checks observed. Both should follow the shared issue fence and the per-credential checks. | [C09](specs/C09-dataset-access-control.md) | S |
 | 343 | **Dataset-local codec and pattern settings.** Add layered settings for adopted vocabulary codecs and predicate patterns, used by subsequent builds and compactions. Preserve existing generations and format refusals, and record the optional portable zstd decoder decision without reopening measured rejected codecs. | [X11](specs/X11-index-compression-and-predicate-patterns.md#dataset-local-settings), [X01](specs/X01-compression-codecs.md#remaining-codec-decisions) | M |
@@ -356,9 +467,10 @@ spec sections.
 | 170 | **Reader tail of the parallel full-text checkpoint.** Since a checkpoint synchronizes its files from eight threads, the mixed full-text reader p99 at 1.05M measured about 4% higher, within the spread of the runs. Measure it with more rounds, and if the checkpoint's share holds, try fewer threads or a lower I/O priority for the synchronizing threads. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S |
 | 171 | **Calibrate the spatial mixed cell for the drive's slow state.** The ordinary writers of the spatial mixed cell at 1.05M fell behind their schedule because the unpaced calibration averaged the drive's fast and slow states. Calibrate the rate against the ordinary writer in the slow state, or probe the flush time before each process, and rerun the cell to settle item 86's reader gate. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S |
 | 276 | **Unweighted path searches after item 150.** Forge measured the unweighted `ps-pair`, `ps-pair-all`, `ps-pair-k5` and `ps-values10` 3 to 4% slower in every round and weighted `path:allShortest` 2.3% slower, although item 150 does not touch their searches. Compare their code generation in both builds and profile them to find what changed. | [Benchmarks](benchmarks/graph/RESULTS.md#weighted-pair-searches) | S |
-| 223 | **Parallel view passes.** Each dataset runs its view passes on one worker thread, which falls behind a fast writer with 100 views. `--view-threads`, a shared worker pool and joins whose large deltas split across threads are not built. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
+| 223 | **Parallel view passes.** Each dataset runs its view passes on one worker thread, which falls behind a fast writer with 100 views. `--view-threads`, a shared worker pool and joins whose large deltas split across threads are not built. Item 223 comes before item 427. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
+| 430 | **Streaming view reads.** `ViewRows` and the snapshot events of live queries decode the whole result before they return it. Stream the rows in bounded chunks, so that reading a large view or opening a large live query does not hold the whole result in memory. | [F13](specs/F13-incremental-views-and-provenance.md#22-reading-a-view), [X05](specs/X05-streaming-query-execution.md#outcome) | M |
 | 225 | **The F13 benchmarks and tests.** The SNB update streams with live short reads and views, BSBM's mix with views, the fan-out test of 1,000 subscribers, a grammar-driven query generator for the differential tests and injected crashes for recovery are not built. A grouped COUNT's pass is only 15 to 35 times cheaper than the query on synthetic data, short of the 100 times target. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
-| 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a two-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
+| 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a two-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. Item 226 goes with item 414. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
 | 240 | **Buffered output of streamed answers.** The cursor writers of streamed SELECT and graph answers still write a few bytes at a time through the response writer and are compiled with the server. Give them the engine-side buffer that eager answers use, with the same count of the rows the client received. | [Benchmarking](BENCHMARKING.md#release-build-settings) | S |
 | 241 | **Front coding on three warm DBpedia queries.** Since item 108, `pat-film-predicates` and `pat-film-predicate-list` take about 4% longer with front coding and `top-linked` 1.4% longer, in all 16 pinned rounds on forge. Count their instructions on both builds and remove the cost, or show that it comes from code placement. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
 | 243 | **Cheaper row accounting in the result buffer.** The buffer checks the row count at every write so that an answer cut partway reports the rows the client received. Serializers write one character at a time, so the check costs 7% of the instructions of `optional-chain` and 14% of its client time on forge, 150.8 ms against 132.0 ms. A row log that the serializers fill themselves measured no cheaper. Find a way to record row ends that costs nothing per write. | [Benchmarks](benchmarks/engine/RESULTS.md#the-cost-of-result-serialization) | S |
@@ -416,21 +528,21 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 49 | **Write previews.** Local dry-run flags, UI previews beyond the CSV import panel and merge page, `If-Match` on `/{ds}/update`, and handling of read-only servers and costly bulk previews. | [C15](specs/C15-write-previews.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 401 | **Views in in-memory clones.** A persistent clone carries the source's view definitions paused, but an in-memory clone carries none, as it carries no stored queries. Seed the clone's view runtime with the captured definitions, paused with the reason `cloned`, through every binding that adopts an in-memory clone. | [F05](specs/F05-snapshot-repositories/OUTCOME.md#recovery-of-managed-definitions), [C06](specs/C06-clone-to-sandbox.md#completion-path) | S |
 | 50 | **Restricted views.** Token scopes limited to graphs, validation and statistics for restricted views, and text scoring local to what a caller can see. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12) | M |
-| 51 | **ARQ.** Parallel LATERAL, user DESCRIBE handlers, the remaining client options and builder methods, and `shortest(…)` evaluation. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
+| 51 | **ARQ.** Parallel LATERAL, user DESCRIBE handlers, and the remaining client options and builder methods. Sparkles does not evaluate `shortest(…)`, and ARQ does not either. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
 | 52 | **History.** Pin rebasing, periods per quad, change feeds per graph, reconstruction of expired states, and history of settings. | [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | M |
 | 53 | **Inference settings.** Input-graph and RDFS settings in the UI, the remaining RDFS-on-read surfaces, and controls for the import policy. | [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 54 | **ShEx.** Combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls. | [G02](specs/G02-shex/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
-| 55 | **Completions and OpenAPI.** Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas. | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 55 | **Completions and OpenAPI.** Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas. This follow-up is outside the completion of formatting, linting and command-line tools. | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 56 | **Legacy MCP resource subscriptions.** | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
 | 57 | **Scratch-branch expiry** as a dataset setting and under stdio. Today only the server's `--mcp-scratch-branch-ttl` sets it. | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
 | 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. | [F21](specs/F21-ontology-api.md) | L |
-| 73 | **Format coverage.** All formats in `load_str`, `dump_graph`, SPARQL `LOAD` and the JVM and Node bindings, and loading Thrift, Protobuf, RDF/JSON and TriX without a temporary N-Quads copy. | [G05](specs/G05-command-line-tools.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 73 | **Format coverage.** All formats in `load_str`, `dump_graph`, SPARQL `LOAD` and the JVM and Node bindings, and loading Thrift, Protobuf, RDF/JSON and TriX without a temporary N-Quads copy. This follow-up is outside the completion of formatting, linting and command-line tools. | [G05](specs/G05-command-line-tools.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 74 | **RDF Patch.** Patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
 | 75 | **Access control.** Validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 76 | **Jena integration completion.** Complete assembler bodies, direct Graph Store naming per dataset, JVM metrics and batched fallback graph patterns. Expand the standalone HTTP harness to its full accepted cases, and record decisions for optional JVM module, allocator and transaction extensions. | [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings/OUTCOME.md#remaining-integration-contract) | M |
 | 77 | **Assistant ingestion.** The Ingest panel should say when it stores uploads without extracting facts because server ingestion is off, and server-side document ingestion needs redaction. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12), [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 79 | **Nonnegative weighted betweenness.** Define zero-weight path counting and validate an algorithm before extending the current finite, strictly positive domain. | [F14](specs/F14-graph-algorithms.md#nonnegative-weighted-betweenness-semantics) | M–L |
-| 80 | **Positive-weight numerical robustness.** Extend the refused mixed-scale domain and define approximation guarantees for distances and path counts in weighted betweenness. | [F14](specs/F14-graph-algorithms.md#positive-weight-numerical-robustness) | M–L |
+| 79 | **Nonnegative weighted betweenness.** Define zero-weight path counting and validate an algorithm before extending the current finite, strictly positive domain. This optional extension is outside the completion path of paths and graph algorithms. | [F14](specs/F14-graph-algorithms.md#nonnegative-weighted-betweenness-semantics) | M–L |
+| 80 | **Positive-weight numerical robustness.** Extend the refused mixed-scale domain and define approximation guarantees for distances and path counts in weighted betweenness. This optional extension is outside the completion path of paths and graph algorithms. | [F14](specs/F14-graph-algorithms.md#positive-weight-numerical-robustness) | M–L |
 | 92 | **Per-crate Nix builds.** Compare the crate2nix prototype with Crane under matched settings, measure which crates rebuild after source changes, and validate packaging and platforms before deciding whether to migrate. | [X13](specs/X13-per-crate-nix-builds.md) | S–M |
 | 399 | **Build and benchmark tooling upkeep.** Check that the Nix development shell evaluates whenever `rust-toolchain.toml` or `flake.lock` changes, since the manual Nix workflow does not catch a toolchain the overlay lacks. Derive the Boxington version in workflows and scripts from the `mise.toml` pin, and build `scripts/nsc-writes.sh` revisions through `mbx` like `nsc-bench.sh`. Keep normalized records, manifests and checksums of benchmark runs in `docs/benchmarks` and move bulky raw logs, headers and responses to digest-pinned storage outside the repository. | [DEVELOPMENT](DEVELOPMENT.md#continuous-integration), [BENCHMARKING](BENCHMARKING.md) | S |
 | 190 | **Per-query cost of derivation on demand.** An OWL RL demand over a 40-triple view expands about 100 specialized rules into about 35,000 generated rules in three stages, and planning these rules costs more than the joins. The two equality stages do not depend on the query but run in every session, and they hold about two thirds of the rules and most of the evaluation time. The engine also scans every rule of a stage in each iteration, although only about a tenth have new facts. In order, cache the equality stages' facts per view as the schema table is cached, index rules by the predicates of their atoms so that an iteration plans only the rules with new facts, prove more schema relations complete so that property rules lose their variable predicates, and merge duplicate keys, such as those that differ only by asking for distinct subject and object, if measurement favours it. Also reduce schema-completeness scans and workspace reservation, repeated program setup and derived-fact merging, including the loss of staged schema reuse for `makeTemp` programs and temporary generator work during implicit fact replay. Cache safe specialization and program results per view, merge derived facts as a sorted run, and measure the reasoner development profile's compilation and cache tradeoff. Complete matched Forge measurement of the bounded temporary closure for tiny positive feedback views against materialization and selective, schema, no-feedback and asserted controls, record its retained-fact memory cost, and follow up every accepted slower control before assessing F17's cost target. | [F17](specs/F17-query-time-reasoning.md#outcome) | M |
@@ -480,8 +592,8 @@ for them.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
-| 69 | **ARQ extras.** JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form and locale collation. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M each |
-| 70 | **Jena-compatible GeoSPARQL mode** that reproduces Jena's answers where Sparkles diverges on purpose, as [COMPARISON.md](COMPARISON.md#geosparql) describes. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
+| 69 | **ARQ extras.** JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form, ARQ's `EXISTS { … }` group element, `AGG` with more than one argument, printing in `afn:print` and `afn:execTime`, and locale collation. This lower-priority extension is outside the completion path of server and Fuseki integration. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M each |
+| 70 | **Jena-compatible GeoSPARQL mode.** Not adopted. Sparkles keeps the answers that [COMPARISON.md](COMPARISON.md#geosparql) describes, and the number stays listed so that it is not reused. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 
 ## Completed
 

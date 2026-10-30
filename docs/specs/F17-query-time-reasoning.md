@@ -337,8 +337,10 @@ generation switch, drops the tables, since ids move.
 With F13 Phase 3, a table becomes a view on F13's core with its fixed-point operator
 (F13 §4.3). Its rules are the demand program with the seeds fixed, and the core maintains
 it from each commit's changes. A table that the cache would evict is dropped from the core
-too. F13's `count` provenance gives the maintenance its weights, and `why` provenance on a
-table is what F18's explanations read for derived answers.
+too. Counts cannot weight the maintenance of a recursive rule, because a fact in a cycle can
+count its own derivations, so deletions use backward and forward rederivation as the
+reasoner does (F13 §4.3). Provenance on a table is what F18's explanations read for
+derived answers, and F13's `why` annotation supplies it.
 
 ## 7. OWL 2 QL query rewriting
 

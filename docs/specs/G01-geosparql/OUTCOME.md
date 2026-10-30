@@ -191,8 +191,8 @@ The per-row nearest-neighbour join described below remains open under item 24.
 **The rest of Phase 3 and geometry limits** (item 24, Tier 3,
 [ROADMAP](../../ROADMAP.md)). The Outcome lists the first items below as not built, and
 FEATURES.md lists the geometry limits. The deliberate divergences in
-[COMPARISON.md](../../COMPARISON.md#geosparql) stay the default; item 70 below adds an
-opt-in mode for Jena's answers.
+[COMPARISON.md](../../COMPARISON.md#geosparql) stay the default. Item 70 below would add an
+opt-in mode for Jena's answers, and it is not adopted.
 
 * **Per-row nearest-neighbour joins.** Constant-distance ordering supports connected
   patterns and independent components as described above. The remaining query asks for
@@ -275,7 +275,7 @@ opt-in mode for Jena's answers.
     curve-against-curve step of `geo/ops/overlay.rs` already computes the crossings by
     segment intersection; it nodes both lines at them before assembling the result,
     so the output's line strings meet only at their ends, as in JTS.
-**A Jena compatibility mode** (item 70, Tier 7, [ROADMAP](../../ROADMAP.md)). The decisions in
+**A Jena compatibility mode** (item 70, not adopted, [ROADMAP](../../ROADMAP.md)). The decisions in
 [COMPARISON.md](../../COMPARISON.md#geosparql) give different answers from Jena on purpose,
 and the Compliance Benchmark's misses trace to some of them (the Conformance paragraph
 above: empty-geometry equality, distances, a metre buffer and rewrite answers). Two are
