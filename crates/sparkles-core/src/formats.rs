@@ -399,11 +399,86 @@ pub const BACKUP_SLOTS: FileKind = FileKind {
 pub const BACKUP_MANIFEST: FileKind = FileKind {
     id: "backup-manifest",
     files: "backup manifests",
-    marker: "`format`, with `indexFormat` and `server.version`",
+    marker: "`format`, with `indexFormat`, `server.version` and the features in `requires`",
     class: Class::Archive,
     writes: 1,
     reads: &[1],
 };
+
+/// The nested definition entries of a backup manifest: a `files` entry whose path is
+/// a managed definition, such as `views/NAME/view.json`, and whose `definition` member
+/// names its kind and the version of the definition file. A manifest with such entries
+/// lists `definitions` in its `requires`. Older readers refuse the entry's path, and this
+/// build refuses an unknown required kind, an unknown feature and a newer file version.
+pub const BACKUP_DEFINITION: FileKind = FileKind {
+    id: "backup-definition",
+    files: "definition entries of backup manifests (`views/NAME/view.json`)",
+    marker: "`definition.format` of the entry, the version of the definition file",
+    class: Class::Archive,
+    writes: 1,
+    reads: &[1],
+};
+
+/// The features a backup manifest may require in `requires`, which this build reads.
+/// A manifest that requires another feature is refused before anything is written.
+pub const BACKUP_MANIFEST_FEATURES: &[&str] = &["definitions"];
+
+/// A kind of dataset-managed definition that backups and clones carry beside the data,
+/// at `DIR/NAME/FILE` under the dataset root. The file is the registered settings file
+/// `file`, whose version member is the definition's format.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionKind {
+    /// The kind's name in a manifest's `definition.kind`.
+    pub id: &'static str,
+    /// The directory under the dataset root that holds one directory per definition.
+    pub dir: &'static str,
+    /// The definition file inside each definition's directory.
+    pub file: &'static str,
+    /// The version written for a definition that runs.
+    pub writes: u32,
+    /// The version of a paused definition: the file with a `paused` member, which
+    /// releases that do not know pauses refuse.
+    pub paused: u32,
+}
+
+impl DefinitionKind {
+    /// The relative path of definition `name`.
+    pub fn path(&self, name: &str) -> String {
+        format!("{}/{name}/{}", self.dir, self.file)
+    }
+
+    /// The definition's name when `path` is exactly `DIR/NAME/FILE` with a valid name
+    /// (letters, digits, `_` and `-`, starting with a letter or digit, at most 64).
+    pub fn name_of<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let rest = path.strip_prefix(self.dir)?.strip_prefix('/')?;
+        let name = rest.strip_suffix(self.file)?.strip_suffix('/')?;
+        crate::stored::valid_name(name).then_some(name)
+    }
+
+    /// The newest version this build reads, from the settings registry.
+    pub fn format(&self) -> u32 {
+        registered(self.file).writes
+    }
+}
+
+/// The definition kinds this build captures and restores. Analysis definitions (F22)
+/// and report configurations (C22b) are added here when they exist.
+pub const DEFINITIONS: &[DefinitionKind] = &[DefinitionKind {
+    id: "view",
+    dir: "views",
+    file: "view.json",
+    writes: 1,
+    paused: 2,
+}];
+
+/// The largest definition file that is defined, captured and restored.
+pub const MAX_DEFINITION_BYTES: u64 = 1 << 20;
+
+/// The definition kind named `id`.
+pub fn definition_kind(id: &str) -> Option<&'static DefinitionKind> {
+    DEFINITIONS.iter().find(|k| k.id == id)
+}
 
 /// Checked offline migration state, including the originating old sibling.
 pub const MIGRATION_STATE: FileKind = FileKind {
@@ -497,6 +572,7 @@ pub const KINDS: &[&FileKind] = &[
     &BACKUP_BLOB,
     &BACKUP_SLOTS,
     &BACKUP_MANIFEST,
+    &BACKUP_DEFINITION,
 ];
 
 /// The kind named `id`.
@@ -592,8 +668,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphrag.json", 1),
     ds("paths.json", 1),
     ds("forms.json", 1),
-    // a view's definition, `views/NAME/view.json`
-    ds("view.json", 1),
+    // a view's definition, `views/NAME/view.json`: format 2 is a paused one
+    ds("view.json", 2),
     named(ds("graphrag/state.json", 2), "version"),
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
@@ -853,6 +929,8 @@ pub fn report() -> serde_json::Value {
         "sparkles": SPARKLES_VERSION,
         "kinds": KINDS,
         "settings": SETTINGS,
+        "definitions": DEFINITIONS,
+        "backupManifestFeatures": BACKUP_MANIFEST_FEATURES,
         "unmarkedSettings": UNMARKED_SETTINGS
             .iter()
             .map(|(name, reason)| serde_json::json!({"name": name, "reason": reason}))
@@ -905,13 +983,39 @@ mod tests {
         assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
         assert_eq!(VIEW_STATE.writes, crate::incr::persist::FORMAT);
         assert_eq!(
-            crate::incr::views::FORMAT,
+            crate::incr::views::PAUSED_FORMAT,
             settings_file(crate::incr::views::FILE).unwrap().writes
         );
         assert_eq!(
             crate::stored::FORMAT,
             settings_file(crate::stored::FILE).unwrap().writes
         );
+        for d in DEFINITIONS {
+            assert!(
+                settings_file(d.file).is_some(),
+                "{} is not registered",
+                d.file
+            );
+            assert!(BACKUP_DEFINITION.reads(d.writes), "{}", d.id);
+        }
+        let v = definition_kind("view").unwrap();
+        assert_eq!(v.writes, crate::incr::views::FORMAT);
+        assert_eq!(v.paused, crate::incr::views::PAUSED_FORMAT);
+        assert_eq!(v.format(), v.paused);
+        let view = definition_kind("view").unwrap();
+        assert_eq!(view.path("sizes"), "views/sizes/view.json");
+        assert_eq!(view.name_of("views/sizes/view.json"), Some("sizes"));
+        for bad in [
+            "views/../view.json",
+            "views/a/b/view.json",
+            "views//view.json",
+            "views/.x/view.json",
+            "views/a/view.json/",
+            "/views/a/view.json",
+            "views/a/paused.json",
+        ] {
+            assert_eq!(view.name_of(bad), None, "{bad}");
+        }
         for k in KINDS {
             assert!(k.reads(k.writes), "{} does not read what it writes", k.id);
             assert!(k.reads.is_sorted(), "{}", k.id);

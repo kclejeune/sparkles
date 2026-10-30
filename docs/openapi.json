@@ -2541,6 +2541,28 @@
                   },
                   "type": "array"
                 },
+                "definition": {
+                  "description": "A dataset-managed definition, such as `views/{name}/view.json`: its kind, the version of the definition file, and whether a reader that does not know the kind must refuse the backup (absent: true). Absent for data and settings files.",
+                  "externalDocs": {
+                    "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
+                  },
+                  "properties": {
+                    "format": {
+                      "type": "integer"
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "required": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "format"
+                  ],
+                  "type": "object"
+                },
                 "kind": {
                   "enum": [
                     "immutable",
@@ -2608,6 +2630,13 @@
           },
           "repository": {
             "type": "string"
+          },
+          "requires": {
+            "description": "Manifest features a reader must know to restore the backup, such as `definitions` when files carry a definition. Absent when the backup needs none.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "run": {
             "type": [

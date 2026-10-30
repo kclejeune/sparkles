@@ -296,6 +296,10 @@ pub(super) async fn rebuild(
     Path((ds_name, name)): Path<(String, String)>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Response> {
+    // a rebuild resumes a restored or cloned view, which rewrites its definition
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
     let ds = dataset(&st, &ds_name)?;
     ds.dataset.views().rebuild(&name)?;
     tracing::info!(

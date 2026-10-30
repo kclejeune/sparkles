@@ -28,6 +28,7 @@ mod commit_stats;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
+pub mod definitions;
 mod deltas;
 mod describe;
 mod diff;
@@ -99,6 +100,7 @@ pub use compaction::{
     CompactionSettings, REBUILD_BUCKETS, RELINK_CATCHING_UP, RELINK_READING, RELINK_WRITING,
     RebuildHistogram, RebuildReason, SETTING_NAMES, Trigger, TriggerKind,
 };
+pub use definitions::{DefinitionFile, DefinitionSource};
 pub use deltas::{CommitDelta, DeltaPage, DeltaSubscription};
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
@@ -1485,6 +1487,8 @@ pub struct Store {
     describe: parking_lot::RwLock<crate::sparql::describe::DescribeOptions>,
     /// the branch this store is, and the dataset's branches
     branching: branching::Branching,
+    /// who keeps the dataset-managed definitions that captures record
+    definitions: definitions::Sources,
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
@@ -1831,6 +1835,7 @@ impl Store {
             branching: Default::default(),
             compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
             describe: Default::default(),
+            definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -2323,6 +2328,7 @@ impl Store {
                 Some(head.timestamp_ms),
             ),
             describe: parking_lot::RwLock::new(describe::read_settings(root)?),
+            definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,

@@ -378,6 +378,12 @@ impl Dataset {
             StoreHandle::Branch(_) => None,
         };
         let views = crate::incr::Runtime::open(views_root, store.dataset_id(), opts.views.clone());
+        // backups and clones capture the views' definitions from the runtime, at the
+        // same writer-lock boundary as the data
+        if let StoreHandle::Own(s) = &store {
+            let source: Arc<dyn crate::store::DefinitionSource> = views.clone();
+            s.register_definitions(Arc::downgrade(&source));
+        }
         let inner = Arc::new_cyclic(|weak| DatasetState {
             reference: StateReference {
                 link: crate::store::lifecycle::WeakLink::new(weak.clone()),

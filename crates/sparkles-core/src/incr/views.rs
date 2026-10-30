@@ -3,6 +3,7 @@
 
 use super::ops::PlanNode;
 use crate::error::{Error, Result};
+pub use crate::store::definitions::Paused;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -10,8 +11,12 @@ use std::path::{Path, PathBuf};
 pub const DIR: &str = "views";
 /// A view's definition file.
 pub const FILE: &str = "view.json";
-/// The format of `view.json` this release writes.
+/// The format of `view.json` this release writes for a view that runs.
 pub const FORMAT: u32 = 1;
+/// The format of a paused `view.json`: format 1 with a `paused` member, written for a
+/// restored or cloned view until it is resumed. Releases that read only format 1 refuse
+/// it, so they never run a view that waits for its checks.
+pub const PAUSED_FORMAT: u32 = 2;
 /// The default budget of a view's state: 256 MiB.
 pub const DEFAULT_MEMORY_BYTES: u64 = 256 << 20;
 
@@ -219,9 +224,10 @@ pub fn valid_name(name: &str) -> bool {
     crate::stored::valid_name(name)
 }
 
-/// Read the definitions under `root`, by name. A newer format refuses the whole set
-/// with [`Error::Unsupported`], so it is never overwritten.
-pub fn read_all(root: &Path) -> Result<Vec<(String, ViewDef)>> {
+/// Read the definitions under `root`, by name, each with its pause when it was
+/// restored or cloned and not resumed. A newer format refuses the whole set with
+/// [`Error::Unsupported`], so it is never overwritten.
+pub fn read_all(root: &Path) -> Result<Vec<(String, ViewDef, Option<Paused>)>> {
     let base = root.join(DIR);
     let entries = match std::fs::read_dir(&base) {
         Ok(e) => e,
@@ -243,29 +249,67 @@ pub fn read_all(root: &Path) -> Result<Vec<(String, ViewDef)>> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
-        let v: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Corrupt(format!("views/{name}/{FILE}: {e}")))?;
-        crate::formats::check_settings(FILE, &v).map_err(|e| match e {
-            Error::Unsupported(m) => Error::Unsupported(format!("views/{name}/{m}")),
-            e => e,
-        })?;
-        let mut v = v;
-        if let Some(o) = v.as_object_mut() {
-            o.remove("format");
-        }
-        let def: ViewDef = serde_json::from_value(v)
-            .map_err(|e| Error::Corrupt(format!("views/{name}/{FILE}: {e}")))?;
-        out.push((name, def));
+        let (def, paused) = parse(&format!("views/{name}/{FILE}"), &bytes)?;
+        out.push((name, def, paused));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+/// Parse the `view.json` at `path` (for messages): its version, its schema and, in
+/// format 2, its pause. The definition is not checked against what this release
+/// supports ([`ViewDef::check`]).
+pub fn parse(path: &str, bytes: &[u8]) -> Result<(ViewDef, Option<Paused>)> {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("{path}: {e}")))?;
+    let format = crate::formats::check_settings(FILE, &v).map_err(|e| match e {
+        Error::Unsupported(m) => Error::Unsupported(format!("{path}: {m}")),
+        Error::Corrupt(m) => Error::Corrupt(format!("{path}: {m}")),
+        e => e,
+    })?;
+    let Some(o) = v.as_object_mut() else {
+        return Err(Error::Corrupt(format!("{path}: not a JSON object")));
+    };
+    o.remove("format");
+    let paused = match (format, o.remove("paused")) {
+        (PAUSED_FORMAT, Some(p)) => Some(
+            serde_json::from_value::<Paused>(p)
+                .map_err(|e| Error::Corrupt(format!("{path}: paused: {e}")))?,
+        ),
+        (PAUSED_FORMAT, None) => {
+            return Err(Error::Corrupt(format!("{path}: format 2 without `paused`")));
+        }
+        (_, Some(_)) => {
+            return Err(Error::Corrupt(format!("{path}: `paused` needs format 2")));
+        }
+        (_, None) => None,
+    };
+    let def: ViewDef =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("{path}: {e}")))?;
+    Ok((def, paused))
+}
+
+/// The bytes of `def` as `view.json`, paused when `paused` is given.
+pub fn to_bytes(def: &ViewDef, paused: Option<&Paused>) -> Result<Vec<u8>> {
+    let mut v = serde_json::to_value(def).map_err(|e| Error::Invalid(format!("{FILE}: {e}")))?;
+    let format = match (paused, v.as_object_mut()) {
+        (Some(p), Some(o)) => {
+            o.insert(
+                "paused".into(),
+                serde_json::to_value(p).map_err(|e| Error::Invalid(e.to_string()))?,
+            );
+            PAUSED_FORMAT
+        }
+        _ => FORMAT,
+    };
+    crate::formats::settings_to_vec_at(FILE, &v, format)
 }
 
 /// Write a definition atomically.
 pub fn write(root: &Path, name: &str, def: &ViewDef) -> Result<()> {
     let d = dir(root, name);
     std::fs::create_dir_all(&d)?;
-    let bytes = crate::formats::settings_to_vec(FILE, def)?;
+    let bytes = to_bytes(def, None)?;
     crate::store::write_atomic(&d.join(FILE), &bytes)
 }
 

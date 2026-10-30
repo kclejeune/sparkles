@@ -180,14 +180,27 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
     if m.files.is_empty() {
         return bad("files", "empty".into());
     }
+    // a feature this build does not know changes what the backup means: refused
+    let features = sparkles_core::formats::BACKUP_MANIFEST_FEATURES;
+    if let Some(f) = m.requires.iter().find(|f| !features.contains(&f.as_str())) {
+        return Err(BackupError::new(
+            Code::IncompatibleFormat,
+            format!(
+                "backup requires the manifest feature {f:?}, written by Sparkles {}; this build reads {}: restore it with that release or a later one",
+                m.server.version,
+                features.join(", ")
+            ),
+        ));
+    }
     let mut seen = HashSet::with_capacity(m.files.len());
     let mut total = 0u64;
     for (i, f) in m.files.iter().enumerate() {
         let field = |k: &str| format!("files[{i}].{k}");
-        if !valid_backup_path(&f.path) {
+        if let Some(d) = &f.definition {
+            check_definition(m, i, f, d)?;
+        } else if !valid_backup_path(&f.path) {
             return bad(&field("path"), format!("{:?} is not allowed", f.path));
-        }
-        if let Some((dir, _)) = f.path.split_once('/')
+        } else if let Some((dir, _)) = f.path.split_once('/')
             && dir != m.generation
         {
             return bad(
@@ -236,6 +249,104 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
         return bad("files", "no CURRENT".into());
     }
     Ok(())
+}
+
+/// The largest definition file a reader accepts.
+pub use sparkles_core::formats::MAX_DEFINITION_BYTES;
+
+/// A definition entry (`files[i].definition`): announced by `requires`, a meta file of
+/// at most [`MAX_DEFINITION_BYTES`] at its kind's path, and a file version this build
+/// reads. An unknown kind is refused when it is required, and is skipped by the
+/// restore otherwise, once its path is a plain relative one.
+fn check_definition(
+    m: &Manifest,
+    i: usize,
+    f: &crate::FileEntry,
+    d: &crate::DefinitionRef,
+) -> Result<()> {
+    let bad =
+        |k: &str, msg: String| Err(BackupError::invalid_backup(&format!("files[{i}].{k}"), msg));
+    if !m.requires.iter().any(|r| r == "definitions") {
+        return Err(BackupError::invalid_backup(
+            "requires",
+            format!(
+                "{:?} is a definition, and `definitions` is not required",
+                f.path
+            ),
+        ));
+    }
+    if f.kind != sparkles_core::store::FileKind::Meta {
+        return bad(
+            "kind",
+            format!("definition {:?} is not a meta file", f.path),
+        );
+    }
+    if f.size > MAX_DEFINITION_BYTES {
+        return bad(
+            "size",
+            format!(
+                "definition {:?} is larger than {MAX_DEFINITION_BYTES} bytes",
+                f.path
+            ),
+        );
+    }
+    let Some(kind) = sparkles_core::formats::definition_kind(&d.kind) else {
+        if d.required {
+            return Err(BackupError::new(
+                Code::IncompatibleFormat,
+                format!(
+                    "backup holds a definition of kind {:?} ({}), written by Sparkles {}, which this build does not know: restore it with that release or a later one",
+                    d.kind, f.path, m.server.version
+                ),
+            ));
+        }
+        let plain = f.path.split('/').all(|p| {
+            !p.is_empty()
+                && p != "."
+                && p != ".."
+                && p.len() <= 64
+                && p.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+        });
+        if !plain || f.path.split('/').count() > 4 {
+            return bad("path", format!("{:?} is not allowed", f.path));
+        }
+        return Ok(());
+    };
+    if kind.name_of(&f.path).is_none() {
+        return bad(
+            "path",
+            format!("{:?} is not a {} definition path", f.path, kind.id),
+        );
+    }
+    if d.format == 0 {
+        return bad("definition.format", "0 is not a version".into());
+    }
+    // an entry holds a definition as it runs: a paused file never leaves its dataset
+    if d.format > kind.writes {
+        return Err(BackupError::new(
+            Code::IncompatibleFormat,
+            format!(
+                "{} has {} format {}, written by Sparkles {}; this build reads up to {}: restore it with that release or a later one",
+                f.path, kind.file, d.format, m.server.version, kind.writes
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The files of `m` that a restore writes: every file but the definitions of a kind
+/// this build does not know and that are not required.
+pub fn restored_files(m: &Manifest) -> Vec<crate::FileEntry> {
+    m.files
+        .iter()
+        .filter(|f| {
+            f.definition
+                .as_ref()
+                .is_none_or(|d| sparkles_core::formats::definition_kind(&d.kind).is_some())
+        })
+        .cloned()
+        .collect()
 }
 
 /// The total size of a manifest's files: the restored directory's size before the
@@ -348,6 +459,7 @@ mod tests {
                     size: *s,
                 })
                 .collect(),
+            definition: None,
         }
     }
 
@@ -562,6 +674,133 @@ mod tests {
             "{e}"
         );
     }
+    /// `good()` with view definitions `names`, announced by `requires`.
+    fn with_views(names: &[&str]) -> Manifest {
+        let mut m = good();
+        m.requires = vec!["definitions".into()];
+        for n in names {
+            let mut f = file(&format!("views/{n}/view.json"), &[40]);
+            f.kind = sparkles_core::store::FileKind::Meta;
+            f.definition = Some(crate::DefinitionRef {
+                kind: "view".into(),
+                format: 1,
+                required: true,
+            });
+            m.files.push(f);
+        }
+        m
+    }
+
+    #[test]
+    fn definition_entries_validate() {
+        let m = with_views(&["a", "b-2"]);
+        validate(&m, PIECE, &[2]).unwrap();
+        assert_eq!(restored_files(&m).len(), m.files.len());
+        // the serialized entry carries its kind and version, and no default member
+        let v = serde_json::to_value(&m.files[4]).unwrap();
+        assert_eq!(v["definition"], json!({"kind": "view", "format": 1}));
+        // a manifest without definitions serializes as before
+        let v = serde_json::to_value(good()).unwrap();
+        assert!(v.get("requires").is_none() && v["files"][0].get("definition").is_none());
+    }
+
+    #[test]
+    fn hostile_definition_entries_are_refused() {
+        let n = good().files.len();
+        let cases: Vec<Case> = vec![
+            (
+                "traversal",
+                Box::new(move |m| m.files[n].path = "views/../../etc/view.json".into()),
+            ),
+            (
+                "nested",
+                Box::new(move |m| m.files[n].path = "views/a/b/view.json".into()),
+            ),
+            (
+                "other file",
+                Box::new(move |m| m.files[n].path = "views/a/paused.json".into()),
+            ),
+            (
+                "absolute",
+                Box::new(move |m| m.files[n].path = "/views/a/view.json".into()),
+            ),
+            (
+                "generation",
+                Box::new(move |m| m.files[n].path = "gen-0001/view.json".into()),
+            ),
+            (
+                "duplicate",
+                Box::new(move |m| m.files[n + 1].path = "views/a/view.json".into()),
+            ),
+            (
+                "not meta",
+                Box::new(move |m| m.files[n].kind = sparkles_core::store::FileKind::Immutable),
+            ),
+            (
+                "too large",
+                Box::new(move |m| {
+                    m.files[n].size = MAX_DEFINITION_BYTES + 1;
+                    m.files[n].blobs = vec![BlobRef {
+                        id: hex64('b'),
+                        size: MAX_DEFINITION_BYTES + 1,
+                    }];
+                }),
+            ),
+            (
+                "version 0",
+                Box::new(move |m| m.files[n].definition.as_mut().unwrap().format = 0),
+            ),
+            ("unannounced", Box::new(|m| m.requires.clear())),
+        ];
+        for (what, f) in cases {
+            let mut m = with_views(&["a", "b"]);
+            f(&mut m);
+            let e = validate(&m, MAX_DEFINITION_BYTES + 1, &[2]).unwrap_err();
+            assert_eq!(e.code(), Code::InvalidBackup, "{what}: {e}");
+        }
+        // an older reader ignores `definition` and `requires`, so it sees a plain file
+        // path that it does not allow, and refuses the backup before writing anything
+        let mut m = with_views(&["a"]);
+        m.files[n].definition = None;
+        assert_eq!(
+            field_of(&m),
+            (Code::InvalidBackup, format!("files[{n}].path"))
+        );
+    }
+
+    #[test]
+    fn unknown_definition_semantics_are_refused_or_skipped() {
+        let n = good().files.len();
+        // a newer definition file version
+        let mut m = with_views(&["a"]);
+        m.files[n].definition.as_mut().unwrap().format = 2;
+        let e = validate(&m, PIECE, &[2]).unwrap_err();
+        assert_eq!(e.code(), Code::IncompatibleFormat, "{e}");
+        assert!(e.message().contains("views/a/view.json"), "{e}");
+        // an unknown required kind
+        let mut m = with_views(&["a"]);
+        m.files[n].path = "analyses/a/analysis.json".into();
+        m.files[n].definition.as_mut().unwrap().kind = "analysis".into();
+        let e = validate(&m, PIECE, &[2]).unwrap_err();
+        assert_eq!(e.code(), Code::IncompatibleFormat, "{e}");
+        assert!(e.message().contains("\"analysis\""), "{e}");
+        // the same kind, not required: validated as a plain path and left out
+        m.files[n].definition.as_mut().unwrap().required = false;
+        validate(&m, PIECE, &[2]).unwrap();
+        assert_eq!(restored_files(&m).len(), n);
+        m.files[n].path = "analyses/../x".into();
+        assert_eq!(
+            validate(&m, PIECE, &[2]).unwrap_err().code(),
+            Code::InvalidBackup
+        );
+        // an unknown manifest feature
+        let mut m = with_views(&["a"]);
+        m.requires.push("retained-history".into());
+        let e = validate(&m, PIECE, &[2]).unwrap_err();
+        assert_eq!(e.code(), Code::IncompatibleFormat, "{e}");
+        assert!(e.message().contains("retained-history"), "{e}");
+    }
+
     #[test]
     fn branch_provenance_is_validated_without_breaking_legacy_manifests() {
         let mut m = good();

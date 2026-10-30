@@ -23,6 +23,7 @@ use super::zset::Changes;
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
+use crate::store::definitions::{self, DefinitionFile, DefinitionSource};
 use crate::store::{DeltaSubscription, Store};
 use crate::task::Control;
 use oxrdf::Term;
@@ -366,6 +367,8 @@ struct ViewEntry {
     /// why the view could not be attached (its query, its principal)
     error: Option<String>,
     checkpointed: u64,
+    /// restored or cloned and not resumed: its `view.json` is the paused format
+    paused: bool,
 }
 
 #[derive(Default)]
@@ -418,6 +421,19 @@ pub struct RuntimeStats {
     pub loaded: u64,
 }
 
+/// The definitions a capture records ([`DefinitionSource`]).
+#[derive(Default)]
+struct Defs {
+    /// why the definitions on disk could not be read: a capture is refused
+    broken: Option<String>,
+    files: Arc<[DefinitionFile]>,
+}
+
+/// Why a restored or cloned view waits ([`definitions::Paused`]), as its suspension.
+fn paused_reason(p: &definitions::Paused) -> String {
+    p.reason.clone()
+}
+
 /// The views and live queries of one dataset.
 pub struct Runtime {
     opts: RwLock<RuntimeOptions>,
@@ -425,6 +441,10 @@ pub struct Runtime {
     dataset: uuid::Uuid,
     host: RwLock<Option<Arc<dyn Host>>>,
     reg: Mutex<Registry>,
+    /// The definitions as backups and clones capture them, replaced while `reg` is
+    /// held after every change. A leaf lock: a capture reads it under the store's
+    /// writer lock, and nothing that holds it waits for another lock.
+    defs: RwLock<Defs>,
     /// a counter of finished rounds, which readers waiting for a view watch
     epoch: Mutex<u64>,
     cv: Condvar,
@@ -635,16 +655,19 @@ impl Runtime {
         if let Some(r) = &root {
             match views::read_all(r) {
                 Ok(defs) => {
-                    for (name, def) in defs {
+                    for (name, def, paused) in defs {
+                        // a restored or cloned view waits until it is resumed
+                        let suspended = paused.as_ref().map(paused_reason);
                         reg.views.insert(
                             name,
                             ViewEntry {
                                 def,
                                 cell: None,
                                 access: None,
-                                suspended: None,
+                                suspended,
                                 error: None,
                                 checkpointed: 0,
+                                paused: paused.is_some(),
                             },
                         );
                     }
@@ -659,12 +682,14 @@ impl Runtime {
                 }
             }
         }
+        let defs = RwLock::new(Self::defs_of(&reg));
         Arc::new(Runtime {
             opts: RwLock::new(opts),
             root,
             dataset,
             host: RwLock::new(None),
             reg: Mutex::new(reg),
+            defs,
             epoch: Mutex::new(0),
             cv: Condvar::new(),
             kick: Arc::new(tokio::sync::Notify::new()),
@@ -1548,6 +1573,15 @@ impl Runtime {
             ));
         }
         def.check()?;
+        // what a backup can restore: a larger definition is refused here, not there
+        let size = views::to_bytes(&def, None)?.len() as u64;
+        let max = crate::formats::MAX_DEFINITION_BYTES;
+        if size > max {
+            return Err(super::error(
+                "invalid-view",
+                format!("the definition is {size} bytes, larger than {max}"),
+            ));
+        }
         let host = self.host()?;
         let text = Self::view_text(host.as_ref(), &def)?;
         let q = self.parse(host.as_ref(), &text)?;
@@ -1562,6 +1596,7 @@ impl Runtime {
         let mut reg = self.reg.lock();
         self.broken(&reg)?;
         self.sync_inference(&mut reg, host.as_ref());
+        // a new definition is the operator's: it runs, and no longer waits for a check
         if let Some(root) = &self.root {
             views::write(root, name, &def)?;
         }
@@ -1580,8 +1615,10 @@ impl Runtime {
                 suspended: None,
                 error: None,
                 checkpointed: 0,
+                paused: false,
             },
         );
+        *self.defs.write() = Self::defs_of(&reg);
         self.attach(store, &mut reg, name)?;
         drop(reg);
         self.kick();
@@ -1602,18 +1639,28 @@ impl Runtime {
         if let Some(root) = &self.root {
             views::remove(root, name)?;
         }
+        *self.defs.write() = Self::defs_of(&reg);
         drop(reg);
         self.kick();
         Ok(())
     }
 
     /// Evaluate view `name` again from scratch on the next round, lifting a
-    /// suspension.
+    /// suspension. A restored or cloned view resumes: it attaches on the next round,
+    /// which resolves its principal and its stored query under the current policy.
     pub fn rebuild(&self, name: &str) -> Result<()> {
         let mut reg = self.reg.lock();
         let Some(e) = reg.views.get_mut(name) else {
             return Err(super::error("view-not-found", format!("no view {name:?}")));
         };
+        // a resumed view's definition is written as it runs, durably, before the
+        // suspension is lifted
+        if e.paused {
+            if let Some(root) = &self.root {
+                views::write(root, name, &e.def)?;
+            }
+            e.paused = false;
+        }
         e.suspended = None;
         e.error = None;
         if let Some(c) = &e.cell {
@@ -1717,7 +1764,32 @@ impl Runtime {
             .collect()
     }
 
-    /// The names and definitions of the views (for backups and clones).
+    /// The definition files of `reg`'s views, as a capture records them.
+    fn defs_of(reg: &Registry) -> Defs {
+        let mut files = Vec::with_capacity(reg.views.len());
+        for (name, e) in &reg.views {
+            match views::to_bytes(&e.def, None) {
+                Ok(bytes) => files.push(DefinitionFile {
+                    kind: "view",
+                    path: views_path(name),
+                    format: views::FORMAT,
+                    bytes: bytes.into(),
+                }),
+                Err(err) => {
+                    return Defs {
+                        broken: Some(format!("view {name:?}: {err}")),
+                        files: Arc::from([]),
+                    };
+                }
+            }
+        }
+        Defs {
+            broken: reg.broken.clone(),
+            files: files.into(),
+        }
+    }
+
+    /// The names and definitions of the views.
     pub fn definitions(&self) -> Vec<(String, ViewDef)> {
         self.reg
             .lock()
@@ -2185,6 +2257,27 @@ fn diff_event(
 impl ViewSource for Runtime {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
         self.read(r)
+    }
+}
+
+/// `views/NAME/view.json`
+fn views_path(name: &str) -> String {
+    format!("{}/{name}/{}", views::DIR, views::FILE)
+}
+
+impl DefinitionSource for Runtime {
+    fn kind(&self) -> &'static str {
+        "view"
+    }
+
+    fn capture_definitions(&self) -> Result<Vec<DefinitionFile>> {
+        let d = self.defs.read();
+        if let Some(why) = &d.broken {
+            return Err(Error::Unsupported(format!(
+                "the view definitions cannot be captured until they are fixed: {why}"
+            )));
+        }
+        Ok(d.files.to_vec())
     }
 }
 

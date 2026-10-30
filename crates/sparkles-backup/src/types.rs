@@ -416,6 +416,27 @@ pub struct FileEntry {
     pub sha256: String,
     /// the file is the concatenation of these blobs, in order
     pub blobs: Vec<BlobRef>,
+    /// a dataset-managed definition, such as `views/NAME/view.json`, which the
+    /// manifest's `requires` announces (`formats::BACKUP_DEFINITION`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<DefinitionRef>,
+}
+
+/// The `definition` member of a manifest file entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefinitionRef {
+    /// an id of `formats::DEFINITIONS` (`view`)
+    pub kind: String,
+    /// the version of the definition file
+    pub format: u32,
+    /// whether a reader that does not know `kind` must refuse the backup; one that is
+    /// not required is skipped
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub required: bool,
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +477,9 @@ pub struct Backup {
     /// the dataset's branches other than `main` that the backup left out
     #[serde(default, skip_serializing_if = "is_zero")]
     pub branches_omitted: u64,
+    /// the manifest features a reader must know to restore the backup
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 
 /// The dataset of a manifest.
@@ -566,6 +590,11 @@ pub struct Manifest {
     /// the dataset's branches other than `main`, which a backup does not copy
     #[serde(default, skip_serializing_if = "is_zero")]
     pub branches_omitted: u64,
+    /// features a reader must know to restore the backup
+    /// (`formats::BACKUP_MANIFEST_FEATURES`): `definitions` when files carry a
+    /// `definition`. A reader refuses a backup that requires a feature it does not know.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 
 impl Manifest {
@@ -612,6 +641,7 @@ impl Manifest {
             stats: self.stats.clone(),
             derived: self.derived.clone(),
             branches_omitted: self.branches_omitted,
+            requires: self.requires.clone(),
         }
     }
 }

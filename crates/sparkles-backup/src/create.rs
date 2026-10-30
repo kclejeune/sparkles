@@ -286,9 +286,45 @@ impl Repository {
             branch,
             next_ordinal,
             branches_omitted,
+            definitions,
             ..
         } = src;
         let mut files = files;
+        // the managed definitions were captured with the data; each is one meta blob,
+        // and its entry names its kind and file version
+        // a definition a restore would refuse fails the backup before anything is
+        // uploaded, so no published backup is one that cannot be restored
+        sparkles_core::store::definitions::check_all(&definitions).map_err(|e| {
+            BackupError::new(
+                Code::InvalidRequest,
+                format!("a view definition cannot be backed up: {e}"),
+            )
+        })?;
+        let mut defined = std::collections::HashMap::new();
+        for d in definitions {
+            let known = sparkles_core::formats::definition_kind(d.kind)
+                .is_some_and(|k| k.name_of(&d.path).is_some());
+            if !known || files.iter().any(|f| f.path == d.path) {
+                return Err(BackupError::internal(format!(
+                    "captured definition {:?} cannot be backed up",
+                    d.path
+                )));
+            }
+            defined.insert(
+                d.path.clone(),
+                crate::DefinitionRef {
+                    kind: d.kind.to_string(),
+                    format: d.format,
+                    required: true,
+                },
+            );
+            files.push(CapturedFile {
+                path: d.path,
+                kind: FileKind::Meta,
+                len: d.bytes.len() as u64,
+                src: FileSource::Bytes(d.bytes),
+            });
+        }
         for (path, content) in &o.extra {
             if !layout::ROOT_FILES.contains(&path.as_str()) {
                 return Err(BackupError::new(
@@ -306,7 +342,8 @@ impl Repository {
         }
         let mut paths = HashSet::new();
         for f in &files {
-            if !layout::valid_backup_path(&f.path) || !paths.insert(f.path.as_str()) {
+            let allowed = layout::valid_backup_path(&f.path) || defined.contains_key(&f.path);
+            if !allowed || !paths.insert(f.path.as_str()) {
                 return Err(BackupError::internal(format!(
                     "captured file {:?} cannot be backed up",
                     f.path
@@ -461,6 +498,7 @@ impl Repository {
                     .or_else(|| hasher.map(Hasher::finish))
                     .unwrap_or_default(),
                 blobs,
+                definition: defined.get(&f.path).cloned(),
             })
             .collect();
         let has_text = entries.iter().any(|e| e.path == "text.json");
@@ -509,6 +547,11 @@ impl Repository {
                 .epoch()
                 .map(|epoch| serde_json::json!({"scheme":"sparkles-repo-v1","epoch":epoch})),
             branches_omitted,
+            requires: if defined.is_empty() {
+                Vec::new()
+            } else {
+                vec!["definitions".to_string()]
+            },
         };
         ctl.check()?;
         ctl.report(0.97, "writing the manifest");
