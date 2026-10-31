@@ -101,7 +101,7 @@ PIDS+=($!)
   --port "$SPORT" > "$WORK/sparkles.log" 2>&1 &
 PIDS+=($!)
 wait_for "localhost:$FPORT/\$/ping"
-wait_for "localhost:$SPORT/\$/ping"
+wait_for "localhost:$SPORT/\$/ready"
 curl -sf -X POST -H 'Content-Type: application/n-triples' --data-binary "@$WORK/corpus.nt" \
   "localhost:$FPORT/cmp/data?default" > /dev/null
 

@@ -10,6 +10,18 @@ a commit-labeled development baseline. No published release baseline exists.
 Library and binding checks, broader machine-readable contracts and deprecation
 signals remain incomplete.
 
+`GET /$/ready` and `GET /$/ready/{ds}` can report the status `degraded`, which spec
+C01 reserved. A server reports it when a dataset failed to open at startup. Such a
+dataset, including one in a format this release does not read, now makes the server
+not ready unless `serve --ready-ignore-failed` is set. `/$/ping` answers as soon as the
+listener is bound, before the datasets open, so it no longer means ready to serve.
+Health checks follow one model. Liveness, and a startup check that waits for the
+process, use `/$/ping`, so that nothing restarts a slow or degraded server. Readiness
+uses `/$/ready`. Deployments with several datasets that should keep serving when one
+fails set `--ready-ignore-failed` and use `/$/ready/{ds}` for the datasets they route or
+monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move to
+`/$/ready`. The Helm chart's startup probe now asks for `/$/ping`.
+
 ### Changed
 
 Change feeds, live queries and long polls end with `access-changed` when the session

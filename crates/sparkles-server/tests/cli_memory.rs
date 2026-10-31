@@ -229,7 +229,9 @@ fn start_server(extra: &[&str]) -> Server {
         .unwrap();
     let url = format!("http://127.0.0.1:{port}");
     let t0 = Instant::now();
-    while reqwest::blocking::get(format!("{url}/$/ping")).is_err() {
+    while reqwest::blocking::get(format!("{url}/$/ready"))
+        .map_or(true, |r| !r.status().is_success())
+    {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
             "server did not start"
@@ -1850,7 +1852,9 @@ fn memory_loc() {
         .spawn()
         .unwrap();
     let t0 = Instant::now();
-    while reqwest::blocking::get(format!("http://127.0.0.1:{port}/$/ping")).is_err() {
+    while reqwest::blocking::get(format!("http://127.0.0.1:{port}/$/ready"))
+        .map_or(true, |r| !r.status().is_success())
+    {
         assert!(t0.elapsed() < Duration::from_secs(60));
         std::thread::sleep(Duration::from_millis(50));
     }

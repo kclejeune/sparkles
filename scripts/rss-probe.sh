@@ -53,7 +53,7 @@ rm -rf probe-server
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null || true; rm -rf "$WORK/probe-server"' EXIT
 for _ in $(seq 240); do
-  curl -sf "localhost:$PORT/\$/ping" > /dev/null && break
+  curl -sf "localhost:$PORT/\$/ready" > /dev/null && break
   kill -0 "$PID" 2> /dev/null || {
     echo "server exited:" >&2
     cat probe-server.log >&2

@@ -222,11 +222,15 @@ spec:
             - name: http
               containerPort: {{ .Values.server.port }}
               protocol: TCP
-          # /$/ready answers 503 while the server starts and once it drains; /$/ping only
-          # shows that the process answers. Both need no credentials with auth.
+          # The server listens before its datasets open. /$/ping shows that the process
+          # answers, so the startup and liveness probes never restart a server that is
+          # still opening datasets or degraded by one that failed to open. /$/ready
+          # answers 503 while datasets open, while one is failed (unless
+          # --ready-ignore-failed) and once the server drains, so only the readiness
+          # probe gates traffic. Both need no credentials with auth.
           startupProbe:
             httpGet:
-              path: /$/ready
+              path: /$/ping
               port: http
               scheme: {{ .Values.probes.scheme }}
             periodSeconds: {{ .Values.probes.startup.periodSeconds }}

@@ -44,7 +44,7 @@ trap cleanup EXIT
 server_pid=$!
 
 for _ in $(seq 1 200); do
-  if curl -fsS "http://127.0.0.1:$port/\$/ping" > /dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:$port/\$/ready" > /dev/null 2>&1; then
     break
   fi
   if ! kill -0 "$server_pid" 2> /dev/null; then

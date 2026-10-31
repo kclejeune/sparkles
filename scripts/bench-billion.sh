@@ -360,7 +360,7 @@ start() { # start <engine>
       "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --data "$S/sparkles-server" --loc dbpedia="$S/sparkles.db" \
         --port "$p" --timeout "$TIMEOUT" "${budget[@]}" --no-access-log ${SPARKLES_ARGS:-} > "$S/logs/server-sparkles.log" 2>&1 &
       URL[$e]=localhost:$p/dbpedia/sparql
-      READY[$e]="localhost:$p/\$/ping"
+      READY[$e]="localhost:$p/\$/ready"
       ;;
     qlever)
       (cd "$S/qlever-index" && exec "${CAP[@]}" "$QSERVER" -i dbpedia -p "$p" -m "${QUERY_MEM_GB}G" \

@@ -53,7 +53,7 @@ impl Server {
             .unwrap();
         let s = Server { child, port };
         let t0 = Instant::now();
-        while s.call("GET", "/$/ping", None).0 != 200 {
+        while s.call("GET", "/$/ready", None).0 != 200 {
             assert!(
                 t0.elapsed() < Duration::from_secs(30),
                 "server did not start"

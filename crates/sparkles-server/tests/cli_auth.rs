@@ -113,7 +113,9 @@ fn start() -> Server {
         .unwrap();
     let url = format!("http://127.0.0.1:{port}");
     let t0 = Instant::now();
-    while reqwest::blocking::get(format!("{url}/$/ping")).is_err() {
+    while reqwest::blocking::get(format!("{url}/$/ready"))
+        .map_or(true, |r| !r.status().is_success())
+    {
         assert!(
             t0.elapsed() < Duration::from_secs(30),
             "server did not start"
@@ -596,7 +598,9 @@ fn mcp_bridge() {
         home: tempfile::tempdir().unwrap(),
     };
     let t0 = Instant::now();
-    while reqwest::blocking::get(format!("{url}/$/ping")).is_err() {
+    while reqwest::blocking::get(format!("{url}/$/ready"))
+        .map_or(true, |r| !r.status().is_success())
+    {
         assert!(
             t0.elapsed() < Duration::from_secs(30),
             "server did not start"

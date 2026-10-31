@@ -9,7 +9,7 @@ use crate::store::{ProcessLock, Store, StoreOptions};
 use crate::{Dataset, DatasetOptions, Error, Result};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -168,6 +168,28 @@ struct Detached {
     reasoning: Option<crate::reasoning::ReasoningRecord>,
 }
 
+/// Why a registered dataset is closed: the message, which names paths, and a stable
+/// kebab-case kind (`unsupported-format`, `missing` for a root without its directory or
+/// CURRENT file, `corrupt`, `io`, `locked`, `invalid`, `recovery` or `error`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Refusal {
+    pub message: String,
+    pub kind: &'static str,
+}
+
+/// The [`Refusal::kind`] of an error that kept a dataset from opening.
+fn failure_kind(e: &Error) -> &'static str {
+    match e {
+        Error::Unsupported(_) => "unsupported-format",
+        Error::Corrupt(_) => "corrupt",
+        Error::Io(_) => "io",
+        Error::Locked { .. } => "locked",
+        Error::Invalid(_) => "invalid",
+        _ => "error",
+    }
+}
+
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
     options: RwLock<CatalogOptions>,
@@ -180,10 +202,17 @@ pub(crate) struct Inner {
     /// Persistent datasets taken out of `entries` for an in-place restore, or left
     /// closed by a rename whose rollback could not reopen them.
     detached: Mutex<BTreeMap<String, Detached>>,
-    /// Datasets left closed at open because their files are in a format this release
-    /// does not read, with the refusal. They are also in `detached`, so they stay
+    /// Datasets left closed because they failed to open, or because a rename could not
+    /// reopen them, with the refusal. They are also in `detached`, so they stay
     /// registered.
-    refused: Mutex<BTreeMap<String, String>>,
+    refused: Mutex<BTreeMap<String, Refusal>>,
+    /// Registered persistent datasets that a deferred open
+    /// ([`open_deferred`](Catalog::open_deferred)) has not opened yet. They are also in
+    /// `detached`, so saves keep them registered and their names stay taken.
+    opening: Mutex<BTreeSet<String>>,
+    /// Names that a program will attach once its registered datasets are open
+    /// ([`expect`](Catalog::expect)); nothing else may take them meanwhile.
+    expected: Mutex<BTreeSet<String>>,
     manage: Mutex<()>,
     #[cfg(feature = "backup")]
     pub(crate) repositories: Mutex<Option<crate::backup::Repositories>>,
@@ -223,7 +252,35 @@ pub struct CloneRequest {
 }
 
 impl Catalog {
+    /// Open the catalog in `dir` and every dataset it registers. A persistent dataset in
+    /// a format this release does not read, or whose directory or CURRENT file is
+    /// missing, is left closed and registered, and [`refused`](Self::refused) lists it.
+    /// Any other failure to open a dataset fails the whole open.
     pub fn open(dir: impl AsRef<Path>, options: CatalogOptions) -> Result<Self> {
+        let (catalog, pending) = Self::open_deferred(dir, options)?;
+        for name in pending {
+            if let Err(e) = catalog.open_registered(&name) {
+                let refused_alone = catalog
+                    .refusal(&name)
+                    .is_some_and(|r| matches!(r.kind, "unsupported-format" | "missing"));
+                if !refused_alone {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(catalog)
+    }
+
+    /// Open the catalog in `dir` without opening its persistent datasets, which can take
+    /// long (a log to replay, indexes to map). The registered in-memory datasets are
+    /// made at once. The persistent ones are returned in registry order and stay
+    /// registered and closed, listed by [`opening`](Self::opening), until
+    /// [`open_registered`](Self::open_registered) opens each. Meanwhile their names
+    /// cannot be created, attached, renamed, deleted or restored.
+    pub fn open_deferred(
+        dir: impl AsRef<Path>,
+        options: CatalogOptions,
+    ) -> Result<(Self, Vec<String>)> {
         let dir = std::path::absolute(dir)?;
         std::fs::create_dir_all(&dir)?;
         let lock = lock_dir(&dir)?;
@@ -251,6 +308,8 @@ impl Catalog {
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
                 refused: Mutex::new(BTreeMap::new()),
+                opening: Mutex::new(BTreeSet::new()),
+                expected: Mutex::new(BTreeSet::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -258,57 +317,30 @@ impl Catalog {
             }),
         };
         let reg = read_registry(&dir)?;
+        let mut pending = Vec::new();
         for e in reg.datasets {
             check_name(&e.name)?;
-            if catalog.inner.entries.read().contains_key(&e.name) {
+            if catalog.inner.entries.read().contains_key(&e.name)
+                || catalog.inner.detached.lock().contains_key(&e.name)
+            {
                 return Err(Error::Corrupt(format!(
                     "duplicate dataset '{}' in config.json",
                     e.name
                 )));
             }
-            let opened = if e.kind == DatasetKind::Persistent {
-                // A registered root that lost its directory or CURRENT is refused
-                // alone, so that the catalog serves the others and nothing recreates it.
-                if let Some(msg) = catalog.missing_registered_root(&e.name)? {
-                    tracing::error!(target: "sparkles::catalog", "{msg}");
-                    catalog.inner.detached.lock().insert(
-                        e.name.clone(),
-                        Detached {
-                            id: None,
-                            reasoning: e.reasoning,
-                        },
-                    );
-                    catalog.inner.refused.lock().insert(e.name, msg);
-                    continue;
-                }
-                catalog.open_existing_dataset(&e.name, None)
-            } else {
-                catalog.open_dataset(&e.name, e.kind, None)
-            };
-            let ds = match opened {
-                Ok(ds) => ds,
-                // A dataset in a format this release does not read is refused alone: it
-                // stays registered and closed, and the catalog serves the others.
-                Err(Error::Unsupported(msg)) if e.kind == DatasetKind::Persistent => {
-                    let msg = format!(
-                        "dataset \"{}\" is not served: {msg} (`sparkles migrate --data {} --dataset {} --check` lists its formats)",
-                        e.name,
-                        dir.display(),
-                        e.name
-                    );
-                    tracing::error!(target: "sparkles::catalog", "{msg}");
-                    catalog.inner.detached.lock().insert(
-                        e.name.clone(),
-                        Detached {
-                            id: None,
-                            reasoning: e.reasoning,
-                        },
-                    );
-                    catalog.inner.refused.lock().insert(e.name, msg);
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
+            if e.kind == DatasetKind::Persistent {
+                catalog.inner.detached.lock().insert(
+                    e.name.clone(),
+                    Detached {
+                        id: None,
+                        reasoning: e.reasoning,
+                    },
+                );
+                catalog.inner.opening.lock().insert(e.name.clone());
+                pending.push(e.name);
+                continue;
+            }
+            let ds = catalog.open_dataset(&e.name, e.kind, None)?;
             if ds.reasoning_record().is_none() {
                 *ds.state().reasoning.write() = e.reasoning;
             }
@@ -321,7 +353,128 @@ impl Catalog {
                 },
             );
         }
-        Ok(catalog)
+        Ok((catalog, pending))
+    }
+
+    /// Open a dataset that [`open_deferred`](Self::open_deferred) left to open, and
+    /// publish it. Several datasets may open at once on different threads. A dataset
+    /// that fails to open, or panics while opening, stays registered and closed, and
+    /// [`refusal`](Self::refusal) gives the reason. The error is returned as well.
+    pub fn open_registered(&self, name: &str) -> Result<()> {
+        if !self.inner.opening.lock().contains(name) {
+            return Err(Error::Conflict(format!(
+                "dataset /{name} is not waiting to open"
+            )));
+        }
+        // A registered root that lost its directory or CURRENT is refused alone, so
+        // that nothing recreates it.
+        let opened = match self.missing_registered_root(name) {
+            Ok(None) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // only a missing root is reported as `NotFound` below
+                self.open_existing_dataset(name, None).map_err(|e| match e {
+                    Error::NotFound(m) => Error::Corrupt(m),
+                    e => e,
+                })
+            }))
+            .unwrap_or_else(|panic| {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                Err(Error::Corrupt(format!("opening panicked: {what}")))
+            }),
+            Ok(Some(message)) => Err(Error::NotFound(message)),
+            Err(e) => Err(e),
+        };
+        // Under the registry lock, so that a save in between sees the dataset either
+        // detached or published. The dataset enters its final state (published or
+        // refused) before it leaves `opening`, so a lookup always finds it in one of
+        // them.
+        let _g = self.inner.manage.lock();
+        let result = match opened {
+            Ok(ds) => {
+                let reasoning = self
+                    .inner
+                    .detached
+                    .lock()
+                    .get(name)
+                    .and_then(|d| d.reasoning.clone());
+                if ds.reasoning_record().is_none() {
+                    *ds.state().reasoning.write() = reasoning;
+                }
+                self.publish_reattached(name, ds);
+                Ok(())
+            }
+            Err(err) => {
+                let (message, kind) = match &err {
+                    Error::NotFound(message) => (message.clone(), "missing"),
+                    // A dataset in a format this release does not read names the
+                    // command that lists its formats.
+                    Error::Unsupported(msg) => (
+                        format!(
+                            "dataset \"{name}\" is not served: {msg} (`sparkles migrate --data {} --dataset {name} --check` lists its formats)",
+                            self.dir()
+                                .map(Path::display)
+                                .map(|d| d.to_string())
+                                .unwrap_or_default(),
+                        ),
+                        failure_kind(&err),
+                    ),
+                    other => (
+                        format!("dataset \"{name}\" is not served: {other}"),
+                        failure_kind(other),
+                    ),
+                };
+                tracing::error!(target: "sparkles::catalog", "{message}");
+                self.inner
+                    .refused
+                    .lock()
+                    .insert(name.into(), Refusal { message, kind });
+                Err(err)
+            }
+        };
+        #[cfg(test)]
+        tests::between_states_hook(self, name);
+        self.inner.opening.lock().remove(name);
+        result
+    }
+
+    /// The registered datasets that wait to be opened by
+    /// [`open_registered`](Self::open_registered).
+    pub fn opening(&self) -> Vec<String> {
+        self.inner.opening.lock().iter().cloned().collect()
+    }
+    /// Whether `name` waits to be opened by [`open_registered`](Self::open_registered).
+    pub fn is_opening(&self, name: &str) -> bool {
+        self.inner.opening.lock().contains(name)
+    }
+
+    /// Take `name` for a dataset that [`attach_expected`](Self::attach_expected) will
+    /// attach later, such as one a server names on its command line and attaches once
+    /// its registered datasets are open. Until then the name cannot be created,
+    /// attached, renamed into or restored into, as for a dataset that is opening.
+    pub fn expect(&self, name: &str) -> Result<()> {
+        let _g = self.inner.manage.lock();
+        self.available(name, false)?;
+        self.inner.expected.lock().insert(name.into());
+        Ok(())
+    }
+    /// Whether `name` is taken by [`expect`](Self::expect) and not attached yet.
+    pub fn is_expected(&self, name: &str) -> bool {
+        self.inner.expected.lock().contains(name)
+    }
+    /// Attach a dataset under a name that [`expect`](Self::expect) took. The name is
+    /// released whether the attach succeeds or not, and only after the dataset is
+    /// registered when it does.
+    pub fn attach_expected(&self, name: &str, source: Attach) -> Result<Dataset> {
+        let _g = self.inner.manage.lock();
+        if !self.inner.expected.lock().contains(name) {
+            return Err(Error::Conflict(format!("dataset /{name} is not expected")));
+        }
+        let result = self.attach_locked(name, source);
+        self.inner.expected.lock().remove(name);
+        result
     }
 
     pub fn memory(options: CatalogOptions) -> Self {
@@ -338,6 +491,8 @@ impl Catalog {
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
                 refused: Mutex::new(BTreeMap::new()),
+                opening: Mutex::new(BTreeSet::new()),
+                expected: Mutex::new(BTreeSet::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -573,6 +728,9 @@ impl Catalog {
                 }
             )));
         }
+        if self.is_opening(name) || self.inner.expected.lock().contains(name) {
+            return Err(Error::Conflict(format!("dataset /{name} is opening")));
+        }
         if self.inner.detached.lock().contains_key(name) {
             return Err(Error::Conflict(format!(
                 "dataset /{name} is registered but closed; reopen the catalog to recover it"
@@ -617,6 +775,9 @@ impl Catalog {
     pub fn attach(&self, name: &str, source: Attach) -> Result<Dataset> {
         let _g = self.inner.manage.lock();
         self.available(name, false)?;
+        self.attach_locked(name, source)
+    }
+    fn attach_locked(&self, name: &str, source: Attach) -> Result<Dataset> {
         let (kind, loc) = match &source {
             Attach::Memory => (DatasetKind::Memory, None),
             Attach::Directory(p) => (DatasetKind::Persistent, Some(p.as_path())),
@@ -641,6 +802,9 @@ impl Catalog {
     pub fn delete(&self, name: &str) -> Result<bool> {
         let trash = {
             let _g = self.inner.manage.lock();
+            if self.is_opening(name) || self.inner.expected.lock().contains(name) {
+                return Err(Error::Conflict(format!("dataset /{name} is opening")));
+            }
             if let Some(holder) = self.reserved_by(name) {
                 return Err(Error::Conflict(format!(
                     "dataset /{name} is reserved by task {holder}"
@@ -792,10 +956,13 @@ impl Catalog {
                 reasoning,
             },
         );
-        self.inner
-            .refused
-            .lock()
-            .insert(name.into(), message.clone());
+        self.inner.refused.lock().insert(
+            name.into(),
+            Refusal {
+                message: message.clone(),
+                kind: "recovery",
+            },
+        );
         match self.save_locked() {
             Ok(()) => Error::Corrupt(message),
             Err(save) => Error::Corrupt(format!(
@@ -809,6 +976,9 @@ impl Catalog {
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset> {
         let _g = self.inner.manage.lock();
         self.available(to, true)?;
+        if self.is_opening(from) || self.inner.expected.lock().contains(from) {
+            return Err(Error::Conflict(format!("dataset /{from} is opening")));
+        }
         if self.reserved_by(from).is_some() {
             return Err(Error::Conflict(format!("dataset /{from} is reserved")));
         }
@@ -1161,15 +1331,30 @@ impl Catalog {
         files.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(files)
     }
-    /// The registered datasets this catalog left closed when it opened, because their
-    /// files are in a format this release does not read, with the reason (name, message).
+    /// The registered datasets this catalog keeps closed, with the reason (name,
+    /// message). A dataset is refused when it failed to open, for instance because its
+    /// files are in a format this release does not read, or when a rename could not
+    /// reopen it.
     pub fn refused(&self) -> Vec<(String, String)> {
         self.inner
             .refused
             .lock()
             .iter()
-            .map(|(n, m)| (n.clone(), m.clone()))
+            .map(|(n, r)| (n.clone(), r.message.clone()))
             .collect()
+    }
+    /// [`refused`](Self::refused) with the kind of each refusal.
+    pub fn refusals(&self) -> Vec<(String, Refusal)> {
+        self.inner
+            .refused
+            .lock()
+            .iter()
+            .map(|(n, r)| (n.clone(), r.clone()))
+            .collect()
+    }
+    /// Why the registered dataset `name` is kept closed, if it is.
+    pub fn refusal(&self, name: &str) -> Option<Refusal> {
+        self.inner.refused.lock().get(name).cloned()
     }
     /// Write `config.json` again, with each dataset's current reasoning record. The
     /// catalog saves after its own changes. Programs that change a dataset's reasoning
@@ -1499,6 +1684,80 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    type StateHook = Box<dyn Fn(&Catalog, &str)>;
+
+    thread_local! {
+        /// Runs in [`Catalog::open_registered`] between the dataset's final state and
+        /// its leaving `opening`, on the opening thread.
+        static BETWEEN_STATES: std::cell::RefCell<Option<StateHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn between_states_hook(cat: &Catalog, name: &str) {
+        BETWEEN_STATES.with(|h| {
+            if let Some(h) = h.borrow().as_ref() {
+                h(cat, name)
+            }
+        });
+    }
+
+    /// At every moment of an open, a lookup finds the dataset published, opening or
+    /// refused, never in none of them.
+    #[test]
+    fn an_opening_dataset_is_always_in_one_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("a", &Default::default()).unwrap());
+        drop(cat.create("bad", &Default::default()).unwrap());
+        drop(cat);
+        std::fs::write(dir.path().join("databases/bad/dataset.json"), b"not json").unwrap();
+        let (cat, pending) = Catalog::open_deferred(dir.path(), Default::default()).unwrap();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+        let inside = seen.clone();
+        BETWEEN_STATES.set(Some(Box::new(move |cat: &Catalog, name: &str| {
+            assert!(
+                cat.get(name).is_some() || cat.is_opening(name) || cat.refusal(name).is_some(),
+                "/{name} is in no state"
+            );
+            inside.set(inside.get() + 1);
+        })));
+        for n in &pending {
+            let _ = cat.open_registered(n);
+        }
+        BETWEEN_STATES.set(None);
+        assert_eq!(seen.get(), 2);
+        assert!(cat.get("a").is_some() && cat.refusal("bad").is_some());
+    }
+
+    #[test]
+    fn an_expected_name_is_taken_until_its_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("a", &Default::default()).unwrap());
+        // a registered name cannot be expected
+        assert!(matches!(cat.expect("a"), Err(Error::Conflict(_))));
+        cat.expect("scratch").unwrap();
+        for r in [
+            cat.create("scratch", &Default::default()).map(drop),
+            cat.attach("scratch", Attach::Memory).map(drop),
+            cat.rename("a", "scratch").map(drop),
+            cat.delete("scratch").map(drop),
+            cat.reserve("scratch", ReservationKind::Restore, "t")
+                .map(drop),
+            cat.reserve("scratch", ReservationKind::Clone, "t")
+                .map(drop),
+        ] {
+            match r {
+                Err(Error::Conflict(m)) => assert!(m.contains("/scratch is opening"), "{m}"),
+                other => panic!("not refused: {other:?}"),
+            }
+        }
+        assert!(cat.attach_expected("other", Attach::Memory).is_err());
+        cat.attach_expected("scratch", Attach::Memory).unwrap();
+        assert!(cat.get("scratch").is_some());
+        assert!(!cat.is_expected("scratch"));
+    }
+
     /// The delete releases the registry lock before it removes the files, so other
     /// catalog operations go on while a large dataset is removed.
     #[test]
@@ -1610,6 +1869,80 @@ mod tests {
             let reg = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
             assert!(reg.contains("\"b\""), "{file}: {reg}");
         }
+    }
+    #[test]
+    fn a_deferred_open_keeps_waiting_datasets_registered_and_their_names_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("a", &Default::default()).unwrap());
+        drop(cat.create("b", &Default::default()).unwrap());
+        drop(cat.create(
+            "m",
+            &CreateDataset {
+                kind: DatasetKind::Memory,
+                ..Default::default()
+            },
+        ));
+        drop(cat);
+        let (cat, pending) = Catalog::open_deferred(dir.path(), Default::default()).unwrap();
+        assert_eq!(pending, ["a", "b"]);
+        assert_eq!(cat.opening(), ["a", "b"]);
+        // in-memory datasets are made at once
+        assert!(cat.get("m").is_some());
+        assert!(cat.get("a").is_none());
+        // the names of waiting datasets are taken, and they cannot be changed
+        for r in [
+            cat.create("a", &Default::default()).map(drop),
+            cat.attach("a", Attach::Memory).map(drop),
+            cat.rename("a", "c").map(drop),
+            cat.rename("m", "a").map(drop),
+            cat.delete("a").map(drop),
+            cat.reserve("a", ReservationKind::Restore, "t").map(drop),
+        ] {
+            match r {
+                Err(Error::Conflict(m)) => assert!(m.contains("/a is opening"), "{m}"),
+                other => panic!("not refused: {other:?}"),
+            }
+        }
+        // a save meanwhile keeps them registered
+        drop(cat.create("c", &Default::default()).unwrap());
+        let reg = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(reg.contains("\"a\"") && reg.contains("\"b\""), "{reg}");
+        // two open at once
+        std::thread::scope(|s| {
+            for n in ["a", "b"] {
+                let cat = &cat;
+                s.spawn(move || cat.open_registered(n).unwrap());
+            }
+        });
+        assert!(cat.opening().is_empty());
+        assert!(cat.get("a").is_some() && cat.get("b").is_some());
+        assert!(cat.open_registered("a").is_err(), "opened twice");
+        assert!(cat.refused().is_empty());
+    }
+    #[test]
+    fn a_dataset_that_does_not_open_is_refused_with_its_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("a", &Default::default()).unwrap());
+        drop(cat.create("b", &Default::default()).unwrap());
+        drop(cat);
+        std::fs::write(dir.path().join("databases/b/dataset.json"), b"not json").unwrap();
+        // the eager open still fails as a whole
+        assert!(Catalog::open(dir.path(), Default::default()).is_err());
+        let (cat, pending) = Catalog::open_deferred(dir.path(), Default::default()).unwrap();
+        for n in &pending {
+            let _ = cat.open_registered(n);
+        }
+        assert!(cat.get("a").is_some());
+        assert!(cat.get("b").is_none());
+        let r = cat.refusal("b").expect("b refused");
+        assert_ne!(r.kind, "unsupported-format", "{r:?}");
+        assert!(r.message.contains("dataset \"b\" is not served"), "{r:?}");
+        assert!(cat.opening().is_empty());
+        cat.save().unwrap();
+        let reg = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(reg.contains("\"b\""), "{reg}");
     }
     #[test]
     fn a_dataset_with_an_incompatible_branch_is_refused_alone() {

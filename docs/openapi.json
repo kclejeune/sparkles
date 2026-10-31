@@ -14657,6 +14657,23 @@
                 "deltaQuads": {
                   "type": "integer"
                 },
+                "error": {
+                  "description": "Why a failed dataset did not open. Only a server administrator reads the whole message, which names paths.",
+                  "type": "string"
+                },
+                "errorKind": {
+                  "enum": [
+                    "unsupported-format",
+                    "missing",
+                    "corrupt",
+                    "io",
+                    "locked",
+                    "invalid",
+                    "recovery",
+                    "error"
+                  ],
+                  "type": "string"
+                },
                 "generation": {
                   "type": "string"
                 },
@@ -14667,6 +14684,7 @@
                   "type": "boolean"
                 },
                 "state": {
+                  "description": "`open`, `opening` while startup opens it, or `failed` when it did not open.",
                   "type": "string"
                 },
                 "type": {
@@ -14697,7 +14715,8 @@
             "enum": [
               "starting",
               "ready",
-              "draining"
+              "draining",
+              "degraded"
             ],
             "type": "string"
           },
@@ -16809,17 +16828,37 @@
           "limits": {
             "$ref": "#/components/schemas/Limits"
           },
+          "openingDatasets": {
+            "description": "The datasets the caller may read that startup has not opened yet.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "readOnly": {
             "type": "boolean"
           },
           "refusedDatasets": {
             "items": {
               "properties": {
+                "kind": {
+                  "enum": [
+                    "unsupported-format",
+                    "missing",
+                    "corrupt",
+                    "io",
+                    "locked",
+                    "invalid",
+                    "recovery",
+                    "error"
+                  ],
+                  "type": "string"
+                },
                 "name": {
                   "type": "string"
                 },
                 "reason": {
-                  "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths.",
+                  "description": "Why the dataset is registered but not served, such as an index format this release does not read or files that do not open. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths.",
                   "type": "string"
                 }
               },
@@ -32611,7 +32650,7 @@
     },
     "/$/ready": {
       "get": {
-        "description": "`200` when the server is ready and `503` otherwise, both with `ReadyInfo`. Without `metrics`, only readable datasets are listed.",
+        "description": "`200` when the server is ready and `503` otherwise, both with `ReadyInfo`. The server is `starting` while datasets open and `degraded` when one failed to open, which is not ready unless `--ready-ignore-failed` is set. Without `metrics`, only readable datasets are listed.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#server"
         },
@@ -32635,7 +32674,7 @@
                 }
               }
             },
-            "description": "Starting or draining."
+            "description": "Starting, degraded or draining."
           },
           "default": {
             "$ref": "#/components/responses/Error"

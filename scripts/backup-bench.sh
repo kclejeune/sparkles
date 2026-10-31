@@ -64,7 +64,7 @@ start_server() { # start_server <db>
   "$SPARKLES" serve --data server --loc bench="$1" --port "$PORT" --no-access-log > server.log 2>&1 &
   SPID=$!
   for _ in $(seq 1 240); do
-    curl -sf "localhost:$PORT/\$/ping" > /dev/null 2>&1 && return 0
+    curl -sf "localhost:$PORT/\$/ready" > /dev/null 2>&1 && return 0
     kill -0 "$SPID" 2> /dev/null || break
     sleep 0.5
   done

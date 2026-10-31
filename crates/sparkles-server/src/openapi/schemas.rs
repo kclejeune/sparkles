@@ -169,8 +169,14 @@ pub(super) fn schemas() -> Map<String, J> {
                 },
                 "refusedDatasets": array(obj(&["name", "reason"], json!({
                     "name": { "type": "string" },
-                    "reason": { "type": "string", "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths." },
+                    "reason": { "type": "string", "description": "Why the dataset is registered but not served, such as an index format this release does not read or files that do not open. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths." },
+                    "kind": string_enum(&["unsupported-format", "missing", "corrupt", "io", "locked", "invalid", "recovery", "error"]),
                 }))),
+                "openingDatasets": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The datasets the caller may read that startup has not opened yet.",
+                },
             }),
         ),
     );
@@ -179,14 +185,16 @@ pub(super) fn schemas() -> Map<String, J> {
         obj(
             &["status", "ready", "uptimeSeconds", "datasets"],
             json!({
-                "status": string_enum(&["starting", "ready", "draining"]),
+                "status": string_enum(&["starting", "ready", "draining", "degraded"]),
                 "ready": { "type": "boolean" },
                 "uptimeSeconds": { "type": "number" },
                 "datasets": array(obj(&["name", "type", "state", "ready"], json!({
                     "name": { "type": "string" },
                     "type": string_enum(&["persistent", "mem"]),
-                    "state": { "type": "string" },
+                    "state": { "type": "string", "description": "`open`, `opening` while startup opens it, or `failed` when it did not open." },
                     "ready": { "type": "boolean" },
+                    "error": { "type": "string", "description": "Why a failed dataset did not open. Only a server administrator reads the whole message, which names paths." },
+                    "errorKind": string_enum(&["unsupported-format", "missing", "corrupt", "io", "locked", "invalid", "recovery", "error"]),
                     "generation": { "type": "string" },
                     "walBytes": { "type": "integer" },
                     "deltaQuads": { "type": "integer" },

@@ -80,7 +80,7 @@ def start(a, prefix=()):
             if proc.poll() is not None:
                 raise RuntimeError("server exited")
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{a.port}/$/ping", timeout=1).close()
+                urllib.request.urlopen(f"http://127.0.0.1:{a.port}/$/ready", timeout=1).close()
                 return proc, data
             except OSError:
                 time.sleep(0.05)

@@ -241,7 +241,7 @@ if has sparkles; then
   PORT[sparkles]=$SPORT
   "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --loc bench="$WORK/sparkles.db" --port "$SPORT" --timeout 600 > sparkles.log 2>&1 &
   PIDS+=($!)
-  wait_for "localhost:$SPORT/\$/ping"
+  wait_for "localhost:$SPORT/\$/ready"
   NAME[sparkles]=sparkles
   URL[sparkles]=localhost:$SPORT/bench/sparql
 fi

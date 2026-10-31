@@ -63,7 +63,7 @@ def wait_ready(port, proc, timeout=300):
             raise RuntimeError(f"server exited with {proc.returncode}")
         try:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
-            c.request("GET", "/$/ping")
+            c.request("GET", "/$/ready")
             if c.getresponse().status == 200:
                 return
         except OSError:

@@ -1010,11 +1010,80 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
   checks the new field. The JSON snapshot of `/$/metrics?format=json` does not have the
   new series, and neither do the OTLP metrics, which are read from that snapshot.
 
-**Not built.** These parts were not built:
+**Not built.** The new Phase 2 metrics are not in the JSON snapshot or the OTLP
+metrics. Item 342 tracks them.
 
-- bind-before-open startup with the `opening`, `failed` and `degraded` states, which
-  changes how the server's state attaches datasets;
-- the new Phase 2 metrics in the JSON snapshot and as OTLP metrics.
+**Bind-before-open startup** (item 64). `serve` binds its listeners, then opens the
+registered datasets as §4.1 Phase 2 describes. The [startup section of
+API.md](../API.md#startup) is the reference.
+- `Catalog::open_deferred` reads the registry and keeps each persistent dataset
+  registered and closed, and `Catalog::open_registered` opens one and publishes it. A
+  waiting dataset's name cannot be created, attached, renamed, deleted or restored, so
+  the admin operations that would race its opening are refused rather than serialized.
+  `Catalog::open` keeps its behaviour on top of the two, and the CLI commands use it.
+- The server opens the datasets on `--open-threads` threads, the number of cores and at
+  most 4 by default. Before, they opened one after another before the bind. Several logs
+  replayed at once raise the peak memory of startup, and the cap of 4 bounds that.
+- Readiness reports `starting` until the datasets are open and the startup steps that
+  name them have run. Each dataset is `open`, `opening` or `failed`, and a failed one
+  carries `error` and `errorKind`. A request to an opening dataset answers `503` with
+  `Retry-After: 5` and the code `dataset-opening`. One to a failed dataset answers `503`
+  with the code `dataset-failed` and the failure's `kind`, as the follow-up sketch asked.
+- The server is `degraded` and not ready while a dataset is failed. `--ready-ignore-failed`
+  keeps it ready, and `--require-all-datasets` stops it, so the follow-up's two policies
+  are both flags and the default is the conservative one of §4.1.
+- A dataset in a format this release does not read is now one kind of failure
+  (`unsupported-format`), so it also leaves the server degraded and not ready. So does a
+  registered dataset whose directory or CURRENT file is missing (`missing`, which C25
+  added to `Catalog::open` with a message that names the expected path), and a dataset
+  that a failed rename leaves closed for recovery (`recovery`). Before, none of them
+  affected readiness. `Catalog::open` itself still fails as a whole on any other
+  failure.
+- `--mem`, `--loc` and `--fuseki-config` datasets are attached after the registered ones
+  open, and report `opening` until then. `Catalog::expect` takes their names before the
+  listener accepts a request, so an administrator cannot create, rename or restore a
+  dataset into one, and `Catalog::attach_expected` hands the name to startup's attach.
+  A failure to attach one still stops the server, as does any other failed startup
+  step, because these are explicit arguments.
+- A dataset that a startup step names (`--text`, `--geo`, `--validate`, `--rdfs`) or
+  that startup attaches stays `opening` for requests until every step has run, so no
+  request reads it or writes it before its configuration is installed. Startup's own
+  steps see it.
+- A dataset leaves the catalog's opening set only after it is published or refused, and
+  a request's lookup looks again after the state checks, so a request that straddles
+  the publication finds the dataset open or opening, never missing.
+  A `--text`, `--geo`, `--validate` or `--rdfs` step for a failed dataset is skipped and
+  logged.
+- `/$/ready`, `/$/ready/{ds}` and `GET /$/server` show the states only for datasets the
+  caller may read, and only a server administrator reads a failure's full message. A
+  caller without access gets the `404` of a missing dataset. `/$/server` gains
+  `openingDatasets`, and `refusedDatasets` gains `kind`. `sparkles_datasets{state}`
+  counts the states, and the JSON snapshot gains `status` and `datasetStates`.
+- A shutdown stops startup when it begins, before the requests drain: startup opens no
+  more datasets and runs no more steps. The server waits for the ones opening once the
+  requests have drained, and the rest stay registered for the next start.
+- `/$/ping` answers before the datasets open, so the benchmark and test scripts that
+  waited for it now wait for `/$/ready`. The maintainer kept the conservative readiness
+  default and settled the probe model. Liveness and a startup check that waits for the
+  process use `/$/ping`, readiness uses `/$/ready`, and a deployment with several
+  datasets that should keep serving sets `--ready-ignore-failed` and checks datasets
+  with `/$/ready/{ds}`. The Helm chart's startup probe moved from `/$/ready` to `/$/ping`,
+  because a degraded server never became ready and Kubernetes restarted it once the
+  startup allowance ran out.
+- Not built: the per-dataset `degraded(reason)` state for an unavailable full-text,
+  vector or spatial index, and replay progress in the dataset's state. Item 402 tracks
+  them.
+
+*Startup time.* The time from spawning `serve` to the first answer of a dataset query
+was measured on a 16-core Intel Core Ultra X7 358H laptop that other builds kept at a
+load of 7 to 16, with release builds of the parent commit and of this change started
+alternately. The store held datasets of 500,000 triples each, with 2,000 small commits
+in each log. With four datasets the median fell from 0.430 s to 0.163 s over 30 starts
+each, because the datasets open in parallel. The process used more CPU time, 0.52 s
+against 0.40 s. With one dataset the median rose from 0.134 s to 0.142 s over 60 starts
+each, and the fastest start from 0.114 s to 0.123 s. That is about 8 ms, or 6%, which
+the loaded host cannot separate from noise. Item 402 repeats the one-dataset
+measurement on a quiet Intel host and removes the cost if it holds.
 
 ### Roadmap follow-ups (2026-10-12)
 
@@ -1045,6 +1114,9 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
   `Catalog::open` before it binds (`state.rs`), so one dataset that fails to open stops
   the server. `--require-all-datasets` keeps that behaviour. WAL replay reports its progress in the dataset's state. The
   release work around it is in [X12](X12-release-engineering.md).
+
+  *Shipped (2026-10-30), except the derived-index state and replay progress.* The
+  Outcome's bind-before-open entry records the delivery, and item 402 tracks the rest.
 * The Phase 2 JSON and OTLP metrics are tracked by item 342 below.
 
 ### Metrics parity

@@ -214,6 +214,7 @@
 
     machine.wait_for_unit("sparkles.service")
     machine.wait_for_open_port(3030)
+    machine.wait_until_succeeds("curl -sf http://127.0.0.1:3030/\\$/ready")
     machine.wait_for_unit("nginx.service")
 
     base = "http://sparkles.test"
@@ -394,6 +395,7 @@
     pid = machine.succeed("systemctl show -p MainPID --value sparkles.service").strip()
     machine.succeed("systemctl reload sparkles.service")
     machine.wait_for_open_port(3030)
+    machine.wait_until_succeeds("curl -sf http://127.0.0.1:3030/\\$/ready")
     assert machine.succeed("systemctl show -p MainPID --value sparkles.service").strip() == pid
     # the runtime values survive a restart, and clearing one brings the declared value back
     a = kind("demo")
@@ -479,6 +481,7 @@
     # choose the budget: the default preauth budget allows 60 failures at once
     authed.wait_for_unit("sparkles.service")
     authed.wait_for_open_port(3030)
+    authed.wait_until_succeeds("curl -sf --cacert /etc/sparkles/tls/ca.pem https://localhost:3030/\\$/ready")
     authed.wait_for_unit("nginx.service")
     c = json.loads(authed.succeed(f"curl -sf {base}/\\$/compaction/demo"))
     assert not c["serverEnabled"] and c["state"] == "off", c

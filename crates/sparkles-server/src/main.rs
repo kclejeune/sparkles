@@ -80,6 +80,7 @@ mod settings_cmd;
 mod shacl;
 mod shex_cmd;
 mod shutdown;
+mod startup;
 mod state;
 #[cfg(feature = "text-cjk-dict")]
 mod text_dict_cmd;
@@ -1297,6 +1298,17 @@ enum Cmd {
         /// are cancelled (a cancelled write commits nothing)
         #[arg(long, default_value_t = 20.0, value_name = "SECS")]
         shutdown_grace: f64,
+        /// Report ready while a dataset that failed to open stays closed; the server is
+        /// still `degraded` in GET /$/ready
+        #[arg(long)]
+        ready_ignore_failed: bool,
+        /// Stop the server when a dataset fails to open, instead of serving the others
+        /// degraded
+        #[arg(long)]
+        require_all_datasets: bool,
+        /// Datasets opened at once at startup (default: the number of cores, at most 4)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        open_threads: Option<u32>,
         /// Background tasks (compaction, clones, reasoning, full-text builds, N-Quads
         /// backups) that run at once; more wait, queued (0: no limit). Backup repository
         /// tasks have their own --backup-max-tasks
@@ -2752,6 +2764,9 @@ fn run() -> Result<()> {
             max_mem_dataset_mb,
             max_dataset_mb,
             shutdown_grace,
+            ready_ignore_failed,
+            require_all_datasets,
+            open_threads,
             mut auth_config,
             #[cfg(feature = "backup")]
             backup_config,
@@ -2890,12 +2905,14 @@ fn run() -> Result<()> {
                 query_memory_mb.unwrap_or_else(|| cli_memory_profile.query_memory_mb()),
                 pool_bytes.map_or("off".to_string(), |b| format!("{} MiB", b >> 20)),
             );
-            let mut st = state::AppState::with_memory(
+            // the registered persistent datasets open after the listener is bound
+            let (mut st, pending) = state::AppState::deferred(
                 &data,
                 opts,
                 Duration::from_secs_f64(timeout),
                 pool_bytes,
             )?;
+            st.ready_ignore_failed = ready_ignore_failed;
             st.admission.profile = cli_memory_profile;
             st.admission.wait = Duration::from_secs_f64(query_admission_wait);
             let mode = spill.unwrap_or(SpillMode::Off);
@@ -3129,32 +3146,78 @@ fn run() -> Result<()> {
                 // the embedding workers of datasets whose vector indexes compute vectors
                 vector::spawn_embedders(st.clone());
             }
-            for m in mem {
-                st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
+            // Before the listener accepts a request: the datasets of --mem, --loc and
+            // --fuseki-config, which startup attaches after the registered ones open, and
+            // the datasets that startup configures answer as opening until startup has
+            // finished, and the catalog refuses the attached names to everyone else.
+            {
+                let mut attach: Vec<(String, state::DbType)> = mem
+                    .iter()
+                    .map(|m| (m.trim_start_matches('/').to_string(), state::DbType::Mem))
+                    .collect();
+                for l in &loc {
+                    let (name, _) = l.split_once('=').context("--loc expects NAME=PATH")?;
+                    attach.push((
+                        name.trim_start_matches('/').to_string(),
+                        state::DbType::Persistent,
+                    ));
+                }
+                let configured: Vec<String> = text
+                    .iter()
+                    .chain(&geo)
+                    .chain(&validate)
+                    .chain(&rdfs)
+                    .map(|s| startup::step_dataset(s).to_string())
+                    .collect();
+                startup::hold(&st, &attach, &configured)?;
             }
-            for l in loc {
-                let (name, path) = l.split_once('=').context("--loc expects NAME=PATH")?;
-                st.attach(
-                    name.trim_start_matches('/'),
-                    state::DbType::Persistent,
-                    Some(std::path::Path::new(path)),
-                )?;
-            }
-            for t in text {
-                enable_text_for(&st, &t)?;
-            }
-            for g in geo {
-                geo::enable_for(&st, &g)?;
-            }
-            for v in validate {
-                validate_at_startup(&st, &v)?;
-            }
-            for r in rdfs {
-                rdfs::configure(&st, &r)?;
-            }
-            if let Some(f) = &fuseki {
-                fuseki_config::start(&st, f)?;
-            }
+            let after_open =
+                move |st: &Arc<state::AppState>, stop: &startup::StopFlag| -> Result<()> {
+                    // a shutdown starts no further step: `stop.check()` before each
+                    for m in mem {
+                        stop.check()?;
+                        st.attach_expected(m.trim_start_matches('/'), state::DbType::Mem, None)?;
+                    }
+                    for l in loc {
+                        stop.check()?;
+                        let (name, path) = l.split_once('=').context("--loc expects NAME=PATH")?;
+                        st.attach_expected(
+                            name.trim_start_matches('/'),
+                            state::DbType::Persistent,
+                            Some(std::path::Path::new(path)),
+                        )?;
+                    }
+                    // a step for a dataset that failed to open is left out: the dataset is
+                    // reported failed, and the step runs at a start that opens it
+                    let open = |flag: &str, spec: &str| {
+                        let name = startup::step_dataset(spec);
+                        let failed = st.catalog.refusal(name).is_some();
+                        if failed {
+                            tracing::error!("{flag} {spec}: skipped, /{name} did not open");
+                        }
+                        !failed
+                    };
+                    for t in text.iter().filter(|t| open("--text", t)) {
+                        stop.check()?;
+                        enable_text_for(st, t)?;
+                    }
+                    for g in geo.iter().filter(|g| open("--geo", g)) {
+                        stop.check()?;
+                        geo::enable_for(st, g)?;
+                    }
+                    for v in validate.iter().filter(|v| open("--validate", v)) {
+                        stop.check()?;
+                        validate_at_startup(st, v)?;
+                    }
+                    for r in rdfs.iter().filter(|r| open("--rdfs", r)) {
+                        stop.check()?;
+                        rdfs::configure(st, r)?;
+                    }
+                    if let Some(f) = &fuseki {
+                        fuseki_config::start(st, f, stop)?;
+                    }
+                    Ok(())
+                };
             // Rayon starts its query pool on first use, and every query asks for its size.
             // Started there, the first query paid for reading the cgroup CPU limits and
             // spawning a thread per core, which made a cold point lookup several times
@@ -3182,6 +3245,19 @@ fn run() -> Result<()> {
             graphrag::refresh::start(&st, rt.handle());
             let grace = Duration::from_secs_f64(shutdown_grace);
             let st_after = st.clone();
+            // a startup step that fails after the listener is bound stops the server with
+            // its error
+            let fatal: Arc<parking_lot::Mutex<Option<anyhow::Error>>> = Default::default();
+            let fatal_notify = Arc::new(tokio::sync::Notify::new());
+            let fatal_after = fatal.clone();
+            let startup_slot: Arc<parking_lot::Mutex<Option<startup::Startup>>> =
+                Default::default();
+            let startup_after = startup_slot.clone();
+            let mut open_options = startup::Options::default();
+            if let Some(n) = open_threads {
+                open_options.threads = n as usize;
+            }
+            open_options.require_all = require_all_datasets;
             // The server runs as a task on a worker thread, not on this thread (which
             // `block_on` would use): the worker that sees a connection arrive accepts it
             // and runs its request itself, instead of waking this thread to accept and
@@ -3241,8 +3317,9 @@ fn run() -> Result<()> {
                     None => format!("{scheme}://{addr}/"),
                 };
                 tracing::info!(
-                    "Sparkles {} listening on {listening} (UI at /ui/)",
-                    env!("CARGO_PKG_VERSION")
+                    "Sparkles {} listening on {listening} (UI at /ui/), opening {} datasets",
+                    env!("CARGO_PKG_VERSION"),
+                    pending.len()
                 );
                 for name in st.datasets().keys() {
                     tracing::info!(
@@ -3278,14 +3355,27 @@ fn run() -> Result<()> {
                 if watch_config {
                     config_watch::start(watched)?;
                 }
-                // every dataset was opened before the listener was bound
-                st.set_phase(obs::Phase::Ready);
+                // the listener is bound: open the datasets, then finish startup and
+                // become ready (spec C01 §4.1)
+                let notify = fatal_notify.clone();
+                let opening =
+                    startup::spawn(st.clone(), pending, open_options, after_open, move |e| {
+                        tracing::error!("startup failed, stopping: {e:#}");
+                        *fatal.lock() = Some(e);
+                        notify.notify_one();
+                    });
+                let stop_opening = opening.stop_flag();
+                *startup_slot.lock() = Some(opening);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
                 let (draining_tx, draining) = tokio::sync::oneshot::channel();
                 let shutdown = async move {
-                    shutdown_signal().await;
-                    st2.set_phase(obs::Phase::Draining);
+                    tokio::select! {
+                        _ = shutdown_signal() => {}
+                        _ = fatal_notify.notified() => {}
+                    }
+                    // before the requests drain: startup opens no more datasets
+                    startup::begin_shutdown(&st2, &stop_opening);
                     // open MCP streams would hold the shutdown up
                     #[cfg(feature = "mcp")]
                     if let Some(m) = &st2.mcp {
@@ -3360,10 +3450,18 @@ fn run() -> Result<()> {
             // and waits a little for it to stop; a write stops before its commit or
             // finishes it
             rt.shutdown_timeout(shutdown::CANCEL_WAIT);
+            // a shutdown while datasets open waits for those opening now, and leaves
+            // the rest registered for the next start
+            if let Some(s) = startup_after.lock().take() {
+                s.stop_and_join();
+            }
             auth::flush(&st_after);
             // flush spans and metrics of the last requests (bounded)
             otel_guard.shutdown();
-            served
+            match fatal_after.lock().take() {
+                Some(e) => Err(e),
+                None => served,
+            }
         }
         #[cfg(feature = "mcp")]
         Cmd::Mcp(args) => mcp::run(args, opts),

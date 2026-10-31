@@ -496,7 +496,7 @@ def self_test(args):
         client = Client(f"http://127.0.0.1:{port}")
         for _ in range(300):
             try:
-                client.get("/$/ping")
+                client.get("/$/ready")
                 break
             except Exception:
                 if server.poll() is not None:
