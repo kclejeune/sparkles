@@ -10435,7 +10435,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
              [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
              [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
              [--disable-tool NAME]... [--no-stored-queries] [--schema-max-entries N] [--text]
-             [--schema-statistics-above QUADS|off] [--task-after-ms MS]
+             [--schema-statistics-above QUADS|off] [--task-after-ms MS] [--no-scratch-expiry]
 sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 ```
 
@@ -10451,6 +10451,7 @@ sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. `--mcp-max-bytes` also bounds compact structured content for `link_entities` with evidence. |
 | `--max-concurrent N` | `4` | Tool calls running at once. Further calls wait, and their timeout runs while they wait. |
 | `--allow-update` | off | Offers `sparql_update` and opens the databases for writing. Without it the process never writes. |
+| `--no-scratch-expiry` | off | With `--allow-update`, the session otherwise deletes the idle scratch branches of every dataset whose `memory.scratchBranches.ttl` is set, once when it opens the databases and every ten minutes after that (see [Memory writes](#memory-writes)). The flag turns that off for the session. |
 | `--allow-service` | off | Allows `SERVICE` in queries. |
 | `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | Where an allowed `SERVICE` may connect, as for `sparkles serve`. |
 | `--disable-tool NAME` | | Does not offer the tool. |
@@ -10892,10 +10893,34 @@ branch moved since. Deleting a protected branch needs `admin`. `merge_branch` an
 
 `sparkles serve --mcp-scratch-branch-ttl DURATION`, such as `24h`, deletes each scratch
 branch whose last commit, or creation when it has none, is older than the duration. A
-background task looks at most every minute. It skips branches with a running task or a
-named snapshot, logs each deletion, and counts it in
-`sparkles_mcp_scratch_branches_expired_total`. Branches made over HTTP, with the CLI or
-through the library are never expired. The flag is off by default.
+dataset can set its own duration with `memory.scratchBranches.ttl`, which takes
+precedence over the flag for that dataset. The setting is a duration from `1m` to
+`3650d` in the units `s`, `m`, `h`, `d`, `w` and `y`, or `off`, which keeps the
+dataset's scratch branches although the flag sets a duration. Without a setting the flag
+decides, and without either nothing expires.
+
+```json
+{ "scratchBranches": { "ttl": "7d" } }
+```
+
+A dataset that has the setting stores `memory.json` as format 2, which an older release
+refuses with a message that names the newer release. `memory.json` stays format 1 while
+it has no `scratchBranches`. A background task, which runs only with `--mcp-allow-update`
+on a writable server, reads the settings again at every pass, so a change applies
+without a restart. The server logs `scratch-branch expiry: on` or `off`, with the reason, once
+at start. The task looks at most every minute and at least four
+times per shortest duration. It skips branches with a running task or a named snapshot,
+logs each deletion, and counts it in `sparkles_mcp_scratch_branches_expired_total`.
+`list_branches` and `create_branch` report `expires` from the dataset's duration.
+Branches made over HTTP, with the CLI or through the library are never expired. The
+flag is off by default.
+
+`sparkles mcp --loc` opens the databases itself and has no server task. With
+`--allow-update` it applies the datasets' `memory.scratchBranches.ttl` once when it
+opens them, before the first call, and again every ten minutes while the session lasts.
+It has no flag for a default duration, so only a dataset's setting makes branches
+expire. `--no-scratch-expiry` turns this off for one session, and a session without
+`--allow-update` never deletes anything.
 
 ### Resources and prompts
 
@@ -11018,7 +11043,7 @@ notification stream after `notifications/initialized`, and ends when stdin close
 |---|---|---|
 | `--mcp` | off | Serves the MCP tools at `/$/mcp`. |
 | `--mcp-allow-update` | off | Offers `sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`. It has no effect, and logs a warning, on a `--read-only` server. |
-| `--mcp-scratch-branch-ttl DURATION` | off | Deletes scratch branches idle for longer than the duration (see [Memory writes](#memory-writes)). |
+| `--mcp-scratch-branch-ttl DURATION` | off | Deletes scratch branches idle for longer than the duration, in every dataset whose `memory.scratchBranches.ttl` does not say otherwise (see [Memory writes](#memory-writes)). |
 | `--mcp-allow-service` | off | Allows `SERVICE` in MCP queries. `--no-service` still wins, and with auth the caller needs `federate`. |
 | `--mcp-dataset PATTERN` | all | The datasets MCP may show, by name or `*` pattern (repeatable). Permissions still apply within them. |
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. `--mcp-max-bytes` also bounds compact structured content for `link_entities` with evidence. |
@@ -11311,6 +11336,12 @@ them. `PUT /$/memory/{ds}` needs `admin` and makes the effective settings equal 
 body, as `PUT /$/settings/{ds}/memory` does. `agentGraphs` holds at most 50 graph IRIs or patterns with `*`. The
 consolidated graph must not match `agentGraphs`, and `conversationFacts` is `immediate`
 or `review`. Anything else is a `400`.
+
+`scratchBranches.ttl` sets how long a scratch branch of the dataset may sit idle before
+the server deletes it. It is a duration from `1m` to `3650d` such as `24h`, or `off`.
+A value outside that range, in an unknown unit or of another type is a `400`. The
+setting overrides `--mcp-scratch-branch-ttl` for the dataset, and
+[Memory writes](#memory-writes) describes the expiry and the file format.
 
 When `agentGraphs` is set, `recall` reports a review status. A triple is `reviewed` when
 the caller's view asserts it in a graph that `agentGraphs` does not match, and

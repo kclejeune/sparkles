@@ -522,6 +522,23 @@ in place of the UNION.
 which binds `?x` (roadmap item 434). The same holds for the `*`, `?`, sequence and
 alternative paths and for `VALUES` tables that mix `UNDEF` and bound rows.
 
+A dataset can set how long its scratch branches may sit idle before they expire, with
+`memory.scratchBranches.ttl`. The value is a duration from `1m` to `3650d`, such as
+`24h`, or `off`. It overrides `--mcp-scratch-branch-ttl` for that dataset, so the flag
+is now the default for datasets without the setting. The server reads the settings at
+each pass, which starts whenever `--mcp` runs with `--mcp-allow-update`, and
+`list_branches` and `create_branch` report `expires` from the dataset's value.
+`sparkles mcp --loc --allow-update` now expires idle scratch branches too, from the
+datasets' setting alone, once when it opens the databases and every ten minutes after
+that. `--no-scratch-expiry` turns it off for a session. A stdio session without the
+setting behaves as before.
+
+On `serve`, idle scratch-branch expiry now needs `--mcp-allow-update`. Before, `--mcp
+--mcp-scratch-branch-ttl DURATION` deleted idle scratch branches without it. Operators
+who run that combination no longer get expiry, and must also pass `--mcp-allow-update` to
+keep it. The same applies to a dataset's `memory.scratchBranches.ttl`. A server without
+`--mcp-allow-update` never deletes a scratch branch, and one with `--read-only` never did.
+
 ### Behavior
 
 `sparkles ask` decides whether a draft calls SERVICE from the parsed query, including
@@ -584,6 +601,12 @@ refuses writes the same way. A newer `managed.json` therefore does not refuse th
 and a backup or clone of a registry with an unknown format or owner is refused. Branches share
 the registry without copying the file, and backups, restores and clones carry both
 files.
+
+`memory.json` is format 2 while it holds `scratchBranches`, and it stays format 1 without
+that member, so datasets that do not use the setting remain readable by older releases.
+A release that reads only format 1 refuses a dataset with the setting by naming both
+versions, instead of ignoring the member and keeping scratch branches that the operator
+meant to expire.
 
 Index generations are written in index format 3. Each column of a permutation block is a
 run of independent LZ4 frames of 2,048 rows, and a new file `<perm>.seg` beside each

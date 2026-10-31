@@ -41,7 +41,8 @@ build community reports.
 * Every tool that reads or writes takes `branch`, and `list_branches`, `create_branch`,
   `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
   need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle
-  scratch branches.
+  scratch branches, and a dataset's `memory.scratchBranches.ttl` overrides it for that
+  dataset. `sparkles mcp --loc` applies the dataset setting as well.
 * `link_entities` can include versioned evidence about the named types and literal
   labels retained for each candidate, with separate flags for display, per-entity and
   query limits. It reports values and counts from the caller's query view. Bounded text
@@ -170,6 +171,10 @@ occurrences, correction, withdrawal, retained-commit recall, graph visibility, b
 separation and citation fidelity. It uses explicit entity seeds and does not establish
 retrieval quality, model accuracy or latency. Shared-profile independence, accepted
 support ownership and dependent freshness remain under items 81 and 340.
+
+Idle scratch branches expire after the dataset's `memory.scratchBranches.ttl`, over HTTP
+and in a `sparkles mcp --loc --allow-update` session. A limit per principal, warnings
+before a branch expires and a way to keep one branch remain under item 435.
 
 ### Document ingestion
 

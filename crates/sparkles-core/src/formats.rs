@@ -659,7 +659,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphql.json", 1),
     named(ds("restore.json", 1), "restoreFormat"),
     ds("assistant.json", 1),
-    ds("memory.json", 1),
+    ds("memory.json", 2),
     ds("ingest.json", 1),
     ds("asks.json", 1),
     ds("query-suggestions.json", 1),
@@ -847,6 +847,17 @@ fn settings_max_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
     }
 }
 
+/// The version a settings file's content is stamped with. It is the highest version
+/// this build writes, except that a file whose content an older release reads keeps
+/// that older version, so only a file that uses a newer feature is refused by older
+/// releases. `memory.json` is format 2 only when it holds `scratchBranches`.
+fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
+    if s.name == "memory.json" && v.get("scratchBranches").is_none() {
+        return 1;
+    }
+    settings_max_format(s, v)
+}
+
 /// The version of a settings file's JSON object, from its member: absent is 1. A
 /// version newer than this build writes is refused, since the file may mean something
 /// this build would misread.
@@ -874,7 +885,7 @@ pub fn check_settings(name: &str, v: &serde_json::Value) -> Result<u32> {
 /// writes. A value that is not an object is left as it is.
 pub fn stamp_settings(name: &str, v: &mut serde_json::Value) {
     let s = registered(name);
-    let format = settings_max_format(s, v);
+    let format = settings_stamp_format(s, v);
     if let Some(o) = v.as_object_mut() {
         o.insert(s.member.into(), format.into());
     }
@@ -1087,6 +1098,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn memory_format_two_needs_scratch_branches() {
+        use serde_json::json;
+        assert_eq!(settings_file("memory.json").unwrap().writes, 2);
+        let mut plain = json!({"agentGraphs": ["urn:x:a/*"]});
+        stamp_settings("memory.json", &mut plain);
+        assert_eq!(plain["format"], 1, "older releases keep reading it");
+        let mut scratch = json!({"scratchBranches": {"ttl": "24h"}});
+        stamp_settings("memory.json", &mut scratch);
+        assert_eq!(scratch["format"], 2);
+        let b = settings_to_vec("memory.json", &json!({"scratchBranches": {"ttl": "1d"}})).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["format"], 2);
+        assert!(check_settings("memory.json", &v).is_ok());
+        let e = check_settings("memory.json", &json!({"format": 3})).unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)), "{e}");
     }
 
     #[test]

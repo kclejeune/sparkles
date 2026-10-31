@@ -738,6 +738,9 @@ fn memory(put: &mut dyn FnMut(&str, J)) {
                         "requireConsolidated": with_desc(boolean(), "Delete only graphs whose facts a reviewed graph asserts too (true by default)."),
                         "every": with_desc(string(), "How often the server applies it, `1d` by default."),
                     })), "The retention of session graphs, off without it."),
+                    "scratchBranches": with_desc(closed(&[], json!({
+                        "ttl": with_desc(string(), "How long a scratch branch may sit idle before the server deletes it, from `1m` to `3650d`, such as `24h`. `off` keeps the dataset's scratch branches even when the server's `--mcp-scratch-branch-ttl` sets a duration. Without it, the server flag decides. A dataset with this member needs a release that reads `memory.json` format 2."),
+                    })), "When idle scratch branches expire. Written as `format` 2 of `memory.json`."),
                 }),
             ),
             "The memory settings of a dataset.",

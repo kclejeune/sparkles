@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const MEMORY_FILE: &str = "memory.json";
 pub const SUGGESTIONS_FILE: &str = "query-suggestions.json";
@@ -73,6 +74,51 @@ pub struct MemorySettings {
     /// notifications about review branches that wait (spec C21 §5.4)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewNotice>,
+    /// the expiry of idle scratch branches that MCP agents leave behind (spec C17 §5.7)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_branches: Option<ScratchBranches>,
+}
+
+/// The shortest idle time after which a scratch branch may expire.
+pub const MIN_SCRATCH_TTL: Duration = Duration::from_secs(60);
+/// The longest `scratchBranches.ttl`, ten years.
+pub const MAX_SCRATCH_TTL: Duration = Duration::from_secs(3650 * 86_400);
+/// The `ttl` that turns expiry off for a dataset whatever the server flag says.
+pub const SCRATCH_TTL_OFF: &str = "off";
+
+/// `scratchBranches` of `memory.json` (spec C17 §5.7): when idle scratch branches
+/// expire. The setting is the dataset's value of what `--mcp-scratch-branch-ttl` sets for
+/// the whole server.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ScratchBranches {
+    /// how long a scratch branch may sit idle before the server deletes it, from `1m`
+    /// to `3650d`, such as `24h`; `off` keeps the dataset's branches even when the
+    /// server flag sets a duration; without it the flag decides
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+impl ScratchBranches {
+    /// The dataset's choice: `None` leaves the decision to the server flag, `Some(None)`
+    /// turns expiry off and `Some(Some(d))` expires after `d`.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn choice(&self) -> Option<Option<Duration>> {
+        match self.ttl.as_deref()? {
+            SCRATCH_TTL_OFF => Some(None),
+            // a value that does not validate leaves the decision to the flag
+            t => scratch_ttl(t).map(Some),
+        }
+    }
+}
+
+/// A `scratchBranches.ttl` duration, or `None` when it is not one in range.
+pub fn scratch_ttl(s: &str) -> Option<Duration> {
+    let secs = duration_days(s)? * 86_400.0;
+    let d = Duration::try_from_secs_f64(secs.round()).ok()?;
+    (MIN_SCRATCH_TTL..=MAX_SCRATCH_TTL)
+        .contains(&d)
+        .then_some(d)
 }
 
 /// `review` of `memory.json` (spec C21 §5.4): when the server tells the operator's
@@ -311,6 +357,15 @@ impl MemorySettings {
                     ));
                 }
             }
+        }
+        if let Some(sb) = &self.scratch_branches
+            && let Some(t) = &sb.ttl
+            && t != SCRATCH_TTL_OFF
+            && scratch_ttl(t).is_none()
+        {
+            return Err(format!(
+                "scratchBranches.ttl: {t:?} is not a duration from 1m to 3650d, such as 24h, or off"
+            ));
         }
         Ok(())
     }

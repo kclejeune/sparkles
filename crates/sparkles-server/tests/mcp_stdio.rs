@@ -159,3 +159,122 @@ fn startup_error_exits_1() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
 }
+
+/// A database `db` under `dir` with a scratch branch `old` that was created in 2020, so
+/// that it counts as idle for any TTL without the test waiting. `ttl` is the dataset's
+/// `memory.scratchBranches.ttl`.
+fn db_with_idle_scratch_branch(dir: &std::path::Path, ttl: Option<&str>) {
+    let run = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+            .args(args)
+            .current_dir(dir)
+            .env_remove("SPARKLES_SERVER")
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    run(&["update", "--loc", "db", "INSERT DATA { <urn:a> <urn:p> 1 }"]);
+    run(&["branch", "create", "--loc", "db", "old"]);
+    let table = dir.join("db/branches.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&table).unwrap()).unwrap();
+    fn mark(v: &mut Value) -> bool {
+        match v {
+            Value::Object(o) if o.get("name") == Some(&json!("old")) => {
+                o.insert("created".into(), json!("2020-01-01T00:00:00Z"));
+                o.insert("scratch".into(), json!({"creator": "agent"}));
+                true
+            }
+            Value::Object(o) => o.values_mut().any(mark),
+            Value::Array(a) => a.iter_mut().any(mark),
+            _ => false,
+        }
+    }
+    assert!(mark(&mut v), "{v}");
+    std::fs::write(&table, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    if let Some(ttl) = ttl {
+        std::fs::write(
+            dir.join("db/memory.json"),
+            json!({"format": 2, "scratchBranches": {"ttl": ttl}}).to_string(),
+        )
+        .unwrap();
+    }
+}
+
+/// The branch names `list_branches` returns in a stdio session over `dir/db`.
+fn session_branches(dir: &std::path::Path, extra: &[&str]) -> Vec<String> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+        .args(["mcp", "--loc", "db"])
+        .args(extra)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut exchange = |msg: Value| -> Option<Value> {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+        msg.get("id")?;
+        let line = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("no response");
+        Some(serde_json::from_str(&line).expect("stdout carries only JSON-RPC lines"))
+    };
+    exchange(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "e2e", "version": "1"}}}),
+    )
+    .unwrap();
+    exchange(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let r = exchange(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+        "name": "list_branches", "arguments": {}}}),
+    )
+    .unwrap();
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let names = r["result"]["structuredContent"]["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_string())
+        .collect();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    names
+}
+
+/// A stdio session with `--allow-update` deletes the scratch branch that the dataset's
+/// `memory.scratchBranches.ttl` calls idle before its first call. A read-only session,
+/// `--no-scratch-expiry` and a dataset without the setting keep it.
+#[test]
+fn stdio_deletes_idle_scratch_branches_of_a_dataset_setting() {
+    let kept = |ttl: Option<&str>, extra: &[&str]| {
+        let d = tempfile::tempdir().unwrap();
+        db_with_idle_scratch_branch(d.path(), ttl);
+        session_branches(d.path(), extra)
+    };
+    assert_eq!(kept(Some("1h"), &["--allow-update"]), ["main"]);
+    assert_eq!(kept(Some("1h"), &[]), ["main", "old"]);
+    assert_eq!(
+        kept(Some("1h"), &["--allow-update", "--no-scratch-expiry"]),
+        ["main", "old"]
+    );
+    assert_eq!(kept(None, &["--allow-update"]), ["main", "old"]);
+    assert_eq!(kept(Some("off"), &["--allow-update"]), ["main", "old"]);
+}

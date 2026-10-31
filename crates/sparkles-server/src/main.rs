@@ -3330,13 +3330,10 @@ fn run() -> Result<()> {
                 if !st.read_only {
                     http::history::spawn_tick(st.clone(), Duration::from_secs(60));
                 }
-                // expiry of the scratch branches that MCP agents leave behind
+                // expiry of the scratch branches that MCP agents leave behind, under the
+                // flag and each dataset's own `memory.scratchBranches.ttl`
                 #[cfg(feature = "mcp")]
-                if !st.read_only
-                    && let Some(ttl) = st.mcp.as_ref().and_then(|m| m.cfg.scratch_ttl)
-                {
-                    mcp::branches::spawn_expiry(st.clone(), ttl);
-                }
+                mcp::branches::spawn_server_expiry(&st);
                 // the SIGHUP listeners register one after another without an await
                 // between them, the settings and models first, so that a reload sent
                 // once the process catches the signal reaches all of them

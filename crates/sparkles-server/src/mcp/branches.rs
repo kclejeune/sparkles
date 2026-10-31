@@ -296,7 +296,7 @@ fn last_activity_ms(b: &BranchInfo) -> i64 {
     own.unwrap_or(b.created_ms).max(b.created_ms)
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
@@ -316,7 +316,7 @@ impl Tools<'_> {
             .store
             .branches()
             .map_err(|e| store_error(e, &self.call.request_id))?;
-        let ttl = self.cfg().scratch_ttl;
+        let ttl = dataset_ttl(&self.server.state, &ds, self.cfg().scratch_ttl);
         let list: Vec<Value> = infos
             .iter()
             .filter(|b| p.level(&on_branch(&ds.name, &b.name)).is_some())
@@ -453,7 +453,7 @@ impl Tools<'_> {
         if let Some(f) = &info.from {
             j["from"] = json!({ "branch": f.branch, "commit": f.seq });
         }
-        if let Some(t) = self.cfg().scratch_ttl {
+        if let Some(t) = dataset_ttl(&self.server.state, &ds, self.cfg().scratch_ttl) {
             j["expires"] =
                 sparkles::commit::rfc3339_ms(info.created_ms + t.as_millis() as i64).into();
         }
@@ -835,14 +835,38 @@ static EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Whether this server expires scratch branches (the metric is exported then).
 static EXPIRING: AtomicBool = AtomicBool::new(false);
 
-/// Delete the scratch branches of every dataset whose last change is older than `ttl`
-/// at `now_ms`. A branch with a running task or a named snapshot is kept, and so is a
-/// branch that other branches were created from. Returns the deleted branches as
-/// `dataset@branch`.
-pub(crate) fn sweep(st: &AppState, ttl: Duration, now_ms: i64) -> Vec<String> {
+/// The scratch-branch TTL of `ds`: its `memory.scratchBranches.ttl` setting when it has
+/// one (`off` is no expiry), else `default`, which is the server's
+/// `--mcp-scratch-branch-ttl`.
+pub(crate) fn dataset_ttl(
+    st: &AppState,
+    ds: &Dataset,
+    default: Option<Duration>,
+) -> Option<Duration> {
+    crate::assist::memory_settings(st, ds)
+        .scratch_branches
+        .and_then(|s| s.choice())
+        .unwrap_or(default)
+}
+
+/// Delete the scratch branches of every dataset whose last change is older than the
+/// dataset's TTL at `now_ms`, which is its `memory.scratchBranches.ttl` setting or else
+/// `default` (`None`: the server sets none). A branch with a running task or a named
+/// snapshot is kept, and so is a branch that other branches were created from. Returns
+/// the deleted branches as `dataset@branch`.
+pub(crate) fn sweep(
+    st: &AppState,
+    default: impl Into<Option<Duration>>,
+    now_ms: i64,
+) -> Vec<String> {
+    let default = default.into();
     let mut out = Vec::new();
-    let cutoff = now_ms - ttl.as_millis() as i64;
     for ds in st.datasets().values() {
+        let Some(ttl) = dataset_ttl(st, ds, default) else {
+            continue;
+        };
+        EXPIRING.store(true, Ordering::Relaxed);
+        let cutoff = now_ms - ttl.as_millis() as i64;
         let Ok(infos) = ds.store.branches() else {
             continue;
         };
@@ -907,22 +931,149 @@ pub(crate) fn sweep(st: &AppState, ttl: Duration, now_ms: i64) -> Vec<String> {
     out
 }
 
+/// When the expiry of a server looks again: at least four times per shortest TTL of its
+/// datasets and at most every minute.
+fn adaptive_wait(st: &AppState, default: Option<Duration>) -> Duration {
+    let shortest = st
+        .datasets()
+        .values()
+        .filter_map(|ds| dataset_ttl(st, ds, default))
+        .min();
+    shortest.map_or(Duration::from_secs(60), |t| {
+        (t / 4).clamp(Duration::from_secs(1), Duration::from_secs(60))
+    })
+}
+
+/// How [`spawn_expiry_with`] schedules its passes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Cadence {
+    /// a pass once the server has opened its datasets, then at least four times per
+    /// shortest TTL and at most every
+    /// minute (`serve`)
+    Adaptive,
+    /// a pass after every interval, the first one after the first interval
+    /// (`sparkles mcp`, whose opening pass runs before it serves)
+    Every(Duration),
+}
+
+/// The ten minutes between the passes of `sparkles mcp`.
+pub(crate) const STDIO_EVERY: Duration = Duration::from_secs(600);
+
+/// The clock of the expiry in milliseconds since the epoch. Tests replace it.
+pub(crate) type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 /// Run [`sweep`] in the background, at most every minute and at least four times per
-/// `ttl`.
-pub(crate) fn spawn_expiry(st: Arc<AppState>, ttl: Duration) {
-    EXPIRING.store(true, Ordering::Relaxed);
-    let every = (ttl / 4).clamp(Duration::from_secs(1), Duration::from_secs(60));
+/// shortest TTL, starting once the server has opened its datasets. `default` is the
+/// server's `--mcp-scratch-branch-ttl`. Each pass reads
+/// the datasets' settings again, so a change takes effect at the next pass and a dataset
+/// created later is covered. The metric is exported once some dataset expires.
+pub(crate) fn spawn_expiry(st: Arc<AppState>, default: impl Into<Option<Duration>>) {
+    let default = default.into();
+    if default.is_some() {
+        EXPIRING.store(true, Ordering::Relaxed);
+    }
+    spawn_expiry_with(st, default, Cadence::Adaptive, Arc::new(now_ms), None);
+}
+
+/// Start the expiry of a `serve --mcp` server. It deletes branches, so it runs only on a
+/// writable server whose MCP endpoint is on and allows updates (`--mcp-allow-update`),
+/// whether the duration comes from the flag or from a dataset's setting. It logs the
+/// decision on one info line when the endpoint is on. Returns whether it started.
+pub(crate) fn spawn_server_expiry(st: &Arc<AppState>) -> bool {
+    let Some(m) = &st.mcp else {
+        return false;
+    };
+    if st.read_only {
+        tracing::info!("scratch-branch expiry: off (read-only server)");
+        return false;
+    }
+    if !m.cfg.allow_update {
+        tracing::info!("scratch-branch expiry: off (no MCP update permission)");
+        return false;
+    }
+    spawn_expiry(st.clone(), m.cfg.scratch_ttl);
+    match m.cfg.scratch_ttl {
+        Some(t) => tracing::info!(
+            "scratch-branch expiry: on (default {t:?}, a dataset's memory.scratchBranches.ttl overrides it)"
+        ),
+        None => tracing::info!(
+            "scratch-branch expiry: on (no default, only a dataset's memory.scratchBranches.ttl expires branches)"
+        ),
+    }
+    true
+}
+
+/// [`spawn_expiry`] with a cadence and a clock. After each pass the deleted branches go
+/// to `passes`, if given.
+pub(crate) fn spawn_expiry_with(
+    st: Arc<AppState>,
+    default: Option<Duration>,
+    cadence: Cadence,
+    clock: Clock,
+    passes: Option<tokio::sync::mpsc::UnboundedSender<Vec<String>>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(every);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let st = st.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || sweep(&st, ttl, now_ms())).await {
-                tracing::warn!("scratch branch expiry panicked: {e}");
+        if matches!(cadence, Cadence::Adaptive) {
+            // `serve` opens its datasets after the listener is bound, and a pass before
+            // they are open would find none and leave the next one a minute away
+            while st.phase() == crate::obs::Phase::Starting {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if st.phase() == crate::obs::Phase::Draining {
+                return;
             }
         }
-    });
+        let mut wait = match cadence {
+            Cadence::Every(d) => d,
+            Cadence::Adaptive => Duration::ZERO,
+        };
+        loop {
+            tokio::time::sleep(wait).await;
+            let (st, clock) = (st.clone(), clock.clone());
+            let pass = tokio::task::spawn_blocking(move || {
+                let gone = sweep(&st, default, clock());
+                let next = match cadence {
+                    Cadence::Every(d) => d,
+                    Cadence::Adaptive => adaptive_wait(&st, default),
+                };
+                (gone, next)
+            })
+            .await;
+            match pass {
+                Ok((gone, next)) => {
+                    wait = next;
+                    if let Some(tx) = &passes {
+                        let _ = tx.send(gone);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("scratch branch expiry panicked: {e}");
+                    wait = match cadence {
+                        Cadence::Every(d) => d,
+                        Cadence::Adaptive => Duration::from_secs(60),
+                    };
+                }
+            }
+        }
+    })
+}
+
+/// Expire scratch branches for `sparkles mcp --loc`, which holds its datasets itself
+/// and has no server task. One pass runs now, so branches that an earlier session
+/// abandoned are gone before the first tool call, and `handle` runs a pass every
+/// `every` while the session lasts. `default` is none, since stdio has no flag: only a
+/// dataset's `memory.scratchBranches.ttl` sets one.
+pub(crate) fn expire_for_stdio(
+    st: &Arc<AppState>,
+    handle: &tokio::runtime::Handle,
+    every: Duration,
+    clock: Clock,
+    passes: Option<tokio::sync::mpsc::UnboundedSender<Vec<String>>>,
+) -> Vec<String> {
+    let gone = sweep(st, None, clock());
+    let _enter = handle.enter();
+    spawn_expiry_with(st.clone(), None, Cadence::Every(every), clock, passes);
+    gone
 }
 
 /// The expiry's counter in the Prometheus text format, when this server expires
@@ -934,7 +1085,7 @@ pub(crate) fn metrics(out: &mut String) {
     }
     let _ = writeln!(
         out,
-        "# HELP sparkles_mcp_scratch_branches_expired_total Scratch branches deleted because they were idle for longer than --mcp-scratch-branch-ttl."
+        "# HELP sparkles_mcp_scratch_branches_expired_total Scratch branches deleted because they were idle for longer than the dataset's scratch-branch TTL (--mcp-scratch-branch-ttl or memory.scratchBranches.ttl)."
     );
     let _ = writeln!(
         out,
