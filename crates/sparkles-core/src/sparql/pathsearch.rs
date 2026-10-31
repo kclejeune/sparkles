@@ -68,6 +68,9 @@ const STEP_BYTES: u64 = 24;
 /// `u64` key and a `u32` rank padded to 16 bytes, with the table's control byte and
 /// room to grow.
 const RANK_BYTES: u64 = 32;
+/// The ratio of the largest to the smallest positive weight up to which the search for
+/// every cheapest path from both ends adds costs exactly.
+const WIDE_WEIGHTS: f64 = (1u64 << 28) as f64;
 /// Estimated bytes per node whose degree `path:maxDegree` checked (a map entry).
 const HUB_BYTES: u64 = 16;
 
@@ -929,7 +932,7 @@ impl Budget<'_> {
 /// What `Tree::paths` needs to skip parents that cannot reach the root: the cost of
 /// each node and the position at which the search settled it.
 struct Prune<'a> {
-    cost: &'a FxHashMap<u64, f64>,
+    cost: &'a FxHashMap<u64, Cost>,
     rank: FxHashMap<u64, u32>,
 }
 
@@ -1110,10 +1113,6 @@ impl Tree {
     }
 }
 
-/// An `f64` ordered by `total_cmp`, for the heaps.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct OrdF64(f64);
-
 /// A sum of non-negative weights kept as a double-double: the rounded sum and the error
 /// of rounding it, from Knuth's TwoSum. A search from both ends adds a path's weights from
 /// each end, and plain floating point can round the two orders apart enough to rank a
@@ -1129,7 +1128,11 @@ impl Cost {
     const ZERO: Cost = Cost { hi: 0.0, lo: 0.0 };
 
     fn of(w: f64) -> Cost {
-        Cost { hi: w, lo: 0.0 }
+        // a weight of -0 counts as 0
+        Cost {
+            hi: w + 0.0,
+            lo: 0.0,
+        }
     }
 
     const INFINITE: Cost = Cost {
@@ -1173,9 +1176,10 @@ impl Cost {
         if !hi.is_finite() {
             return Cost::INFINITE;
         }
+        // adding +0 turns a -0 into +0, so that equal costs compare equal under `Ord`
         Cost {
             hi,
-            lo: e - (hi - s),
+            lo: e - (hi - s) + 0.0,
         }
     }
 }
@@ -1192,6 +1196,31 @@ impl Ord for Cost {
     fn cmp(&self, o: &Self) -> Ordering {
         self.hi.total_cmp(&o.hi).then(self.lo.total_cmp(&o.lo))
     }
+}
+
+/// Every path of a front half from `front`, the edge `e` and a back half from `back`,
+/// given to `emit` until it returns false, which this returns too. Each path counts
+/// against `budget`, since the product can be far larger than the halves.
+fn join_halves(
+    front: &[Vec<Edge>],
+    e: Edge,
+    back: &[Vec<Edge>],
+    budget: &mut Budget<'_>,
+    emit: &mut dyn FnMut(Vec<Edge>) -> Result<bool>,
+) -> Result<bool> {
+    for a in front {
+        for z in back {
+            budget.tick()?;
+            let mut p = Vec::with_capacity(a.len() + 1 + z.len());
+            p.extend_from_slice(a);
+            p.push(e);
+            p.extend_from_slice(z);
+            if !emit(p)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// A path from `s` with every cycle cut out, so each node appears once. Two halves of a
@@ -1214,17 +1243,6 @@ fn without_loops(s: u64, edges: Vec<Edge>) -> Vec<Edge> {
         at.insert(e.to, out.len());
     }
     out
-}
-impl Eq for OrdF64 {}
-impl PartialOrd for OrdF64 {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for OrdF64 {
-    fn cmp(&self, o: &Self) -> Ordering {
-        self.0.total_cmp(&o.0)
-    }
 }
 
 /// One index range that holds edges: `perm` with the predicate fixed or not, or the
@@ -1625,7 +1643,7 @@ impl<'a> Engine<'a> {
     fn prune<'c>(
         &self,
         tree: &Tree,
-        cost: Option<&'c FxHashMap<u64, f64>>,
+        cost: Option<&'c FxHashMap<u64, Cost>>,
         all: bool,
     ) -> Result<Option<Prune<'c>>> {
         let Some(cost) = cost.filter(|_| all) else {
@@ -1945,15 +1963,11 @@ impl<'a> Engine<'a> {
         Ok(best.unwrap_or(default))
     }
 
+    /// A path's cost as reported: the double-double sum of its weights from the start,
+    /// rounded to a double, so that equally cheap paths report the same cost whatever
+    /// order their weights come in.
     fn path_cost(&self, edges: &[Edge]) -> Result<f64> {
-        if !self.spec.weighted() {
-            return Ok(edges.len() as f64);
-        }
-        let mut c = 0.0;
-        for e in edges {
-            c += self.weight(e)?;
-        }
-        Ok(c)
+        Ok(self.exact_cost(edges, |x| x)?.hi)
     }
 
     /// Grow a breadth-first tree by one level. `virt` is the node the virtual id stands
@@ -2183,10 +2197,12 @@ impl<'a> Engine<'a> {
         banned_nodes: Option<&FxHashSet<u64>>,
         banned_edges: Option<&FxHashSet<Edge>>,
         virt: u64,
-    ) -> Result<(Tree, FxHashMap<u64, f64>)> {
+    ) -> Result<(Tree, FxHashMap<u64, Cost>)> {
         self.set_roots(&[if root == VIRT { virt } else { root }]);
         let mut tree = Tree::new(root, forward);
-        let mut dist: FxHashMap<u64, f64> = FxHashMap::default();
+        // double-doubles, so that ties are decided on the weights' sums and not on the
+        // order the search added them in, as in the search from both ends
+        let mut dist: FxHashMap<u64, Cost> = FxHashMap::default();
         let mut settled: FxHashSet<u64> = FxHashSet::default();
         let mut heap = BinaryHeap::new();
         let mut missing: FxHashSet<u64> = targets
@@ -2196,14 +2212,14 @@ impl<'a> Engine<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        dist.insert(root, 0.0);
-        heap.push(Reverse((OrdF64(0.0), root)));
+        dist.insert(root, Cost::ZERO);
+        heap.push(Reverse((Cost::ZERO, root)));
         let mut n = 0u64;
         // once every target is settled, a search for all the cheapest paths goes on
         // through the nodes of the last cost: a zero-weight edge from one of them can
         // still reach a settled target at that cost
-        let mut last_cost: Option<f64> = None;
-        while let Some(Reverse((OrdF64(d), u))) = heap.pop() {
+        let mut last_cost: Option<Cost> = None;
+        while let Some(Reverse((d, u))) = heap.pop() {
             if last_cost.is_some_and(|c| d > c) {
                 break;
             }
@@ -2274,7 +2290,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 let real = |x: u64| if x == VIRT { virt } else { x };
-                let nd = d + self.weight(&e.map(real))?;
+                let nd = d.add(Cost::of(self.weight(&e.map(real))?));
                 let parent = Parent {
                     node: u,
                     p: st.p,
@@ -2292,7 +2308,7 @@ impl<'a> Engine<'a> {
                         dist.insert(y, nd);
                         tree.first.insert(y, (parent, 0));
                         tree.extra.remove(&y);
-                        heap.push(Reverse((OrdF64(nd), y)));
+                        heap.push(Reverse((nd, y)));
                     }
                 }
             }
@@ -2437,6 +2453,296 @@ impl<'a> Engine<'a> {
         Ok(Some((path, cost)))
     }
 
+    /// Every cheapest path from `s` to `t` by Dijkstra's algorithm from both ends
+    /// (ROADMAP item 277), given to `emit` one at a time until it returns false, so
+    /// `path:shortest` takes the first. When `s`
+    /// and `t` are the same node the paths are the cheapest cycles through it, and the
+    /// backward search starts from the virtual id, which stands for `s` as the end.
+    ///
+    /// Both sides keep every parent of equal cost, as [`dijkstra`](Self::dijkstra) does,
+    /// and neither expands the other's root, since no path passes through an end. The
+    /// search stops once the least costs of the two queues add up to more than the
+    /// cheapest meeting and both are above zero. Every node with a cost below its side's
+    /// least queued cost, `Tf` forward and `Tb` backward, has then been settled with its
+    /// final parents. Call these nodes the forward and the backward region. A node on a
+    /// cheapest path has `df + db = μ < Tf + Tb`, so it lies in one of the regions. Costs
+    /// rise along a cheapest path from `s`, so the nodes of the forward region on it form
+    /// a prefix, and the rest lie in the backward region. Each cheapest path is therefore
+    /// the forward region's cheapest path to its last node `u` in that region, the edge to
+    /// the next node `v`, and the backward region's cheapest path from `v` to `t`, or a
+    /// path inside the forward region. The halves are joined only at such an edge, and
+    /// only with backward halves that stay out of the forward region. Each path then has
+    /// one split, so no path is found twice, and the halves share no node, so it is simple.
+    fn dijkstra_pair_all(
+        &self,
+        s: u64,
+        t: u64,
+        all: bool,
+        emit: &mut dyn FnMut(Vec<Edge>) -> Result<bool>,
+    ) -> Result<bool> {
+        let cycle = s == t;
+        let tt = if cycle { VIRT } else { t };
+        let real = |x: u64| if x == VIRT { s } else { x };
+        self.set_roots(&[s, t]);
+        let mut trees = [Tree::new(s, true), Tree::new(tt, false)];
+        let mut dist: [FxHashMap<u64, Cost>; 2] = Default::default();
+        let mut settled: [FxHashSet<u64>; 2] = Default::default();
+        let mut heaps: [BinaryHeap<Reverse<(Cost, u64)>>; 2] = Default::default();
+        for (i, r) in [s, tt].into_iter().enumerate() {
+            dist[i].insert(r, Cost::ZERO);
+            heaps[i].push(Reverse((Cost::ZERO, r)));
+        }
+        // a node a path may pass through: an end, or a node neither a hub nor a literal
+        let passable = |x: u64| -> Result<bool> {
+            Ok(x == s || x == tt || !(self.sink(x, true) || self.blocked(x)?))
+        };
+        // the edges, in path order, that join a node the forward side reached to one the
+        // backward side reached, and the cheapest path through one of them so far
+        let mut meets: FxHashSet<Edge> = FxHashSet::default();
+        let mut best: Option<Cost> = None;
+        let mut best_edge: Option<Edge> = None;
+        let mut n = 0u64;
+        // the least cost in each queue, infinite when it is empty
+        let mut tops = [Cost::INFINITE; 2];
+        // the smallest and largest positive weights relaxed
+        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
+        loop {
+            for i in 0..2 {
+                while let Some(&Reverse((_, u))) = heaps[i].peek() {
+                    if !settled[i].contains(&u) {
+                        break;
+                    }
+                    heaps[i].pop();
+                }
+                tops[i] = heaps[i].peek().map_or(Cost::INFINITE, |r| r.0.0);
+            }
+            // a side whose queue is empty has settled every node it reaches. Without a
+            // meeting there is then no path. With one, the other side goes on until its
+            // least cost is above zero, so that its region holds at least its root.
+            let empty = [heaps[0].is_empty(), heaps[1].is_empty()];
+            if (empty[0] && empty[1]) || (best.is_none() && (empty[0] || empty[1])) {
+                break;
+            }
+            // one path needs no ties, so the test of the cheapest path from both ends
+            // suffices
+            if !all && best.is_some_and(|mu| tops[0].add(tops[1]) >= mu) {
+                break;
+            }
+            if best.is_some_and(|mu| tops[0].add(tops[1]) > mu)
+                && tops[0] > Cost::ZERO
+                && tops[1] > Cost::ZERO
+            {
+                break;
+            }
+            let side = if empty[0] || empty[1] {
+                usize::from(empty[0])
+            } else {
+                usize::from(heaps[0].len() > heaps[1].len())
+            };
+            let forward = side == 0;
+            let Reverse((d, u)) = heaps[side].pop().unwrap();
+            settled[side].insert(u);
+            if u != trees[side].root {
+                trees[side].order.push((u, 0));
+            }
+            self.visit(1)?;
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            // no path passes through an end
+            if u == if forward { tt } else { s } {
+                continue;
+            }
+            let scan = real(u);
+            let mut out = Vec::new();
+            self.expand(&[scan], forward, &mut out)?;
+            for (_, st) in out {
+                let y = if forward && cycle && st.node == s {
+                    VIRT
+                } else {
+                    st.node
+                };
+                if y == trees[side].root {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                let wv = self.weight(&e.map(real))?;
+                if wv > 0.0 {
+                    wmin = wmin.min(wv);
+                    wmax = wmax.max(wv);
+                }
+                let w = Cost::of(wv);
+                let nd = d.add(w);
+                let parent = Parent {
+                    node: u,
+                    p: st.p,
+                    rev: st.rev,
+                };
+                match dist[side].get(&y) {
+                    Some(&cur) if nd > cur => {}
+                    Some(&cur) if nd == cur => {
+                        if all {
+                            trees[side].extra.entry(y).or_default().push(parent);
+                        }
+                    }
+                    // a settled node has its final cost
+                    _ if settled[side].contains(&y) => {}
+                    _ => {
+                        dist[side].insert(y, nd);
+                        trees[side].first.insert(y, (parent, 0));
+                        trees[side].extra.remove(&y);
+                        heaps[side].push(Reverse((nd, y)));
+                    }
+                }
+                if let Some(&o) = dist[1 - side].get(&y)
+                    && passable(e.from)?
+                    && passable(e.to)?
+                {
+                    // the cost of a path through the edge, added in path order from the
+                    // forward end's cost, whichever side found it
+                    let c = if forward { nd.add(o) } else { o.add(w).add(d) };
+                    if best.is_none_or(|mu| c < mu) {
+                        best = Some(c);
+                        best_edge = Some(e);
+                    }
+                    if all && meets.insert(e) {
+                        self.charge.add(STEP_BYTES)?;
+                    }
+                }
+            }
+        }
+        if best.is_none() {
+            return Ok(true);
+        }
+        // The sums are exact while the weights lie within 2^28 of each other, since a
+        // search visits fewer than 2^24 nodes by default and a double-double holds about
+        // 106 bits. Otherwise the two sides can round a path's cost apart, so the search
+        // from the source alone answers, which adds every cost in one order.
+        if wmax > wmin * WIDE_WEIGHTS {
+            return Ok(false);
+        }
+        let to_real = |p: Vec<Edge>| -> Vec<Edge> { p.into_iter().map(|e| e.map(real)).collect() };
+        let check = || self.ctx.check();
+        if !all {
+            // path:shortest: the first parents through the cheapest meeting, which only
+            // got cheaper after it was found, so the halves cost at most the meeting's
+            // cost. Zero-weight edges can make them share a node, which is cut out.
+            let (Some(mu), Some(e)) = (best, best_edge) else {
+                return Ok(false);
+            };
+            if mu.hi.is_infinite() {
+                return Ok(false);
+            }
+            let (Some(a), Some(z)) = (
+                trees[0].paths(e.from, false, 1, None, &check)?.pop(),
+                trees[1].paths(e.to, false, 1, None, &check)?.pop(),
+            ) else {
+                return Ok(false);
+            };
+            let mut p = a;
+            p.push(e);
+            p.extend(z);
+            emit(to_real(without_loops(s, p)))?;
+            return Ok(true);
+        }
+        // only settled nodes have final parents
+        for i in 0..2 {
+            trees[i].first.retain(|k, _| settled[i].contains(k));
+            dist[i].retain(|k, _| settled[i].contains(k));
+        }
+        let region = |i: usize, x: u64| dist[i].get(&x).is_some_and(|&c| c < tops[i]);
+        // the cheapest cost among the joins, from the final costs
+        let at_end = dist[0].get(&tt).copied().filter(|_| region(0, tt));
+        let mut joins: Vec<(Edge, Cost)> = Vec::new();
+        for &e in &meets {
+            if !region(0, e.from) || region(0, e.to) || !region(1, e.to) {
+                continue;
+            }
+            let w = Cost::of(self.weight(&e.map(real))?);
+            joins.push((e, dist[0][&e.from].add(w).add(dist[1][&e.to])));
+        }
+        drop(meets);
+        // a meeting with no join, or a cost past the largest double, leaves the answer
+        // to the search from the source alone
+        let Some(mu) = joins.iter().map(|j| j.1).chain(at_end).min() else {
+            return Ok(false);
+        };
+        if mu.hi.is_infinite() {
+            return Ok(false);
+        }
+        joins.retain(|j| j.1 == mu);
+        joins.sort_unstable_by_key(|(e, _)| (e.from, e.to, e.p, e.rev));
+        // path:shortest follows first parents, which reach the root in linear time
+        let prunes = [
+            self.prune(&trees[0], Some(&dist[0]), all)?,
+            self.prune(&trees[1], Some(&dist[1]), all)?,
+        ];
+        let cap = |left: usize| if all { left } else { left.min(1) };
+        if at_end == Some(mu) {
+            let left = self.left.get();
+            for p in trees[0].paths(tt, all, cap(left), prunes[0].as_ref(), &check)? {
+                if !emit(to_real(p))? {
+                    return Ok(true);
+                }
+            }
+        }
+        // the backward halves from each node, kept while their joins are emitted
+        let mut back: FxHashMap<u64, Rc<[Vec<Edge>]>> = FxHashMap::default();
+        // the product of the halves can be far larger than either, so its paths count
+        // against the deadline and cancellation as the halves' steps do
+        let mut joined = Budget {
+            steps: 0,
+            check: &check,
+        };
+        let mut i = 0;
+        while i < joins.len() {
+            let u = joins[i].0.from;
+            let left = self.left.get();
+            if left == 0 {
+                return Ok(true);
+            }
+            let front = trees[0].paths(u, all, cap(left), prunes[0].as_ref(), &check)?;
+            while i < joins.len() && joins[i].0.from == u {
+                let e = joins[i].0;
+                i += 1;
+                let v = e.to;
+                let halves = match back.get(&v) {
+                    Some(h) => h.clone(),
+                    None => {
+                        let mut h =
+                            trees[1].paths(v, all, cap(left), prunes[1].as_ref(), &check)?;
+                        // a half that enters the forward region belongs to another split
+                        h.retain(|p| p.iter().all(|x| !region(0, x.to)));
+                        self.charge
+                            .add(h.iter().map(|p| p.len() as u64 * 32 + 24).sum())?;
+                        let h: Rc<[Vec<Edge>]> = h.into();
+                        back.insert(v, h.clone());
+                        h
+                    }
+                };
+                if !join_halves(&front, e, &halves, &mut joined, &mut |p| emit(to_real(p)))? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// The shortest path from `from` to `to` (forward) that avoids the banned nodes and
     /// edges, of at most `budget` edges without weights: Yen's spur search.
     fn spur(
@@ -2465,7 +2771,7 @@ impl<'a> Engine<'a> {
                 Some(banned_edges),
                 virt,
             )?;
-            let Some(&c) = dist.get(&to) else {
+            let Some(c) = dist.get(&to).map(|c| c.hi) else {
                 return Ok(None);
             };
             return Ok(tree
@@ -2876,20 +3182,49 @@ pub fn run(
                     }
                     continue;
                 }
-                // one cheapest path between two different nodes: from both ends
-                if single && weighted && !all {
-                    let t = *targets.set.first().unwrap();
-                    if t != s {
-                        eng.begin();
-                        if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
-                            && !add(&mut found, s, t, p, None, true)?
-                        {
+                // every cheapest path of one pair, and the cheapest cycles through the
+                // source: from both ends
+                let t0 = targets.set.first().copied();
+                let both_ends = single && weighted && (all || t0 == Some(s));
+                if both_ends {
+                    let t = t0.unwrap();
+                    eng.begin();
+                    if spec.min_len == 0 && s == t {
+                        if !add(&mut found, s, t, Vec::new(), None, true)? {
                             break 'sources;
                         }
                         continue;
                     }
+                    let mut stop = false;
+                    let answered = eng.dijkstra_pair_all(s, t, all, &mut |p| {
+                        let more = add(&mut found, s, t, p, None, true)?;
+                        stop = !more;
+                        // path:shortest keeps the first cheapest cycle
+                        Ok(more && all)
+                    })?;
+                    if stop {
+                        break 'sources;
+                    }
+                    if answered {
+                        continue;
+                    }
+                    // with weights too wide to add exactly, or past the largest double,
+                    // the search from the source alone answers, on the same visit budget
                 }
-                eng.begin();
+                // one cheapest path between two different nodes: from both ends
+                if single && weighted && !both_ends {
+                    let t = t0.unwrap();
+                    eng.begin();
+                    if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
+                        && !add(&mut found, s, t, p, None, true)?
+                    {
+                        break 'sources;
+                    }
+                    continue;
+                }
+                if !both_ends {
+                    eng.begin();
+                }
                 let close = targets.any || tset.contains(&s);
                 let (tree, cost) = if weighted {
                     let (tree, cost) = eng.dijkstra(
@@ -3204,6 +3539,45 @@ mod tree_tests {
     }
 
     #[test]
+    fn joining_halves_is_checked_against_the_deadline() {
+        let edge = |from, to| Edge {
+            from,
+            to,
+            p: 0,
+            rev: false,
+        };
+        let front: Vec<Vec<Edge>> = (0..100).map(|i| vec![edge(0, 10 + i)]).collect();
+        let back: Vec<Vec<Edge>> = (0..100).map(|i| vec![edge(1000 + i, 1)]).collect();
+        let stop = || Err(Error::Cancelled);
+        let mut budget = Budget {
+            steps: 0,
+            check: &stop,
+        };
+        let mut n = 0;
+        let r = join_halves(&front, edge(5, 6), &back, &mut budget, &mut |_| {
+            n += 1;
+            Ok(true)
+        });
+        assert!(r.is_err());
+        assert!(n < 4096, "{n} paths joined before the check");
+        // without a failing check every pair is joined once
+        let go = || Ok(());
+        let mut budget = Budget {
+            steps: 0,
+            check: &go,
+        };
+        let mut n = 0;
+        assert!(
+            join_halves(&front, edge(5, 6), &back, &mut budget, &mut |_| {
+                n += 1;
+                Ok(true)
+            })
+            .unwrap()
+        );
+        assert_eq!(n, 10_000);
+    }
+
+    #[test]
     fn pruning_work_is_checked_against_the_deadline() {
         // node 1 has the root as its first parent and K + 1 as an extra one, and K + 1
         // reaches 1 only through a chain of first parents, so the search for a way out
@@ -3216,7 +3590,7 @@ mod tree_tests {
         }
         t.extra.insert(1, vec![parent(K + 1)]);
         t.order = (1..=K + 1).map(|i| (i, 0)).collect();
-        let cost: FxHashMap<u64, f64> = (1..=K + 1).map(|i| (i, 0.0)).collect();
+        let cost: FxHashMap<u64, Cost> = (1..=K + 1).map(|i| (i, Cost::ZERO)).collect();
         let check = || Err(Error::Timeout);
         let prune = Prune {
             cost: &cost,
@@ -3286,7 +3660,7 @@ mod tree_tests {
     fn single_path_reconstruction_is_linear() {
         const L: u64 = 5000;
         let t = chain(L);
-        let cost: FxHashMap<u64, f64> = (1..=L).map(|i| (i, 0.0)).collect();
+        let cost: FxHashMap<u64, Cost> = (1..=L).map(|i| (i, Cost::ZERO)).collect();
         let calls = Cell::new(0u32);
         let check = || {
             calls.set(calls.get() + 1);
@@ -3311,7 +3685,7 @@ mod tree_tests {
         for i in 1..L {
             t.extra.insert(i, vec![parent(i + 1)]);
         }
-        let cost: FxHashMap<u64, f64> = (1..=L).map(|i| (i, 0.0)).collect();
+        let cost: FxHashMap<u64, Cost> = (1..=L).map(|i| (i, Cost::ZERO)).collect();
         let calls = Cell::new(0u32);
         let check = || {
             calls.set(calls.get() + 1);
@@ -3333,7 +3707,7 @@ mod tree_tests {
     fn all_shortest_reconstruction_of_a_one_way_zero_weight_chain_is_linear() {
         const L: u64 = 5000;
         let t = chain(L);
-        let cost: FxHashMap<u64, f64> = (1..=L).map(|i| (i, 0.0)).collect();
+        let cost: FxHashMap<u64, Cost> = (1..=L).map(|i| (i, Cost::ZERO)).collect();
         let calls = Cell::new(0u32);
         let check = || {
             calls.set(calls.get() + 1);

@@ -24,6 +24,15 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
+node in both shortest modes, run Dijkstra's algorithm from both ends. Weighted path
+searches add costs in double-double arithmetic everywhere, so paths whose weights have
+equal sums tie whatever order the weights come in while the weights lie within a factor
+of 2^28 of each other, and `path:cost` is the sum rounded to the nearest double. A search could return one of two such paths before, as with weights
+0.1, 0.2 and 0.3 added in opposite orders, and paths with weights of very different sizes
+can report a slightly different cost than before. Among equally cheap paths the order of
+`path:pathIndex` can differ from earlier releases.
+
 Change feeds, live queries and long polls end with `access-changed` when the session
 or token they were opened with expires, including a session's idle timeout. OIDC
 sign-ins decide admission and the session lifetime under the policy current after the

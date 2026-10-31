@@ -271,6 +271,13 @@ With weights, `path:shortest` and `path:allShortest` use Dijkstra's algorithm an
 count edges, and `path:maxLength` and `path:minLength` filter the paths the search
 enumerates in cost order.
 
+The cost of a path is the sum of its weights, added in double-double arithmetic, and
+`path:cost` is that sum rounded to the nearest double. Two paths tie in the shortest modes
+when their sums are equal, whatever order the weights are added in, as long as the weights
+lie within a factor of 2^28 of each other. Beyond that a double-double sum can round, and
+ties are decided on the sums added from the source. This paragraph was added with
+[ROADMAP](../ROADMAP.md) item 277.
+
 ### 4.6 Access control
 
 The search reads the caller's view of the dataset. A grant limited to some graphs limits
@@ -778,3 +785,125 @@ the limit of 10 million visited nodes, and they now take 69 ms and 656 ms.
 k-shortest and `VALUES` searches measured 3 to 4% slower in every round, and weighted
 `path:allShortest` 2.3% slower, although the change does not touch their searches. Item 276
 looks for the cause, and item 277 would run weighted `path:allShortest` from both ends.
+
+### Every cheapest path from both ends (2026-10-31)
+
+[ROADMAP](../ROADMAP.md) item 277 made weighted `path:allShortest` between one pair run
+Dijkstra's algorithm from both ends, and the cheapest weighted cycles through the source in
+both shortest modes. `Engine::dijkstra_pair_all` in `pathsearch.rs` keeps a heap, a
+distance table and a tree of parents for each end and grows the end whose heap is smaller.
+Each side records every parent of equal cost, as the search from one end does for
+zero-weight edges, and neither side expands the other's root, since no path passes through
+an end. An edge that one side relaxes onto a node the other side has reached is kept as a
+meeting, unless one of its nodes is a hub or a literal that a path may not pass through.
+
+The search stops once the least costs of the two heaps add up to more than the cheapest
+meeting and both are above zero. The forward region is then the set of nodes whose cost
+from the source is below the forward heap's least cost, and the backward region is defined
+in the same way from the target. Every node of either region is settled with its final
+parents. A node on a cheapest path lies in one of the regions, because its costs from the
+source and to the target add up to the path's cost, which is below the sum of the two least
+costs. Costs only rise along a cheapest path, so the path's nodes in the forward region form
+a prefix and the rest lie in the backward region. The search therefore takes each meeting
+edge that leaves the forward region, and joins every cheapest path from the source to the
+edge's start with every cheapest path from the edge's end to the target. It adds the
+cheapest paths that lie wholly in the forward region. Each path has exactly one such split,
+so none is returned twice, and its two halves share no node, so it is simple. A backward
+half that enters the forward region is dropped, which can only happen when rounding breaks
+these properties. The condition that both least costs are above zero puts the source in the
+forward region even when zero-weight edges surround it. A side whose heap empties has
+settled every node it reaches, and the other side then goes on until its own least cost is
+above zero.
+
+The halves are listed through the recorded parents with the pruning of the search from one
+end. For one cheapest cycle, `path:shortest` records neither tied parents nor every
+meeting. It keeps the cheapest meeting edge, stops as the search for one cheapest pair
+does once the least costs add up to at least that meeting, and joins the first parents of
+the edge's ends, cutting out any loop that zero-weight edges make. Its memory then grows
+with the nodes it settles, and a cycle with exponentially many tied halves is found at
+once. The paths go to the output one at a time, so `path:limit` stops the enumeration, and
+only the backward halves are kept while the search joins them. A cycle through the source
+uses the virtual id of the search from one end as its target. The forward side records an
+edge into the source as an edge into the virtual id, and the backward side starts from the
+virtual id with the source's predecessors and never expands the source.
+
+**Ties.** Both searches compare costs as double-double sums, so the search from the source
+alone, which still runs for several or unbound targets and for a target without a source,
+now adds its weights in double-double as well. Two paths tie when the sums of their weights
+are equal. A double-double holds about 106 bits, so the sums are exact while the weights
+lie within a factor of 2^28 of each other, since a search visits fewer than 2^24 nodes by
+default. Beyond that the two sides of a search could round one path's cost apart. The
+search from both ends therefore records the smallest and largest positive weights it
+relaxes, and when they lie further apart, when the cheapest cost is past the largest
+double, or when a meeting yields no join, it returns nothing and the search from the
+source alone answers on the same visit budget. Both searches then always return the same
+paths, but beyond that range the search from the source alone can round too, so a tie of
+exact sums can still be missed. 493 would decide ties exactly at any range. In
+plain doubles `0.1 + 0.2 + 0.3` and `0.3 + 0.2 + 0.1` differ, so
+the search from one end used to return only one of two equally cheap paths. `path:cost` now
+reports the double-double sum rounded to the nearest double in every weighted mode, so
+equally cheap paths report the same cost. Costs of integer weights do not change while
+every partial sum stays below 2^53, and above that the reported cost can differ from the
+plain double sum, as `10^16 + 1 + 1` reports 10000000000000002 where it reported 10^16.
+
+**Cycles and several targets.**
+
+* A cycle through the source searches from both ends in both shortest modes, because the
+  virtual id makes it an ordinary pair. Yen's spur searches that close a cycle, in
+  `path:kShortest`, still search from one end, which 492 addresses.
+* A source with several bound targets keeps one search from the source, as the unweighted
+  search and the single cheapest path do. That search settles the region near the source
+  once for all targets, while a search per pair settles it again for each target, and which
+  costs less depends on the number of targets and how far apart they are. 491 would
+  choose between them. A source with an unbound target and a target without a source have
+  only one end to search from.
+
+**Budgets.** The product of the halves can be far larger than either, so `join_halves`
+counts each joined path against the deadline and cancellation, as the listing of the
+halves counts its steps. The unit test `joining_halves_is_checked_against_the_deadline`
+covers it.
+
+**Tests.** `crates/sparkles-core/tests/path_search_all_shortest.rs` compares the search
+from both ends on 120 random weighted graphs, in every direction, with skipped predicates,
+hub limits, self-loops and parallel edges, and with weights of 0, 0.1, 0.2, 0.3, 0.5, 1, 2
+and 3. For every pair, including the source with itself, the paths must equal the simple
+paths of least exact cost from a brute-force enumeration with integer sums, and those of the
+search from the source alone with an unbound target and with two targets. No path may
+appear twice, every reported cost must be the exact sum rounded to a double, `path:limit 1`
+must return one of the paths, and `path:shortest` one of them as well. Three more tests
+cover ties that hold only for exact sums, a zero-weight chain that both sides reach at the
+same cost, and cycles through the source with self-loops and parallel edges. Three tests
+added after review cover a chain of 32 diamonds whose 2^32 tied cycles `path:shortest`
+must not list, weights at the largest double, and weights 2^106 apart, where the two
+sides would round a cost apart. A fourth checks that one cheapest cycle in a complete
+graph of 200 nodes with zero weights holds no more memory than twice a pair search on the
+same graph. Each fails without its fix.
+
+**Performance.** A Namespace screen on an 8-vCPU AMD EPYC instance compared the build
+before the change with this one, in two A, B, B, A rounds of five timed requests per query
+and server process. The data was the 10.5M-triple benchmark set with an `ex:km` weight from
+1 to 100 on a reifier of each of its 2.5 million `foaf:knows` triples, 15.5 million quads in
+all. Each search ran from person 0 to the last person, or from person 0 to itself for the
+cycles, over `foaf:knows`. Unit weights used a weight property absent from the data, so
+every edge had the default weight of 1. The table gives medians of the server's execution
+time.
+
+| search | weights | one end (ms) | both ends (ms) |
+|---|---|---:|---:|
+| every cheapest path | 1 | 775.3 | 5.7 |
+| every cheapest path | 1 to 100 | 6,756.7 | 28.5 |
+| every cheapest path, `path:direction path:both` | 1 | 708.2 | 4.2 |
+| every cheapest path, `path:direction path:both` | 1 to 100 | 8,362.8 | 25.8 |
+| every cheapest cycle | 1 | 549.0 | 3.1 |
+| every cheapest cycle | 1 to 100 | 3,622.4 | 42.2 |
+| one cheapest cycle | 1 to 100 | 3,258.9 | 39.0 |
+
+The paths of each search were the same in both builds, compared as sets of edge lists,
+and only their order differed. Two targets bound by `VALUES`, which still search from the
+source, took 6,657 ms before the change and 6,648 ms after it. One weighted path to every
+reachable person took 1,846 and 1,694 ms, so adding costs in double-double measured no
+slower. The unweighted `ps-pair-all`, whose search did not change, measured 20.6% slower in
+this screen with a spread of 92 to 131% between server processes. A rerun of four rounds of
+30 requests measured it 1.9% slower, at 1.20 and 1.23 ms, and the weighted cheapest pair
+0.5% slower, at 24.1 and 24.3 ms, so neither change is above the noise. Item 276 rechecks
+both on forge.

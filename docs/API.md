@@ -6386,7 +6386,7 @@ described under "Edges from a pattern" below.
 | `path:edgeSubject`, `path:edgePredicate`, `path:edgeObject` | variables | | The edge's triple as stored. For the edges of a nested pattern, the start and end, and no predicate. |
 | `path:edge` | a variable | | The edge's triple as a triple term, `<<( s p o )>>`. |
 | `path:length` | a variable | | The number of edges, an `xsd:integer`. |
-| `path:cost` | a variable | | The sum of the weights, an `xsd:double`. Without `path:weight` it is the length. |
+| `path:cost` | a variable | | The sum of the weights rounded to an `xsd:double`. Without `path:weight` it is the length. |
 
 * **Paths.** A path never visits a node twice, except that it may end where it started.
   So a search from a node to itself finds the shortest cycle through it, as
@@ -6411,8 +6411,13 @@ described under "Edges from a pattern" below.
   `ex:a ex:road ex:b {| ex:km 12 |}` writes. The smallest value counts when there are
   several. A weight that is not a non-negative number fails the query. The shortest
   modes then use Dijkstra's algorithm and `path:kShortest` uses Yen's algorithm with
-  Dijkstra's. The cheapest path of one pair and Yen's spur searches run from both ends.
-  Lengths still count edges.
+  Dijkstra's. The cheapest path of one pair, every cheapest path of one pair, the cheapest
+  cycles through a node and Yen's spur searches between two nodes run from both ends.
+  Weights are added with about twice the precision of a double, so two paths whose
+  weights have equal sums tie whatever order the weights come in, as long as the weights
+  lie within a factor of 2^28 of each other. With weights further apart, the sums are
+  added from the source and can round, so an equally cheap path can be missed. Lengths
+  still count edges.
 * **Graphs and access.** The search reads the active graph, as a triple pattern would.
   Under `GRAPH ?g` each named graph is searched on its own and `?g` is bound to it. A
   path never uses a triple that the caller's grants or protections hide, and a hidden
