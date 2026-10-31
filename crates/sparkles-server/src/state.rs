@@ -1262,9 +1262,10 @@ impl AppState {
         let end = Instant::now() + LEAVE_DRAIN;
         let cached = self.routing.lock().remove(name);
         // Only a managed persistent dataset has files that an old handle could write.
-        let managed = cached
-            .as_ref()
-            .is_none_or(|ds| ds.kind == DbType::Persistent && !ds.ephemeral);
+        let managed = match cached.as_ref() {
+            Some(ds) => ds.kind == DbType::Persistent && !ds.ephemeral,
+            None => self.catalog_persistent(name),
+        };
         if managed && cached.as_ref().is_some_and(|ds| !drained(ds, end)) {
             self.routing
                 .lock()
@@ -1306,6 +1307,13 @@ impl AppState {
                 Err(e.into())
             }
         }
+    }
+
+    /// Whether the catalog registers `name` as a persistent dataset.
+    fn catalog_persistent(&self, name: &str) -> bool {
+        self.catalog
+            .info(name)
+            .is_some_and(|info| info.kind == DbType::Persistent)
     }
 
     /// The configuration that a rename of `from` would leave pointing at nothing, and
@@ -1352,8 +1360,11 @@ impl AppState {
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
         drop(cached);
-        // As in delete, wait for the workers that hold the dataset itself.
-        wait_until(end, || !self.catalog.in_use(from));
+        // As in delete, wait for the workers that hold the dataset itself. The catalog
+        // refuses a rename for those handles only on a persistent dataset.
+        if self.catalog_persistent(from) {
+            wait_until(end, || !self.catalog.in_use(from));
+        }
         let result = self.catalog.rename(from, to);
         drop(leaving);
         match result {
@@ -2076,6 +2087,13 @@ pub(crate) mod tests {
         st.rename("renamed-briefly", "renamed-after").unwrap();
         holder.join().unwrap();
         assert!(st.get("renamed-after").is_some());
+        // A memory dataset's handles do not block its rename, so it does not wait.
+        drop(st.create("memory-held", DbType::Memory).unwrap());
+        let kept = st.catalog.get("memory-held").unwrap();
+        let started = Instant::now();
+        st.rename("memory-held", "memory-renamed").unwrap();
+        assert!(started.elapsed() < LEAVE_DRAIN, "{:?}", started.elapsed());
+        drop(kept);
         // A holder that outlasts the window is still refused, and the dataset stays.
         let kept = st.get("renamed-after").unwrap();
         let started = Instant::now();
