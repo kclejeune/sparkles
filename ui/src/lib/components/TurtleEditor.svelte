@@ -1,7 +1,7 @@
 <script lang="ts">
-  // A small CodeMirror editor for a Turtle document (the SHACL shapes graph): the SPARQL
-  // tokenizer highlights it (the two share their terms), with undo history, the error
-  // line of a syntax error, and Shift+Alt+F to format.
+  // A small CodeMirror editor for a Turtle or SHACLC document (the SHACL shapes graph): the
+  // SPARQL tokenizer highlights it (the two share their terms), with undo history, the
+  // error line of a syntax error, lint marks, and Shift+Alt+F to format.
   import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
   import {
     defaultKeymap,
@@ -15,7 +15,9 @@
   import { EditorState, Prec, type Extension } from '@codemirror/state';
   import { drawSelection, EditorView, keymap, lineNumbers } from '@codemirror/view';
   import { onDestroy, onMount } from 'svelte';
+  import type { LintDiagnostic } from '$lib/api';
   import { viewTarget } from '$lib/fmt-view';
+  import { lintView, setLintDiagnostics } from '$lib/lint-view';
   import { errorField, highlightError, sparqlHighlight, sparqlLanguage } from '$lib/sparql-lang';
 
   let {
@@ -100,6 +102,7 @@
       sparqlLanguage,
       syntaxHighlighting(sparqlHighlight),
       errorField,
+      lintView(),
       EditorState.tabSize.of(2),
       EditorView.contentAttributes.of({ 'aria-label': label, spellcheck: 'false' }),
       theme,
@@ -135,6 +138,11 @@
   /** Replace the document with its formatted text in one undoable step. */
   export function replaceFormatted(text: string, cursorOffset: number | null) {
     target.replaceFormatted(text, cursorOffset);
+  }
+
+  /** Show lint findings (an empty list clears them). */
+  export function setLint(diagnostics: LintDiagnostic[]) {
+    view?.dispatch({ effects: setLintDiagnostics.of(diagnostics) });
   }
 
   /** Highlight the line (and column) of a syntax error; no line clears it. */

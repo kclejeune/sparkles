@@ -34,3 +34,24 @@ test('lint findings are marked while typing and fixed from the Format menu', asy
   await page.waitForTimeout(800);
   await expect(mark).toHaveCount(0);
 });
+
+test('the shapes editor lints its text and marks the findings', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
+  await page.goto('/ui/datasets/foaf');
+  const shapes = page.getByRole('textbox', { name: 'Shapes graph (Turtle)' });
+  await shapes.click();
+  await selectAll(page);
+  await page.keyboard.insertText(
+    'PREFIX ex: <http://example.org/>\nPREFIX sh: <http://www.w3.org/ns/shacl#>\n<urn:s> a sh:NodeShape .',
+  );
+  const mark = page.locator('.cm-lint-warning');
+  await expect(mark).toHaveCount(1);
+  await expect(mark).toHaveAttribute('title', /the prefix ex: is declared but never used/);
+  await expect(page.getByRole('status').filter({ hasText: '1 warning' })).toBeVisible();
+
+  // a blank editor has nothing to lint
+  await selectAll(page);
+  await page.keyboard.press('Delete');
+  await expect(mark).toHaveCount(0);
+  await expect(page.getByRole('status').filter({ hasText: 'warning' })).toHaveCount(0);
+});

@@ -22,6 +22,26 @@ export function shapesFormatLanguage(syntax: ShaclSyntax): 'turtle' | 'shaclc' {
   return syntax === 'shaclc' ? 'shaclc' : 'turtle';
 }
 
+/**
+ * The lint request for the shapes in the editor: the syntax is the linter's language, so
+ * Turtle shapes get the Turtle rules and the SPARQL of their `sh:select`, `sh:ask`,
+ * `sh:construct` and `sh:update` literals, and SHACLC gets its prefix and term rules. A
+ * blank editor has nothing to lint (`null`).
+ */
+export function shapesLintRequest(
+  text: string,
+  syntax: ShaclSyntax,
+  fix = false,
+): { text: string; language: 'turtle' | 'shaclc'; fix?: boolean } | null {
+  if (!text.trim()) return null;
+  const req: { text: string; language: 'turtle' | 'shaclc'; fix?: boolean } = {
+    text,
+    language: shapesFormatLanguage(syntax),
+  };
+  if (fix) req.fix = true;
+  return req;
+}
+
 /** The editor's label for a syntax. */
 export function shapesLabel(syntax: ShaclSyntax): string {
   return syntax === 'shaclc' ? 'Shapes graph (SHACLC)' : 'Shapes graph (Turtle)';
