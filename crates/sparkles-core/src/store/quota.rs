@@ -144,14 +144,43 @@ impl Quota {
         *self.measured.lock() = None;
     }
 
-    /// A grouped commit queued `bytes` of records for its fence to write.
-    pub(crate) fn queue(&self, bytes: u64) {
-        self.queued.fetch_add(bytes, Ordering::Relaxed);
+    /// The bytes reserved for queued commits (for tests).
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> u64 {
+        self.queued.load(Ordering::Relaxed)
     }
 
-    /// A fence wrote, or failed to write, `bytes` of queued records. A written fence
-    /// counts them through [`add`](Self::add) and the preallocated space.
-    pub(crate) fn dequeue(&self, bytes: u64) {
+    /// A grouped commit queued `bytes` of records and new terms for its fence to write.
+    /// The quota counts them until the fence has written them, or until the reservation
+    /// is dropped with a commit that is never written.
+    pub(crate) fn reserve(self: &std::sync::Arc<Self>, bytes: u64) -> Reservation {
+        self.queued.fetch_add(bytes, Ordering::Relaxed);
+        Reservation {
+            quota: self.clone(),
+            bytes: AtomicU64::new(bytes),
+        }
+    }
+
+    /// A fence wrote the commits of `reservations`: their bytes leave the queued count as
+    /// the files' growth `grew` enters the measured one, with the new preallocated space
+    /// of the log and the vocabulary. One step under the measurement's lock, so that no
+    /// use of the quota counts the prefix twice or not at all.
+    pub(crate) fn written<'a>(
+        &self,
+        reservations: impl IntoIterator<Item = &'a Reservation>,
+        grew: u64,
+        preallocated: u64,
+        vocab_preallocated: u64,
+    ) {
+        let _m = self.measured.lock();
+        let released: u64 = reservations.into_iter().map(Reservation::take).sum();
+        self.dequeue(released);
+        self.add(grew);
+        self.set_preallocated(preallocated);
+        self.set_vocab_preallocated(vocab_preallocated);
+    }
+
+    fn dequeue(&self, bytes: u64) {
         let mut q = self.queued.load(Ordering::Relaxed);
         while let Err(now) = self.queued.compare_exchange_weak(
             q,
@@ -341,6 +370,28 @@ impl Store {
         let _w = self.guarded_writer();
         self.quota.set(max_bytes)?;
         Ok(self.quota.status())
+    }
+}
+
+/// Bytes of a queued grouped commit that the quota counts before its fence writes them
+/// (see [`Quota::reserve`]). Dropping it releases what was not written.
+pub(crate) struct Reservation {
+    quota: std::sync::Arc<Quota>,
+    bytes: AtomicU64,
+}
+
+impl Reservation {
+    fn take(&self) -> u64 {
+        self.bytes.swap(0, Ordering::Relaxed)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let bytes = self.take();
+        if bytes > 0 {
+            self.quota.dequeue(bytes);
+        }
     }
 }
 

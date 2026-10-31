@@ -51,8 +51,8 @@ pub(super) struct Pending {
     /// it staged for the full-text index
     pub bytes: u64,
     /// what the quota counts for the commit until its fence writes it: its records and
-    /// its new terms
-    pub queued: u64,
+    /// its new terms, released when the commit is dropped unwritten
+    pub reserved: quota::Reservation,
     pub ticket: Arc<Ticket>,
     /// what the write guard found, told to the guard once the commit is published
     pub validation: Option<Arc<crate::guard::ValidationSummary>>,
@@ -381,7 +381,10 @@ impl Coordinator {
             std::thread::scope(|sc| {
                 let annotations = std::thread::Builder::new()
                     .name("annotations-sync".into())
-                    .spawn_scoped(sc, || ann.sync_data());
+                    .spawn_scoped(sc, || {
+                        store.failpoint("group-annotations-syncing");
+                        ann.sync_data()
+                    });
                 let log = write();
                 let annotations = match annotations {
                     Ok(h) => h.join().unwrap_or_else(|_| {
@@ -394,8 +397,6 @@ impl Coordinator {
         } else {
             write()
         };
-        // the records are in the log, or will never be: the quota counts them there
-        store.quota.dequeue(batch.iter().map(|p| p.queued).sum());
         store
             .commit_stats
             .synced(SyncPath::Group, started.elapsed());
@@ -595,11 +596,12 @@ impl Store {
         let direct = written?;
         self.failpoint("group-written");
         io.end = last.wal_end;
-        self.quota.add(io.alloc - alloc_before);
-        self.quota
-            .add(dvocab.allocated().saturating_sub(vocab_before));
-        self.quota.set_preallocated(io.alloc - io.end);
-        self.quota.set_vocab_preallocated(dvocab.preallocated());
+        self.quota.written(
+            batch.iter().map(|p| &p.reserved),
+            (io.alloc - alloc_before) + dvocab.allocated().saturating_sub(vocab_before),
+            io.alloc - io.end,
+            dvocab.preallocated(),
+        );
         // A writer that checked its quota meanwhile may have walked the directory with
         // this growth in it, which the lines above counted again.
         if self.quota.measures() != measures {
@@ -794,7 +796,7 @@ impl WriteTxn<'_> {
         // number and its place in the log, and a failure poisons the writer.
         let wal_start = w.wal_len;
         w.wal_len += bytes;
-        store.quota.queue(bytes + terms);
+        let reserved = store.quota.reserve(bytes + terms);
         let snapshot = Arc::new(snapshot);
         // A compaction that is building carries this commit into its new generation. It
         // takes commits only after the writer lock's drain has made the queue durable, so
@@ -824,7 +826,7 @@ impl WriteTxn<'_> {
             tail: w.tail.clone(),
             prealloc,
             bytes: bytes + staged,
-            queued: bytes + terms,
+            reserved,
             ticket: ticket.clone(),
             validation: validation.clone(),
             annotation: annotation.clone(),
@@ -837,7 +839,6 @@ impl WriteTxn<'_> {
         w.staged = Some(snapshot);
         if let Err(e) = group.enqueue(pending) {
             w.poisoned = true;
-            store.quota.dequeue(bytes + terms);
             return Err(e);
         }
         store.failpoint("group-enqueued-writer-held");
@@ -2446,6 +2447,83 @@ mod tests {
         s.quota.remeasure();
         let measured = s.quota.used();
         assert_eq!(counted, measured, "the fence's growth was counted twice");
+    }
+
+    /// A fence releases its commits' quota reservations as it counts their growth, in one
+    /// step, even while its annotation synchronization still runs, so no writer's check
+    /// counts the prefix twice meanwhile.
+    #[test]
+    fn a_fence_releases_its_reservation_with_its_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        insert(&s, "seed").unwrap();
+        let (seen_tx, seen) = mpsc::channel();
+        s.set_failpoint(
+            "group-annotations-syncing",
+            Some(Arc::new(move |st: &Store| {
+                let until = Instant::now() + Duration::from_secs(2);
+                while st.quota.queued() > 0 && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let counted = st.quota.used();
+                st.quota.remeasure();
+                let _ = seen_tx.send((st.quota.queued(), counted, st.quota.used()));
+            })),
+        );
+        let mut t = s.write_with(
+            CommitKind::Update,
+            crate::guard::WriteOptions {
+                message: Some("annotated".into()),
+                ..Default::default()
+            },
+        );
+        let ids = t
+            .encode_quad(
+                &Quad::new(
+                    NamedNode::new("urn:annotated").unwrap(),
+                    NamedNode::new("urn:p").unwrap(),
+                    oxrdf::Literal::new_simple_literal("a new term"),
+                    GraphName::DefaultGraph,
+                ),
+                &mut Default::default(),
+            )
+            .unwrap();
+        t.insert(ids).unwrap();
+        t.commit().unwrap();
+        let (queued, counted, measured) = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(queued, 0, "the reservation outlived the fence's write");
+        assert_eq!(counted, measured, "the prefix was counted twice");
+    }
+
+    /// Commits that a failed fence discards, queued behind it or in it, release their
+    /// quota reservations.
+    #[test]
+    fn a_failed_fence_releases_the_reservations_it_discards() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        insert(&s, "seed").unwrap();
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let later: Vec<_> = ["two", "three"]
+            .into_iter()
+            .map(|n| {
+                let s = s.clone();
+                thread::spawn(move || insert(&s, n))
+            })
+            .collect();
+        queued(&s, 2);
+        assert!(s.quota.queued() > 0);
+        s.fail_next_group_sync();
+        go.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        for t in later {
+            assert!(t.join().unwrap().is_err());
+        }
+        assert_eq!(s.quota.queued(), 0);
     }
 
     /// A publisher that panics fails the prefix synchronized behind it: those commits are
