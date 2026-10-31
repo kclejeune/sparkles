@@ -1417,4 +1417,47 @@ mod callback_management {
         assert_eq!(super::super::gate::UNWIND_LEAKED.load(Ordering::SeqCst), 1);
         println!("CHILD-RETURNED");
     }
+
+    #[test]
+    fn startup_opening_and_expected_names_survive_a_refused_callback_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        cat.create("source", &Default::default()).unwrap();
+        cat.create("pending", &Default::default()).unwrap();
+        drop(cat);
+        let (cat, waiting) = Catalog::open_deferred(dir.path(), Default::default()).unwrap();
+        assert_eq!(waiting, ["pending", "source"]);
+        cat.open_registered("source").unwrap();
+        cat.expect("later").unwrap();
+        let ds = cat.get("source").unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let attached = dir.path().join("attached");
+        install(&ds, &cat, move |c| {
+            s.lock().push(c.open_registered("pending"));
+            s.lock().push(
+                c.attach_expected("later", Attach::Directory(attached.clone()))
+                    .map(drop),
+            );
+            // Both names keep their startup state for the startup code that owns them.
+            assert!(c.is_opening("pending"));
+            assert!(c.is_expected("later"));
+        });
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        for result in seen.lock().drain(..) {
+            assert!(
+                matches!(&result, Err(Error::Conflict(m)) if m.starts_with("catalog-disposing")),
+                "{result:?}"
+            );
+        }
+        assert!(cat.is_opening("pending") && cat.get("pending").is_none());
+        assert!(cat.is_expected("later") && !dir.path().join("attached").exists());
+        cat.open_registered("pending").unwrap();
+        assert!(cat.get("pending").is_some() && !cat.is_opening("pending"));
+        cat.attach_expected("later", Attach::Directory(dir.path().join("attached")))
+            .unwrap();
+        assert!(!cat.is_expected("later"));
+    }
 }

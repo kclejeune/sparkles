@@ -33,7 +33,8 @@ thread, such as create, delete or rename, fails at once with a `catalog-disposin
 same thread after releasing the catalog and before returning. A deferred call that panics
 is logged and later calls still run. Calls that deferred calls defer in turn run in the
 same loop. A reserved clone or restore publication refused this way leaves its files and
-staged directory in place. Deferred calls are kept only in memory, so callbacks
+staged directory in place. A deferred open or an expected attach refused this way keeps its name
+opening or expected for the startup code that owns it. Deferred calls are kept only in memory, so callbacks
 must be idempotent. Management calls from other threads wait for the disposal as before.
 Members closed during unwinding can skip checkpoints that require a clean close.
 The runtime retains root exclusion through required resource shutdown.
