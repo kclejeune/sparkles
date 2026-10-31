@@ -468,7 +468,7 @@ DISTINCT over input ordered on some of its columns holds one run of the first or
 column at a time instead of every row it emitted.
 
 At 10.5M on forge with eight threads, the grouping above a spilled join takes 1.5 s
-under a 4 MiB budget where it took 16.4 s, and writes 135 MB where it wrote 592 MB. A
+under a 4 MiB budget where it took 16.4 s, and writes 101 MB where it wrote 444 MB. A
 DISTINCT over input ordered on its first column holds 1.2 MB where it held 479 MB, and
 the cursor takes 174 ms where it took 800 ms. A server with spill on and the same server with spill
 off returned the same answers to all 30 synthetic queries, and their server times had

@@ -1986,32 +1986,33 @@ The spill matrix used two release builds of the mode probe, d65eaf40, the base o
 lane, and 8ca35daa, the lane through the release of finished scans. The three later
 commits are not in them. They turn spill on in `serve`, keep a LIMIT's input order and
 sum integers in 128 bits. Each run was one probe process with eight Rayon threads and
-batches of 4,096 rows, which timed the cursor and the eager plan three times each and
-compared their rows. A spilled cell set the cursor's budget and gave it a fresh directory
+batches of 4,096 rows, which ran the cursor and the eager plan once to warm up and three times to
+time them and compared their rows. A spilled cell set the cursor's budget and gave it a fresh directory
 on the local disk. The runs went in the order A, B, B, A for each query and cell. The
-table gives the median of the two runs of each binary, and all times are in milliseconds.
+table gives the median of the two runs of each binary. Times are in milliseconds,
+and the bytes written are those of one execution.
 
 | 10.5M, plain spill | Cell | Eager | Base cursor | Lane cursor | Base written | Lane written |
 |---|---|---:|---:|---:|---:|---:|
 | `ordered-join`, 917,941 groups | unlimited | 200 | 276 | 271 | 0 | 0 |
-| | 16 MiB | 200 | 732 | 708 | 74.7 MB | 55.3 MB |
-| | 4 MiB | 208 | 16,370 | **1,498** | 592.0 MB | **134.6 MB** |
+| | 16 MiB | 200 | 732 | 708 | 56.0 MB | 41.5 MB |
+| | 4 MiB | 208 | 16,370 | **1,498** | 444.0 MB | **100.9 MB** |
 | `distinct-order`, 917,941 rows | unlimited | 589 | 593 | 606 | 0 | 0 |
-| | 16 MiB | 607 | 876 | 824 | 14.7 MB | 14.7 MB |
-| | 4 MiB | 609 | 1,587 | 1,483 | 36.5 MB | 33.3 MB |
+| | 16 MiB | 607 | 876 | 824 | 11.1 MB | 11.1 MB |
+| | 4 MiB | 609 | 1,587 | 1,483 | 27.4 MB | 24.9 MB |
 | `optional`, 490,540 rows | unlimited | 134 | 158 | 159 | 0 | 0 |
-| | 16 MiB | 134 | 201 | 201 | 12.2 MB | 12.2 MB |
-| | 4 MiB | 138 | 357 | 359 | 28.9 MB | 28.9 MB |
+| | 16 MiB | 134 | 201 | 201 | 9.1 MB | 9.1 MB |
+| | 4 MiB | 138 | 357 | 359 | 21.7 MB | 21.7 MB |
 | `minus`, 76,559 rows | unlimited | 13 | 31 | 31 | 0 | 0 |
-| | 16 MiB | 13 | 59 | 41 | 5.4 MB | 2.5 MB |
-| | 4 MiB | 13 | 111 | 108 | 7.9 MB | 7.9 MB |
+| | 16 MiB | 13 | 59 | 41 | 4.0 MB | 1.9 MB |
+| | 4 MiB | 13 | 111 | 108 | 6.0 MB | 6.0 MB |
 
 *Measured on forge.*
 
 The `ordered-join` query is the grouping above a spilled join described above. Under
-4 MiB it took 1.5 s where the base took 16.4 s, and it wrote 135 MB where the base wrote
-592 MB. Under 16 MiB it took 3% less time and wrote 26% fewer bytes. The `minus` query
-at 16 MiB took 29% less time and wrote 2.5 MB where the base wrote 5.4 MB, and the
+4 MiB it took 1.5 s where the base took 16.4 s, and it wrote 101 MB where the base wrote
+444 MB. Under 16 MiB it took 3% less time and wrote 26% fewer bytes. The `minus` query
+at 16 MiB took 29% less time and wrote 1.9 MB where the base wrote 4.0 MB, and the
 `distinct-order` cells under a budget took 6% less time. The other cells moved by
 at most 3%. The unlimited cursor held 366 MB for `ordered-join`, 980 MB for
 `distinct-order`, 185 MB for `optional` and 54 MB for `minus`, and every spilled run

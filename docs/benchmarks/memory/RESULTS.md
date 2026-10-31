@@ -249,15 +249,16 @@ thus costs 1.7 to 2.8 times the time, and one near half of it costs little.
 The same probe ran four queries on forge under a budget beside the
 unlimited cursor and eager execution, and checked that the spilled rows matched the eager
 ones. It ran at 10.5M with eight threads and batches of 4,096 rows, and the table gives
-the median of two runs in the order A, B, B, A, each of which timed three rounds. The
+the median of two runs in the order A, B, B, A, each of which timed three rounds after
+one warm-up round. The last column is the bytes one execution wrote. The
 spill directory was on the local disk.
 
 | 10.5M, ms | Eager | Cursor, unlimited | Cursor, 16 MiB | Cursor, 4 MiB | Written at 4 MiB |
 |---|---:|---:|---:|---:|---:|
-| `ordered-join`, a grouping above a spilled join, 917,941 groups | **200** | 271 | 708 | 1,498 | 134.6 MB |
-| `distinct-order`, `SELECT DISTINCT … ORDER BY`, 917,941 rows | **589** | 606 | 824 | 1,483 | 33.3 MB |
-| `optional`, OPTIONAL with a filter, 490,540 rows | **134** | 159 | 201 | 359 | 28.9 MB |
-| `minus`, MINUS with a filter, 76,559 rows | **13** | 31 | 41 | 108 | 7.9 MB |
+| `ordered-join`, a grouping above a spilled join, 917,941 groups | **200** | 271 | 708 | 1,498 | 100.9 MB |
+| `distinct-order`, `SELECT DISTINCT … ORDER BY`, 917,941 rows | **589** | 606 | 824 | 1,483 | 24.9 MB |
+| `optional`, OPTIONAL with a filter, 490,540 rows | **134** | 159 | 201 | 359 | 21.7 MB |
+| `minus`, MINUS with a filter, 76,559 rows | **13** | 31 | 41 | 108 | 6.0 MB |
 
 *Measured on forge at 8ca35daa. The eager column is from the unlimited runs.*
 
@@ -265,9 +266,9 @@ The unlimited cursors held 366 MB for `ordered-join`, 980 MB for `distinct-order
 185 MB for `optional` and 54 MB for `minus`. Every spilled run stayed within its
 budget, closed with no reserved spill bytes and left its spill directory empty, and
 the cursor's rows matched the eager rows in all 88 runs. The base, d65eaf40, took
-16,370 ms and wrote 592 MB for `ordered-join` under 4 MiB, because each scan kept a
+16,370 ms and wrote 444 MB for `ordered-join` under 4 MiB, because each scan kept a
 decoded block charged after it ended and the grouping then ran one group per pass.
-Releasing the finished operators took 1,498 ms and 135 MB. A DISTINCT over input
+Releasing the finished operators took 1,498 ms and 101 MB. A DISTINCT over input
 ordered on its first column, `SELECT DISTINCT ?s ?o { ?s ?p ?o }` over 10,527,312 rows,
 took 174 ms and 1.2 MB in the cursor where the base cursor took 800 ms and 479 MB and
 the eager plan 959 ms. `--spill encrypted` added 0% to 7% to the bytes written and

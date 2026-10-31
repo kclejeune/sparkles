@@ -28,3 +28,7 @@ returned the same sorted TSV answers. In `matrix`, `matrix.sh.zst` holds the scr
 ran. The first line of each log that starts with `metrics` holds the digests of the cursor and eager rows, the budget, the peak
 and the bytes written, and `summary.md` is the output of `matrix-summary.py`. Each
 `-files-after.txt` file lists what a spilled run left in its directory, and all are empty.
+
+The `summary.md` of `matrix` divides the cumulative bytes written by three, the number of
+timed rounds. Each run also executes the cursor once to warm up, so the published figures
+divide by four. The logs and the summary keep the original numbers.
