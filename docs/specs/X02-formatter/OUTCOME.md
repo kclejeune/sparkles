@@ -181,6 +181,10 @@ shared document model.
   `tests/golden/shaclc` cover layout, wrapping at three widths, alignment, pruning,
   nested bodies, paths, strings and the ignore pragma.
 
+### Scope changes
+
+**RDF/XML formatting.** The non-goal in §1, the rejection in §4.5 and the rejected alternative in §12 of the spec excluded RDF/XML formatting, because comments and abbreviations cannot be kept without an XML syntax tree. RDF/XML formatting is now planned under [ROADMAP](../../ROADMAP.md) item 465 in the Roadmap follow-ups below. Range formatting and the formatting of SPARQL inside `sh:select` stay non-goals.
+
 ### Roadmap follow-ups
 
 #### Interop and query surfaces workstream

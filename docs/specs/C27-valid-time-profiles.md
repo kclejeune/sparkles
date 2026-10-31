@@ -37,8 +37,10 @@ truth, applicability and temporal matching remain separate decisions.
 
 The first phases do not add temporal SQL syntax, change SPARQL comparison rules,
 infer a person's travel, or treat a shortest path as a sequence of feasible timed
-movements. Time-respecting path algorithms and specialized indexes need separate
-semantics and measurements. All examples below use invented advisory identifiers.
+movements. Time-respecting path algorithms, temporal projections and specialized indexes
+need separate semantics and measurements, and they are outside the design of this
+profile. [ROADMAP](../ROADMAP.md) item 463 plans them under
+[F26](F26-temporal-paths/README.md), which specifies the semantics first. All examples below use invented advisory identifiers.
 
 ## 2. Vocabulary and coordinates
 
@@ -401,3 +403,8 @@ roadmap items 81 and 341.
 The bounded projection helper, runtime configuration, event-time UI, expiry fencing
 and analysis invalidation remain unimplemented later phases. The existing U01 slider
 continues to select recorded history.
+
+### Scope changes
+
+**Time-respecting paths and temporal projections.** The scope statement in §1 excluded time-respecting path algorithms and specialized indexes until they had separate semantics and measurements. Time-respecting paths and temporal projections are now planned under [ROADMAP](../ROADMAP.md) item 463 and [F26](F26-temporal-paths/README.md), which specifies the semantics first.
+

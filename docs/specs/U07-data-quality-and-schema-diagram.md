@@ -58,8 +58,12 @@ profiles with observed and declared cardinalities.
 - Storing full reports for every commit. Summaries and result keys are kept, and a full
   report of any readable state is one `at=` validation away.
 - Data-quality metrics beyond SHACL and ShEx results, such as completeness scores. They
-  can be expressed as shapes.
-- An ontology editor. The diagram is read-only.
+  can be expressed as shapes. Scores for completeness, consistency and freshness, and
+  numeric outlier detection, are outside the design of this spec. [ROADMAP](../ROADMAP.md)
+  item 463 plans them in the Roadmap follow-ups of [F14](F14-graph-algorithms.md).
+- An ontology editor. The diagram is read-only. Editing an ontology, including an
+  editable schema diagram, is outside the design of this spec. [ROADMAP](../ROADMAP.md)
+  item 457 plans it under [U12](U12-ontology-workbench/README.md).
 
 ## 2. User-visible behaviour
 
@@ -639,4 +643,11 @@ cost does not grow with the dataset.
 16. **Stored blank nodes as targets.** A `target` that is a stored blank node's label names
     that stored node even when the shapes come from the body, whose own blank nodes are
     local to the shapes.
+
+### Scope changes
+
+**Data-quality scores and numeric outlier detection.** The non-goal in §1 excluded data-quality metrics beyond SHACL and ShEx results, such as completeness scores. Scores per class or source and numeric outlier detection are now planned under [ROADMAP](../ROADMAP.md) item 463 in the Roadmap follow-ups of [F14](F14-graph-algorithms.md).
+
+**Ontology editing and an editable schema diagram.** The non-goal in §1 excluded an ontology editor and kept the diagram read-only. Ontology editing in the UI, including an editable schema diagram, is now planned under item 457 and [U12](U12-ontology-workbench/README.md).
+
 

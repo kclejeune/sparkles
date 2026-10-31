@@ -593,8 +593,10 @@ finding.
   Jena's `rb:violation`. Diagnostics would then sit in the inferred graph and go stale
   with it, and the data would need a violation vocabulary. Separate SPARQL checks stay
   explicit, auditable and on demand.
-- **Full OWL consistency checking** with a DL tableau reasoner. It is out of scope, and
-  it would contradict the rule that a subset checker never claims consistency.
+- **Full OWL consistency checking** with a DL tableau reasoner. It would contradict the
+  rule that a subset checker never claims consistency, so it is outside the design of
+  this spec. [ROADMAP](../ROADMAP.md) item 457 plans a bridge to external DL reasoners
+  under [F24](F24-owl-classification/README.md).
 - **Reusing `sh:ValidationReport` with `sh:conforms`.** `sh:conforms true` would read
   as a guarantee.
 
@@ -1102,6 +1104,10 @@ stored triples only, and Graph Store reads and DESCRIBE's descriptions show stor
 triples. Diagnostics still include the inferences by default only when the default graph
 is checked. Jena's ontology document manager also reads an `ont-policy.rdf`, can skip
 imports by IRI and caches models in memory, and Sparkles has none of these.
+
+### Scope changes
+
+**External OWL DL reasoner bridge.** The rejected alternative in §8 set DL consistency checking with a tableau reasoner out of scope. A bridge to external DL reasoners is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md). The diagnostics of this spec still never claim consistency.
 
 ### Roadmap follow-ups (2026-10-12)
 

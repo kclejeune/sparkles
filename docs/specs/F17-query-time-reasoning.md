@@ -68,7 +68,9 @@ materialized facts and deriving them.
    a fact limit, and fails with a clear error (§8).
 7. A decision on a Datalog surface syntax (§9).
 
-**Non-goals.** OWL 2 DL or EL reasoning. Full SPARQL entailment regimes (the SPARQL 1.1
+**Non-goals.** OWL 2 DL reasoning. OWL 2 EL classification is outside this spec's own
+design, and [ROADMAP](../ROADMAP.md) item 457 plans it under
+[F24](F24-owl-classification/README.md). Full SPARQL entailment regimes (the SPARQL 1.1
 Entailment Regimes recommendation's RDFS and OWL Direct Semantics regimes are cited for
 terminology, not implemented as such). Rules with side effects. Changing RDFS on read,
 which stays the Jena-compatible mode for RDFS. A distributed or federated reasoner.
@@ -975,6 +977,10 @@ views, and from 8 KB to 19 KB for the schema-heavy view. In two interleaved deve
 runs of `every_inferred_triple_has_a_sound_demand_tree`, the test took 214 s and 387 s
 before these changes and 107 s and 167 s after, with the host's one-minute load between
 16 and 47.
+
+### Scope changes
+
+**OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 DL or EL reasoning. OWL 2 EL classification is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md). OWL 2 DL reasoning stays a non-goal of this spec.
 
 ### Roadmap follow-ups
 

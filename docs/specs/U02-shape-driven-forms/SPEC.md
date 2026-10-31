@@ -51,7 +51,11 @@ existing merge page.
 - ShEx-driven forms. G02's schemas validate, but this spec reads SHACL only (§10).
 - SHACL-SPARQL constraints or SHACL rules in the browser. The server checks them.
 - Editing ontologies or the shapes themselves. The shapes editor of the Validate panel
-  does that.
+  does that. Editing ontologies in the UI is outside the design of this spec, and
+  [ROADMAP](../../ROADMAP.md) item 457 plans it under
+  [U12](../U12-ontology-workbench/README.md). Term editing forms for vocabulary terms
+  are also outside this design, and item 458 plans them under
+  [C30](../C30-resource-catalog/README.md).
 - Bulk editing of many resources in a table. That is a later spec.
 
 ## 2. User-visible behaviour

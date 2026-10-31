@@ -65,10 +65,11 @@ and maps.
 9. A published subset of the openCypher TCK that passes (§12).
 
 **Non-goals.** Writes (`CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`,
-`FOREACH`, `LOAD CSV`). The Bolt protocol and Neo4j driver compatibility. Procedures and
-user-defined functions, apart from three schema procedures in Phase 2. Shortest-path
-functions, which wait for the path search of F07. Spatial and full temporal support.
-Schema constraints and indexes. A stored property-graph copy of the data.
+`FOREACH`, `LOAD CSV`). The Bolt protocol and Neo4j driver compatibility are outside the
+design of this spec, and [ROADMAP](../ROADMAP.md) item 465 plans them in this spec's
+Roadmap follow-ups, after item 20. Procedures and user-defined functions, apart from
+three schema procedures in Phase 2. Shortest-path functions, which wait for the path
+search of F07. Spatial and full temporal support. Schema constraints and indexes. A stored property-graph copy of the data.
 
 ## 2. The property-graph view of RDF
 
@@ -800,8 +801,9 @@ message and a position.
 
 The Neo4j drivers, Neo4j Browser, Bloom and `cypher-shell` speak the Bolt protocol, and
 none of them can use this endpoint. Bolt needs sessions, transactions, bookmarks and
-PackStream encoding, and it makes sense only together with writes. It is out of scope
-here and would get its own spec.
+PackStream encoding, and it makes sense only together with writes. It is outside the
+design of this spec, and [ROADMAP](../ROADMAP.md) item 465 plans it in this spec's Roadmap
+follow-ups, after item 20.
 
 Clients that can use Cypher on Sparkles in Phase 1 are HTTP clients that send a query and
 read JSON. These include `curl`, scripts and notebooks, the Sparkles UI, the CLI, the MCP
@@ -1265,6 +1267,10 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Nothing is built.
+
+### Scope changes
+
+**Bolt protocol.** The non-goal in §1 excluded the Bolt protocol and Neo4j driver compatibility. Bolt is now planned under [ROADMAP](../ROADMAP.md) item 465 in this spec's Roadmap follow-ups, after item 20.
 
 ### Roadmap follow-ups (2026-10-12)
 

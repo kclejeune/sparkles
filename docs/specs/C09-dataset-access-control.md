@@ -103,7 +103,9 @@ Out of scope:
 - IdP-issued JWT access tokens on the API (Phase 2). In Phase 1, OIDC logs in the
   *browser*, and programs use Sparkles API tokens.
 - Managing users through the API. Config users are managed in the file, and external
-  identities come from the IdP or proxy.
+  identities come from the IdP or proxy. Local user and role management through the API
+  and the UI is outside the design of this spec, and [ROADMAP](../ROADMAP.md) item 466
+  plans it in this spec's Roadmap follow-ups.
 - Native TLS.
 - Per-IP rate limiting (Phase 2). Phase 1 instead bounds the cost of failed logins and
   caps pending grants.
@@ -2315,6 +2317,10 @@ Authorized operation failures emit a code without request bodies, notes, credent
 paths or raw error messages. Authentication refusals and hidden-object checks retain
 their existing access-log behavior. Events use the configured tracing output and
 filters; they do not add a separate durable audit journal.
+
+### Scope changes
+
+**Local user and role management.** The non-goal in §1.2 excluded managing users through the API, so that config users stayed in the file. Local user and role management through the API and the UI is now planned under [ROADMAP](../ROADMAP.md) item 466 in this spec's Roadmap follow-ups.
 
 ### Roadmap follow-ups (2026-10-12)
 

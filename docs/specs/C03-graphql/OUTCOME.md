@@ -190,7 +190,8 @@ and the MCP tools of stored queries come from C16 and C11 unchanged. A document 
 validated against the installed schema when stored and again when the schema changes;
 a document the new schema breaks is marked `invalid` and refuses to run.
 
-**Mutations.** §12 keeps them out of scope. A design would generate, per node type,
+**Mutations.** §12 keeps them out of this spec's design, and [ROADMAP](../../ROADMAP.md)
+item 465 plans them in the Roadmap follow-ups below. A design would generate, per node type,
 `create<T>`, `update<T>` and `delete<T>` from the same `@rdf` mapping, each compiled to
 one SPARQL update under the caller's write grant and protections, run as one commit
 per request through the guard of C10 and the previews of C15 (`dryRun: true`), with the
@@ -212,8 +213,12 @@ must bound rows produced per parent, rather than only slicing the assembled JSON
 
 Subscriptions are deferred under item 37 until a workload asks for them, and then use
 F13 as live queries. Mutations remain a separately approved design, as §12 and the follow-up
-above state. Neither conditional extension can be treated as delivered merely because
+above state, and item 465 plans them in the Roadmap follow-ups below. Neither conditional extension can be treated as delivered merely because
 Phase 2 completes, and declining one must be recorded explicitly.
+
+### Scope changes
+
+**GraphQL mutations generated from the mapping.** The non-goal in §1 and §12 of the spec kept mutations out of scope and left writes with SPARQL Update, the Graph Store Protocol and uploads. GraphQL mutations generated from the mapping are now planned under [ROADMAP](../../ROADMAP.md) item 465 in the Roadmap follow-ups below. They run as SPARQL updates under the same access rules.
 
 ### Roadmap follow-ups
 

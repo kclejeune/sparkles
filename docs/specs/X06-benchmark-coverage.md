@@ -79,8 +79,12 @@ the refresh protocol and the regression tracking.
   that needs a missing feature waits for it (Graphalytics waits for F14).
 - Tuning other engines beyond their documented settings for the workload.
 - Continuous benchmarking on every pull request. The A/B harness `scripts/nsc-bench.sh`
-  already covers relative checks of one change (§8).
+  already covers relative checks of one change (§8). Continuous per-PR benchmarking is
+  outside the design of this spec, and [ROADMAP](../ROADMAP.md) item 452 plans it in this
+  spec's Roadmap follow-ups.
 - A dashboard service. The record is JSON in the repository and the tables are Markdown.
+  A hosted dashboard is outside the design of this spec, and item 452 plans it in the
+  same Roadmap follow-ups.
 
 ## 2. Current coverage
 
@@ -283,7 +287,12 @@ Rules:
 2. An engine whose license or terms forbid publishing benchmark results is not run.
    Commercial editions (Neo4j Enterprise, GraphDB, Stardog, RDFox, Virtuoso's commercial
    edition) are out of scope unless their terms allow it and a free license for the run
-   exists. The license check is recorded in the run manifest (§6).
+   exists. The license check is recorded in the run manifest (§6). Comparisons with
+   Virtuoso Open Source and GraphDB Free, and with Blazegraph at low priority, are
+   outside the design of this spec. Comparisons with RDFox and Stardog are outside it as
+   well, and they wait for a check of their licenses for benchmark-publication clauses,
+   with the measurement kept private when publication is forbidden. [ROADMAP](../ROADMAP.md)
+   item 452 plans all of these in this spec's Roadmap follow-ups.
 3. Each engine's configuration file or command line is checked in with the suite, and
    every setting that differs from the engine's default is justified in a comment that
    cites the engine's documentation.
@@ -555,7 +564,9 @@ one ranking.
 - **One aggregate score.** A geometric mean over unlike suites hides losses. Each suite
   reports its own metrics, and the summary lists wins and losses per suite.
 - **A hosted benchmarking service.** JSON records in the repository suffice and keep the
-  history reviewable.
+  history reviewable. This spec keeps that design, and [ROADMAP](../ROADMAP.md) item 452
+  plans continuous per-PR benchmarking and a hosted dashboard in this spec's Roadmap
+  follow-ups.
 
 ## 16. Open questions
 
@@ -1732,6 +1743,12 @@ rechecked `optional-count` and `order-by-full`. Large timing spreads prevent a p
 cost claim from these Namespace results. Item 328 retains matched quiet Intel checks
 of these queries, including the small accepted `order-by-full` increase. Further
 optimization remains reserved for a material persistent cost or a simple broad fix.
+
+### Scope changes
+
+**Further engines for comparison.** The second rule in §4 left commercial editions out of scope and did not run an engine whose terms forbid publishing results. Comparisons with Virtuoso Open Source and GraphDB Free, with Blazegraph at low priority, and with RDFox and Stardog after a check of their licenses for benchmark-publication clauses, are now planned under [ROADMAP](../ROADMAP.md) item 452 in this spec's Roadmap follow-ups. A measurement stays private when publication is forbidden.
+
+**Continuous benchmarking and a hosted dashboard.** The non-goals in §1 and the rejected alternative in §15 excluded benchmarking on every pull request and a hosted dashboard service. Both are now planned under item 452 in this spec's Roadmap follow-ups.
 
 ### Roadmap follow-ups
 

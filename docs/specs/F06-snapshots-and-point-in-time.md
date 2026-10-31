@@ -69,7 +69,9 @@ This feature lets users read that history and keep it:
 * Branches, or writes at a past commit.
 * Full-text search at past commits.
 * History for in-memory datasets.
-* Remote or tiered storage of old generations.
+* Remote or tiered storage of old generations, which is outside this spec's design.
+  [ROADMAP](../ROADMAP.md) item 455 plans an object-store tier for immutable generations
+  under [X17](X17-tiered-segments/README.md).
 
 ## 2. User-visible behavior
 
@@ -1929,6 +1931,13 @@ preparation. Existing hidden-quad, pattern-row and shared-cache limits retain th
 scope. The extension covers temporary buffers, cached results and exact inherited
 origins before a bounded caller receives its view. No bounded preparation phase has
 shipped.
+
+### Scope changes
+
+**Tiered storage of old generations.** The non-goal in §1 excluded remote or tiered
+storage of old generations. [ROADMAP](../ROADMAP.md) item 455 now plans it under
+[X17](X17-tiered-segments/README.md), which fetches whole segments from object storage
+into a local disk cache and keeps memory mapping.
 
 ### Roadmap follow-ups
 

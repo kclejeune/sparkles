@@ -222,6 +222,10 @@ Measurements:
 The A10 refresh, the R2RML cases on PostgreSQL and the BSBM comparison wait for the
 PostgreSQL source and Phase 2.
 
+### Scope changes
+
+**OWL 2 QL rewriting over virtual graphs.** The non-goal in §1 of the spec excluded ontology-based query rewriting over virtual graphs, as Ontop does, and left reasoning to C08 and F17. OWL 2 QL rewriting over virtual graphs is now planned at low priority under [ROADMAP](../../ROADMAP.md) item 465 in this spec's Roadmap follow-ups.
+
 ### Roadmap follow-ups
 
 #### Interop and query surfaces workstream

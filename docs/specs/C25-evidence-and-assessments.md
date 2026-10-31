@@ -33,7 +33,10 @@ permission to assert a proposition or execute retrieved content.
 
 This feature supplies a reusable data contract and guarded operations. It does not
 define domain ontologies, a universal confidence score, probabilistic reasoning or
-automatic identity resolution. [F22](F22-analysis-lifecycle.md) owns support-set logic,
+automatic identity resolution. Probabilistic reasoning through external engines, as
+integration only, is outside the design of this profile, and [ROADMAP](../ROADMAP.md)
+item 463 plans it under [F28](F28-ml-and-probabilistic-integration/README.md).
+[F22](F22-analysis-lifecycle.md) owns support-set logic,
 analysis scheduling and dependent-result freshness. [C27](C27-valid-time-profiles.md)
 owns valid-time intervals and temporal selection. [F13](F13-incremental-views-and-provenance.md)
 and [F18](F18-explanations-and-entailment-diffs.md) own exact engine derivations and their
@@ -619,3 +622,8 @@ required before those runtime phases are complete.
 Exact retained-reference resolution additionally uses item 395 and
 [C29](C29-bounded-view-preparation/README.md) for bounded history and permission
 preparation. A point-only reader does not complete the general guarded-view contract.
+
+### Scope changes
+
+**Probabilistic reasoning through external engines.** The scope statement in §1 excluded probabilistic reasoning. Probabilistic reasoning through external engines, as integration only, is now planned under [ROADMAP](../ROADMAP.md) item 463 and [F28](F28-ml-and-probabilistic-integration/README.md). Sparkles still defines no probabilistic reasoner of its own.
+

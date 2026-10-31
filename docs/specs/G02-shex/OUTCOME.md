@@ -211,6 +211,10 @@ merged with a file are not built. A persisted typing and ShEx 2.2 (`EXTENDS`,
 `ABSTRACT`) were built on 2026-10-13, as the first of the roadmap follow-ups below
 records.
 
+### Scope changes
+
+**ShEx to SHACL translation.** The non-goal in §1 of the spec excluded ShEx-to-SHACL translation in either direction. Translating ShEx schemas to SHACL where the constructs correspond is now planned under [ROADMAP](../../ROADMAP.md) item 457, in the OWL and SHACL translation phase of the Roadmap follow-ups of [F21](../F21-ontology-api.md#roadmap-follow-ups). Translation from SHACL to ShEx stays a non-goal.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **ShEx 2.2 and a persisted typing** (item 13, Tier 2, [ROADMAP](../../ROADMAP.md)).

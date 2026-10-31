@@ -91,12 +91,15 @@ ORDER BY DESC(?rank) LIMIT 20
 - A graph catalog of mutable in-memory graphs, as GDS's `mutate` mode keeps. A projection
   belongs to one snapshot and is rebuilt from the store.
 - Machine-learning pipelines: link prediction, node classification and training of graph
-  neural networks.
+  neural networks. Sparkles does not train models. [ROADMAP](../ROADMAP.md) item 463 plans integration
+  with standard ML pipeline, model registry and collaborative-filtering tools under [F28](F28-ml-and-probabilistic-integration/README.md).
 - Distributed execution across machines.
 - Algorithms on RDF lists or on literals as nodes. Literals are not nodes of a projection,
   except as endpoints of a nested pattern's edges when the pattern binds them.
 - Incremental maintenance of algorithm results after each commit. [F13](F13-incremental-views-and-provenance.md)
-  could maintain some of them later (§13).
+  could maintain some of them later (§13). Item 463 plans incremental WCC, PageRank and
+  label propagation as maintained views in this spec's Roadmap follow-ups, after the
+  shared maintenance core of [F23](F23-reasoner-core/README.md).
 
 ## 2. User-visible behaviour
 
@@ -549,7 +552,9 @@ F01's procedures need F01 Phase 1. Graphalytics needs X06's harness.
 
 F13 could maintain WCC, label propagation and PageRank incrementally after each commit,
 as differential dataflow does for iterative computations, so that a view of components
-stays current. It is left out of this spec.
+stays current. It is left out of this spec, and [ROADMAP](../ROADMAP.md) item 463 plans
+it in this spec's Roadmap follow-ups, after the shared maintenance core of
+[F23](F23-reasoner-core/README.md).
 
 ## 14. Sources
 
@@ -1000,6 +1005,12 @@ changed, so `build` refuses a projection name that is not a valid catalog name a
 `metric` other than `jaccard` and `overlap`, with a test for each. Integer parameters
 keep their exact value. An integer literal is read as an integer, and a decimal or
 double is accepted for an integer parameter only when it is whole and at most 2^53.
+
+### Scope changes
+
+**ML pipelines, model registries and collaborative filtering.** The non-goal in §1 excluded machine-learning pipelines. Integration with standard ML tools, and nothing that trains models inside Sparkles, is now planned under [ROADMAP](../ROADMAP.md) item 463 and [F28](F28-ml-and-probabilistic-integration/README.md).
+
+**Incremental WCC, PageRank and label propagation.** The non-goal in §1 and the note in §13 left incremental maintenance of algorithm results out of this spec. Maintained views of these three algorithms are now planned under item 463 in this spec's Roadmap follow-ups, after the shared maintenance core of [F23](F23-reasoner-core/README.md).
 
 ### Roadmap follow-ups
 

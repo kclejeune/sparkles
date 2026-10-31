@@ -82,11 +82,18 @@ stays in AUDIT §5 as the record of the original scope; this spec supersedes it.
    mode is complete for, and entity views that include materialized inferences (§7).
 7. Reads and writes under the caller's view, budgets and write-time validation (§8).
 
-**Non-goals.** An OWL 2 DL reasoner, OWL 2 EL classification or any reasoning beyond what
-C08, F16 and F17 provide. Manchester syntax and OWL/XML. Re-implementing the whole
-`jena-ontapi` interface set in native code. SWRL rules. Ontology modularization,
-alignment or versioning beyond diffs between commits. Storing axioms anywhere other than
-as RDF triples in the dataset.
+**Non-goals.** An OWL 2 DL reasoner, or any reasoning beyond what C08, F16 and F17
+provide. OWL 2 EL classification and a bridge to external OWL 2 DL reasoners are outside
+the design of this spec. [ROADMAP](../ROADMAP.md) item 457 plans them under
+[F24](F24-owl-classification/README.md). Manchester syntax and OWL/XML are likewise
+outside this spec's design, and item 457 plans them in the syntaxes phase of this spec's
+Roadmap follow-ups. Re-implementing the whole `jena-ontapi` interface set in native code.
+SWRL rules are outside this spec's design. Item 456 plans DL-safe SWRL import under
+[F23](F23-reasoner-core/README.md), which runs SHACL-AF natively and translates SWRL, SPIN
+and N3 into its rule engine. Ontology modularization and alignment are outside this
+spec's design, and item 457 plans them in the module extraction and ontology matcher
+phases of this spec's Roadmap follow-ups. Versioning beyond diffs between commits.
+Storing axioms anywhere other than as RDF triples in the dataset.
 
 ## 2. User-visible behaviour
 
@@ -557,6 +564,18 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 71.
+
+### Scope changes
+
+**OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 EL classification. It is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md).
+
+**External OWL DL reasoner bridge.** The non-goal in §1 excluded an OWL 2 DL reasoner and anything beyond C08, F16 and F17. A bridge to external DL reasoners is now planned under item 457 and [F24](F24-owl-classification/README.md). A native DL reasoner stays a non-goal.
+
+**Manchester and OWL/XML syntaxes.** The non-goal in §1 excluded Manchester syntax and OWL/XML. Readers and writers for these and for functional syntax and OBO are now planned under item 457 as the syntaxes phase of this spec's Roadmap follow-ups.
+
+**Module extraction and alignment.** The non-goal in §1 excluded ontology modularization and alignment. Module extraction and an ontology matcher with SSSOM output and merge review are now planned under item 457 in this spec's Roadmap follow-ups.
+
+**SWRL import and rule frontends.** The non-goal in §1 excluded SWRL rules. Item 456 and [F23](F23-reasoner-core/README.md) now plan DL-safe SWRL import, SPIN and N3 translation into the rule engine, and native SHACL-AF rules.
 
 ### Roadmap follow-ups
 

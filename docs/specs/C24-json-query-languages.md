@@ -81,7 +81,11 @@ itself: the language here is designed for Sparkles and documented on its own, so
 neither project's changes bind the other, although simple Fluree queries translate
 mechanically (§12). JSON-LD contexts fetched from the network: a remote `@context` IRI
 is refused unless it is one of the contexts the server preloads. Datalog with
-aggregates in recursion, or with function symbols beyond Jena's builtins.
+function symbols beyond Jena's builtins. A native n-ary Datalog core with aggregates in
+recursion is outside the design of this spec, which encodes relations as triples and
+evaluates them through F17. [Roadmap](../ROADMAP.md) item 456 plans it under
+[F23](F23-reasoner-core/README.md), with stratified aggregates first and monotone
+aggregates in recursion after F23's columnar derived tier.
 
 ## 2. User-visible behaviour
 
@@ -528,6 +532,13 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 72.
+
+### Scope changes
+
+**Aggregates in recursion.** The non-goal in §1.2 excluded Datalog with aggregates in
+recursion. That capability is now planned under [ROADMAP](../ROADMAP.md) item 456 and
+[F23](F23-reasoner-core/README.md), with a native n-ary Datalog core. This spec keeps its
+triple encoding and F17 evaluation.
 
 ### Roadmap follow-ups
 

@@ -85,7 +85,9 @@ reasoning on:
    throughput (§11).
 
 **Non-goals.** Query-time derivation, which is F17. Derivation trees and explanations,
-which are F18. OWL 2 DL or EL reasoning. Distributed reasoning across machines.
+which are F18. OWL 2 DL reasoning. OWL 2 EL classification is outside this spec's own
+design, and [ROADMAP](../ROADMAP.md) item 457 plans it under
+[F24](F24-owl-classification/README.md). Distributed reasoning across machines.
 Datatype reasoning beyond `dt-not-type` and the existing `dt-diff` use in diagnostics.
 Changing the default profile or turning reasoning on by default.
 
@@ -672,6 +674,9 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
   reasoner's semi-naive engine and backward/forward maintenance are measured and exact
   today, and F13 Phase 3 is not built. This spec keeps the reasoner's own engine and
   revisits the question when F13's operator has measurements on LUBM.
+  One incremental-maintenance core shared by rules and views is outside the design of
+  this spec. [ROADMAP](../ROADMAP.md) item 456 plans it under
+  [F23](F23-reasoner-core/README.md), sequenced after the LUBM measurements of item 417.
 
 ## 14. Open questions
 
@@ -1155,6 +1160,12 @@ not run.
   candidates.
 * `examples/reasoner-bench.rs` and `examples/incremental.rs` did not gain flags. The new
   example takes `RAYON_NUM_THREADS`.
+
+### Scope changes
+
+**OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 DL or EL reasoning. OWL 2 EL classification is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md). OWL 2 DL reasoning stays a non-goal of this spec.
+
+**One maintenance core shared by rules and views.** The rejected alternative in §13 kept the reasoner on its own engine rather than moving it onto F13's fixed-point operator now. One incremental-maintenance core shared by rules and views is now planned under [ROADMAP](../ROADMAP.md) item 456 and [F23](F23-reasoner-core/README.md), sequenced after the LUBM measurements of item 417.
 
 ### Roadmap follow-ups (2026-10-18)
 

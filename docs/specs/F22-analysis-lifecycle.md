@@ -36,7 +36,9 @@ publication, reviewable replacements and durable notifications. A first implemen
 recomputes affected analyses rather than requiring a general incremental engine.
 
 This design does not add a probabilistic reasoner, a forecast model, a universal risk
-score or an automatic truth arbiter. It does not require application algorithms to run
+score or an automatic truth arbiter. Probabilistic reasoning through external engines,
+as integration only, is outside this design, and [ROADMAP](../ROADMAP.md) item 463 plans
+it under [F28](F28-ml-and-probabilistic-integration/README.md). It does not require application algorithms to run
 inside the database process. It does not replace C08's maintenance of rule closures or
 F18's proof search. A hypothesis is not a logical consequence merely because its run
 has complete provenance.
@@ -401,3 +403,8 @@ This capability is specified and unimplemented. Existing query, reasoner, algori
 GraphRAG operations retain their current behavior. The analysis records, guarded
 publication lifecycle and automatic dependency maintenance described here have not
 shipped.
+
+### Scope changes
+
+**Probabilistic reasoning through external engines.** The scope statement in §1 excluded a probabilistic reasoner. Probabilistic reasoning through external engines, as integration only, is now planned under [ROADMAP](../ROADMAP.md) item 463 and [F28](F28-ml-and-probabilistic-integration/README.md). This design still adds no reasoner of its own.
+

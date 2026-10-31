@@ -55,7 +55,10 @@ stacks. The feature provides:
 * **Executing semantic actions** beyond the specification's Test extension (§4.6). No
   JavaScript, SPARQL-generating or "Map" actions.
 * **Repair and suggestion features**, such as shexTest's `validation-contrib`.
-* **ShEx-to-SHACL translation** in either direction.
+* **ShEx-to-SHACL translation** in either direction. Translating ShEx schemas to SHACL
+  where the constructs correspond is outside the design of this spec. [ROADMAP](../../ROADMAP.md)
+  item 457 plans it in the OWL and SHACL translation phase of the Roadmap follow-ups of
+  [F21](../F21-ontology-api.md#roadmap-follow-ups).
 * **ShExR in Phase 1.** Schemas as RDF wait for Phase 2. A ShEx result vocabulary in RDF
   is out of scope, because none is standardized.
 * **Incremental write-time validation.** This waits for Phase 3. Until then the guard
