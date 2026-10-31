@@ -4970,7 +4970,9 @@ impl Store {
                 }
                 _ => {}
             }
-        } else if estimated_quads(sources) > self.opts.bulk_threshold {
+        } else if estimated_quads(sources) > self.opts.bulk_threshold
+            || streams_exceed(sources, self.opts.bulk_threshold)?
+        {
             return self.replace_bulk(target, sources, kind, o);
         }
         let mut parsed = Vec::with_capacity(sources.len());
@@ -7011,6 +7013,30 @@ fn estimated_quads(sources: &[Source]) -> u64 {
     bytes / 80
 }
 
+/// Whether the streams among `sources`, whose length is unknown, hold more than `quads`
+/// quads by the estimate of [`estimated_quads`]. Each stream is read ahead until it ends
+/// or passes its share of the estimate, about 80 bytes per quad, and the bytes read ahead
+/// are parsed later. A replacement then chooses the bounded bulk path for a large stream
+/// instead of holding all its quads in memory, and holds at most that read-ahead of a
+/// small one.
+fn streams_exceed(sources: &[Source], quads: u64) -> Result<bool> {
+    let mut bytes = 0u64;
+    for s in sources {
+        let crate::io::SourceData::Reader(r) = &s.data else {
+            continue;
+        };
+        let limit = quads.saturating_mul(80);
+        let expansion = s.codec()?.expansion().max(1);
+        let want = (limit + 1).saturating_sub(bytes).div_ceil(expansion);
+        let held = r.read_ahead(usize::try_from(want).unwrap_or(usize::MAX))? as u64;
+        bytes += held * expansion;
+        if bytes > limit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A prefix binding as [`Store::set_prefix`] accepts it: a valid name and an absolute
 /// IRI, within their length limits.
 pub fn check_prefix(prefix: &str, iri: &str) -> Result<()> {
@@ -7806,6 +7832,41 @@ pub(crate) fn replay_wal(
 mod tests {
     use super::*;
     use crate::io::RdfFormat;
+
+    #[test]
+    fn a_large_stream_replaces_through_the_bulk_path() {
+        let lines = |n: usize| {
+            (0..n)
+                .map(|i| format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let stream =
+            |n| Source::from_reader(std::io::Cursor::new(lines(n)), RdfFormat::NTriples, None);
+        // the read-ahead decides, and the stream still parses in full afterwards
+        let big = stream(1000);
+        assert!(streams_exceed(std::slice::from_ref(&big), 10).unwrap());
+        let small = stream(3);
+        assert!(!streams_exceed(std::slice::from_ref(&small), 10).unwrap());
+        assert!(
+            !streams_exceed(
+                &[Source::from_bytes(lines(1000), RdfFormat::NTriples, None)],
+                10
+            )
+            .unwrap()
+        );
+        for (src, n) in [(big, 1000u64), (small, 3)] {
+            let store = Store::in_memory(StoreOptions {
+                bulk_threshold: 10,
+                ..StoreOptions::default()
+            });
+            store
+                .load(&[Source::from_bytes(lines(5), RdfFormat::NTriples, None)])
+                .unwrap();
+            assert_eq!(store.replace(ReplaceTarget::All, &[src]).unwrap(), n);
+            assert_eq!(store.snapshot().len(), n);
+        }
+    }
 
     #[test]
     fn poisoned_writer_refuses_transaction_admission_and_vocabulary_appends() {

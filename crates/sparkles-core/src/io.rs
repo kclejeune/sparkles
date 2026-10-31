@@ -84,6 +84,33 @@ struct ReaderState {
     reader: Option<Box<dyn Read + Send>>,
 }
 
+impl ReaderState {
+    fn read_ahead(&mut self, n: usize) -> Result<usize> {
+        let ReaderState { head, reader } = self;
+        let Some(reader) = reader.as_mut() else {
+            return Err(Error::invalid("a reader source can be read only once"));
+        };
+        while head.len() < n {
+            let start = head.len();
+            head.resize(start + (n - start).min(INPUT_BUFFER_BYTES), 0);
+            match reader.read(&mut head[start..]) {
+                Ok(k) => {
+                    head.truncate(start + k);
+                    if k == 0 {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => head.truncate(start),
+                Err(e) => {
+                    head.truncate(start);
+                    return Err(crate::codec::io_error(e));
+                }
+            }
+        }
+        Ok(head.len())
+    }
+}
+
 impl ReaderSource {
     pub fn new(reader: impl Read + Send + 'static) -> ReaderSource {
         ReaderSource(Mutex::new(ReaderState {
@@ -95,21 +122,14 @@ impl ReaderSource {
     /// The first `n` bytes of the stream (fewer at its end), kept to be read again.
     fn peek(&self, n: usize) -> Result<Vec<u8>> {
         let mut state = self.0.lock();
-        let ReaderState { head, reader } = &mut *state;
-        let Some(reader) = reader.as_mut() else {
-            return Err(Error::invalid("a reader source can be read only once"));
-        };
-        let mut block = [0u8; 64];
-        while head.len() < n {
-            let want = (n - head.len()).min(block.len());
-            match reader.read(&mut block[..want]) {
-                Ok(0) => break,
-                Ok(k) => head.extend_from_slice(&block[..k]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(crate::codec::io_error(e)),
-            }
-        }
-        Ok(head[..n.min(head.len())].to_vec())
+        let len = state.read_ahead(n)?;
+        Ok(state.head[..n.min(len)].to_vec())
+    }
+
+    /// Read ahead until `n` bytes are held or the stream ends, and return how many are
+    /// held. The bytes are kept to be read again.
+    pub(crate) fn read_ahead(&self, n: usize) -> Result<usize> {
+        self.0.lock().read_ahead(n)
     }
 
     /// The whole stream, from its first byte. A second call fails.
@@ -519,7 +539,7 @@ fn load_bytes(src: &Source) -> Result<Loaded<'_>> {
     match &src.data {
         SourceData::Bytes(b) if codec == Codec::None => Ok(Loaded::Slice(b)),
         SourceData::Bytes(b) => inflate(&mut &b[..]),
-        SourceData::Reader(r) => inflate(&mut r.take()?),
+        SourceData::Reader(r) => buffer_stream(src, codec, r.take()?),
         SourceData::File(p) => {
             let mut f = File::open(p)?;
             if codec != Codec::None {
@@ -532,6 +552,32 @@ fn load_bytes(src: &Source) -> Result<Loaded<'_>> {
             }
         }
     }
+}
+
+/// The decoded bytes of a stream for the whole-document parser: in memory up to the
+/// source's buffering allowance, and in an unnamed temporary file that is mapped beyond
+/// it, so that a large stream does not have to fit in memory. The file is in the system's
+/// temporary directory and is removed when the parse ends, or by the system if the
+/// process dies.
+fn buffer_stream(src: &Source, codec: Codec, raw: Box<dyn Read + Send>) -> Result<Loaded<'_>> {
+    use std::io::Write;
+    let limit = src.buffer_limit();
+    let mut decoded = codec.reader(raw, src.max_decompressed)?;
+    let mut head = Vec::new();
+    (&mut decoded)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut head)
+        .map_err(crate::codec::io_error)?;
+    if head.len() <= limit {
+        return Ok(Loaded::Vec(head));
+    }
+    let mut spill = tempfile::tempfile()?;
+    spill.write_all(&head)?;
+    drop(head);
+    std::io::copy(&mut decoded, &mut spill).map_err(crate::codec::io_error)?;
+    spill.flush()?;
+    // SAFETY: the file is unnamed and only this process writes it, before the mapping.
+    Ok(Loaded::Map(unsafe { Mmap::map(&spill)? }))
 }
 
 /// Receives parsed quads; one sink per parallel chunk.
@@ -1018,8 +1064,9 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
                     }
                     Ok(())
                 })?;
-            // a full slot or a finished reader: the block is freed
-            let _ = spare_tx.try_send(bytes);
+            // the buffer goes back to the reader, which waits for it once both exist; a
+            // finished reader frees it
+            let _ = spare_tx.send(bytes);
         }
         Ok(())
     })?;
@@ -1042,13 +1089,22 @@ fn line_pieces(bytes: &[u8], n: usize) -> Vec<&[u8]> {
     out
 }
 
+/// The first room a block buffer gets. A buffer grows by doubling up to the block size
+/// as the input fills it, so a small input never allocates or zeroes a whole block.
+const BLOCK_START: usize = 64 << 10;
+
+/// Buffers of [`read_blocks`] alive at once: one being filled while the parser works on
+/// the other.
+const BLOCK_BUFFERS: usize = 2;
+
 /// Send `src` decompressed in blocks of at least `block` bytes that end at a line break
 /// (the last one at the end of the data), with their offsets. Stops when the receiver
 /// is gone.
 ///
-/// A block is filled into a buffer the parser has returned through `spare` when there
-/// is one. Without that, every block was a new allocation of `block` bytes, and the
-/// allocator kept several freed blocks resident while the parse went on.
+/// At most [`BLOCK_BUFFERS`] buffers exist. Once both are allocated, the next block waits
+/// for the parser to return a buffer through `spare`, so the blocks in memory are the one
+/// being parsed and the one being filled, whichever of the channel or the reader holds it.
+/// A buffer grows as it fills, from [`BLOCK_START`] bytes.
 fn read_blocks(
     src: &Source,
     codec: Codec,
@@ -1064,17 +1120,18 @@ fn read_blocks(
     let mut r = codec.reader(raw, src.max_decompressed)?;
     let mut offset = 0u64;
     let mut buf: Vec<u8> = Vec::new();
-    // bytes of `buf` read; the rest is zeroed room for the next reads, zeroed once per
-    // block (a decoder fills a few hundred KiB per call)
+    let mut allocated = 1;
+    // bytes of `buf` read; the rest of its length is zeroed room for the next reads
     let mut filled = 0;
     let mut target = block;
     let mut eof = false;
     loop {
-        if buf.len() < target {
-            buf.resize(target, 0);
-        }
         while filled < target && !eof {
-            match r.read(&mut buf[filled..target]) {
+            if filled == buf.len() {
+                let grown = buf.len().saturating_mul(2).max(BLOCK_START).min(target);
+                buf.resize(grown, 0);
+            }
+            match r.read(&mut buf[filled..]) {
                 Ok(0) => eof = true,
                 Ok(k) => filled += k,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1090,25 +1147,36 @@ fn read_blocks(
                 continue;
             }
         };
-        let mut next = spare.try_recv().unwrap_or_default();
-        next.clear();
-        next.reserve(block.max(filled - cut));
-        next.extend_from_slice(&buf[cut..filled]);
-        filled -= cut;
+        // the start of the next block's first line
+        let carry = buf[cut..filled].to_vec();
         buf.truncate(cut);
         let len = buf.len() as u64;
-        if len > 0
-            && tx
-                .send(Ok((offset, std::mem::replace(&mut buf, next))))
-                .is_err()
-        {
-            return Ok(());
+        if len > 0 {
+            if tx.send(Ok((offset, std::mem::take(&mut buf)))).is_err() {
+                return Ok(());
+            }
+            buf = if allocated < BLOCK_BUFFERS {
+                allocated += 1;
+                Vec::new()
+            } else {
+                match spare.recv() {
+                    Ok(b) => b,
+                    // the parser stopped
+                    Err(_) => return Ok(()),
+                }
+            };
         }
         offset += len;
-        target = block;
         if eof {
             return Ok(());
         }
+        // a returned buffer keeps its zeroed length as room
+        let room = buf.len().max(carry.len());
+        buf.clear();
+        buf.extend_from_slice(&carry);
+        buf.resize(room, 0);
+        filled = carry.len();
+        target = block;
     }
 }
 
@@ -1507,6 +1575,88 @@ mod tests {
             .collect();
         assert!(counts.len() > 1, "one sink took every quad: {counts:?}");
         assert!(counts.iter().all(|&c| c > 0), "{counts:?}");
+    }
+
+    #[test]
+    fn block_reading_starts_small_and_holds_two_buffers() {
+        use std::sync::mpsc::{TryRecvError, sync_channel};
+        use std::time::Duration;
+        // a tiny stream fills a small buffer, not a whole block
+        let src = Source::from_reader(
+            trickle(b"<http://e/s> <http://e/p> <http://e/o> .\n".to_vec()),
+            RdfFormat::NTriples,
+            None,
+        );
+        let (tx, rx) = sync_channel(1);
+        let (_spare_tx, spare_rx) = sync_channel(1);
+        read_blocks(&src, Codec::None, 256 << 20, &tx, &spare_rx).unwrap();
+        let (_, first) = rx.recv().unwrap().unwrap();
+        assert!(first.capacity() <= BLOCK_START, "{}", first.capacity());
+
+        // a parser that holds its block: the reader fills one more and then waits
+        let line = b"<http://e/s> <http://e/p> \"some literal\" .\n";
+        let data = line.repeat(64 * 1024 / line.len() * 8);
+        let src = Source::from_bytes(data, RdfFormat::NTriples, None);
+        let block = 64 << 10;
+        let (tx, rx) = sync_channel(1);
+        let (spare_tx, spare_rx) = sync_channel(1);
+        std::thread::scope(|scope| {
+            let src = &src;
+            scope.spawn(move || read_blocks(src, Codec::None, block, &tx, &spare_rx).unwrap());
+            let (_, held) = rx.recv().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            let (_, queued) = rx.try_recv().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                "the reader filled a third block"
+            );
+            spare_tx.send(held).unwrap();
+            let mut blocks = 2;
+            let mut back = Some(queued);
+            for msg in rx.iter() {
+                let (_, b) = msg.unwrap();
+                blocks += 1;
+                if let Some(b) = back.replace(b) {
+                    let _ = spare_tx.send(b);
+                }
+            }
+            assert!(blocks >= 4, "{blocks}");
+            drop(spare_tx);
+        });
+    }
+
+    #[test]
+    fn a_buffered_stream_past_its_allowance_is_parsed_from_a_temporary_file() {
+        let mut nt = String::new();
+        for i in 0..2000 {
+            nt += &format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n");
+        }
+        for format in [RdfFormat::NTriples, RdfFormat::Turtle, RdfFormat::RdfXml] {
+            let data = if format == RdfFormat::RdfXml {
+                let (quads, _) = parse_to_vec(&Source::from_bytes(
+                    nt.clone().into_bytes(),
+                    RdfFormat::NTriples,
+                    None,
+                ))
+                .unwrap();
+                let mut w = oxrdfio::RdfSerializer::from_format(format).for_writer(Vec::new());
+                for q in &quads {
+                    w.serialize_triple(oxrdf::TripleRef::new(&q.subject, &q.predicate, &q.object))
+                        .unwrap();
+                }
+                w.finish().unwrap()
+            } else {
+                nt.clone().into_bytes()
+            };
+            for allowance in [Some(100), Some(1 << 30)] {
+                let mut src = Source::from_reader(trickle(gzip(&data)), format, None);
+                src.parse_mode = ParseMode::Buffered;
+                src.auto_buffer_bytes = allowance;
+                let (got, _) = collect_reader(&src, 4).unwrap();
+                assert_eq!(got.len(), 2000, "{format} {allowance:?}");
+            }
+        }
     }
 
     #[test]
