@@ -2,9 +2,9 @@
 //! dataset (`sparkles://{ds}/schema`, `sparkles://{ds}/prefixes`), one per stored query
 //! the caller may run as a tool (`sparkles://{ds}/queries/{name}`), the open items of
 //! the memory review inbox of each dataset with memory settings whose inbox the caller
-//! may review (`sparkles://{ds}/memory/review`), and five prompts
+//! may review (`sparkles://{ds}/memory/review`), and eight prompts
 //! (`explore_dataset`, `answer_question`, `run_stored_query`, `ask_graph`,
-//! `explain_term`). Each lists
+//! `explain_term`, `agent_memory`, `ingest_document`, `consolidate_memory`). Each lists
 //! and reads only the datasets the caller may read. Prompt text is static apart from the
 //! dataset name, its prefixes, the definition of a stored query and the user's own
 //! arguments: no data of the dataset is put into it.

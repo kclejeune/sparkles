@@ -188,7 +188,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Without `--secrets-key`, runtime keys are sealed with a key that the server generated in
   the data directory, which does not protect them from someone who can read that
   directory. An operator who wants no keys on disk locks the secrets in the settings file.
-  Roadmap item 77.
+  Roadmap item 65.
 
 ## Configuration and usage
 
@@ -207,7 +207,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 37](../ROADMAP.md), [item 39](../ROADMAP.md), [item 69](../ROADMAP.md), [item 61](../ROADMAP.md), [item 65](../ROADMAP.md), [item 66](../ROADMAP.md), [item 71](../ROADMAP.md), [item 75](../ROADMAP.md), [item 76](../ROADMAP.md), [item 77](../ROADMAP.md), [item 342](../ROADMAP.md).
+The remaining work described above refers to [item 37](../ROADMAP.md), [item 39](../ROADMAP.md), [item 69](../ROADMAP.md), [item 61](../ROADMAP.md), [item 65](../ROADMAP.md), [item 66](../ROADMAP.md), [item 71](../ROADMAP.md), [item 75](../ROADMAP.md), [item 76](../ROADMAP.md), [item 342](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -51,8 +51,17 @@ build community reports.
   allowance across mentions. The final check also includes branch and policy metadata.
   Query memory limits govern lookup and ranking state.
 * Resources give each dataset's schema summary and prefixes and each stored query's
-  definition. The prompts `explore_dataset`, `answer_question`, `run_stored_query`,
-  `explain_term`, `agent_memory` and `ask_graph` start common workflows.
+  definition. Eight prompts start common workflows. `explore_dataset` describes the
+  server's tool workflow with the dataset's prefixes. `answer_question` answers a
+  question with bounded, verified queries. `run_stored_query` runs one of the dataset's
+  stored queries through its tool and explains its parameters. `ask_graph` grounds a
+  plain-language question in the schema and the entities, drafts and checks a query, runs
+  it, repairs it when it fails and answers from the rows. `explain_term` explains a class,
+  predicate or resource from its description and usage. `agent_memory` answers from a
+  dataset used as long-term memory and records new facts with their sources.
+  `ingest_document` turns a document into facts that cite their passages, on a branch for a
+  person to review. `consolidate_memory` proposes consolidated facts, duplicate entities
+  and conflicts from session graphs, also on a branch for review.
 
 ### Questions in plain language
 

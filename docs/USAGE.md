@@ -5824,6 +5824,51 @@ server. A delete leaves alone a copy that `sparkles migrate --keep-old` kept in
 `databases/.pre-migrate-<version>-<name>`, which must be removed by hand once it is no
 longer needed.
 
+### Library errors
+
+Every call of the library that can fail returns `sparkles::Error`. `Error::code()` gives
+a stable kebab-case name for each error, which is the same in every binding and which the
+Python and JVM exception classes are chosen from. The server answers an `Error` with the
+HTTP status in the last column. The table lists the codes of the engine's own errors.
+
+| Code | Meaning | HTTP status |
+|---|---|---|
+| `io` | An operating system I/O failure. | 500 |
+| `locked` | The directory is open in another opener, as `Error::Locked { path, pid }`. | 409 |
+| `sparql-syntax` | A SPARQL query or update that does not parse. | 400 |
+| `rdf-parse` | RDF data that does not parse. | 400 |
+| `timeout` | A request ran past its time limit. | 408 |
+| `cancelled` | A request was cancelled. | 503 |
+| `budget-exceeded` | A request passed a budget. The status is 413 for decompressed bytes, 503 when the server's query memory is in use and a retry can succeed, and 507 otherwise. | 413, 503 or 507 |
+| `unsupported` | A feature this build or dataset lacks. | 501 |
+| `invalid` | A refused argument or request. | 400 |
+| `corrupt` | An index or other stored file failed a check. | 500 |
+| `service` | A `SERVICE` call to a remote endpoint failed. | 502 |
+| `poisoned` | A write-ahead log or generation write failed, so later writes are refused until the store is reopened. | 503 |
+| `text-unavailable` | The full-text index is stale or rebuilding for the queried snapshot. | 503 |
+| `not-found` | A commit, snapshot or other named thing does not exist. | 404 |
+| `history-gone` | A commit existed but its data is no longer kept. | 410 |
+| `history-unsupported` | A past-state read that this dataset or feature cannot serve. | 501 |
+| `conflict` | The request conflicts with the current state, such as a name in use. | 409 |
+| `rejected` | Write-time validation rejected the commit and nothing was written. | 422 |
+| `guard-missing` | The dataset needs a write guard that this process has not installed. | 501 |
+| `not-permitted` | The caller lacks a permission such as outbound `SERVICE` or `LOAD`. | 403 |
+| `storage-full` | The commit would leave too little free disk space or grow an in-memory store past its limit. | 507 |
+| `precondition-failed` | A write's precondition did not hold. | 412 |
+| `writer-busy` | A write that asked not to wait would have had to wait. It can be retried. | 503 |
+| `dry-run` | A dry run stopped where the write would have committed. `preview::catch` turns it into a result. | 500 |
+| `patch` | An RDF Patch that cannot be read or applied. | 400, or 412 when `prev` is not the head |
+
+Three variants carry a code of their own instead. A branch error uses a code such as
+`no-such-branch` or `invalid-branch`, and its status is 400, 403, 404, 409, 410 or 501
+according to its kind. A managed-graph error is `profile-managed-graph` or
+`unsupported-profile` with status 409, or `managed-unavailable` with status 503. A
+component error, from a backup repository, the reasoner, the GraphQL adapter or the views
+runtime, keeps the component's own code. The server gives it status 500, except for the views
+runtime, which has its own statuses, and the reasoner's `reasoning-budget` and
+`reasoning-rules`, which are 422. A program that wants the details can downcast its
+`source`.
+
 ## Python
 
 The `sparkles` Python package embeds the same engine. It is built from

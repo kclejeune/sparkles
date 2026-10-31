@@ -160,7 +160,8 @@ On the same kind of instance, ordinary Jena use on Sparkles took 25 µs for an `
 bound triple against TDB2's 27 µs, 22 µs for a `SELECT ?o` on a subject against 23 µs,
 10 µs for an initial binding on a parsed query against 12 µs, and 52 µs for a DESCRIBE
 of one resource against 36 µs. A DELETE/INSERT WHERE on one resource in the in-memory
-store took 13 to 15 ms against TDB2's 2.3 to 3.2 ms.
+store took 4.2 ms against TDB2's 3.9 ms, as recorded in the
+[JVM bindings outcome](../../specs/P04-jvm-bindings/OUTCOME.md).
 
 *The rdflib, Node.js and Jena per-call figures use 8-vCPU AMD EPYC cloud instances.
 Runs on different instances differed by up to 30%. The native Python figures use the

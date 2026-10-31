@@ -1519,6 +1519,11 @@ Phases 1, 2 and 3 are implemented. The notes below record the implementation
 decisions and measurements. The catalog, Python handles, dataset CLI and HTTP rename
 are available. Catalog opening remains eager after the startup measurements below.
 
+Open question 8 is answered by the table of `Error::code()` values and their HTTP
+statuses under [Library errors](../USAGE.md#library-errors) in the usage guide. The
+server's own codes for backup routes and the other component errors stay with those
+routes in [API.md](../API.md#errors).
+
 ### Implementation notes
 
 * **`getGraphGroups` in Python, Node.js and the JVM.** `Dataset.graph.groups` in Python,
