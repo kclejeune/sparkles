@@ -2463,4 +2463,23 @@ mod generator_divergences {
         .collect();
         check(&s, &cases);
     }
+
+    // A deferred FILTER still links two components that share no variable. Every
+    // element that binds ?x is in the first component, so once the components meet ?x
+    // has its final value and the equality can key their join. The UNDEF row joins all
+    // n `?s :p ?x` rows and the row :o0 one of them, and each ?x meets the one ?y equal
+    // to it, so n + 1 rows come back without the n² product.
+    #[test]
+    fn a_deferred_equality_still_keys_the_join_of_two_components() {
+        let n = 200;
+        let ttl: String = (0..n)
+            .map(|i| format!(":a{i} :p :o{i} . :o{i} :q {i} .\n"))
+            .collect();
+        let s = store_with(&ttl);
+        let text = "PREFIX : <http://ex/> SELECT * WHERE { VALUES (?x ?k) { (UNDEF 1) (:o0 2) } \
+                    ?s :p ?x . ?y :q ?v FILTER(?x = ?y) }";
+        let r = query(s.snapshot(), text, &QueryOptions::default()).unwrap();
+        assert_eq!(r.rows().len(), n + 1);
+        assert!(has_op(&r.plan, "KeyedJoin"), "{:#?}", r.plan);
+    }
 }

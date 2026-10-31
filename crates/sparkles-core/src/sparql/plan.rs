@@ -3001,7 +3001,7 @@ impl<'a> Planner<'a> {
         // part of the join, when each of its variables has its final value there. A
         // variable that an element may leave unbound (a UNION branch, an OPTIONAL, a
         // failed BIND, an UNDEF of VALUES) does not, when another element can still bind
-        // it. Such a FILTER waits for the whole group.
+        // it. Such a FILTER waits until every element that binds them has joined.
         let deferred = defer_open_filters(&mut filters, &triples, &paths, &nodes, &unpacks);
 
         let mut leaves: Vec<Vec<Node>> = Vec::new();
@@ -3038,6 +3038,21 @@ impl<'a> Planner<'a> {
         for n in nodes {
             leaves.push(vec![n]);
         }
+        // A deferred FILTER whose variables only the join's leaves bind is settled once
+        // the components that hold them are planned, since a component holds every leaf
+        // that shares a variable with it. The join of the components can then still key
+        // on it. One whose variables a path, an unpack or a dependent search also binds
+        // waits for those.
+        let binds_late = |v: VarId| {
+            paths.iter().any(|p| p.s == PT::V(v) || p.o == PT::V(v))
+                || unpacks
+                    .iter()
+                    .any(|u| u.t == v || u.parts.contains(&PT::V(v)))
+                || dependent.iter().any(|n| n.vars.contains(&v))
+        };
+        let (mut settled, late): (Vec<Expr>, Vec<Expr>) = deferred
+            .into_iter()
+            .partition(|f| !f.var_set().into_iter().any(binds_late));
         if self.ctx.opt.probed_keys && leaves.len() > 1 {
             super::keyprobe::prepare(self.ctx, &leaves);
         }
@@ -3049,8 +3064,9 @@ impl<'a> Planner<'a> {
             vars.dedup();
             Node::empty(vars)
         } else {
-            self.join_order(leaves, &mut filters)?
+            self.join_order(leaves, &mut filters, &mut settled)?
         };
+        filters.append(&mut settled);
 
         // attach property paths, preferring those whose endpoint is already bound
         while !paths.is_empty() {
@@ -3106,7 +3122,7 @@ impl<'a> Planner<'a> {
                 result = filter(result, now, self.ctx);
             }
         }
-        filters.extend(deferred);
+        filters.extend(late);
         if !filters.is_empty() {
             result = filter(result, filters, self.ctx);
         }
@@ -3187,7 +3203,15 @@ impl<'a> Planner<'a> {
     }
 
     /// DP / greedy join ordering over connected components (QLever QueryPlanner).
-    fn join_order(&self, leaves: Vec<Vec<Node>>, filters: &mut Vec<Expr>) -> Result<Node> {
+    /// `settled` are FILTERs that may run only on whole components: each is placed on
+    /// the component that binds all its variables, and the rest join the `filters` of
+    /// the joins between components.
+    fn join_order(
+        &self,
+        leaves: Vec<Vec<Node>>,
+        filters: &mut Vec<Expr>,
+        settled: &mut Vec<Expr>,
+    ) -> Result<Node> {
         let n = leaves.len();
         // connected components by shared variables
         let mut comp: Vec<usize> = (0..n).collect();
@@ -3264,8 +3288,9 @@ impl<'a> Planner<'a> {
             } else {
                 self.greedy(items, filters)?
             };
-            parts.push(plan);
+            parts.push(self.place_filters(plan, settled));
         }
+        filters.append(settled);
         // components connected by a spatial conjunct are joined on it
         super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
         // cross products between components, smallest first
@@ -5325,7 +5350,8 @@ fn reorder_scan(spec: &ScanSpec, first: VarId) -> Option<ScanSpec> {
 /// [`Planner::collect_path`]); a longer range runs whole in the path operator.
 const RANGE_UNROLL: u64 = 32;
 
-/// Remove from `filters` and return those that must wait for the whole join group. A
+/// Remove from `filters` and return those that must wait until every element of the join
+/// group that binds their variables has joined (see [`Planner::join_order`]). A
 /// FILTER waits when one of its variables may be unbound in an element of the group that
 /// binds it and another element also binds it, since the join with that element can fill
 /// in the value the FILTER would test early. A variable bound in every row of each

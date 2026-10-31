@@ -466,8 +466,9 @@ variables. The planner placed a FILTER on part of the join as soon as that part 
 bind every variable of it, even when a UNION branch, an OPTIONAL, a failed BIND or an
 `UNDEF` of `VALUES` left one of them unbound and a later pattern of the group bound it.
 The FILTER then saw the variable unbound and dropped rows that SPARQL keeps. Such a
-FILTER now runs on the join of the whole group, and every other FILTER is placed as
-before.
+FILTER now runs once every pattern that binds its variables has joined. An equality
+among them still keys the join of two parts of the group that share no variable, so
+the fix adds no Cartesian product, and every other FILTER is placed as before.
 
 `{ ?x :p 1 } UNION { ?y :q 1 } ?z :r ?x FILTER(sameTerm(?x, ?y))` returns the row in
 which the second branch's `?y` meets the `?x` of `?z :r ?x` (roadmap item 433). The same
