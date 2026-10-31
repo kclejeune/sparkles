@@ -680,7 +680,7 @@ sequence and its `progress.log` records the fallback.
 | `gate.sh --fetch <rev>` | Copies and merges the results into `.artifacts/gates/main-gate-<name>-<host>/` of the main checkout. |
 | `gate.sh --hosts` | Prints each host's lock state, number of gate units and free disk. |
 | `gate.sh --host atlas <rev>` | Runs the whole gate on one host. |
-| `gate.sh --auto <rev>` | Splits when both hosts are idle and otherwise runs the whole gate on the idle host that has the disk for it. |
+| `gate.sh --auto <rev>` | Splits when both hosts are idle and otherwise runs the whole gate on the idle host that has the disk for it. With no idle host it puts ci on the shortest queue and splits only onto a helper whose queue is no longer. |
 | `gate.sh --jobs 2 --tag j2 <rev>` | Passes `--jobs 2` to `scripts/ci.sh` and names the run `<short>-j2`, so it can run beside a default run of the same commit. |
 
 The tag also applies to `--status` and `--fetch`. `GATE_HELPER=none` turns the split off,

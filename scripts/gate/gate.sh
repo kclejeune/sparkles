@@ -15,6 +15,7 @@
 #   --auto       pick the hosts from their heavy locks and gate queues (see below)
 #   --jobs N     pass --jobs N to scripts/ci.sh (default 1)
 #   --tag T      name the run <short>-T, so a second run of the same commit can coexist
+#   --dry-run    print the chosen hosts and stop before pushing or starting anything
 #
 # By default scripts/ci.sh runs on wally while the conformance suites (test:w3c, test:shacl,
 # test:shex and the plain and encrypted spill matrices) run on atlas for the same commit.
@@ -37,8 +38,9 @@
 #
 # --auto checks each gate host's ~/gate/.lock (the same file as ~/lanes/.heavy.lock) and
 # its gate-* units. With the primary and helper both idle it splits. Otherwise it runs the
-# whole gate on an idle host that has the free disk for it, and with no idle host it
-# splits as by default.
+# whole gate on an idle host that has the free disk for it. With no idle host it puts ci on
+# the host with the fewest gate units and splits only onto a helper whose queue is no
+# longer.
 set -euo pipefail
 
 self=$(readlink -f "${BASH_SOURCE[0]}")
@@ -57,6 +59,7 @@ default_helper() {
 helper=${GATE_HELPER-$(default_helper "$primary")}
 mode="wait"
 auto=0
+dry=0
 jobs=1
 tag=
 host_set=0
@@ -76,6 +79,7 @@ while [ $# -gt 0 ]; do
     --fetch) mode=fetch ;;
     --hosts) mode=hosts ;;
     --auto) auto=1 ;;
+    --dry-run) dry=1 ;;
     --host)
       primary=${2:?--host needs a host}
       host_set=1
@@ -363,14 +367,15 @@ esac
 if [ $auto = 1 ]; then
   # idle[h]=1 when h is reachable with its lock free and no gate units; full[h]=1 when h has
   # the disk for a whole gate and half[h]=1 when it has the disk for a conformance half.
-  declare -A idle=() full=() half=()
+  declare -A idle=() full=() half=() units=()
   report=
   for h in "${gate_hosts[@]}"; do
     p=$(probe "$h")
     report+="$h [$p] "
     read -r l u d <<< "$p" || true
-    idle[$h]=0 full[$h]=0 half[$h]=0
+    idle[$h]=0 full[$h]=0 half[$h]=0 units[$h]=999
     [ "$l" = unreachable ] && continue
+    units[$h]=${u:-0}
     [ "$l" = free ] && [ "${u:-0}" = 0 ] && idle[$h]=1
     [ "${d:-0}" -ge "${GATE_MIN_FREE_GB:-40}" ] && full[$h]=1
     [ "${d:-0}" -ge "${GATE_MIN_FREE_HALF_GB:-20}" ] && half[$h]=1
@@ -387,12 +392,32 @@ if [ $auto = 1 ]; then
       fi
     done
   fi
-  if [ -z "$chosen" ] && [ "$helper" != none ] && [ "${half[$helper]:-0}" = 0 ]; then helper=none; fi
+  if [ -z "$chosen" ]; then
+    # No host is idle. ci goes to the host with the shortest gate queue, and the split is
+    # kept only when a helper's queue is no longer, since the merge waits for both halves.
+    best=
+    for h in "$primary" "${gate_hosts[@]}"; do
+      [ "${full[$h]:-0}" = 1 ] || continue
+      if [ -z "$best" ] || [ "${units[$h]}" -lt "${units[$best]}" ]; then best=$h; fi
+    done
+    [ -n "$best" ] && primary=$best
+    helper=none
+    for h in "${gate_hosts[@]}"; do
+      [ "$h" != "$primary" ] && [ "${half[$h]:-0}" = 1 ] || continue
+      if [ "${units[$h]}" -le "${units[$primary]:-999}" ] && { [ "$helper" = none ] || [ "${units[$h]}" -lt "${units[$helper]}" ]; }; then
+        helper=$h
+      fi
+    done
+  fi
   echo "auto: ${report}-> primary $primary helper $helper"
   refuse_bench
   dest=$root/.artifacts/gates/main-gate-$name-$primary
 fi
 
+if [ $dry = 1 ]; then
+  echo "dry run: gate-$name primary $primary helper $helper jobs $jobs results $dest"
+  exit 0
+fi
 note=
 if [ "$helper" != none ] && ! ssh "${ssh_opts[@]}" "$helper" true 2> /dev/null; then
   note="helper $helper is unreachable; running the conformance suites on $primary after ci"
