@@ -1,4 +1,5 @@
-//! `POST /$/lint`: lint a SPARQL, Turtle or TriG document (spec X03). The JSON body is
+//! `POST /$/lint`: lint a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads,
+//! JSON-LD or SHACLC document (spec X04). RDF/XML is `415`. The JSON body is
 //! `{text, language?, rules?, fix?}`; the answer is `{language, diagnostics}`, and with
 //! `fix` also the fixed `text` and the number of fixes `applied`. Each diagnostic has
 //! its range as lines and columns and, for the editor, as UTF-16 offsets (`from`, `to`).
@@ -13,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde_json::{Value as J, json};
 use sparkles_fmt::lint::{self, LintError, LintOptions};
-use sparkles_fmt::{Detection, Language, byte_to_utf16};
+use sparkles_fmt::{Detection, Language};
 
 fn bad_request(msg: impl Into<String>) -> ApiError {
     ApiError(
@@ -62,12 +63,15 @@ pub(super) async fn lint_handler(
     let language = match obj.get("language") {
         None | Some(J::Null) => match sparkles_fmt::detect(None, &text) {
             Detection::Lang(l) => l,
+            Detection::RdfXml => return Err(rdf_xml()),
             _ => {
                 return Err(bad_request(
                     "cannot tell the language of the text: set `language`",
                 ));
             }
         },
+        // a language the linter knows and does not take, as opposed to an unknown name
+        Some(J::String(n)) if n.eq_ignore_ascii_case("rdfxml") => return Err(rdf_xml()),
         Some(J::String(n)) => Language::from_name(n).ok_or_else(|| {
             bad_request(format!(
                 "unknown language '{n}': sparql, turtle, trig, ntriples, nquads, jsonld or shaclc"
@@ -110,14 +114,14 @@ pub(super) async fn lint_handler(
                     "language": language.name(),
                     "text": f.text,
                     "applied": f.applied,
-                    "diagnostics": f.diagnostics.iter().map(|d| diagnostic(&f.text, d)).collect::<Vec<J>>(),
+                    "diagnostics": diagnostics(&f.text, &f.diagnostics),
                 })
             })
         } else {
             lint::lint(&text, language, &opts).map(|l| {
                 json!({
                     "language": language.name(),
-                    "diagnostics": l.diagnostics.iter().map(|d| diagnostic(&text, d)).collect::<Vec<J>>(),
+                    "diagnostics": diagnostics(&text, &l.diagnostics),
                 })
             })
         })
@@ -127,6 +131,11 @@ pub(super) async fn lint_handler(
     Ok(axum::Json(j).into_response())
 }
 
+/// `415` with `code: "unsupported-language"`: RDF/XML is not linted.
+fn rdf_xml() -> ApiError {
+    lint_error(&LintError::UnsupportedLanguage("RDF/XML"))
+}
+
 fn timed_out() -> ApiError {
     err(
         StatusCode::REQUEST_TIMEOUT,
@@ -134,10 +143,54 @@ fn timed_out() -> ApiError {
     )
 }
 
+/// The findings as JSON, their UTF-16 offsets counted in one pass over the text.
+fn diagnostics(text: &str, found: &[lint::Diagnostic]) -> Vec<J> {
+    let u16 = Utf16::new(text, found);
+    found.iter().map(|d| diagnostic(&u16, d)).collect()
+}
+
+/// The UTF-16 offsets of the byte offsets of some findings and their fixes, counted in
+/// one pass over the text rather than from its start for each offset.
+pub(crate) struct Utf16 {
+    at: std::collections::HashMap<usize, usize>,
+}
+
+impl Utf16 {
+    pub(crate) fn new(text: &str, found: &[lint::Diagnostic]) -> Utf16 {
+        let mut offsets: Vec<usize> = Vec::with_capacity(found.len() * 2);
+        for d in found {
+            offsets.extend([d.start, d.end]);
+            if let Some(f) = &d.fix {
+                offsets.extend(f.edits.iter().flat_map(|e| [e.start, e.end]));
+            }
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        let mut at = std::collections::HashMap::with_capacity(offsets.len());
+        let (mut byte, mut units) = (0, 0);
+        for o in offsets {
+            let mut b = o.min(text.len());
+            while !text.is_char_boundary(b) {
+                b -= 1;
+            }
+            if b > byte {
+                units += text[byte..b].encode_utf16().count();
+                byte = b;
+            }
+            at.insert(o, units);
+        }
+        Utf16 { at }
+    }
+
+    fn get(&self, text_offset: usize) -> usize {
+        self.at[&text_offset]
+    }
+}
+
 /// A finding as JSON: lines and columns, `from` and `to` in UTF-16 code units, and the
-/// fix of a rule whose fixes are safe.
-pub(crate) fn diagnostic(text: &str, d: &lint::Diagnostic) -> J {
-    let u16 = |b: usize| byte_to_utf16(text, b);
+/// fix of a rule whose fixes are safe. `utf16` holds the finding's offsets.
+pub(crate) fn diagnostic(utf16: &Utf16, d: &lint::Diagnostic) -> J {
+    let u16 = |b: usize| utf16.get(b);
     let mut j = json!({
         "rule": d.rule,
         "severity": d.severity.name(),

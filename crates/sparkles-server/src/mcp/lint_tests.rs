@@ -196,7 +196,7 @@ async fn results_respect_max_bytes() {
     assert_eq!(r["counts"]["warning"], 300);
     let shown = r["diagnostics"].as_array().unwrap().len();
     assert!(shown > 0 && shown < 300, "{shown}");
-    assert!(r.to_string().len() <= 4096 + 512, "{}", r.to_string().len());
+    assert!(r.to_string().len() <= 4096, "{}", r.to_string().len());
     // a fixed text that does not fit is refused, as the formatter's is
     let (text, meta) = c
         .error(
@@ -205,4 +205,33 @@ async fn results_respect_max_bytes() {
         )
         .await;
     assert_eq!(meta, json!({"code": "too-large", "status": 413}), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fixed_text_is_budgeted_as_serialized() {
+    // the raw text fits the cap, but its JSON escapes do not
+    let cfg = McpConfig {
+        max_bytes: 4096,
+        ..McpConfig::default()
+    };
+    let mut c = Client::start(server_with(&[], cfg));
+    let text = format!("ASK {{}} #{}", "\"".repeat(3000));
+    assert!(text.len() < 4096);
+    let (msg, meta) = c
+        .error(
+            "lint",
+            json!({"text": text, "language": "sparql", "fix": true}),
+        )
+        .await;
+    assert_eq!(meta, json!({"code": "too-large", "status": 413}), "{msg}");
+    // a fixed text that fits leaves the findings what is left, escapes and all
+    let text = format!("PREFIX u: <http://u/>\nASK {{}} #{}", "\"".repeat(1500));
+    let r = c
+        .structured(
+            "lint",
+            json!({"text": text, "language": "sparql", "fix": true}),
+        )
+        .await;
+    assert_eq!(r["applied"], 1, "{r}");
+    assert!(r.to_string().len() <= 4096, "{}", r.to_string().len());
 }

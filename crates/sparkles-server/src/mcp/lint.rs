@@ -1,8 +1,10 @@
 //! The `lint` tool: lint a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads,
 //! JSON-LD or SHACLC document with the rules of `sparkles lint` and `POST /$/lint`,
 //! including the SPARQL inside SHACL literals. It reads no dataset and writes nothing. The
-//! input is capped at 1 MiB of text, the findings and the fixed text at the server's
-//! `--mcp-max-bytes`, and the call runs within its timeout.
+//! input is capped at 1 MiB of text, and the result at the server's `--mcp-max-bytes`,
+//! measured as the structured content is serialized: a fixed text whose escaped form does
+//! not fit is refused, and the findings fill what is left. The call runs within its
+//! timeout.
 
 use super::Outcome;
 use super::errors::{ToolError, secs};
@@ -89,46 +91,52 @@ impl Tools<'_> {
         // the findings describe the fixed text when there is one
         let text = fixed.as_deref().unwrap_or(&a.text);
         let max = self.cfg().max_bytes;
-        if fixed.as_ref().is_some_and(|f| f.len() > max) {
-            return Err(ToolError::new(
-                "too-large",
-                413,
-                format!(
-                    "the fixed text has {} bytes, more than the {max} bytes a result may have",
-                    text.len(),
-                ),
-            )
-            .hint("lint the document in parts, or use `sparkles lint --fix` on the file"));
-        }
         let mut counts = json!({"error": 0, "warning": 0, "info": 0, "hint": 0});
         for d in &diagnostics {
             let n = &mut counts[d.severity.name()];
             *n = json!(n.as_u64().unwrap_or(0) + 1);
         }
-        // the findings fit what is left of the cap after the fixed text and the framing
-        let mut room = max.saturating_sub(fixed.as_ref().map_or(0, String::len) + 256);
+        // the result without findings, as it is serialized, escapes included, and with
+        // `truncated` counted whether or not it is set
+        let mut out = json!({
+            "language": lang.name(),
+            "diagnostics": [],
+            "total": diagnostics.len(),
+            "counts": counts,
+            "truncated": true,
+        });
+        if let Some(f) = &fixed {
+            out["fixed"] = json!(f);
+            out["applied"] = json!(applied);
+        }
+        let frame = serialized_len(&out);
+        if frame > max {
+            return Err(ToolError::new(
+                "too-large",
+                413,
+                format!(
+                    "the result with the fixed text has {frame} bytes, more than the {max} bytes a result may have"
+                ),
+            )
+            .hint("lint the document in parts, or use `sparkles lint --fix` on the file"));
+        }
+        // the findings fit what is left, each with the comma before it
+        let mut room = max - frame;
         let mut shown: Vec<Value> = Vec::new();
+        let utf16 = crate::http::lint::Utf16::new(text, &diagnostics);
         for d in &diagnostics {
-            let j = crate::http::lint::diagnostic(text, d);
-            let size = j.to_string().len() + 1;
+            let j = crate::http::lint::diagnostic(&utf16, d);
+            let size = serialized_len(&j) + usize::from(!shown.is_empty());
             if size > room {
                 break;
             }
             room -= size;
             shown.push(j);
         }
-        let mut out = json!({
-            "language": lang.name(),
-            "diagnostics": shown,
-            "total": diagnostics.len(),
-            "counts": counts,
-        });
-        if shown_len(&out) < diagnostics.len() {
-            out["truncated"] = json!(true);
-        }
-        if let Some(f) = fixed {
-            out["fixed"] = json!(f);
-            out["applied"] = json!(applied);
+        let truncated = shown.len() < diagnostics.len();
+        out["diagnostics"] = Value::Array(shown);
+        if !truncated && let Some(o) = out.as_object_mut() {
+            o.remove("truncated");
         }
         Ok(Outcome::Structured(out))
     }
@@ -157,6 +165,19 @@ impl Tools<'_> {
     }
 }
 
-fn shown_len(out: &Value) -> usize {
-    out["diagnostics"].as_array().map_or(0, Vec::len)
+/// The length of `v` as compact JSON, counted without building the string.
+fn serialized_len(v: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    serde_json::to_writer(&mut c, v).expect("a JSON value serializes");
+    c.0
 }
