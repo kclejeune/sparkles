@@ -3576,28 +3576,31 @@ fn run() -> Result<()> {
                 "auto" => None,
                 c => Some(sparkles::codec::Codec::parse(c)?),
             };
-            let sources = files
-                .iter()
-                .zip(&prepared.names)
-                .zip(&prepared.converted)
-                .map(|((f, name), &converted)| -> Result<Source> {
-                    let mut s = Source::from_path(f, g.clone())?;
-                    s.name = name.clone();
-                    // a converted table is plain N-Triples
-                    s.compression = if converted { None } else { explicit };
-                    s.lenient = lenient;
-                    s.parse_mode = parse_mode;
-                    s.auto_buffer_bytes = auto_buffer_bytes;
-                    if jsonld_streaming
-                        && let oxrdfio::RdfFormat::JsonLd { profile } = &mut s.format
-                    {
-                        *profile |= oxrdfio::JsonLdProfile::Streaming;
-                    }
-                    // fail before loading anything
-                    s.codec()?;
-                    Ok(s)
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let sources =
+                files
+                    .iter()
+                    .zip(&prepared.names)
+                    .zip(&prepared.converted)
+                    .map(|((f, name), &converted)| -> Result<Source> {
+                        let mut s = Source::from_path(f, g.clone())?;
+                        s.name = name.clone();
+                        // a converted table is plain N-Triples
+                        s.compression = if converted { None } else { explicit };
+                        s.lenient = lenient;
+                        s.parse_mode = parse_mode;
+                        s.auto_buffer_bytes = auto_buffer_bytes;
+                        if jsonld_streaming
+                            && let sparkles::io::RdfSyntax::Rdf(oxrdfio::RdfFormat::JsonLd {
+                                profile,
+                            }) = &mut s.format
+                        {
+                            *profile |= oxrdfio::JsonLdProfile::Streaming;
+                        }
+                        // fail before loading anything
+                        s.codec()?;
+                        Ok(s)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             let t = Instant::now();
             let before = store.snapshot().len();
             let wopts = sparkles::guard::WriteOptions {

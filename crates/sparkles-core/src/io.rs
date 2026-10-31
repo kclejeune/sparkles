@@ -2,6 +2,7 @@
 
 use crate::codec::Codec;
 use crate::error::{Error, Result};
+use crate::jena_formats::JenaFormat;
 use memmap2::Mmap;
 use oxrdf::{GraphName, NamedNode, Quad};
 pub use oxrdfio::RdfFormat;
@@ -57,9 +58,100 @@ pub enum SourceData {
     Bytes(Vec<u8>),
 }
 
+/// A W3C syntax or one of Jena's. Both [`RdfFormat`] and [`JenaFormat`] convert into it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RdfSyntax {
+    Rdf(RdfFormat),
+    Jena(JenaFormat),
+}
+
+impl RdfSyntax {
+    /// The syntax of a file path by its extension, looking past a compression extension
+    /// (`data.trix.gz`, `data.ttl.zst`).
+    pub fn from_path(path: &Path) -> Option<RdfSyntax> {
+        JenaFormat::from_path(path)
+            .map(RdfSyntax::Jena)
+            .or_else(|| format_for_path(path).map(|(f, _)| RdfSyntax::Rdf(f)))
+    }
+
+    /// The syntax of a media type or a format name (`ttl`, `nquads`, `trix`, `thrift`,
+    /// `rdf/json`, `application/rdf+protobuf`, …), in any case. A media type may carry
+    /// parameters.
+    pub fn from_name(name: &str) -> Option<RdfSyntax> {
+        JenaFormat::from_name(name)
+            .map(RdfSyntax::Jena)
+            .or_else(|| {
+                crate::sparql::results::rdf_format_from_name(name)
+                    .or_else(|| format_for_media_type(name))
+                    .map(RdfSyntax::Rdf)
+            })
+    }
+
+    /// The syntax of a file extension without its dot (`ttl`, `nq`, `trix`, `rt`, `rj`).
+    pub fn from_extension(ext: &str) -> Option<RdfSyntax> {
+        let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+        JenaFormat::from_file_name(&format!("x.{ext}"))
+            .map(RdfSyntax::Jena)
+            .or_else(|| {
+                format_for_path(Path::new(&format!("x.{ext}"))).map(|(f, _)| RdfSyntax::Rdf(f))
+            })
+    }
+
+    /// The W3C syntax, when it is one.
+    pub fn rdf(self) -> Option<RdfFormat> {
+        match self {
+            RdfSyntax::Rdf(f) => Some(f),
+            RdfSyntax::Jena(_) => None,
+        }
+    }
+
+    /// Jena's syntax, when it is one.
+    pub fn jena(self) -> Option<JenaFormat> {
+        match self {
+            RdfSyntax::Rdf(_) => None,
+            RdfSyntax::Jena(j) => Some(j),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RdfSyntax::Rdf(f) => f.name(),
+            RdfSyntax::Jena(j) => j.name(),
+        }
+    }
+
+    /// The media type, without parameters.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            RdfSyntax::Rdf(f) => f.media_type(),
+            RdfSyntax::Jena(j) => j.media_type(),
+        }
+    }
+
+    /// Whether the syntax holds named graphs.
+    pub fn supports_datasets(self) -> bool {
+        match self {
+            RdfSyntax::Rdf(f) => f.supports_datasets(),
+            RdfSyntax::Jena(j) => j.quads(),
+        }
+    }
+}
+
+impl From<RdfFormat> for RdfSyntax {
+    fn from(f: RdfFormat) -> RdfSyntax {
+        RdfSyntax::Rdf(f)
+    }
+}
+
+impl From<JenaFormat> for RdfSyntax {
+    fn from(j: JenaFormat) -> RdfSyntax {
+        RdfSyntax::Jena(j)
+    }
+}
+
 pub struct Source {
     pub data: SourceData,
-    pub format: RdfFormat,
+    pub format: RdfSyntax,
     /// The compression of the data: `None` detects it (magic bytes, then the file
     /// extension); a codec is checked against the magic bytes.
     pub compression: Option<Codec>,
@@ -85,18 +177,34 @@ pub struct Source {
     /// such as DBpedia's whose IRIs are not all valid RFC 3987 IRIs. Syntax errors still
     /// fail.
     pub lenient: bool,
+    /// The source is one graph, as the body of a Graph Store write is. A quad in a named
+    /// graph in one of Jena's syntaxes is then a parse error, as Jena's graph readers
+    /// refuse it. The W3C quad syntaxes keep their named graphs either way.
+    pub triples_only: bool,
 }
 
 impl Source {
     fn buffer_limit(&self) -> usize {
-        self.auto_buffer_bytes.unwrap_or(match self.format {
-            RdfFormat::Turtle | RdfFormat::TriG => TURTLE_AUTO_BUFFER_BYTES,
+        self.auto_buffer_bytes.unwrap_or(match self.format.rdf() {
+            Some(RdfFormat::Turtle | RdfFormat::TriG) => TURTLE_AUTO_BUFFER_BYTES,
             _ => AUTO_BUFFER_BYTES,
         })
     }
 
+    /// The W3C syntax of the source, for the parsers of [`RdfFormat`]. Jena's syntaxes
+    /// are read by [`parse_jena`] and never reach those.
+    fn rdf_format(&self) -> Result<RdfFormat> {
+        self.format.rdf().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{}: {} has no document parser",
+                self.name,
+                self.format.name()
+            ))
+        })
+    }
+
     pub fn from_path(path: &Path, graph: Option<NamedNode>) -> Result<Source> {
-        let (format, _) = format_for_path(path).ok_or_else(|| {
+        let format = RdfSyntax::from_path(path).ok_or_else(|| {
             Error::invalid(format!("cannot determine RDF format of {}", path.display()))
         })?;
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -111,13 +219,18 @@ impl Source {
             base: Some(format!("file://{}", abs.display())),
             name: path.display().to_string(),
             lenient: false,
+            triples_only: false,
         })
     }
 
-    pub fn from_bytes(bytes: Vec<u8>, format: RdfFormat, graph: Option<NamedNode>) -> Source {
+    pub fn from_bytes(
+        bytes: Vec<u8>,
+        format: impl Into<RdfSyntax>,
+        graph: Option<NamedNode>,
+    ) -> Source {
         Source {
             data: SourceData::Bytes(bytes),
-            format,
+            format: format.into(),
             compression: None,
             parse_mode: ParseMode::Auto,
             auto_buffer_bytes: None,
@@ -126,6 +239,7 @@ impl Source {
             base: None,
             name: "<request body>".into(),
             lenient: false,
+            triples_only: false,
         }
     }
 
@@ -349,10 +463,17 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     parallelism: usize,
     make_sink: F,
 ) -> Result<BTreeMap<String, String>> {
+    if let Some(j) = src.format.jena() {
+        // Thrift and Protobuf streams have no record boundaries to split at, and TriX
+        // and RDF/JSON are documents: one decoder feeds the loader's sinks.
+        parse_jena_bulk(src, j, parallelism, make_sink)?;
+        return Ok(BTreeMap::new());
+    }
+    let format = src.rdf_format()?;
     let parser = source_parser(src)?;
     let codec = src.codec()?;
     let buffer_limit = src.buffer_limit();
-    let line_based = matches!(src.format, RdfFormat::NTriples | RdfFormat::NQuads);
+    let line_based = matches!(format, RdfFormat::NTriples | RdfFormat::NQuads);
     if src.parse_mode == ParseMode::Streaming {
         let mut sink = make_sink();
         let prefixes = parse_reader(src, parser, source_reader(src, codec)?, |q| sink.quad(q))?;
@@ -372,7 +493,7 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
         return Ok(BTreeMap::new());
     }
     let splittable = matches!(
-        src.format,
+        format,
         RdfFormat::NTriples | RdfFormat::NQuads | RdfFormat::Turtle
     );
     let mapped_size = match &src.data {
@@ -434,7 +555,7 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
 }
 
 fn source_parser(src: &Source) -> Result<RdfParser> {
-    let mut parser = RdfParser::from_format(src.format);
+    let mut parser = RdfParser::from_format(src.rdf_format()?);
     if let Some(base) = &src.base {
         parser = parser
             .with_base_iri(base.clone())
@@ -496,9 +617,13 @@ pub fn parse_source_into(
     src: &Source,
     sink: impl FnMut(Quad) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
+    if let Some(j) = src.format.jena() {
+        parse_jena(src, j, sink)?;
+        return Ok(BTreeMap::new());
+    }
     if src.parse_mode == ParseMode::Buffered {
         let bytes = load_bytes(src)?;
-        crate::nesting::check(src.format, bytes.as_ref(), &src.name)?;
+        crate::nesting::check(src.rdf_format()?, bytes.as_ref(), &src.name)?;
         let mut parsed = source_parser(src)?.for_slice(bytes.as_ref());
         let mut sink = sink;
         for q in parsed.by_ref() {
@@ -517,13 +642,124 @@ pub fn parse_source_into(
     )
 }
 
+/// Read a source in one of Jena's syntaxes into a callback, straight from the
+/// decompressing reader. A TriX document resolves relative IRIs against the source's
+/// base, and triples in the default graph go to the source's graph, as the W3C syntaxes
+/// do. Byte budgets and codec failures keep their own errors.
+fn parse_jena(
+    src: &Source,
+    format: JenaFormat,
+    mut sink: impl FnMut(Quad) -> Result<()>,
+) -> Result<()> {
+    crate::jena_formats::read_into(
+        format,
+        source_reader(src, src.codec()?)?,
+        src.base.as_deref(),
+        &src.name,
+        |mut q| {
+            if src.triples_only && q.graph_name != GraphName::DefaultGraph {
+                return Err(Error::RdfParse(format!(
+                    "{}: {} body for a graph holds a quad in graph {}",
+                    src.name,
+                    format.name(),
+                    q.graph_name
+                )));
+            }
+            if let (GraphName::DefaultGraph, Some(g)) = (&q.graph_name, &src.graph) {
+                q.graph_name = GraphName::NamedNode(g.clone());
+            }
+            sink(q)
+        },
+    )
+}
+
+/// Quads a decoder hands to the sinks at once.
+const JENA_BATCH: usize = 4096;
+
+/// Read a source in one of Jena's syntaxes with one decoder, and encode its quads on
+/// `parallelism` sinks. A Thrift or Protobuf stream has no record boundaries to split
+/// at, so the decoder runs alone on the calling thread and passes batches of quads through
+/// a bounded channel to sinks that each run on a thread of their own. The loader's
+/// encoding and sorting are most of the work, so they stay parallel.
+fn parse_jena_bulk<S: QuadSink, F: Fn() -> S + Sync>(
+    src: &Source,
+    format: JenaFormat,
+    parallelism: usize,
+    make_sink: F,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let workers = parallelism.max(1);
+    if workers == 1 {
+        let mut sink = make_sink();
+        parse_jena(src, format, |q| sink.quad(q))?;
+        return sink.finish();
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Quad>>(workers * 2);
+    let rx = Mutex::new(rx);
+    let failed = AtomicBool::new(false);
+    let failure: Mutex<Option<Error>> = Mutex::new(None);
+    let mut decoded = Ok(());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let mut sink = make_sink();
+                let mut result = Ok(());
+                loop {
+                    // one sink waits for the next batch while the others encode
+                    let Ok(batch) = rx.lock().recv() else { break };
+                    if result.is_err() {
+                        // keep draining, so that the decoder never blocks on a full channel
+                        continue;
+                    }
+                    for q in batch {
+                        if let Err(e) = sink.quad(q) {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
+                let result = result.and_then(|()| sink.finish());
+                if let Err(e) = result {
+                    failed.store(true, Ordering::Relaxed);
+                    failure.lock().get_or_insert(e);
+                }
+            });
+        }
+        let mut batch = Vec::with_capacity(JENA_BATCH);
+        decoded = parse_jena(src, format, |q| {
+            if failed.load(Ordering::Relaxed) {
+                // a sink failed: stop decoding, its error is the one to report
+                return Err(Error::Cancelled);
+            }
+            batch.push(q);
+            if batch.len() == JENA_BATCH {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(JENA_BATCH));
+                tx.send(full).map_err(|_| Error::Cancelled)?;
+            }
+            Ok(())
+        });
+        if decoded.is_ok() && !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+        drop(tx);
+    });
+    match (failure.into_inner(), decoded) {
+        (Some(e), _) => Err(e),
+        (None, decoded) => decoded,
+    }
+}
+
 fn parse_reader(
     src: &Source,
     parser: RdfParser,
     reader: impl Read,
     mut sink: impl FnMut(Quad) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
-    let mut parsed = parser.for_reader(crate::nesting::Guarded::rdf(reader, src.format, &src.name));
+    let mut parsed = parser.for_reader(crate::nesting::Guarded::rdf(
+        reader,
+        src.rdf_format()?,
+        &src.name,
+    ));
     for q in parsed.by_ref() {
         let q = q.map_err(|e| match e {
             oxrdfio::RdfParseError::Io(e) => crate::codec::io_error(e),
@@ -544,10 +780,11 @@ fn parse_slice<S: QuadSink, F: Fn() -> S + Sync>(
     parallelism: usize,
     make_sink: F,
 ) -> Result<BTreeMap<String, String>> {
-    crate::nesting::check(src.format, slice, &src.name)?;
+    let format = src.rdf_format()?;
+    crate::nesting::check(format, slice, &src.name)?;
     let prefixes = Mutex::new(BTreeMap::new());
     let splittable = matches!(
-        src.format,
+        format,
         RdfFormat::NTriples | RdfFormat::NQuads | RdfFormat::Turtle
     );
     let n = if splittable {
@@ -603,6 +840,7 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
     make_sink: F,
 ) -> Result<()> {
     let codec = src.codec()?;
+    let format = src.rdf_format()?;
     let parallelism = parallelism.max(1);
     let mut sinks: Vec<S> = Vec::new();
     std::thread::scope(|scope| -> Result<()> {
@@ -621,7 +859,7 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
             // are checked in parallel pieces
             line_pieces(&bytes, n)
                 .into_par_iter()
-                .try_for_each(|p| crate::nesting::check(src.format, p, &src.name))?;
+                .try_for_each(|p| crate::nesting::check(format, p, &src.name))?;
             let parsers = parser.clone().split_slice_for_parallel_parsing(&bytes, n);
             while sinks.len() < parsers.len() {
                 sinks.push(make_sink());

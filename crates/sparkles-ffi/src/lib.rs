@@ -70,7 +70,7 @@ use read::SnapReader;
 use sparkles::Dataset;
 use sparkles::embed::TxnWorker;
 use sparkles::id::Id;
-use sparkles::io::{RdfFormat, Source};
+use sparkles::io::{RdfSyntax, Source};
 use sparkles::store::{Snapshot, StoreOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -378,7 +378,8 @@ impl FfiDataset {
         )?))
     }
 
-    /// Bulk-load files in one commit; the format is taken from each file's extension.
+    /// Bulk-load files in one commit; the format is taken from each file's extension,
+    /// Jena's syntaxes included.
     /// Triples go to `graph` when it is given. Blank node labels are scoped to the load.
     pub fn load_files(&self, paths: Vec<String>, graph: Option<String>) -> FfiResult<Receipt> {
         self.inner.check_writable()?;
@@ -390,7 +391,9 @@ impl FfiDataset {
         Ok((&self.inner.ds.load_sources_receipt(sources)?).into())
     }
 
-    /// Load RDF data in one commit. `format` is a media type or a file extension.
+    /// Load RDF data in one commit. `format` is a media type, a format name or a file
+    /// extension, for a W3C syntax or for Jena's TriX, RDF Thrift, RDF Protobuf and
+    /// RDF/JSON.
     pub fn load_bytes(
         &self,
         data: Vec<u8>,
@@ -399,8 +402,8 @@ impl FfiDataset {
         graph: Option<String>,
     ) -> FfiResult<Receipt> {
         self.inner.check_writable()?;
-        let f = RdfFormat::from_media_type(&format)
-            .or_else(|| RdfFormat::from_extension(format.trim_start_matches('.')))
+        let f = RdfSyntax::from_name(&format)
+            .or_else(|| RdfSyntax::from_extension(&format))
             .ok_or_else(|| {
                 FfiError::new(
                     ErrorKind::Unsupported,

@@ -2784,7 +2784,7 @@ impl Spooled {
     /// The body as an RDF source, and the temporary file to keep until it is read.
     fn into_source(
         self,
-        format: RdfFormat,
+        format: impl Into<sparkles::io::RdfSyntax>,
         graph: Option<oxrdf::NamedNode>,
         max_decompressed: Option<u64>,
     ) -> (Source, Option<tempfile::NamedTempFile>) {
@@ -2794,138 +2794,12 @@ impl Spooled {
                 s.max_decompressed = max_decompressed;
                 (s, None)
             }
-            Spooled::File(f) => (
-                Source {
-                    data: sparkles::io::SourceData::File(f.path().to_path_buf()),
-                    format,
-                    compression: None,
-                    parse_mode: sparkles::io::ParseMode::Auto,
-                    auto_buffer_bytes: None,
-                    max_decompressed,
-                    graph,
-                    base: None,
-                    name: "<request body>".into(),
-                    lenient: false,
-                },
-                Some(f),
-            ),
-        }
-    }
-}
-
-/// A body in one of Jena's syntaxes ([`jena_formats`]) as N-Quads (`quads`) or
-/// N-Triples, in memory or in a temporary file as the body was. The output counts
-/// against `max_decompressed` as it is written, because a compact wire encoding can
-/// expand far beyond its request size, and is refused with 413 past it.
-fn transcode_body(
-    body: Spooled,
-    fmt: jena_formats::JenaFormat,
-    quads: bool,
-    max_decompressed: Option<u64>,
-) -> ApiResult<Spooled> {
-    use std::io::Write;
-    // Compact wire encodings can expand far beyond the request's in-memory size.
-    // Spill based on the actual *output*, including a single very large write.
-    struct Writer(Spooled);
-    impl Write for Writer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            match &mut self.0 {
-                Spooled::Memory(b) if b.len().saturating_add(bytes.len()) <= SPOOL_AFTER => {
-                    b.extend_from_slice(bytes);
-                    Ok(bytes.len())
-                }
-                Spooled::Memory(b) => {
-                    let mut file = tempfile::Builder::new()
-                        .prefix("sparkles-transcode-")
-                        .tempfile()?;
-                    file.write_all(b)?;
-                    file.write_all(bytes)?;
-                    self.0 = Spooled::File(file);
-                    Ok(bytes.len())
-                }
-                Spooled::File(file) => file.write(bytes),
+            Spooled::File(f) => {
+                let mut s = Source::from_bytes(Vec::new(), format, graph);
+                s.data = sparkles::io::SourceData::File(f.path().to_path_buf());
+                s.max_decompressed = max_decompressed;
+                (s, Some(f))
             }
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            match &mut self.0 {
-                Spooled::Memory(_) => Ok(()),
-                Spooled::File(file) => file.flush(),
-            }
-        }
-    }
-    // Stops the output at the cap, before the bytes past it reach memory or disk.
-    struct Capped<W> {
-        inner: W,
-        left: Option<u64>,
-        exceeded: bool,
-    }
-    impl<W: Write> Write for Capped<W> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let Some(left) = &mut self.left else {
-                return self.inner.write(bytes);
-            };
-            if bytes.len() as u64 > *left {
-                self.exceeded = true;
-                return Err(std::io::Error::other("decompressed size limit"));
-            }
-            let n = self.inner.write(bytes)?;
-            *left -= n as u64;
-            Ok(n)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.inner.flush()
-        }
-    }
-    let too_large = || {
-        err(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "decompressed request body exceeds --max-decompressed-mb",
-        )
-    };
-    let bad = |e: jena_formats::DecodeError| err(StatusCode::BAD_REQUEST, e.to_string());
-    let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    fn capped<W>(inner: W, left: Option<u64>) -> Capped<W> {
-        Capped {
-            inner,
-            left,
-            exceeded: false,
-        }
-    }
-    match body {
-        Spooled::Memory(b) => {
-            let mut out = capped(
-                Writer(Spooled::Memory(Vec::with_capacity(
-                    b.len().min(SPOOL_AFTER),
-                ))),
-                max_decompressed,
-            );
-            let r = jena_formats::transcode(fmt, &b[..], quads, &mut out);
-            if out.exceeded {
-                return Err(too_large());
-            }
-            r.map_err(bad)?;
-            Ok(out.inner.0)
-        }
-        Spooled::File(f) => {
-            let src = std::fs::File::open(f.path()).map_err(io)?;
-            let dir = f
-                .path()
-                .parent()
-                .map_or_else(std::env::temp_dir, |d| d.to_path_buf());
-            let mut tmp = tempfile::Builder::new()
-                .prefix("sparkles-body-")
-                .tempfile_in(dir)
-                .map_err(io)?;
-            let mut w = std::io::BufWriter::new(capped(tmp.as_file_mut(), max_decompressed));
-            let r = jena_formats::transcode(fmt, src, quads, &mut w);
-            let flushed = w.flush();
-            if w.get_ref().exceeded {
-                return Err(too_large());
-            }
-            r.map_err(bad)?;
-            flushed.map_err(io)?;
-            drop(w);
-            Ok(Spooled::File(tmp))
         }
     }
 }
@@ -3518,27 +3392,26 @@ async fn gsp_on(
             }
             history::reject_at(&params)?;
             let ct = content_type(&headers);
-            // Jena's RDF Thrift, RDF Protobuf, RDF/JSON and TriX are read into N-Quads
-            // or N-Triples first
-            let jena = jena_formats::JenaFormat::from_media_type(&ct);
-            let quads = matches!(target, Target::Dataset);
-            let format = match jena {
-                Some(_) if quads => RdfFormat::NQuads,
-                Some(_) => RdfFormat::NTriples,
-                None => sparkles::io::format_for_media_type(
-                    headers
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or(&ct),
-                )
-                .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
-                .ok_or_else(|| {
-                    err(
-                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                        format!("unsupported content type '{ct}'"),
+            // Jena's RDF Thrift, RDF Protobuf, RDF/JSON and TriX are read from the body
+            // as the W3C syntaxes are
+            let format: sparkles::io::RdfSyntax =
+                match jena_formats::JenaFormat::from_media_type(&ct) {
+                    Some(j) => j.into(),
+                    None => sparkles::io::format_for_media_type(
+                        headers
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or(&ct),
                     )
-                })?,
-            };
+                    .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
+                    .ok_or_else(|| {
+                        err(
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            format!("unsupported content type '{ct}'"),
+                        )
+                    })?
+                    .into(),
+                };
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
             let (mut wopts, _cancel_on_drop) =
@@ -3574,12 +3447,10 @@ async fn gsp_on(
                     ),
                     _ => None,
                 };
-                let body = match jena {
-                    Some(j) => transcode_body(body, j, quads, st.limits.max_decompressed_bytes)?,
-                    None => body,
-                };
-                let (src, _spooled) =
+                let (mut src, _spooled) =
                     body.into_source(format, graph.clone(), st.limits.max_decompressed_bytes);
+                // a body for one graph, which Jena's syntaxes refuse to find graphs in
+                src.triples_only = !matches!(target, Target::Dataset);
                 use sparkles::commit::CommitKind;
                 let (count, receipt) = if replace {
                     // parse first, then clear and insert atomically
@@ -3882,28 +3753,8 @@ async fn upload(
             ),
             None => None,
         };
-        // files in Jena's RDF Thrift, RDF Protobuf, RDF/JSON or TriX (by extension) are
-        // read into N-Quads, or N-Triples for a graph
-        let mut files = files;
-        for f in files.iter_mut() {
-            let name = f
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if let Some(j) = jena_formats::JenaFormat::from_path(f) {
-                let quads = g.is_none();
-                let out = f.with_extension(if quads { "nq" } else { "nt" });
-                let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-                // compressed files (`data.trix.gz`) are decompressed on the way
-                let src = sparkles::tabular::open(f, st.limits.max_decompressed_bytes)
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{name}: {e}")))?;
-                let mut w = std::io::BufWriter::new(std::fs::File::create(&out).map_err(io)?);
-                jena_formats::transcode(j, src, quads, &mut w)
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{name}: {e}")))?;
-                std::io::Write::flush(&mut w).map_err(io)?;
-                *f = out;
-            }
-        }
+        // files in Jena's RDF Thrift, RDF Protobuf, RDF/JSON or TriX are read by their
+        // extension, as the W3C syntaxes are
         // CSV and TSV files, and the files a mapping reads, are converted
         let lookup = match lookup_view {
             Some(view) => Some(tabular_lookup(&ds, view)?),
@@ -3923,7 +3774,7 @@ async fn upload(
             .map(|p| {
                 Source::from_path(p, g.clone()).map(|mut s| {
                     if let Some(format) = plain_format {
-                        s.format = format;
+                        s.format = format.into();
                     }
                     s.max_decompressed = st.limits.max_decompressed_bytes;
                     s
@@ -6042,51 +5893,39 @@ mod spool_tests {
     }
 
     #[test]
-    fn transcoded_output_stops_at_the_decompressed_cap() {
-        let body = expanding_body(&"\n".repeat(5 << 20));
-        let cap = SPOOL_AFTER as u64 + (1 << 20);
-        for spooled in [false, true] {
-            let body = if spooled {
-                let mut f = tempfile::NamedTempFile::new().unwrap();
-                std::io::Write::write_all(&mut f, &body).unwrap();
-                Spooled::File(f)
-            } else {
-                Spooled::Memory(body.clone())
-            };
-            match transcode_body(body, jena_formats::JenaFormat::Protobuf, true, Some(cap)) {
-                Err(ApiError(status, _)) => {
-                    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{spooled}")
-                }
-                Ok(_) => panic!("output past the cap must be refused ({spooled})"),
-            }
-        }
-    }
-
-    #[test]
-    fn small_wire_body_spools_when_transcoded_output_expands() {
+    fn wire_body_is_read_in_place_and_held_to_the_decompressed_cap() {
         let literal = "\n".repeat(5 << 20);
         let body = expanding_body(&literal);
-        assert!(body.len() < SPOOL_AFTER);
-        let Ok(Spooled::File(file)) = transcode_body(
-            Spooled::Memory(body),
-            jena_formats::JenaFormat::Protobuf,
-            true,
-            None,
-        ) else {
-            panic!("expanded RDF output must spill to disk");
-        };
-        assert!(file.as_file().metadata().unwrap().len() > SPOOL_AFTER as u64);
-        let mut parser =
-            oxrdfio::RdfParser::from_format(RdfFormat::NQuads).for_reader(file.reopen().unwrap());
-        assert_eq!(
-            parser.next().unwrap().unwrap().object,
-            oxrdf::Literal::new_simple_literal(literal).into()
-        );
-        assert!(parser.next().unwrap().is_ok());
-        assert!(parser.next().is_none());
-        let path = file.path().to_path_buf();
-        drop(file);
-        assert!(!path.exists());
+        for spooled in [false, true] {
+            let make = || {
+                if spooled {
+                    let mut f = tempfile::NamedTempFile::new().unwrap();
+                    std::io::Write::write_all(&mut f, &body).unwrap();
+                    Spooled::File(f)
+                } else {
+                    Spooled::Memory(body.clone())
+                }
+            };
+            // the body is read as it is, with no copy of its N-Quads rewritten
+            let (src, guard) = make().into_source(jena_formats::JenaFormat::Protobuf, None, None);
+            let (quads, _) = sparkles::io::parse_to_vec(&src).unwrap();
+            assert_eq!(quads.len(), 2, "{spooled}");
+            assert_eq!(
+                quads[0].object,
+                oxrdf::Literal::new_simple_literal(literal.clone()).into()
+            );
+            drop(guard);
+            // the cap counts the body's bytes
+            let (src, _guard) =
+                make().into_source(jena_formats::JenaFormat::Protobuf, None, Some(1 << 20));
+            assert!(
+                matches!(
+                    sparkles::io::parse_to_vec(&src),
+                    Err(Error::BudgetExceeded(_))
+                ),
+                "{spooled}"
+            );
+        }
     }
 
     #[tokio::test]

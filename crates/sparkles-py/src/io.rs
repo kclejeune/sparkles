@@ -3,9 +3,10 @@
 //!
 //! Besides oxrdfio's syntaxes, `RdfFormat` names Jena's TriX, RDF Thrift, RDF Protobuf
 //! and RDF/JSON ([`sparkles::jena_formats`]). An input in one of them is read by the
-//! engine's reader on a thread of its own as it streams: `parse` and file objects take
-//! the N-Quads it writes through a pipe, and `Dataset.load` spools them to a temporary
-//! file for the bulk loader. An output is written by the engine's writer.
+//! engine's reader on a thread of its own as it streams, and `parse` takes the N-Quads
+//! it writes through a pipe. `Dataset.load` hands the path or the bytes to the loader,
+//! which reads these syntaxes as it reads the others. An output is written by the
+//! engine's writer.
 
 use crate::errors::{EngineResult, invalid};
 use crate::results::PyQuadIterator;
@@ -16,7 +17,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use sparkles::codec::Codec;
-use sparkles::io::{Source, SourceData};
+use sparkles::io::{RdfSyntax, Source, SourceData};
 use sparkles::jena_formats::{JenaFormat, RdfWriter};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -30,6 +31,15 @@ use std::path::{Path, PathBuf};
 pub enum Fmt {
     Rdf(RdfFormat),
     Jena(JenaFormat),
+}
+
+impl From<Fmt> for RdfSyntax {
+    fn from(f: Fmt) -> RdfSyntax {
+        match f {
+            Fmt::Rdf(f) => RdfSyntax::Rdf(f),
+            Fmt::Jena(j) => RdfSyntax::Jena(j),
+        }
+    }
 }
 
 impl Fmt {
@@ -261,19 +271,9 @@ pub fn source_from_py(
     compression: Option<&str>,
     lenient: bool,
 ) -> PyResult<(Source, Option<Spool>)> {
-    let format = format_from_py(format)?;
+    // Jena's syntaxes load as the W3C ones do, straight from the path or the bytes
+    let format: Option<RdfSyntax> = format_from_py(format)?.map(Into::into);
     let input = input.filter(|i| !i.is_none());
-    // a path in one of Jena's syntaxes, by its extension
-    let format = format.or_else(|| {
-        path.as_deref()
-            .and_then(JenaFormat::from_path)
-            .map(Fmt::Jena)
-    });
-    if let Some(Fmt::Jena(j)) = format {
-        let (src, spool) = jena_source(py, j, input, path, base_iri, graph, compression, lenient)?;
-        return Ok((src, Some(spool)));
-    }
-    let format = rdf_only(format, "datasets")?;
     let mut spool = None;
     let mut src = match (input, path) {
         (Some(_), Some(_)) => return Err(PyValueError::new_err("give input or path, not both")),
@@ -490,39 +490,6 @@ impl Drop for Spool {
     }
 }
 
-/// A source of an input in one of Jena's syntaxes for the bulk loader: read by the
-/// engine's reader as it streams and written as N-Quads to a temporary file in the
-/// system's temporary directory, so neither the input nor its N-Quads are held in
-/// memory. The source reads the file until the [`Spool`] is dropped.
-#[allow(clippy::too_many_arguments)]
-fn jena_source(
-    py: Python<'_>,
-    fmt: JenaFormat,
-    input: Option<&Bound<'_, PyAny>>,
-    path: Option<PathBuf>,
-    base_iri: Option<String>,
-    graph: Option<NamedNode>,
-    compression: Option<&str>,
-    lenient: bool,
-) -> PyResult<(Source, Spool)> {
-    let (raw, name, base) = jena_raw(py, input, path, compression)?;
-    let base = base_iri.or(base);
-    let (spool, file) = Spool::create()?;
-    py.detach(|| -> Result<(), String> {
-        let mut w = BufWriter::with_capacity(1 << 16, file);
-        sparkles::jena_formats::transcode_with_base(fmt, raw, true, &mut w, base.as_deref())
-            .map_err(|e| e.to_string())?;
-        w.flush().map_err(|e| e.to_string())
-    })
-    .map_err(|e| invalid(py, format!("{name}: {}: {e}", fmt.name())))?;
-    let mut src = Source::from_bytes(Vec::new(), RdfFormat::NQuads, graph);
-    src.data = SourceData::File(spool.0.clone());
-    src.compression = Some(Codec::None);
-    src.name = name;
-    src.lenient = lenient;
-    Ok((src, spool))
-}
-
 /// Whether `input` is a file object rather than `str` or bytes.
 pub fn is_file_object(input: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(input.cast::<PyString>().is_err()
@@ -687,13 +654,19 @@ pub fn quad_stream(
                 compression,
                 lenient,
             )?;
+            let Some(rdf) = src.format.rdf() else {
+                return Err(PyValueError::new_err(format!(
+                    "{} is read by its own reader",
+                    src.format.name()
+                )));
+            };
             let codec = src.codec().py(py)?;
             let raw: Box<dyn Read + Send> = match src.data {
                 SourceData::File(p) => Box::new(std::fs::File::open(p)?),
                 SourceData::Bytes(b) => Box::new(std::io::Cursor::new(b)),
             };
             let r = codec.reader_send(raw, None).py(py)?;
-            (r, src.format, src.base, src.graph, src.name)
+            (r, rdf, src.base, src.graph, src.name)
         }
     };
     stream_of(py, reader, format, base, graph, lenient, name)

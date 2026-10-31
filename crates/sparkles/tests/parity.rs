@@ -186,22 +186,46 @@ fn entries() -> Vec<(&'static str, Entry)> {
             ds.queries().run("q", &BTreeMap::new(), &Default::default());
         }),
         op!("gspGet", "dataset.dump_graph", |ds| {
-            ds.dump_graph(oxrdf::GraphNameRef::DefaultGraph, Vec::new(), any());
+            ds.dump_graph(
+                oxrdf::GraphNameRef::DefaultGraph,
+                Vec::new(),
+                any::<sparkles::RdfSyntax>(),
+            );
         }),
         op!("gspReadGet", "dataset.dump_graph", |ds| {
-            ds.dump_graph(oxrdf::GraphNameRef::DefaultGraph, Vec::new(), any());
+            ds.dump_graph(
+                oxrdf::GraphNameRef::DefaultGraph,
+                Vec::new(),
+                any::<sparkles::RdfSyntax>(),
+            );
         }),
         op!("directGraphGet", "dataset.dump_graph", |ds| {
-            ds.dump_graph(oxrdf::GraphNameRef::DefaultGraph, Vec::new(), any());
+            ds.dump_graph(
+                oxrdf::GraphNameRef::DefaultGraph,
+                Vec::new(),
+                any::<sparkles::RdfSyntax>(),
+            );
         }),
         op!("gspHead", "dataset.dump_graph", |ds| {
-            ds.dump_graph(oxrdf::GraphNameRef::DefaultGraph, Vec::new(), any());
+            ds.dump_graph(
+                oxrdf::GraphNameRef::DefaultGraph,
+                Vec::new(),
+                any::<sparkles::RdfSyntax>(),
+            );
         }),
         op!("gspReadHead", "dataset.dump_graph", |ds| {
-            ds.dump_graph(oxrdf::GraphNameRef::DefaultGraph, Vec::new(), any());
+            ds.dump_graph(
+                oxrdf::GraphNameRef::DefaultGraph,
+                Vec::new(),
+                any::<sparkles::RdfSyntax>(),
+            );
         }),
         op!("directGraphHead", "dataset.dump_graph", |ds| {
-            ds.dump_graph(oxrdf::GraphNameRef::DefaultGraph, Vec::new(), any());
+            ds.dump_graph(
+                oxrdf::GraphNameRef::DefaultGraph,
+                Vec::new(),
+                any::<sparkles::RdfSyntax>(),
+            );
         }),
         op!("datasetHead", "dataset.dump", |ds| {
             ds.dump(Vec::new(), any::<sparkles::RdfSyntax>());

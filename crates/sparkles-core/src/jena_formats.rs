@@ -4,8 +4,9 @@
 //! and datasets in RDF Thrift and asks for RDF Thrift back, and for SELECT results in
 //! SPARQL Results Thrift.
 //!
-//! Request bodies in these syntaxes are read into N-Quads or N-Triples for the loader
-//! ([`transcode`]). Responses are written by [`RdfWriter`] and [`ThriftResults`].
+//! The loader reads these syntaxes straight from their streams through [`read`]. Request
+//! bodies that are not loaded can be rewritten as N-Quads or N-Triples with
+//! [`transcode`]. Responses are written by [`RdfWriter`] and [`ThriftResults`].
 //!
 //! The encodings follow Jena's `BinaryRDF.thrift` (the Thrift compact protocol, one
 //! `RDF_StreamRow` after another) and `binary-rdf.proto` (length-delimited
@@ -164,7 +165,7 @@ pub fn transcode_with_base(
     };
     let mut ser = oxrdfio::RdfSerializer::from_format(target).for_writer(out);
     let mut n = 0u64;
-    let mut sink = |q: Quad| -> Res<()> {
+    read(fmt, input, base, &mut |q: Quad| -> Res<()> {
         if !quads && q.graph_name != GraphName::DefaultGraph {
             return bad(format!(
                 "{} body for a graph holds a quad in graph {}",
@@ -175,15 +176,95 @@ pub fn transcode_with_base(
         ser.serialize_quad(&q)?;
         n += 1;
         Ok(())
-    };
-    match fmt {
-        JenaFormat::Thrift => ThriftReader::new(input).read_stream(&mut sink)?,
-        JenaFormat::Protobuf => ProtoReader::new(input).read_stream(&mut sink)?,
-        JenaFormat::RdfJson => read_rdf_json(input, &mut sink)?,
-        JenaFormat::TriX => crate::trix::parse(BufReader::new(input), base, &mut sink)?,
-    }
+    })?;
     ser.finish()?;
     Ok(n)
+}
+
+/// Read `input` in `fmt` and pass each quad to `sink` as it is decoded, without
+/// collecting them. A relative IRI of a TriX document is resolved against `base` (the
+/// other formats hold absolute IRIs only). A blank node label is one blank node for the
+/// whole stream. RDF Thrift and RDF Protobuf errors name the number of statements read
+/// before the fault, and TriX and RDF/JSON errors name a line and column.
+pub fn read(
+    fmt: JenaFormat,
+    input: impl Read,
+    base: Option<&str>,
+    sink: &mut dyn FnMut(Quad) -> Result<(), DecodeError>,
+) -> Result<(), DecodeError> {
+    let mut n = 0u64;
+    let mut counted = |q: Quad| -> Res<()> {
+        sink(q)?;
+        n += 1;
+        Ok(())
+    };
+    let late = |e: DecodeError, n: u64| DecodeError(format!("{e} (after {n} statements)"));
+    match fmt {
+        JenaFormat::Thrift => ThriftReader::new(input)
+            .read_stream(&mut counted)
+            .map_err(|e| late(e, n)),
+        JenaFormat::Protobuf => ProtoReader::new(input)
+            .read_stream(&mut counted)
+            .map_err(|e| late(e, n)),
+        JenaFormat::RdfJson => read_rdf_json(input, &mut counted),
+        JenaFormat::TriX => crate::trix::parse(BufReader::new(input), base, &mut counted),
+    }
+}
+
+/// [`read`] for the loaders. The sink's own errors and the reader's I/O errors (a byte
+/// budget, a codec failure) come back as they were, and a malformed body is a parse
+/// error that names `name` and the syntax.
+pub fn read_into(
+    fmt: JenaFormat,
+    input: impl Read,
+    base: Option<&str>,
+    name: &str,
+    mut sink: impl FnMut(Quad) -> crate::Result<()>,
+) -> crate::Result<()> {
+    use std::cell::RefCell;
+    struct Capture<'a, R> {
+        inner: R,
+        failure: &'a RefCell<Option<io::Error>>,
+    }
+    impl<R: Read> Read for Capture<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.inner.read(buf) {
+                Err(e) if e.kind() != io::ErrorKind::Interrupted => {
+                    let copy = io::Error::new(e.kind(), e.to_string());
+                    *self.failure.borrow_mut() = Some(e);
+                    Err(copy)
+                }
+                other => other,
+            }
+        }
+    }
+    let io_failure = RefCell::new(None);
+    let sink_failure = RefCell::new(None);
+    let reader = Capture {
+        inner: input,
+        failure: &io_failure,
+    };
+    let result = read(fmt, reader, base, &mut |q| {
+        sink(q).map_err(|e| {
+            *sink_failure.borrow_mut() = Some(e);
+            DecodeError(String::new())
+        })
+    });
+    let Err(e) = result else { return Ok(()) };
+    if let Some(e) = sink_failure.into_inner() {
+        return Err(e);
+    }
+    if let Some(e) = io_failure.into_inner() {
+        return Err(crate::codec::io_error(e));
+    }
+    // TriX errors already begin with the syntax's name
+    let detail =
+        e.0.strip_prefix(&format!("{}: ", fmt.name()))
+            .unwrap_or(&e.0);
+    Err(crate::Error::RdfParse(format!(
+        "{name}: {}: {detail}",
+        fmt.name()
+    )))
 }
 
 // --------------------------------------------------------------- terms ------

@@ -184,18 +184,19 @@ impl NativeRdfParser {
     pub fn new(options: String, cancel: &Cancellation) -> napi::Result<Self> {
         let v = parse(&options)?;
         let control = Control::new(&v, cancel).map_err(err)?;
-        let fmt = streams::format(&v).map_err(err)?;
+        let fmt = streams::syntax(&v).map_err(err)?;
         let codec = streams::codec(&v).map_err(err)?;
-        let mut parser = RdfParser::from_format(fmt);
-        if let Some(base) = v["baseIri"].as_str() {
+        let base = v["baseIri"].as_str().map(str::to_owned);
+        if let Some(base) = &base {
             oxrdf::NamedNode::new(base).map_err(|e| invalid(e.to_string()))?;
-            parser = parser
-                .with_base_iri(base)
-                .map_err(|e| invalid(e.to_string()))?;
+            // a base that the parser would refuse fails here, before the worker starts
+            if let Some(f) = fmt.rdf() {
+                let _ = RdfParser::from_format(f)
+                    .with_base_iri(base)
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
         }
-        if v["lenient"].as_bool() == Some(true) {
-            parser = parser.lenient();
-        }
+        let lenient = v["lenient"].as_bool() == Some(true);
         let (sender, rx) = mpsc::channel(2);
         let (tx, receiver) = mpsc::channel(2);
         let ctl = control.clone();
@@ -211,18 +212,16 @@ impl NativeRdfParser {
                     let reader = codec.reader(input, None)?;
                     // Send each bounded batch immediately: a consumer can observe a
                     // quad before an upstream producer finishes its next chunk.
-                    for quad in parser.for_reader(reader) {
+                    streams::read_quads(fmt, reader, base.as_deref(), lenient, |quad| {
                         ctl.check()?;
-                        let quad = quad.map_err(|e| EngineError::RdfParse(e.to_string()))?;
                         let row = terms::encode_quad(&quad).to_string();
                         if row.len() > MAX_ROW {
                             return Err(EngineError::invalid(
                                 "RDF quad exceeds 16 MiB transfer limit",
                             ));
                         }
-                        ctl.send(&tx, Ok(row))?;
-                    }
-                    Ok(())
+                        ctl.send(&tx, Ok(row))
+                    })
                 })();
                 if let Err(e) = result {
                     let _ = ctl.send(&tx, Err(ctl.check().err().unwrap_or(e)));
@@ -286,7 +285,7 @@ impl NativeRdfSerializer {
     pub fn new(options: String, cancel: &Cancellation) -> napi::Result<Self> {
         let v = parse(&options)?;
         let control = Control::new(&v, cancel).map_err(err)?;
-        let fmt = streams::format(&v).map_err(err)?;
+        let fmt = streams::syntax(&v).map_err(err)?;
         let codec = streams::codec(&v).map_err(err)?;
         let (sender, mut rx) = mpsc::channel::<oxrdf::Quad>(2);
         let (tx, receiver) = mpsc::channel(2);
@@ -309,14 +308,26 @@ impl NativeRdfSerializer {
                         None,
                         1,
                     )?;
-                    let mut writer = RdfSerializer::from_format(fmt).for_writer(writer);
-                    while let Some(quad) = ctl.recv(&mut rx)? {
-                        writer.serialize_quad(&quad)?;
-                        // Coalesce the serializer's small per-term writes, while
-                        // still making a completed quad available before EOF.
-                        sink.flush_buffer()?;
-                    }
-                    let writer = writer.finish()?;
+                    let writer = match fmt {
+                        sparkles::io::RdfSyntax::Rdf(f) => {
+                            let mut writer = RdfSerializer::from_format(f).for_writer(writer);
+                            while let Some(quad) = ctl.recv(&mut rx)? {
+                                writer.serialize_quad(&quad)?;
+                                // Coalesce the serializer's small per-term writes, while
+                                // still making a completed quad available before EOF.
+                                sink.flush_buffer()?;
+                            }
+                            writer.finish()?
+                        }
+                        sparkles::io::RdfSyntax::Jena(j) => {
+                            let mut writer = sparkles::jena_formats::RdfWriter::new(j, writer);
+                            while let Some(quad) = ctl.recv(&mut rx)? {
+                                writer.quad(&quad)?;
+                                sink.flush_buffer()?;
+                            }
+                            writer.finish()?
+                        }
+                    };
                     writer.finish()?;
                     sink.flush_buffer()?;
                     Ok(())

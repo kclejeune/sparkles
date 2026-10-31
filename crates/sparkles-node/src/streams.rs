@@ -12,9 +12,51 @@ enum StreamResult {
     Eager(Box<QueryResult>),
     Streaming(sparkles::sparql::QueryExecution),
 }
+/// The W3C syntax named by `format`, for the places that read no other (SHACL shapes).
 pub(crate) fn format(v: &Value) -> sparkles::Result<sparkles::io::RdfFormat> {
     sparkles::sparql::results::rdf_format_from_name(v["format"].as_str().unwrap_or("nq"))
         .ok_or_else(|| EngineError::invalid("unsupported RDF format"))
+}
+/// The RDF syntax named by `format`, a W3C syntax or one of Jena's (TriX, RDF Thrift,
+/// RDF Protobuf and RDF/JSON), by name, extension or media type.
+pub(crate) fn syntax(v: &Value) -> sparkles::Result<sparkles::io::RdfSyntax> {
+    let name = v["format"].as_str().unwrap_or("nq");
+    sparkles::io::RdfSyntax::from_name(name)
+        .or_else(|| sparkles::io::RdfSyntax::from_extension(name))
+        .ok_or_else(|| EngineError::invalid("unsupported RDF format"))
+}
+/// Read `reader` in `syntax` and pass each quad to `sink` as it decodes, with relative
+/// IRIs resolved against `base` where the syntax has them.
+pub(crate) fn read_quads(
+    syntax: sparkles::io::RdfSyntax,
+    reader: impl Read,
+    base: Option<&str>,
+    lenient: bool,
+    mut sink: impl FnMut(oxrdf::Quad) -> sparkles::Result<()>,
+) -> sparkles::Result<()> {
+    use sparkles::io::RdfSyntax;
+    match syntax {
+        RdfSyntax::Jena(j) => sparkles::jena_formats::read_into(j, reader, base, "<input>", sink),
+        RdfSyntax::Rdf(f) => {
+            let mut parser = RdfParser::from_format(f);
+            if let Some(base) = base {
+                parser = parser
+                    .with_base_iri(base)
+                    .map_err(|e| EngineError::invalid(e.to_string()))?;
+            }
+            if lenient {
+                parser = parser.lenient();
+            }
+            for q in parser.for_reader(reader) {
+                match q {
+                    Ok(q) => sink(q)?,
+                    Err(oxrdfio::RdfParseError::Io(e)) => return Err(sparkles::codec::io_error(e)),
+                    Err(e) => return Err(EngineError::RdfParse(e.to_string())),
+                }
+            }
+            Ok(())
+        }
+    }
 }
 pub(crate) fn codec(v: &Value) -> sparkles::Result<sparkles::codec::Codec> {
     sparkles::codec::Codec::parse(v["compression"].as_str().unwrap_or("none"))
@@ -257,22 +299,15 @@ impl NativeDataset {
                     let _permit = permit;
                     let result = (|| {
                         let opts = write_options(&v, workerflag.clone())?;
-                        let rdf = format(&v)?;
+                        let syntax = syntax(&v)?;
                         let reader = Chunks {
                             rx: receiver,
                             bytes: std::io::Cursor::new(Vec::new()),
                             flag: workerflag.clone(),
                         };
                         let reader = codec(&v)?.reader(reader, None)?;
-                        let mut parser = RdfParser::from_format(rdf);
-                        if let Some(base) = v["baseIri"].as_str() {
-                            parser = parser
-                                .with_base_iri(base)
-                                .map_err(|e| EngineError::invalid(e.to_string()))?
-                        }
-                        if v["lenient"].as_bool() == Some(true) {
-                            parser = parser.lenient()
-                        }
+                        let base = v["baseIri"].as_str().map(str::to_owned);
+                        let lenient = v["lenient"].as_bool() == Some(true);
                         let graph = v["toGraph"]
                             .as_str()
                             .map(oxrdf::NamedNode::new)
@@ -283,17 +318,22 @@ impl NativeDataset {
                                 .ds
                                 .transaction_receipt_with(opts.clone(), move |tx| {
                                     let mut inserted = 0u64;
-                                    for q in parser.for_reader(reader) {
-                                        opts.check()?;
-                                        let mut q =
-                                            q.map_err(|e| EngineError::RdfParse(e.to_string()))?;
-                                        if q.graph_name.is_default_graph()
-                                            && let Some(g) = &graph
-                                        {
-                                            q.graph_name = g.clone().into();
-                                        }
-                                        inserted += tx.insert(q.as_ref())? as u64;
-                                    }
+                                    read_quads(
+                                        syntax,
+                                        reader,
+                                        base.as_deref(),
+                                        lenient,
+                                        |mut q| {
+                                            opts.check()?;
+                                            if q.graph_name.is_default_graph()
+                                                && let Some(g) = &graph
+                                            {
+                                                q.graph_name = g.clone().into();
+                                            }
+                                            inserted += tx.insert(q.as_ref())? as u64;
+                                            Ok(())
+                                        },
+                                    )?;
                                     Ok(inserted)
                                 })?;
                         Ok(json!({
@@ -342,7 +382,7 @@ impl NativeDataset {
             for path in paths {
                 let mut source = sparkles::io::Source::from_path(Path::new(&path), graph.clone())?;
                 if v["format"].is_string() {
-                    source.format = format(&v)?
+                    source.format = syntax(&v)?
                 }
                 source.lenient = v["lenient"].as_bool().unwrap_or(false);
                 sources.push(source)
@@ -377,7 +417,7 @@ impl NativeDataset {
             let result = (|| {
                 let sink = Sink::new(sender, None);
                 let mut writer = codec(&v)?.writer(sink, None, 1)?;
-                let fmt = format(&v)?;
+                let fmt = syntax(&v)?;
                 if let Some(graph) = v["fromGraph"].as_str() {
                     shared.ds.dump_graph(
                         oxrdf::NamedNode::new(graph)
@@ -418,16 +458,19 @@ impl NativeDataset {
         blocking(move || {
             let mut v = v;
             if v["format"].is_null() {
-                let (f, c) = sparkles::io::format_for_path(Path::new(&path))
+                let f = sparkles::io::RdfSyntax::from_path(Path::new(&path))
                     .ok_or_else(|| EngineError::invalid("cannot infer dump format"))?;
                 v["format"] = f.media_type().into();
                 if v["compression"].is_null() {
-                    v["compression"] = c.unwrap_or(sparkles::codec::Codec::None).name().into()
+                    v["compression"] = sparkles::codec::Codec::from_extension(Path::new(&path))
+                        .unwrap_or(sparkles::codec::Codec::None)
+                        .name()
+                        .into()
                 }
             }
             let f = std::fs::File::create(&path)?;
             let mut writer = codec(&v)?.writer(f, None, 1)?;
-            let fmt = format(&v)?;
+            let fmt = syntax(&v)?;
             let n = if let Some(graph) = v["fromGraph"].as_str() {
                 let graph = oxrdf::NamedNode::new(graph)
                     .map_err(|e| EngineError::invalid(e.to_string()))?;
