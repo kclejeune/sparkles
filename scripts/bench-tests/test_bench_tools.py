@@ -51,7 +51,7 @@ for output in outputs:
         (store / 'bin').mkdir(exist_ok=True)
         if not os.environ.get('MISSING_BIN'):
             for binary in ['qlever-index', 'qlever-server', 'tdb2.tdbloader', 'fuseki-server', 'oxigraph',
-                           'fluree', 'aux', 'time']:
+                           'fluree', 'aux', 'time', 'hyperfine']:
                 p = store / 'bin' / binary
                 p.write_text('#!/bin/sh\\nexit 0\\n')
                 p.chmod(0o755)
@@ -60,7 +60,7 @@ for output in outputs:
         nix.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                         CALLS=str(self.calls), STORE_ROOT=str(self.store), ROOT=str(ROOT), WORK=str(self.work))
-        for key in ("FLUREE_VERSION", "FLUREE", "QINDEX", "QSERVER", "TDBLOADER", "FUSEKI", "OXIGRAPH"):
+        for key in ("FLUREE_VERSION", "FLUREE", "QINDEX", "QSERVER", "TDBLOADER", "FUSEKI", "OXIGRAPH", "HYPERFINE"):
             self.env.pop(key, None)
 
     def shell(self, command, **env):
@@ -73,7 +73,7 @@ for output in outputs:
     def test_engines_ignore_path_and_keep_roots(self):
         for package, binary in [("qlever", "qlever-server"), ("apache-jena", "tdb2.tdbloader"),
                                 ("apache-jena-fuseki", "fuseki-server"), ("oxigraph", "oxigraph"),
-                                ("fluree", "fluree")]:
+                                ("fluree", "fluree"), ("hyperfine", "hyperfine")]:
             with self.subTest(package=package):
                 on_path = self.bin / binary
                 on_path.write_text("#!/bin/sh\nexit 99\n")
@@ -146,9 +146,18 @@ for output in outputs:
                        'has() { [[ " $ENGINES " == *" $1 "* ]]; }; resolve_tools',
                        TDBLOADER="/custom/loader", FUSEKI="/custom/fuseki", QINDEX="/custom/index",
                        QSERVER="/custom/server", OXIGRAPH="/custom/oxigraph", FLUREE="/custom/fluree",
-                       FLUREE_VERSION="other", FAIL_NIX="1")
+                       HYPERFINE="/custom/hyperfine", FLUREE_VERSION="other", FAIL_NIX="1")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.nix_calls(), [])
+
+    def test_resolve_tools_puts_the_flake_hyperfine_first(self):
+        on_path = self.bin / "hyperfine"
+        on_path.write_text("#!/bin/sh\nexit 99\n")
+        on_path.chmod(0o755)
+        p = self.shell('has() { false; }; resolve_tools; command -v hyperfine')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), str(self.store / "hyperfine" / "bin" / "hyperfine"))
+        self.assertIn(f"{ROOT}#hyperfine", self.nix_calls()[-1])
 
     def test_resolve_tools_propagates_build_failure(self):
         p = self.shell('has() { [[ "$1" == qlever ]]; }; resolve_tools; echo started', FAIL_NIX="1")

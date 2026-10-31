@@ -18,6 +18,10 @@ let
 in
 engines
 // {
+  # The timer of the HTTP runners. Like the engines it comes from the locked nixpkgs even
+  # when another version is on PATH, since hyperfine 2 writes `measurements` where the
+  # records read `times` (scripts/bench-tools.sh).
+  hyperfine = pkgs.hyperfine;
   # The data generators of the WatDiv and SP2Bench runners, built from checksum-pinned
   # releases (scripts/bench-watdiv.sh, scripts/bench-sp2b.sh).
   watdiv-gen = import ../scripts/bench-watdiv/watdiv.nix { inherit pkgs; };

@@ -9,7 +9,7 @@
 nixpkg() {
   local package=$1 installable
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree)
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | hyperfine)
       installable="$ROOT#$package"
       ;;
     *) installable="nixpkgs#$package" ;;
@@ -36,11 +36,12 @@ nixexe() {
   return 1
 }
 
-# Auxiliary tools come from PATH when it has them, and engines always come from this flake.
+# Auxiliary tools come from PATH when it has them. Engines and the hyperfine timer always
+# come from this flake.
 nixbin() {
   local package=$1 binary=$2
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree) ;;
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | hyperfine) ;;
     *)
       if command -v "$binary" > /dev/null; then
         command -v "$binary"
@@ -63,6 +64,15 @@ fluree_bin() {
   nixbin fluree fluree
 }
 
+# Put the flake's hyperfine first on PATH, so the runners' bare `hyperfine` calls, including
+# those behind a CPU-pinning client prefix, time with the pinned version. HYPERFINE names
+# another binary instead.
+use_hyperfine() {
+  local binary=${HYPERFINE:-}
+  if [ -z "$binary" ]; then binary=$(nixbin hyperfine hyperfine) || return; fi
+  PATH="$(dirname "$binary"):$PATH"
+}
+
 resolve_tools() {
   if has jena; then
     TDBLOADER=${TDBLOADER:-$(nixbin apache-jena tdb2.tdbloader)} || return
@@ -74,6 +84,7 @@ resolve_tools() {
   fi
   if has oxigraph; then OXIGRAPH=${OXIGRAPH:-$(nixbin oxigraph oxigraph)} || return; fi
   if has fluree; then FLUREE=${FLUREE:-$(fluree_bin)} || return; fi
+  use_hyperfine
 }
 
 # GNU time, rather than the shell keyword. It cannot go through nixbin, because command -v

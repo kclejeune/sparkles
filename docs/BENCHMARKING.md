@@ -101,7 +101,11 @@ can explicitly select other executables. The billion-triple loader also accepts 
 `FLUREE_VERSION`, when supplied without `FLUREE`, must match the packaged version.
 Jena loaders and servers clear `JAVA_HOME` so their wrappers use the packaged JDK.
 The RDFS oracle also defaults to the locked JDK, with `JAVA` as an explicit override.
-Other auxiliary tools prefer `PATH` and otherwise use the repository's locked nixpkgs.
+The hyperfine timer also comes from the flake, since hyperfine 2 writes its samples in a
+format the run records do not read. `HYPERFINE` can select another executable. The probe,
+geospatial, vector and SHACL write runners call the `hyperfine` on `PATH`, which the mise
+pin supplies at the same version. Other auxiliary tools prefer `PATH` and otherwise use the
+repository's locked nixpkgs.
 
 The locked nixpkgs builds QLever with GCC 15.3. GCC 16 rejects range-v3's late
 `enable_borrowed_range` specialization for `std::string_view`.
