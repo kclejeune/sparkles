@@ -422,7 +422,7 @@ impl Input {
         }
         Some(Source {
             data: SourceData::File(self.path.clone()?),
-            format: self.format,
+            format: self.format.into(),
             compression,
             parse_mode: sparkles::io::ParseMode::Auto,
             auto_buffer_bytes: None,
@@ -431,6 +431,7 @@ impl Input {
             base: self.base.clone(),
             name: self.name.clone(),
             lenient,
+            triples_only: false,
         })
     }
 
@@ -588,7 +589,7 @@ fn read_head(r: &mut impl Read) -> Result<(Vec<u8>, bool)> {
 fn file_reader(p: &Path, name: &str, compression: Option<Codec>) -> Result<Box<dyn Read + Send>> {
     let src = Source {
         data: SourceData::File(p.to_path_buf()),
-        format: RdfFormat::NQuads,
+        format: RdfFormat::NQuads.into(),
         compression,
         parse_mode: sparkles::io::ParseMode::Auto,
         auto_buffer_bytes: None,
@@ -597,6 +598,7 @@ fn file_reader(p: &Path, name: &str, compression: Option<Codec>) -> Result<Box<d
         base: None,
         name: name.to_string(),
         lenient: false,
+        triples_only: false,
     };
     let codec = src.codec()?;
     let f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;

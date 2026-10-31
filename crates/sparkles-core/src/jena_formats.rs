@@ -4,8 +4,9 @@
 //! and datasets in RDF Thrift and asks for RDF Thrift back, and for SELECT results in
 //! SPARQL Results Thrift.
 //!
-//! Request bodies in these syntaxes are read into N-Quads or N-Triples for the loader
-//! ([`transcode`]). Responses are written by [`RdfWriter`] and [`ThriftResults`].
+//! The loader reads these syntaxes straight from their streams through [`read`]. Request
+//! bodies that are not loaded can be rewritten as N-Quads or N-Triples with
+//! [`transcode`]. Responses are written by [`RdfWriter`] and [`ThriftResults`].
 //!
 //! The encodings follow Jena's `BinaryRDF.thrift` (the Thrift compact protocol, one
 //! `RDF_StreamRow` after another) and `binary-rdf.proto` (length-delimited
@@ -164,7 +165,7 @@ pub fn transcode_with_base(
     };
     let mut ser = oxrdfio::RdfSerializer::from_format(target).for_writer(out);
     let mut n = 0u64;
-    let mut sink = |q: Quad| -> Res<()> {
+    read(fmt, input, base, &mut |q: Quad| -> Res<()> {
         if !quads && q.graph_name != GraphName::DefaultGraph {
             return bad(format!(
                 "{} body for a graph holds a quad in graph {}",
@@ -175,15 +176,95 @@ pub fn transcode_with_base(
         ser.serialize_quad(&q)?;
         n += 1;
         Ok(())
-    };
-    match fmt {
-        JenaFormat::Thrift => ThriftReader::new(input).read_stream(&mut sink)?,
-        JenaFormat::Protobuf => ProtoReader::new(input).read_stream(&mut sink)?,
-        JenaFormat::RdfJson => read_rdf_json(input, &mut sink)?,
-        JenaFormat::TriX => crate::trix::parse(BufReader::new(input), base, &mut sink)?,
-    }
+    })?;
     ser.finish()?;
     Ok(n)
+}
+
+/// Read `input` in `fmt` and pass each quad to `sink` as it is decoded, without
+/// collecting them. A relative IRI of a TriX document is resolved against `base` (the
+/// other formats hold absolute IRIs only). A blank node label is one blank node for the
+/// whole stream. RDF Thrift and RDF Protobuf errors name the number of statements read
+/// before the fault, and TriX and RDF/JSON errors name a line and column.
+pub fn read(
+    fmt: JenaFormat,
+    input: impl Read,
+    base: Option<&str>,
+    sink: &mut dyn FnMut(Quad) -> Result<(), DecodeError>,
+) -> Result<(), DecodeError> {
+    let mut n = 0u64;
+    let mut counted = |q: Quad| -> Res<()> {
+        sink(q)?;
+        n += 1;
+        Ok(())
+    };
+    let late = |e: DecodeError, n: u64| DecodeError(format!("{e} (after {n} statements)"));
+    match fmt {
+        JenaFormat::Thrift => ThriftReader::new(input)
+            .read_stream(&mut counted)
+            .map_err(|e| late(e, n)),
+        JenaFormat::Protobuf => ProtoReader::new(input)
+            .read_stream(&mut counted)
+            .map_err(|e| late(e, n)),
+        JenaFormat::RdfJson => read_rdf_json(input, &mut counted),
+        JenaFormat::TriX => crate::trix::parse(BufReader::new(input), base, &mut counted),
+    }
+}
+
+/// [`read`] for the loaders. The sink's own errors and the reader's I/O errors (a byte
+/// budget, a codec failure) come back as they were, and a malformed body is a parse
+/// error that names `name` and the syntax.
+pub fn read_into(
+    fmt: JenaFormat,
+    input: impl Read,
+    base: Option<&str>,
+    name: &str,
+    mut sink: impl FnMut(Quad) -> crate::Result<()>,
+) -> crate::Result<()> {
+    use std::cell::RefCell;
+    struct Capture<'a, R> {
+        inner: R,
+        failure: &'a RefCell<Option<io::Error>>,
+    }
+    impl<R: Read> Read for Capture<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.inner.read(buf) {
+                Err(e) if e.kind() != io::ErrorKind::Interrupted => {
+                    let copy = io::Error::new(e.kind(), e.to_string());
+                    *self.failure.borrow_mut() = Some(e);
+                    Err(copy)
+                }
+                other => other,
+            }
+        }
+    }
+    let io_failure = RefCell::new(None);
+    let sink_failure = RefCell::new(None);
+    let reader = Capture {
+        inner: input,
+        failure: &io_failure,
+    };
+    let result = read(fmt, reader, base, &mut |q| {
+        sink(q).map_err(|e| {
+            *sink_failure.borrow_mut() = Some(e);
+            DecodeError(String::new())
+        })
+    });
+    let Err(e) = result else { return Ok(()) };
+    if let Some(e) = sink_failure.into_inner() {
+        return Err(e);
+    }
+    if let Some(e) = io_failure.into_inner() {
+        return Err(crate::codec::io_error(e));
+    }
+    // TriX errors already begin with the syntax's name
+    let detail =
+        e.0.strip_prefix(&format!("{}: ", fmt.name()))
+            .unwrap_or(&e.0);
+    Err(crate::Error::RdfParse(format!(
+        "{name}: {}: {detail}",
+        fmt.name()
+    )))
 }
 
 // --------------------------------------------------------------- terms ------
@@ -336,6 +417,107 @@ impl Terms {
             object: t.object,
             graph_name,
         })
+    }
+}
+
+/// The size of `q` as an N-Quads line in bytes, which is the length of `format!("{q} .\n")`
+/// as OxRDF writes it. It is the measure of how far a decoded body has expanded, for the
+/// loaders' byte cap and for the size of a batch of quads, and it takes one pass over
+/// each literal's bytes and nothing else.
+pub fn nquads_len(q: &Quad) -> u64 {
+    fn iri(s: &str) -> u64 {
+        s.len() as u64 + 2
+    }
+    fn lexical(s: &str) -> u64 {
+        // The escapes of OxRDF's `print_quoted_str`, which writes every line of N-Quads
+        // here. Backspace, tab, line feed, form feed, carriage return, the quote and the
+        // backslash take two bytes. The other control characters, DEL and the two
+        // noncharacters U+FFFE and U+FFFF take six, where U+FFFE and U+FFFF are three
+        // bytes of UTF-8. Anything else is written as it is.
+        let bytes = s.as_bytes();
+        let mut n = 2u64;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            i += 1;
+            n += match b {
+                b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' | b'"' | b'\\' => 2,
+                0..0x20 | 0x7f => 6,
+                0xEF if matches!(bytes.get(i..i + 2), Some([0xBF, 0xBE | 0xBF])) => {
+                    i += 2;
+                    6
+                }
+                _ => 1,
+            };
+        }
+        n
+    }
+    fn literal(l: &Literal) -> u64 {
+        let base = lexical(l.value());
+        match l.language() {
+            Some(tag) => base + 1 + tag.len() as u64 + l.direction().map_or(0, |_| 5),
+            None if l.datatype() == xsd::STRING => base,
+            None => base + 2 + iri(l.datatype().as_str()),
+        }
+    }
+    fn term(t: &Term) -> u64 {
+        match t {
+            Term::NamedNode(n) => iri(n.as_str()),
+            Term::BlankNode(b) => 2 + b.as_str().len() as u64,
+            Term::Literal(l) => literal(l),
+            Term::Triple(t) => triple(t),
+        }
+    }
+    fn subject(s: &NamedOrBlankNode) -> u64 {
+        match s {
+            NamedOrBlankNode::NamedNode(n) => iri(n.as_str()),
+            NamedOrBlankNode::BlankNode(b) => 2 + b.as_str().len() as u64,
+        }
+    }
+    // `<<( s p o )>>` with its spaces
+    fn triple(t: &Triple) -> u64 {
+        10 + subject(&t.subject) + iri(t.predicate.as_str()) + term(&t.object)
+    }
+    let graph = match &q.graph_name {
+        GraphName::DefaultGraph => 0,
+        GraphName::NamedNode(n) => 1 + iri(n.as_str()),
+        GraphName::BlankNode(b) => 3 + b.as_str().len() as u64,
+    };
+    // three spaces, the dot and the line break
+    5 + subject(&q.subject) + iri(q.predicate.as_str()) + term(&q.object) + graph
+}
+
+/// The running size of the quads of one body as N-Quads, held to a limit. A Protobuf or
+/// Thrift body can expand far past its own size through a prefix or a repeated term, so a
+/// cap on the bytes read does not bound what the loader receives.
+pub struct Expansion {
+    limit: Option<u64>,
+    total: u64,
+}
+
+impl Expansion {
+    pub fn new(limit: Option<u64>) -> Expansion {
+        Expansion { limit, total: 0 }
+    }
+
+    /// Whether anything is measured, which the callers use to skip the sizes.
+    pub fn is_limited(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    /// Add a quad of `bytes` bytes, failing once the total passes the limit.
+    pub fn add(&mut self, bytes: u64) -> crate::Result<()> {
+        self.total = self.total.saturating_add(bytes);
+        match self.limit {
+            Some(limit) if self.total > limit => {
+                Err(crate::Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::error::BudgetKind::DecompressedBytes,
+                    limit,
+                    requested: self.total,
+                }))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1977,5 +2159,167 @@ mod tests {
         assert_eq!(double_lexical(3.5), "3.5E0");
         assert_eq!(double_lexical(100.0), "1.0E2");
         assert_eq!(double_lexical(-0.001), "-1.0E-3");
+    }
+
+    fn line_len(q: &Quad) -> u64 {
+        format!("{q} .\n").len() as u64
+    }
+
+    #[test]
+    fn nquads_len_is_the_serialized_line_for_every_kind_of_term() {
+        let ex = |s: &str| NamedNode::new(format!("http://example.org/{s}")).unwrap();
+        let mut quads = sample();
+        let nasty = "a\"b\\c\nd\re\tf\u{1}g\u{7f}h \u{e9}\u{1f600}\u{8}\u{c}\u{fffe}\u{ffff}";
+        for object in [
+            Term::from(Literal::new_simple_literal(nasty)),
+            Literal::new_language_tagged_literal(nasty, "en-GB")
+                .unwrap()
+                .into(),
+            Literal::new_typed_literal(nasty, ex("dt")).into(),
+            ex("o").into(),
+            BlankNode::new("b9").unwrap().into(),
+        ] {
+            for graph in [
+                GraphName::DefaultGraph,
+                GraphName::NamedNode(ex("g")),
+                GraphName::BlankNode(BlankNode::new("g1").unwrap()),
+            ] {
+                quads.push(Quad::new(ex("s"), ex("p"), object.clone(), graph));
+            }
+        }
+        for q in quads {
+            assert_eq!(nquads_len(&q), line_len(&q), "{q}");
+        }
+    }
+
+    /// Every character class: each code point below U+3000, the edges of the planes and
+    /// the noncharacters, alone and repeated, in a plain, a tagged and a typed literal.
+    #[test]
+    fn nquads_len_matches_oxrdf_for_every_code_point_class() {
+        let ex = |s: &str| NamedNode::new(format!("http://example.org/{s}")).unwrap();
+        let points = (0..0x3000u32)
+            .chain([0xD7FF, 0xE000, 0xFDD0, 0xFDEF, 0xFFFD, 0xFFFE, 0xFFFF])
+            .chain([0x10000, 0x1FFFE, 0x1FFFF, 0x10FFFF]);
+        for c in points.filter_map(char::from_u32) {
+            for text in [
+                c.to_string(),
+                format!("x{c}{c}y"),
+                c.to_string().repeat(37),
+                format!("{c}\u{ffff}{c}\u{fffe}\u{ffff}"),
+            ] {
+                for object in [
+                    Term::from(Literal::new_simple_literal(&text)),
+                    Literal::new_language_tagged_literal(&text, "de")
+                        .unwrap()
+                        .into(),
+                    Literal::new_typed_literal(&text, ex("dt")).into(),
+                ] {
+                    let q = Quad::new(ex("s"), ex("p"), object, GraphName::DefaultGraph);
+                    assert_eq!(nquads_len(&q), line_len(&q), "U+{:04X}", c as u32);
+                }
+            }
+        }
+    }
+
+    mod property {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Text that leans on the characters with escapes.
+        fn text() -> impl Strategy<Value = String> {
+            let special = prop::sample::select(vec![
+                '"',
+                '\\',
+                '\n',
+                '\r',
+                '\t',
+                '\u{8}',
+                '\u{c}',
+                '\u{0}',
+                '\u{1f}',
+                '\u{7f}',
+                '\u{fffe}',
+                '\u{ffff}',
+                '\u{fffd}',
+                '\u{e9}',
+                '\u{20ac}',
+                '\u{1f600}',
+                'a',
+                ' ',
+            ]);
+            prop::collection::vec(prop_oneof![3 => special, 1 => any::<char>()], 0..64)
+                .prop_map(|v| v.into_iter().collect())
+        }
+
+        fn iri() -> impl Strategy<Value = NamedNode> {
+            "http://[a-z]{1,8}\\.example/[a-zA-Z0-9/._~-]{0,40}"
+                .prop_map(|s| NamedNode::new(s).unwrap())
+        }
+
+        fn bnode() -> impl Strategy<Value = BlankNode> {
+            "[a-z][a-z0-9]{0,10}".prop_map(|s| BlankNode::new(s).unwrap())
+        }
+
+        fn literal() -> impl Strategy<Value = Literal> {
+            (text(), 0..3u8, iri(), "[a-z]{2,3}(-[A-Z]{2})?").prop_map(|(t, kind, dt, lang)| {
+                match kind {
+                    0 => Literal::new_simple_literal(t),
+                    1 => Literal::new_language_tagged_literal(t, lang).unwrap(),
+                    _ => Literal::new_typed_literal(t, dt),
+                }
+            })
+        }
+
+        fn object() -> impl Strategy<Value = Term> {
+            let leaf = prop_oneof![
+                iri().prop_map(Term::from),
+                bnode().prop_map(Term::from),
+                literal().prop_map(Term::from),
+            ];
+            leaf.prop_recursive(2, 8, 1, |inner| {
+                (
+                    prop_oneof![
+                        iri().prop_map(NamedOrBlankNode::from),
+                        bnode().prop_map(NamedOrBlankNode::from)
+                    ],
+                    iri(),
+                    inner,
+                )
+                    .prop_map(|(subject, predicate, object)| {
+                        Term::Triple(Box::new(Triple {
+                            subject,
+                            predicate,
+                            object,
+                        }))
+                    })
+            })
+        }
+
+        fn quad() -> impl Strategy<Value = Quad> {
+            (
+                prop_oneof![
+                    iri().prop_map(NamedOrBlankNode::from),
+                    bnode().prop_map(NamedOrBlankNode::from)
+                ],
+                iri(),
+                object(),
+                prop_oneof![
+                    Just(GraphName::DefaultGraph),
+                    iri().prop_map(GraphName::from),
+                    bnode().prop_map(GraphName::from),
+                ],
+            )
+                .prop_map(|(s, p, o, g)| Quad::new(s, p, o, g))
+        }
+
+        proptest! {
+            /// The size is never below the line and is exactly its length.
+            #[test]
+            fn nquads_len_is_never_below_the_line(q in quad()) {
+                let (n, line) = (nquads_len(&q), format!("{q} .\n").len() as u64);
+                prop_assert!(n >= line, "{} < {} for {}", n, line, q);
+                prop_assert!(n <= line, "{} > {} for {}", n, line, q);
+            }
+        }
     }
 }

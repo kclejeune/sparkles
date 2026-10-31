@@ -1,0 +1,66 @@
+base data.rt round 1: 3.23 s, peak temp 105 MiB | loaded 1052801 quads in 1.51s (696273 quads/s); database now has 1052801 quads; commit 1
+new data.rt round 1: 3.05 s, peak temp 0 MiB | loaded 1052801 quads in 2.98s (353574 quads/s); database now has 1052801 quads; commit 1
+base data.rt round 2: 3.17 s, peak temp 105 MiB | loaded 1052801 quads in 1.75s (601353 quads/s); database now has 1052801 quads; commit 1
+new data.rt round 2: 2.61 s, peak temp 0 MiB | loaded 1052801 quads in 2.53s (415450 quads/s); database now has 1052801 quads; commit 1
+base data.rt round 3: 2.89 s, peak temp 105 MiB | loaded 1052801 quads in 1.47s (715741 quads/s); database now has 1052801 quads; commit 1
+new data.rt round 3: 2.57 s, peak temp 0 MiB | loaded 1052801 quads in 2.52s (417965 quads/s); database now has 1052801 quads; commit 1
+base data.rt round 4: 2.01 s, peak temp 105 MiB | loaded 1052801 quads in 0.60s (1757502 quads/s); database now has 1052801 quads; commit 1
+new data.rt round 4: 1.80 s, peak temp 0 MiB | loaded 1052801 quads in 1.76s (598672 quads/s); database now has 1052801 quads; commit 1
+base data.rt round 5: 2.42 s, peak temp 105 MiB | loaded 1052801 quads in 0.82s (1288914 quads/s); database now has 1052801 quads; commit 1
+new data.rt round 5: 3.50 s, peak temp 0 MiB | loaded 1052801 quads in 3.38s (311791 quads/s); database now has 1052801 quads; commit 1
+base data.rt round 6: 8.19 s, peak temp 105 MiB | loaded 1052801 quads in 3.13s (336577 quads/s); database now has 1052801 quads; commit 1
+new data.rt round 6: 3.07 s, peak temp 0 MiB | loaded 1052801 quads in 2.99s (352429 quads/s); database now has 1052801 quads; commit 1
+base data.rt round 7: 2.78 s, peak temp 105 MiB | loaded 1052801 quads in 1.24s (849740 quads/s); database now has 1052801 quads; commit 1
+new data.rt round 7: 2.73 s, peak temp 0 MiB | loaded 1052801 quads in 2.64s (399450 quads/s); database now has 1052801 quads; commit 1
+base data.rpb round 1: 5.44 s, peak temp 105 MiB | loaded 1052801 quads in 3.20s (329341 quads/s); database now has 1052801 quads; commit 1
+new data.rpb round 1: 8.42 s, peak temp 0 MiB | loaded 1052801 quads in 8.23s (127949 quads/s); database now has 1052801 quads; commit 1
+base data.rpb round 2: 3.28 s, peak temp 105 MiB | loaded 1052801 quads in 1.30s (808835 quads/s); database now has 1052801 quads; commit 1
+new data.rpb round 2: 2.64 s, peak temp 0 MiB | loaded 1052801 quads in 2.48s (423754 quads/s); database now has 1052801 quads; commit 1
+base data.rpb round 3: 2.60 s, peak temp 105 MiB | loaded 1052801 quads in 1.12s (937417 quads/s); database now has 1052801 quads; commit 1
+new data.rpb round 3: 2.37 s, peak temp 0 MiB | loaded 1052801 quads in 2.33s (452365 quads/s); database now has 1052801 quads; commit 1
+base data.rpb round 4: 2.24 s, peak temp 105 MiB | loaded 1052801 quads in 0.80s (1309779 quads/s); database now has 1052801 quads; commit 1
+new data.rpb round 4: 2.13 s, peak temp 0 MiB | loaded 1052801 quads in 2.08s (506572 quads/s); database now has 1052801 quads; commit 1
+base data.rpb round 5: 2.36 s, peak temp 105 MiB | loaded 1052801 quads in 0.92s (1141082 quads/s); database now has 1052801 quads; commit 1
+new data.rpb round 5: 2.80 s, peak temp 0 MiB | loaded 1052801 quads in 2.53s (415364 quads/s); database now has 1052801 quads; commit 1
+base data.rpb round 6: 2.17 s, peak temp 105 MiB | loaded 1052801 quads in 0.87s (1208615 quads/s); database now has 1052801 quads; commit 1
+new data.rpb round 6: 2.15 s, peak temp 0 MiB | loaded 1052801 quads in 2.10s (500228 quads/s); database now has 1052801 quads; commit 1
+base data.rpb round 7: 1.83 s, peak temp 105 MiB | loaded 1052801 quads in 0.60s (1748591 quads/s); database now has 1052801 quads; commit 1
+new data.rpb round 7: 1.88 s, peak temp 0 MiB | loaded 1052801 quads in 1.85s (569624 quads/s); database now has 1052801 quads; commit 1
+base data.trix round 1: 2.75 s, peak temp 105 MiB | loaded 1052801 quads in 0.79s (1330745 quads/s); database now has 1052801 quads; commit 1
+new data.trix round 1: 2.57 s, peak temp 0 MiB | loaded 1052801 quads in 2.54s (414792 quads/s); database now has 1052801 quads; commit 1
+base data.trix round 2: 2.52 s, peak temp 105 MiB | loaded 1052801 quads in 0.64s (1648104 quads/s); database now has 1052801 quads; commit 1
+new data.trix round 2: 2.89 s, peak temp 0 MiB | loaded 1052801 quads in 2.85s (369722 quads/s); database now has 1052801 quads; commit 1
+base data.trix round 3: 2.65 s, peak temp 105 MiB | loaded 1052801 quads in 0.77s (1367653 quads/s); database now has 1052801 quads; commit 1
+new data.trix round 3: 2.68 s, peak temp 0 MiB | loaded 1052801 quads in 2.65s (397802 quads/s); database now has 1052801 quads; commit 1
+base data.trix round 4: 2.74 s, peak temp 105 MiB | loaded 1052801 quads in 0.86s (1218953 quads/s); database now has 1052801 quads; commit 1
+new data.trix round 4: 2.94 s, peak temp 0 MiB | loaded 1052801 quads in 2.90s (363009 quads/s); database now has 1052801 quads; commit 1
+base data.trix round 5: 2.83 s, peak temp 105 MiB | loaded 1052801 quads in 0.87s (1209712 quads/s); database now has 1052801 quads; commit 1
+new data.trix round 5: 2.86 s, peak temp 0 MiB | loaded 1052801 quads in 2.82s (373424 quads/s); database now has 1052801 quads; commit 1
+base data.trix round 6: 3.72 s, peak temp 105 MiB | loaded 1052801 quads in 1.34s (784022 quads/s); database now has 1052801 quads; commit 1
+new data.trix round 6: 2.88 s, peak temp 0 MiB | loaded 1052801 quads in 2.83s (371666 quads/s); database now has 1052801 quads; commit 1
+base data.trix round 7: 2.91 s, peak temp 105 MiB | loaded 1052801 quads in 0.86s (1228926 quads/s); database now has 1052801 quads; commit 1
+new data.trix round 7: 2.93 s, peak temp 0 MiB | loaded 1052801 quads in 2.89s (364685 quads/s); database now has 1052801 quads; commit 1
+base data.rj round 1: 2.30 s, peak temp 105 MiB | loaded 1052801 quads in 0.69s (1517193 quads/s); database now has 1052801 quads; commit 1
+new data.rj round 1: 2.61 s, peak temp 0 MiB | loaded 1052801 quads in 2.57s (410140 quads/s); database now has 1052801 quads; commit 1
+base data.rj round 2: 2.49 s, peak temp 105 MiB | loaded 1052801 quads in 0.88s (1196878 quads/s); database now has 1052801 quads; commit 1
+new data.rj round 2: 2.36 s, peak temp 0 MiB | loaded 1052801 quads in 2.32s (453198 quads/s); database now has 1052801 quads; commit 1
+base data.rj round 3: 2.40 s, peak temp 105 MiB | loaded 1052801 quads in 0.77s (1359523 quads/s); database now has 1052801 quads; commit 1
+new data.rj round 3: 2.49 s, peak temp 0 MiB | loaded 1052801 quads in 2.44s (431838 quads/s); database now has 1052801 quads; commit 1
+base data.rj round 4: 2.29 s, peak temp 105 MiB | loaded 1052801 quads in 0.70s (1510701 quads/s); database now has 1052801 quads; commit 1
+new data.rj round 4: 8.94 s, peak temp 0 MiB | loaded 1052801 quads in 8.67s (121419 quads/s); database now has 1052801 quads; commit 1
+base data.rj round 5: 4.33 s, peak temp 105 MiB | loaded 1052801 quads in 1.98s (531029 quads/s); database now has 1052801 quads; commit 1
+new data.rj round 5: 2.32 s, peak temp 0 MiB | loaded 1052801 quads in 2.28s (462131 quads/s); database now has 1052801 quads; commit 1
+base data.rj round 6: 2.23 s, peak temp 105 MiB | loaded 1052801 quads in 0.66s (1589931 quads/s); database now has 1052801 quads; commit 1
+new data.rj round 6: 2.39 s, peak temp 0 MiB | loaded 1052801 quads in 2.35s (447771 quads/s); database now has 1052801 quads; commit 1
+base data.rj round 7: 2.20 s, peak temp 105 MiB | loaded 1052801 quads in 0.63s (1665399 quads/s); database now has 1052801 quads; commit 1
+new data.rj round 7: 2.16 s, peak temp 0 MiB | loaded 1052801 quads in 2.12s (495853 quads/s); database now has 1052801 quads; commit 1
+
+data.rt    base  median   2.89 s  min   2.01 s  peak temp    105 MiB
+data.rt    new   median   2.73 s  min   1.80 s  peak temp      0 MiB
+data.rpb   base  median   2.36 s  min   1.83 s  peak temp    105 MiB
+data.rpb   new   median   2.37 s  min   1.88 s  peak temp      0 MiB
+data.trix  base  median   2.75 s  min   2.52 s  peak temp    105 MiB
+data.trix  new   median   2.88 s  min   2.57 s  peak temp      0 MiB
+data.rj    base  median   2.30 s  min   2.20 s  peak temp    105 MiB
+data.rj    new   median   2.39 s  min   2.16 s  peak temp      0 MiB
+done

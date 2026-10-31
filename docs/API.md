@@ -1847,8 +1847,9 @@ language-tagged strings, and every other literal is a `<typedLiteral>`. The cont
 written with its direction after `--` in `xml:lang` (`en--ltr`), which Jena's reader
 understands. Triple terms are nested `<triple>` elements, and `<qname>` is read against
 the XML namespaces in scope. The writer writes full IRIs and no XML declaration, as Jena
-does. SPARQL Update's `LOAD` reads TriX too, by the response's media type or the `.trix`
-extension. The JSONP `callback` and XSLT `stylesheet` parameters of
+does. SPARQL Update's `LOAD` reads TriX, RDF Thrift, RDF Protobuf and RDF/JSON too, by the
+response's media type or the file name extension, and asks for them in its `Accept`
+header. The JSONP `callback` and XSLT `stylesheet` parameters of
 Fuseki are not supported.
 
 Query parameters beyond the standard protocol:
@@ -3601,8 +3602,10 @@ the request fails with `413`. That limit counts bytes after HTTP decompression. 
 default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
 means unlimited. `--max-decompressed-mb` caps the RDF sources separately as they are
 parsed, both files compressed inside the body and plain RDF. A body in RDF Thrift, RDF
-Protobuf, RDF/JSON or TriX is translated to N-Quads, and the translation counts against
-that cap as it is written. Before each 64 MiB of a spooled body is written to the
+Protobuf, RDF/JSON or TriX is read as it arrives, with no translated copy. Its bytes count
+against that cap as they are read, and so does the size of its quads written as N-Quads,
+since a prefix or a repeated term lets a small body expand into much more. A request
+whose quads pass the cap fails with `413`. Before each 64 MiB of a spooled body is written to the
 temporary directory, the server checks that the file system keeps `--min-free-disk-mb`
 free (default 1024, `0` for no check). Otherwise the request fails with `507`.
 

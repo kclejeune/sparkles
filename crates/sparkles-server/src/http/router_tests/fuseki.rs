@@ -359,6 +359,168 @@ async fn trix_in_and_out() {
     assert_eq!(r.json()["count"], 2);
 }
 
+/// A Protobuf body of about 64 KiB whose 100 statements each use a 64 KiB prefix for
+/// three terms, which is some 19 MiB of N-Quads.
+fn expanding_protobuf() -> Vec<u8> {
+    fn varint(mut v: usize, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        varint(payload.len(), &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+    let iri = format!("http://ex.org/{}/", "x".repeat(64 << 10));
+    let mut prefix = field(0x0a, b"p");
+    prefix.extend(field(0x12, iri.as_bytes()));
+    let mut body = Vec::new();
+    let mut row = |row: Vec<u8>| {
+        varint(row.len(), &mut body);
+        body.extend(row);
+    };
+    row(field(0x0a, &prefix));
+    let mut pname = field(0x0a, b"p");
+    pname.extend(field(0x12, b"a"));
+    let pname = field(0x22, &pname);
+    let predicate = field(0x0a, &field(0x0a, b"http://ex.org/p"));
+    let mut statement = field(0x0a, &pname);
+    statement.extend(field(0x12, &predicate));
+    statement.extend(field(0x1a, &pname));
+    for _ in 0..100 {
+        row(field(0x12, &statement));
+    }
+    body
+}
+
+/// The decompressed-size limit holds a Jena body by the quads it expands to as well as by
+/// its own bytes, on the Graph Store routes and on uploads.
+#[tokio::test]
+async fn a_jena_body_that_expands_past_the_decompressed_limit_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.limits.max_decompressed_bytes = Some(1 << 20);
+    let state = Arc::new(st);
+    state.attach("ds", DbType::Mem, None).unwrap();
+    let app = router(state.clone());
+    let body = expanding_protobuf();
+    assert!(body.len() < 80 << 10, "{}", body.len());
+    for (method, uri) in [
+        ("PUT", "/ds/data?default"),
+        ("POST", "/ds/data?default"),
+        ("POST", "/ds/data"),
+        ("POST", "/ds/upload"),
+        ("POST", "/ds/upload?graph=urn:t:g"),
+    ] {
+        let r = call(
+            &app,
+            method,
+            uri,
+            Some("application/rdf+protobuf"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{method} {uri}: {}",
+            r.text()
+        );
+    }
+    assert_eq!(state.get("ds").unwrap().store.snapshot().len(), 0);
+    // under the limit the same body loads
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.limits.max_decompressed_bytes = Some(64 << 20);
+    let state = Arc::new(st);
+    state.attach("open", DbType::Mem, None).unwrap();
+    let app = router(state);
+    let r = call(
+        &app,
+        "POST",
+        "/open/upload",
+        Some("application/rdf+protobuf"),
+        body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// An upload aimed at one graph takes the triples of Jena's syntaxes and refuses a named
+/// graph, as a write to a single graph does, whether the file is the body or a part of a
+/// multipart form.
+#[tokio::test]
+async fn a_targeted_upload_refuses_a_named_graph_in_jena_syntaxes() {
+    let s = server();
+    let doc = r#"<trix xmlns="http://www.w3.org/2004/03/trix/trix-1/">
+  <graph>
+    <uri>urn:t:other</uri>
+    <triple><uri>urn:t:s</uri><uri>urn:t:p</uri><plainLiteral>x</plainLiteral></triple>
+  </graph>
+</trix>"#;
+    let r = call(
+        &s.app,
+        "POST",
+        "/ds/upload?graph=urn:t:target",
+        Some("application/trix+xml"),
+        doc.into(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let b = "sparkles-test-boundary";
+    let form = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"g.trix\"\r\n\r\n{doc}\r\n--{b}--\r\n"
+    );
+    let r = send(
+        &s.app,
+        Request::post("/ds/upload?graph=urn:t:target")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={b}"),
+            )
+            .body(Body::from(form.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // nothing reached either graph
+    for g in ["urn:t:other", "urn:t:target"] {
+        let r = get(
+            &s.app,
+            &format!("/ds/data?graph={g}"),
+            "application/n-triples",
+        )
+        .await;
+        assert!(!r.text().contains("urn:t:s"), "{g}: {}", r.text());
+    }
+    // without a target the named graph stays
+    let r = send(
+        &s.app,
+        Request::post("/ds/upload")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={b}"),
+            )
+            .body(Body::from(form))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(
+        &s.app,
+        "/ds/data?graph=urn:t:other",
+        "application/n-triples",
+    )
+    .await;
+    assert!(r.text().contains("urn:t:s"), "{}", r.text());
+}
+
 #[tokio::test]
 async fn the_union_graph_is_read_only() {
     let s = server();

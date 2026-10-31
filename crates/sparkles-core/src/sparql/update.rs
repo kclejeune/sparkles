@@ -7,10 +7,12 @@ use super::{QueryOptions, Timing};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::Perm;
+use crate::io::RdfSyntax;
+use crate::jena_formats::JenaFormat;
 use crate::outbound::RequestBudget;
 use crate::store::{Store, WriteTxn};
 use oxrdf::{BlankNode, NamedNode, Term};
-use oxrdfio::{RdfFormat, RdfParseError, RdfParser};
+use oxrdfio::{RdfParseError, RdfParser};
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use spargebra::algebra::{GraphTarget, QueryDataset};
@@ -918,22 +920,14 @@ fn load(
             ));
         }
         let path = opts.file_loads.check(url)?;
-        let format = if crate::trix::is_path(&path) {
-            LoadSyntax::TriX
-        } else {
-            LoadSyntax::Rdf(
-                crate::io::format_for_path(&path)
-                    .ok_or_else(|| {
-                        Error::invalid(format!("cannot determine RDF format of {}", path.display()))
-                    })?
-                    .0,
-            )
-        };
+        let format = RdfSyntax::from_path(&path).ok_or_else(|| {
+            Error::invalid(format!("cannot determine RDF format of {}", path.display()))
+        })?;
         let mut f = std::fs::File::open(&path)?;
         let name = path.display().to_string();
         let (codec, head) = crate::io::sniff_codec(&mut f, Some(&path), &name)?;
         let r = codec.reader(std::io::Cursor::new(head).chain(f), None)?;
-        return insert_parsed(txn, r, format, &name, &into, stats, req);
+        return insert_parsed(txn, r, format, &name, &into, None, stats, req);
     }
     if opts.forbid_remote_load {
         return Err(Error::NotPermitted(
@@ -950,7 +944,9 @@ fn load(
             client.get(u).header(
                 "Accept",
                 "text/turtle, application/n-triples, application/n-quads, application/trig, \
-                 application/rdf+xml, application/ld+json;q=0.9, application/trix+xml;q=0.8",
+                 application/rdf+xml, application/ld+json;q=0.9, application/trix+xml;q=0.8, \
+                 application/rdf+thrift;q=0.8, application/rdf+protobuf;q=0.8, \
+                 application/rdf+json;q=0.8",
             )
         })
         .map_err(|f| {
@@ -963,19 +959,11 @@ fn load(
     }
     let ct = resp.content_type;
     let url_path = std::path::Path::new(url);
-    let format = if crate::trix::is_media_type(&ct) {
-        LoadSyntax::TriX
-    } else if let Some(f) = crate::io::format_for_media_type(&ct) {
-        LoadSyntax::Rdf(f)
-    } else if crate::trix::is_path(url_path) {
-        LoadSyntax::TriX
-    } else {
-        LoadSyntax::Rdf(
-            crate::io::format_for_path(url_path)
-                .map(|f| f.0)
-                .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?,
-        )
-    };
+    let format = JenaFormat::from_media_type(&ct)
+        .map(RdfSyntax::Jena)
+        .or_else(|| crate::io::format_for_media_type(&ct).map(RdfSyntax::Rdf))
+        .or_else(|| RdfSyntax::from_path(url_path))
+        .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
     let mut body = resp.body;
     let (codec, head) =
         crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| read_error(url, e))?;
@@ -995,14 +983,17 @@ fn load(
         Some(budget) => Box::new(crate::outbound::Counted { inner: r, budget }),
         None => r,
     };
-    insert_parsed(txn, r, format, url, &into, stats, req).map_err(|e| read_error(url, e))
-}
-
-/// The syntax of a `LOAD`ed document: one oxrdfio reads, or TriX.
-#[derive(Clone, Copy)]
-enum LoadSyntax {
-    Rdf(RdfFormat),
-    TriX,
+    insert_parsed(
+        txn,
+        r,
+        format,
+        url,
+        &into,
+        Some(policy.max_response_bytes),
+        stats,
+        req,
+    )
+    .map_err(|e| read_error(url, e))
 }
 
 /// Where the quads of a `LOAD` go.
@@ -1014,13 +1005,17 @@ struct Into<'a> {
     silent: bool,
 }
 
-/// Parse `r` as it streams in and insert its quads.
+/// Parse `r` as it streams in and insert its quads. A body in one of Jena's syntaxes can
+/// expand far past its own size, so its quads, counted as N-Quads, are held to
+/// `expansion_limit` as well.
+#[allow(clippy::too_many_arguments)]
 fn insert_parsed(
     txn: &mut WriteTxn<'_>,
     r: impl Read,
-    syntax: LoadSyntax,
+    syntax: RdfSyntax,
     name: &str,
     into: &Into<'_>,
+    expansion_limit: Option<u64>,
     stats: &mut UpdateStats,
     req: &Request<'_>,
 ) -> Result<()> {
@@ -1041,7 +1036,7 @@ fn insert_parsed(
         Ok(())
     };
     match syntax {
-        LoadSyntax::Rdf(format) => {
+        RdfSyntax::Rdf(format) => {
             let mut parser = RdfParser::from_format(format)
                 .with_base_iri(into.base)
                 .map_err(|e| Error::invalid(e.to_string()))?;
@@ -1056,17 +1051,16 @@ fn insert_parsed(
                 })?)?;
             }
         }
-        LoadSyntax::TriX => {
-            let r = std::io::BufReader::new(r);
-            crate::trix::parse(r, Some(into.base), |mut q| -> Result<()> {
+        RdfSyntax::Jena(format) => {
+            let mut expansion = crate::jena_formats::Expansion::new(expansion_limit);
+            crate::jena_formats::read_into(format, r, Some(into.base), name, |mut q| {
                 if let (Some(g), oxrdf::GraphName::DefaultGraph) = (&into.graph, &q.graph_name) {
                     q.graph_name = oxrdf::GraphName::NamedNode(g.clone());
                 }
+                if expansion.is_limited() {
+                    expansion.add(crate::jena_formats::nquads_len(&q))?;
+                }
                 insert(q)
-            })
-            .map_err(|e| match e {
-                Error::RdfParse(m) => Error::RdfParse(format!("{name}: {m}")),
-                e => e,
             })?;
         }
     }

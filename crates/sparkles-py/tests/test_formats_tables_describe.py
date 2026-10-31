@@ -131,8 +131,8 @@ def test_a_broken_stream_fails_while_it_is_read() -> None:
 
 
 def test_large_jena_inputs_are_not_held_in_memory(tmp_path: Path) -> None:
-    """A parse of a large RDF Thrift file keeps its memory flat, and a load spools the
-    N-Quads to a temporary file that it removes."""
+    """A parse of a large RDF Thrift file keeps its memory flat, and a load of the path
+    reads the file in place with no temporary copy."""
     n = 400_000
     path = tmp_path / "big.rt"
     big(n).dump(path)

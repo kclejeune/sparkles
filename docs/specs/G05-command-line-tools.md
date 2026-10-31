@@ -513,3 +513,80 @@ SPARQL `LOAD`, and Jena's syntaxes loaded without a temporary N-Quads copy.**
   Protobuf copies of the 10.5M-quad benchmark data (`scripts/gen-data.py`) compares the
   direct path with the copy for time and peak disk use, and its numbers go in the
   Outcome.
+
+**Outcome of item 73.**
+
+* **Delivered.**
+  * `jena_formats::read` is the quad source of the four syntaxes. `read_into` wraps it for
+    the loaders and keeps the sink's own errors, byte budgets and codec failures. A source's
+    errors read `name: syntax: message`. RDF Thrift and RDF Protobuf messages end with how
+    many statements were read before the fault, TriX messages give a byte offset, and
+    RDF/JSON messages give a line and column.
+  * `RdfSyntax` moved to `sparkles::io` beside `Source`, whose `format` field is an
+    `RdfSyntax`. `RdfSyntax::from_name`, `from_extension` and `from_path` find a syntax by
+    any of its names, so the bindings share one lookup.
+  * `parse_source` sends a Jena syntax to one decoder on the calling thread. The decoder
+    passes batches of up to 4096 quads or 1 MiB through a bounded channel to as many sinks as the loader
+    has threads, so the encoding and sorting stay parallel behind a decoder that cannot
+    split its input. The transaction path reads the same decoder through
+    `parse_source_into`.
+  * `file_sources` returns plain sources, and `jena_to_nquads` and `transcode_body` are
+    gone. `sparkles load`, uploads, Graph Store writes, `Dataset::load_file`, `load_files`,
+    `load_file_into` and the Python `Dataset.load` of a path or bytes write no copy. A
+    Python file object is still copied once to a temporary file before it loads, as for
+    every syntax.
+  * `Dataset::load_str`, `load_str_into` and `dump_graph` take `impl Into<RdfSyntax>`, and
+    `Dataset::load_bytes(data, format, base, graph)` loads any syntax from memory.
+    `dump_graph` writes the triples of a graph as default-graph triples in a quad syntax.
+  * SPARQL `LOAD` reads all four syntaxes by media type or file name extension, and its
+    `Accept` header names them at `q=0.8`.
+  * The JVM binding's `load_bytes` takes any syntax name, media type or extension, and its
+    `load_files` reads Jena's file extensions. The Node.js binding's `format` option takes
+    every syntax in `load`, `dump`, `dumpToFile`, `parse` and `serialize`, and a dump to a
+    file with a Jena extension picks that syntax.
+* **Gaps found before the change.** `Dataset::load_str`, `load_str_into` and `dump_graph`
+  took an `RdfFormat`. SPARQL `LOAD` read TriX only. The JVM `load_bytes` and the Node.js
+  `format` took W3C syntaxes only, and Node's `parse`, `serialize` and `load` stream could
+  not read or write a Jena syntax. `Dataset::load_file`, `load_files`, `load_file_into` and
+  `sparkles load` wrote a temporary N-Quads file for each Jena file, the server's uploads and
+  Graph Store bodies wrote one past a size, and the Python `Dataset.load` wrote one.
+* **Deviations and decisions.**
+  * The server's `--max-decompressed-mb` counts the bytes of a Thrift, Protobuf, RDF/JSON
+    or TriX body as the reader takes them, and also the size of its quads as N-Quads
+    lines, which `jena_formats::nquads_len` computes with one pass over each literal. The
+    second count keeps the bound that the rewrite gave, since a Protobuf prefix or a
+    repeated term expands a body of a few kilobytes into hundreds of megabytes. It applies
+    to Graph Store writes, uploads, and SPARQL `LOAD` over HTTP with the outbound
+    response ceiling. A file `LOAD` and the CLI have no cap, as before.
+  * The decoder groups quads into batches of 4096 quads or 1 MiB of N-Quads, whichever
+    comes first, and a single larger quad is a batch of its own. The quads in flight are
+    at most three batches per loader thread and one more, so large literals cannot pile
+    up in the channel. A sink that fails stops the decoder at its next quad.
+  * A targeted upload, with `graph`, sets `Source::triples_only` as the Graph Store routes
+    do, so a named graph in one of these bodies is refused with `400`.
+  * `Source::triples_only` keeps the refusal of a named graph in a TriX, RDF Thrift or RDF
+    Protobuf body sent to one graph, which the rewrite as N-Triples gave. The Graph Store
+    routes set it. The W3C quad syntaxes keep their graphs there, as before.
+  * `Source::format` changed type, so code that reads it as an `RdfFormat` calls `rdf()`.
+    `Source::from_bytes` takes `impl Into<RdfSyntax>`, so existing calls compile.
+  * Only TriX uses the base IRI, since the other three syntaxes hold absolute IRIs.
+  * The Python `parse` keeps its thread and pipe. It streams quads and writes no file.
+* **Tests.** `crates/sparkles-core/tests/jena_load.rs` loads each syntax as a source
+  through the bulk and the transaction loaders with and without gzip. It checks the graph
+  mapping, the blank node scope of each source, byte budgets, `LOAD` of files and HTTP
+  bodies with and without compression, `LOAD SILENT` of a broken body, and malformed input
+  of each syntax. `crates/sparkles/tests/format_coverage.rs` round-trips every syntax
+  through `load_bytes`, `load_str`, `load_str_into`, files, `dump`, `dump_graph` and `LOAD`,
+  and runs Jena's TriX files against their N-Quads. `no_temp_files.rs` makes the
+  temporary directory unusable and loads each syntax through every library entry point.
+  `crates/sparkles-server/tests/cli_jena_load.rs` does the same for `sparkles load`. The
+  JVM, Node.js and Python suites cover the bindings.
+* **Measurements.** On a shared 16-core laptop, the command `sparkles load` takes 11 to
+  22 percent less wall time on 1.05M-triple files. On the quiet host atlas, with the final
+  loader, it takes 16 percent less on a 5.26M-triple RDF Thrift file and 22 percent less
+  on an RDF Protobuf file. It writes no temporary file where it wrote 105 MiB and 533 MiB.
+  Peak RSS falls from about 1.28 GiB to 1.0 GiB on the larger files. The first build, in which the
+  decoder also encoded the quads, measured level with the old loader, and the batches to
+  parallel sinks made the difference. The full table and the method are in the
+  [loading results](../benchmarks/loading/RESULTS.md#jenas-syntaxes). These are not forge
+  numbers.

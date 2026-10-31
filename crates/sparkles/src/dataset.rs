@@ -36,7 +36,7 @@ use crate::commit::{CommitInfo, CommitKind, CommitPage, CommitRange, Receipt};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::{G, Key, O, P, Perm, S};
-use crate::io::{RdfFormat, Source};
+use crate::io::{RdfSyntax, Source};
 use crate::reasoning::ReasoningRecord;
 use crate::sparql::rdfs::RdfsOnRead;
 use crate::sparql::update::UpdateStats;
@@ -554,7 +554,7 @@ impl Dataset {
 
     /// Load a file; the format is taken from the extension (`.ttl`, `.nt.gz`, `.trig`, …).
     /// Jena's TriX (`.trix`), RDF Thrift (`.rt`, `.trdf`), RDF Protobuf (`.rpb`,
-    /// `.pbrdf`) and RDF/JSON (`.rj`) are read too, by way of a temporary N-Quads file.
+    /// `.pbrdf`) and RDF/JSON (`.rj`) are read too, straight from the file.
     /// Returns the number of new quads.
     pub fn load_file(&self, path: impl AsRef<Path>) -> Result<u64> {
         self.load_files([path])
@@ -563,34 +563,50 @@ impl Dataset {
     /// Load a file's triples into a named graph. Named graphs of a quad syntax are kept.
     pub fn load_file_into(&self, path: impl AsRef<Path>, graph: &str) -> Result<u64> {
         let g = NamedNode::new(graph).map_err(|e| Error::invalid(e.to_string()))?;
-        let (sources, _spooled) = crate::syntax::file_sources([path], Some(g))?;
+        let sources = crate::syntax::file_sources([path], Some(g))?;
         self.load_sources(sources)
     }
 
     /// Load many files at once (parallel bulk path for large inputs), in the syntaxes
     /// [`load_file`](Self::load_file) reads.
     pub fn load_files(&self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Result<u64> {
-        let (sources, _spooled) = crate::syntax::file_sources(paths, None)?;
+        let sources = crate::syntax::file_sources(paths, None)?;
         self.load_sources(sources)
     }
 
-    /// Load RDF text.
-    pub fn load_str(&self, data: &str, format: RdfFormat) -> Result<u64> {
-        self.load_sources(vec![Source::from_bytes(
-            data.as_bytes().to_vec(),
-            format,
-            None,
-        )])
+    /// Load RDF text in a W3C syntax ([`RdfFormat`](crate::io::RdfFormat)) or one of Jena's
+    /// ([`JenaFormat`](crate::jena_formats::JenaFormat)).
+    pub fn load_str(&self, data: &str, format: impl Into<RdfSyntax>) -> Result<u64> {
+        self.load_bytes(data.as_bytes(), format, None, None)
     }
 
     /// Load RDF text into a named graph.
-    pub fn load_str_into(&self, data: &str, format: RdfFormat, graph: &str) -> Result<u64> {
-        let g = NamedNode::new(graph).map_err(|e| Error::invalid(e.to_string()))?;
-        self.load_sources(vec![Source::from_bytes(
-            data.as_bytes().to_vec(),
-            format,
-            Some(g),
-        )])
+    pub fn load_str_into(
+        &self,
+        data: &str,
+        format: impl Into<RdfSyntax>,
+        graph: &str,
+    ) -> Result<u64> {
+        self.load_bytes(data.as_bytes(), format, None, Some(graph))
+    }
+
+    /// Load RDF in any syntax, including the binary ones (RDF Thrift and RDF Protobuf).
+    /// Relative IRIs resolve against `base` when there is one, and triples go to
+    /// `graph` when there is one. Named graphs of a quad syntax are kept. A gzip, bzip2,
+    /// xz, zstd, lz4 or snappy compressed body is decompressed as a file would be.
+    pub fn load_bytes(
+        &self,
+        data: &[u8],
+        format: impl Into<RdfSyntax>,
+        base: Option<&str>,
+        graph: Option<&str>,
+    ) -> Result<u64> {
+        let g = graph
+            .map(|g| NamedNode::new(g).map_err(|e| Error::invalid(e.to_string())))
+            .transpose()?;
+        let mut source = Source::from_bytes(data.to_vec(), format, g);
+        source.base = base.map(str::to_owned);
+        self.load_sources(vec![source])
     }
 
     fn load_sources(&self, sources: Vec<Source>) -> Result<u64> {
@@ -1069,14 +1085,14 @@ impl Dataset {
         )
     }
 
-    /// Serialize the dataset in a W3C syntax ([`RdfFormat`]) or one of Jena's
+    /// Serialize the dataset in a W3C syntax ([`RdfFormat`](crate::io::RdfFormat)) or one of Jena's
     /// ([`JenaFormat`](crate::jena_formats::JenaFormat)). Quad syntaxes (N-Quads, TriG,
     /// TriX, RDF Thrift, RDF Protobuf) write every graph, and triple syntaxes write the
     /// default graph only.
     pub fn dump(&self, w: impl Write, format: impl Into<crate::RdfSyntax>) -> Result<u64> {
         let format = match format.into() {
-            crate::RdfSyntax::Rdf(f) => f,
-            crate::RdfSyntax::Jena(j) => return self.dump_jena(w, j),
+            RdfSyntax::Rdf(f) => f,
+            RdfSyntax::Jena(j) => return self.dump_jena(w, j),
         };
         let snap = self.inner.store.snapshot();
         let quads_format = format.supports_datasets();
@@ -1166,8 +1182,12 @@ impl Dataset {
         &self,
         graph: GraphNameRef<'_>,
         w: impl Write,
-        format: RdfFormat,
+        format: impl Into<RdfSyntax>,
     ) -> Result<u64> {
+        let format = match format.into() {
+            RdfSyntax::Rdf(f) => f,
+            RdfSyntax::Jena(j) => return self.dump_graph_jena(graph, w, j),
+        };
         let ser = crate::io::with_prefixes(
             oxrdfio::RdfSerializer::from_format(format),
             self.inner.store.prefixes(),
@@ -1177,6 +1197,23 @@ impl Dataset {
         for q in self.quads(Some(graph), None, None, None) {
             let q = q?;
             out.serialize_triple(TripleRef::new(&q.subject, &q.predicate, &q.object))?;
+            n += 1;
+        }
+        out.finish()?;
+        Ok(n)
+    }
+
+    fn dump_graph_jena(
+        &self,
+        graph: GraphNameRef<'_>,
+        w: impl Write,
+        format: crate::jena_formats::JenaFormat,
+    ) -> Result<u64> {
+        let mut out = crate::jena_formats::RdfWriter::new(format, w);
+        let mut n = 0;
+        for q in self.quads(Some(graph), None, None, None) {
+            let q = q?;
+            out.triple(&oxrdf::Triple::new(q.subject, q.predicate, q.object))?;
             n += 1;
         }
         out.finish()?;
@@ -1818,6 +1855,7 @@ fn read_origin(path: &Path) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::RdfFormat;
     use oxrdf::{Literal, NamedNodeRef};
 
     #[test]

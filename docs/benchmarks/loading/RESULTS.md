@@ -58,6 +58,36 @@ CPU divided by wall time.
 
 Decompression runs as one stream in front of the parallel parser and adds 0.1–0.5 s.
 
+### Jena's syntaxes
+
+`sparkles load` reads RDF Thrift, RDF Protobuf, TriX and RDF/JSON files through their
+streaming readers. A single decoder passes batches of quads to the same parallel sinks
+that parse the W3C syntaxes. The previous loader rewrote each file as N-Quads in a
+temporary file first and then loaded that. The table gives the wall time of the whole
+command, median of 7 loads for the 1.05M file and of 5 for the 5.26M file, with the
+before and after builds interleaved on one host.
+
+| File | Before | After | Temporary disk before | Peak RSS before and after |
+|---|---:|---:|---:|---:|
+| RDF Thrift, 1.05M triples | 1.57 s | **1.23 s** | 105 MiB | not measured |
+| RDF Protobuf, 1.05M triples | 1.33 s | **1.06 s** | 105 MiB | not measured |
+| TriX, 1.05M triples | 1.70 s | **1.43 s** | 105 MiB | not measured |
+| RDF/JSON, 1.05M triples | 1.81 s | **1.61 s** | 105 MiB | not measured |
+| RDF Thrift, 5.26M triples | 6.50 s | **5.45 s** | 533 MiB | 1,287 and 971 MiB |
+| RDF Protobuf, 5.26M triples | 6.34 s | **4.94 s** | 533 MiB | 1,276 and 999 MiB |
+
+*The 1.05M rows are local measurements on a shared laptop with an Intel Core Ultra X7
+358H, from the first version of the loader. The 5.26M rows are from the final loader on
+atlas, an Intel Core i5-13500 with 20 logical CPUs, which ran nothing else. The after
+build wrote no temporary file in any run. The records and the script are in
+[`runs/2026-10-30-jena-syntaxes-local`](runs/2026-10-30-jena-syntaxes-local/README.md) and
+[`runs/2026-10-31-jena-syntaxes-atlas`](runs/2026-10-31-jena-syntaxes-atlas/README.md).
+The load phase that `sparkles load` prints on its own is longer than before, because the
+decoder now runs inside it, but the command as a whole is faster. The decoder is a single
+thread, so a file that is mostly decoding gains less than one that is mostly encoding. The
+final loader also sizes each quad as an N-Quads line, to bound its batches and to hold the
+decoded quads to the decompressed-size cap, and that work is inside these times.*
+
 ### Index builds
 
 | Build | Time | Result |
