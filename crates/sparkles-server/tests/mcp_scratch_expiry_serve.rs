@@ -123,14 +123,26 @@ impl Running {
     }
 
     /// Whether `/$/ready` answers `200`. The port is this child's, since the child
-    /// logged that it bound it and is still running.
-    fn ready(&self) -> bool {
-        let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
+    /// logged that it bound it and is still running. Connecting, writing and the one
+    /// read each wait at most 2 s, and at most `left`, so a child that accepts the
+    /// connection and stalls counts as not ready and leaves the caller's deadline intact.
+    fn ready(&self, left: Duration) -> bool {
+        let limit = left
+            .min(Duration::from_secs(2))
+            .max(Duration::from_millis(1));
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+        let Ok(mut c) = std::net::TcpStream::connect_timeout(&addr, limit) else {
             return false;
         };
-        let _ = write!(c, "GET /$/ready HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
-        let mut buf = String::new();
-        c.read_to_string(&mut buf).is_ok() && buf.starts_with("HTTP/1.0 200")
+        if c.set_read_timeout(Some(limit)).is_err() || c.set_write_timeout(Some(limit)).is_err() {
+            return false;
+        }
+        if write!(c, "GET /$/ready HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").is_err() {
+            return false;
+        }
+        // the status line comes first, so one read of its start decides
+        let mut buf = [0u8; 12];
+        c.read_exact(&mut buf).is_ok() && &buf == b"HTTP/1.0 200"
     }
 }
 
@@ -170,9 +182,10 @@ fn serve(dir: &Path, extra: &[&str]) -> Running {
         r.wait_for("scratch-branch expiry: ", Duration::from_secs(30))
             .expect("the server exited before deciding about expiry");
         let t0 = Instant::now();
-        while !r.ready() {
+        let deadline = Duration::from_secs(60);
+        while !r.ready(deadline.saturating_sub(t0.elapsed())) {
             assert!(r.alive(), "server exited\n{}", r.log());
-            assert!(t0.elapsed() < Duration::from_secs(60), "server not ready");
+            assert!(t0.elapsed() < deadline, "server not ready");
             std::thread::sleep(Duration::from_millis(50));
         }
         return r;
