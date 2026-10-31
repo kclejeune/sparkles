@@ -268,8 +268,6 @@ fn chunk_crc(header: &[u8], payload: &[u8]) -> u32 {
     c.sum()
 }
 
-/// A chunk holding `keys`, whose first entry has id `first` within the file, preceded by
-/// the file header when `header` is set.
 /// `keys` as chunks of at most [`MAX_CHUNK`] bytes of payload each (one entry when it is
 /// larger), the first numbered `first`, after the file header when `header` is set.
 /// Refuses an entry whose length a chunk cannot record.
@@ -283,7 +281,8 @@ fn encode_chunks(first: u64, keys: &[Arc<[u8]>], header: bool) -> Result<Vec<u8>
             k.len()
         )));
     }
-    let mut out = Vec::new();
+    let total: usize = keys.iter().map(|k| 4 + k.len()).sum();
+    let mut out = Vec::with_capacity(HEADER + total + CHUNK_HEADER * (1 + total / MAX_CHUNK));
     let mut start = 0usize;
     while start < keys.len() {
         let (mut end, mut size) = (start, 0usize);
@@ -291,19 +290,21 @@ fn encode_chunks(first: u64, keys: &[Arc<[u8]>], header: bool) -> Result<Vec<u8>
             size += 4 + keys[end].len();
             end += 1;
         }
-        out.extend_from_slice(&encode_chunk(
+        encode_chunk(
+            &mut out,
             first + start as u64,
             &keys[start..end],
             header && start == 0,
-        ));
+        );
         start = end;
     }
     Ok(out)
 }
 
-fn encode_chunk(first: u64, keys: &[Arc<[u8]>], header: bool) -> Vec<u8> {
+/// Append a chunk holding `keys`, whose first entry has id `first` within the file,
+/// preceded by the file header when `header` is set.
+fn encode_chunk(out: &mut Vec<u8>, first: u64, keys: &[Arc<[u8]>], header: bool) {
     let plen: usize = keys.iter().map(|k| 4 + k.len()).sum();
-    let mut out = Vec::with_capacity(HEADER + CHUNK_HEADER + plen);
     if header {
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
@@ -321,7 +322,6 @@ fn encode_chunk(first: u64, keys: &[Arc<[u8]>], header: bool) -> Vec<u8> {
     }
     let crc = chunk_crc(&out[at + 4..at + CHUNK_HEADER], &out[at + CHUNK_HEADER..]);
     out[at..at + 4].copy_from_slice(&crc.to_le_bytes());
-    out
 }
 
 /// The end of a delta vocabulary at some moment (see [`DeltaVocab::mark`]).
