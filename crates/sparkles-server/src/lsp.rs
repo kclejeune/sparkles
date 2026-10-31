@@ -540,12 +540,25 @@ impl Doc {
         if let Some(l) = self.lint(uri).clone() {
             // the lint's own findings replace the formatter's note on undeclared prefixes
             out.retain(|d| d.code != Some(NumberOrString::String("undeclared-prefix".to_string())));
-            out.extend(
-                l.diagnostics
-                    .iter()
-                    .filter(|d| d.rule != "syntax")
-                    .map(|d| lint_diagnostic(&self.text, d, enc)),
-            );
+            let found: Vec<&lint::Diagnostic> = l
+                .diagnostics
+                .iter()
+                .filter(|d| d.rule != "syntax")
+                .collect();
+            // every position in one pass over the text
+            let offsets: Vec<usize> = found.iter().flat_map(|d| [d.start, d.end]).collect();
+            let at = text::positions(&self.text, &offsets, enc);
+            let pos = |b: usize| {
+                let (line, character) = at[&b];
+                Position { line, character }
+            };
+            out.extend(found.into_iter().map(|d| {
+                let range = Range {
+                    start: pos(d.start),
+                    end: pos(d.end),
+                };
+                lint_diagnostic_at(d, range)
+            }));
         }
         out
     }
@@ -616,6 +629,11 @@ fn warning_severity(code: &str) -> DiagnosticSeverity {
 
 /// A lint finding as an LSP diagnostic, over its whole range.
 fn lint_diagnostic(text: &str, d: &lint::Diagnostic, enc: Encoding) -> Diagnostic {
+    lint_diagnostic_at(d, range(text, d.start, d.end, enc))
+}
+
+/// A lint finding as an LSP diagnostic over `range`.
+fn lint_diagnostic_at(d: &lint::Diagnostic, range: Range) -> Diagnostic {
     let severity = match d.severity {
         Severity::Error => DiagnosticSeverity::ERROR,
         Severity::Warning => DiagnosticSeverity::WARNING,
@@ -623,7 +641,7 @@ fn lint_diagnostic(text: &str, d: &lint::Diagnostic, enc: Encoding) -> Diagnosti
         Severity::Hint => DiagnosticSeverity::HINT,
     };
     Diagnostic {
-        range: range(text, d.start, d.end, enc),
+        range,
         severity: Some(severity),
         code: Some(NumberOrString::String(d.rule.to_string())),
         source: Some("sparkles lint".to_string()),
