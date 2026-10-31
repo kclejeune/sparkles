@@ -43,7 +43,7 @@ token and absolute deadline into computation and algorithm-slot admission. Work 
 at its next cooperative check, and the returned promise waits for native cleanup.
 This does not preempt a native operation between checks.
 
-`load` accepts a string, bytes, a Node.js Readable, a Web ReadableStream, an async iterable of byte chunks, or `{ path }`. `loadFiles` loads several paths atomically. Paths infer RDF format/compression from their extension. Streams require an explicit format. `dump` returns a Web ReadableStream; `dumpToFile` and `dumpToString` are convenience methods. `queryToStream` serializes results on a Rust thread; pass `accept` for TSV, SPARQL JSON or an RDF result format.
+`format` names any W3C RDF syntax or Jena's `trix`, `thrift`, `protobuf` and `rdf/json`, and applies to `load`, `dump`, `parse` and `serialize`. `load` accepts a string, bytes, a Node.js Readable, a Web ReadableStream, an async iterable of byte chunks, or `{ path }`. `loadFiles` loads several paths atomically. Paths infer RDF format/compression from their extension. Streams require an explicit format. `dump` returns a Web ReadableStream; `dumpToFile` and `dumpToString` are convenience methods. `queryToStream` serializes results on a Rust thread; pass `accept` for TSV, SPARQL JSON or an RDF result format.
 
 `ds.changes({ after, signal })` yields recorded commits and their RDF/JS changes, waiting for engine notifications between commits. Its `return()` and `close()` cancel a pending wait; closing the dataset closes its streams and transactions. History gaps fail explicitly. If a commit exceeds the configured `maxQuads`, increase that ceiling before resuming from the last complete cursor.
 

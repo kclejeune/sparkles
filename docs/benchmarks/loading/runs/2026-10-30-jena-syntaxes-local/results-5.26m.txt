@@ -1,0 +1,26 @@
+base big/data.rt round 1: 9.70 s, peak temp 533 MiB, peak RSS 998 MiB | loaded 5263576 quads in 3.07s (1715916 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 1: 5.92 s, peak temp 0 MiB, peak RSS 890 MiB | loaded 5263576 quads in 5.85s (899643 quads/s); database now has 5263576 quads; commit 1
+base big/data.rt round 2: 8.23 s, peak temp 533 MiB, peak RSS 1176 MiB | loaded 5263576 quads in 2.28s (2308483 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 2: 5.43 s, peak temp 0 MiB, peak RSS 818 MiB | loaded 5263576 quads in 5.38s (977752 quads/s); database now has 5263576 quads; commit 1
+base big/data.rt round 3: 8.18 s, peak temp 533 MiB, peak RSS 1172 MiB | loaded 5263576 quads in 2.83s (1857099 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 3: 6.61 s, peak temp 0 MiB, peak RSS 908 MiB | loaded 5263576 quads in 6.47s (813286 quads/s); database now has 5263576 quads; commit 1
+base big/data.rt round 4: 7.54 s, peak temp 533 MiB, peak RSS 1159 MiB | loaded 5263576 quads in 2.65s (1986975 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 4: 7.50 s, peak temp 0 MiB, peak RSS 900 MiB | loaded 5263576 quads in 7.45s (706224 quads/s); database now has 5263576 quads; commit 1
+base big/data.rt round 5: 6.77 s, peak temp 533 MiB, peak RSS 1152 MiB | loaded 5263576 quads in 2.44s (2160400 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 5: 5.65 s, peak temp 0 MiB, peak RSS 908 MiB | loaded 5263576 quads in 5.60s (939302 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 1: 6.32 s, peak temp 533 MiB, peak RSS 1147 MiB | loaded 5263576 quads in 2.34s (2247274 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 1: 4.71 s, peak temp 0 MiB, peak RSS 948 MiB | loaded 5263576 quads in 4.66s (1129489 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 2: 5.94 s, peak temp 533 MiB, peak RSS 1174 MiB | loaded 5263576 quads in 2.05s (2567124 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 2: 4.83 s, peak temp 0 MiB, peak RSS 900 MiB | loaded 5263576 quads in 4.79s (1098343 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 3: 6.57 s, peak temp 533 MiB, peak RSS 1164 MiB | loaded 5263576 quads in 2.12s (2487494 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 3: 5.00 s, peak temp 0 MiB, peak RSS 889 MiB | loaded 5263576 quads in 4.95s (1063859 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 4: 8.58 s, peak temp 533 MiB, peak RSS 1159 MiB | loaded 5263576 quads in 3.15s (1669188 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 4: 7.54 s, peak temp 0 MiB, peak RSS 896 MiB | loaded 5263576 quads in 7.50s (702092 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 5: 8.89 s, peak temp 533 MiB, peak RSS 1136 MiB | loaded 5263576 quads in 2.57s (2048315 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 5: 4.59 s, peak temp 0 MiB, peak RSS 905 MiB | loaded 5263576 quads in 4.56s (1154859 quads/s); database now has 5263576 quads; commit 1
+
+big/data.rt base  median   8.18 s  min   6.77 s  peak temp    533 MiB  peak RSS   1176 MiB
+big/data.rt new   median   5.92 s  min   5.43 s  peak temp      0 MiB  peak RSS    908 MiB
+big/data.rpb base  median   6.57 s  min   5.94 s  peak temp    533 MiB  peak RSS   1174 MiB
+big/data.rpb new   median   4.83 s  min   4.59 s  peak temp      0 MiB  peak RSS    948 MiB
+done

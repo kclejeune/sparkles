@@ -290,8 +290,8 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 
 These decisions fix what completes four capabilities in the [capability matrix](FEATURES.md#capability-status).
 
-* Formatting, linting and command-line tools complete with item 48 alone. Items 55 and 73 are
-  follow-ups outside that capability.
+* Formatting, linting and command-line tools complete with item 48 alone. Item 55 is a
+  follow-up outside that capability.
 * Paths and graph algorithms complete with items 8, 275, 276 and 277. OpenCypher
   procedures belong to item 20 under additional query languages, and the C23 writer belongs
   to item 36 under batched updates and triggers. The weighted-betweenness extensions in
@@ -538,7 +538,6 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 56 | **Legacy MCP resource subscriptions.** | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
 | 57 | **Scratch-branch expiry** as a dataset setting and under stdio. Today only the server's `--mcp-scratch-branch-ttl` sets it. | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
 | 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. | [F21](specs/F21-ontology-api.md) | L |
-| 73 | **Format coverage.** All formats in `load_str`, `dump_graph`, SPARQL `LOAD` and the JVM and Node bindings, and loading Thrift, Protobuf, RDF/JSON and TriX without a temporary N-Quads copy. This follow-up is outside the completion of formatting, linting and command-line tools. | [G05](specs/G05-command-line-tools.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 74 | **RDF Patch.** Patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
 | 75 | **Access control.** Validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 76 | **Jena integration completion.** Complete assembler bodies, direct Graph Store naming per dataset, JVM metrics and batched fallback graph patterns. Expand the standalone HTTP harness to its full accepted cases, and record decisions for optional JVM module, allocator and transaction extensions. | [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings/OUTCOME.md#remaining-integration-contract) | M |
@@ -616,6 +615,7 @@ linked spec Outcome records how they landed.
 - **62.** Dataset and branch administration audit events. [C09](specs/C09-dataset-access-control.md#dataset-administration-audit)
 - **67.** MCP OAuth. [C11](specs/C11-mcp-server.md#oauth-for-the-mcp-endpoint-item-67-2026-10-24)
 - **68.** Sealed runtime secrets. [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12)
+- **73.** Format coverage. [G05](specs/G05-command-line-tools.md#roadmap-follow-ups-2026-10-12)
 - **83.** Verified ShEx schema copies and full validation for legacy configurations. [C10](specs/C10-write-time-validation.md#known-gap-schema-copy-digest-2026-10-16)
 - **85.** Hash-join, ordered DISTINCT and encrypted spill. [X08](specs/X08-disk-spill-and-server-memory.md) §6.3 and §6.7
 - **87.** Small incremental runs over a kept closure. [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18)

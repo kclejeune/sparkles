@@ -58,6 +58,31 @@ CPU divided by wall time.
 
 Decompression runs as one stream in front of the parallel parser and adds 0.1–0.5 s.
 
+### Jena's syntaxes
+
+`sparkles load` reads RDF Thrift, RDF Protobuf, TriX and RDF/JSON files through their
+streaming readers. A single decoder passes batches of quads to the same parallel sinks
+that parse the W3C syntaxes. The previous loader rewrote each file as N-Quads in a
+temporary file first and then loaded that. The table gives the wall time of the whole
+command, median of 7 loads for the 1.05M file and of 5 for the 5.26M file, with the
+before and after builds interleaved on one host.
+
+| File | Before | After | Temporary disk before | Peak RSS before and after |
+|---|---:|---:|---:|---:|
+| RDF Thrift, 1.05M triples | 1.57 s | **1.23 s** | 105 MiB | not measured |
+| RDF Protobuf, 1.05M triples | 1.33 s | **1.06 s** | 105 MiB | not measured |
+| TriX, 1.05M triples | 1.70 s | **1.43 s** | 105 MiB | not measured |
+| RDF/JSON, 1.05M triples | 1.81 s | **1.61 s** | 105 MiB | not measured |
+| RDF Thrift, 5.26M triples | 8.18 s | **5.92 s** | 533 MiB | 1,176 and 908 MiB |
+| RDF Protobuf, 5.26M triples | 6.57 s | **4.83 s** | 533 MiB | 1,174 and 948 MiB |
+
+*These are local measurements on a shared laptop with an Intel Core Ultra X7 358H, taken
+on 2026-10-30. The after build wrote no temporary file in any run. The records and the
+script are in [`runs/2026-10-30-jena-syntaxes-local`](runs/2026-10-30-jena-syntaxes-local/README.md).
+The load phase that `sparkles load` prints on its own is longer than before, because the
+decoder now runs inside it, but the command as a whole is faster. The decoder is a single
+thread, so a file that is mostly decoding gains less than one that is mostly encoding.*
+
 ### Index builds
 
 | Build | Time | Result |

@@ -1,0 +1,18 @@
+base big/data.rt round 1: 9.50 s, peak temp 533 MiB, peak RSS 1076 MiB | loaded 5263576 quads in 3.46s (1522197 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 1: 5.35 s, peak temp 0 MiB, peak RSS 813 MiB | loaded 5263576 quads in 5.30s (993719 quads/s); database now has 5263576 quads; commit 1
+base big/data.rt round 2: 7.03 s, peak temp 533 MiB, peak RSS 1171 MiB | loaded 5263576 quads in 2.78s (1894476 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 2: 15.92 s, peak temp 0 MiB, peak RSS 770 MiB | loaded 5263576 quads in 15.72s (334931 quads/s); database now has 5263576 quads; commit 1
+base big/data.rt round 3: 22.52 s, peak temp 533 MiB, peak RSS 901 MiB | loaded 5263576 quads in 11.98s (439542 quads/s); database now has 5263576 quads; commit 1
+new big/data.rt round 3: 23.00 s, peak temp 0 MiB, peak RSS 710 MiB | loaded 5263576 quads in 22.77s (231135 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 1: 27.14 s, peak temp 533 MiB, peak RSS 1043 MiB | loaded 5263576 quads in 9.02s (583742 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 1: 12.78 s, peak temp 0 MiB, peak RSS 680 MiB | loaded 5263576 quads in 12.52s (420486 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 2: 19.56 s, peak temp 533 MiB, peak RSS 1013 MiB | loaded 5263576 quads in 7.57s (695243 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 2: 7.77 s, peak temp 0 MiB, peak RSS 831 MiB | loaded 5263576 quads in 7.70s (683958 quads/s); database now has 5263576 quads; commit 1
+base big/data.rpb round 3: 9.96 s, peak temp 533 MiB, peak RSS 1140 MiB | loaded 5263576 quads in 2.93s (1799122 quads/s); database now has 5263576 quads; commit 1
+new big/data.rpb round 3: 7.31 s, peak temp 0 MiB, peak RSS 872 MiB | loaded 5263576 quads in 7.23s (727754 quads/s); database now has 5263576 quads; commit 1
+
+big/data.rt base  median   9.50 s  min   7.03 s  peak temp    533 MiB  peak RSS   1171 MiB
+big/data.rt new   median  15.92 s  min   5.35 s  peak temp      0 MiB  peak RSS    813 MiB
+big/data.rpb base  median  19.56 s  min   9.96 s  peak temp    533 MiB  peak RSS   1140 MiB
+big/data.rpb new   median   7.77 s  min   7.31 s  peak temp      0 MiB  peak RSS    872 MiB
+done

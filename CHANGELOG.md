@@ -68,6 +68,20 @@ string it read, which are the only unread strings that can still rank ahead. SPÂ
 against 127 to 141 ms in a local server A/B. The planner keeps the plain sort for literal
 columns whose first rows are not plain strings, such as language-tagged labels.
 
+Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON now work wherever the W3C syntaxes do.
+`Dataset::load_str`, `load_str_into` and `dump_graph` take any syntax, and the new
+`Dataset::load_bytes` loads the binary ones from memory. SPARQL `LOAD` reads all four
+from files and over HTTP, and asks for them in its `Accept` header. The JVM binding loads
+them from a stream or a file, and the Node.js binding accepts them in `load`, `dump`,
+`parse` and `serialize`. The loader reads these syntaxes straight from the file or body
+through their streaming readers, so `sparkles load`, `Dataset::load_file`, uploads, Graph
+Store writes and the Python `Dataset.load` no longer write a temporary N-Quads copy. A
+malformed RDF Thrift or RDF Protobuf body now reports how many statements were read
+before the fault. The decompressed-size cap of the server now counts the bytes of a
+Thrift, Protobuf, RDF/JSON or TriX body as it does for every other syntax, instead of the
+size of the N-Quads that the body used to be rewritten as. Loading a file in one of these
+syntaxes takes 11 to 28 percent less time and no longer needs the disk room of the copy.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.

@@ -633,7 +633,7 @@ directly. A running server locks the databases it holds, so use the HTTP API ins
 
 ```sh
 sparkles load    --loc db data/*.ttl.gz       # parallel bulk load (tdb2.tdbloader)
-sparkles load    --loc db data.trix data.rt   # TriX and Jena's binary syntaxes, read into N-Quads first
+sparkles load    --loc db data.trix data.rt   # TriX and Jena's binary syntaxes, read like the others
 sparkles load    --loc db people.csv --base http://ex.org/p/ --key id   # CSV and TSV tables, see below
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
@@ -5213,6 +5213,7 @@ use sparkles::querybuilder::{SelectBuilder, UpdateBuilder, expr, lit, var};
 let ds = Dataset::open("mydb")?;                 // or Dataset::memory()
 ds.load_file("data.ttl.gz")?;                    // parallel bulk path for large inputs
 ds.load_file("export.rt")?;                      // Jena's TriX, RDF Thrift, RDF Protobuf, RDF/JSON
+ds.load_bytes(&thrift, sparkles::jena_formats::JenaFormat::Thrift, None, None)?; // memory, binary too
 
 // SPARQL text
 let q = "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -5889,9 +5890,10 @@ variable, and `row.get("name", default)` returns the default instead.
 `parse` and `serialize` take all of them, by name, extension or media type as well.
 An input in one of Jena's syntaxes streams through the engine's reader on a thread of
 its own. `parse` and a file object's `load` take the quads as the reader finds them.
-`load` from a path or from bytes writes them as N-Quads to a temporary file in the
-system's temporary directory (`TMPDIR`) for the bulk loader and removes the file
-afterwards. The reader of RDF/JSON reads its whole document first. RDF/JSON holds one
+`load` from a path or from bytes passes them to the loader, which reads them as it reads
+the W3C syntaxes and writes no temporary copy. A file object is the exception, since
+`load` first copies it to a temporary file, as it does for every syntax. The reader of
+RDF/JSON reads its whole document first. RDF/JSON holds one
 graph, so `dump` writes the default graph, or `from_graph`.
 
 `load` reads a CSV or TSV table when the format is `"csv"` or `"tsv"`, or the path ends
