@@ -100,6 +100,35 @@ impl OwnerKind {
         }
     }
 
+    /// Why this build cannot read the owner's settings `bytes` for `profile`, if it
+    /// cannot: the settings file's envelope, its `format` and `profile` members, must
+    /// be ones this build reads.
+    pub(crate) fn check_settings(self, bytes: &[u8], profile: u32) -> Option<String> {
+        match self {
+            OwnerKind::Evidence => {
+                let file = self.settings_file();
+                let v: serde_json::Value = match serde_json::from_slice(bytes) {
+                    Ok(v @ serde_json::Value::Object(_)) => v,
+                    Ok(_) => return Some(format!("{file} is not a JSON object")),
+                    Err(e) => return Some(format!("{file} is not JSON: {e}")),
+                };
+                if let Err(e) = crate::formats::check_settings(file, &v) {
+                    return Some(e.to_string());
+                }
+                match v.get("profile").map(serde_json::Value::as_u64) {
+                    None => None,
+                    Some(Some(p)) if p == u64::from(profile) => None,
+                    Some(p) => Some(format!(
+                        "{file} has profile {}, not the managed profile {profile}",
+                        p.map_or_else(|| "?".to_string(), |p| p.to_string())
+                    )),
+                }
+            }
+            #[cfg(test)]
+            OwnerKind::Test => None,
+        }
+    }
+
     /// The profile versions of this owner that this build enforces.
     pub fn supports_profile(self, profile: u32) -> bool {
         match self {
@@ -572,6 +601,9 @@ fn decode_inner(
                 format!("{file} does not match the digest {FILE} records for it"),
                 true,
             ));
+        }
+        if let Some(why) = owner.check_settings(&found, entry.profile) {
+            return Err((why, false));
         }
         settings.insert(owner, Arc::from(found));
         owners.insert(owner, entry);

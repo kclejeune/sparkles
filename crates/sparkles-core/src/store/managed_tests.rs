@@ -12,6 +12,8 @@ use oxrdf::{Literal, NamedNode, Term};
 const M: &str = "urn:managed";
 const T: &str = "urn:test-owned";
 const SETTINGS: &[u8] = br#"{"format":1,"profile":1}"#;
+const OLD: &[u8] = br#"{"format":1,"profile":1,"note":"old"}"#;
+const NEW: &[u8] = br#"{"format":1,"profile":1,"note":"new"}"#;
 
 fn entry(graphs: &[&str], settings: &[u8]) -> OwnerEntry {
     OwnerEntry::for_settings(1, graphs.iter().map(|g| g.to_string()).collect(), settings)
@@ -575,9 +577,9 @@ fn an_interrupted_enablement_recovers_safely() {
     assert_eq!((m.revision, m.owner_of(T)), (1, None));
     assert_eq!(managed_code(upd(&s, &insert_m)), "profile-managed-graph");
     // one whose settings changed fails closed until the owner is enabled again
-    let (_dir, s) = crash_at("managed-settings-written", b"old", b"new");
+    let (_dir, s) = crash_at("managed-settings-written", OLD, NEW);
     assert_eq!(managed_code(upd(&s, &insert_t)), "managed-unavailable");
-    s.enable_managed(OwnerKind::Evidence, entry(&[M, T], b"new"), b"new")
+    s.enable_managed(OwnerKind::Evidence, entry(&[M, T], NEW), NEW)
         .unwrap();
     assert_eq!(managed_code(upd(&s, &insert_t)), "profile-managed-graph");
     // after the commit point, the new registry holds
@@ -763,5 +765,46 @@ fn enablement_waits_for_detached_writers() {
         let mut t = dev.write();
         put(&mut t, Some(M), "after");
         assert!(t.commit().is_err());
+    }
+}
+
+/// An owner settings file whose envelope this build does not read refuses writes even
+/// when its digest matches, and enabling with such settings is refused.
+#[test]
+fn an_unsupported_owner_settings_version_is_not_enforced() {
+    let newer: &[u8] = br#"{"format":2,"profile":1}"#;
+    let other_profile: &[u8] = br#"{"format":1,"profile":2}"#;
+    for bad in [newer, other_profile, b"not json".as_slice()] {
+        let s = Store::in_memory(StoreOptions::default());
+        assert_eq!(
+            managed_code(s.enable_managed(OwnerKind::Evidence, entry(&[M], bad), bad)),
+            "unsupported-profile"
+        );
+        let (dir, s) = setup();
+        enable(&s, &[M]);
+        drop(s);
+        let root = dir.path().join("ds");
+        std::fs::write(root.join("evidence.json"), bad).unwrap();
+        let digest = crate::managed::settings_digest(bad);
+        edit(&root, "managed.json", |v| {
+            v["owners"]["evidence"]["settingsDigest"] = digest.into()
+        });
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(count(&s, M), 1);
+        assert_eq!(
+            managed_code(upd(
+                &s,
+                "INSERT DATA { GRAPH <urn:free> { <urn:x> <urn:p> 1 } }"
+            )),
+            "managed-unavailable"
+        );
+        assert_eq!(
+            managed_code(s.managed_writer(OwnerKind::Evidence, uuid::Uuid::new_v4())),
+            "managed-unavailable"
+        );
+        assert_eq!(
+            managed_code(s.enable_managed(OwnerKind::Evidence, entry(&[M], SETTINGS), SETTINGS)),
+            "managed-unavailable"
+        );
     }
 }

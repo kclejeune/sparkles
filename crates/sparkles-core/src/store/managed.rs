@@ -129,6 +129,12 @@ impl Store {
                 why,
             ));
         }
+        if let Some(why) = owner.check_settings(settings, entry.profile) {
+            return Err(ManagedError::error(
+                ManagedErrorKind::UnsupportedProfile,
+                why,
+            ));
+        }
         crate::managed::check_graphs(&entry.graphs)?;
         if settings.len() > crate::managed::MAX_SETTINGS_BYTES {
             return Err(Error::invalid(format!(
