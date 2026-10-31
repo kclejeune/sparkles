@@ -1818,17 +1818,20 @@ pub(super) fn probe_for(ctx: &Ctx, probe: &Node, left: &Table) -> Result<Option<
         if !sorted || !worth(1) {
             return Ok(None);
         }
-        // the most keys that pay, in [1, len)
-        let (mut most, mut over) = (1, col.len());
-        while over - most > 1 {
-            let m = most + (over - most) / 2;
-            if worth(m) { most = m } else { over = m }
-        }
-        let mut runs = 1;
-        for w in col.windows(2) {
-            runs += usize::from(w[0] != w[1]);
-            if runs > most {
-                return Ok(None);
+        // An empty or one-row left side has at most one key, which pays. A longer one
+        // has the most keys that pay in [1, len).
+        if col.len() > 1 {
+            let (mut most, mut over) = (1, col.len());
+            while over - most > 1 {
+                let m = most + (over - most) / 2;
+                if worth(m) { most = m } else { over = m }
+            }
+            let mut runs = 1;
+            for w in col.windows(2) {
+                runs += usize::from(w[0] != w[1]);
+                if runs > most {
+                    return Ok(None);
+                }
             }
         }
     }

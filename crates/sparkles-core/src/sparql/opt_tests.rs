@@ -2159,6 +2159,20 @@ fn optional_with_an_unbound_left_key_reads_the_pattern() {
     same_rows(&s, text);
 }
 
+/// An empty left side, sorted on the key, still decides whether to probe.
+#[test]
+fn optional_with_an_empty_sorted_left_side() {
+    let s = review_store();
+    for text in [
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 FILTER(?r = ex:none) OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:none OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 . ?r ex:for ex:p8 OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 FILTER(STRLEN(STR(?r)) > 100) OPTIONAL { ?r ex:rating ?x } }",
+    ] {
+        assert!(same_rows(&s, text).is_empty(), "{text}");
+    }
+}
+
 // ---------------------------------------------------- comparisons decided on ids ------
 
 /// Dates and dateTimes with and without timezones, non-canonical and invalid forms, and
