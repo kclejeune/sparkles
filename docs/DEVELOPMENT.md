@@ -685,9 +685,20 @@ sequence and its `progress.log` records the fallback.
 
 The tag also applies to `--status` and `--fetch`. `GATE_HELPER=none` turns the split off,
 and a `GATE_HELPER` that does not resolve exercises the unreachable-host fallback.
-`GATE_PRIMARY` changes the default primary host. The driver refuses forge, which is
-reserved for benchmarks. `~/.local/bin/wally-gate.sh` on the laptop is a wrapper that runs
-this script from the main checkout, so older invocations keep working.
+`GATE_PRIMARY` changes the default primary host. The results directory names the host that
+ran the ci half. A gate that the older driver started has no record on the laptop, so the
+status and fetch look for its out directory on each gate host and use the newest.
+`~/.local/bin/wally-gate.sh` on the laptop is a wrapper that runs this script from the main
+checkout, so older invocations keep working.
+
+atlas and forge are identical machines, and one of them is the benchmark host, which runs
+nothing else while it measures. `SPARKLES_BENCH_HOST` names it and defaults to forge. The
+driver drops that host from `GATE_HOSTS`, which defaults to wally, atlas and forge, and
+refuses it even when `--host` names it. The default helper is the first gate host other than
+the primary. The settings may also be lines such as `SPARKLES_BENCH_HOST=atlas` in
+`~/.config/sparkles/gate.env`, and the environment takes precedence over that file. To swap
+the roles, run `scripts/gate/setup-host.sh forge` once, set `SPARKLES_BENCH_HOST=atlas` in
+that file, and let the gates already queued on atlas finish before benchmarking there.
 
 The driver installs `scripts/gate/remote/gate-start.sh` and `gate-inner.sh` on each host
 under `~/gate/bin/v-<hash>/`, named by the hash of their contents. A new version therefore

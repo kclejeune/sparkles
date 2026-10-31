@@ -8,15 +8,16 @@
 # symlink to ~/lanes/.heavy.lock, ~/gate/suites copied from the source host (default
 # wally) through the laptop, ~/gate/conformance.env and the pytest venv ~/gate/py-venv.
 # It then checks linger, mbx, mise and free disk. The mise tools themselves install in
-# each gate's first step. forge is the benchmark host and is refused.
+# each gate's first step. The benchmark host, SPARKLES_BENCH_HOST (default forge), is
+# refused, so swapping roles means setting that first and then preparing the new gate host.
 set -euo pipefail
 host=${1:?usage: setup-host.sh <host> [suites-source-host]}
 src=${2:-wally}
-case $host in forge | forge.*)
-  echo "forge is the benchmark host and never runs gate work" >&2
+bench=${SPARKLES_BENCH_HOST:-forge}
+if [ "$host" = "$bench" ] || [ "${host%%.*}" = "$bench" ]; then
+  echo "$host is the benchmark host (SPARKLES_BENCH_HOST) and never runs gate work" >&2
   exit 2
-  ;;
-esac
+fi
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 
 # shellcheck disable=SC2016

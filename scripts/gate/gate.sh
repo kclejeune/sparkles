@@ -10,7 +10,7 @@
 #   gate.sh --hosts                    print each gate host's lock, queue and free disk
 #
 # Options:
-#   --host H     run the whole gate on H (wally or atlas), with no conformance half elsewhere
+#   --host H     run the whole gate on H, with no conformance half elsewhere
 #   --helper H   run the conformance half on H while ci runs on the primary host, or "none"
 #   --auto       pick the hosts from their heavy locks and gate queues (see below)
 #   --jobs N     pass --jobs N to scripts/ci.sh (default 1)
@@ -24,21 +24,48 @@
 # 0 only when both halves pass. A fetch of a finished split gate also copies the merged
 # files back into the primary host's ~/gate/out/<name>/.
 #
-# --auto checks each host's ~/gate/.lock (the same file as ~/lanes/.heavy.lock) and its
-# gate-* units. With both hosts idle it splits. With one busy it runs the whole gate on the
-# idle one, provided that host has the free disk for it. With both busy it splits unless
-# atlas has the shorter queue.
+# Host roles: SPARKLES_BENCH_HOST (default forge) names the benchmark host, which never
+# runs gate work, not even when named with --host. GATE_HOSTS (default "wally atlas
+# forge") lists the hosts that may run gates, and the benchmark host is dropped from it.
+# GATE_PRIMARY (or the older WALLY_HOST) sets the default primary host, and GATE_HELPER
+# the default helper, which is otherwise the first other gate host. GATE_HELPER=none
+# disables the split, and a GATE_HELPER that does not resolve exercises the
+# unreachable-helper fallback. These settings may also live in ~/.config/sparkles/gate.env
+# (or $SPARKLES_GATE_CONFIG) as KEY=VALUE lines, and the environment takes precedence.
+# Swapping the benchmark role from forge to atlas is SPARKLES_BENCH_HOST=atlas there, after
+# scripts/gate/setup-host.sh forge has prepared forge.
 #
-# Environment: GATE_PRIMARY (or the older WALLY_HOST) sets the default primary host and
-# GATE_HELPER the default helper; GATE_HELPER=none disables the split. Pointing GATE_HELPER
-# at a name that does not resolve exercises the unreachable-helper fallback. forge is the
-# benchmark host and is always refused.
+# --auto checks each gate host's ~/gate/.lock (the same file as ~/lanes/.heavy.lock) and
+# its gate-* units. With the primary and helper both idle it splits. Otherwise it runs the
+# whole gate on an idle host that has the free disk for it, and with no idle host it
+# splits as by default.
 set -euo pipefail
 
 self=$(readlink -f "${BASH_SOURCE[0]}")
 here=$(dirname "$self")
-primary=${GATE_PRIMARY:-${WALLY_HOST:-wally}}
-helper=${GATE_HELPER-atlas}
+config=${SPARKLES_GATE_CONFIG:-$HOME/.config/sparkles/gate.env}
+if [ -f "$config" ]; then
+  while IFS='=' read -r k v; do
+    case $k in
+      SPARKLES_BENCH_HOST | GATE_HOSTS | GATE_PRIMARY | GATE_HELPER | GATE_MIN_FREE_GB | GATE_MIN_FREE_HALF_GB)
+        [ -n "${!k+x}" ] || export "$k=$v"
+        ;;
+    esac
+  done < <(grep -E '^[A-Z_]+=' "$config")
+fi
+bench=${SPARKLES_BENCH_HOST:-forge}
+gate_hosts=()
+for h in ${GATE_HOSTS:-wally atlas forge}; do [ "$h" = "$bench" ] || gate_hosts+=("$h"); done
+primary=${GATE_PRIMARY:-${WALLY_HOST:-${gate_hosts[0]:-wally}}}
+default_helper() {
+  local h
+  for h in "${gate_hosts[@]}"; do [ "$h" = "$1" ] || {
+    echo "$h"
+    return
+  }; done
+  echo none
+}
+helper=${GATE_HELPER-$(default_helper "$primary")}
 mode="wait"
 auto=0
 jobs=1
@@ -111,7 +138,8 @@ probe() {
 }
 
 if [ $mode = hosts ]; then
-  for h in wally atlas; do printf '%-6s %s\n' "$h" "$(probe "$h")"; done
+  echo "benchmark host: $bench (never runs gates)"
+  for h in "${gate_hosts[@]}"; do printf '%-6s %s\n' "$h" "$(probe "$h")"; done
   exit 0
 fi
 
@@ -121,25 +149,40 @@ short=${full:0:8}
 name=$short${tag:+-$tag}
 statefile=$statedir/$name.env
 
-for h in "$primary" "$helper"; do
-  case $h in forge | forge.*) die "forge is the benchmark host and never runs gate work" ;; esac
-done
-
 # Status and fetch read the hosts recorded when the gate started. A gate started by the
-# older wally-gate.sh has no record and ran whole on wally.
+# older wally-gate.sh has no record. It ran whole on WALLY_HOST when that is set, and
+# otherwise on the gate host whose out directory for it is newest.
 if [ $mode = status ] || [ $mode = fetch ]; then
   if [ -f "$statefile" ]; then
     # shellcheck disable=SC1090
     . "$statefile"
   else
-    primary=${GATE_PRIMARY:-${WALLY_HOST:-wally}}
     helper=none
     hname=
+    if [ -z "${GATE_PRIMARY:-${WALLY_HOST:-}}" ]; then
+      best=0
+      for h in "${gate_hosts[@]}"; do
+        # shellcheck disable=SC2029
+        t=$(ssh "${ssh_opts[@]}" "$h" "stat -c %Y ~/gate/out/$name/progress.log" 2> /dev/null) || continue
+        if [ "${t:-0}" -gt "$best" ]; then
+          best=$t
+          primary=$h
+        fi
+      done
+    fi
   fi
 fi
+
+for h in "$primary" "$helper"; do
+  if [ "$h" = "$bench" ] || [ "${h%%.*}" = "$bench" ]; then
+    die "$h is the benchmark host (SPARKLES_BENCH_HOST) and never runs gate work"
+  fi
+done
+
 pout=gate/out/$name
 hname=${hname:-$name-conf}
 hout=gate/out/$hname
+# The results directory names the host that ran ci. Older drivers always used -wally.
 dest=$root/.artifacts/gates/main-gate-$name-$primary
 
 # Installs scripts/gate/remote/ on a host under ~/gate/bin/v-<hash>/ and prints that path.
@@ -284,32 +327,34 @@ case $mode in
 esac
 
 if [ $auto = 1 ]; then
-  pw=$(probe wally)
-  pa=$(probe atlas)
-  read -r wl wu _ <<< "$pw" || true
-  read -r al au ad <<< "$pa" || true
-  wbusy=1 abusy=1
-  [ "$wl" = free ] && [ "${wu:-0}" = 0 ] && wbusy=0
-  [ "$al" = free ] && [ "${au:-0}" = 0 ] && abusy=0
-  # A whole gate needs room for a ci target and a half needs room for the test binaries.
-  afull=0 ahalf=0
-  [ "$al" != unreachable ] && [ "${ad:-0}" -ge "${GATE_MIN_FREE_GB:-40}" ] && afull=1
-  [ "$al" != unreachable ] && [ "${ad:-0}" -ge "${GATE_MIN_FREE_HALF_GB:-20}" ] && ahalf=1
-  if [ "$wl" = unreachable ]; then
-    [ $afull = 1 ] || die "wally is unreachable and atlas lacks the disk for a whole gate ($pa)"
-    primary=atlas helper=none
-  elif [ $wbusy = 1 ] && [ $abusy = 0 ] && [ $afull = 1 ]; then
-    primary=atlas helper=none
-  elif [ $wbusy = 0 ] && [ $abusy = 1 ]; then
-    primary=wally helper=none
-  elif [ $ahalf = 0 ]; then
-    primary=wally helper=none
-  elif [ $wbusy = 1 ] && [ $abusy = 1 ] && [ $afull = 1 ] && [ "${au:-0}" -lt "${wu:-0}" ]; then
-    primary=atlas helper=none
+  # idle[h]=1 when h is reachable with its lock free and no gate units; full[h]=1 when h has
+  # the disk for a whole gate and half[h]=1 when it has the disk for a conformance half.
+  declare -A idle=() full=() half=()
+  report=
+  for h in "${gate_hosts[@]}"; do
+    p=$(probe "$h")
+    report+="$h [$p] "
+    read -r l u d <<< "$p" || true
+    idle[$h]=0 full[$h]=0 half[$h]=0
+    [ "$l" = unreachable ] && continue
+    [ "$l" = free ] && [ "${u:-0}" = 0 ] && idle[$h]=1
+    [ "${d:-0}" -ge "${GATE_MIN_FREE_GB:-40}" ] && full[$h]=1
+    [ "${d:-0}" -ge "${GATE_MIN_FREE_HALF_GB:-20}" ] && half[$h]=1
+  done
+  chosen=
+  if [ "$helper" != none ] && [ "${idle[$primary]:-0}" = 1 ] && [ "${full[$primary]:-0}" = 1 ] &&
+    [ "${idle[$helper]:-0}" = 1 ] && [ "${half[$helper]:-0}" = 1 ]; then
+    chosen="split"
   else
-    primary=wally helper=atlas
+    for h in "$primary" "${gate_hosts[@]}"; do
+      if [ "${idle[$h]:-0}" = 1 ] && [ "${full[$h]:-0}" = 1 ]; then
+        primary=$h helper=none chosen=whole
+        break
+      fi
+    done
   fi
-  echo "auto: wally [$pw] atlas [$pa] -> primary $primary helper $helper"
+  if [ -z "$chosen" ] && [ "$helper" != none ] && [ "${half[$helper]:-0}" = 0 ]; then helper=none; fi
+  echo "auto: ${report}-> primary $primary helper $helper"
   dest=$root/.artifacts/gates/main-gate-$name-$primary
 fi
 
