@@ -2204,6 +2204,8 @@ struct Operator {
     growing: bool,
     reason: Option<String>,
     bind_reuse: Option<Box<bind::Reuse>>,
+    /// Whether the operator and those below it released what they hold for reading.
+    released: bool,
     /// The variables every output batch, and the concatenation of all of them, is
     /// sorted on in raw ID order. It is fixed when the operator is built, and each
     /// output batch carries it.
@@ -2591,11 +2593,24 @@ impl Operator {
         // Which children's order this operator relies on. A projection or BIND passes
         // on what its parent needs. A join that cannot merge on what the plan claims
         // reads its build input into a hash table and keeps only the probe input's
-        // order. Other operators may use their inputs' order.
+        // order. A filter keeps its input's order without using it. A grouping in a hash
+        // table claims no order, and when no aggregate depends on the order of its rows
+        // it relies on none (item 93). A LIMIT or OFFSET chooses its rows by their
+        // order, so it relies on it whatever its parent needs. Other operators may use
+        // their inputs' order.
         let hashes = joins && ctx.spill.is_some() && !merge::eligible(&node);
+        let order_free_group = incremental_group
+            && match &node.kind {
+                Kind::Group { aggs, .. } => aggs.iter().all(|(_, agg)| group::order_free(agg)),
+                _ => false,
+            };
         let needs: Vec<bool> = (0..node.children.len())
             .map(|i| match node.kind {
-                Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } => needed,
+                Kind::Slice { offset, limit } if offset > 0 || limit.is_some() => true,
+                Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } | Kind::Filter(_) => {
+                    needed
+                }
+                Kind::Group { .. } if order_free_group => false,
                 _ if hashes => needed && i == binary::probe_side(&node),
                 _ => true,
             })
@@ -2832,10 +2847,35 @@ impl Operator {
             growing,
             reason,
             bind_reuse,
+            released: false,
             order,
             #[cfg(debug_assertions)]
             last: None,
         })
+    }
+
+    /// Release what an operator that produces no more rows holds for reading, and the
+    /// same for every operator below it, including one that did not reach its own end,
+    /// such as the other input of a merge join whose first input ended. Nothing pulls
+    /// them again.
+    /// Each scan otherwise keeps the charge of a decoded block, about a megabyte, for
+    /// the rest of the query, which left a grouping above a finished join with a
+    /// fraction of a small budget for all of its later passes (item 93). Plan
+    /// metadata stays.
+    fn release_finished(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        match &mut self.state {
+            State::Scan(scan) => scan.base = None,
+            State::Binary(binary) => binary.release_working_sets(),
+            State::Ripple(ripple) => ripple.release_working_sets(),
+            _ => {}
+        }
+        for child in &mut self.children {
+            child.release_finished();
+        }
     }
 
     /// Check, in debug builds, that a batch keeps the operator's order, within the
@@ -3017,6 +3057,7 @@ impl Operator {
         ctx.produced(self.rows)?;
         self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
         self.done = true;
+        self.release_finished();
         ctx.check()?;
         Ok(Some(count))
     }
@@ -3087,6 +3128,7 @@ impl Operator {
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
                 self.done = true;
+                self.release_finished();
             }
         }
         ctx.check()?;
@@ -3137,6 +3179,7 @@ impl Operator {
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
                 self.done = true;
+                self.release_finished();
             }
             ctx.check()?;
             Ok(batch)
@@ -4765,6 +4808,58 @@ mod tests {
 
     /// A cursor over a few dozen distinct IRIs and literals, and its first batch of
     /// eight rows, for the tests of the decoded batch's reservation.
+    /// The scans under a merge join give back the charge of their decoded blocks once
+    /// the join ends, while the grouping above it still outputs its groups (item 93).
+    #[test]
+    fn finished_joins_release_their_scans_block_charges() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..4096)
+            .map(|i| {
+                format!(
+                    "<urn:s:{i}> <urn:p> <urn:o:{}> .\n<urn:s:{i}> <urn:q> {i} .\n",
+                    i % 7
+                )
+            })
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let cursor = CursorOptions {
+            batch_rows: 1,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(
+            store.snapshot(),
+            "SELECT ?o (COUNT(*) AS ?n) { ?s <urn:p> ?o . ?s <urn:q> ?x } GROUP BY ?o",
+            &QueryOptions::default(),
+            &cursor,
+        )
+        .unwrap();
+        let plan = cursor.plan_json().unwrap();
+        assert!(plan.contains("MergeJoin"), "{plan}");
+        let batch = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(batch.len(), 1);
+        // Each scan charged a block's decoded columns, BLOCK_ROWS * 32 bytes.
+        let block = crate::index::BLOCK_ROWS as u64 * 32;
+        assert!(
+            cursor.ctx.mem_peak() > 2 * block,
+            "the scans held no blocks: peak {}",
+            cursor.ctx.mem_peak()
+        );
+        assert!(
+            cursor.ctx.live_bytes() < block,
+            "the finished scans still hold their blocks: live {}",
+            cursor.ctx.live_bytes()
+        );
+    }
+
     fn first_batch(memory: u64) -> QueryBatch {
         use crate::io::Source;
         use crate::store::{Store, StoreOptions};

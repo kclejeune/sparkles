@@ -224,9 +224,14 @@ fn nested_optional_with_a_named_graph_fits_a_small_budget_at_large_batch_caps() 
 /// that order; the UNION of the second has no order to keep.
 const INNER: &str = "SELECT ?a ?v ?b ?w ?k { ?a <urn:v> ?v . ?a <urn:p> ?k . \
                      ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l }";
-/// The join of INNER under a grouping, which may use its input's order, so that a
-/// spilled join keeps the probe input's order.
-const INNER_ORDERED: &str = "SELECT ?a (COUNT(*) AS ?n) (SUM(?w) AS ?ws) { ?a <urn:v> ?v . \
+/// The join of INNER under a grouping whose SAMPLE depends on the order of its rows, so
+/// that a spilled join keeps the probe input's order.
+const INNER_ORDERED: &str = "SELECT ?a (COUNT(*) AS ?n) (SAMPLE(?v) AS ?sv) { ?a <urn:v> ?v . \
+                             ?a <urn:p> ?k . ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l } \
+                             GROUP BY ?a";
+/// The join of INNER under a grouping whose aggregates do not depend on the order of
+/// their rows, so that a spilled join need not restore the probe input's order.
+const INNER_GROUPED: &str = "SELECT ?a (COUNT(*) AS ?n) (SUM(?w) AS ?ws) { ?a <urn:v> ?v . \
                              ?a <urn:p> ?k . ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l } \
                              GROUP BY ?a";
 const INNER_UNORDERED: &str = "SELECT ?a ?v ?b ?k ?l { { ?a <urn:v> ?v . ?a <urn:p> ?k } \
@@ -238,7 +243,7 @@ fn spilled_hash_joins_match_eager_at_every_batch_size() {
     let s = store(30_000, false);
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
-    for q in [INNER_ORDERED, INNER, INNER_UNORDERED] {
+    for q in [INNER_ORDERED, INNER_GROUPED, INNER, INNER_UNORDERED] {
         let expected = eager(&s, q);
         let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
         assert_eq!(sorted(memory.rows.clone()), expected, "{q}");
@@ -277,6 +282,16 @@ fn spilled_hash_joins_match_eager_at_every_batch_size() {
             } else {
                 // Nothing relies on the order, so the join emits partition by partition.
                 assert!(!spilled.plan.contains("spillMergePasses"), "{q}");
+            }
+            // A grouping above the join groups many rows in each pass once the join
+            // and its scans have given their memory back (item 93). It used to take
+            // one group per pass.
+            if let Some(passes) = counter(&spilled.plan, "spillPasses") {
+                assert!(
+                    passes as usize * 20 < expected.len(),
+                    "{q}: {passes} passes for {} groups",
+                    expected.len()
+                );
             }
             assert_eq!(sorted(spilled.rows), expected, "{q} at batch size {batch}");
             assert_eq!(spill.reserved_bytes(), 0, "{q}");
@@ -576,6 +591,61 @@ fn failures_in_a_spilled_join_leave_nothing_behind() {
     spill.inject_fault(Fault::Read, 20);
     let error = drain(&opts).unwrap_err();
     assert!(matches!(&error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
+/// A grouping above a hash join whose probe input is a merge join of two scans, the
+/// shape of a GROUP BY over a subquery's join. Once the joins end, their scans give back
+/// the charge of their decoded blocks, about a megabyte each, so that the grouping's
+/// later passes have the budget's room. They used to keep it, and under 4 MiB every
+/// later pass took one group (item 93).
+#[test]
+fn a_grouping_above_finished_joins_has_their_room_for_its_passes() {
+    let s = store(60_000, false);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT ?b (COUNT(*) AS ?n) (SUM(?v) AS ?vs) { ?a <urn:v> ?v . \
+             { SELECT ?a ?b { ?a <urn:p> ?k . ?b <urn:q> ?k } } } GROUP BY ?b";
+    let expected = eager(&s, q);
+    let spilled = run(&s, q, 4 << 20, Some(spill.clone()), 4096).unwrap();
+    assert_eq!(sorted(spilled.rows), expected);
+    let passes = counter(&spilled.plan, "spillPasses").expect("the grouping spills");
+    assert!(
+        passes as usize * 20 < expected.len(),
+        "{passes} passes for {} groups: {}",
+        expected.len(),
+        spilled.plan
+    );
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
+/// A LIMIT chooses its rows by their order even when nothing above it relies on the
+/// order of its output. The spilled OPTIONAL below this one keeps its left input's value
+/// order, so the LIMIT picks the rows with the largest values as it does in memory.
+#[test]
+fn a_limit_below_an_order_free_grouping_keeps_its_input_order() {
+    let s = store(60_000, false);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT (SUM(?v) AS ?vs) (COUNT(DISTINCT ?a) AS ?n) { SELECT ?a ?v { \
+             { SELECT ?a ?k ?v { ?a <urn:v> ?v . ?a <urn:p> ?k } ORDER BY DESC(?v) ?a } \
+             OPTIONAL { ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l } } LIMIT 3000 }";
+    let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
+    let spilled = run(&s, q, 4 << 20, Some(spill.clone()), 4096).unwrap();
+    assert!(
+        counter(&spilled.plan, "spilledBytes").is_some_and(|b| b > 0),
+        "{}",
+        spilled.plan
+    );
+    assert_eq!(spilled.rows, memory.rows, "{}", spilled.plan);
+    assert!(
+        memory.rows[0].contains("\"36000\""),
+        "{:?} {}",
+        memory.rows,
+        memory.plan
+    );
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
 }

@@ -1,5 +1,7 @@
-//! `serve` keeps spill opt-in until every X08 Phase 2b gate passes. Enabling spill
-//! explicitly requires a usable directory; an ordinary start leaves it unopened.
+//! `serve` spills by default (X08, item 93). With the default, a spill directory that
+//! cannot be used is passed over with a warning and the server runs without spill. With
+//! `--spill on` or `--spill encrypted` given, the same directory fails the start, and
+//! `--spill off` turns spill off and leaves the directory unopened.
 
 use serde_json::Value as J;
 use std::io::{Read, Write};
@@ -94,7 +96,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn spill_is_opt_in_and_an_unusable_directory_fails_when_requested() {
+fn spill_is_on_by_default_and_an_unusable_directory_only_fails_an_explicit_request() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let log = dir.path().join("server.log");
@@ -104,18 +106,20 @@ fn spill_is_opt_in_and_an_unusable_directory_fails_when_requested() {
     let unusable = unusable.to_str().unwrap();
 
     {
-        let s = Server::start(&data, &[], &log);
+        let s = Server::start(&data, &["--spill", "off"], &log);
         assert_eq!(s.spill()["enabled"], false, "{}", s.spill());
         assert!(!data.join(".spill").exists());
+    }
+    {
+        let s = Server::start(&data, &[], &log);
+        assert_eq!(s.spill()["enabled"], true, "{}", s.spill());
+        assert!(data.join(".spill").is_dir());
     }
     {
         let s = Server::start(&data, &["--spill-dir", unusable], &log);
         assert_eq!(s.spill()["enabled"], false, "{}", s.spill());
-        assert!(!data.join(".spill").exists());
-    }
-    {
-        let s = Server::start(&data, &["--spill", "off"], &log);
-        assert_eq!(s.spill()["enabled"], false, "{}", s.spill());
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("running without spill"), "{text}");
     }
     for mode in ["on", "encrypted"] {
         let (mut command, _) = serve(&data, &["--spill", mode, "--spill-dir", unusable], &log);

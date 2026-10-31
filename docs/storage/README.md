@@ -333,12 +333,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays
   collected. The UI, MCP and Python's collected query API collect results, while explicit
   cursors and the JVM's automatic execution can pull SELECT batches. Roadmap item 7.
-* Disk spill is off by default. With spill on, a DISTINCT over an ordered input other than
-  an ORDER BY keeps its whole set, a grouping's single group can outgrow the budget, and
-  eager operators still fail at their budget. A spilled join that must keep its order
-  writes its output once more to merge it, which made one join under 4 MiB 8.9 times
-  slower than the same cursor without a memory limit. Grouping above an ordered spilled
-  join is slow. Roadmap item 93.
+* Disk spill is on by default. A DISTINCT above an ORDER BY that cannot move below the
+  sort, or above a ranking, keeps its whole set, which is item 497. A grouping's
+  single group can outgrow the budget, and eager operators still fail at their budget. A
+  spilled join below an operator that relies on its order, such as an ORDER BY, a
+  DISTINCT or a GROUP_CONCAT, writes its output once more to merge it, which is item
+  496. Automatic execution keeps a DISTINCT over partly ordered input eager though
+  its cursor is faster, which is item 498.
 * Incremental table views and SSE live queries are available. Graph views, per-fact
   provenance and commit-time maintenance remain planned under item 17. Live operator
   profiling and running-query monitoring remain item 27.
@@ -391,7 +392,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 446](../ROADMAP.md), [item 447](../ROADMAP.md), [item 448](../ROADMAP.md).
+The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 496](../ROADMAP.md), [item 497](../ROADMAP.md), [item 498](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 446](../ROADMAP.md), [item 447](../ROADMAP.md), [item 448](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -1,19 +1,19 @@
 # X08: Disk spill and server-wide memory
 
-> **Status:** implemented in part. Phases 1 and 2 shipped, with spill opt-in. Phase 3 is specified.
+> **Status:** implemented in part. Phases 1 and 2 shipped, with spill on by default. Phase 3 is specified.
 >
 > **Phases:** Phase 1 is shipped. It is server-wide cache sizing, a smaller memory
 > profile and the server-wide query memory pool with admission control. Phase 2 implements
 > batch-oriented hash join and grouping kernels in the cursor engine, then disk spill for
 > hash joins, sorts, grouping and DISTINCT. The full-scale plain and encrypted spill
-> matrix passes. Eager fallbacks, execution costs and the spill-default decision remain
-> under roadmap items 7 and 93, so spill stays opt-in. Phase 3 is not built. It reduces the
+> matrix passes, and `serve` spills by default since item 93. Eager fallbacks remain under
+> roadmap item 7. Phase 3 is not built. It reduces the
 > idle server footprint, the Python process footprint and the size of the full-text index.
 >
 > **User docs:** [USAGE](../USAGE.md#memory-and-caches) and
 > [API](../API.md#query-memory-pool) cover memory management.
 > [Usage](../USAGE.md#incremental-query-execution) covers execution modes, and
-> [Memory and caches](../USAGE.md#memory-and-caches) covers opt-in spill.
+> [Memory and caches](../USAGE.md#memory-and-caches) covers spill.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how Phases 1 and 2 landed and where they differ from the text above.
@@ -769,9 +769,10 @@ gate at 1.05M, 10.5M and on DBpedia, as
 [the retune](#small-profile-retune-and-the-phase-1a-control-item-97-2026-10-23) records.
 Phase 2 is built for sorts, groupings and DISTINCT under item 7, and item 85 added
 hash-join spill, the merge-join spool, DISTINCT below an ORDER BY and encryption on
-2026-10-18. Spill remains opt-in. Item 93 records the full-scale acceptance runs,
-the review of enabling spill by default and the remaining execution work. Phase 3
-is not built and belongs to item 40.
+2026-10-18. Item 93 recorded the full-scale acceptance runs, reduced the costs of
+spilled groupings and DISTINCT over ordered input, and turned spill on by default on
+2026-10-31, as [its section](#spill-execution-costs-and-the-default-item-93-2026-10-31)
+records. Phase 3 is not built and belongs to item 40.
 
 ### Phase 1a: shared caches
 
@@ -1920,3 +1921,158 @@ like them.
 
 Spill file formats are unchanged, since only the routing of rows changed.
 
+### Spill execution costs and the default, item 93 (2026-10-31)
+
+Item 93 took the costs that the full-scale acceptance left and decided the default.
+`serve` now spills when `--spill` is not given. A spill directory that cannot be used is
+then passed over with a warning and the server runs without spill, while `--spill on` and
+`--spill encrypted` still fail the start. The embedded API spills only when
+`QueryOptions::spill` holds a spill directory, as before.
+
+**Grouping above a spilled join.** At 10.5M under 4 MiB, the GROUP BY of
+`SELECT ?friend (COUNT(*) AS ?n) (SUM(?age) AS ?ageSum)` over the join of `foaf:age`
+with a subquery's merge join took one group in every pass, 917,941 passes for 917,941
+groups. Each scan kept the charge of a decoded block, about a megabyte, until the query
+ended, so three finished scans left the grouping a fifth of its budget for every later
+pass. An operator that reaches its end now releases what it and every operator below it
+hold for reading, including a scan that ended on the shared batch path and the other
+input of a merge join whose first input ended. A later pass of a grouping or DISTINCT
+also sizes itself from the room it has when it starts. The same query now takes 273
+passes. The regression tests are
+`a_grouping_above_finished_joins_has_their_room_for_its_passes`, which took 54,000 passes
+for 54,000 groups before, and `finished_joins_release_their_scans_block_charges`.
+
+**Restoring the probe order.** Every operator other than a projection, BIND or LIMIT was
+taken to rely on its input's order, so a spilled hash join below a GROUP BY numbered its
+probe rows and merged its output files back into their order. A grouping in a hash table
+claims no order, and COUNT, SUM, AVG, MIN and MAX do not depend on the order of their
+rows, so such a grouping now relies on none, and a filter passes on what its parent
+needs. A LIMIT or OFFSET chooses its rows by their order, so it relies on its input's
+order whatever its parent needs. GROUP_CONCAT, SAMPLE and the ARQ statistics aggregates
+still rely on the order. A SUM or AVG of integers now holds its running sum in 128 bits
+and checks only the final sum against the `xsd:integer` range, so it no longer fails in
+one row order and succeeds in another. An AVG is still unbound when that sum leaves the
+range although the average would fit. A spilled SUM or AVG of doubles may round differently
+in its last bits than in memory, a sum of decimals near the decimal range may still
+overflow in one order only, and MIN or MAX may keep another of two values that compare
+equal, all of which SPARQL leaves open. The regression tests are
+`a_limit_below_an_order_free_grouping_keeps_its_input_order` and
+`integer_sums_do_not_depend_on_the_order_of_their_rows`. A join below an ORDER BY, a
+DISTINCT, a LIMIT or an order-dependent aggregate still writes its output once more,
+which [roadmap](../ROADMAP.md) item 496 takes.
+
+**DISTINCT over partly ordered input.** A DISTINCT over input ordered on some but not
+all of its columns kept the set of every row it had emitted, with or without spill.
+Equal rows have equal values in the first order column, and the input is sorted on it,
+so every copy of a row lies in one run of that value. The set now holds one run and
+starts again when the value changes, and a set that a long run left oversized is freed
+rather than cleared for each short run after it. The rows that pass keep the input's
+order, so the operator's order claim is unchanged. The regression test is
+`distinct_over_partly_ordered_input_holds_one_run`, which failed its 256 KiB budget
+before. A DISTINCT above an ORDER BY that cannot move below the sort, or above a
+ranking, still keeps its whole set, which item 497 takes. Automatic execution
+still runs such a DISTINCT eagerly although its cursor is now faster, which item
+498 takes.
+
+**Forge measurements.** The runs below used forge, which has a 13th Gen Intel Core
+i5-13500 with 20 logical CPUs and 15.6 GiB of memory, on kernel 7.2.9. Each ran under the
+heavy lock with no other job on the host, on the synthetic people file of 1,000,000
+people, which loads as 10,527,319 quads. The raw records are in
+`.artifacts/bench-spill-7-93`, and the
+[compact copies](../benchmarks/memory/records/spill-item-93-2026-10-31/README.md) with their
+hashes are in the memory benchmark directory.
+
+The spill matrix used two release builds of the mode probe, d65eaf40, the base of the
+lane, and 8ca35daa, the lane through the release of finished scans. The three later
+commits are not in them. They turn spill on in `serve`, keep a LIMIT's input order and
+sum integers in 128 bits. Each run was one probe process with eight Rayon threads and
+batches of 4,096 rows, which ran the cursor and the eager plan once to warm up and three times to
+time them and compared their rows. A spilled cell set the cursor's budget and gave it a fresh directory
+on the local disk. The runs went in the order A, B, B, A for each query and cell. The
+table gives the median of the two runs of each binary. Times are in milliseconds,
+and the bytes written are those of one execution.
+
+| 10.5M, plain spill | Cell | Eager | Base cursor | Lane cursor | Base written | Lane written |
+|---|---|---:|---:|---:|---:|---:|
+| `ordered-join`, 917,941 groups | unlimited | 200 | 276 | 271 | 0 | 0 |
+| | 16 MiB | 200 | 732 | 708 | 56.0 MB | 41.5 MB |
+| | 4 MiB | 208 | 16,370 | **1,498** | 444.0 MB | **100.9 MB** |
+| `distinct-order`, 917,941 rows | unlimited | 589 | 593 | 606 | 0 | 0 |
+| | 16 MiB | 607 | 876 | 824 | 11.1 MB | 11.1 MB |
+| | 4 MiB | 609 | 1,587 | 1,483 | 27.4 MB | 24.9 MB |
+| `optional`, 490,540 rows | unlimited | 134 | 158 | 159 | 0 | 0 |
+| | 16 MiB | 134 | 201 | 201 | 9.1 MB | 9.1 MB |
+| | 4 MiB | 138 | 357 | 359 | 21.7 MB | 21.7 MB |
+| `minus`, 76,559 rows | unlimited | 13 | 31 | 31 | 0 | 0 |
+| | 16 MiB | 13 | 59 | 41 | 4.0 MB | 1.9 MB |
+| | 4 MiB | 13 | 111 | 108 | 6.0 MB | 6.0 MB |
+
+*Measured on forge.*
+
+The `ordered-join` query is the grouping above a spilled join described above. Under
+4 MiB it took 1.5 s where the base took 16.4 s, and it wrote 101 MB where the base wrote
+444 MB. Under 16 MiB it took 3% less time and wrote 26% fewer bytes. The `minus` query
+at 16 MiB took 29% less time and wrote 1.9 MB where the base wrote 4.0 MB, and the
+`distinct-order` cells under a budget took 6% less time. The other cells moved by
+at most 3%. The unlimited cursor held 366 MB for `ordered-join`, 980 MB for
+`distinct-order`, 185 MB for `optional` and 54 MB for `minus`, and every spilled run
+stayed within its budget, with peaks of 3.6 to 4.19 MB under 4 MiB and 14.8 to 16.7 MB
+under 16 MiB. The cursor's rows had the same digest as the eager rows and the same bag
+of rows in all 88 runs. Every run closed with no reserved spill bytes and left its spill
+directory empty.
+
+`--spill encrypted` ran the same cells with the lane build. It added 0% to 7% to the
+bytes written and 1% to 11% to the time of the cells under 16 and 4 MiB. The largest
+rises were 11% for `ordered-join` at both budgets and for `minus` under 4 MiB.
+
+| 10.5M, unlimited cursor, ms | Eager | Base cursor | Lane cursor | Base ledger peak | Lane ledger peak |
+|---|---:|---:|---:|---:|---:|
+| `pdistinct-scan`, `SELECT DISTINCT ?s ?o { ?s ?p ?o }`, 10,527,312 rows | 959 | 800 | **174** | 479.3 MB | **1.2 MB** |
+| `pdistinct-join`, `SELECT DISTINCT ?p ?age` over a merge join, 833,177 rows | 107 | 87 | **71** | 32.2 MB | **2.4 MB** |
+
+*Measured on forge.*
+
+A DISTINCT over input ordered on its first column now holds one run of that column, so
+its ledger peak fell from 479 MB to 1.2 MB for the scan and from 32 MB to 2.4 MB for
+the join. The `pdistinct-scan` query ran
+4.6 times as fast as the base cursor and 5.5 times as fast as the eager plan. Automatic
+execution still runs it eagerly, which item 498 takes.
+
+The default was measured on the lane build 890c60ef, run once as `serve --spill off`
+and once as `serve --spill on`, so that one binary supplied both sides. A and B started fresh servers on one shared store for each of eight rounds
+in the order A, B, B, A, with one Rayon thread, the server on one core and the client on
+another, three warm-up and 20 timed requests per query and process, over all 30 queries
+of the synthetic suite. The second run swapped the sides to remove the order effect. The
+ratios are medians of the server's execution time in the response.
+
+| 10.5M, `--spill on` against `--spill off` | Spill off first | Spill on first |
+|---|---:|---:|
+| Server time, geometric mean of 30 queries | 0.991 | 0.995 |
+| Client wall time, geometric mean of 30 queries | 1.000 | 1.000 |
+| Server time, 21 queries of 1 ms or more, range | 0.985 to 1.005 | 0.992 to 1.007 |
+| Server time, 9 queries under 0.1 ms, range | 0.938 to 1.019 | 0.961 to 0.994 |
+
+*Measured on forge. The right column inverts the run's B over A ratios so that both read
+as spill on over spill off.*
+
+Both runs returned the same sorted TSV answers for all 30 queries on the two sides.
+The queries of a few microseconds read no more than 2% slower with spill on, and
+their ranges overlap 1.0 between the two runs. The slowest client change was
+`order-by-full` at +2.1% in the first run, with a spread of more than 150% between the
+servers of one binary, and it read +0.2% in the second. No query that takes a millisecond
+or more changed by more than 1.5% in either run. A server that spills by default
+therefore costs no query time that these runs can resolve.
+
+The comparison that the earlier push screen asked for, between a build before the opt-in
+spill work, 5453f9d0, and the last commit of that work, c88c5969, ran the default path
+without `--spill`. It used 16 rounds in the order A, B, B, A with 80 timed requests and
+10 warm-up requests per process, over `distinct-join`, `expr-order-key`, `distinct-obj`
+and `employee-docs`, on a fresh load of each build. The builds returned the same sorted
+TSV answers. `distinct-join` read 1.004 in server time, `employee-docs` 0.995, and
+`distinct-obj` 1.060 on a median of 0.003 ms with a spread of 55% between servers.
+`expr-order-key` read 1.035 in server time and 1.036 in client time, and its per-round
+ratio stayed between 1.031 and 1.040 in all 16 rounds with a spread of 1.5% and 2.0%
+between the servers of each build. The geometric mean was 1.023 for server time and
+1.010 for client time. The slowdown of `expr-order-key` is therefore reproducible
+between these two builds, which do not include the commits of item 93, and its cause is
+unknown.

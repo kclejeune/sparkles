@@ -165,14 +165,19 @@ check them against the W3C suites and Jena's own answers.
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
 * Disk spill lets large queries finish within their memory budget
-  ([X08](../specs/X08-disk-spill-and-server-memory.md)). It is off by default, and
-  `serve --spill on` or `encrypted` and `QueryOptions::spill` turn it on.
+  ([X08](../specs/X08-disk-spill-and-server-memory.md)). `serve` spills by default,
+  `--spill off` turns it off, and `--spill encrypted` encrypts the files. An embedded
+  store spills when `QueryOptions::spill` holds a spill directory.
   * A streamed sort without LIMIT writes sorted runs and merges them. A grouping or a
     DISTINCT keeps what fits and handles the rest in later passes over hash-partitioned
     files.
   * A hash join whose build input outgrows its share partitions both inputs by key, up to
     three levels, and joins a heavy key as a block nested loop. A merge join spools a long
-    run of equal keys to a file.
+    run of equal keys to a file. A spilled join restores its probe input's order only for
+    an operator above that relies on it, which a grouping of COUNT, SUM, AVG, MIN and MAX
+    does not.
+  * A DISTINCT over input ordered on some of its columns holds the rows of one run of the
+    first order column at a time, with or without spill.
   * `--spill encrypted` seals every frame with AES-256-GCM under a per-file key held only
     in memory. Spill files are versioned, CRC-checked, unnamed while written and removed
     with their query or process.
@@ -180,8 +185,9 @@ check them against the W3C suites and Jena's own answers.
     with `--spill-max-mb`. With spill on, automatic execution streams a query that eager
     execution would hold in more than half its budget, and reruns an eager query that
     exceeds its budget as a cursor unless it calls SERVICE.
-  * The server refuses to start with an unusable spill directory, one on tmpfs or ramfs, or
-    one that other users can write.
+  * With `--spill on` or `encrypted`, the server refuses to start with an unusable spill
+    directory, one on tmpfs or ramfs, or one that other users can write. With the default,
+    it logs a warning and runs without spill.
 
 ### Explaining queries
 

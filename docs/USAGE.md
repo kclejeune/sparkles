@@ -464,8 +464,8 @@ happens to materialized inferences, and the limits.
 | `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
 | `--total-query-memory-mb N` | half the available memory, less the caches (`small`: `2048`) | The query memory pool, the estimated memory of all queries and updates together. A request waits for a share of it before it runs. `0` turns the pool off. See [Memory and caches](#memory-and-caches). |
 | `--query-admission-wait S` | `2` | Seconds a request waits for its share of the pool before it answers `503` with `Retry-After: 1`. |
-| `--spill MODE` | `off` | `on` lets a streamed sort, grouping, DISTINCT or join that outgrows its memory budget write the excess to disk. `encrypted` does the same with every spill file encrypted under a key held only in memory, and `off` makes such a query fail with its memory budget. See [Memory and caches](#memory-and-caches). |
-| `--spill-dir DIR` | `<data>/.spill` | Directory of the spill files, on a local disk. The server's user must own it and no other user may write it. The server opens it only when `--spill on` or `encrypted` is given, and fails to start if it cannot be used or sits on tmpfs or ramfs. |
+| `--spill MODE` | `on` | `on` lets a streamed sort, grouping, DISTINCT or join that outgrows its memory budget write the excess to disk. `encrypted` does the same with every spill file encrypted under a key held only in memory, and `off` makes such a query fail with its memory budget. When the flag is not given and the spill directory cannot be used, the server logs a warning and runs without spill. See [Memory and caches](#memory-and-caches). |
+| `--spill-dir DIR` | `<data>/.spill` | Directory of the spill files, on a local disk. The server's user must own it and no other user may write it. With `--spill off` the server does not open it. With `--spill on` or `encrypted` given, the server fails to start if it cannot be used or sits on tmpfs or ramfs. |
 | `--spill-max-mb N` | a quarter of the free space, at most 65536 | Disk that all queries' spill files may reserve together, at least 1. Queries take it in 64 MiB extents, first come first served, and give each back once their open files no longer need it. |
 | `--query-spill-mb N` | `16384` | Disk that one query's spill files may reserve. A request may lower it with `spill-mb`. |
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
@@ -620,7 +620,9 @@ spill on, automatic execution also streams a query that eager execution would ho
 more than half its memory budget, and runs an eager query that exceeds its budget once
 more as a cursor. The files go to `--spill-dir`, have no name while they are written,
 and disappear when the query ends or the process dies. `--spill encrypted` encrypts them
-under keys held only in memory, and `--spill off` keeps query data off the disk. A sort that spills to a local SSD at
+under keys held only in memory, and `--spill off` keeps query data off the disk. Without
+`--spill`, a spill directory that cannot be used, such as one on tmpfs or on a read-only
+disk, is passed over with a warning and the server runs without spill. A sort that spills to a local SSD at
 10.5M triples took 0.72 to 0.85 times the eager time on one thread and 1.9 to 2.2 times
 on eight, holding about 50 MB where an in-memory sort holds 580 MB. The details are in
 [API.md](API.md#disk-spill).
@@ -5392,8 +5394,8 @@ has seen, and an eligible aggregate keeps its group state. Sorting and unsupport
 operators read their whole input first, and the plan marks where they do. Kept state
 and terms the query creates count against the budget. A query that exceeds the budget
 fails, unless `QueryOptions::spill` holds a `sparkles::spill::Spill` opened on a local
-directory. Then a sort without LIMIT, a grouping and a DISTINCT over unordered input
-write what does not fit to disk, as the server's `--spill on` does. The ordinary
+directory. Then a sort without LIMIT, a grouping, a DISTINCT over unordered input and a
+join write what does not fit to disk, as the server does by default. The ordinary
 `query` and `select` calls run eagerly. Cursors inside a native transaction are not supported.
 
 `graph_cursor` and `graph_cursor_with` return batches of decoded quads for CONSTRUCT

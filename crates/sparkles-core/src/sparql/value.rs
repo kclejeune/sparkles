@@ -415,6 +415,19 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
 /// The scale of oxsdatatypes' decimals, which hold `value × 10^-18` in an `i128`.
 const DECIMAL_SCALE: i128 = 1_000_000_000_000_000_000;
 
+/// An exact integer sum as a value to add further numbers to. It is an `xsd:integer` when
+/// it fits one and otherwise an `xsd:decimal`, so that adding a decimal or a double to a
+/// sum of integers past the `xsd:integer` range does not fail in one row order and not
+/// in another. `None` when the sum fits neither.
+pub(crate) fn exact_sum(sum: i128) -> Option<Value> {
+    match i64::try_from(sum) {
+        Ok(sum) => Some(Value::Integer(sum.into())),
+        Err(_) => sum
+            .checked_mul(DECIMAL_SCALE)
+            .map(|v| Value::Decimal(Decimal::from_be_bytes(v.to_be_bytes()))),
+    }
+}
+
 /// The decimal product or quotient of `a` and `b` in one `i128` operation, for the
 /// operands whose oxsdatatypes result it is known to equal, or `None` to use
 /// oxsdatatypes. Its `checked_mul` and `checked_div` strip and count trailing zeros

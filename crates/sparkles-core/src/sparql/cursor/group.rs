@@ -50,6 +50,24 @@ fn admitted(agg: &Agg) -> bool {
         }
 }
 
+/// Whether an admitted aggregate's result is the same whatever the order of its group's
+/// rows, as SPARQL defines it: COUNT, SUM, AVG, MIN and MAX, with or without DISTINCT.
+/// GROUP_CONCAT joins its values in row order and SAMPLE keeps the first value, so they
+/// depend on it, and the ARQ statistics aggregates are left with them. A sum of doubles
+/// or floats in another order may round differently in its last bits, and MIN or MAX
+/// keeps the first of values that compare equal, which SPARQL leaves open as well.
+pub(super) fn order_free(agg: &Agg) -> bool {
+    admitted(agg)
+        && matches!(
+            agg.func,
+            AggregateFunction::Count
+                | AggregateFunction::Sum
+                | AggregateFunction::Avg
+                | AggregateFunction::Min
+                | AggregateFunction::Max
+        )
+}
+
 pub(super) fn eligible(node: &Node) -> bool {
     let Kind::Group { aggs, .. } = &node.kind else {
         return false;
@@ -125,7 +143,7 @@ pub(super) struct Group {
     /// Where rows of groups that do not fit go, when the query may spill.
     query: Option<Arc<QuerySpill>>,
     /// The state's bytes at which a pass takes no new groups, half the room the query
-    /// had when the grouping started.
+    /// had when the grouping or, for a later pass, the pass started.
     threshold: u64,
     /// Whether this pass takes no new groups.
     frozen: bool,
@@ -435,7 +453,9 @@ impl Group {
             .any(|agg| matches!(agg.func, AggregateFunction::Min | AggregateFunction::Max));
         let mut key = vec![Id::UNDEF; self.keys.len()];
         let mut report = Report::default();
-        if self.query.is_some() && self.threshold == 0 {
+        // A later pass sizes itself from the room it has when it starts, once the input
+        // it read and the pass before it have given their memory back.
+        if self.query.is_some() && (self.threshold == 0 || self.source.is_some()) {
             self.threshold = (ctx.memory_room() / 2).max(MIN_PASS_BYTES);
         }
         // Every input row contributes even when a parent requests a tiny prefix.

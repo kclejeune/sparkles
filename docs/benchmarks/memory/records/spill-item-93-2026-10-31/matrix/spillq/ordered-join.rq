@@ -1,0 +1,6 @@
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX ex: <http://example.org/>
+SELECT ?friend (COUNT(*) AS ?n) (SUM(?age) AS ?ageSum) WHERE {
+  ?p foaf:age ?age .
+  { SELECT ?p ?friend WHERE { ?p foaf:knows ?friend . ?friend foaf:age ?friendAge } }
+} GROUP BY ?friend

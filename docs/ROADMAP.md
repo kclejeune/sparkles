@@ -98,7 +98,7 @@ Wave A holds the work that most improves the engine against objective measures.
   `execution=streaming`, `incr_bench` as a mise task, a demand and RDFS-on-read latency
   benchmark and an instruction-count screen. Each further loss that item 452's
   competitive coverage finds becomes its own Wave A item.
-* Streaming execution and spill follow through items 7 and 93.
+* Streaming execution follows through item 7.
 * The first three stages of the unified executor, item 453, follow. Items 474 to 478
   delete dead and superseded paths, item 479 sets the first-release format cutoff, and
   items 480 to 484 consolidate the execution policy, the reasoning mode, request
@@ -174,7 +174,7 @@ against the improved baseline.
 
 Several workstreams have hard orderings.
 
-* Items 7 and 93 land before the executor merge of item 453.
+* Item 7 lands before the executor merge of item 453.
 * Items 446 and 447 land before the commit-path merge of item 455, which is the long-term
   half of its shared publish tail.
 * Storage consolidation in X16 lands before fragment composition in X18.
@@ -233,7 +233,7 @@ not to every extension in a spec or to phases that have already shipped.
 
 | Track | Open items | Specs |
 |---|---|---|
-| **Performance** | 1 refreshes the evidence while 7 and 4 address their remaining gates. Item 93 controls the spill default, and 446 lowers the fence cost of indexed group commit. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
+| **Performance** | 1 refreshes the evidence while 7 and 4 address their remaining gates. Item 446 lowers the fence cost of indexed group commit. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
 | **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 414. | F14, C22, F13 |
 | **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. Item 456 completes OWL 2 RL and rebuilds the reasoner core, starting with items 485 to 487. | F16, F17, F13, F18, F23 |
 | **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, starting with items 474 to 484. Item 454 follows the executor merge, and 455 follows 446, 447, 4 and 14. | X14, X15, X16, X17, X05 |
@@ -252,7 +252,6 @@ flowchart LR
     PL["480–483 · Policy plumbing"] --> XM
     PT["484 · Commit publish tail"] --> XM
     I7["7 · Batch execution and spill"] --> XM
-    I93["93 · Spill costs and default"] --> XM
     XM --> JA["454 · Join algorithms and estimation"]
     FC --> I58["58 · Packages"]
     FC --> I59["59 · Server binaries and images"]
@@ -436,8 +435,8 @@ continues within its caller-visible evidence and measured-latency scope.
 | 21 | **Editing forms generated from SHACL shapes.** Complete atomic nested changes and browser editing from the Rust library's pooled read models, plus list and `sh:or`/`sh:xone` editors. Complete blank-named graph contexts and admission for model sources, complex nested paths, remaining target and query producers and controlled reader integration through item 395. | [U02](specs/U02-shape-driven-forms/SPEC.md#outcome) | M–L | Medium–high |
 | 100 | **Reports for distinct audiences.** Planned named GraphRAG configurations have separate principals, projections, guarded reports and review histories, with an explicit default and shared dataset spending limits. | [C22b](specs/C22b-report-configurations.md) | M | High |
 | 65 | **Encryption.** Finish key workflows, Vault/cloud KMS and recovery export, then Phase 2 write-only age-recipient repositories and age identities. Phase 3 live-dataset and Phase 4 derived-index encryption follow; item 61 owns the shared chunking gate. A delayed initializer with the wrong key should remove its own leftover intent, and the marker-attachment branches should share one helper. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
-| 7 | **Batch-oriented execution and disk spill.** The full-scale spill matrix passes, while execution follow-ups and the default decision remain under item 93. Spill stays opt-in, and several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
-| 453 | **Unified executor.** Sparkles runs queries through an eager columnar executor and a pull-cursor executor, so every kernel exists twice and each entry point encodes its own execution policy. This workstream merges them into one morsel-driven pull engine in six stages, from cheap deletions and policy plumbing through one accounting model and shared kernels to the merge itself. Items 474 to 484 hold the first three stages, and the merge needs items 7 and 93 and the gates of items 469 to 473. | [X14](specs/X14-unified-executor/README.md) | XL | Very high |
+| 7 | **Batch-oriented execution and disk spill.** Spill is on by default and the full-scale spill matrix passes. Several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
+| 453 | **Unified executor.** Sparkles runs queries through an eager columnar executor and a pull-cursor executor, so every kernel exists twice and each entry point encodes its own execution policy. This workstream merges them into one morsel-driven pull engine in six stages, from cheap deletions and policy plumbing through one accounting model and shared kernels to the merge itself. Items 474 to 484 hold the first three stages, and the merge needs item 7 and the gates of items 469 to 473. | [X14](specs/X14-unified-executor/README.md) | XL | Very high |
 | 454 | **Join algorithms and estimation.** The planner assumes independent patterns outside subject stars, stops exhaustive ordering at 16 inputs and runs cyclic patterns through binary joins. Correlation-aware estimation, a worst-case-optimal join, scalable enumeration, adaptive re-optimization, OPTIONAL reordering, a reachability index and factorized results remain. They follow the executor merge of item 453 so that each lands in one engine. | [X15](specs/X15-join-algorithms-and-estimation/README.md) | XL | High |
 | 455 | **Storage consolidation.** The store still reads every pre-release format, keeps about 80 twin readers and publishes commits through three paths. The format cutoff of item 479, budgeted readers through one Control trait, the shared publish tail of item 484 and one load plan remove that duplication, and partitioned vocabularies with per-range generations make maintenance follow the size of a change. Tiered segments in X17 add an object-store tier, and the work follows items 446, 447, 4 and 14. | [X16](specs/X16-storage-consolidation/README.md) | XL | High |
 | 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress and the remaining binding and JVM surfaces for the existing algorithms remain. New algorithms belong to item 463. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
@@ -503,8 +502,6 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 
 ### Remaining work for item 7
 
-* Spill stays opt-in while item 93 closes execution costs and the default decision,
-  preserving the passed full-scale plain/encrypted acceptance matrix.
 * LIMIT propagation into fallbacks, running state for FOLD and registered aggregates,
   and earlier first bytes remain from the X05 follow-ups.
 * An EXISTS evaluated once per outer key, in BIND or an OPTIONAL condition, stays eager
@@ -613,7 +610,10 @@ spec sections.
 | 84 | **Large query plans.** An n-ary join would let the 4000-level plan limit rise, and planning time still grows with the square of the number of triple patterns. A star of a variable that many patterns share remains slow at the limit. | [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns) | M |
 | 88 | **Allocator overhead of the server-wide caches.** The result cache's heap is about 1.2 times the bytes it counts, and evicted entries leave free pages on the tokio and Rayon threads. The item also covers about 3% more instructions on queries of a few microseconds. | [X08](specs/X08-disk-spill-and-server-memory.md#gates) | S–M |
 | 91 | **Large SP²Bench answers.** The `q4` answer is 1.96 GB of TSV and needs a `--max-result-mb` above the default. Profile large-result costs while preserving response budgets and bounded memory. The `q12b` comparison is inside the ten-percent tie band. | [X06](specs/X06-benchmark-coverage.md#matched-query-comparisons), [follow-up](specs/X06-benchmark-coverage.md#sp2bench-q4-and-q6-follow-up-2026-10-23) | M |
-| 93 | **Spill execution costs and the default.** The full-scale acceptance matrix passes. Grouping cost above ordered spilled joins, the extra writes that restore probe order, a DISTINCT over ordered input that keeps its whole set, the [performance investigation](#spill-performance-investigation) and a decision on enabling spill by default remain. | [X08](specs/X08-disk-spill-and-server-memory.md#full-scale-spill-acceptance-item-93-2026-10-21) | M |
+| 496 | **Order restoration of spilled joins.** A spilled hash join below an operator that relies on its probe input's order, such as an ORDER BY, a DISTINCT, a LIMIT or a grouping with GROUP_CONCAT or SAMPLE, numbers its probe rows and writes its output once more to merge it back into that order. Restore the order with fewer writes, or let a sort above the join order its ties without it. | [X08](specs/X08-disk-spill-and-server-memory.md#spill-execution-costs-and-the-default-item-93-2026-10-31) | S–M |
+| 497 | **DISTINCT over value-ordered input.** A DISTINCT above an ORDER BY that cannot move below the sort, or above a ranking or a join that passes such an order on, keeps the set of every row it emitted and fails at its budget. Hold one run of equal sort keys at a time when every sort key is projected, as a DISTINCT over input ordered on a column does, because an unprojected key can put equal rows in different runs. | [X08](specs/X08-disk-spill-and-server-memory.md#spill-execution-costs-and-the-default-item-93-2026-10-31) | S |
+| 498 | **Automatic execution of a partly ordered DISTINCT.** Automatic execution runs `SELECT DISTINCT ?s ?o { ?s ?p ?o }` eagerly in about 1 s at 10.5M, while the cursor, which now holds one run of `?s` at a time, takes 174 ms and 1.2 MB. Measure such shapes and admit them, or let the eager DISTINCT use the input's order as well. | [X05](specs/X05-streaming-query-execution.md#outcome), [X08](specs/X08-disk-spill-and-server-memory.md#spill-execution-costs-and-the-default-item-93-2026-10-31) | S |
+| 499 | **Cost of the item 85 spill work on `expr-order-key`.** On forge at 10.5M the last commit of the opt-in spill work, c88c5969, takes 1.035 times the server time of a build before it, 5453f9d0, on `expr-order-key` in all 16 rounds, while `distinct-join` reads 1.004. Capture the plans, profile the shared cursor buffer accounting and bisect the commits of that work before choosing a fix. | [X08](specs/X08-disk-spill-and-server-memory.md#spill-execution-costs-and-the-default-item-93-2026-10-31) | S |
 | 446 | **Write-through group commit fences.** A fence synchronizes its WAL records and new terms with an `fdatasync` of each file, which flushes the device cache, while an ordinary commit writes both with FUA writes. In the slow state of the SK hynix drives of atlas and forge that flush makes a fence cost 1.4 to 1.5 times an ordinary commit. Let the group leader write a prefix's records and terms through the write-through handles, which needs the writers to leave the log's tail to the leader. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | M |
 | 447 | **Small gaps of group commit on indexed datasets.** Staged full-text documents do not count their bytes in the queue's 4 MiB limit. The leader applies a prefix's text changes while its fence is still active, which delays the next fence. The model test has no write transaction that searches text. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S |
 | 448 | **Small costs that the indexed group-commit gates accept.** A serial commit finds the group idle and takes the ordinary path, but its admission checks add about 1,000 user instructions, 0.1% to 0.3% of a spatial commit at 10.5M. Atlas measured serial spatial deletes at 10.5M at paired p50 and p90 ratios of 1.016 and 1.019, and forge measured the spatial readers at 1.05M under mixed load at a paired p50 ratio of 1.028, all within their gates. Measure them with more rounds and skip the checks that an idle group does not need. | [X09 Outcome](specs/X09-group-commit-by-default.md#phase-4) | S |
@@ -642,19 +642,6 @@ spec sections.
 | 449 | **Query thread count on hybrid cores.** On forge a Sparkles server process sometimes runs the DBpedia 50M `births-by-decade` query three to four times slower than its usual 3 to 5 ms for its whole life, while the per-round medians of QLever stayed between 13 and 18 ms. BSBM BI `q3` at 10M takes 22.65 ms with twelve query threads, as many as the logical CPUs of the performance cores, and 34.37 ms with the default twenty, which keeps it 1.09 to 1.12 times slower than QLever. BI `q5` gains 24% with twelve threads and `q8` loses 12%. The servers were not pinned, so placement on the efficiency cores is a hypothesis. Measure with controlled placement, find the operators whose sequential parts or fixed work division put an efficiency core on the critical path if that is the cause, fix them, and recheck `births-by-decade` with the frequency governor recorded. | [X06](specs/X06-benchmark-coverage.md#wave-a-query-losses), [births-by-decade](specs/X06-benchmark-coverage.md#births-by-decade-after-decimal-arithmetic-on-forge) | S |
 | 494 | **Probed OPTIONAL in streamed execution.** Eager execution reads an OPTIONAL's triple pattern only for the keys of a small left side, and a streamed OPTIONAL still reads the whole pattern. Give the cursor's OPTIONAL the same probe for a left side whose rows it holds, within the cursor's memory budget. | [X06](specs/X06-benchmark-coverage.md#wave-a-query-losses) | S |
 | 495 | **Cost check of a rejected OPTIONAL probe.** On forge with one query thread, `optional-count` takes 1.9% more server time, about 10 µs, because the probed OPTIONAL counts up to its most worthwhile keys among 30,000 sorted left rows before it declines. Bound the decision by an estimate of the left side's distinct keys where the plan has one, or remove the cost another way. | [X06](specs/X06-benchmark-coverage.md#wave-a-query-losses) | S |
-
-### Spill performance investigation
-
-This work belongs to item 93 and to [X08](specs/X08-disk-spill-and-server-memory.md).
-Repeat the default-path `expr-order-key` and `distinct-join` comparisons on a quiet Intel
-host with matched builds and inputs. Capture the executed plans and profile shared cursor
-buffer accounting, join and DISTINCT work before assigning a cause, and bisect
-reproducible slowdowns that stay below the push limit as well as clear failures.
-
-Measure ordered hash joins with a GROUP BY parent at tight and larger spill budgets,
-including consolidation writes, merge passes, charged memory, result equality and
-cleanup. Compare memory budgets within one build separately from comparisons between
-builds, and keep coverage for partially ordered DISTINCT.
 
 ### Graph-interaction UI
 
@@ -788,6 +775,7 @@ linked spec Outcome records how they landed.
 - **87.** Small incremental runs over a kept closure. [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18)
 - **89.** Ask and `check_query` on large datasets. [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12)
 - **90.** VALUES pushdown into GRAPH patterns, through the GRAPH operands of a group and past FILTERs and BINDs on variables the pattern binds. [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#item-90-values-pushdown-in-more-shapes)
+- **93.** Spill execution costs and spill on by default. [X08](specs/X08-disk-spill-and-server-memory.md#spill-execution-costs-and-the-default-item-93-2026-10-31)
 - **94.** Spilled join amplification. [X08](specs/X08-disk-spill-and-server-memory.md#spilled-join-amplification-item-94-2026-10-24)
 - **95.** Close-only locks on the database directory. [P06](specs/P06-library-admin-api.md), [F05](specs/F05-snapshot-repositories/SPEC.md#23-restore)
 - **96.** Streaming NOT EXISTS over a Cartesian product. [X08](specs/X08-disk-spill-and-server-memory.md#automatic-streaming-without-spill-item-96-2026-10-23)
