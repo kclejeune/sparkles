@@ -21133,7 +21133,7 @@
         "type": "object"
       },
       "ViewDefinition": {
-        "description": "A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0.",
+        "description": "A view's definition. Phase 1 takes `table` views without `graph`, maintained `async` on `main`, without provenance, with `onFailure` `suspend`, `declassify` false and `keepCommits` 0.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
         },
@@ -21143,6 +21143,9 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "declassify": {
+            "type": "boolean"
           },
           "graph": {
             "type": "string"
@@ -21167,6 +21170,13 @@
             "enum": [
               "table",
               "graph"
+            ],
+            "type": "string"
+          },
+          "onFailure": {
+            "enum": [
+              "suspend",
+              "reject"
             ],
             "type": "string"
           },

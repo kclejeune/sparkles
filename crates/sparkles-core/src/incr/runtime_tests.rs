@@ -673,7 +673,7 @@ fn unknown_formats_are_refused() {
     // a newer view.json
     let file = dir.path().join("views/team-sizes/view.json");
     let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    v["format"] = 2.into();
+    v["format"] = 3.into();
     std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
     let rt = runtime(&s, Some(dir.path().to_path_buf()));
     let e = rt
@@ -1691,6 +1691,98 @@ fn unsupported_options_on_disk_do_not_run() {
     rt.round(&s);
     assert_eq!(
         read(&rt, &s, "keep-commits", None).unwrap(),
+        oracle(&s, TEAM_SIZES, None)
+    );
+    rt.close(&s);
+}
+
+/// The members that only format 3 holds (spec F13 §8.4), `onFailure` and `declassify`,
+/// in a format 1 `view.json` mark that view failed with `unsupported-option` unless
+/// they hold their defaults. They do not make the whole set unreadable, so the other
+/// views of the dataset still run and can still be changed.
+#[test]
+fn later_members_in_format_1_fail_only_their_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let s = persistent(dir.path(), true);
+    load(&s);
+    let query = serde_json::Value::from(q(TEAM_SIZES));
+    let bad = [
+        ("on-failure", "onFailure", serde_json::json!("reject")),
+        ("declassify", "declassify", serde_json::json!(true)),
+    ];
+    // the defaults mean what Phase 1 does and run
+    let defaults = [
+        ("suspend", "onFailure", serde_json::json!("suspend")),
+        ("not-declassified", "declassify", serde_json::json!(false)),
+    ];
+    for (name, member, value) in bad.iter().chain(&defaults) {
+        let mut v = serde_json::json!({"format": 1, "query": query});
+        v[*member] = value.clone();
+        let d = root.join("views").join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("view.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+    super::views::write(&root, "good", &ViewDef::table(q(TEAM_SIZES))).unwrap();
+    let rt = runtime(&s, Some(root.clone()));
+    rt.round(&s);
+    for name in ["good", "suspend", "not-declassified"] {
+        assert_eq!(
+            read(&rt, &s, name, None).unwrap(),
+            oracle(&s, TEAM_SIZES, None),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        rt.stats(&s).circuits,
+        1,
+        "the views that run share a circuit"
+    );
+    for (name, ..) in &bad {
+        match rt.get(&s, name).unwrap().state {
+            ViewState::Failed { error } => {
+                assert!(error.starts_with("unsupported-option"), "{name}: {error}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    // a definition that names the defaults is written without them, so a release that
+    // reads only the Phase 1 members still reads the file
+    let def: ViewDef = serde_json::from_value(
+        serde_json::json!({"query": query, "onFailure": "suspend", "declassify": false}),
+    )
+    .unwrap();
+    rt.put(&s, "explicit-defaults", def).unwrap();
+    let written: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("views/explicit-defaults/view.json")).unwrap(),
+    )
+    .unwrap();
+    const PHASE_1: &[&str] = &[
+        "format",
+        "query",
+        "storedQuery",
+        "mode",
+        "graph",
+        "principal",
+        "provenance",
+        "maintenance",
+        "branches",
+        "memoryBytes",
+        "keepCommits",
+    ];
+    for k in written.as_object().unwrap().keys() {
+        assert!(PHASE_1.contains(&k.as_str()), "{k} is written: {written}");
+    }
+    // a definition with the member is refused, and one without it replaces the file
+    let def: ViewDef =
+        serde_json::from_value(serde_json::json!({"query": query, "declassify": true})).unwrap();
+    let e = rt.put(&s, "declassify", def).unwrap_err();
+    assert_eq!(e.code(), "unsupported-option", "{e}");
+    rt.put(&s, "declassify", ViewDef::table(q(TEAM_SIZES)))
+        .unwrap();
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "declassify", None).unwrap(),
         oracle(&s, TEAM_SIZES, None)
     );
     rt.close(&s);

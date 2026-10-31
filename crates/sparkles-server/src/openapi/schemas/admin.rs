@@ -388,6 +388,8 @@ fn views(put: &mut dyn FnMut(&str, J)) {
         "principal": with_desc(string(), "The user whose view of the dataset the query reads; the definer by default."),
         "provenance": string_enum(&["none", "count", "why", "lineage"]),
         "maintenance": string_enum(&["async", "commit"]),
+        "onFailure": string_enum(&["suspend", "reject"]),
+        "declassify": boolean(),
         "branches": array(string()),
         "memoryBytes": { "type": "integer", "minimum": 1, "description": "The budget of the view's state." },
         "keepCommits": { "type": "integer", "minimum": 0 },
@@ -396,7 +398,7 @@ fn views(put: &mut dyn FnMut(&str, J)) {
         "ViewDefinition",
         doc(
             obj(&[], definition.clone()),
-            "A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0.",
+            "A view's definition. Phase 1 takes `table` views without `graph`, maintained `async` on `main`, without provenance, with `onFailure` `suspend`, `declassify` false and `keepCommits` 0.",
             "incremental-views",
         ),
     );
