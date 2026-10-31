@@ -459,6 +459,25 @@ the first policy. `scripts/eval-ask-rescore` scores a run's saved answers again 
 current policy without calling a model, and the paid wrapper records every request and
 reply, key redacted, in `replies.jsonl`.
 
+### Fixed
+
+A FILTER of a group no longer runs before the group's other patterns can bind its
+variables. The planner placed a FILTER on part of the join as soon as that part could
+bind every variable of it, even when a UNION branch, an OPTIONAL, a failed BIND or an
+`UNDEF` of `VALUES` left one of them unbound and a later pattern of the group bound it.
+The FILTER then saw the variable unbound and dropped rows that SPARQL keeps. Such a
+FILTER now runs on the join of the whole group, and every other FILTER is placed as
+before.
+
+`{ ?x :p 1 } UNION { ?y :q 1 } ?z :r ?x FILTER(sameTerm(?x, ?y))` returns the row in
+which the second branch's `?y` meets the `?x` of `?z :r ?x` (roadmap item 433). The same
+holds for `=`, `!=`, `STR`, `BOUND` and conjunctions of them, and for an OPTIONAL group
+in place of the UNION.
+
+`VALUES ?x { UNDEF } ?x :knows+ ?y FILTER(BOUND(?x))` returns the rows of the path,
+which binds `?x` (roadmap item 434). The same holds for the `*`, `?`, sequence and
+alternative paths and for `VALUES` tables that mix `UNDEF` and bound rows.
+
 ### Behavior
 
 `sparkles ask` decides whether a draft calls SERVICE from the parsed query, including

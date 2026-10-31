@@ -655,6 +655,8 @@ linked spec Outcome records how they landed.
 
 - **397.** Native Rust direct mapping controls through conversion and the final atomic load. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
 - **403.** Credential expiry for long-lived reads and fenced OIDC sign-in. [C09](specs/C09-dataset-access-control.md)
+- **433.** A FILTER over two variables of different UNION branches keeps the rows that a later pattern of the group completes. [Querying](querying/README.md#standards-conformance)
+- **434.** A FILTER on a variable that `VALUES … { UNDEF }` leaves unbound keeps the rows that a later property path binds. [Querying](querying/README.md#standards-conformance)
 
 ## Keeping this current
 

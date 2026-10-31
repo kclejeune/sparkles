@@ -2997,6 +2997,13 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // A FILTER of the group tests the join of all its elements. It can run earlier, on
+        // part of the join, when each of its variables has its final value there. A
+        // variable that an element may leave unbound (a UNION branch, an OPTIONAL, a
+        // failed BIND, an UNDEF of VALUES) does not, when another element can still bind
+        // it. Such a FILTER waits for the whole group.
+        let deferred = defer_open_filters(&mut filters, &triples, &paths, &nodes, &unpacks);
+
         let mut leaves: Vec<Vec<Node>> = Vec::new();
         for t in &triples {
             leaves.push(self.scan_options(t)?);
@@ -3099,6 +3106,7 @@ impl<'a> Planner<'a> {
                 result = filter(result, now, self.ctx);
             }
         }
+        filters.extend(deferred);
         if !filters.is_empty() {
             result = filter(result, filters, self.ctx);
         }
@@ -5316,6 +5324,52 @@ fn reorder_scan(spec: &ScanSpec, first: VarId) -> Option<ScanSpec> {
 /// The longest prefix of an ARQ path range the planner unrolls into joined steps (see
 /// [`Planner::collect_path`]); a longer range runs whole in the path operator.
 const RANGE_UNROLL: u64 = 32;
+
+/// Remove from `filters` and return those that must wait for the whole join group. A
+/// FILTER waits when one of its variables may be unbound in an element of the group that
+/// binds it and another element also binds it, since the join with that element can fill
+/// in the value the FILTER would test early. A variable bound in every row of each
+/// element that binds it, or bound by one element only, has its final value as soon as
+/// that element is joined.
+fn defer_open_filters(
+    filters: &mut Vec<Expr>,
+    triples: &[Triple],
+    paths: &[PathItem],
+    nodes: &[Node],
+    unpacks: &[UnpackItem],
+) -> Vec<Expr> {
+    if filters.is_empty() || !nodes.iter().any(|n| n.certain.len() < n.vars.len()) {
+        return Vec::new();
+    }
+    let in_graph = |g: &ActiveGraph, v: VarId| matches!(g, ActiveGraph::Var(x) if *x == v);
+    let open = |v: VarId| {
+        if !nodes
+            .iter()
+            .any(|n| n.vars.contains(&v) && !n.certain.contains(&v))
+        {
+            return false;
+        }
+        let elements = triples
+            .iter()
+            .filter(|t| t.t.contains(&PT::V(v)) || in_graph(&t.graph, v))
+            .count()
+            + paths
+                .iter()
+                .filter(|p| p.s == PT::V(v) || p.o == PT::V(v) || in_graph(&p.graph, v))
+                .count()
+            + nodes.iter().filter(|n| n.vars.contains(&v)).count()
+            + unpacks
+                .iter()
+                .filter(|u| u.t == v || u.parts.contains(&PT::V(v)))
+                .count();
+        elements > 1
+    };
+    let (deferred, kept): (Vec<Expr>, Vec<Expr>) = std::mem::take(filters)
+        .into_iter()
+        .partition(|f| f.var_set().into_iter().any(open));
+    *filters = kept;
+    deferred
+}
 
 fn flatten_union<'g>(gp: &'g GraphPattern, out: &mut Vec<&'g GraphPattern>) {
     if let GraphPattern::Union { left, right } = gp {
