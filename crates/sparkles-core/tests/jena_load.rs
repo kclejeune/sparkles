@@ -349,6 +349,70 @@ fn a_prefix_that_expands_the_body_is_held_to_the_byte_budget() {
     assert_eq!(n, 100);
 }
 
+/// A Protobuf body of one statement whose object is the literal `lexical`.
+fn proto_literal_body(lexical: &str) -> Vec<u8> {
+    let iri = |s: &[u8]| field(0x0a, &field(0x0a, s));
+    let mut statement = field(0x0a, &iri(b"http://ex.org/s"));
+    statement.extend(field(0x12, &iri(b"http://ex.org/p")));
+    statement.extend(field(0x1a, &field(0x1a, &field(0x0a, lexical.as_bytes()))));
+    let row = field(0x12, &statement);
+    // the row is length-delimited in the stream
+    let mut framed = Vec::new();
+    varint(row.len(), &mut framed);
+    framed.extend(row);
+    framed
+}
+
+fn load_with_cap(body: &[u8], cap: u64) -> sparkles_core::Result<u64> {
+    let mut src = Source::from_bytes(body.to_vec(), JenaFormat::Protobuf, None);
+    src.max_decompressed = Some(cap);
+    Store::in_memory(StoreOptions::default()).load(&[src])
+}
+
+#[test]
+fn the_expansion_count_follows_the_escapes_of_nquads() {
+    let over = |r: sparkles_core::Result<u64>| {
+        matches!(
+            r,
+            Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::DecompressedBytes,
+                ..
+            }))
+        )
+    };
+    // U+FFFE and U+FFFF are three bytes in the body and a six-byte escape in the
+    // N-Quads line, so 600 KB of them are 1.2 MB of output
+    for c in ['\u{fffe}', '\u{ffff}'] {
+        let body = proto_literal_body(&c.to_string().repeat(200_000));
+        assert!(body.len() < 700_000, "{}", body.len());
+        assert!(over(load_with_cap(&body, 1 << 20)), "{c:?} over the cap");
+        // under a cap above the line, the body loads
+        assert!(
+            load_with_cap(&body, 1_300_000).is_ok(),
+            "{c:?} under the cap"
+        );
+    }
+    // backspace and form feed are two bytes in the line, as they are in the body
+    // (200 KB in, 400 KB out), where six bytes each would be 1.2 MB
+    let body = proto_literal_body(&"\u{8}\u{c}".repeat(100_000));
+    assert!(body.len() < 250_000, "{}", body.len());
+    assert!(
+        load_with_cap(&body, 512 << 10).is_ok(),
+        "backspace and form feed"
+    );
+    assert!(
+        over(load_with_cap(&body, 300_000)),
+        "backspace and form feed over a cap of 300 kB"
+    );
+    // the four together
+    let body = proto_literal_body(&"\u{8}\u{fffe}\u{c}\u{ffff}".repeat(70_000));
+    assert!(over(load_with_cap(&body, 1 << 20)), "mixed");
+    assert!(
+        load_with_cap(&body, 1_500_000).is_ok(),
+        "mixed under the cap"
+    );
+}
+
 /// A malformed body of each syntax, with what its message names.
 fn malformed() -> Vec<(JenaFormat, Vec<u8>, &'static str)> {
     let thrift = encode(JenaFormat::Thrift, &fixture(JenaFormat::Thrift));

@@ -420,8 +420,8 @@ impl Terms {
     }
 }
 
-/// The size of `q` as an N-Quads line in bytes, within a few bytes of the line itself and
-/// never below it. It is the measure of how far a decoded body has expanded, for the
+/// The size of `q` as an N-Quads line in bytes, which is the length of `format!("{q} .\n")`
+/// as OxRDF writes it. It is the measure of how far a decoded body has expanded, for the
 /// loaders' byte cap and for the size of a batch of quads, and it takes one pass over
 /// each literal's bytes and nothing else.
 pub fn nquads_len(q: &Quad) -> u64 {
@@ -429,13 +429,24 @@ pub fn nquads_len(q: &Quad) -> u64 {
         s.len() as u64 + 2
     }
     fn lexical(s: &str) -> u64 {
-        // a quote, a backslash or a line break takes two bytes, another control character
-        // up to six, and anything else its own length
+        // The escapes of OxRDF's `print_quoted_str`, which writes every line of N-Quads
+        // here. Backspace, tab, line feed, form feed, carriage return, the quote and the
+        // backslash take two bytes. The other control characters, DEL and the two
+        // noncharacters U+FFFE and U+FFFF take six, where U+FFFE and U+FFFF are three
+        // bytes of UTF-8. Anything else is written as it is.
+        let bytes = s.as_bytes();
         let mut n = 2u64;
-        for &b in s.as_bytes() {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            i += 1;
             n += match b {
-                b'"' | b'\\' | b'\n' | b'\r' | b'\t' => 2,
+                b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' | b'"' | b'\\' => 2,
                 0..0x20 | 0x7f => 6,
+                0xEF if matches!(bytes.get(i..i + 2), Some([0xBF, 0xBE | 0xBF])) => {
+                    i += 2;
+                    6
+                }
                 _ => 1,
             };
         }
@@ -2150,11 +2161,15 @@ mod tests {
         assert_eq!(double_lexical(-0.001), "-1.0E-3");
     }
 
+    fn line_len(q: &Quad) -> u64 {
+        format!("{q} .\n").len() as u64
+    }
+
     #[test]
-    fn nquads_len_covers_the_serialized_line_within_a_few_bytes() {
+    fn nquads_len_is_the_serialized_line_for_every_kind_of_term() {
         let ex = |s: &str| NamedNode::new(format!("http://example.org/{s}")).unwrap();
         let mut quads = sample();
-        let nasty = "a\"b\\c\nd\re\tf\u{1}g\u{7f}h \u{e9}\u{1f600}";
+        let nasty = "a\"b\\c\nd\re\tf\u{1}g\u{7f}h \u{e9}\u{1f600}\u{8}\u{c}\u{fffe}\u{ffff}";
         for object in [
             Term::from(Literal::new_simple_literal(nasty)),
             Literal::new_language_tagged_literal(nasty, "en-GB")
@@ -2173,14 +2188,138 @@ mod tests {
             }
         }
         for q in quads {
-            let line = format!("{q} .\n");
-            let n = nquads_len(&q);
-            assert!(n >= line.len() as u64, "{n} < {} for {line}", line.len());
-            assert!(
-                n <= line.len() as u64 + 24,
-                "{n} is far over {} for {line}",
-                line.len()
-            );
+            assert_eq!(nquads_len(&q), line_len(&q), "{q}");
+        }
+    }
+
+    /// Every character class: each code point below U+3000, the edges of the planes and
+    /// the noncharacters, alone and repeated, in a plain, a tagged and a typed literal.
+    #[test]
+    fn nquads_len_matches_oxrdf_for_every_code_point_class() {
+        let ex = |s: &str| NamedNode::new(format!("http://example.org/{s}")).unwrap();
+        let points = (0..0x3000u32)
+            .chain([0xD7FF, 0xE000, 0xFDD0, 0xFDEF, 0xFFFD, 0xFFFE, 0xFFFF])
+            .chain([0x10000, 0x1FFFE, 0x1FFFF, 0x10FFFF]);
+        for c in points.filter_map(char::from_u32) {
+            for text in [
+                c.to_string(),
+                format!("x{c}{c}y"),
+                c.to_string().repeat(37),
+                format!("{c}\u{ffff}{c}\u{fffe}\u{ffff}"),
+            ] {
+                for object in [
+                    Term::from(Literal::new_simple_literal(&text)),
+                    Literal::new_language_tagged_literal(&text, "de")
+                        .unwrap()
+                        .into(),
+                    Literal::new_typed_literal(&text, ex("dt")).into(),
+                ] {
+                    let q = Quad::new(ex("s"), ex("p"), object, GraphName::DefaultGraph);
+                    assert_eq!(nquads_len(&q), line_len(&q), "U+{:04X}", c as u32);
+                }
+            }
+        }
+    }
+
+    mod property {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Text that leans on the characters with escapes.
+        fn text() -> impl Strategy<Value = String> {
+            let special = prop::sample::select(vec![
+                '"',
+                '\\',
+                '\n',
+                '\r',
+                '\t',
+                '\u{8}',
+                '\u{c}',
+                '\u{0}',
+                '\u{1f}',
+                '\u{7f}',
+                '\u{fffe}',
+                '\u{ffff}',
+                '\u{fffd}',
+                '\u{e9}',
+                '\u{20ac}',
+                '\u{1f600}',
+                'a',
+                ' ',
+            ]);
+            prop::collection::vec(prop_oneof![3 => special, 1 => any::<char>()], 0..64)
+                .prop_map(|v| v.into_iter().collect())
+        }
+
+        fn iri() -> impl Strategy<Value = NamedNode> {
+            "http://[a-z]{1,8}\\.example/[a-zA-Z0-9/._~-]{0,40}"
+                .prop_map(|s| NamedNode::new(s).unwrap())
+        }
+
+        fn bnode() -> impl Strategy<Value = BlankNode> {
+            "[a-z][a-z0-9]{0,10}".prop_map(|s| BlankNode::new(s).unwrap())
+        }
+
+        fn literal() -> impl Strategy<Value = Literal> {
+            (text(), 0..3u8, iri(), "[a-z]{2,3}(-[A-Z]{2})?").prop_map(|(t, kind, dt, lang)| {
+                match kind {
+                    0 => Literal::new_simple_literal(t),
+                    1 => Literal::new_language_tagged_literal(t, lang).unwrap(),
+                    _ => Literal::new_typed_literal(t, dt),
+                }
+            })
+        }
+
+        fn object() -> impl Strategy<Value = Term> {
+            let leaf = prop_oneof![
+                iri().prop_map(Term::from),
+                bnode().prop_map(Term::from),
+                literal().prop_map(Term::from),
+            ];
+            leaf.prop_recursive(2, 8, 1, |inner| {
+                (
+                    prop_oneof![
+                        iri().prop_map(NamedOrBlankNode::from),
+                        bnode().prop_map(NamedOrBlankNode::from)
+                    ],
+                    iri(),
+                    inner,
+                )
+                    .prop_map(|(subject, predicate, object)| {
+                        Term::Triple(Box::new(Triple {
+                            subject,
+                            predicate,
+                            object,
+                        }))
+                    })
+            })
+        }
+
+        fn quad() -> impl Strategy<Value = Quad> {
+            (
+                prop_oneof![
+                    iri().prop_map(NamedOrBlankNode::from),
+                    bnode().prop_map(NamedOrBlankNode::from)
+                ],
+                iri(),
+                object(),
+                prop_oneof![
+                    Just(GraphName::DefaultGraph),
+                    iri().prop_map(GraphName::from),
+                    bnode().prop_map(GraphName::from),
+                ],
+            )
+                .prop_map(|(s, p, o, g)| Quad::new(s, p, o, g))
+        }
+
+        proptest! {
+            /// The size is never below the line and is exactly its length.
+            #[test]
+            fn nquads_len_is_never_below_the_line(q in quad()) {
+                let (n, line) = (nquads_len(&q), format!("{q} .\n").len() as u64);
+                prop_assert!(n >= line, "{} < {} for {}", n, line, q);
+                prop_assert!(n <= line, "{} > {} for {}", n, line, q);
+            }
         }
     }
 }

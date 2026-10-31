@@ -5773,6 +5773,7 @@ dependencies = [
  "parquet",
  "percent-encoding",
  "proj4rs",
+ "proptest",
  "quick-xml 0.37.5",
  "quick_cache",
  "rand 0.10.3",
