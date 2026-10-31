@@ -10907,7 +10907,8 @@ A dataset that has the setting stores `memory.json` as format 2, which an older 
 refuses with a message that names the newer release. `memory.json` stays format 1 while
 it has no `scratchBranches`. A background task, which runs only with `--mcp-allow-update`
 on a writable server, reads the settings again at every pass, so a change applies
-without a restart. It looks at most every minute and at least four
+without a restart. The server logs `scratch-branch expiry: on` or `off`, with the reason, once
+at start. The task looks at most every minute and at least four
 times per shortest duration. It skips branches with a running task or a named snapshot,
 logs each deletion, and counts it in `sparkles_mcp_scratch_branches_expired_total`.
 `list_branches` and `create_branch` report `expires` from the dataset's duration.

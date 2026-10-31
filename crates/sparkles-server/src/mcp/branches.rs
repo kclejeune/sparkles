@@ -975,16 +975,29 @@ pub(crate) fn spawn_expiry(st: Arc<AppState>, default: impl Into<Option<Duration
 
 /// Start the expiry of a `serve --mcp` server. It deletes branches, so it runs only on a
 /// writable server whose MCP endpoint is on and allows updates (`--mcp-allow-update`),
-/// whether the duration comes from the flag or from a dataset's setting. Returns
-/// whether it started.
+/// whether the duration comes from the flag or from a dataset's setting. It logs the
+/// decision on one info line when the endpoint is on. Returns whether it started.
 pub(crate) fn spawn_server_expiry(st: &Arc<AppState>) -> bool {
     let Some(m) = &st.mcp else {
         return false;
     };
-    if st.read_only || !m.cfg.allow_update {
+    if st.read_only {
+        tracing::info!("scratch-branch expiry: off (read-only server)");
+        return false;
+    }
+    if !m.cfg.allow_update {
+        tracing::info!("scratch-branch expiry: off (no MCP update permission)");
         return false;
     }
     spawn_expiry(st.clone(), m.cfg.scratch_ttl);
+    match m.cfg.scratch_ttl {
+        Some(t) => tracing::info!(
+            "scratch-branch expiry: on (default {t:?}, a dataset's memory.scratchBranches.ttl overrides it)"
+        ),
+        None => tracing::info!(
+            "scratch-branch expiry: on (no default, only a dataset's memory.scratchBranches.ttl expires branches)"
+        ),
+    }
     true
 }
 

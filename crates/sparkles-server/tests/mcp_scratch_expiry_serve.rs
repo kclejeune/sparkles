@@ -5,7 +5,8 @@
 #![cfg(all(feature = "mcp", unix))]
 
 use serde_json::{Value, json};
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -90,12 +91,56 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Start `sparkles serve` over `dir/db` and wait until this child reports that it is
-/// listening. Another process may take the port between the probe and the child's bind,
-/// and a ping could then reach that process. So readiness is the child's own log line
-/// about the address it bound, and a child that exits first, as a failed bind does, is
-/// started again on a new port. The sweeper's first pass starts before the line.
-fn serve(dir: &Path, extra: &[&str]) -> Server {
+/// The running server and its log.
+struct Running {
+    server: Server,
+    port: u16,
+    log: PathBuf,
+}
+
+impl Running {
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn alive(&mut self) -> bool {
+        self.server.0.try_wait().unwrap().is_none()
+    }
+
+    /// Wait until the log holds `needle`. A child that exits meanwhile gives `None`.
+    fn wait_for(&mut self, needle: &str, limit: Duration) -> Option<()> {
+        let t0 = Instant::now();
+        loop {
+            if self.log().contains(needle) {
+                return Some(());
+            }
+            if !self.alive() {
+                return None;
+            }
+            assert!(t0.elapsed() < limit, "no {needle:?} in\n{}", self.log());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Whether `/$/ready` answers `200`. The port is this child's, since the child
+    /// logged that it bound it and is still running.
+    fn ready(&self) -> bool {
+        let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
+            return false;
+        };
+        let _ = write!(c, "GET /$/ready HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+        let mut buf = String::new();
+        c.read_to_string(&mut buf).is_ok() && buf.starts_with("HTTP/1.0 200")
+    }
+}
+
+/// Start `sparkles serve` over `dir/db`, identify the child by its own log line about
+/// the address it bound, wait for the line with the server's decision about scratch
+/// branch expiry, and then for HTTP readiness. Another process may take the port between
+/// the probe and the child's bind, and the child then exits, so the start is repeated on
+/// a new port, up to 5 times. The decision line comes after the sweeper was started or
+/// left off, so a case that watches the branch from there sees the whole outcome.
+fn serve(dir: &Path, extra: &[&str]) -> Running {
     let log = dir.join("serve.log");
     for _ in 0..5 {
         let port = free_port();
@@ -113,43 +158,57 @@ fn serve(dir: &Path, extra: &[&str]) -> Server {
             .stderr(std::fs::File::create(&log).unwrap())
             .spawn()
             .unwrap();
-        let mut s = Server(child);
+        let mut r = Running {
+            server: Server(child),
+            port,
+            log: log.clone(),
+        };
         let listening = format!("listening on http://127.0.0.1:{port}/");
+        if r.wait_for(&listening, Duration::from_secs(60)).is_none() {
+            continue;
+        }
+        r.wait_for("scratch-branch expiry: ", Duration::from_secs(30))
+            .expect("the server exited before deciding about expiry");
         let t0 = Instant::now();
-        loop {
-            if std::fs::read_to_string(&log).is_ok_and(|l| l.contains(&listening)) {
-                assert!(s.0.try_wait().unwrap().is_none(), "server exited");
-                return s;
-            }
-            if s.0.try_wait().unwrap().is_some() {
-                break;
-            }
-            assert!(
-                t0.elapsed() < Duration::from_secs(60),
-                "server did not start"
-            );
+        while !r.ready() {
+            assert!(r.alive(), "server exited\n{}", r.log());
+            assert!(t0.elapsed() < Duration::from_secs(60), "server not ready");
             std::thread::sleep(Duration::from_millis(50));
         }
+        return r;
     }
     panic!("no server started in 5 attempts");
 }
 
-/// Whether the idle scratch branch is deleted by a server started with `extra` over a
-/// database with the dataset setting `ttl`. Deletion is awaited for up to 30 s. When it
-/// does not come, the branch is watched for 2 s after the server answered, which covers
-/// the immediate first pass of the sweeper.
-fn expires(ttl: Option<&str>, extra: &[&str], expect: bool) {
+/// What a server started with `extra` over a database with the dataset setting `ttl`
+/// decides and does. The log must say `decision` (`on` or `off`) about expiry. Deletion
+/// is awaited for up to 30 s. When none is expected the branch is watched for 2 s, and
+/// the child has to stay alive through that window.
+fn expires(ttl: Option<&str>, extra: &[&str], decision: &str, deleted: bool) {
     let d = tempfile::tempdir().unwrap();
     database(d.path(), ttl);
-    let _server = serve(d.path(), extra);
-    let wait = Duration::from_secs(if expect { 30 } else { 2 });
+    let mut r = serve(d.path(), extra);
+    let said = format!("scratch-branch expiry: {decision} (");
+    assert!(
+        r.log().contains(&said),
+        "serve --mcp {extra:?}, dataset ttl {ttl:?}: no {said:?} in\n{}",
+        r.log()
+    );
+    let other = if decision == "on" { "off" } else { "on" };
+    assert!(
+        !r.log()
+            .contains(&format!("scratch-branch expiry: {other} ("))
+    );
+    let wait = Duration::from_secs(if deleted { 30 } else { 2 });
     let t0 = Instant::now();
     while exists(d.path()) && t0.elapsed() < wait {
+        assert!(r.alive(), "server exited\n{}", r.log());
         std::thread::sleep(Duration::from_millis(50));
     }
+    assert!(r.alive(), "server exited\n{}", r.log());
     assert_eq!(
         !exists(d.path()),
-        expect,
+        deleted,
         "serve --mcp {extra:?} with dataset ttl {ttl:?}"
     );
 }
@@ -162,11 +221,11 @@ fn serve_expires_scratch_branches_only_with_mcp_update_permission() {
         v
     };
     // the flag alone, and the dataset setting alone, without permission
-    expires(None, &flag, false);
-    expires(Some("1h"), &[], false);
+    expires(None, &flag, "off", false);
+    expires(Some("1h"), &[], "off", false);
     // and with it
-    expires(None, &with_update(flag.to_vec()), true);
-    expires(Some("1h"), &with_update(vec![]), true);
+    expires(None, &with_update(flag.to_vec()), "on", true);
+    expires(Some("1h"), &with_update(vec![]), "on", true);
     // a dataset's off keeps its branch although the flag and the permission are there
-    expires(Some("off"), &with_update(flag.to_vec()), false);
+    expires(Some("off"), &with_update(flag.to_vec()), "on", false);
 }
