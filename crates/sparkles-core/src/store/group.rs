@@ -2,6 +2,20 @@
 //! caller seals immediately; subsequent callers can append during that fence.
 //! A publisher never takes the writer mutex. General writer operations drain the
 //! coordinator before inspecting the writer's private speculative head.
+//!
+//! A grouped transaction does not write to the log. It encodes its records, hands them to
+//! the queue with the commit and leaves the log's tail ([`wal::Tail`]) to the leader of its
+//! fence, which writes the whole prefix's records and terms in one go, through the
+//! write-through handles when they fit in preallocated space (X09 item 446). A fence then
+//! makes its prefix durable with FUA writes and no cache flush, as an ordinary commit
+//! does. When the prefix does not fit, or the file system refuses direct I/O, the leader
+//! writes it with buffered writes and synchronizes the files with `fdatasync`.
+//!
+//! A fence has two stages. The leader writes and synchronizes its prefix (`syncing`), and
+//! then publishes it (`publishing`), which applies its commits' full-text changes. The
+//! next fence may seal and synchronize while the last one publishes, so index work never
+//! delays a synchronization (X09 item 447), but it publishes only after the last one has
+//! published, so publication keeps commit order.
 use super::*;
 use parking_lot::Condvar;
 use std::collections::VecDeque;
@@ -21,8 +35,20 @@ pub(super) struct Pending {
     pub snapshot: Arc<Snapshot>,
     pub changes: Vec<(u8, [Id; 4])>,
     pub author: Option<Arc<str>>,
+    /// a descriptor of the log, for the leader's buffered write and synchronization
     pub wal: File,
+    /// where the commit's records start in the log
+    pub wal_start: u64,
+    /// and where they end
     pub wal_end: u64,
+    /// the commit's records, which the leader of its fence writes to the log
+    pub data: Vec<u8>,
+    /// the log's tail that the records are written at
+    pub tail: Arc<wal::Tail>,
+    /// the most the leader preallocates in the log after the records
+    pub prealloc: u64,
+    /// what the commit counts against the queue's limit: its records and the documents
+    /// it staged for the full-text index
     pub bytes: u64,
     pub ticket: Arc<Ticket>,
     /// what the write guard found, told to the guard once the commit is published
@@ -38,14 +64,36 @@ pub(super) struct Pending {
     _family: Arc<family::FamilyPermit>,
 }
 
+/// A sealed prefix in one of the two stages of its fence.
+#[derive(Default)]
+struct Stage {
+    /// the tickets of its commits not yet failed
+    tickets: Vec<Arc<Ticket>>,
+    /// its commits and bytes, still counted in the queue's totals
+    commits: usize,
+    bytes: u64,
+    /// a failure took its commits back: the leader must not publish them
+    revoked: bool,
+}
+
 #[derive(Default)]
 struct State {
     queue: VecDeque<Pending>,
-    active: bool,
-    inflight: Vec<Arc<Ticket>>,
+    /// the prefix whose fence writes and synchronizes it
+    syncing: Option<Stage>,
+    /// the prefix that is synchronized and being published
+    publishing: Option<Stage>,
     failed: bool,
+    /// commits and bytes queued or in a stage
     commits: usize,
     bytes: u64,
+}
+
+impl State {
+    /// A fence runs in either stage.
+    fn busy(&self) -> bool {
+        self.syncing.is_some() || self.publishing.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -58,6 +106,9 @@ pub(super) struct Coordinator {
     fail_next_sync: AtomicBool,
     #[cfg(test)]
     fences: AtomicUsize,
+    /// fences whose records went through the log's write-through handle
+    #[cfg(test)]
+    direct_fences: AtomicUsize,
     /// times a waiter parked with its commit still pending
     #[cfg(test)]
     parks: AtomicUsize,
@@ -72,7 +123,7 @@ impl Coordinator {
     /// in its group.
     pub fn idle(&self) -> bool {
         let s = self.state.lock();
-        !s.active && s.queue.is_empty() && !s.failed
+        !s.busy() && s.queue.is_empty() && !s.failed
     }
 
     /// Wait, without leading a fence, until no commit is in flight: no fence runs, and
@@ -93,7 +144,7 @@ impl Coordinator {
         let mut left = s.commits;
         let mut deadline = std::time::Instant::now() + stall;
         loop {
-            if !s.active && (s.failed || s.queue.is_empty()) {
+            if !s.busy() && (s.failed || s.queue.is_empty()) {
                 return true;
             }
             if s.commits < left {
@@ -101,7 +152,7 @@ impl Coordinator {
                 deadline = std::time::Instant::now() + stall;
             }
             if self.changed.wait_until(&mut s, deadline).timed_out() && s.commits >= left {
-                return !s.active && (s.failed || s.queue.is_empty());
+                return !s.busy() && (s.failed || s.queue.is_empty());
             }
         }
     }
@@ -123,9 +174,10 @@ impl Coordinator {
         Ok(())
     }
 
-    /// A later transaction's WAL write failed. No fence runs again, so the queued
-    /// commits fail. A prefix whose fence is already running keeps that fence's
-    /// outcome: when the sync succeeds, its commits are durable and are acknowledged.
+    /// A later transaction failed after its commit number was taken. No fence runs again,
+    /// so the queued commits fail. A prefix whose fence is already running keeps that
+    /// fence's outcome: when the sync succeeds, its commits are durable and are
+    /// acknowledged.
     pub fn fail(&self) {
         let mut s = self.state.lock();
         s.failed = true;
@@ -133,16 +185,52 @@ impl Coordinator {
         self.changed.notify_all();
     }
 
-    fn fail_locked(s: &mut State) {
-        s.failed = true;
-        for ticket in &s.inflight {
+    /// Take a stage's commits back: fail the tickets not yet acknowledged, and remove
+    /// its commits from the totals.
+    fn revoke(stage: &mut Stage, commits: &mut usize, bytes: &mut u64) {
+        for ticket in stage.tickets.drain(..) {
             let _ = ticket
                 .0
                 .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
         }
+        *commits -= stage.commits;
+        *bytes -= stage.bytes;
+        stage.commits = 0;
+        stage.bytes = 0;
+        stage.revoked = true;
+    }
+
+    /// The prefix being synchronized cannot be published: its synchronization failed,
+    /// its leader panicked, or the prefix before it was not published. That prefix and
+    /// the queue fail, and no fence runs again. A prefix that is already synchronized and
+    /// publishing is durable and keeps its outcome.
+    fn fail_locked(s: &mut State) {
+        s.failed = true;
+        let State {
+            syncing,
+            commits,
+            bytes,
+            ..
+        } = s;
+        if let Some(stage) = syncing.as_mut() {
+            Self::revoke(stage, commits, bytes);
+        }
         Self::fail_queue(s);
-        s.commits = 0;
-        s.bytes = 0;
+    }
+
+    /// The publishing leader panicked: the commits it had not published fail, and so does
+    /// everything after them, since nothing may be published past the gap.
+    fn fail_all(s: &mut State) {
+        let State {
+            publishing,
+            commits,
+            bytes,
+            ..
+        } = s;
+        if let Some(stage) = publishing.as_mut() {
+            Self::revoke(stage, commits, bytes);
+        }
+        Self::fail_locked(s);
     }
 
     fn fail_queue(s: &mut State) {
@@ -157,7 +245,10 @@ impl Coordinator {
     }
 
     fn in_flight(s: &State, ticket: &Ticket) -> bool {
-        s.inflight.iter().any(|t| std::ptr::eq(&**t, ticket))
+        [&s.syncing, &s.publishing]
+            .into_iter()
+            .flatten()
+            .any(|st| st.tickets.iter().any(|t| std::ptr::eq(&**t, ticket)))
     }
 
     pub fn wait(&self, store: &Store, ticket: &Ticket) -> Result<()> {
@@ -179,7 +270,7 @@ impl Coordinator {
             // leading finished after it returned, nobody leads the queued commit, so this
             // waiter must loop and lead it instead of sleeping out the poll.
             let mut s = self.state.lock();
-            if ticket.0.load(Ordering::Acquire) == 0 && s.active {
+            if ticket.0.load(Ordering::Acquire) == 0 && s.busy() {
                 #[cfg(test)]
                 self.parks.fetch_add(1, Ordering::Relaxed);
                 self.changed.wait_for(&mut s, Duration::from_millis(20));
@@ -198,13 +289,13 @@ impl Coordinator {
                 if s.failed {
                     // A running fence can still publish its prefix. The caller resets
                     // the writer's head to the durable one, so it waits for that.
-                    if !s.active {
+                    if !s.busy() {
                         return Err(Error::Poisoned);
                     }
                     self.changed.wait_for(&mut s, Duration::from_millis(20));
                     continue;
                 }
-                if !s.active && s.queue.is_empty() {
+                if !s.busy() && s.queue.is_empty() {
                     return Ok(());
                 }
                 if o.is_some_and(|o| o.no_wait) {
@@ -215,14 +306,14 @@ impl Coordinator {
                 continue;
             }
             let mut s = self.state.lock();
-            if s.active {
+            if s.busy() {
                 self.changed.wait_for(&mut s, Duration::from_millis(20));
             }
         }
     }
 
-    /// Seal exactly the ready prefix. Appends during the fence belong to the next
-    /// fence even if the kernel happened to sync their bytes too.
+    /// Seal exactly the ready prefix, write and synchronize it, and publish it after the
+    /// prefix before it. Appends during the fence belong to the next fence.
     fn drive(&self, store: &Store, ticket: Option<&Ticket>) -> Result<bool> {
         let mut batch = {
             let mut s = self.state.lock();
@@ -238,33 +329,37 @@ impl Coordinator {
                 }
                 return Err(Error::Poisoned);
             }
-            if s.active || s.queue.is_empty() {
+            // A waiter whose commit is publishing must not lead the next prefix: if that
+            // fence failed, the waiter would report the failure for a commit that its own
+            // fence still publishes. The queued commits' own threads lead it.
+            if s.syncing.is_some()
+                || s.queue.is_empty()
+                || ticket.is_some_and(|t| Self::in_flight(&s, t))
+            {
                 return Ok(false);
             }
-            s.active = true;
             let batch: Vec<_> = s.queue.drain(..).collect();
-            s.inflight = batch.iter().map(|p| p.ticket.clone()).collect();
+            s.syncing = Some(Stage {
+                tickets: batch.iter().map(|p| p.ticket.clone()).collect(),
+                commits: batch.len(),
+                bytes: batch.iter().map(|p| p.bytes).sum(),
+                revoked: false,
+            });
             batch
         };
         let mut leader = Leader {
             group: self,
+            publishing: false,
             complete: false,
         };
         store.failpoint("group-sealed");
-        let last = batch.last().expect("nonempty sealed prefix");
         let started = std::time::Instant::now();
         #[cfg(any(test, feature = "failpoints"))]
         let injected = self.fail_next_sync.swap(false, Ordering::AcqRel);
         #[cfg(not(any(test, feature = "failpoints")))]
         let injected = false;
         let ann_file = batch.iter().rev().find_map(|p| p.ann_file.clone());
-        let sync_log = || {
-            sync_commit_reused(
-                &last.wal,
-                &last.snapshot.generation.dvocab,
-                &mut self.vocab.lock(),
-            )
-        };
+        let write = || store.write_prefix(&batch, &mut self.vocab.lock());
         let synced = if injected {
             Err(std::io::Error::from_raw_os_error(5).into())
         } else if let Some(ann) = ann_file {
@@ -273,36 +368,67 @@ impl Coordinator {
                 let annotations = std::thread::Builder::new()
                     .name("annotations-sync".into())
                     .spawn_scoped(sc, || ann.sync_data());
-                let log = sync_log();
+                let log = write();
                 let annotations = match annotations {
                     Ok(h) => h.join().unwrap_or_else(|_| {
                         Err(std::io::Error::other("the annotations sync panicked"))
                     }),
                     Err(_) => ann.sync_data(),
                 };
-                log.and(annotations.map_err(Error::from))
+                log.and_then(|direct| annotations.map(|()| direct).map_err(Error::from))
             })
         } else {
-            sync_log()
+            write()
         };
+        // the records are in the log, or will never be: the quota counts them there
+        store
+            .quota
+            .dequeue(batch.iter().map(|p| p.data.len() as u64).sum());
         store
             .commit_stats
             .synced(SyncPath::Group, started.elapsed());
         #[cfg(test)]
-        self.fences.fetch_add(1, Ordering::Relaxed);
+        {
+            self.fences.fetch_add(1, Ordering::Relaxed);
+            if matches!(synced, Ok(true)) {
+                self.direct_fences.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         store.failpoint("group-synced");
-        let (mut s, outcome) = match synced {
+        match synced {
             // A later write may have failed during the fence. That poisons the
             // writer and fails the queue, but this prefix is durable all the same.
             //
             // The prefix is published outside the state mutex (X09 section 17.4),
             // because publication applies the commits' full-text changes and schedules
             // their embedding work, and `enqueue` takes the same mutex while its caller
-            // holds the writer lock. `active` stays set until the end, so no other fence
-            // leads meanwhile and only this leader publishes, in commit order. Each
-            // ticket is set under the mutex, so a waiter that checked its ticket before
-            // parking is woken, and an old waiter never leads an unrelated prefix.
-            Ok(()) => {
+            // holds the writer lock. Only one prefix publishes at a time, and a prefix
+            // takes over publication only from the one before it, since the next fence
+            // seals only once this one has left `syncing`. So publication keeps commit
+            // order. Each ticket is set under the mutex, so a waiter that checked its
+            // ticket before parking is woken, and an old waiter never leads an unrelated
+            // prefix.
+            Ok(_) => {
+                {
+                    let mut s = self.state.lock();
+                    while s.publishing.is_some() && !s.syncing.as_ref().is_some_and(|st| st.revoked)
+                    {
+                        self.changed.wait_for(&mut s, Duration::from_millis(20));
+                    }
+                    let stage = s.syncing.take().expect("this fence's stage");
+                    if stage.revoked {
+                        // The publisher of the prefix before this one failed. These
+                        // commits are durable, but a reader must never see them without
+                        // the commits before them, so they report the failure.
+                        leader.complete = true;
+                        self.changed.notify_all();
+                        return Err(Error::Poisoned);
+                    }
+                    s.publishing = Some(stage);
+                    leader.publishing = true;
+                    // the next fence may seal and synchronize while this one publishes
+                    self.changed.notify_all();
+                }
                 for p in &mut batch {
                     store.publish_group_prefix(p);
                     {
@@ -314,11 +440,12 @@ impl Coordinator {
                 }
                 let mut s = self.state.lock();
                 store.commit_stats.fenced(batch.len());
-                // `fail` takes only queued commits out of the counts, and a failure of
-                // this leader ends in `Leader::drop`, which never comes here
-                s.commits -= batch.len();
-                s.bytes -= batch.iter().map(|p| p.bytes).sum::<u64>();
-                (s, Ok(()))
+                let stage = s.publishing.take().expect("this fence's stage");
+                s.commits -= stage.commits;
+                s.bytes -= stage.bytes;
+                leader.complete = true;
+                self.changed.notify_all();
+                Ok(true)
             }
             // Every commit of the fence reports the same failure, the one that led it
             // included. The cause is logged, since the error says only that the writer
@@ -327,6 +454,7 @@ impl Coordinator {
                 let mut s = self.state.lock();
                 store.commit_stats.failed();
                 Self::fail_locked(&mut s);
+                s.syncing = None;
                 tracing::error!(
                     target: "sparkles::store",
                     error = %e,
@@ -335,28 +463,31 @@ impl Coordinator {
                     last = batch[batch.len() - 1].info.seq,
                     "group commit fence failed to synchronize; writes are refused until the store is reopened"
                 );
-                (s, Err(Error::Poisoned))
+                leader.complete = true;
+                self.changed.notify_all();
+                Err(Error::Poisoned)
             }
-        };
-        s.inflight.clear();
-        s.active = false;
-        leader.complete = true;
-        self.changed.notify_all();
-        outcome.map(|_| true)
+        }
     }
 }
 
 struct Leader<'a> {
     group: &'a Coordinator,
+    /// the fence's prefix left `syncing` for `publishing`
+    publishing: bool,
     complete: bool,
 }
 impl Drop for Leader<'_> {
     fn drop(&mut self) {
         if !self.complete {
             let mut s = self.group.state.lock();
-            Coordinator::fail_locked(&mut s);
-            s.inflight.clear();
-            s.active = false;
+            if self.publishing {
+                Coordinator::fail_all(&mut s);
+                s.publishing = None;
+            } else {
+                Coordinator::fail_locked(&mut s);
+                s.syncing = None;
+            }
             self.group.changed.notify_all();
         }
     }
@@ -370,6 +501,92 @@ impl Store {
         if let Some(g) = &self.group {
             g.fail_next_sync.store(true, Ordering::Release);
         }
+    }
+
+    /// Write a sealed prefix's records and the terms they name, and make both durable: the
+    /// I/O of a fence (X09 item 446). `Ok(true)` when the records went through the log's
+    /// write-through handle.
+    ///
+    /// The records go to the log at its tail, which only this leader writes while the
+    /// prefix is in flight, so they start where the last fence's write ended. When they fit
+    /// in the space the log has preallocated, they go through the write-through handle, and
+    /// the terms through the vocabulary's on its worker at the same time, as an ordinary
+    /// commit's do in [`commit_direct`]. Both are `O_DSYNC` writes into allocated space,
+    /// which a device with FUA persists without a cache flush. Otherwise the terms and then
+    /// the records are written with buffered writes, and both files are synchronized with
+    /// `fdatasync`, as [`sync_commit_reused`] does. Either way only the terms of the prefix
+    /// are written, those before the vocabulary entry its last commit's snapshot ends at,
+    /// and not the terms of a transaction that runs meanwhile, which could still roll them
+    /// back (see [`DeltaVocab::sync_on`]).
+    ///
+    /// A crash during the write can leave any part of the prefix's records and terms on
+    /// disk. None of its commits is acknowledged yet, and every commit record of the prefix
+    /// counts the commits before it back to the published head as possibly not durable,
+    /// so replay treats the damage as a torn tail, as it does for a buffered prefix whose
+    /// pages reach the disk in any order.
+    fn write_prefix(&self, batch: &[Pending], worker: &mut crate::vocab::LazySync) -> Result<bool> {
+        let (first, last) = (&batch[0], batch.last().expect("nonempty sealed prefix"));
+        let generation = &last.snapshot.generation;
+        let dvocab = &generation.dvocab;
+        let upto = last.snapshot.dvocab_len;
+        let tail = &last.tail;
+        let mut io = tail.lock();
+        let at = first.wal_start;
+        // The prefix must start where the log's file ends and be contiguous. Anything else
+        // would write over or past records that are not this prefix's.
+        if io.end != at
+            || batch.windows(2).any(|w| w[1].wal_start != w[0].wal_end)
+            || batch.iter().any(|p| !Arc::ptr_eq(&p.tail, tail))
+        {
+            return Err(Error::Corrupt(format!(
+                "a group commit fence would write at byte {at} of a log written up to byte {}",
+                io.end
+            )));
+        }
+        let joined;
+        let data: &[u8] = if batch.len() == 1 {
+            &first.data
+        } else {
+            joined = batch
+                .iter()
+                .flat_map(|p| p.data.iter().copied())
+                .collect::<Vec<u8>>();
+            &joined
+        };
+        let path = generation
+            .dir
+            .as_deref()
+            .filter(|_| self.opts.wal_direct_writes)
+            .map(|d| d.join("wal.log"));
+        dvocab.set_prealloc(last.prealloc);
+        let (alloc_before, vocab_before) = (io.alloc, dvocab.allocated());
+        let written = (|| -> Result<bool> {
+            if wal::DirectLog::fits(at, data.len(), io.alloc)
+                && let Some(direct) = io.direct.handle(path.as_deref(), &last.wal)
+            {
+                if commit_direct(direct, at, data, dvocab, worker, upto)? {
+                    return Ok(true);
+                }
+                // the file system refused direct I/O: buffered from now on
+                io.direct = wal::Direct::Off;
+            }
+            // the terms are in the file before the records that name them
+            if dvocab.needs_sync_to(upto) {
+                dvocab.flush_to(upto)?;
+            }
+            wal::write_commit(&last.wal, at, &mut io.alloc, data, last.prealloc)?;
+            sync_commit_reused(&last.wal, dvocab, worker, upto)?;
+            Ok(false)
+        })();
+        tail.release(&io);
+        let direct = written?;
+        io.end = last.wal_end;
+        self.quota.add(io.alloc - alloc_before);
+        self.quota
+            .add(dvocab.allocated().saturating_sub(vocab_before));
+        self.quota.set_preallocated(io.alloc - io.end);
+        self.quota.set_vocab_preallocated(dvocab.preallocated());
+        Ok(direct)
     }
 
     /// Publish only a successfully fenced prefix, in commit order. The commit's full-text
@@ -453,13 +670,8 @@ impl WriteTxn<'_> {
         let c = self.next_commit(validation.as_deref());
         let bytes = self.wal_bytes();
         let prealloc = self.wal_prealloc();
-        // the terms are in the file before the records that name them
-        let vocab_before = generation.dvocab.allocated();
-        generation.dvocab.set_prealloc(prealloc);
-        if generation.dvocab.needs_sync() {
-            generation.dvocab.flush()?;
-        }
-        // The descriptor clone fails before any byte of this transaction is written.
+        // The descriptor clone fails before any byte of this transaction is written. The
+        // commit's terms stay in memory until its fence writes them with its records.
         let owned_wal = self
             .guard
             .wal
@@ -467,16 +679,15 @@ impl WriteTxn<'_> {
             .expect("persistent grouped transaction")
             .get_ref()
             .try_clone()?;
-        // The annotation record is written, not synced, before the WAL records: the fence
-        // syncs both files, and the commit record says an annotation is expected. Nothing
-        // that can fail comes between this and the WAL write, and a failed write poisons
-        // the writer, so the record is never taken back: if the commit is recovered, its
-        // annotation is there.
+        // The annotation record is written, not synced, before the fence writes the WAL
+        // records: the fence syncs both files, and the commit record says an annotation is
+        // expected. Nothing after this takes the commit back without poisoning the writer,
+        // and a failed fence poisons it too, so the record is never taken back: if the
+        // commit is recovered, its annotation is there.
         let (annotation, ann_file) =
             store.annotate_unsynced(&c, message, || Some(self.change_lines()))?;
         let family = self.guard.family.clone();
         let w = &mut **self.guard;
-        let wal = w.wal.as_mut().expect("persistent grouped transaction");
         let mut data = Vec::with_capacity(bytes as usize);
         let mut rec = [0u8; WAL_REC];
         for (op, q) in &self.log {
@@ -506,23 +717,12 @@ impl WriteTxn<'_> {
             &data,
         );
         data.extend_from_slice(&rec);
-        let before = w.wal_alloc;
-        if let Err(e) = wal.flush().and_then(|_| {
-            wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)
-        }) {
-            w.poisoned = true;
-            group.fail();
-            return Err(e.into());
-        }
-        store.quota.add(w.wal_alloc - before);
-        store
-            .quota
-            .add(generation.dvocab.allocated().saturating_sub(vocab_before));
+        // The records are not written here: the leader of the commit's fence writes them
+        // with the rest of its prefix (X09 item 446). From here on the commit holds its
+        // number and its place in the log, and a failure poisons the writer.
+        let wal_start = w.wal_len;
         w.wal_len += bytes;
-        store.quota.set_preallocated(w.wal_alloc - w.wal_len);
-        store
-            .quota
-            .set_vocab_preallocated(generation.dvocab.preallocated());
+        store.quota.queue(bytes);
         let mut snapshot = Snapshot {
             cacheable: true,
             dataset_id: self.base.dataset_id,
@@ -547,9 +747,10 @@ impl WriteTxn<'_> {
         // with the snapshot. The full-text changes are only staged here, and nothing of
         // either reaches the disk.
         store.maintain_geo(&mut snapshot, &self.base, &self.log);
-        // The commit's record is already in the log, so a panic while staging must not
-        // unwind past the queue: no fence would cover the record and the next commit
-        // would reuse its number. The writer is poisoned instead, as after a failed write.
+        // The commit holds its number, its place in the log and its annotation record,
+        // so a panic while staging must not unwind past the queue: the next commit would
+        // reuse its number and leave a gap where its records were to go. The writer is
+        // poisoned instead, as after a failed write.
         #[cfg(feature = "text")]
         let text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             store.stage_text(&mut snapshot, &self.log)
@@ -562,6 +763,7 @@ impl WriteTxn<'_> {
                     "staging a grouped commit's full-text changes panicked; writes are refused until the store is reopened"
                 );
                 w.poisoned = true;
+                store.quota.dequeue(bytes);
                 group.fail();
                 return Err(Error::Poisoned);
             }
@@ -583,14 +785,19 @@ impl WriteTxn<'_> {
             }
         }
         let ticket = Arc::new(Ticket::default());
+        let staged = 0;
         let pending = Pending {
             info: c,
             snapshot: snapshot.clone(),
             changes: std::mem::take(&mut self.log),
             author: self.opts.author.clone(),
             wal: owned_wal,
+            wal_start,
             wal_end: w.wal_len,
-            bytes,
+            data,
+            tail: w.tail.clone(),
+            prealloc,
+            bytes: bytes + staged,
             ticket: ticket.clone(),
             validation: validation.clone(),
             annotation: annotation.clone(),
@@ -603,6 +810,7 @@ impl WriteTxn<'_> {
         w.staged = Some(snapshot);
         if let Err(e) = group.enqueue(pending) {
             w.poisoned = true;
+            store.quota.dequeue(bytes);
             return Err(e);
         }
         store.failpoint("group-enqueued-writer-held");
@@ -1336,6 +1544,56 @@ mod tests {
         fresh_prefix_case(true);
     }
 
+    /// A fence writes only its prefix's terms (X09 item 446). A transaction that starts
+    /// from the speculative head marks the vocabulary before the fence has written the
+    /// prefix's terms, so its mark places them after its rollback point. If the fence also
+    /// wrote that transaction's own new term, its rollback would cut the chunk, the
+    /// acknowledged commit's term with it, and a crash before the next fence would lose
+    /// that commit. The image taken right after the rollback must hold the commit.
+    #[test]
+    fn a_rollback_after_a_fence_keeps_the_fenced_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = Arc::new(Store::open(&root, options()).unwrap());
+        insert(&s, "prior").unwrap();
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "fenced"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        // the next transaction marks the vocabulary and adds a term of its own while the
+        // fenced commit's term is still unwritten
+        let mut t = speculative(&s);
+        assert_eq!(
+            t.base().commit,
+            2,
+            "the transaction starts from the queued commit"
+        );
+        t.encode_quad(
+            &Quad::new(
+                NamedNode::new("urn:rolled-back").unwrap(),
+                NamedNode::new("urn:p").unwrap(),
+                NamedNode::new("urn:o").unwrap(),
+                GraphName::DefaultGraph,
+            ),
+            &mut Default::default(),
+        )
+        .unwrap();
+        go.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap().commit.seq, 2);
+        drop(t);
+        // power loss now: only what the fences and the rollback synchronized is on disk
+        let crashed = dir.path().join("crashed");
+        copy_dir(&root, &crashed);
+        drop(s);
+        let s = Store::open(&crashed, Default::default()).unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.commit, 2, "the acknowledged commit survives");
+        assert!(has(&snap, "prior") && has(&snap, "fenced"));
+        assert!(snap.lookup_iri("urn:rolled-back").is_none());
+    }
+
     #[test]
     fn aborted_uncommitted_suffix_does_not_clean_or_publish_prefix() {
         let dir = tempfile::tempdir().unwrap();
@@ -1678,14 +1936,14 @@ mod tests {
             thread::spawn(move || insert(&s, "queued"))
         };
         queued(&s, 1);
-        // The next transaction's WAL write fails: its descriptor is read-only.
-        let read_only = File::open(wal_path(dir.path())).unwrap();
+        // A later transaction fails after taking its commit number, as one whose staging
+        // panicked does. Writers no longer write to the log, so this is the failure a
+        // writer can meet once its commit holds a place in the log.
         {
             let mut w = s.writer.lock();
-            w.wal = Some(BufWriter::new(read_only));
-            w.wal_direct = Default::default();
+            w.poisoned = true;
+            s.group.as_ref().unwrap().fail();
         }
-        assert!(insert(&s, "failed").is_err());
         go.send(()).unwrap();
         // The sealed prefix's fence succeeded, so its commit is durable and acknowledged.
         assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
@@ -1798,10 +2056,12 @@ mod tests {
         assert!(matches!(insert(&s, "three"), Err(Error::Poisoned)));
         drop(s);
         // As with ordinary failed sync, complete but unacknowledged WAL records
-        // may recover. Nothing that returned success can disappear.
+        // may recover. Nothing that returned success can disappear. The failed fence
+        // wrote the first commit's records and terms, and the second commit, queued
+        // behind it, was never written: writers leave the log to the leaders.
         let s = Store::open(dir.path(), Default::default()).unwrap();
-        assert_eq!(s.snapshot().commit, 2);
-        assert_eq!(s.snapshot().len(), 2);
+        assert_eq!(s.snapshot().commit, 1);
+        assert_eq!(s.snapshot().len(), 1);
     }
 
     #[test]
@@ -1880,6 +2140,171 @@ mod tests {
         assert_eq!(s.head_commit().seq, 0);
         assert!(matches!(insert(&s, "three"), Err(Error::Poisoned)));
     }
+    /// Wait until `n` fences have finished their synchronization.
+    fn fenced(s: &Store, n: usize) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while s.group.as_ref().unwrap().fences.load(Ordering::Relaxed) < n {
+            assert!(Instant::now() < until, "the fence did not synchronize");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The next fence seals and synchronizes while a prefix publishes, so the index work
+    /// of publication never delays a synchronization, and it publishes only after the
+    /// prefix before it (X09 item 447).
+    #[test]
+    fn the_next_fence_synchronizes_while_a_prefix_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit, go) = pause(&s, "group-published");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "two"))
+        };
+        // the first prefix is still publishing, and the second is synchronized
+        fenced(&s, 2);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            s.snapshot().commit,
+            1,
+            "the second prefix publishes after the first"
+        );
+        go.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+        assert_eq!(second.join().unwrap().unwrap().commit.seq, 2);
+        assert_eq!(s.snapshot().commit, 2);
+        let g = s.group.as_ref().unwrap();
+        assert!(g.idle());
+        let st = g.state.lock();
+        assert_eq!((st.commits, st.bytes), (0, 0));
+    }
+
+    /// A waiter whose commit is in the prefix being published never leads the next one. If
+    /// it did and that fence failed, it would report the failure for a commit that its own
+    /// prefix then publishes.
+    #[test]
+    fn a_waiter_whose_commit_publishes_never_leads_the_next_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit0, go0) = pause(&s, "group-sealed");
+        let zero = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "zero"))
+        };
+        hit0.recv_timeout(Duration::from_secs(5)).unwrap();
+        let a_paused = Arc::new(AtomicBool::new(false));
+        let y_go = Arc::new(AtomicBool::new(false));
+        {
+            let (a_paused, y_go) = (a_paused.clone(), y_go.clone());
+            s.set_failpoint(
+                "group-wait-observed",
+                Some(Arc::new(move |_| {
+                    let until = Instant::now() + Duration::from_secs(10);
+                    let flag = match thread::current().name() {
+                        // a2 leaves the next fence to a1, so a2's commit waits in it
+                        Some("a2") => &a_paused,
+                        Some("y") => &y_go,
+                        _ => return,
+                    };
+                    while !flag.load(Ordering::SeqCst) && Instant::now() < until {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })),
+            );
+        }
+        let named = |name: &'static str| {
+            let s = s.clone();
+            thread::Builder::new()
+                .name(name.into())
+                .spawn(move || insert(&s, name))
+                .unwrap()
+        };
+        let a1 = named("a1");
+        queued(&s, 1);
+        let a2 = named("a2");
+        queued(&s, 2);
+        let (hit_tx, hit) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        {
+            let a_paused = a_paused.clone();
+            let once = AtomicBool::new(false);
+            s.set_failpoint(
+                "group-published",
+                Some(Arc::new(move |st: &Store| {
+                    if st.snapshot().commit == 2 && !once.swap(true, Ordering::SeqCst) {
+                        a_paused.store(true, Ordering::SeqCst);
+                        hit_tx.send(()).unwrap();
+                        let _ = go_rx.lock().recv_timeout(Duration::from_secs(10));
+                    }
+                })),
+            );
+        }
+        go0.send(()).unwrap();
+        assert_eq!(zero.join().unwrap().unwrap().commit.seq, 1);
+        // a1 leads the prefix of a1 and a2 and stops after publishing a1
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        s.fail_next_group_sync();
+        let y = named("y");
+        queued(&s, 1);
+        // a2 polls while its prefix publishes and must leave y's commit alone
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 2);
+        y_go.store(true, Ordering::SeqCst);
+        assert!(matches!(y.join().unwrap(), Err(Error::Poisoned)));
+        go_tx.send(()).unwrap();
+        assert_eq!(a1.join().unwrap().unwrap().commit.seq, 2);
+        assert_eq!(a2.join().unwrap().unwrap().commit.seq, 3);
+        assert_eq!(s.snapshot().commit, 3);
+    }
+
+    /// A publisher that panics fails the prefix synchronized behind it: those commits are
+    /// durable, but a reader must not see them without the commits before them.
+    #[test]
+    fn a_failed_publisher_revokes_the_next_synchronized_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit_tx, hit) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel::<()>();
+        let go = Mutex::new(go);
+        let once = AtomicBool::new(false);
+        s.set_failpoint(
+            "group-published",
+            Some(Arc::new(move |_| {
+                if !once.swap(true, Ordering::Relaxed) {
+                    hit_tx.send(()).unwrap();
+                    let _ = go.lock().recv_timeout(Duration::from_secs(10));
+                    panic!("injected publisher failure");
+                }
+            })),
+        );
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "two"))
+        };
+        fenced(&s, 2);
+        go_tx.send(()).unwrap();
+        assert!(first.join().is_err());
+        assert!(matches!(second.join().unwrap(), Err(Error::Poisoned)));
+        assert_eq!(s.snapshot().commit, 1);
+        assert!(matches!(insert(&s, "three"), Err(Error::Poisoned)));
+        drop(s);
+        // both prefixes were synchronized, so both are durable
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, 2);
+        assert!(has(&reopened.snapshot(), "two"));
+    }
+
     #[test]
     fn cancelled_capture_waiting_for_a_prefix_releases_its_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -1947,7 +2372,10 @@ mod tests {
         // Inject an actual fdatasync error for only the second sealed prefix.
         // Its original records still exist in the real WAL; they cannot be acked
         // merely because the first fence may happen to cover a later append.
+        // The fence writes through the log's tail, so the write-through handle is turned
+        // off to make it write and synchronize through this descriptor.
         s.group.as_ref().unwrap().state.lock().queue[0].wal = File::open("/dev/null").unwrap();
+        s.writer.lock().tail.lock().direct = wal::Direct::Off;
         go.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
         assert!(second.join().unwrap().is_err());
@@ -2172,7 +2600,10 @@ mod tests {
                 .unwrap()
         };
         appended.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The fence writes through the log's tail, so the write-through handle is turned
+        // off to make it write and synchronize through this descriptor.
         s.group.as_ref().unwrap().state.lock().queue[0].wal = File::open("/dev/null").unwrap();
+        s.writer.lock().tail.lock().direct = wal::Direct::Off;
         resume.send(()).unwrap();
         assert_eq!(old.join().unwrap().unwrap().commit.seq, 2);
         assert_eq!(
@@ -2849,15 +3280,17 @@ mod tests {
             })
             .collect();
         queued(&s, 3);
-        // Power loss now could keep any subset of the pages of commits 2 to 5,
-        // which no sync has covered yet. Only commit 1 was acknowledged.
-        let crashed = dir.path().join("crashed");
-        copy_dir(&root, &crashed);
+        // Power loss during the fences of commits 2 to 5 could keep any subset of the
+        // pages of their records, which no fence had made durable yet. Only commit 1 was
+        // acknowledged. Writers leave the log to the leaders, so the records reach the
+        // file with their fences, and the image is the files once all four are written.
         go.send(()).unwrap();
         second.join().unwrap().unwrap();
         for t in later {
             t.join().unwrap().unwrap();
         }
+        let crashed = dir.path().join("crashed");
+        copy_dir(&root, &crashed);
         let buf = std::fs::read(wal_path(&crashed)).unwrap();
         let txns = transactions(&buf);
         assert_eq!(txns.len(), 5);
@@ -3363,6 +3796,14 @@ mod tests {
         if let Err(panic) = copied {
             std::panic::resume_unwind(panic);
         }
+        // Writers leave the log to the leader, so the records of m3 and m4 reach it only
+        // with their own fence. The image is the crash right after that fence's records
+        // and terms were written through and before its annotation sync returned: the log
+        // and vocabulary as they are now, with the annotations file copied mid-fence.
+        let log = wal_path(&root);
+        std::fs::copy(&log, wal_path(&crashed)).unwrap();
+        let vocab = log.with_file_name("delta.vocab");
+        std::fs::copy(&vocab, wal_path(&crashed).with_file_name("delta.vocab")).unwrap();
         (root, crashed)
     }
 

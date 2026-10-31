@@ -1342,6 +1342,21 @@ fn background_oracle_requires_a_fresh_transaction_in_one_successful_sync() {
     );
 }
 
+/// Whether files under `dir` can be opened for direct I/O, which the write-through
+/// handles need.
+fn direct_io_available(dir: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let probe = dir.join("direct-probe");
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
+        .open(&probe)
+        .is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
 fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     let base = 3;
     let run = run_writer(name, cfg, base, true, "", text, background);
@@ -1394,6 +1409,35 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             overlaps > 0,
             "{name}: no fresh transaction began and was acknowledged during one successful text-file synchronization"
         );
+    }
+    // With every commit grouped and the write-through handles on, the leaders write each
+    // fence's records and terms with `O_DSYNC` writes once the log has preallocated
+    // space, and no writer writes the log itself (X09 item 446). The crash images below
+    // then check those writes against the receipts.
+    if cfg.group && cfg.direct && !cfg.idle_direct {
+        let dsync = |name: &str| {
+            log.iter()
+                .filter(
+                    |r| matches!(r, Rec::Write { path, dsync: true, .. } if path.ends_with(name)),
+                )
+                .count()
+        };
+        let buffered_wal = log
+            .iter()
+            .filter(|r| matches!(r, Rec::Write { path, dsync: false, .. } if path.ends_with("/wal.log")))
+            .count();
+        let (wal, vocab) = (dsync("/wal.log"), dsync("/delta.vocab"));
+        println!(
+            "{name}: {wal} write-through log writes, {buffered_wal} buffered, {vocab} write-through vocabulary writes"
+        );
+        if direct_io_available(&run.root) {
+            assert!(
+                wal >= 10 && vocab >= 10 && wal > buffered_wal,
+                "{name}: fences wrote {wal} records and {vocab} terms through, {buffered_wal} records buffered"
+            );
+        } else {
+            println!("{name}: the file system refuses O_DIRECT, so fences wrote buffered");
+        }
     }
     let root = run.root.canonicalize().unwrap();
     // the paths in the log are canonical
@@ -1523,6 +1567,16 @@ fn crash_images_keep_every_acknowledged_commit() {
                 group: true,
                 direct: true,
                 idle_direct: true,
+                threads: 4,
+                commits: 25,
+            },
+        ),
+        (
+            "group-direct-fences",
+            Config {
+                group: true,
+                direct: true,
+                idle_direct: false,
                 threads: 4,
                 commits: 25,
             },

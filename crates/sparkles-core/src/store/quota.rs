@@ -74,6 +74,9 @@ pub(crate) struct Quota {
     preallocated: AtomicU64,
     /// the same after the last chunk of the delta vocabulary
     vocab_preallocated: AtomicU64,
+    /// the records of grouped commits queued for their fence, which the leader writes to
+    /// the log later: counted as if they were in it
+    queued: AtomicU64,
 }
 
 impl Quota {
@@ -93,6 +96,7 @@ impl Quota {
             excluded: Mutex::new(None),
             preallocated: AtomicU64::new(0),
             vocab_preallocated: AtomicU64::new(0),
+            queued: AtomicU64::new(0),
         })
     }
 
@@ -118,10 +122,29 @@ impl Quota {
         }
         // the zero bytes preallocated after the last commit of the log, and after the
         // last chunk of the delta vocabulary, are not data
-        self.used.load(Ordering::Relaxed).saturating_sub(
+        (self.used.load(Ordering::Relaxed) + self.queued.load(Ordering::Relaxed)).saturating_sub(
             self.preallocated.load(Ordering::Relaxed)
                 + self.vocab_preallocated.load(Ordering::Relaxed),
         )
+    }
+
+    /// A grouped commit queued `bytes` of records for its fence to write.
+    pub(crate) fn queue(&self, bytes: u64) {
+        self.queued.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A fence wrote, or failed to write, `bytes` of queued records. A written fence
+    /// counts them through [`add`](Self::add) and the preallocated space.
+    pub(crate) fn dequeue(&self, bytes: u64) {
+        let mut q = self.queued.load(Ordering::Relaxed);
+        while let Err(now) = self.queued.compare_exchange_weak(
+            q,
+            q.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            q = now;
+        }
     }
 
     /// Leave `dir` (a generation being built in the background) out of the measured
