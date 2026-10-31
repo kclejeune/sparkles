@@ -3650,7 +3650,8 @@ grows from 64 KiB as it fills. Buffered mode decodes a stream into memory up to 
 cutoff and into an unnamed temporary file past it. `guard::WriteOptions::before_publish`
 takes a `PublishHook` that the store runs after a write is parsed, indexed and validated,
 right before it is published, for transactions and bulk rebuilds alike. An `Err` from it
-abandons the write. `--parse-mode streaming` always uses a sequential reader, and
+abandons the write, and the cancellation and deadline are checked again after it
+returns. `--parse-mode streaming` always uses a sequential reader, and
 `--parse-mode buffered` always reads the whole document into memory first. A buffered
 compressed input needs RAM for its full decompressed size. These modes only affect
 parsing. Transactional changes, the vocabulary, the map of blank-node labels and

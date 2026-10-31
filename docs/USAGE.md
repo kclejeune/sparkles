@@ -5984,7 +5984,8 @@ stream on one thread. Into a dataset that holds data it inserts the quads in one
 the size of a stream is not known before it is read. `replace` reads up to about 20 MB of
 the decompressed stream ahead, and a longer stream goes through the bounded bulk
 replacement instead of being held in memory. The bytes read ahead are parsed afterwards,
-and the read-ahead stops at the write's cancellation and deadline. Each read asks the file object for at most 64 KiB, or 64 Ki
+and every read of the raw stream, including the decompressor's own, stops at the write's
+cancellation and deadline. Each read asks the file object for at most 64 KiB, or 64 Ki
 characters of a text-mode file, whose text is encoded as UTF-8. The compression is
 detected from the first bytes of the stream.
 
@@ -6006,8 +6007,11 @@ dataset unchanged. Ctrl-C stops the reading at the next read and raises
 object, it waits until the main thread has run the handlers of the signals that arrived,
 so an interrupt at any point before publication changes nothing, whatever decoder read
 the stream. A signal that arrives during publication itself can raise after the commit.
-A signal handler whose function returns lets the load go on, and it may query other
-datasets. `replace` from a file object also stops for its `cancel` token
+A signal handler whose function returns lets the load go on. It may read the dataset
+and write other datasets, but a write to the dataset that is loading raises
+`ConflictError` at once, as a write from inside its own transaction does, since the load
+may hold the writer lock while it waits for the handler. The store checks the timeout
+and the cancellation again after the handlers have run. `replace` from a file object also stops for its `cancel` token
 and `timeout`.
 
 ### Terms

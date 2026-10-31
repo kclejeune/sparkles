@@ -121,7 +121,8 @@ file by its path. A block buffer grows as it fills, which also spares small comp
 line-based files a 256 MiB buffer. An exception that the file object's `read` raises now
 propagates as itself. Ctrl-C stops the load at the next read, and the store runs the
 main thread's signal handlers right before it publishes, so an interrupt during the load
-no longer lets it commit. In Rust, `SourceData::Reader` and `Source::from_reader` give
+no longer lets it commit. A handler's write to the dataset that is loading raises
+`ConflictError` at once instead of waiting for the load's writer lock. In Rust, `SourceData::Reader` and `Source::from_reader` give
 the loader a stream that it reads once, and `WriteOptions::before_publish` takes a hook
 that the store runs right before it publishes a write. Code that matches every variant of
 `SourceData`, or builds a `WriteOptions` without `..Default::default()`, needs the new
