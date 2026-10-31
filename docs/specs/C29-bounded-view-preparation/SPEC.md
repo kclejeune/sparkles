@@ -168,10 +168,14 @@ snapshot. The snapshot alone does not enforce graph restrictions. Its accessors
 borrow that owner. Independent raw clones and caller-owned copies need separate
 accounting. An input snapshot that is already masked is accepted only when its mask
 belongs to the requested policy or the policy hides no triples, and any other masked
-input returns `Unsupported`. The cap covers conservative peak
-working storage and retained delta, policy and mask allocations, including spare
-container capacity. It does not replace immutable index mappings, shared store cache
-accounting or query execution limits.
+input returns `Unsupported`. The cap covers conservative peak working storage and
+the policy and mask allocations the view retains, including spare container capacity.
+The input snapshot and the persistent delta it shares with the view belong to the
+caller and are not charged again. A cold mask admits each batch of delta writes at an
+upper bound before it runs and keeps the bytes of the nodes those writes copied or
+created, so the view is charged for the storage it alone owns. A cached mask records
+that amount, and a later view of it is charged the same. The cap does not replace
+immutable index mappings, shared store cache accounting or query execution limits.
 
 `GuardDecision::exempt_controlled` is an additive provider contract. Its default
 returns `Unsupported` without invoking the legacy callback. The built-in GraphRAG
@@ -193,10 +197,22 @@ and query adoption, C25 exact references and U02 readers remain under item 395. 
 history handles and controlled permission helper do not provide an end-to-end query
 preparation limit for those callers.
 
-Controlled preparation accepts extra checks, conservative workspace admission and
-temporary allocations. Delta vocabulary lookup may scan borrowed entries, and a cold
-disclosure call builds a request-local index. Local unoptimized diagnostics compare
-identical cold and cached inputs, verify equal RDF answers or exemptions and record
-elapsed time. The core diagnostic also observes allocation with the existing moving
-test allocator. These diagnostics do not establish release performance. Item 398
-tracks release measurements and cost reduction before broader caller adoption.
+Controlled delta-vocabulary lookup probes the vocabulary's index once, holding its
+read lock only for that probe. A key longer than 1 MiB is instead compared entry by
+entry in polled pieces, since hashing it could not be interrupted. The seven
+permutations of a cold mask are written in parallel, as the legacy path writes them,
+and hidden keys are sorted in pieces of 16,384 merged through an admitted buffer.
+Writes to the shared delta report the nodes they copy, split or grow, which is how
+each batch keeps only the bytes it allocated. A cached disclosure index is read in
+place without charging the shared index to the request.
+
+A release diagnostic (`controlled_preparation_cost_diagnostic`) compared these changes
+with the previous controlled path on one host, interleaving three runs of each under
+a load average of 40. Results matched the legacy masks. On stores of 20,000 and
+100,000 quads held in an uncompacted delta, the smallest cap that admitted a cold mask
+fell from 87 MB to 7.9 MB and from 431 MB to 41 MB. On a compacted store of 100,000
+quads it fell from 22 MB to 5.6 MB. A delta-vocabulary lookup fell from 0.18 ms and
+2.9 ms to about 0.3 µs. Cold mask medians fell from 23 ms to 15 ms, from 103 ms to
+34 ms and from 17 ms to 11 ms. Cached views stayed between 3 and 5 µs. Total
+allocation of a cold mask is unchanged within 7%, since it is the copied delta nodes
+themselves. These loaded-host diagnostics are not published benchmark results.

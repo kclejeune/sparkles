@@ -218,8 +218,10 @@ Rust callers can prepare graph, predicate and class permission masks with
 `GraphAccess::masked_controlled` and one `Preparation`. Its `Control` carries
 cancellation and an absolute deadline through binding, scans, vocabulary decoding,
 class closure, ordering and supported providers. The request memory cap covers
-conservative temporary peaks and retained delta, policy and mask storage. Cached
-results must fit it too. `with_no_wait(true)` refuses a preparation lock that is held.
+conservative temporary peaks and the policy and mask storage the view retains,
+including the delta nodes a mask copies. The input snapshot and the delta it shares
+with the view belong to the caller and are not charged again. Cached results must fit
+the cap too. `with_no_wait(true)` refuses a preparation lock that is held.
 A refused call returns no partial view.
 
 The returned `PreparedView` owns its retained-state reservations and borrows its access
@@ -235,7 +237,8 @@ Providers implement `GuardDecision::exempt_controlled` to share these controls a
 reservations. The default returns `Unsupported` without running the legacy callback.
 The built-in GraphRAG disclosure guard supports controlled preparation, including cold
 index reads, footprint digest checking and exact coverage. It builds a temporary local
-index on a cold call and can reuse an existing compatible index after admission.
+index on a cold call and reads an existing compatible index in place, charging only the
+exemptions it returns.
 
 Arbitrary protection-pattern planning and unresolved providers nested in triple rules
 or protection graph definitions remain unsupported by the bounded helper. Static
@@ -246,8 +249,11 @@ provide no managed-write authority, source authenticity or complete HTTP query
 preparation limit. Bounded callers must propagate refusal without weakening the policy
 or selecting another state.
 
-Controlled dictionary lookup and mask preparation incur additional checks and temporary
-allocations. Delta vocabulary lookup may scan retained entries, and a cold disclosure
-call rebuilds its local index. These costs belong to the opt-in preparation helper.
-[Item 398](../ROADMAP.md) tracks release measurements and reductions before broader
-caller adoption.
+Controlled preparation polls its controls and admits storage before allocating it.
+A delta-vocabulary lookup is one index probe, and a cold mask writes its seven
+permutations in parallel as the legacy path does. The view is charged for the delta
+nodes its mask copies rather than for the shared input delta, so a cap of a few
+megabytes admits a mask over an uncompacted delta of 100,000 quads. A cold disclosure
+call still rebuilds its local index. The C29
+[Outcome](../specs/C29-bounded-view-preparation/SPEC.md#outcome) records release
+diagnostics of these costs.

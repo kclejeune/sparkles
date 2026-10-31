@@ -8,8 +8,8 @@ Phase 1 provides capped Store snapshots and trusted Dataset history handles, inc
 retained branch origins. Phase 2 adds controlled graph, predicate and class masks and
 the built-in disclosure guard. Protection-pattern planning, retained nested-provider
 accounting and guarded caller adoption
-remain under roadmap item 395. Item 398 tracks controlled preparation costs before
-broader caller adoption.
+remain under roadmap item 395. Controlled preparation charges only the storage a
+view owns, and its Outcome records release cost diagnostics.
 
 Read the [design and acceptance](SPEC.md). Its [Outcome](SPEC.md#outcome) records the
 delivery boundary, and its [Provenance](SPEC.md#provenance) records the design sources.
