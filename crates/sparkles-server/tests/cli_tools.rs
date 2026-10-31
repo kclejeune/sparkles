@@ -799,6 +799,7 @@ fn rsparql_and_rupdate_against_an_endpoint() {
 
 /// Wait until the server on `port` answers `GET /$/ready` with `200`: it listens before
 /// its datasets open.
+#[cfg(feature = "auth")]
 fn wait_ready(port: u16) {
     use std::io::{Read as _, Write as _};
     let t0 = std::time::Instant::now();

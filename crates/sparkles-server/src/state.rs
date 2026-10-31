@@ -1186,6 +1186,9 @@ impl AppState {
         )?;
         Ok(self.get(name).expect("created"))
     }
+    /// Startup attaches its datasets with [`attach_expected`](Self::attach_expected),
+    /// so outside the tests only `sparkles ingest` (with `mcp`) attaches this way.
+    #[cfg(any(test, feature = "mcp"))]
     pub fn attach(&self, name: &str, kind: DbType, loc: Option<&Path>) -> Result<Arc<Dataset>> {
         let source = match kind {
             DbType::Memory => sparkles::catalog::Attach::Memory,
