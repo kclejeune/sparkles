@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 
@@ -96,7 +97,106 @@ class BoxingtonContracts(unittest.TestCase):
         self.assertIn("before", streamed.stdout)
         self.assertNotIn("after", streamed.stdout)
 
+    def ci_setup(self, check):
+        """Put scripts/ci.sh in the contract workspace with a mise stand-in whose prepare
+        step builds and whose `jvm:test` check runs `check`, and return its environment."""
+        (self.workspace / "scripts").mkdir(exist_ok=True)
+        for name in ("ci.sh", "cargo-sparkles-task"):
+            shutil.copy2(ROOT / "scripts" / name, self.workspace / "scripts" / name)
+        bin_dir = self.root / "ci-bin"
+        bin_dir.mkdir(exist_ok=True)
+        frontend = bin_dir / "mise"
+        frontend.write_text(
+            "#!/bin/sh\n"
+            "for task; do :; done\n"
+            'case "$task" in\n'
+            "  jvm:native) exec mbx build --offline ;;\n"
+            # The collection that removed a gate's target between two of its tasks, forced.
+            f"  jvm:test) {check} ;;\n"
+            "  *) exit 8 ;;\n"
+            "esac\n"
+        )
+        frontend.chmod(0o755)
+        env = dict(self.env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"])
+        env.pop("SPARKLES_CI_LEASED", None)
+        return env
 
+    def ci_run(self, leased):
+        """Run scripts/ci.sh on `jvm:test`, whose check collects the target before it reads
+        what prepare built."""
+        env = self.ci_setup(
+            'mbx clean "$PWD" || exit 9; test -e target/debug/libsparkles_mbx_contract.rlib'
+        )
+        if not leased:
+            # A run that takes an outer command's lease for granted, as every run of
+            # ci.sh did before it took one itself.
+            env["SPARKLES_CI_LEASED"] = "1"
+        result = subprocess.run(
+            ["bash", "scripts/ci.sh", "jvm:test"], cwd=self.workspace, env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        summary = (self.workspace / ".artifacts/ci/summary.txt").read_text()
+        return result, summary
+
+    def test_ci_run_holds_managed_target_lease_between_tasks(self):
+        result, summary = self.ci_run(leased=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(summary, r"prepare\s+pass")
+        self.assertRegex(summary, r"jvm:test\s+pass")
+        self.assertTrue((self.workspace / "target").exists(), "collector removed a leased target")
+        self.mbx("clean", str(self.workspace))
+        self.assertFalse((self.workspace / "target").exists(), "ci.sh did not release its lease")
+
+    def test_ci_run_without_the_lease_loses_prepared_outputs(self):
+        # The negative control: the same run without the lease loses what prepare built.
+        result, summary = self.ci_run(leased=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(summary, r"prepare\s+pass")
+        self.assertRegex(summary, r"jvm:test\s+FAIL")
+
+    def test_terminated_ci_run_stops_its_tasks_and_releases_the_lease(self):
+        started = self.root / "check-started"
+        env = self.ci_setup(f'touch "{started}"; exec sleep 60')
+        run = subprocess.Popen(
+            ["bash", "scripts/ci.sh", "jvm:test"], cwd=self.workspace, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(lambda: run.poll() is None and run.kill())
+        deadline = time.monotonic() + 60
+        while not started.exists():
+            self.assertIsNone(run.poll(), run.communicate()[1] if run.poll() is not None else "")
+            self.assertLess(time.monotonic(), deadline, "the check did not start")
+            time.sleep(0.05)
+        self.mbx("clean", str(self.workspace))
+        self.assertTrue((self.workspace / "target").exists(), "collector removed a leased target")
+        run.terminate()
+        _, stderr = run.communicate(timeout=30)
+        self.assertEqual(run.returncode, 130, stderr)
+        summary = (self.workspace / ".artifacts/ci/summary.txt").read_text()
+        self.assertRegex(summary, r"jvm:test\s+stopped")
+        # The holder ends with the script, so the next collection may take the target.
+        deadline = time.monotonic() + 15
+        while (self.workspace / "target").exists():
+            self.assertLess(time.monotonic(), deadline, "the lease outlived the CI run")
+            self.mbx("clean", str(self.workspace))
+            time.sleep(0.2)
+
+    def test_explicit_target_dir_needs_the_task_lease_after_collection(self):
+        # A collection that has moved the view away and dropped its record, but not yet the
+        # link, leaves `target` dangling. mbx does not place an explicitly named target, so
+        # a bare build fails, and the same build under sparkles-task gets a fresh view.
+        self.mbx("build", "--offline")
+        view = Path(os.readlink(self.workspace / "target"))
+        shutil.rmtree(view)
+        view.with_suffix(".json").unlink()
+        bare = subprocess.run(
+            [MBX, "build", "--offline", "--target-dir", "target"], cwd=self.workspace,
+            env=self.env, capture_output=True, text=True, timeout=45,
+        )
+        self.assertNotEqual(bare.returncode, 0, "the negative control built through the link")
+        self.assertIn("Not a directory", bare.stderr)
+        self.mbx("sparkles-task", "--", MBX, "build", "--offline", "--target-dir", "target")
+        self.assertTrue((self.workspace / "target/debug").is_dir())
 
     def test_container_checksum_failure_stops_even_in_conditional_source(self):
         fake = self.root / "fake-bin"
@@ -165,6 +265,82 @@ class TaskFailureContracts(unittest.TestCase):
             self.assertEqual(result.returncode, 23, result.stderr)
 
 
+class JvmBindingContracts(unittest.TestCase):
+    def run_two_jvm_tasks(self, locked):
+        """Start two JVM tasks a second apart and return their exit codes and errors."""
+        with tempfile.TemporaryDirectory(prefix="sparkles-jvm-lock-") as directory:
+            root = Path(directory)
+            for name in ("jvm-native.sh", "jvm-gradle.sh", "with-lock.py"):
+                (root / "scripts").mkdir(exist_ok=True)
+                shutil.copy2(ROOT / "scripts" / name, root / "scripts" / name)
+            tools = {
+                "bin/mbx": "#!/bin/sh\nexit 0\n",
+                # The generator writes the bindings a moment after the old ones are gone.
+                # The generator marks that it started, then writes the bindings a moment
+                # after the old ones are gone.
+                "target/debug/uniffi-bindgen": (
+                    '#!/bin/sh\ntouch "started.$$"\nwhile [ "$1" != --out-dir ]; do shift; done\n'
+                    'sleep 0.3; mkdir -p "$2"; touch "$2/bindings.kt"\n'
+                ),
+                # Gradle gives the other task up to two seconds to start generating, then
+                # reads the bindings it was given.
+                "jvm/gradlew": (
+                    "#!/bin/sh\nfor i in $(seq 20); do\n"
+                    "  [ \"$(ls ../started.* 2> /dev/null | wc -l)\" -ge 2 ] && break\n  sleep 0.1\ndone\n"
+                    "test -e ../target/jvm/uniffi/bindings.kt || exit 41\n"
+                ),
+            }
+            for name, content in tools.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                path.chmod(0o755)
+            (root / "target/release").mkdir(parents=True)
+            (root / "target/release/libsparkles_ffi.so").touch()
+            env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
+            env.pop("SPARKLES_JVM_LOCKED", None)
+            if not locked:
+                # Each task believes a caller already holds the lock.
+                env["SPARKLES_JVM_LOCKED"] = "1"
+            runs = []
+            for n in range(2):
+                runs.append(subprocess.Popen(
+                    ["bash", "scripts/jvm-gradle.sh", f":task{n}"], cwd=root, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ))
+                # The first task's Gradle is running when the second task starts.
+                time.sleep(1)
+            results = []
+            for run in runs:
+                _, stderr = run.communicate(timeout=30)
+                results.append((run.returncode, stderr))
+            return results
+
+    def test_concurrent_jvm_tasks_do_not_regenerate_bindings_under_each_other(self):
+        for code, stderr in self.run_two_jvm_tasks(locked=True):
+            self.assertEqual(code, 0, stderr)
+
+    def test_unlocked_jvm_tasks_lose_bindings_to_each_other(self):
+        # The negative control: without the lock, the second task deletes the bindings
+        # the first task's Gradle reads.
+        self.assertEqual(self.run_two_jvm_tasks(locked=False)[0][0], 41)
+
+
+class ExplicitTargetTasks(unittest.TestCase):
+    def test_every_explicit_root_target_cargo_call_holds_the_task_lease(self):
+        tasks = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]
+        calls = []
+        for name, task in tasks.items():
+            run = task.get("run", [])
+            for line in "\n".join(run if isinstance(run, list) else [run]).splitlines():
+                if "--target-dir target" in line and line.lstrip().startswith("mbx "):
+                    calls.append((name, line.strip()))
+        self.assertTrue(calls)
+        for name, line in calls:
+            with self.subTest(task=name):
+                self.assertTrue(line.startswith("mbx sparkles-task -- "), line)
+
+
 class ArtifactRetentionContracts(unittest.TestCase):
     def test_ci_evidence_survives_compiler_target_collection(self):
         with tempfile.TemporaryDirectory(prefix="sparkles-ci-artifacts-") as directory:
@@ -177,10 +353,19 @@ class ArtifactRetentionContracts(unittest.TestCase):
             frontend = root / "bin/mise"
             frontend.write_text('#!/bin/sh\nprintf "retained-ci-output\\n"\n')
             frontend.chmod(0o755)
-            env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
+            leaser = root / "bin/mbx"
+            leaser.write_text(
+                '#!/bin/sh\n[ "$1" = sparkles-task ] || exit 23\nshift\n[ "$1" != -- ] || shift\n'
+                'touch "$LEASE_MARKER"\nexec "$@"\n'
+            )
+            leaser.chmod(0o755)
+            env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                       LEASE_MARKER=str(root / "leased"))
+            env.pop("SPARKLES_CI_LEASED", None)
             result = subprocess.run(["bash", str(script), "lint:doc-paths"], cwd=root,
                                     env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "leased").exists(), "ci.sh ran without the target lease")
             summaries = list(root.glob("**/ci/summary.txt"))
             self.assertEqual(len(summaries), 1, result.stdout)
             summary = summaries[0]
