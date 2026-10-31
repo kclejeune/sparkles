@@ -257,7 +257,7 @@ fetch() {
   mkdir -p "$dest"
   if [ "$helper" = none ]; then
     # --delete keeps an earlier run's gate.exit from standing in for a rerun's result.
-    rsync -a --delete "$primary:$pout/" "$dest/"
+    rsync -a --delete "$primary:$pout/" "$dest/" || return 97
     wall "$dest" > "$dest/wall.txt"
     echo "results in $dest"
     return 0
@@ -265,7 +265,7 @@ fetch() {
   # A split gate whose merge was already copied back to the primary needs no new merge.
   # shellcheck disable=SC2029
   if ssh "${ssh_opts[@]}" "$primary" "test -e ~/$pout/gate.exit"; then
-    rsync -a --delete "$primary:$pout/" "$dest/"
+    rsync -a --delete "$primary:$pout/" "$dest/" || return 97
     echo "results in $dest"
     return 0
   fi
@@ -273,7 +273,12 @@ fetch() {
   tmp=$(mktemp -d "$root/.artifacts/gates/.merge-$name.XXXXXX")
   conf=$tmp/conf
   mkdir -p "$conf"
-  rsync -a "$primary:$pout/" "$tmp/"
+  # Each transfer checks its own result, since a caller may run fetch where errexit is off.
+  if ! rsync -a "$primary:$pout/" "$tmp/"; then
+    rm -rf "$tmp"
+    echo "could not copy the ci half from $primary" >&2
+    return 97
+  fi
   if ! rsync -a "$helper:$hout/" "$conf/"; then
     rsync -a "$tmp/" "$dest/"
     rm -rf "$tmp"
@@ -301,9 +306,17 @@ fetch() {
   elif finished "$primary" "$name" && finished "$helper" "$hname"; then
     # Both units have stopped, but a half may have written its exit file after the copy
     # above. Look again before taking a missing file as a run that stopped without one.
+    local pe he
     # shellcheck disable=SC2029
-    if ssh "${ssh_opts[@]}" "$primary" "test -e ~/$pout/part.exit" &&
-      ssh "${ssh_opts[@]}" "$helper" "test -e ~/$hout/part.exit"; then
+    pe=$(ssh "${ssh_opts[@]}" "$primary" "test -e ~/$pout/part.exit && echo yes || echo no") || pe=
+    # shellcheck disable=SC2029
+    he=$(ssh "${ssh_opts[@]}" "$helper" "test -e ~/$hout/part.exit && echo yes || echo no") || he=
+    if [ -z "$pe" ] || [ -z "$he" ]; then
+      rm -rf "$tmp"
+      echo "could not recheck the exit files; not merging yet" >&2
+      return 97
+    fi
+    if [ "$pe" = yes ] || [ "$he" = yes ]; then
       rm -rf "$tmp"
       fetch
       return
@@ -313,9 +326,18 @@ fetch() {
   if [ -n "$code" ]; then
     echo "$code" > "$tmp/gate.exit"
     # Keep the primary's out directory complete for anyone reading it on the host.
-    rsync -a "$tmp/" "$primary:$pout/"
+    # gate.exit goes last, since a fetch that finds it there trusts the merge.
+    if ! rsync -a --exclude gate.exit "$tmp/" "$primary:$pout/" ||
+      ! rsync -a "$tmp/gate.exit" "$primary:$pout/gate.exit"; then
+      rm -rf "$tmp"
+      echo "could not copy the merge back to $primary" >&2
+      return 97
+    fi
   fi
-  rsync -a --delete "$tmp/" "$dest/"
+  if ! rsync -a --delete "$tmp/" "$dest/"; then
+    rm -rf "$tmp"
+    return 97
+  fi
   rm -rf "$tmp"
   echo "results in $dest"
 }
