@@ -224,9 +224,14 @@ fn nested_optional_with_a_named_graph_fits_a_small_budget_at_large_batch_caps() 
 /// that order; the UNION of the second has no order to keep.
 const INNER: &str = "SELECT ?a ?v ?b ?w ?k { ?a <urn:v> ?v . ?a <urn:p> ?k . \
                      ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l }";
-/// The join of INNER under a grouping, which may use its input's order, so that a
-/// spilled join keeps the probe input's order.
-const INNER_ORDERED: &str = "SELECT ?a (COUNT(*) AS ?n) (SUM(?w) AS ?ws) { ?a <urn:v> ?v . \
+/// The join of INNER under a grouping whose SAMPLE depends on the order of its rows, so
+/// that a spilled join keeps the probe input's order.
+const INNER_ORDERED: &str = "SELECT ?a (COUNT(*) AS ?n) (SAMPLE(?v) AS ?sv) { ?a <urn:v> ?v . \
+                             ?a <urn:p> ?k . ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l } \
+                             GROUP BY ?a";
+/// The join of INNER under a grouping whose aggregates do not depend on the order of
+/// their rows, so that a spilled join need not restore the probe input's order.
+const INNER_GROUPED: &str = "SELECT ?a (COUNT(*) AS ?n) (SUM(?w) AS ?ws) { ?a <urn:v> ?v . \
                              ?a <urn:p> ?k . ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l } \
                              GROUP BY ?a";
 const INNER_UNORDERED: &str = "SELECT ?a ?v ?b ?k ?l { { ?a <urn:v> ?v . ?a <urn:p> ?k } \
@@ -238,7 +243,7 @@ fn spilled_hash_joins_match_eager_at_every_batch_size() {
     let s = store(30_000, false);
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
-    for q in [INNER_ORDERED, INNER, INNER_UNORDERED] {
+    for q in [INNER_ORDERED, INNER_GROUPED, INNER, INNER_UNORDERED] {
         let expected = eager(&s, q);
         let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
         assert_eq!(sorted(memory.rows.clone()), expected, "{q}");

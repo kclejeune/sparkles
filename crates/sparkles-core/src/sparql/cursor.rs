@@ -2591,11 +2591,21 @@ impl Operator {
         // Which children's order this operator relies on. A projection or BIND passes
         // on what its parent needs. A join that cannot merge on what the plan claims
         // reads its build input into a hash table and keeps only the probe input's
-        // order. Other operators may use their inputs' order.
+        // order. A filter keeps its input's order without using it. A grouping in a hash
+        // table claims no order, and when no aggregate depends on the order of its rows
+        // it relies on none (item 93). Other operators may use their inputs' order.
         let hashes = joins && ctx.spill.is_some() && !merge::eligible(&node);
+        let order_free_group = incremental_group
+            && match &node.kind {
+                Kind::Group { aggs, .. } => aggs.iter().all(|(_, agg)| group::order_free(agg)),
+                _ => false,
+            };
         let needs: Vec<bool> = (0..node.children.len())
             .map(|i| match node.kind {
-                Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } => needed,
+                Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } | Kind::Filter(_) => {
+                    needed
+                }
+                Kind::Group { .. } if order_free_group => false,
                 _ if hashes => needed && i == binary::probe_side(&node),
                 _ => true,
             })

@@ -50,6 +50,24 @@ fn admitted(agg: &Agg) -> bool {
         }
 }
 
+/// Whether an admitted aggregate's result is the same whatever the order of its group's
+/// rows, as SPARQL defines it: COUNT, SUM, AVG, MIN and MAX, with or without DISTINCT.
+/// GROUP_CONCAT joins its values in row order and SAMPLE keeps the first value, so they
+/// depend on it, and the ARQ statistics aggregates are left with them. A sum of doubles
+/// or floats in another order may round differently in its last bits, and MIN or MAX
+/// keeps the first of values that compare equal, which SPARQL leaves open as well.
+pub(super) fn order_free(agg: &Agg) -> bool {
+    admitted(agg)
+        && matches!(
+            agg.func,
+            AggregateFunction::Count
+                | AggregateFunction::Sum
+                | AggregateFunction::Avg
+                | AggregateFunction::Min
+                | AggregateFunction::Max
+        )
+}
+
 pub(super) fn eligible(node: &Node) -> bool {
     let Kind::Group { aggs, .. } = &node.kind else {
         return false;
