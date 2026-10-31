@@ -1003,7 +1003,10 @@ fn run_node(
                     owned_input.set(true);
                 }
                 infos.push(info);
-                note = Some("[values not totally ordered: ran the generic plan]".into());
+                note = Some(
+                    "[values not totally ordered, or ids cannot decide: ran the generic plan]"
+                        .into(),
+                );
                 out.table
             }
         },
@@ -3114,9 +3117,10 @@ enum Lexical {
     Step,
     /// these ids, proper prefixes of the last one read, can still win: read their rows
     Read(Vec<u64>),
-    /// the k-th candidate is a literal that strings of any order beat: read the rest of
-    /// the piece whole
-    Whole,
+    /// the ids cannot decide: the k-th candidate is a literal that unread plain strings
+    /// may beat. The generic plan answers instead, which also keeps its order of tied
+    /// rows.
+    Generic,
 }
 
 /// The [`Lexical`] verdict on a lexical run, after a step, for the k-th candidate `kth`.
@@ -3136,10 +3140,8 @@ fn lexical_check(
     let s = match kth {
         None | Some(Value::BNode(_) | Value::Iri(_)) => return Ok(Lexical::Done),
         Some(Value::Str(s)) => s,
-        // an unread plain string would beat it. The k-th candidate only improves, so a
-        // run that looked up prefixes for a plain string never gets here.
-        Some(_) if run.extra.is_empty() => return Ok(Lexical::Whole),
-        Some(_) => return Ok(Lexical::Step),
+        // an unread plain string would beat it
+        Some(_) => return Ok(Lexical::Generic),
     };
     let vocab = &ctx.snap.generation.vocab;
     let last = run.lo - 1;
@@ -3840,8 +3842,6 @@ pub(super) fn ordered_topk(
         cand.sorted.clear();
         cand.sort_by_vars(&spec.tie_order);
         let (top, _) = order_by(ctx, cand, &keys, Some(spec.k), &mut ExprReport::default())?;
-        // rows that a check reads are ranked before the answer is taken
-        let mut rerank = false;
         if top.len() == spec.k {
             // a piece is finished once the k-th row is strictly better than its best
             // unread value, and so than every unread value
@@ -3860,26 +3860,7 @@ pub(super) fn ordered_topk(
                             }
                             run.hold = true;
                         }
-                        Lexical::Whole => {
-                            let piece = super::plan::TopKPiece {
-                                lo: run.lo,
-                                hi: run.hi,
-                                exact: run.exact,
-                                mono: None,
-                                lexical: false,
-                            };
-                            let best = if ctx.is_cursor() && heap_eligible(ctx) {
-                                cursor_topk_rest(ctx, spec, &vars, &[&piece], &mut scanned)?
-                            } else {
-                                topk_rest(ctx, spec, &vars, &[&piece], &mut scanned)?
-                            };
-                            let Some(best) = best else {
-                                return Ok(None);
-                            };
-                            run.kept.append(best);
-                            run.done = true;
-                            rerank = true;
-                        }
+                        Lexical::Generic => return Ok(None),
                     }
                     continue;
                 }
@@ -3889,7 +3870,7 @@ pub(super) fn ordered_topk(
                 }
             }
         }
-        if !rerank && runs.iter().all(|r| r.done) {
+        if runs.iter().all(|r| r.done) {
             drop(held);
             return Ok(Some((top.project(out), scanned)));
         }

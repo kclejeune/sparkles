@@ -1273,6 +1273,73 @@ fn ordered_top_k_reads_strings_from_the_low_end() {
     }
 }
 
+/// Load `body` (Turtle without prefixes) and compare `q` with the generic plan, with the
+/// planner's own choice and with the ordered read forced.
+fn lexical_case(body: &str, q: &str) -> QueryResult {
+    let s = Store::in_memory(StoreOptions::default());
+    let ttl = format!(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n{body}"
+    );
+    load(&s, &ttl, RdfFormat::Turtle);
+    let slow = run(&s, q, without_ordered_topk());
+    let fast = run(&s, q, Optimizations::ALL);
+    assert_eq!(fast.rows(), slow.rows(), "{q}");
+    topk_check(&s, q);
+    fast
+}
+
+/// Equal values with different ids (non-canonical integers) at the cut: the generic
+/// plan breaks their tie by its own row order, which the ordered read must keep.
+#[test]
+fn ordered_top_k_lexical_reads_keep_the_generic_tie_order() {
+    let mut ttl = String::new();
+    for i in 0..32 {
+        ttl.push_str(&format!("ex:drop{i} ex:p \"!{i}\" .\n"));
+    }
+    for i in 0..128 {
+        ttl.push_str(&format!("ex:keep_x{i} ex:p \"0001\"^^xsd:int .\n"));
+    }
+    ttl.push_str("ex:keep_m ex:p \"001\"^^xsd:int .\nex:keep_a ex:p \"01\"^^xsd:int .\n");
+    for i in 0..10_000 {
+        ttl.push_str(&format!("ex:keep_u{i} ex:p \"u{i}\"^^ex:unknown .\n"));
+    }
+    let r = lexical_case(
+        &ttl,
+        "SELECT ?s WHERE { ?s ex:p ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY ?v LIMIT 1",
+    );
+    assert_eq!(solutions(&r), ["<http://ex.org/keep_a>"]);
+}
+
+/// Plain strings that a FILTER drops start the column, so the ordered read is planned,
+/// and its steps then read dateTimes with and without a timezone, which are only
+/// partially ordered. The generic plan must decide.
+#[test]
+fn ordered_top_k_lexical_steps_fall_back_on_partially_ordered_values() {
+    let mut ttl = String::new();
+    for i in 0..32 {
+        ttl.push_str(&format!("ex:drop{i} ex:p \"!{i}\" .\n"));
+    }
+    // four fractional digits keep them out of the inline dateTimes, in the vocabulary
+    for (i, d) in [
+        "2024-01-01T01:00:00.0001+10:00",
+        "2024-01-01T00:00:00.0001Z",
+        "2024-01-01T00:30:00.0001",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ttl.push_str(&format!("ex:keep_d{i} ex:p \"{d}\"^^xsd:dateTime .\n"));
+    }
+    for i in 0..10_000 {
+        ttl.push_str(&format!("ex:keep_u{i} ex:p \"u{i}\"^^ex:unknown .\n"));
+    }
+    let r = lexical_case(
+        &ttl,
+        "SELECT ?s ?v WHERE { ?s ex:p ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY ?v LIMIT 10",
+    );
+    assert!(has_desc(&r.plan, "ran the generic plan"), "{:#?}", r.plan);
+}
+
 /// IRIs whose order differs from the order of their keys' bytes under other encodings
 /// (a prefix of another IRI, `/`, `#` and `-` against `>`, case, multi-byte characters),
 /// mixed with blank nodes, literals and numbers, and IRIs that updates add with delta ids

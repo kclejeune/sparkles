@@ -162,7 +162,7 @@ pub struct TopKPiece {
     /// candidate, a plain string itself, is therefore either greater than every string
     /// read or a proper prefix of the last one, and those prefixes are looked up in the
     /// vocabulary. A literal of another kind ranks after every plain string. When the
-    /// k-th candidate is not a plain string, the rest of the piece is read whole.
+    /// k-th candidate is not a plain string, the generic plan answers.
     pub lexical: bool,
 }
 
@@ -4668,8 +4668,8 @@ const LEXICAL_PROBE_ROWS: usize = 32;
 /// Whether the first rows of `scan` with order-column ids in `[lo, hi]` hold plain strings
 /// of the base vocabulary. A piece of base-vocabulary literals read from its low end
 /// stops early only when the k-th candidate is a plain string. When it is a literal of
-/// another kind, the rest of the piece is read whole after the first step, so the
-/// planner keeps the plain sort for columns that do not start with plain strings, such
+/// another kind, the generic plan answers after the first step, so the planner keeps
+/// the plain sort for columns that do not start with plain strings, such
 /// as language-tagged labels. Only the plan depends on this check.
 fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> bool {
     let col = scan.prefix.len();
