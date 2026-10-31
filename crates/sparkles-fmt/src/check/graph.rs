@@ -105,9 +105,6 @@ pub fn isomorphic(a: &[Quad], b: &[Quad]) -> bool {
     canonical(a) == canonical(b)
 }
 
-/// The most blank nodes [`isomorphic_bounded`] canonicalizes exactly.
-pub const EXACT_BLANK_NODES: usize = 8;
-
 /// The work [`isomorphic_bounded`] spends searching for a blank node mapping, counted in
 /// candidate tries and quad lookups. Typical shapes graphs need a few hundred per blank
 /// node, and ten thousand identical property shapes still fit.
@@ -117,13 +114,14 @@ pub const SEARCH_BUDGET: usize = 20_000_000;
 /// `Ok(Some(true))` means a blank node mapping was found and checked quad by quad, and
 /// `Ok(Some(false))` means the graphs differ. `Ok(None)` means the budget ran out before
 /// either was shown, and the caller must refuse. `Err(Timeout)` means `deadline` passed.
-/// The fast path is the same as [`isomorphic`]'s. When it misses, a graph with at most
-/// [`EXACT_BLANK_NODES`] blank nodes on each side is canonicalized as before. A larger
-/// one is first compared by colour refinement, which can only reject, and then a
-/// backtracking search guided by the colours looks for a mapping. The terms are interned
-/// to small numbers once, so no step hashes or copies a term. Canonicalizing many
-/// symmetric blank nodes takes factorial time and does not check the deadline, so input
-/// from the network must not reach it.
+/// The fast path is the same as [`isomorphic`]'s. When it misses, the graphs are compared
+/// by colour refinement, which can only reject, and then a backtracking search guided by
+/// the colours looks for a mapping, whatever the number of blank nodes: exact
+/// canonicalization takes factorial time on a few symmetric blank nodes and cannot be
+/// stopped, so it is never used here. The terms are interned to small numbers once, so no
+/// step hashes or copies a term. The deadline is checked between the steps of the
+/// preparation and every so many steps of the refinement and the search. A graph with a
+/// blank node inside a triple term is not searched, and the answer is `Ok(None)`.
 pub fn isomorphic_bounded(
     a: &[Quad],
     b: &[Quad],
@@ -138,20 +136,23 @@ fn isomorphic_within(
     budget: usize,
     deadline: Option<Instant>,
 ) -> Result<Option<bool>, FormatError> {
-    if relabeled(a) == relabeled(b) {
+    deadline_check(deadline)?;
+    let fast = relabeled(a);
+    deadline_check(deadline)?;
+    if fast == relabeled(b) {
         return Ok(Some(true));
     }
+    drop(fast);
     deadline_check(deadline)?;
-    if blank_nodes(a) <= EXACT_BLANK_NODES && blank_nodes(b) <= EXACT_BLANK_NODES {
-        return Ok(Some(isomorphic(a, b)));
-    }
     let Some(mut g) = Interned::new(a, b) else {
         return Ok(None);
     };
+    deadline_check(deadline)?;
     g.a.quads.sort_unstable();
     g.a.quads.dedup();
     g.b.quads.sort_unstable();
     g.b.quads.dedup();
+    deadline_check(deadline)?;
     if g.a.quads.len() != g.b.quads.len() {
         return Ok(Some(false));
     }
@@ -191,19 +192,6 @@ impl Ticker {
         }
         Ok(())
     }
-}
-
-fn blank_nodes(quads: &[Quad]) -> usize {
-    let mut names: HashMap<&str, usize> = HashMap::new();
-    for q in quads {
-        let mut r = Relabel(&mut names);
-        r.subject(&q.subject);
-        r.term(&q.object);
-        if let GraphName::BlankNode(b) = &q.graph_name {
-            r.blank(b);
-        }
-    }
-    names.len()
 }
 
 /// A term of an interned quad: a constant's number, or a blank node's number with
@@ -679,5 +667,44 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn small_symmetric_graphs_keep_to_the_deadline() {
+        // eight blank nodes all alike, each pointing at every other one, against the same
+        // graph with one edge turned into a loop: the fast path misses and every
+        // labelling ties
+        let k8 = |skip: Option<(usize, usize)>| {
+            let mut s = String::new();
+            for i in 0..8 {
+                for j in 0..8 {
+                    if i != j && skip != Some((i, j)) {
+                        s.push_str(&format!("_:b{i} <http://e/p> _:b{j} .\n"));
+                    }
+                }
+            }
+            if skip.is_some() {
+                s.push_str("_:b0 <http://e/p> _:b0 .\n");
+            }
+            quads(&s, Language::Turtle)
+        };
+        let (a, b) = (k8(None), k8(Some((0, 1))));
+        let start = std::time::Instant::now();
+        let deadline = Instant::now() + std::time::Duration::from_millis(50);
+        let r = isomorphic_bounded(&a, &b, Some(deadline));
+        assert!(
+            matches!(r, Ok(Some(false)) | Err(FormatError::Timeout)),
+            "{r:?}"
+        );
+        // generous slack over the 50 ms deadline
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        // a relabelled copy is still found isomorphic
+        let mut c = a.clone();
+        c.reverse();
+        assert_eq!(bounded(&a, &c), Some(true));
     }
 }
