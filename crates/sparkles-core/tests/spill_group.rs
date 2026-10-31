@@ -389,3 +389,27 @@ fn distinct_over_a_join_of_an_ordered_subquery_keeps_the_order_or_fails() {
         assert_eq!(spill.reserved_bytes(), 0, "{q}");
     }
 }
+
+/// A DISTINCT over input ordered on some of its columns holds the rows of one run of the
+/// first order column at a time (item 93). Its set no longer grows with the whole input,
+/// so it fits a budget that the whole set exceeds, without spill, and keeps the order.
+#[test]
+fn distinct_over_partly_ordered_input_holds_one_run() {
+    let s = store(60_000);
+    // The merge join on ?s comes ordered on ?s, and ?t is not in that order. Each pair
+    // comes once for each of the subject's three values.
+    let q = "SELECT DISTINCT ?s ?t { ?s <urn:p> ?v . ?s <urn:t> ?t }";
+    let expected = eager(&s, q);
+    assert_eq!(expected.len(), 30_000);
+    let unlimited = run_in_order(&s, q, 256 << 20, None).unwrap();
+    assert_eq!(sorted(unlimited.clone()), expected);
+    // The set of all 30,000 pairs takes more than 256 KiB, and the set of one subject's
+    // pairs a few hundred bytes.
+    let small = run_in_order(&s, q, 256 << 10, None).unwrap();
+    assert_eq!(small, unlimited);
+}
+
+fn sorted(mut rows: Vec<String>) -> Vec<String> {
+    rows.sort();
+    rows
+}

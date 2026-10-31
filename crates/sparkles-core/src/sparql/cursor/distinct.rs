@@ -1,6 +1,8 @@
 //! Incremental DISTINCT. Input ordered on every output column drops a row equal to the
-//! one before it and keeps only the last row. Other input keeps a charged set of the
-//! rows emitted so far.
+//! one before it and keeps only the last row. Input ordered on some output columns
+//! keeps a charged set of the rows of the current run of its first order column, since
+//! equal rows lie in one such run, and empties it when the run ends (item 93). Other
+//! input keeps a charged set of the rows emitted so far.
 //!
 //! Unordered input of a query that may spill deduplicates in passes (X08 §6.5). Once
 //! the set of rows emitted would hold half the room the query had when the operator
@@ -54,6 +56,11 @@ pub(super) struct Distinct {
     adjacent: bool,
     /// The last row of the previous batch of ordered input.
     last: Option<Vec<Id>>,
+    /// The column on which input that is not ordered on every output column is
+    /// ordered, whose runs of one value hold every copy of a row (item 93).
+    segment: Option<usize>,
+    /// The value of the run the set holds.
+    run: Option<Id>,
     /// Zero-column input: whether its one distinct row went out.
     emitted_empty: bool,
     charge: Option<RetainedCharge>,
@@ -102,11 +109,19 @@ impl Distinct {
     ) -> Result<Self> {
         let keys = &vars[..vars.len() - usize::from(numbered)];
         let adjacent = !keys.is_empty() && keys.iter().all(|v| input_order.contains(v));
+        // The first column of the input's order divides it into runs of one value, and
+        // equal rows lie in one run. A numbered DISTINCT's order does not matter.
+        let segment = (!adjacent && !numbered)
+            .then(|| input_order.first())
+            .flatten()
+            .and_then(|first| keys.iter().position(|v| v == first));
         let base = 256 + vars.len() as u64 * 8;
         Ok(Self {
             seen: None,
             adjacent,
             last: None,
+            segment,
+            run: None,
             emitted_empty: false,
             charge: ctx.retained_charge(base)?,
             bytes: base,
@@ -262,8 +277,78 @@ impl Distinct {
         if self.adjacent {
             return self.apply_adjacent(ctx, buffer);
         }
-        // Room for every row of the batch to be new, reserved before the set grows. While
-        // a table grows, its old and new allocations coexist.
+        let output = if let Some(column) = self.segment {
+            self.apply_segmented(ctx, buffer, column)?
+        } else {
+            if !self.reserve(ctx, width, len)? {
+                return self.apply_frozen(ctx, buffer);
+            }
+            self.insert(ctx, buffer, 0..len, 0)?
+        };
+        for column in &mut buffer.table.cols {
+            column.truncate(output);
+        }
+        buffer.table.len = output;
+        buffer.reconcile()
+    }
+
+    /// Input ordered on a column: equal rows have equal values there and lie in one run of
+    /// them, so the set holds one run at a time and starts again at each new value. The
+    /// rows that pass keep the input's order. Returns how many rows pass, compacted to the
+    /// front of the batch.
+    fn apply_segmented(&mut self, ctx: &Ctx, buffer: &mut Buffer, column: usize) -> Result<usize> {
+        let width = buffer.table.width() - usize::from(self.numbered);
+        let len = buffer.table.len;
+        let mut output = 0;
+        let mut start = 0;
+        while start < len {
+            let id = buffer.table.cols[column][start];
+            let mut end = start + 1;
+            while end < len && buffer.table.cols[column][end] == id {
+                end += 1;
+            }
+            if self.run != Some(id) {
+                self.restart()?;
+                self.run = Some(id);
+            }
+            // A query without spill never freezes the set.
+            let fits = self.reserve(ctx, width, end - start)?;
+            debug_assert!(fits, "a segmented DISTINCT does not spill");
+            output = self.insert(ctx, buffer, start..end, output)?;
+            start = end;
+        }
+        Ok(output)
+    }
+
+    /// Empty the set for the next run of a segmented DISTINCT. A table whose capacity a
+    /// long run left far larger than what it holds is freed, so that many short runs
+    /// after a long one do not each clear its whole capacity.
+    fn restart(&mut self) -> Result<()> {
+        let oversized = match &self.seen {
+            None => return Ok(()),
+            Some(Seen::One(ids)) => ids.capacity() > 1024 && ids.len() * 8 < ids.capacity(),
+            Some(Seen::Many { table, .. }) => {
+                table.capacity() > 1024 && table.len() * 8 < table.capacity()
+            }
+        };
+        if oversized {
+            self.seen = None;
+            return self.retain(self.base);
+        }
+        match self.seen.as_mut().expect("distinct state") {
+            Seen::One(ids) => ids.clear(),
+            Seen::Many { table, rows } => {
+                table.clear();
+                rows.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Room in the set for `len` more rows of `width` key columns, reserved before the set
+    /// grows. While a table grows, its old and new allocations coexist. Returns false when
+    /// the set of a query that may spill stops growing instead.
+    fn reserve(&mut self, ctx: &Ctx, width: usize, len: usize) -> Result<bool> {
         let numbered = self.numbered;
         let seen = self.seen.get_or_insert_with(|| {
             if width == 1 && !numbered {
@@ -342,7 +427,7 @@ impl Distinct {
                         ) =>
                 {
                     self.frozen = true;
-                    return self.apply(ctx, buffer);
+                    return Ok(false);
                 }
                 Err(error) => return Err(error),
             }
@@ -367,15 +452,25 @@ impl Distinct {
             };
             self.retain(table_bytes(capacity, entry) + arena as u64 * 8 + 256)?;
         }
-        if self.frozen {
-            return self.apply_frozen(ctx, buffer);
-        }
+        Ok(!self.frozen)
+    }
+
+    /// Insert the rows `range` of `buffer` into the set, whose room [`Self::reserve`]
+    /// made, and move the new ones to the front from row `output` on. Returns the
+    /// number of rows at the front after them.
+    fn insert(
+        &mut self,
+        ctx: &Ctx,
+        buffer: &mut Buffer,
+        range: std::ops::Range<usize>,
+        mut output: usize,
+    ) -> Result<usize> {
+        let width = buffer.table.width() - usize::from(self.numbered);
         let seen = self.seen.as_mut().expect("distinct state");
-        let mut output = 0;
         match seen {
             Seen::One(ids) => {
                 let column = &mut buffer.table.cols[0];
-                for row in 0..len {
+                for row in range {
                     if row.is_multiple_of(1024) {
                         ctx.check()?;
                     }
@@ -388,7 +483,7 @@ impl Distinct {
             }
             Seen::Many { table, rows } => {
                 let mut key = Vec::with_capacity(width);
-                for row in 0..len {
+                for row in range {
                     if row.is_multiple_of(1024) {
                         ctx.check()?;
                     }
@@ -417,11 +512,7 @@ impl Distinct {
                 }
             }
         }
-        for column in &mut buffer.table.cols {
-            column.truncate(output);
-        }
-        buffer.table.len = output;
-        buffer.reconcile()
+        Ok(output)
     }
 
     /// A set that no longer grows: rows in it are dropped and the others go to the
