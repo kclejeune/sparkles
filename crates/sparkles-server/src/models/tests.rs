@@ -432,6 +432,86 @@ fn step_budgets_are_rounded_per_step() {
     );
 }
 
+/// A step retried after a cache-bearing answer charges the provider's budget what the
+/// step's budget grew by, so both round the step's cache reads once: two reads of 513
+/// tokens count 103, not 52 + 52.
+#[test]
+fn the_provider_budget_rounds_each_step_once() {
+    let mock = MockModel::start(|_, n| {
+        let text = if n == 0 {
+            r#"{"wrong":1}"#
+        } else {
+            r#"{"query":"ASK {}"}"#
+        };
+        (
+            200,
+            json!({
+                "content": [{ "type": "text", "text": text }], "stop_reason": "end_turn",
+                "usage": { "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 513 }
+            }),
+        )
+    });
+    let m = models(
+        json!({ "a": { "kind": "anthropic", "endpoint": mock.url(),
+            "structuredOutput": "json-schema", "budget": { "tokensPerDay": 1000 } } }),
+        &[],
+    );
+    let a = call(&m, "a").unwrap();
+    assert_eq!(a.record.requests, 2);
+    assert_eq!(a.record.budget_tokens(), 103);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 103);
+}
+
+/// At the `tool` level the answer comes as the tool's input with no text. A retry for
+/// a bound the strict tool could not carry shows that input as the assistant's turn,
+/// since Anthropic refuses an empty assistant message.
+#[test]
+fn a_tool_answer_is_replayed_in_its_retry() {
+    let mock = MockModel::start(|_, n| {
+        let q = if n == 0 {
+            "SELECT * WHERE { ?s ?p ?o }"
+        } else {
+            "ASK {}"
+        };
+        (
+            200,
+            json!({
+                "content": [{ "type": "tool_use", "id": "t", "name": "Draft", "input": { "query": q } }],
+                "stop_reason": "tool_use", "usage": { "input_tokens": 10, "output_tokens": 5 }
+            }),
+        )
+    });
+    let m = models(
+        json!({ "a": { "kind": "anthropic", "endpoint": mock.url(), "structuredOutput": "tool" } }),
+        &[],
+    );
+    let mut out = draft_schema();
+    out.schema["properties"]["query"]["maxLength"] = json!(10);
+    let a = m
+        .call(
+            Some(Role::Draft),
+            &Pair::new("a", "m1"),
+            "system text",
+            "user text",
+            &out,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(a.value, json!({ "query": "ASK {}" }));
+    let r = mock.requests();
+    assert_eq!(r[0].body["tool_choice"], json!({ "type": "auto" }));
+    assert_eq!(
+        r[0].body["tools"][0]["input_schema"]["properties"]["query"],
+        json!({ "type": "string" })
+    );
+    let said = &r[1].body["messages"][1];
+    assert_eq!(said["role"], "assistant");
+    assert_eq!(
+        said["content"],
+        r#"{"query":"SELECT * WHERE { ?s ?p ?o }"}"#
+    );
+}
+
 #[test]
 fn a_reload_shares_the_token_count_with_requests_on_the_old_config() {
     let mock = MockModel::start(|_, _| (200, mock::ollama(r#"{"query":"ASK {}"}"#)));

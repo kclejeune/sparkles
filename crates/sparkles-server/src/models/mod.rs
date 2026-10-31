@@ -845,6 +845,9 @@ impl Models {
                         return fail(StepError::Call(e), rec);
                     }
                 };
+                // the provider's budget counts what the step's budget grew by, so both
+                // round the step's cache classes once
+                let before = rec.budget_tokens();
                 rec.add(resp.usage);
                 rec.stop = resp.stop.clone();
                 {
@@ -852,7 +855,8 @@ impl Models {
                     if t.0 != today() {
                         *t = (today(), 0);
                     }
-                    t.1 = t.1.saturating_add(resp.usage.budget());
+                    t.1 =
+                        t.1.saturating_add(rec.budget_tokens().saturating_sub(before));
                 }
                 match structured::value_of(&resp, out, level) {
                     Ok(value) => {
@@ -874,7 +878,13 @@ impl Models {
                     Err(errors) => {
                         last = Some(StepError::InvalidOutput(errors.clone()));
                         if attempt == 0 {
-                            messages.push(Message::assistant(resp.text.clone()));
+                            // a tool answer has no text, and Anthropic refuses an
+                            // empty assistant message, so the retry shows its input
+                            let said = match (&resp.tool_input, resp.text.trim().is_empty()) {
+                                (Some(v), true) => v.to_string(),
+                                _ => resp.text.clone(),
+                            };
+                            messages.push(Message::assistant(said));
                             messages.push(structured::retry_message(&errors));
                         }
                     }

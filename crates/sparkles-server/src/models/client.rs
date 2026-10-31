@@ -396,7 +396,7 @@ fn read_usage(kind: Kind, v: &Value, ttl: Option<CacheTtl>) -> (Usage, bool) {
         Kind::Anthropic => (&v["usage"]["input_tokens"], &v["usage"]["output_tokens"]),
         Kind::Local => return (Usage::default(), false),
     };
-    let complete = i.as_u64().is_some() && o.as_u64().is_some();
+    let mut complete = i.as_u64().is_some() && o.as_u64().is_some();
     let mut u = Usage {
         input: i.as_u64().unwrap_or(0),
         output: o.as_u64().unwrap_or(0),
@@ -404,8 +404,21 @@ fn read_usage(kind: Kind, v: &Value, ttl: Option<CacheTtl>) -> (Usage, bool) {
     };
     if kind == Kind::Anthropic {
         let r = &v["usage"];
-        let written = r["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        // a cache member that is present but not a count leaves the usage unknown, so
+        // that a settlement keeps its reservation
         let split = &r["cache_creation"];
+        let members = [
+            &r["cache_creation_input_tokens"],
+            &r["cache_read_input_tokens"],
+            &split["ephemeral_5m_input_tokens"],
+            &split["ephemeral_1h_input_tokens"],
+        ];
+        if members.iter().any(|m| !m.is_null() && m.as_u64().is_none())
+            || !(split.is_null() || split.is_object())
+        {
+            complete = false;
+        }
+        let written = r["cache_creation_input_tokens"].as_u64().unwrap_or(0);
         let (five, hour) = (
             split["ephemeral_5m_input_tokens"].as_u64(),
             split["ephemeral_1h_input_tokens"].as_u64(),
@@ -1374,6 +1387,23 @@ mod tests {
             ),
             None
         );
+        // or with a cache member that is not a count
+        for bad in [
+            json!({ "cache_read_input_tokens": "9000" }),
+            json!({ "cache_creation_input_tokens": -1 }),
+            json!({ "cache_creation_input_tokens": 5, "cache_creation": { "ephemeral_1h_input_tokens": 5.5 } }),
+            json!({ "cache_creation": [5] }),
+        ] {
+            let mut u = json!({ "input_tokens": 1, "output_tokens": 1 });
+            u.as_object_mut()
+                .unwrap()
+                .extend(bad.as_object().unwrap().clone());
+            assert_eq!(
+                usage_of(Kind::Anthropic, body(u.clone()).as_bytes(), None),
+                None,
+                "{u}"
+            );
+        }
     }
 
     #[test]
