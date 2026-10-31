@@ -10,3 +10,7 @@ The result report is a manual import. A linked raw record supports only the meas
 and metadata it contains. Missing build revisions, host details, durability settings or
 answer evidence remain unknown and must be supplied by a new run before a broader claim
 is generated. Existing raw records retain their original bytes and paths.
+
+The [spill default and execution cost records](records/spill-item-93-2026-10-31/README.md)
+hold the manual records of the forge runs for roadmap item 93. They list their builds,
+configuration and file hashes, and the run catalog does not include them.

@@ -1,0 +1,10 @@
+A: file /home/kclejeune/lanes/spill-7-93-20261031/bin/sparkles-5453f9d0
+A sha256: 6db286d65cc12d28b9b8be6fb9596cb48bafdebb75bd9b7fbd60a1a6b7c8f2fd
+B: file /home/kclejeune/lanes/spill-7-93-20261031/bin/sparkles-c88c5969
+B sha256: f7e94f791d3cb600515913fbaebc5d3ca7b50401d94865dd058e10a28543e62b
+data: /home/kclejeune/lanes/spill-7-93-20261031/data/people-1000000.nt.zst 3f51783448371dd0f57391e7d3fdadae66442f0c32ae260c93a3a96b43b1cbd4
+host: forge 7.2.9
+cpu:  13th Gen Intel(R) Core(TM) i5-13500
+serve A: 
+serve B: 
+share store: 0

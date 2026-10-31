@@ -1,0 +1,70 @@
+20:19:42 unpacking
+20:19:45 data: 10527323 triples
+20:19:49 A loaded in 4.16 s
+20:19:53 B loaded in 4.47 s
+20:19:53 queries: distinct-join distinct-obj employee-docs expr-order-key
+20:20:05 round 1 epoch 1 (A) done
+20:20:17 round 1 epoch 2 (B) done
+20:20:28 round 1 epoch 3 (B) done
+20:20:40 round 1 epoch 4 (A) done
+20:20:51 round 2 epoch 5 (A) done
+20:21:02 round 2 epoch 6 (B) done
+20:21:13 round 2 epoch 7 (B) done
+20:21:24 round 2 epoch 8 (A) done
+20:21:35 round 3 epoch 9 (A) done
+20:21:47 round 3 epoch 10 (B) done
+20:21:58 round 3 epoch 11 (B) done
+20:22:09 round 3 epoch 12 (A) done
+20:22:20 round 4 epoch 13 (A) done
+20:22:31 round 4 epoch 14 (B) done
+20:22:42 round 4 epoch 15 (B) done
+20:22:54 round 4 epoch 16 (A) done
+20:23:05 round 5 epoch 17 (A) done
+20:23:16 round 5 epoch 18 (B) done
+20:23:27 round 5 epoch 19 (B) done
+20:23:38 round 5 epoch 20 (A) done
+20:23:49 round 6 epoch 21 (A) done
+20:24:00 round 6 epoch 22 (B) done
+20:24:12 round 6 epoch 23 (B) done
+20:24:23 round 6 epoch 24 (A) done
+20:24:34 round 7 epoch 25 (A) done
+20:24:45 round 7 epoch 26 (B) done
+20:24:56 round 7 epoch 27 (B) done
+20:25:07 round 7 epoch 28 (A) done
+20:25:18 round 8 epoch 29 (A) done
+20:25:30 round 8 epoch 30 (B) done
+20:25:41 round 8 epoch 31 (B) done
+20:25:52 round 8 epoch 32 (A) done
+20:26:03 round 9 epoch 33 (A) done
+20:26:14 round 9 epoch 34 (B) done
+20:26:26 round 9 epoch 35 (B) done
+20:26:37 round 9 epoch 36 (A) done
+20:26:48 round 10 epoch 37 (A) done
+20:26:59 round 10 epoch 38 (B) done
+20:27:10 round 10 epoch 39 (B) done
+20:27:21 round 10 epoch 40 (A) done
+20:27:32 round 11 epoch 41 (A) done
+20:27:44 round 11 epoch 42 (B) done
+20:27:55 round 11 epoch 43 (B) done
+20:28:06 round 11 epoch 44 (A) done
+20:28:17 round 12 epoch 45 (A) done
+20:28:28 round 12 epoch 46 (B) done
+20:28:39 round 12 epoch 47 (B) done
+20:28:51 round 12 epoch 48 (A) done
+20:29:02 round 13 epoch 49 (A) done
+20:29:13 round 13 epoch 50 (B) done
+20:29:24 round 13 epoch 51 (B) done
+20:29:35 round 13 epoch 52 (A) done
+20:29:46 round 14 epoch 53 (A) done
+20:29:58 round 14 epoch 54 (B) done
+20:30:09 round 14 epoch 55 (B) done
+20:30:20 round 14 epoch 56 (A) done
+20:30:31 round 15 epoch 57 (A) done
+20:30:42 round 15 epoch 58 (B) done
+20:30:53 round 15 epoch 59 (B) done
+20:31:05 round 15 epoch 60 (A) done
+20:31:16 round 16 epoch 61 (A) done
+20:31:27 round 16 epoch 62 (B) done
+20:31:38 round 16 epoch 63 (B) done
+20:31:49 round 16 epoch 64 (A) done
+20:31:49 finished

@@ -1,0 +1,12 @@
+forge
+7.2.9
+ 13th Gen Intel(R) Core(TM) i5-13500
+60956ee62d5321e902dedd2f02a641aeb8f327164f19dd4787380cad88d8a2e2  bin/modeprobe-d65eaf40
+a81f6e042d9487727a68bffbbe9727a8a29c03383246ef6932123857bcc765a0  bin/modeprobe-8ca35daa
+327723f59023dd3597dd5e667ca3be01f0491c25a0174dc250dd0eaad102ccb5  spillq/distinct-order.rq
+17430b5cdb99e32a07271c7885a5604e4e81c2e89af0daa8af8a75a0e2075291  spillq/minus.rq
+7baa58f93409e78c95ebf1fdd99ad302517940817b2b7b3428e366f10f7412b0  spillq/optional.rq
+dcb1571eafce0f9cdf65428154a7b437fb82b07f0a9fbccfeffa51c4e2ab5b19  spillq/ordered-join.rq
+8522e62629acf5f81afcecbaf24259d7be3e51beb84104bf5d9292142a632e86  spillq/pdistinct-hash.rq
+af6a60fd0e77f8f1ef502d4c2b8cf67fd552d2f8d722bf47dbeb210da99b42ce  spillq/pdistinct-join.rq
+2f9d4194b689bda9c069a9e4ca0a0ef1af2b2162b192b3903748e89e79cdecba  spillq/pdistinct-scan.rq

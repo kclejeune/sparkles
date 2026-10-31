@@ -1950,8 +1950,9 @@ rows, so such a grouping now relies on none, and a filter passes on what its par
 needs. A LIMIT or OFFSET chooses its rows by their order, so it relies on its input's
 order whatever its parent needs. GROUP_CONCAT, SAMPLE and the ARQ statistics aggregates
 still rely on the order. A SUM or AVG of integers now holds its running sum in 128 bits
-and checks only the result against the `xsd:integer` range, so it no longer fails in one
-row order and succeeds in another. A spilled SUM or AVG of doubles may round differently
+and checks only the final sum against the `xsd:integer` range, so it no longer fails in
+one row order and succeeds in another. An AVG is still unbound when that sum leaves the
+range although the average would fit. A spilled SUM or AVG of doubles may round differently
 in its last bits than in memory, a sum of decimals near the decimal range may still
 overflow in one order only, and MIN or MAX may keep another of two values that compare
 equal, all of which SPARQL leaves open. The regression tests are
@@ -1977,7 +1978,9 @@ NEW-ITEM-3 takes.
 i5-13500 with 20 logical CPUs and 15.6 GiB of memory, on kernel 7.2.9. Each ran under the
 heavy lock with no other job on the host, on the synthetic people file of 1,000,000
 people, which loads as 10,527,319 quads. The raw records are in
-`.artifacts/bench-spill-7-93`.
+`.artifacts/bench-spill-7-93`, and the
+[compact copies](../benchmarks/memory/records/spill-item-93-2026-10-31/README.md) with their
+hashes are in the memory benchmark directory.
 
 The spill matrix used two release builds of the mode probe, d65eaf40, the base of the
 lane, and 8ca35daa, the lane through the release of finished scans. The three later

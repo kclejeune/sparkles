@@ -458,11 +458,12 @@ both. Rust callers set
 A cursor operator that reaches its end gives back what it and the operators below it
 hold for reading, such as the decoded block that each scan keeps charged, and a later
 pass of a spilled grouping or DISTINCT sizes itself from the memory it has when it starts.
-A spilled hash join below a grouping of COUNT, SUM, AVG, MIN and MAX, or below a FILTER,
-no longer writes its output a second time to restore its probe input's order, so a
-spilled SUM or AVG of doubles may round differently in its last bits than in memory. A
-SUM or AVG of integers keeps a 128-bit running sum and is unbound only when its result
-leaves the `xsd:integer` range, where it used to fail whenever a partial sum did. A
+A spilled hash join below a grouping of COUNT, SUM, AVG, MIN and MAX, or below a FILTER
+under such a grouping, no longer writes its output a second time to restore its probe
+input's order, so a spilled SUM or AVG of doubles may round differently in its last bits
+than in memory. A SUM or AVG of integers keeps a 128-bit running sum and is unbound only
+when the final sum leaves the `xsd:integer` range, where it used to fail whenever a
+partial sum did. A
 DISTINCT over input ordered on some of its columns holds one run of the first order
 column at a time instead of every row it emitted.
 

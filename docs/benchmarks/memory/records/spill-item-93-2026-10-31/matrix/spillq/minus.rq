@@ -1,0 +1,9 @@
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX ex: <http://example.org/>
+SELECT ?p WHERE {
+  ?p a ex:Researcher .
+  MINUS {
+    { ?p foaf:age ?value } UNION { ?p ex:salary ?value }
+    FILTER(?value < 65)
+  }
+}
