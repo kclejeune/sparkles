@@ -12,6 +12,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Another build of the bindings deletes target/jvm/uniffi, so builds take turns.
+# scripts/jvm-gradle.sh already holds the lock when it runs this script.
+if [ -z "${SPARKLES_JVM_LOCKED:-}" ] && command -v flock > /dev/null; then
+  mkdir -p .artifacts
+  exec 8> .artifacts/jvm-native.lock
+  flock 8
+fi
+
 crate=crates/sparkles-ffi
 profile="${JVM_PROFILE:-release}"
 dir=debug

@@ -513,23 +513,23 @@ description = "Build the sparkles-jena jar (jvm/sparkles-jena/build/libs), with 
 dir = "jvm"
 # The native library is built again inside this lease, so collection cannot remove it
 # before Gradle reads it. A fresh build takes seconds.
-run = "mbx sparkles-task -- bash -ec '../scripts/jvm-native.sh && exec ./gradlew --console=plain :sparkles-jena:assemble \"$@\"' jvm"
+run = "mbx sparkles-task -- ../scripts/jvm-gradle.sh :sparkles-jena:assemble"
 
 [tasks."jvm:test"]
-sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh"]
+sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh", "scripts/jvm-gradle.sh"]
 outputs = []
 description = "Jena's contract tests and the binding's own tests on the host's native library, once with the hand-written JNI calls and once without; extra args go to Gradle"
 dir = "jvm"
 # The native library is built again inside this lease, so collection cannot remove it
 # before Gradle reads it. A fresh build takes seconds.
-run = "mbx sparkles-task -- bash -ec '../scripts/jvm-native.sh && exec ./gradlew --console=plain :sparkles-jena:test :sparkles-jena:testUniffi \"$@\"' jvm"
+run = "mbx sparkles-task -- ../scripts/jvm-gradle.sh :sparkles-jena:test :sparkles-jena:testUniffi"
 
 [tasks."jvm:sample"]
 description = "Compile the Java sample (jvm/sample-java) with -Xlint:all -Werror against the library, run its tests, and run it"
 dir = "jvm"
 # The native library is built again inside this lease, so collection cannot remove it
 # before Gradle reads it. A fresh build takes seconds.
-run = "mbx sparkles-task -- bash -ec '../scripts/jvm-native.sh && exec ./gradlew --console=plain :sample-java:build :sample-java:run \"$@\"' jvm"
+run = "mbx sparkles-task -- ../scripts/jvm-gradle.sh :sample-java:build :sample-java:run"
 
 [tasks."jvm:lint"]
 sources = ["@group:rust"]
@@ -590,13 +590,9 @@ dir = "js"
 # The server is built and tested inside one lease, so collection cannot remove the binary
 # in between. SPARKLES_CLIENT_TEST_SERVER_BIN defaults to the server cargo just built,
 # under CARGO_TARGET_DIR when one is set.
-run = """
-mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
-mbx build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles
-SPARKLES_CLIENT_TEST_SERVER_BIN="${SPARKLES_CLIENT_TEST_SERVER_BIN:-${CARGO_TARGET_DIR:-{{config_root}}/target}/debug/sparkles}" \\
-  node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs
-SPARKLES_TASK
-"""
+run = '''
+mbx sparkles-task -- bash -ec 'mbx build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles && SPARKLES_CLIENT_TEST_SERVER_BIN="${SPARKLES_CLIENT_TEST_SERVER_BIN:-${CARGO_TARGET_DIR:-{{config_root}}/target}/debug/sparkles}" exec node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs "$@"' node-test
+'''
 
 [tasks."node:lint"]
 sources = ["@group:rust"]

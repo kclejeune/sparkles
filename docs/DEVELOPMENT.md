@@ -98,9 +98,9 @@ less free space than `gc.min_free_size`. The only protection is the target's lea
 each `mbx` command holds from its start until it exits. Two `mbx` commands in a row
 therefore leave a gap in which a background collection can remove everything the first
 one built, such as `target/release/libsparkles_ffi.so` or `target/jvm/uniffi`. The next
-command then starts from an empty target. `scripts/ci.sh` closes the gap by running
-itself under `mbx sparkles-task`, so one lease covers the prepare step and every check
-until the run ends. This holds however the script is started, including the batch gate
+command then starts from an empty target. `scripts/ci.sh` closes the gap by starting
+`mbx sparkles-task` around a command that waits for the script to end, so one lease
+covers the prepare step and every check until the run ends, however the run stops. This holds however the script is started, including the batch gate
 on a build host. Tasks that consume a build also make it inside their own lease.
 `jvm:test`, `jvm:build` and `jvm:sample` run `scripts/jvm-native.sh` first, `node:test`
 and `ui:e2e` build the server, and the benchmark and screenshot tasks build the release
@@ -504,8 +504,10 @@ UniFFI version. `mise run jvm:lock` refreshes the lock from the root one.
 
 `mise run jvm:native` (`scripts/jvm-native.sh`) builds the library in release mode in the
 root `target` directory and writes its generated Kotlin to `target/jvm/uniffi`.
-`jvm:build`, `jvm:test` and `jvm:sample` run the same script first, inside the
-target lease that Gradle then runs in. `JVM_PROFILE=dev` builds it without optimizations. The Gradle build in `jvm/` runs through
+`jvm:build`, `jvm:test` and `jvm:sample` run Gradle through `scripts/jvm-gradle.sh`, which
+runs the same script first inside the target lease that Gradle then runs in. It holds a
+checkout lock from that build until Gradle exits, so two JVM tasks at once do not
+regenerate the bindings while the other's Gradle reads them. `JVM_PROFILE=dev` builds it without optimizations. The Gradle build in `jvm/` runs through
 its checked-in wrapper and reads both paths, which the Gradle properties
 `sparkles.nativeLib` and `sparkles.bindings` can change. It compiles the generated code
 on its own, puts the library into the jar under

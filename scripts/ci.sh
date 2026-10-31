@@ -34,17 +34,6 @@ set -euo pipefail
 main() {
   cd "$(dirname "$0")/.."
 
-  # The run holds one lease on the checkout's managed target from here to its end. Boxington
-  # collects a whole target whose lease nobody holds, for its size budget or a short disk,
-  # and every task is a separate mbx command. Without this lease, a collection between two
-  # tasks removes what the earlier ones built, such as the JVM library that prepare built
-  # for jvm:test. `mbx sparkles-task` (scripts/cargo-sparkles-task) runs this script again
-  # under the lease, and SPARKLES_CI_LEASED tells that second run it holds it.
-  if [ -z "${SPARKLES_CI_LEASED:-}" ]; then
-    export SPARKLES_CI_LEASED=1
-    PATH="$PWD/scripts:$PATH" exec mbx sparkles-task -- "$BASH" "$PWD/scripts/ci.sh" "$@"
-  fi
-
   full=(
     fmt:check ui:fmt:check node:fmt:check lint:shell lint:doc-paths api:check test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
@@ -83,6 +72,27 @@ main() {
         tasks+=("$feature_task")
       fi
     done
+  fi
+
+  # The run holds one lease on the checkout's managed target from here to its end. Boxington
+  # collects a whole target whose lease nobody holds, for its size budget or a short disk,
+  # and every task is a separate mbx command. Without this lease, a collection between two
+  # tasks removes what the earlier ones built, such as the JVM library that prepare built
+  # for jvm:test. The holder is `mbx sparkles-task` (scripts/cargo-sparkles-task) around a
+  # command that reports once mbx holds the lease and then waits for this script to close
+  # its input, which happens however the script ends. SPARKLES_CI_LEASED tells a nested
+  # run, such as a test of this script, that an outer command holds the lease.
+  if [ -z "${SPARKLES_CI_LEASED:-}" ]; then
+    coproc lease {
+      PATH="$PWD/scripts:$PATH" exec mbx sparkles-task -- bash -c 'echo leased && exec cat > /dev/null'
+    }
+    ready=
+    read -r ready <&"${lease[0]}" || true
+    if [ "$ready" != leased ]; then
+      echo "could not take the lease on the managed target (mbx sparkles-task)" >&2
+      exit 1
+    fi
+    export SPARKLES_CI_LEASED=1
   fi
 
   out=.artifacts/ci
