@@ -1460,4 +1460,72 @@ mod callback_management {
             .unwrap();
         assert!(!cat.is_expected("later"));
     }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn a_reserved_replacement_from_a_close_callback_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        cat.create("target", &Default::default()).unwrap();
+        let ds = cat.create("source", &Default::default()).unwrap();
+        let staged = dir.path().join("databases").join(".restore-target-1");
+        drop(Store::open(&staged, Default::default()).unwrap());
+        let reservation = take_once(
+            cat.reserve("target", ReservationKind::Restore, "1")
+                .unwrap(),
+        );
+        let seen = Seen::default();
+        let s = seen.clone();
+        let path = staged.clone();
+        install(&ds, &cat, move |c| {
+            let r = reservation().expect("one close");
+            let started = std::time::Instant::now();
+            *s.lock() = Some(c.replace_restored_reserved(r, &path, "1", false).map(drop));
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the refusal waited"
+            );
+        });
+        drop(ds);
+        let worker = cat.clone();
+        assert!(bounded(move || worker.delete("source")).unwrap());
+        assert_disposing(&seen);
+        assert!(
+            staged.join("CURRENT").exists(),
+            "the staging directory stays"
+        );
+        assert!(cat.get("target").is_some());
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn a_reserved_replacement_releases_its_reservation_before_deferred_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("target", &Default::default()).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let s = seen.clone();
+        install(&ds, &cat, move |c| {
+            let s = s.clone();
+            c.defer(move |c| {
+                *s.lock() = Some(c.reserve("target", ReservationKind::Restore, "2").map(drop));
+            });
+        });
+        drop(ds);
+        let staged = dir.path().join("databases").join(".restore-target-1");
+        drop(Store::open(&staged, Default::default()).unwrap());
+        let r = cat
+            .reserve("target", ReservationKind::Restore, "1")
+            .unwrap();
+        let worker = cat.clone();
+        bounded(move || {
+            worker
+                .replace_restored_reserved(r, &staged, "1", false)
+                .map(drop)
+        })
+        .unwrap();
+        let reserved = seen.lock().take().expect("the deferred reservation ran");
+        assert!(reserved.is_ok(), "{reserved:?}");
+        assert!(cat.reserved_by("target").is_none());
+    }
 }

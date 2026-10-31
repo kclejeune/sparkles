@@ -50,6 +50,7 @@ pub fn publish_new(
 
 /// Replace the registered persistent dataset `name` with `restored` (see the module
 /// docs). `task` names the `.replaced-` directory; `keep_replaced` keeps it.
+#[cfg(test)]
 pub fn replace_in_place(
     st: &Catalog,
     name: &str,
@@ -99,7 +100,30 @@ fn close_hook(stage: CloseStage, attempt: u32) {
     });
 }
 
-/// [`replace_in_place`] with its drain time.
+/// Replace the registered persistent dataset of `reservation` with `restored` (see
+/// the module docs), under that restore reservation. The swap owns the reservation
+/// and releases it before the operations that close callbacks deferred run.
+pub(crate) fn replace_reserved(
+    st: &Catalog,
+    reservation: Reservation,
+    restored: &Path,
+    task: &str,
+    keep_replaced: bool,
+) -> Result<Dataset, BackupError> {
+    let name = reservation.name().to_string();
+    swap(
+        st,
+        &name,
+        restored,
+        task,
+        keep_replaced,
+        DRAIN,
+        Some(reservation),
+    )
+}
+
+/// [`replace_in_place`] with its drain time, without a reservation of its own.
+#[cfg(test)]
 pub(crate) fn replace_with(
     st: &Catalog,
     name: &str,
@@ -108,15 +132,30 @@ pub(crate) fn replace_with(
     keep_replaced: bool,
     drain: Duration,
 ) -> Result<Dataset, BackupError> {
+    swap(st, name, restored, task, keep_replaced, drain, None)
+}
+
+fn swap(
+    st: &Catalog,
+    name: &str,
+    restored: &Path,
+    task: &str,
+    keep_replaced: bool,
+    drain: Duration,
+    reservation: Option<Reservation>,
+) -> Result<Dataset, BackupError> {
     let _span = tracing::info_span!(
         "restore.swap",
         "db.namespace" = name,
         "sparkles.task" = task
     )
     .entered();
-    // Operations that close callbacks defer run once the whole swap returns.
+    // Operations that close callbacks defer run once the whole swap returns, after
+    // the reservation below is released, because it is declared after the scope.
     let _batch = st.batch_scope();
-    let _restoring = if st.restoring_by(name).as_deref() == Some(task) {
+    let _restoring = if reservation.is_some() {
+        reservation
+    } else if st.restoring_by(name).as_deref() == Some(task) {
         None
     } else {
         Some(
