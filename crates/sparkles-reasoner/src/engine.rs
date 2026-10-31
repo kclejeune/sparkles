@@ -1570,58 +1570,93 @@ type Done = (usize, Vec<Triple>, Held, Option<anyhow::Error>);
 /// new facts. A rule with an atom of a variable predicate, or with a builtin that reads
 /// facts outside its atoms, is planned in every iteration, as it is without the index.
 pub(crate) struct RuleIndex {
-    by_pred: FxHashMap<u64, Vec<usize>>,
+    /// each constant predicate of an atom with a rule that has the atom, sorted
+    pairs: Vec<(u64, usize)>,
     always: Vec<usize>,
     /// the atoms of every rule, which a full scan reads
     atoms: usize,
+    /// the charge of `pairs` and `always`
+    _held: Held,
 }
 
 impl RuleIndex {
-    pub(crate) fn new(rules: &[CRule]) -> RuleIndex {
-        let mut by_pred: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-        let mut always = Vec::new();
-        for (ri, r) in rules.iter().enumerate() {
-            if r.atoms.iter().any(|a| !matches!(a.p, Slot::Const(_)))
+    /// The index of `rules`, charged to `budget` before it is allocated.
+    pub(crate) fn new(rules: &[CRule], budget: &Arc<Budget>) -> Result<RuleIndex, MemoryExceeded> {
+        let always_rule = |r: &CRule| {
+            r.atoms.iter().any(|a| !matches!(a.p, Slot::Const(_)))
                 || implicit_fact_reads(r).next().is_some()
-            {
+        };
+        let (mut n_always, mut n_pairs) = (0usize, 0usize);
+        for r in rules {
+            if always_rule(r) {
+                n_always += 1;
+            } else {
+                n_pairs += r.atoms.len();
+            }
+        }
+        let held = Held::try_new(
+            budget,
+            n_pairs
+                .saturating_mul(size_of::<(u64, usize)>())
+                .saturating_add(n_always.saturating_mul(size_of::<usize>())),
+        )?;
+        let mut pairs = Vec::with_capacity(n_pairs);
+        let mut always = Vec::with_capacity(n_always);
+        for (ri, r) in rules.iter().enumerate() {
+            if always_rule(r) {
                 always.push(ri);
                 continue;
             }
             for a in &r.atoms {
                 if let Slot::Const(p) = a.p {
-                    let rules = by_pred.entry(p).or_default();
-                    if rules.last() != Some(&ri) {
-                        rules.push(ri);
-                    }
+                    pairs.push((p, ri));
                 }
             }
         }
+        pairs.sort_unstable();
+        pairs.dedup();
         let atoms = rules.iter().map(|r| r.atoms.len()).sum();
-        RuleIndex {
-            by_pred,
+        Ok(RuleIndex {
+            pairs,
             always,
             atoms,
-        }
+            _held: held,
+        })
+    }
+
+    /// The rules with an atom of predicate `p`.
+    fn rules_of(&self, p: u64) -> &[(u64, usize)] {
+        let lo = self.pairs.partition_point(|&(q, _)| q < p);
+        let hi = self.pairs.partition_point(|&(q, _)| q <= p);
+        &self.pairs[lo..hi]
     }
 
     /// The rules, in order, that an iteration over the new rows from `ds` on may plan:
-    /// those with an atom whose predicate one of the rows has. `None` when every rule
-    /// is to be planned: when the rows include the base tier, whose predicates are not
-    /// listed, or when the graph has more predicates than the program has atoms, so that
-    /// a scan of the rules costs less than a scan of the predicates.
-    pub(crate) fn candidates(&self, g: &Graph, ds: u32) -> Option<Vec<usize>> {
+    /// those with an atom whose predicate one of the rows has, with the charge of the
+    /// list. `None` when every rule is to be planned: when the rows include the base
+    /// tier, whose predicates are not listed, or when the graph has more predicates than
+    /// the program has atoms, so that a scan of the rules costs less than a scan of the
+    /// predicates.
+    pub(crate) fn candidates(
+        &self,
+        g: &Graph,
+        ds: u32,
+        budget: &Arc<Budget>,
+    ) -> Result<Option<(Vec<usize>, Held)>, MemoryExceeded> {
         if ds < g.offset() || g.predicate_count() > self.atoms {
-            return None;
+            return Ok(None);
         }
-        let mut out = self.always.clone();
+        let mut n = self.always.len();
+        g.predicates_since(ds, |p| n += self.rules_of(p).len());
+        let held = Held::try_new(budget, n.saturating_mul(size_of::<usize>()))?;
+        let mut out = Vec::with_capacity(n);
+        out.extend_from_slice(&self.always);
         g.predicates_since(ds, |p| {
-            if let Some(rules) = self.by_pred.get(&p) {
-                out.extend_from_slice(rules);
-            }
+            out.extend(self.rules_of(p).iter().map(|&(_, ri)| ri))
         });
         out.sort_unstable();
         out.dedup();
-        Some(out)
+        Ok(Some((out, held)))
     }
 }
 
@@ -1737,12 +1772,12 @@ pub(crate) fn run_observed(
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
     };
-    let index = RuleIndex::new(rules);
     let mut iteration = 0usize;
     let (mut ds, mut de) = (start.unwrap_or(0).min(base_len), base_len);
     let memory = |e: MemoryExceeded, iteration: usize| -> anyhow::Error {
         anyhow::Error::new(e.with_context(format!(" (in iteration {})", iteration + 1)))
     };
+    let index = RuleIndex::new(rules, &limits.budget).map_err(|e| memory(e, 0))?;
     loop {
         terms.analysis_round(iteration);
         if cancelled() {
@@ -1770,8 +1805,21 @@ pub(crate) fn run_observed(
         // ---- plans for this iteration
         let t_iter = std::time::Instant::now();
         let naive = iteration == 0 && start.is_none();
-        let candidates = if naive { None } else { index.candidates(g, ds) };
-        let tasks = plan_iteration(g, rules, naive, ds, de, candidates.as_deref());
+        let candidates = if naive {
+            None
+        } else {
+            index
+                .candidates(g, ds, &limits.budget)
+                .map_err(|e| memory(e, iteration))?
+        };
+        let tasks = plan_iteration(
+            g,
+            rules,
+            naive,
+            ds,
+            de,
+            candidates.as_ref().map(|(c, _)| c.as_slice()),
+        );
         for (ri, p) in &tasks {
             let (s, o) = index_needs(&rules[*ri], p);
             if s {
@@ -2217,7 +2265,8 @@ mod index_tests {
         for seed in 1..=300u64 {
             let mut r = Rng(seed * 7_919 + 1);
             let rules: Vec<CRule> = (0..1 + r.below(40)).map(|_| rule(&mut r)).collect();
-            let index = RuleIndex::new(&rules);
+            let budget = Budget::unlimited();
+            let index = RuleIndex::new(&rules, &budget).unwrap();
             let mut g = Graph::default();
             let n = r.below(200);
             g.add_batch((0..n).map(|_| [1 + r.below(8), 100 + r.below(12), 1 + r.below(8)]));
@@ -2228,12 +2277,21 @@ mod index_tests {
                 let candidates = if naive {
                     None
                 } else {
-                    index.candidates(&g, ds)
+                    index.candidates(&g, ds, &budget).unwrap()
                 };
-                let indexed = plan_iteration(&g, &rules, naive, ds, de, candidates.as_deref());
+                let indexed = plan_iteration(
+                    &g,
+                    &rules,
+                    naive,
+                    ds,
+                    de,
+                    candidates.as_ref().map(|(c, _)| c.as_slice()),
+                );
                 let every = plan_iteration(&g, &rules, naive, ds, de, None);
                 planned += every.len();
-                skipped += candidates.as_ref().map_or(0, |c| rules.len() - c.len());
+                skipped += candidates
+                    .as_ref()
+                    .map_or(0, |(c, _)| rules.len() - c.len());
                 assert_eq!(
                     format!("{indexed:?}"),
                     format!("{every:?}"),
@@ -2243,5 +2301,32 @@ mod index_tests {
         }
         // the cases plan tasks, and the index leaves rules out
         assert!(planned > 1_000 && skipped > 1_000, "{planned} {skipped}");
+    }
+
+    /// The index and each iteration's list of rules are charged to the run's budget
+    /// while they are held, and refused when they do not fit.
+    #[test]
+    fn rule_index_and_candidates_are_charged() {
+        let mut r = Rng(17);
+        let rules: Vec<CRule> = (0..400).map(|_| rule(&mut r)).collect();
+        let tight = Budget::new(Some(64));
+        assert!(RuleIndex::new(&rules, &tight).is_err());
+        let budget = Budget::unlimited();
+        let index = RuleIndex::new(&rules, &budget).unwrap();
+        let after_index = budget.used();
+        assert!(after_index > 0);
+        let mut g = Graph::default();
+        g.add_batch((0..20).map(|i| [1, 100 + i % 12, 2]));
+        let (list, held) = index.candidates(&g, 0, &budget).unwrap().unwrap();
+        assert!(!list.is_empty());
+        assert!(budget.used() > after_index);
+        drop((list, held));
+        assert_eq!(budget.used(), after_index);
+        drop(index);
+        assert_eq!(budget.used(), 0);
+        let small = Budget::new(Some(1 << 20));
+        let index = RuleIndex::new(&rules, &small).unwrap();
+        let _rest = Held::try_new(&small, small.available()).unwrap();
+        assert!(index.candidates(&g, 0, &small).is_err());
     }
 }
