@@ -533,6 +533,12 @@ datasets' setting alone, once when it opens the databases and every ten minutes 
 that. `--no-scratch-expiry` turns it off for a session. A stdio session without the
 setting behaves as before.
 
+On `serve`, idle scratch-branch expiry now needs `--mcp-allow-update`. Before, `--mcp
+--mcp-scratch-branch-ttl DURATION` deleted idle scratch branches without it. Operators
+who run that combination no longer get expiry, and must also pass `--mcp-allow-update` to
+keep it. The same applies to a dataset's `memory.scratchBranches.ttl`. A server without
+`--mcp-allow-update` never deletes a scratch branch, and one with `--read-only` never did.
+
 ### Behavior
 
 `sparkles ask` decides whether a draft calls SERVICE from the parsed query, including
