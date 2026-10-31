@@ -973,6 +973,21 @@ pub(crate) fn spawn_expiry(st: Arc<AppState>, default: impl Into<Option<Duration
     spawn_expiry_with(st, default, Cadence::Adaptive, Arc::new(now_ms), None);
 }
 
+/// Start the expiry of a `serve --mcp` server. It deletes branches, so it runs only on a
+/// writable server whose MCP endpoint is on and allows updates (`--mcp-allow-update`),
+/// whether the duration comes from the flag or from a dataset's setting. Returns
+/// whether it started.
+pub(crate) fn spawn_server_expiry(st: &Arc<AppState>) -> bool {
+    let Some(m) = &st.mcp else {
+        return false;
+    };
+    if st.read_only || !m.cfg.allow_update {
+        return false;
+    }
+    spawn_expiry(st.clone(), m.cfg.scratch_ttl);
+    true
+}
+
 /// [`spawn_expiry`] with a cadence and a clock. After each pass the deleted branches go
 /// to `passes`, if given.
 pub(crate) fn spawn_expiry_with(

@@ -205,3 +205,47 @@ async fn server_passes_read_settings_of_datasets_created_later() {
     }
     handle.abort();
 }
+
+/// The server's sweeper deletes branches, so it starts only when the operator allowed
+/// MCP updates, whether the duration comes from the flag or from a dataset setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_sweeper_needs_mcp_update_permission() {
+    let conf = |allow_update: bool, scratch_ttl: Option<Duration>| {
+        Arc::new(crate::mcp::http::HttpConf {
+            cfg: crate::mcp::McpConfig {
+                allow_update,
+                scratch_ttl,
+                ..Default::default()
+            },
+            max_sessions: 0,
+            shutdown: Default::default(),
+            require_auth: false,
+        })
+    };
+    let hour = Some(Duration::from_secs(3600));
+    for (allow, ttl, read_only, starts) in [
+        (false, None, false, false),
+        (false, hour, false, false),
+        (true, hour, true, false),
+        (true, None, false, true),
+        (true, hour, false, true),
+    ] {
+        let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
+        st.read_only = read_only;
+        st.mcp = Some(conf(allow, ttl));
+        // a dataset with its own duration, so a started sweeper has work to do
+        let st = Arc::new(st);
+        dataset_with_scratch(&st, "d", Some("1h"));
+        assert_eq!(
+            branches::spawn_server_expiry(&st),
+            starts,
+            "allow_update {allow}, flag {ttl:?}, read_only {read_only}"
+        );
+    }
+    // without the endpoint nothing starts either
+    let st = Arc::new(AppState::standalone(
+        Default::default(),
+        Duration::from_secs(30),
+    ));
+    assert!(!branches::spawn_server_expiry(&st));
+}
