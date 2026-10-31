@@ -294,7 +294,13 @@ fetch() {
   for f in progress.log mempeak.log env.txt mempeak.final; do
     [ -f "$conf/$f" ] && cp -a "$conf/$f" "$tmp/${f%.*}-conf.${f##*.}"
   done
-  [ -f "$tmp/steps.txt" ] && mv "$tmp/steps.txt" "$tmp/steps-ci.txt"
+  # After an earlier merge was partly copied back, steps.txt on the primary is that merge
+  # and steps-ci.txt keeps the ci half's own steps.
+  if [ -f "$tmp/steps-ci.txt" ]; then
+    rm -f "$tmp/steps.txt"
+  elif [ -f "$tmp/steps.txt" ]; then
+    mv "$tmp/steps.txt" "$tmp/steps-ci.txt"
+  fi
   cat "$tmp/steps-ci.txt" "$conf/steps.txt" > "$tmp/steps.txt" 2> /dev/null || true
   {
     echo "split: ci on $primary (gate-$name), conformance on $helper (gate-$hname)"
@@ -316,7 +322,8 @@ fetch() {
       echo "could not recheck the exit files; not merging yet" >&2
       return 97
     fi
-    if [ "$pe" = yes ] || [ "$he" = yes ]; then
+    # Retry only when a file missing from the snapshot has appeared since.
+    if { [ "$pe" = yes ] && [ ! -f "$tmp/part.exit" ]; } || { [ "$he" = yes ] && [ ! -f "$conf/part.exit" ]; }; then
       rm -rf "$tmp"
       fetch
       return
