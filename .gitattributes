@@ -4,3 +4,6 @@
 
 # Generated dependency notices preserve upstream license whitespace verbatim.
 /THIRD_PARTY_LICENSES.md whitespace=-blank-at-eol
+
+# The vendored CSVW test suite keeps its line endings, which some tests check.
+/testsuite/csvw/** -text

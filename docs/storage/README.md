@@ -75,7 +75,8 @@ These read paths are tuned for queries over data that is not yet in memory
   metadata, or with Tarql-style CONSTRUCT templates that the SPARQL engine runs in
   batches. CSVW covers datatypes and formats, null values, defaults, lists, virtual
   columns and RFC 6570 URI templates. Tables stream, compressed or not, and an invalid
-  cell stops the load and names its row and column.
+  cell stops the load and names its row and column. The 270 RDF tests of the W3C CSVW
+  test suite pass in minimal and standard mode.
 * CSVW's standard mode adds the table group, table and row descriptions, and primary and
   foreign keys are checked across the tables of a load in the order their references
   need. A CONSTRUCT template can call Tarql's `tarql:expandPrefix` and

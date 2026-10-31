@@ -320,6 +320,12 @@ pub fn encode_name(s: &str) -> String {
     out
 }
 
+/// The column name of a title by CSVW's rules: the characters that RFC 6570 does not
+/// allow in a variable name are percent-encoded, the hyphen and the tilde included.
+pub fn encode_variable_name(s: &str) -> String {
+    encode_name(s).replace('-', "%2D").replace('~', "%7E")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

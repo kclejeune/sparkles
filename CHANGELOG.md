@@ -556,6 +556,18 @@ SQLite database. The `rml:UnsafeIRI` term type now inserts template values witho
 percent-encoding and fails the run when the result is not a valid IRI. All RML-Core test
 cases except RMLTC0027b pass, whose expected output holds IRIs with spaces.
 
+The W3C CSVW test suite is vendored under `testsuite/csvw` and run by
+`mise run test:csvw`. All 270 RDF tests pass in minimal and standard mode. To get there
+the converter checks UAX 35 number patterns, date, time and `dateTime` bounds, binary
+lengths in octets and the consistency of datatype and metadata properties, and it
+converts common properties that are JSON-LD node objects or value objects to RDF, where
+it failed before. It adds `rowTitles`, schema references given as URLs, foreign keys that
+reference their own table and `_col.N` names for columns the metadata does not describe.
+Library users can set `tabular::Options.lenient` with `csvw::parse_with` to follow
+CSVW's processing rules, which warn about a problem and use the default and keep a cell
+that fails its datatype as a plain string. The default stays strict, and the command
+line and uploads do not expose the mode.
+
 ### Fixed
 
 A delete or rename of a dataset waits up to two seconds for the requests and workers

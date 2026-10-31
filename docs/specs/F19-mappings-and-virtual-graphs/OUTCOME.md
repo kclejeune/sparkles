@@ -71,12 +71,24 @@ roadmap item 43.
   `--lookup` and `--max-json-mb`. `sparkles csv convert` takes the CSVW options and
   leaves engine mappings to `sparkles map run`.
 * **CSVW.** `tabular::Options.standard` adds the table group, table and row
-  descriptions of §6.1, and the metadata's notes and common properties as JSON-LD
-  values. `tabular::KeyRegistry` keeps the primary and foreign key values of a load
+  descriptions of §6.1, and the metadata's notes and common properties as RDF, where a
+  node object becomes a blank node and a value object keeps its datatype or language. `tabular::KeyRegistry` keeps the primary and foreign key values of a load
   within its budget, and `tabular::key_order` orders the tables by their foreign keys,
   so each referencing table is checked in one pass after the tables it references. A
   cycle of foreign keys or a reference to a table the load lacks fails before anything
-  is read.
+  is read. `tabular::Options.lenient` and `tabular::csvw::parse_with` apply CSVW's
+  processing rules, where a property or cell that does not conform produces a warning and
+  takes its default and a cell that does not match its datatype stays a plain string. The
+  default stays strict. The converter also checks UAX 35 number patterns, date, time and
+  `dateTime` bounds, binary lengths in octets and `rowTitles`, reads a `tableSchema` or
+  schema reference given as a URL, and lets a table's foreign key reference the table
+  itself.
+* **CSVW conformance.** `testsuite/csvw/` holds the 270 RDF tests of the W3C CSVW test
+  suite at commit b3f461db0e86a68c019bc1f912e86f3555907e34, and
+  `crates/sparkles-core/tests/csvw_conformance.rs` runs them in minimal and standard
+  mode with `mise run test:csvw`. All 270 pass, which include 136 tests that expect warnings and 58 negative tests.
+  The harness locates metadata by the suite's rules and reads it leniently. The suite
+  needs no excluded test.
 * **Templates.** `tarql:expandPrefix` and `tarql:expandPrefixedName` resolve prefixes
   of the template, then those of the dataset. A file may hold several CONSTRUCT
   queries, and each runs for every batch. `apf:strSplit` is tested in a template. A
@@ -191,7 +203,9 @@ Tests and conformance:
   exact phases for cancellation and deadline checks. The native tests retain
   preconditions, graph authority, previews, commit messages, old exhaustive option
   literals and successful receipts after publication.
-* The W3C CSVW test suite is not vendored, which is roadmap item 235.
+* The CSVW processing rules for a problem in the metadata or in a cell are available to
+  the library only. The `sparkles csv`, `sparkles load` and upload entry points read
+  metadata and cells strictly, which is roadmap item NEW-ITEM-1.
 
 Measurements:
 

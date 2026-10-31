@@ -99,7 +99,7 @@ Wave A holds the work that most improves the engine against objective measures.
   internal circuits, the provenance algebra, reasoner witnesses and the fixed-point
   operator.
 * Small lanes that finish a capability run in free capacity. These are items 277 and
-  77, and the CSVW conformance gaps in item 235.
+  77.
 
 ### Wave B: memory and entities
 
@@ -263,7 +263,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F16](specs/F16-materialization-at-scale.md#outcome) | 9, 113 | Deliver the separate derived layer, canonical equality representatives and the remaining barrier-free and incremental-equality execution. Re-run the scale, differential, datatype and kept-closure memory gates, and settle the named small-change costs with matched measurements. |
 | [F17](specs/F17-query-time-reasoning.md#outcome) | 19, 190, 192, 193 | Finish automatic cost selection, hybrid rules, OWL 2 QL, settings and client surfaces, then F13-maintained tables and provenance. Close Phase 1's cache accounting, DESCRIBE and per-query costs with demand/materialization equivalence tests. |
 | [F18](specs/F18-explanations-and-entailment-diffs.md#outcome) | 18, 285, 286 | Add F13-backed supported visibility and reviewed-only derivations, result-cell actions and the explicitly extended unbound why-not contract. Compare filtered answers with fresh derivation after support withdrawal and policy changes, including multiple supports and truncated witnesses. |
-| [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | 43, 230, 233, 234, 235, 236, 237, 238, 239, 404 | Finish the named source, UI/task, conformance, function and term-identity gaps before claiming Phase 1 complete. Phase 2 virtual graphs must match materialized SPARQL answers with pushdown, access, cancellation and source-failure behavior tested. |
+| [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | 43, 230, 233, 234, 236, 237, 238, 239, 404, NEW-ITEM-1 | Finish the named source, UI/task, conformance, function and term-identity gaps before claiming Phase 1 complete. Phase 2 virtual graphs must match materialized SPARQL answers with pushdown, access, cancellation and source-failure behavior tested. |
 | [G01](specs/G01-geosparql/SPEC.md#outcome) | 24 | Complete per-row nearest-neighbour joins, QLever's spatial syntax, metric-property rewrites, polygon approximations, datum shifts and curved GML segments as item 24 lists them. Keep intentional default divergences explicit, since item 70's Jena-compatible mode is not adopted. |
 | [G02](specs/G02-shex/SPEC.md#outcome) | 54 | Complete combined guards, graph-plus-file schemas and CLI outbound controls with the adopted ShEx conformance and incremental/full equivalence tests. Unsupported reference syntax remains a stated language boundary rather than a claim of universal ShEx parity. |
 | [P01](specs/P01-python-bindings.md#outcome) | 32, 33, 40, 58 | Complete release/platform and further async administration and bulk coverage, reusable plans and the remaining bounded per-call and footprint assessment. Validate package installation and the Python API suite on the claimed runtimes while preserving cancellation, term identity and snapshots. |
@@ -554,7 +554,7 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 230 | **PostgreSQL and DuckDB sources for mappings.** The `postgres` and `duckdb` connection kinds of F19 §4.4 with secret references, the outbound policy for PostgreSQL hosts, the R2RML test cases on PostgreSQL in CI, and acceptance examples A1 and A10. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | M |
 | 233 | **A Mappings page in the web UI** that lists stored mappings, edits them, runs them with a dry run first and shows the last run. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#8-stored-mappings) | M |
 | 234 | **Stored mapping runs as tasks.** Runs longer than 10 seconds become tasks of `/$/tasks` with progress and cancellation, as F19 §2.2 describes. A run is one request. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | S–M |
-| 235 | **The W3C CSVW test suite,** vendored as test data for the RDF tests in minimal and standard mode. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#131-conformance-and-equivalence) | S–M |
+| NEW-ITEM-1 | **CSVW processing rules at the command line and over HTTP.** The library reads metadata and cells leniently with `Options.lenient` and `csvw::parse_with`, warning and using the default as CSVW specifies. `sparkles csv`, `sparkles load` and uploads still read strictly. A `--csvw-errors warn` option and a `csvwErrors` upload parameter would expose the mode and report its warnings. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#131-conformance-and-equivalence) | S |
 | 236 | **The remaining SPARQL functions in function maps,** such as the date, numeric and term functions, as `urn:x-sparkles:fn:` functions. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | S |
 | 237 | **Parquet sources in object stores** (`s3`, `gcs`, `azure`) through `object_store`, as F19 §4.4 lists. Parquet files are read from the local disk. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | M |
 | 238 | **Template lookups that keep the dataset's blank nodes.** A lookup that binds an existing blank node writes a new one, because the loader scopes blank node labels per file. | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | S–M |
@@ -613,6 +613,7 @@ linked spec Outcome records how they landed.
 - **22.** RML, R2RML and YARRRML loading. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) Phase 1
 - **231.** JVM and Node.js stored mappings and direct mapping runs. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
 - **232.** RML join conditions written as expression maps and `rml:UnsafeIRI` templates. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
+- **235.** The W3C CSVW test suite, vendored and passing in minimal and standard mode. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
 - **48.** Formatter and linter. [G03](specs/G03-shaclc.md#linter-extensions-item-48-part-b), [X02](specs/X02-formatter/OUTCOME.md#roadmap-follow-ups-2026-10-12), [X04](specs/X04-linter.md#linter-extensions-item-48-part-b)
 - **64.** Bind-before-open startup with opening, failed and degraded states. [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12)
 - **62.** Dataset and branch administration audit events. [C09](specs/C09-dataset-access-control.md#dataset-administration-audit)
