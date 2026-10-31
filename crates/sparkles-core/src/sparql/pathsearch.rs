@@ -68,6 +68,9 @@ const STEP_BYTES: u64 = 24;
 /// `u64` key and a `u32` rank padded to 16 bytes, with the table's control byte and
 /// room to grow.
 const RANK_BYTES: u64 = 32;
+/// The ratio of the largest to the smallest positive weight up to which the search for
+/// every cheapest path from both ends adds costs exactly.
+const WIDE_WEIGHTS: f64 = (1u64 << 28) as f64;
 /// Estimated bytes per node whose degree `path:maxDegree` checked (a map entry).
 const HUB_BYTES: u64 = 16;
 
@@ -2449,8 +2452,9 @@ impl<'a> Engine<'a> {
         &self,
         s: u64,
         t: u64,
+        all: bool,
         emit: &mut dyn FnMut(Vec<Edge>) -> Result<bool>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let cycle = s == t;
         let tt = if cycle { VIRT } else { t };
         let real = |x: u64| if x == VIRT { s } else { x };
@@ -2474,6 +2478,8 @@ impl<'a> Engine<'a> {
         let mut n = 0u64;
         // the least cost in each queue, infinite when it is empty
         let mut tops = [Cost::INFINITE; 2];
+        // the smallest and largest positive weights relaxed
+        let (mut wmin, mut wmax) = (f64::INFINITY, 0.0f64);
         loop {
             for i in 0..2 {
                 while let Some(&Reverse((_, u))) = heaps[i].peek() {
@@ -2544,7 +2550,12 @@ impl<'a> Engine<'a> {
                         rev: st.rev,
                     }
                 };
-                let w = Cost::of(self.weight(&e.map(real))?);
+                let wv = self.weight(&e.map(real))?;
+                if wv > 0.0 {
+                    wmin = wmin.min(wv);
+                    wmax = wmax.max(wv);
+                }
+                let w = Cost::of(wv);
                 let nd = d.add(w);
                 let parent = Parent {
                     node: u,
@@ -2582,7 +2593,14 @@ impl<'a> Engine<'a> {
             }
         }
         if best.is_none() {
-            return Ok(());
+            return Ok(true);
+        }
+        // The sums are exact while the weights lie within 2^28 of each other, since a
+        // search visits fewer than 2^24 nodes by default and a double-double holds about
+        // 106 bits. Otherwise the two sides can round a path's cost apart, so the search
+        // from the source alone answers, which adds every cost in one order.
+        if wmax > wmin * WIDE_WEIGHTS {
+            return Ok(false);
         }
         // only settled nodes have final parents
         for i in 0..2 {
@@ -2601,22 +2619,29 @@ impl<'a> Engine<'a> {
             joins.push((e, dist[0][&e.from].add(w).add(dist[1][&e.to])));
         }
         drop(meets);
+        // a meeting with no join, or a cost past the largest double, leaves the answer
+        // to the search from the source alone
         let Some(mu) = joins.iter().map(|j| j.1).chain(at_end).min() else {
-            return Ok(());
+            return Ok(false);
         };
+        if mu.hi.is_infinite() {
+            return Ok(false);
+        }
         joins.retain(|j| j.1 == mu);
         joins.sort_unstable_by_key(|(e, _)| (e.from, e.to, e.p, e.rev));
+        // path:shortest follows first parents, which reach the root in linear time
         let prunes = [
-            self.prune(&trees[0], Some(&dist[0]), true)?,
-            self.prune(&trees[1], Some(&dist[1]), true)?,
+            self.prune(&trees[0], Some(&dist[0]), all)?,
+            self.prune(&trees[1], Some(&dist[1]), all)?,
         ];
+        let cap = |left: usize| if all { left } else { left.min(1) };
         let check = || self.ctx.check();
         let to_real = |p: Vec<Edge>| -> Vec<Edge> { p.into_iter().map(|e| e.map(real)).collect() };
         if at_end == Some(mu) {
             let left = self.left.get();
-            for p in trees[0].paths(tt, true, left, prunes[0].as_ref(), &check)? {
+            for p in trees[0].paths(tt, all, cap(left), prunes[0].as_ref(), &check)? {
                 if !emit(to_real(p))? {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -2627,9 +2652,9 @@ impl<'a> Engine<'a> {
             let u = joins[i].0.from;
             let left = self.left.get();
             if left == 0 {
-                return Ok(());
+                return Ok(true);
             }
-            let front = trees[0].paths(u, true, left, prunes[0].as_ref(), &check)?;
+            let front = trees[0].paths(u, all, cap(left), prunes[0].as_ref(), &check)?;
             while i < joins.len() && joins[i].0.from == u {
                 let e = joins[i].0;
                 i += 1;
@@ -2637,7 +2662,8 @@ impl<'a> Engine<'a> {
                 let halves = match back.get(&v) {
                     Some(h) => h.clone(),
                     None => {
-                        let mut h = trees[1].paths(v, true, left, prunes[1].as_ref(), &check)?;
+                        let mut h =
+                            trees[1].paths(v, all, cap(left), prunes[1].as_ref(), &check)?;
                         // a half that enters the forward region belongs to another split
                         h.retain(|p| p.iter().all(|x| !region(0, x.to)));
                         self.charge
@@ -2654,13 +2680,13 @@ impl<'a> Engine<'a> {
                         p.push(e);
                         p.extend_from_slice(z);
                         if !emit(to_real(p))? {
-                            return Ok(());
+                            return Ok(true);
                         }
                     }
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// The shortest path from `from` to `to` (forward) that avoids the banned nodes and
@@ -3105,7 +3131,8 @@ pub fn run(
                 // every cheapest path of one pair, and the cheapest cycles through the
                 // source: from both ends
                 let t0 = targets.set.first().copied();
-                if single && weighted && (all || t0 == Some(s)) {
+                let both_ends = single && weighted && (all || t0 == Some(s));
+                if both_ends {
                     let t = t0.unwrap();
                     eng.begin();
                     if spec.min_len == 0 && s == t {
@@ -3115,7 +3142,7 @@ pub fn run(
                         continue;
                     }
                     let mut stop = false;
-                    eng.dijkstra_pair_all(s, t, &mut |p| {
+                    let answered = eng.dijkstra_pair_all(s, t, all, &mut |p| {
                         let more = add(&mut found, s, t, p, None, true)?;
                         stop = !more;
                         // path:shortest keeps the first cheapest cycle
@@ -3124,10 +3151,14 @@ pub fn run(
                     if stop {
                         break 'sources;
                     }
-                    continue;
+                    if answered {
+                        continue;
+                    }
+                    // with weights too wide to add exactly, or past the largest double,
+                    // the search from the source alone answers, on the same visit budget
                 }
                 // one cheapest path between two different nodes: from both ends
-                if single && weighted {
+                if single && weighted && !both_ends {
                     let t = t0.unwrap();
                     eng.begin();
                     if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
@@ -3137,7 +3168,9 @@ pub fn run(
                     }
                     continue;
                 }
-                eng.begin();
+                if !both_ends {
+                    eng.begin();
+                }
                 let close = targets.any || tset.contains(&s);
                 let (tree, cost) = if weighted {
                     let (tree, cost) = eng.dijkstra(

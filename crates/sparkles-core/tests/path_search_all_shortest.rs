@@ -461,3 +461,73 @@ fn all_shortest_cycles_through_the_source() {
     let paths: BTreeSet<&String> = r.iter().map(|x| &x["path"]).collect();
     assert_eq!(paths.len(), 3, "{r:?}");
 }
+
+/// A chain of 32 diamonds of unit weights closed back to the source has 2^32 cheapest
+/// cycles through it. `path:shortest` returns one of them at once, since it follows first
+/// parents only, and `path:allShortest` with a limit stops after that many.
+#[test]
+fn one_cheapest_cycle_through_many_tied_ones() {
+    let mut ttl = String::new();
+    for i in 0..32 {
+        let (a, b) = (format!("ex:c{i}"), format!("ex:c{}", i + 1));
+        ttl += &format!(
+            "{a} ex:p ex:u{i} {{| ex:w 1 |}} . ex:u{i} ex:p {b} {{| ex:w 1 |}} . \
+             {a} ex:p ex:d{i} {{| ex:w 1 |}} . ex:d{i} ex:p {b} {{| ex:w 1 |}} . "
+        );
+    }
+    ttl += "ex:c32 ex:p ex:c0 {| ex:w 1 |} .";
+    let s = store_of(&ttl);
+    let opts = QueryOptions {
+        timeout: Some(std::time::Duration::from_secs(10)),
+        ..Default::default()
+    };
+    for (alg, n) in [("path:shortest", 1), ("path:allShortest ; path:limit 3", 3)] {
+        let r = query(
+            s.snapshot(),
+            &format!(
+                "{PREFIXES}SELECT ?path ?l ?c WHERE {{ SERVICE path:search {{ [] path:source ex:c0 ; \
+                 path:target ex:c0 ; path:weight ex:w ; path:algorithm {alg} ; \
+                 path:pathIndex ?path ; path:length ?l ; path:cost ?c }} }}"
+            ),
+            &opts,
+        )
+        .unwrap_or_else(|e| panic!("{alg}: {e}"));
+        assert_eq!(r.rows().len(), n, "{alg}");
+    }
+}
+
+/// Weights at the largest double make every cost of a path past the source's first edge
+/// infinite. The path is still found, by the search from the source alone.
+#[test]
+fn all_shortest_with_infinite_costs() {
+    let w = f64::MAX;
+    let s = store_of(&format!(
+        "ex:s ex:p ex:a {{| ex:w {w:e} |}} . ex:a ex:p ex:b {{| ex:w {w:e} |}} .
+         ex:b ex:p ex:c {{| ex:w {w:e} |}} . ex:c ex:p ex:t {{| ex:w {w:e} |}} ."
+    ));
+    let params = "path:source ex:s ; path:target ex:t ; path:weight ex:w ; \
+                  path:algorithm path:allShortest";
+    assert_eq!(
+        sequences(&s, params),
+        BTreeSet::from(["s a b c t".to_string()])
+    );
+}
+
+/// Weights 2^106 apart: double-double sums are no longer exact, so the two sides of a
+/// search from both ends could add the same total differently. `s a b c t` weighs 1, 2^106,
+/// 1 and 2^53, and `s d e f t` weighs 2^53, 1, 1 and 2^106, with a dead end `s z` of 1e300.
+/// Both paths are found, as the search from the source alone finds them.
+#[test]
+fn all_shortest_with_weights_too_wide_to_add_exactly() {
+    let (big, mid) = ("81129638414606681695789005144064e0", "9007199254740992e0");
+    let s = store_of(&format!(
+        "ex:s ex:p ex:a {{| ex:w 1 |}} . ex:a ex:p ex:b {{| ex:w {big} |}} .
+         ex:b ex:p ex:c {{| ex:w 1 |}} . ex:c ex:p ex:t {{| ex:w {mid} |}} .
+         ex:s ex:p ex:d {{| ex:w {mid} |}} . ex:d ex:p ex:e {{| ex:w 1 |}} .
+         ex:e ex:p ex:f {{| ex:w 1 |}} . ex:f ex:p ex:t {{| ex:w {big} |}} .
+         ex:s ex:p ex:z {{| ex:w 1e300 |}} ."
+    ));
+    let params = "path:source ex:s ; path:weight ex:w ; path:algorithm path:allShortest";
+    let want = BTreeSet::from(["s a b c t".to_string(), "s d e f t".to_string()]);
+    assert_eq!(sequences(&s, &format!("{params} ; path:target ex:t")), want);
+}
