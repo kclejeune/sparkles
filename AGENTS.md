@@ -196,7 +196,9 @@ agent raises.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
 batch. One full gate runs on the batch: `scripts/ci.sh`, the conformance suites and a
-Namespace screen (`mise run bench:nsc origin/main HEAD`). Push when the tests pass and the
+Namespace screen (`mise run bench:nsc origin/main HEAD`). `scripts/gate/gate.sh <rev>` runs
+the tests on wally and atlas, as the
+[batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Push when the tests pass and the
 screen shows no query 10% or more slower after a rerun of the flagged queries with more
 rounds.
 
