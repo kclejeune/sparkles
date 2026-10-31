@@ -154,6 +154,27 @@ pub struct WriteOptions {
     /// does not refuse it. A form's check of a session branch it has not created uses it
     /// (spec U02 §2.6). Without `dry_run` it does nothing.
     pub preview_as_new_branch: bool,
+    /// Run after the write is parsed, indexed and validated, right before it is
+    /// published, for a transaction and for a bulk rebuild. An `Err` abandons the write,
+    /// and nothing is published. The Python bindings use it to run the main thread's
+    /// signal handlers before a load from a file object commits.
+    pub before_publish: Option<PublishHook>,
+}
+
+/// The check of [`WriteOptions::before_publish`].
+#[derive(Clone)]
+pub struct PublishHook(pub Arc<dyn Fn() -> Result<()> + Send + Sync>);
+
+impl PublishHook {
+    pub fn new(f: impl Fn() -> Result<()> + Send + Sync + 'static) -> PublishHook {
+        PublishHook(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for PublishHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PublishHook")
+    }
 }
 
 /// A check of the committed state that a write depends on (an HTTP `If-Match`, say).
@@ -202,6 +223,16 @@ impl WriteOptions {
             return Err(crate::Error::Timeout);
         }
         Ok(())
+    }
+
+    /// [`check`](Self::check), then the [`before_publish`](Self::before_publish) hook:
+    /// the last check of a write before it is published.
+    pub fn check_publish(&self) -> Result<()> {
+        self.check()?;
+        match &self.before_publish {
+            Some(hook) => (hook.0)(),
+            None => Ok(()),
+        }
     }
 }
 

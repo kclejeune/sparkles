@@ -1106,6 +1106,7 @@ impl Tools<'_> {
             })),
             no_wait: false,
             preview_as_new_branch: false,
+            before_publish: None,
             graphs: opts.graphs.clone(),
             dry_run: dry_run.then_some(sparkles::preview::DryRun {
                 changes,

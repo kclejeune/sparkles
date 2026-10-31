@@ -634,6 +634,7 @@ fn guard_failures(
         precondition: None,
         no_wait: false,
         preview_as_new_branch: false,
+        before_publish: None,
         graphs: opts.graphs.clone(),
         dry_run: Some(sparkles::preview::DryRun {
             changes: 0,
@@ -1378,6 +1379,7 @@ impl Tools<'_> {
             precondition: None,
             no_wait: false,
             preview_as_new_branch: false,
+            before_publish: None,
             graphs: opts.graphs.clone(),
             dry_run: None,
         };

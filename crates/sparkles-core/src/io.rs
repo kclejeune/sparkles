@@ -78,19 +78,22 @@ impl SourceData {
 pub struct ReaderSource(Mutex<ReaderState>);
 
 struct ReaderState {
-    /// bytes read ahead to detect the compression, which come before the rest of `reader`
+    /// bytes read ahead, which come before the rest of `reader`
     head: Vec<u8>,
     /// `None` once the parser has taken the stream
     reader: Option<Box<dyn Read + Send>>,
+    /// `reader` and `head` hold the decompressed stream (see [`ReaderSource::decode`])
+    decoded: bool,
 }
 
 impl ReaderState {
-    fn read_ahead(&mut self, n: usize) -> Result<usize> {
-        let ReaderState { head, reader } = self;
+    fn read_ahead(&mut self, n: usize, check: &dyn Fn() -> Result<()>) -> Result<usize> {
+        let ReaderState { head, reader, .. } = self;
         let Some(reader) = reader.as_mut() else {
             return Err(Error::invalid("a reader source can be read only once"));
         };
         while head.len() < n {
+            check()?;
             let start = head.len();
             head.resize(start + (n - start).min(INPUT_BUFFER_BYTES), 0);
             match reader.read(&mut head[start..]) {
@@ -116,20 +119,49 @@ impl ReaderSource {
         ReaderSource(Mutex::new(ReaderState {
             head: Vec::new(),
             reader: Some(Box::new(reader)),
+            decoded: false,
         }))
     }
 
     /// The first `n` bytes of the stream (fewer at its end), kept to be read again.
     fn peek(&self, n: usize) -> Result<Vec<u8>> {
         let mut state = self.0.lock();
-        let len = state.read_ahead(n)?;
+        let len = state.read_ahead(n, &|| Ok(()))?;
         Ok(state.head[..n.min(len)].to_vec())
     }
 
     /// Read ahead until `n` bytes are held or the stream ends, and return how many are
-    /// held. The bytes are kept to be read again.
-    pub(crate) fn read_ahead(&self, n: usize) -> Result<usize> {
-        self.0.lock().read_ahead(n)
+    /// held. The bytes are kept to be read again. `check` runs before each read, so that
+    /// a write's cancellation and deadline stop a slow stream.
+    pub(crate) fn read_ahead(&self, n: usize, check: &dyn Fn() -> Result<()>) -> Result<usize> {
+        self.0.lock().read_ahead(n, check)
+    }
+
+    /// Put the decompressing reader of `codec` in front of the stream, with the bytes
+    /// read ahead replayed into it, so that later reads ahead count decoded bytes. The
+    /// source's compression is then [`Codec::None`]. A second call does nothing.
+    pub(crate) fn decode(&self, codec: Codec, max_decompressed: Option<u64>) -> Result<()> {
+        let mut state = self.0.lock();
+        if state.decoded {
+            return Ok(());
+        }
+        if codec != Codec::None {
+            let Some(reader) = state.reader.take() else {
+                return Err(Error::invalid("a reader source can be read only once"));
+            };
+            let head = std::mem::take(&mut state.head);
+            let raw = PrefixReader {
+                prefix: Some(Cursor::new(head)),
+                reader,
+            };
+            state.reader = Some(codec.reader_send(raw, max_decompressed)?);
+        }
+        state.decoded = true;
+        Ok(())
+    }
+
+    fn decoded(&self) -> bool {
+        self.0.lock().decoded
     }
 
     /// The whole stream, from its first byte. A second call fails.
@@ -370,6 +402,8 @@ impl Source {
                 }
                 (n, Some(p.as_path()))
             }
+            // a decoded stream holds the decompressed bytes
+            SourceData::Reader(r) if r.decoded() => return Ok(Codec::None),
             SourceData::Reader(r) => {
                 let head = r.peek(prefix.len())?;
                 prefix[..head.len()].copy_from_slice(&head);
@@ -1129,6 +1163,7 @@ fn read_blocks(
         while filled < target && !eof {
             if filled == buf.len() {
                 let grown = buf.len().saturating_mul(2).max(BLOCK_START).min(target);
+                buf.reserve_exact(grown - buf.len());
                 buf.resize(grown, 0);
             }
             match r.read(&mut buf[filled..]) {
@@ -1147,37 +1182,61 @@ fn read_blocks(
                 continue;
             }
         };
-        // the start of the next block's first line
-        let carry = buf[cut..filled].to_vec();
-        buf.truncate(cut);
-        let len = buf.len() as u64;
-        if len > 0 {
-            if tx.send(Ok((offset, std::mem::take(&mut buf)))).is_err() {
-                return Ok(());
-            }
-            buf = if allocated < BLOCK_BUFFERS {
-                allocated += 1;
-                Vec::new()
-            } else {
-                match spare.recv() {
-                    Ok(b) => b,
-                    // the parser stopped
-                    Err(_) => return Ok(()),
-                }
-            };
-        }
-        offset += len;
         if eof {
+            buf.truncate(filled);
+            if !buf.is_empty() {
+                let _ = tx.send(Ok((offset, buf)));
+            }
             return Ok(());
         }
-        // a returned buffer keeps its zeroed length as room
-        let room = buf.len().max(carry.len());
-        buf.clear();
-        buf.extend_from_slice(&carry);
-        buf.resize(room, 0);
-        filled = carry.len();
+        // The next buffer, from the two, takes the start of the next block's first line,
+        // so that no third allocation holds it. While both are out, it waits for the
+        // parser to return one.
+        let mut next = if allocated < BLOCK_BUFFERS {
+            allocated += 1;
+            Vec::new()
+        } else {
+            match spare.recv() {
+                Ok(b) => b,
+                // the parser stopped
+                Err(_) => return Ok(()),
+            }
+        };
+        next.clear();
+        let carried = filled - cut;
+        next.reserve_exact(carried.max(BLOCK_START.min(block)));
+        next.extend_from_slice(&buf[cut..filled]);
+        buf.truncate(cut);
+        let len = buf.len() as u64;
+        if tx
+            .send(Ok((offset, std::mem::replace(&mut buf, next))))
+            .is_err()
+        {
+            return Ok(());
+        }
+        offset += len;
+        filled = carried;
         target = block;
     }
+}
+
+/// Parse the N-Triples or N-Quads of `src` in blocks of `block` bytes as automatic mode
+/// parses a stream, with one parser per block. For tests of the block reader's memory.
+#[doc(hidden)]
+pub fn parse_lines_in_blocks<S: QuadSink, F: Fn() -> S + Sync>(
+    src: &Source,
+    parallelism: usize,
+    block: usize,
+    make_sink: F,
+) -> Result<()> {
+    parse_stream(
+        src,
+        source_parser(src)?,
+        parallelism,
+        block,
+        block,
+        make_sink,
+    )
 }
 
 /// Parse a source fully into memory (small inputs: updates, uploads, rule files).
@@ -1593,7 +1652,8 @@ mod tests {
         let (_, first) = rx.recv().unwrap().unwrap();
         assert!(first.capacity() <= BLOCK_START, "{}", first.capacity());
 
-        // a parser that holds its block: the reader fills one more and then waits
+        // a parser that holds its block: the reader fills the other buffer and waits for
+        // the first one back before it sends
         let line = b"<http://e/s> <http://e/p> \"some literal\" .\n";
         let data = line.repeat(64 * 1024 / line.len() * 8);
         let src = Source::from_bytes(data, RdfFormat::NTriples, None);
@@ -1605,21 +1665,16 @@ mod tests {
             scope.spawn(move || read_blocks(src, Codec::None, block, &tx, &spare_rx).unwrap());
             let (_, held) = rx.recv().unwrap().unwrap();
             std::thread::sleep(Duration::from_millis(200));
-            let (_, queued) = rx.try_recv().unwrap().unwrap();
-            std::thread::sleep(Duration::from_millis(200));
             assert!(
                 matches!(rx.try_recv(), Err(TryRecvError::Empty)),
-                "the reader filled a third block"
+                "the reader sent a second block while the first was held"
             );
             spare_tx.send(held).unwrap();
-            let mut blocks = 2;
-            let mut back = Some(queued);
+            let mut blocks = 1;
             for msg in rx.iter() {
                 let (_, b) = msg.unwrap();
                 blocks += 1;
-                if let Some(b) = back.replace(b) {
-                    let _ = spare_tx.send(b);
-                }
+                let _ = spare_tx.send(b);
             }
             assert!(blocks >= 4, "{blocks}");
             drop(spare_tx);
