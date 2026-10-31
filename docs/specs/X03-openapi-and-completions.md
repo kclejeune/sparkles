@@ -557,3 +557,11 @@ above.
   `DeviceLoginPending` and `ReasonDeleted`, each added to `openapi::contract_tests` with
   a request that produces it. MCP's JSON-RPC messages stay an open object, since the MCP
   specification defines them.
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Contract tests for every API route.** Check every one of the 264 operations against its schema and fail on open-object responses. Item 55 adds six schemas only. It depends on item 55.
+
+**Generated HTTP client SDKs.** Generate and check typed clients from `docs/openapi.json` for further languages. X03 designed the document for generators. It depends on items 55 and 58.

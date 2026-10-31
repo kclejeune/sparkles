@@ -524,3 +524,11 @@ MCP tool has tests in `mcp/lint_tests.rs`, and the tool-list test lists it. The 
 editor has a unit test of its lint request and a mock-backend test of the marks, and
 `ui/src/lib/lint-runner.test.ts` tests that both editors drop the answer of a lint whose
 text has changed, been cleared or been closed.
+
+### Roadmap follow-ups
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**SHACL query prefix contract.** Make `sparkles-shacl` resolve the same prefixes as the linter, or make the linter flag document-only prefixes. A query can lint clean and then fail validation.

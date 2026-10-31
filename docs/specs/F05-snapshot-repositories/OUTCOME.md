@@ -359,3 +359,13 @@ definition change against many captures and checks that each capture holds the
 definition current at its commit or the one that followed it. A failpoint test changes a
 definition while the capture holds the writer lock and again after it releases the lock,
 and the capture keeps the earlier definition in both cases.
+
+### Roadmap follow-ups
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Restore of derived indexes.** Report time to searchable after a large restore and optionally capture or rebuild derived indexes with progress. Backups exclude them by design and the rebuild cost is unmeasured. It depends on item 61.
+
+**GCS and Azure repositories in CI.** Test both against emulators and run S3 against MinIO on a schedule. Two advertised backends have never been tested.

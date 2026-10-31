@@ -1769,3 +1769,13 @@ is missing at `537e048` and the order of the remaining work.
      third kind of format change of X12 §4.3.
 * **Builds.** Encryption is useful only if the published binaries have it, so X12 puts
   `backup-encryption` in every release build and image.
+
+#### Security and audit workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 466, the security and audit workstream, whose primary spec is [C34](C34-audit-and-erasure/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Refuse unprotected runtime secrets outside loopback.** Require `--secrets-key` or a KMS key when the server listens beyond loopback, or warn loudly, and refuse to generate secrets.key in a group- or world-writable data directory (C19 follow-up D3, left behind when item 68 completed). Without the flag, runtime keys are sealed with a key kept beside them, and the doc cites item 77, which is unrelated (see the documentation fixes). It depends on item 65.
+
+**Additional key providers.** Add Azure Key Vault and Managed HSM, PKCS#11 or KMIP, and a TPM2 source. Azure and HSM deployments cannot use the planned three. It depends on item 65.
+
+**FIPS build option.** Offer a tested `aws-lc-rs` FIPS build and record the operational-mode requirements. F11's Outcome says FIPS compliance is not established. It depends on items 59 and 65.

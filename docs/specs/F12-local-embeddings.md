@@ -683,3 +683,11 @@ these. One of its items has since landed: the `Dockerfile` takes
   `loading`, `loaded`, `unloaded`), `weightBytes`, the queue and `lastError` or
   `downloadError`, from the same response, with a Pull action for an
   absent snapshot when downloads are on.
+
+#### Search depth workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 464, the search depth workstream. Each phase gets its own numbered item when it is ready to start.
+
+**More local embedding architectures.** Add ModernBERT, Gemma-based, Jina, GTE-style and bge-m3 encoders. Item 26 covers formats and devices, not model families. It depends on item 26.
+
+**Re-embed on a changed local model snapshot.** Record the snapshot id and flag or schedule `reembed` when it changes under the same name. A swapped snapshot leaves incompatible vectors silently. It depends on item 26.

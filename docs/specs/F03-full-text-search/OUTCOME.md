@@ -528,3 +528,11 @@ fields' predicates in PSO order, so an entity's literals come together. Acceptan
 fields `name` and `body`, an entity whose label has `quokka` and description
 `marsupial` is found by `name:quokka AND body:marsupial`; an entity with both words in
 its label only is not.
+
+#### Search depth workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 464, the search depth workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Full-text facets.** Return facet counts per field, predicate, language or graph from full-text queries. F03 Outcome says facets are not built and items 23 and 35 do not include them. It depends on item 35.
+
+**Synonyms, phonetic analyzers and a suggester.** Add synonym lists or graphs, phonetic analyzers and autocomplete or suggester endpoints. Entity lookup for gene aliases and name variants and the UI search box need them. jena-text supports custom analyzers. It depends on items 35 and 251.

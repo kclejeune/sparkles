@@ -82,11 +82,18 @@ stays in AUDIT §5 as the record of the original scope; this spec supersedes it.
    mode is complete for, and entity views that include materialized inferences (§7).
 7. Reads and writes under the caller's view, budgets and write-time validation (§8).
 
-**Non-goals.** An OWL 2 DL reasoner, OWL 2 EL classification or any reasoning beyond what
-C08, F16 and F17 provide. Manchester syntax and OWL/XML. Re-implementing the whole
-`jena-ontapi` interface set in native code. SWRL rules. Ontology modularization,
-alignment or versioning beyond diffs between commits. Storing axioms anywhere other than
-as RDF triples in the dataset.
+**Non-goals.** An OWL 2 DL reasoner, or any reasoning beyond what C08, F16 and F17
+provide. OWL 2 EL classification and a bridge to external OWL 2 DL reasoners are outside
+the design of this spec. [ROADMAP](../ROADMAP.md) item 457 plans them under
+[F24](F24-owl-classification/README.md). Manchester syntax and OWL/XML are likewise
+outside this spec's design, and item 457 plans them in the syntaxes phase of this spec's
+Roadmap follow-ups. Re-implementing the whole `jena-ontapi` interface set in native code.
+SWRL rules are outside this spec's design. Item 456 plans DL-safe SWRL import under
+[F23](F23-reasoner-core/README.md), which runs SHACL-AF natively and translates SWRL, SPIN
+and N3 into its rule engine. Ontology modularization and alignment are outside this
+spec's design, and item 457 plans them in the module extraction and ontology matcher
+phases of this spec's Roadmap follow-ups. Versioning beyond diffs between commits.
+Storing axioms anywhere other than as RDF triples in the dataset.
 
 ## 2. User-visible behaviour
 
@@ -557,3 +564,45 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 71.
+
+### Scope changes
+
+**OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 EL classification. It is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md).
+
+**External OWL DL reasoner bridge.** The non-goal in §1 excluded an OWL 2 DL reasoner and anything beyond C08, F16 and F17. A bridge to external DL reasoners is now planned under item 457 and [F24](F24-owl-classification/README.md). A native DL reasoner stays a non-goal.
+
+**Manchester and OWL/XML syntaxes.** The non-goal in §1 excluded Manchester syntax and OWL/XML. Readers and writers for these and for functional syntax and OBO are now planned under item 457 as the syntaxes phase of this spec's Roadmap follow-ups.
+
+**Module extraction and alignment.** The non-goal in §1 excluded ontology modularization and alignment. Module extraction and an ontology matcher with SSSOM output and merge review are now planned under item 457 in this spec's Roadmap follow-ups.
+
+**SWRL import and rule frontends.** The non-goal in §1 excluded SWRL rules. Item 456 and [F23](F23-reasoner-core/README.md) now plan DL-safe SWRL import, SPIN and N3 translation into the rule engine, and native SHACL-AF rules.
+
+### Roadmap follow-ups
+
+#### Ontology workbench workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 457, the ontology workbench workstream. Each phase gets its own numbered item when it is ready to start.
+
+**OWL and SHACL translation.** Generate SHACL from domains, ranges, restrictions and cardinalities under a closed-world reading, summarize shapes as OWL, translate ShEx schemas to SHACL where the constructs correspond, and install the result as a guard like drafted shapes. It bridges the ontology and the shapes and forms stack that already exists. It depends on item 71.
+
+**Ontology refactoring operations.** Rename or change IRIs everywhere including RDF 1.2 triple terms, merge entities, move axioms between ontologies, deprecate with replacement and delete with usage check, each as a previewed commit. These are daily ontology maintenance tasks. Rename can ship first over SPARQL. It depends on item 71.
+
+**The F21 axiom model as the workbench base.** Item 71 builds the F21 Phase 1 axiom model, the reverse and forward mappings, the profile checks and `/$/ontology/{ds}` as a new `sparkles-owl` crate. Almost every ontology editing, refactoring, diff, documentation and classification phase depends on it, so it is the root of this workstream.
+
+**Functional, Manchester, OWL/XML, OBO and OBO Graphs JSON syntaxes.** Add readers and writers for OFN, Manchester, OWL/XML, OBO 1.4 and OBO Graphs JSON in sparkles-owl, registered with the loader, formatter, linter and LSP, with a Manchester class-expression editor mode. Ontologies are distributed in these formats and Protégé users write Manchester. Manchester is only rendered today (`schema/expressions.rs`). It depends on item 71.
+
+**SSSOM mapping sets.** Import and export SSSOM TSV as RDF and review mapping sets in the UI. Crosswalks between vocabularies have no support.
+
+**Axiom-level and hierarchy-level diffs.** Diff axioms between commits or branches rendered in Manchester or OFN with labels, and classify changes as effectual or ineffectual from entailment diffs. Ontology review needs semantic diffs, not triple diffs. It depends on item 71.
+
+**Module extraction and import refresh.** Extract syntactic locality modules (top, bot, star) and MIREOT term lists into import graphs and refresh them against a new source version. It is the standard OBO way to manage imports. It depends on item 71.
+
+**Ontology release pipeline.** Run checks, reason, produce ODK base, full and simple artifacts in chosen syntaxes, bump the version IRI, take a named snapshot and publish files as a durable job from a branch head. It follows ODK and OBO practice and makes Sparkles the ontology build system. It depends on item 339.
+
+**ROBOT templates and DOS-DP patterns.** Read ROBOT template strings and DOS-DP YAML patterns over CSV or TSV to generate axioms, using the Manchester parser. CSVW, Tarql and RML produce triples, not axioms. It depends on item 71.
+
+**Ontology matcher and mapping review.** Combine lexical matching over labels and synonyms, embedding similarity and structural propagation, output SSSOM, and repair incoherent mappings with the classifier. Matches are exchanged as SSSOM and enter the ontology through merge review. Alignment is a common task with no store-integrated tool. It depends on items 71 and 396.
+
+**LinkML import and export.** Read LinkML YAML into OWL and SHACL graphs and export classes and shapes as LinkML. It bridges to the LinkML ecosystem and its generators.
+
+**Annotator endpoint.** Return text spans and term IRIs from labels and synonyms of selected ontologies at POST `/$/annotate/{ds}`. It matches the BioPortal Annotator over the existing entity linking.

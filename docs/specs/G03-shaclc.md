@@ -685,3 +685,11 @@ Completed item 13 covers the adopted list and node-expression contracts. The dra
 SHACL 1.2 Core constraints listed above were not part of that node-expression phase,
 and its completion does not claim the entire draft suite passes. Adopting additional
 draft constraints requires a named design and conformance scope of its own.
+
+### Roadmap follow-ups
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**SHACL 1.2 Core additions and the Working Group suite.** Implement the non-node-expression SHACL 1.2 Core features and vendor the WG Core and SHACL-SPARQL groups into the runner.

@@ -513,6 +513,16 @@ another branch.
 
 See [ROADMAP](../ROADMAP.md) item 11.
 
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Timeline view over valid time.** Draw C27 intervals and events as a timeline or Gantt view. C27's event-time UI is generic. It depends on item 341.
+
+**Remaining time-slider features.** Add a calendar-aware track, branch-qualified selectors, paging past 500 grouped changes, grouping by named graph and time-lapse export. U01 lists them as not built. It depends on item 29.
+
 ## Phase 4: time-lapse and commit diffs on the canvas (2026-10-23)
 
 This phase was added on 2026-10-23, when the user approved a set of graph-interaction

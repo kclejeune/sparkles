@@ -94,12 +94,16 @@ client that never names a branch sees no change.
 - Merging configuration. Shapes, reasoning settings, prefixes, full-text settings and
   compaction settings belong to each branch and are not merged.
 - Detecting that two blank-node structures added on the two sides are isomorphic. They
-  are different nodes, and a merge keeps both.
+  are different nodes, and a merge keeps both. Treating isomorphic structures as the same
+  node is outside the design of this spec. [ROADMAP](../ROADMAP.md) item 460 plans it in
+  this spec's Roadmap follow-ups.
 - Moving refs. A branch is a line of commits with its own numbering. It is not a pointer
   that a fast-forward moves (§4.6).
 - Remote branches, push and pull between servers. The replication work covers shipping
   commits between servers. This spec covers only a one-off clone from another server
-  (Phase 3).
+  (Phase 3). Two-way sync with remotes, with fetch, push and pull, is outside the design
+  of this spec and is planned under [ROADMAP](../ROADMAP.md) item 460 and
+  [F25](F25-git-sync-and-remotes/README.md).
 
 ## 2. User-visible behaviour
 
@@ -748,7 +752,7 @@ that its data contains.
 Two sides that each added an equivalent blank-node structure, such as the same address
 written as `[ ex:city "Oslo" ]`, end up with two nodes after the merge. RDF says they are
 two nodes, and recognizing equivalent structures would need a canonicalization of the
-changes. That is out of scope (§8).
+changes. That is outside the design of this spec (§8), and item 460 plans it.
 
 When a resolution discards one side's change to a group, blank nodes that only that side
 created since the base can be left without any reference. Sparkles removes them with the
@@ -1137,7 +1141,9 @@ These are estimates for Phase 1 to confirm, on a 10.5M-quad dataset.
   a relabelling table.
 - **Merging blank-node structures that are isomorphic.** Deciding which added blank nodes
   are "the same" needs a canonicalization of each side's changes and a policy for partial
-  matches. RDF treats them as distinct nodes.
+  matches. RDF treats them as distinct nodes. This spec keeps that design, and
+  [ROADMAP](../ROADMAP.md) item 460 plans a blank-node-isomorphic merge in this spec's
+  Roadmap follow-ups.
 - **Hard links or reflinks to share generation files.** A branch lives inside the
   dataset directory, so it can name the upstream's files directly, and naming them lets
   both branches share mapped files and block-cache entries in one process. Links would
@@ -1393,7 +1399,10 @@ dataset page's Backups panel says that the other branch is not backed up.
    `rdf:type`, `rdfs:label` and `skos:altLabel`, whose cells often gain values on both
    sides? Default: no exemptions in Phase 1, and per-merge exemptions in Phase 2.
    Answered in Phase 2: no predicate is exempt by default, and exemptions are given per
-   merge and per dataset.
+   merge and per dataset. Conflicts and exemptions that follow from the schema, such as
+   conflicts for functional properties and `sh:maxCount` 1 values, are outside the design
+   of this spec. [ROADMAP](../ROADMAP.md) item 460 plans them in this spec's Roadmap
+   follow-ups.
 2. **Configuration.** Branches copy the configuration at creation. Should the validation
    shapes instead be shared, so `main`'s guard applies on every branch? Default: copy,
    so a branch can try new shapes.
@@ -1850,6 +1859,12 @@ grants that allow and refuse it, and the read-only server. The JVM and Node bind
 tests relink a persistent branch after `main` compacts and check its id, head and
 data.
 
+### Scope changes
+
+**Remotes with fetch, push and pull.** The non-goal in §1 excluded remote branches and push and pull between servers, leaving only a one-off clone. Two-way sync with remotes is now planned under [ROADMAP](../ROADMAP.md) item 460 and [F25](F25-git-sync-and-remotes/README.md).
+
+**Schema-aware and blank-node-isomorphic merge.** The non-goal in §1, the rejected alternative in §8 and the first open question in §10 left out detection of isomorphic blank-node structures and any conflict rule drawn from the schema. Both are now planned under item 460 in this spec's Roadmap follow-ups.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Remote relink from the CLI, cross-server clones and archive transfer** (item 45,
@@ -1890,3 +1905,13 @@ Acceptance: a clone of `dev` at `commit:57` from server A to server B through `r
 and through an archive file, gives a dataset whose quads, blank-node labels, prefixes
 and configuration equal A's at that commit, with `forkedFrom` naming A's dataset,
 branch and seq.
+
+#### Git sync and remotes workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 460, the git sync and remotes workstream, whose primary spec is [F25](F25-git-sync-and-remotes/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Large merges beyond the rows budget.** Stream and spill merge toggle sets and use the bulk path for large merges, as F09 §4.5 states. Measure a million-quad merge. Merges fail with 507 beyond `--max-rows`. It depends on item 93.
+
+**Branch-aware backups.** Back up and restore all branches with the branch table, with a policy choice of main only or all branches. Scheduled backups capture `main` only. It depends on item 61.
+
+**Schema-aware and blank-node-isomorphic merge.** Report conflicts for functional properties and `sh:maxCount` 1 values changed on both sides, and treat blank-node structures that are isomorphic on both sides as the same during merge. Both are common sources of false or missed merge conflicts in RDF.

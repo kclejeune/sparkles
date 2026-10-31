@@ -66,7 +66,9 @@ The report holds:
   it would run now.
 * Holding the result for a later commit. A dry run is not a prepared transaction, and a
   write made after it runs again from the start. Section 8 covers why.
-* Multi-request transactions. Sparkles still has one request per transaction.
+* Multi-request transactions. Sparkles still has one request per transaction. Interactive
+  multi-request transactions over HTTP are outside the design of this spec, and
+  [ROADMAP](../ROADMAP.md) item 465 plans them in this spec's Roadmap follow-ups.
 * Previews of admin operations such as compaction, reasoning runs, clones and restores.
 * A `--dry-run` for the local CLI commands. The library API of §2.7 makes one easy to add.
 
@@ -575,7 +577,9 @@ writes one WAL insert record, and its receipt says `inserted: 1, deleted: 0`.
   requests, so one slow client would stop every writer. A token naming the previewed
   state with a later "commit this" would need the whole change set kept on the server.
   `If-Match` with the head's tag gives the same safety: the write fails if anything
-  changed since the preview.
+  changed since the preview. This spec keeps that design for previews. Interactive
+  multi-request transactions are a separate feature, and item 465 plans them in this
+  spec's Roadmap follow-ups.
 * **Reporting through a `200` whatever the outcome.** Scripts check the status. A
   pipeline that previews a migration should fail when the migration would be rejected.
 * **Stopping at the first refusal**, as the write does. The preview is for learning what
@@ -764,6 +768,10 @@ Bulk ShEx schema previews retain the committed schema for grandfather comparison
 Change detection reads batch IDs in their source dictionary before the rebuild's
 renumbering, so schema edits are checked in both previews and actual bulk commits.
 
+### Scope changes
+
+**Interactive multi-request HTTP transactions.** The non-goal in §1 and the rejected alternative in §8 left Sparkles with one request per transaction and no held transaction. Interactive multi-request transactions over HTTP are now planned under [ROADMAP](../ROADMAP.md) item 465 in this spec's Roadmap follow-ups. A dry run stays a preview and is not a held transaction.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Local dry-run flags, previews in the UI, read-only servers and costly bulk previews**
@@ -809,3 +817,11 @@ renumbering, so schema edits are checked in both previews and actual bulk commit
   can skip building the index permutations that only queries need: it builds the
   candidate's vocabulary and the SPO order, runs the guard over that, and discards
   them.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Interactive multi-request transactions over HTTP.** Let a client open a transaction, run several queries and updates against its snapshot and then commit or abort it, in the style of the RDF4J transaction protocol, with timeouts and limits on open transactions. RDF4J, GraphDB, Stardog and Neo4j offer them, and agents that read and then write need more than If-Match.
+
+**Blank-node-aware graph sync.** Match payload blank nodes by isomorphism on `PUT` so unchanged data is no change. Reloading unchanged Turtle with blank nodes churns commits and feeds.

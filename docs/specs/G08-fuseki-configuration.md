@@ -533,3 +533,11 @@ direct naming per dataset.** The item's third part, JVM metrics, belongs to
   A body with `fuseki:allowedUsers` is still refused with its report. Two datasets, one
   with `read` and one with `off`, answer a direct `GET`, a direct `PUT` and a request to
   the other dataset as the setting says.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Triple and quad pattern fragments endpoints.** Serve TPF and QPF with hypermedia controls and paging, and brTPF. No LDF support exists.
+
+**Fuseki-exact status codes.** Return `204` for updates without a JSON `Accept` and `201` only on created graphs. Drop-in clients branch on these codes.

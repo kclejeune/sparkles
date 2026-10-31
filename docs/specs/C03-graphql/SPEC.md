@@ -54,7 +54,9 @@ caller's credentials, graph view, budgets and rate limits.
 7. The endpoint follows the GraphQL over HTTP draft, supports full introspection, and
    works with standard clients and with GraphiQL-style tools.
 
-**Non-goals.** Mutations (§12), subscriptions in Phase 1 (§13), Apollo Federation,
+**Non-goals.** Mutations (§12), which are outside the design of this spec and which
+[ROADMAP](../../ROADMAP.md) item 465 plans in the Roadmap follow-ups of its
+[delivery record](OUTCOME.md#roadmap-follow-ups), subscriptions in Phase 1 (§13), Apollo Federation,
 schema stitching across datasets, aggregates beyond `totalCount`, a schema that changes
 by itself when the data changes, and a SPARQL passthrough field.
 
@@ -816,7 +818,9 @@ reasons.
   have to compute first.
 
 Ontotext's service does generate mutations from SOML. A mutation design would be a
-separate spec, and it would start from these three problems.
+separate spec, and it would start from these three problems. [ROADMAP](../../ROADMAP.md)
+item 465 plans GraphQL mutations generated from the mapping in the Roadmap follow-ups of
+the [delivery record](OUTCOME.md#roadmap-follow-ups).
 
 ## 13. Subscriptions
 

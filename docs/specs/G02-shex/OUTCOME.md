@@ -211,6 +211,10 @@ merged with a file are not built. A persisted typing and ShEx 2.2 (`EXTENDS`,
 `ABSTRACT`) were built on 2026-10-13, as the first of the roadmap follow-ups below
 records.
 
+### Scope changes
+
+**ShEx to SHACL translation.** The non-goal in §1 of the spec excluded ShEx-to-SHACL translation in either direction. Translating ShEx schemas to SHACL where the constructs correspond is now planned under [ROADMAP](../../ROADMAP.md) item 457, in the OWL and SHACL translation phase of the Roadmap follow-ups of [F21](../F21-ontology-api.md#roadmap-follow-ups). Translation from SHACL to ShEx stays a non-goal.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **ShEx 2.2 and a persisted typing** (item 13, Tier 2, [ROADMAP](../../ROADMAP.md)).
@@ -361,3 +365,9 @@ compaction. It differs from the design above in where and when it writes.
   import policy from them. The local default stays `allow_private: true`, so existing
   invocations keep working, and `--outbound-block-private` refuses imports from
   private addresses.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Remaining ShEx conformance cases.** Resolve lexical blank-node labels in shape maps, infinities, relative labels, `includeWithCardinality` and the coherence rule, or list each as a boundary. The 99.9% figure hides 42 skipped tests. It depends on item 54.

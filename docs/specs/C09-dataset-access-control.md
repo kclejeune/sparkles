@@ -103,7 +103,9 @@ Out of scope:
 - IdP-issued JWT access tokens on the API (Phase 2). In Phase 1, OIDC logs in the
   *browser*, and programs use Sparkles API tokens.
 - Managing users through the API. Config users are managed in the file, and external
-  identities come from the IdP or proxy.
+  identities come from the IdP or proxy. Local user and role management through the API
+  and the UI is outside the design of this spec, and [ROADMAP](../ROADMAP.md) item 466
+  plans it in this spec's Roadmap follow-ups.
 - Native TLS.
 - Per-IP rate limiting (Phase 2). Phase 1 instead bounds the cost of failed logins and
   caps pending grants.
@@ -2316,6 +2318,10 @@ paths or raw error messages. Authentication refusals and hidden-object checks re
 their existing access-log behavior. Events use the configured tracing output and
 filters; they do not add a separate durable audit journal.
 
+### Scope changes
+
+**Local user and role management.** The non-goal in §1.2 excluded managing users through the API, so that config users stayed in the file. Local user and role management through the API and the UI is now planned under [ROADMAP](../ROADMAP.md) item 466 in this spec's Roadmap follow-ups.
+
 ### Roadmap follow-ups (2026-10-12)
 
 Item 62's [dataset administration audit](#dataset-administration-audit) is available.
@@ -2363,3 +2369,17 @@ group lookup** (item 63, Tier 6, [ROADMAP](../ROADMAP.md)).
   with the request's `CF_Authorization` cookie, caches it for the assertion's lifetime,
   and takes the groups from it. The fetch goes through the outbound policy; on failure
   the principal keeps the assertion's groups and the server logs a warning.
+
+#### Security and audit workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 466, the security and audit workstream, whose primary spec is [C34](C34-audit-and-erasure/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Per-token MCP tool allow-lists and scopes.** Allow a token or operator flag to limit the tools an agent may call below read, update and admin. It gives each agent least privilege. It depends on item 270.
+
+**Grants bound to dataset identity.** Optionally bind a grant to the dataset UUID and report orphaned grants. A recreated dataset inherits grants by name.
+
+**SAML, LDAP and SCIM.** Add native SAML, LDAP or Active Directory binds and SCIM provisioning. Item 63 does not include them, and G08 does not translate Shiro LDAP realms. It depends on item 63.
+
+**Self-service datasets in a granted namespace.** Let `admin` on a name pattern create, rename and delete matching datasets within quotas. Multi-team servers otherwise need a server administrator. It depends on item 62.
+
+**Local user and role management.** Create, update and remove local users and roles through the admin API and the UI instead of editing files. Deployments without an identity provider need it.

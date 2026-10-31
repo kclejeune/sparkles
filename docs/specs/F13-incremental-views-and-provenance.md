@@ -82,7 +82,9 @@ solution rows. The three features are:
 **Non-goals**
 
 - Stream reasoning and windows over time, as in RSP-QL or C-SPARQL. A commit is the unit
-  of change, and there are no tumbling or sliding windows.
+  of change, and there are no tumbling or sliding windows. RSP-QL windows and complex
+  event processing are outside the design of this spec, and [ROADMAP](../ROADMAP.md)
+  item 467 plans them in this spec's Roadmap follow-ups.
 - Views across datasets, over remote `SERVICE` endpoints or over federated sources.
 - Answering ordinary queries from views by query rewriting. §14 records it as an open
   question.
@@ -1145,3 +1147,17 @@ all 776 tests. Twenty repetitions of all six HTTP group commit tests pass, inclu
 the persistent reopen assertion that exposed the directory lock race. The worker
 callback case that reopens through a retained state and the thread-local destruction
 case each pass 100 repetitions.
+
+### Scope changes
+
+**RSP-QL windows and complex event processing.** The non-goal in §1 excluded stream reasoning and windows over time, as in RSP-QL or C-SPARQL, so that a commit stayed the only unit of change. RSP-QL windows and complex event processing are now planned under [ROADMAP](../ROADMAP.md) item 467 in this spec's Roadmap follow-ups.
+
+### Roadmap follow-ups
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**RSP-QL windows and CEP.** Add tumbling and sliding windows over event time and CEP patterns. Live queries exist without windows. It depends on items 341 and 419.
+
+**Time-series values and downsampling.** Store compact time-series values or a per-predicate column store with downsampling and retention aggregates. No time-series support exists. It depends on item 341.

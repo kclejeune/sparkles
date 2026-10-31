@@ -221,3 +221,23 @@ Measurements:
 
 The A10 refresh, the R2RML cases on PostgreSQL and the BSBM comparison wait for the
 PostgreSQL source and Phase 2.
+
+### Scope changes
+
+**OWL 2 QL rewriting over virtual graphs.** The non-goal in §1 of the spec excluded ontology-based query rewriting over virtual graphs, as Ontop does, and left reasoning to C08 and F17. OWL 2 QL rewriting over virtual graphs is now planned at low priority under [ROADMAP](../../ROADMAP.md) item 465 in this spec's Roadmap follow-ups.
+
+### Roadmap follow-ups
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Arrow IPC and Flight results, ADBC and Parquet export.** Return SELECT results as Arrow IPC or over Flight, ship an ADBC driver and export results and graphs as Parquet. Result formats are JSON, XML, CSV, TSV and RDF syntaxes only. Analytics users need columnar transfer.
+
+**DuckDB extension or embedded pushdown.** Offer a DuckDB extension that queries Sparkles, or push virtual-graph subqueries into embedded DuckDB. Item 230 adds DuckDB only as a materialized mapping source. It depends on items 43 and 230.
+
+**Refine-style grid and reconciliation service.** Add a tabular grid with facets, clustering, GREL transforms and preview, and serve the W3C Reconciliation API over the full-text and vector indexes. OpenRefine and Ontotext Refine users work this way. It depends on items 233 and 234.
+
+**CSV and TSV in place in virtual graphs.** Add CSV and TSV to the virtual-graph source list. Item 43 names SQL, Parquet and Iceberg only. It depends on item 43.
+
+**Ontology rewriting over virtual graphs.** Rewrite OWL 2 QL queries over virtual graphs as Ontop does. Item 43 targets plain virtual graphs. It depends on items 19 and 43.

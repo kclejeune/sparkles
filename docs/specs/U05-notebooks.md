@@ -51,10 +51,15 @@ machinery, and an agent reads and runs it over MCP.
 **Non-goals**
 
 - Running code other than SPARQL. There is no Python or JavaScript kernel. Chart and map
-  cells are declarative.
+  cells are declarative. A Jupyter kernel that runs SPARQL from a Jupyter client is outside
+  the design of this spec, and [ROADMAP](../ROADMAP.md) item 468 plans it in this spec's
+  Roadmap follow-ups.
 - Real-time co-editing. Two people editing one notebook commit separately, and branches
   and merges reconcile them.
 - Scheduled runs and reports. A later spec can run notebooks on C21's notifications.
+  Scheduled notebook runs with delivery are outside the design of this spec, and
+  [ROADMAP](../ROADMAP.md) item 467 plans them in the Roadmap follow-ups of
+  [C26](C26-durable-jobs-and-delivery.md#roadmap-follow-ups).
 - Executing a Jupyter notebook written elsewhere. Import accepts only the cell kinds
   this spec defines.
 
@@ -341,7 +346,9 @@ chart kind, and Vega-Lite (BSD-3-Clause), whose runtime is larger.
 - **Storing results by default.** Results can be large and would grow the dataset with
   every run. Pinning to a commit makes reruns reproducible.
 - **A code kernel.** Running user code in the server is out of scope, and SPARQL plus
-  declarative cells covers the analyses this spec targets.
+  declarative cells covers the analyses this spec targets. A Jupyter kernel runs in the
+  client's Jupyter process and sends SPARQL to the server, so it does not change this
+  rule. Item 468 plans it in this spec's Roadmap follow-ups.
 
 ## 11. Open questions
 
@@ -349,7 +356,9 @@ chart kind, and Vega-Lite (BSD-3-Clause), whose runtime is larger.
    graphs that hold metadata rather than data. Today only notebooks would use it.
 2. Whether a notebook may span datasets, with a dataset per cell.
 3. Whether **Run all** should run on the server through `/run`, so a notebook can run
-   from the CLI and a cron-like schedule with the same results as the browser.
+   from the CLI and a cron-like schedule with the same results as the browser. Item 467
+   plans scheduled notebook runs with delivery in the Roadmap follow-ups of
+   [C26](C26-durable-jobs-and-delivery.md#roadmap-follow-ups).
 
 ## Provenance
 
@@ -375,3 +384,19 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 30.
+
+### Scope changes
+
+**Scheduled notebook runs.** The non-goal in §1 and the third open question in §11 left scheduled runs and reports to a later spec. Scheduled notebook runs with delivery are now planned under [ROADMAP](../ROADMAP.md) item 467 in the Roadmap follow-ups of [C26](C26-durable-jobs-and-delivery.md#roadmap-follow-ups).
+
+**Jupyter kernel.** The non-goal in §1 and the rejected alternative in §10 excluded a Python or JavaScript kernel. A Jupyter kernel that runs SPARQL against an embedded or remote store is now planned under item 468 in this spec's Roadmap follow-ups. Importing foreign notebooks stays a non-goal.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Jupyter kernel.** Provide a Jupyter kernel that runs SPARQL against an embedded or remote store and renders results. Importing foreign notebooks stays out of scope. Data scientists work in Jupyter.
+
+**Dashboards of stored queries.** Pin stored queries as chart panels with refresh. Notebooks with chart cells in U05 Phase 2 are the nearest. It depends on items 30 and 424.

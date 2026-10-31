@@ -81,7 +81,10 @@ protocol.
   direct mapping's shape, which a user edits. That covers its practical use.
 - Writes to virtual graphs. SPARQL Update against a virtual graph fails (§9.10).
 - Ontology-based query rewriting over virtual graphs (OWL 2 QL, as Ontop does). Reasoning
-  stays with [C08](../C08-inference-freshness.md) and the query-time work of F17.
+  stays with [C08](../C08-inference-freshness.md) and the query-time work of F17. The
+  rewriting itself is outside the design of this spec, and
+  [ROADMAP](../../ROADMAP.md) item 465 plans it at low priority in this spec's Roadmap
+  follow-ups.
 - Sources fetched over HTTP during a mapping. Every file source is local to the CLI or
   uploaded with the request, and every database is a named connection (§4.4).
 - MySQL, SQL Server and Oracle. The SQL printer is per dialect, and each dialect needs its

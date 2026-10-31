@@ -1704,6 +1704,26 @@ made. Costs use new request IDs, since raw case costs include charges from earli
 with the same case IDs. The [paid record](../../benchmarks/2026-10-25-ask-grounding-paid.json)
 retains exact policies, paired case changes, tokens, costs and provenance.
 
+### Roadmap follow-ups
+
+#### Agent platform workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 462, the agent platform workstream, whose primary spec is [C33](../C33-agent-platform-controls/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**An `ask` MCP tool.** Expose the server's checked, self-repairing NL-to-SPARQL pipeline as an MCP tool. MCP reaches Ask only through the `ask_graph` prompt, so thin hosts and small models must reimplement it. It depends on items 263 and 318. Roadmap item 488 holds this phase.
+
+**End-to-end MCP agent evaluation harness.** Score agent tasks on trajectory and answer across tool descriptions and models. Ask-only evals miss tool-description regressions. It depends on item 6.
+
+**A `global_answer` MCP tool.** Expose GraphRAG map-reduce global answering over MCP. It is reachable only through HTTP Ask. It depends on items 100 and 262.
+
+**Community and subgraph embeddings for retrieval.** Embed communities, reports and pooled subgraphs for vector retrieval. It retrieves communities by similarity for retrieval-augmented answers. It depends on items 12 and 41.
+
+**DRIFT and hybrid local-global GraphRAG.** Run a community primer followed by local follow-ups. It improves mid-scope questions. Item 262 covers only classification. It depends on items 12 and 262.
+
+**Extraction quality evaluation.** Measure entity and relation F1 for ingestion on a labelled corpus. `scripts/eval-ingest` covers one sample. It depends on item 15.
+
+**Multi-turn Ask over MCP.** Carry a thread id and prior turns into Ask over MCP. Follow-ups could reuse grounding. It depends on item 263.
+
 ## Ask stage diagnostics for item 318
 
 The local Ask pipeline records bounded debug spans and completion events for total

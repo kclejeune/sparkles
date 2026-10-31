@@ -716,3 +716,11 @@ next to its vector.
   `LoadCredential` so that it is read from the systemd credentials directory. The
   module test checks the generated arguments and that a file secret is readable by the
   service user only through the credential.
+
+#### Search depth workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 464, the search depth workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Embedding record through backup, restore and clone.** Carry or rebuild each embedding index's reconciliation record so restored or cloned datasets do not re-embed. A restore repeats the whole embedding cost with a hosted provider. It depends on item 41.
+
+**Tokenizer-exact chunking and token limits.** Use the model's tokenizer for chunk sizes and `tokensPerMinute`. Four characters per token can exceed model input limits. It depends on item 26.

@@ -50,6 +50,9 @@ commit path.
 **Non-goals**
 - Computing embeddings. Sparkles has no model runtime, so clients bring their vectors.
 - Sparse vectors, binary or Hamming metrics, and multi-vector (late-interaction) scoring.
+  These are outside the design of this spec. [ROADMAP](../ROADMAP.md) item 464 plans
+  sparse retrieval first and multi-vector scoring later, together with product and binary
+  quantization and an SSD-resident index, in this spec's Roadmap follow-ups.
 - Equality or ordering of `spk:vector` literals by value. `=` stays RDF-term equality.
 - Distributed or GPU search.
 - Hybrid ranking fusion with F03. Sections 6 and 9 only reserve room for it.
@@ -1173,6 +1176,10 @@ was not built either.
   against 536 ms. The compact form takes about 5.3 bytes per dimension where the JSON
   literals of these vectors take about 9.
 
+### Scope changes
+
+**Sparse and multi-vector retrieval and compressed indexes.** The non-goal in §1 excluded sparse vectors, binary metrics and multi-vector scoring, and the quantization planned under item 34 covered f16 and i8 only. Sparse retrieval, multi-vector scoring, and product and binary quantization with an SSD-resident index are now planned under [ROADMAP](../ROADMAP.md) item 464 in this spec's Roadmap follow-ups, with sparse retrieval first and multi-vector scoring later.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Index maintenance and build speed** (item 10, Tier 2, [ROADMAP](../ROADMAP.md)).
@@ -1416,3 +1423,15 @@ The review of item 10 left four questions that need measurements rather than cod
   dimension, rows, nodes, overlay and pending counts, bytes and state, from the data
   that route already returns, so `GET /$/stats/{ds}` reports it with the rest of the
   dataset's counts.
+
+#### Search depth workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 464, the search depth workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Tunable hybrid ranking.** Add linear and score-normalized fusion, MMR diversity and a graph-proximity boost to `spk:hybridSearch`. Only RRF exists.
+
+**GraphQL search root fields.** Generate text, vector and hybrid search root fields over F03, F04 and `spk:hybridSearch`. GraphQL users cannot reach the search stack. It depends on item 37.
+
+**PQ and binary quantization with an SSD-resident index.** Add product and binary quantization and a DiskANN-style on-disk graph for 10M+ vectors under RAM limits. Item 34 targets f16 and i8 only. It depends on items 4 and 34.
+
+**Sparse and multi-vector retrieval.** Add SPLADE sparse vectors and ColBERT late-interaction scoring. Sparse retrieval comes first, and multi-vector scoring follows later. They improve retrieval quality for retrieval-augmented answers. It depends on items 26 and 34.

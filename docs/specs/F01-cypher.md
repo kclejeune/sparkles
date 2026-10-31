@@ -65,10 +65,11 @@ and maps.
 9. A published subset of the openCypher TCK that passes (§12).
 
 **Non-goals.** Writes (`CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`,
-`FOREACH`, `LOAD CSV`). The Bolt protocol and Neo4j driver compatibility. Procedures and
-user-defined functions, apart from three schema procedures in Phase 2. Shortest-path
-functions, which wait for the path search of F07. Spatial and full temporal support.
-Schema constraints and indexes. A stored property-graph copy of the data.
+`FOREACH`, `LOAD CSV`). The Bolt protocol and Neo4j driver compatibility are outside the
+design of this spec, and [ROADMAP](../ROADMAP.md) item 465 plans them in this spec's
+Roadmap follow-ups, after item 20. Procedures and user-defined functions, apart from
+three schema procedures in Phase 2. Shortest-path functions, which wait for the path
+search of F07. Spatial and full temporal support. Schema constraints and indexes. A stored property-graph copy of the data.
 
 ## 2. The property-graph view of RDF
 
@@ -800,8 +801,9 @@ message and a position.
 
 The Neo4j drivers, Neo4j Browser, Bloom and `cypher-shell` speak the Bolt protocol, and
 none of them can use this endpoint. Bolt needs sessions, transactions, bookmarks and
-PackStream encoding, and it makes sense only together with writes. It is out of scope
-here and would get its own spec.
+PackStream encoding, and it makes sense only together with writes. It is outside the
+design of this spec, and [ROADMAP](../ROADMAP.md) item 465 plans it in this spec's Roadmap
+follow-ups, after item 20.
 
 Clients that can use Cypher on Sparkles in Phase 1 are HTTP clients that send a query and
 read JSON. These include `curl`, scripts and notebooks, the Sparkles UI, the CLI, the MCP
@@ -1266,6 +1268,10 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 Nothing is built.
 
+### Scope changes
+
+**Bolt protocol.** The non-goal in §1 excluded the Bolt protocol and Neo4j driver compatibility. Bolt is now planned under [ROADMAP](../ROADMAP.md) item 465 in this spec's Roadmap follow-ups, after item 20.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Item 20** of the [roadmap](../ROADMAP.md) keeps this design and adds three links to it.
@@ -1288,3 +1294,13 @@ Nothing is built.
   compile time and the run time beside the SPARQL query's, so the cost of the frontend
   is measured. Queries outside the subset are listed with the feature that excludes
   them.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Bolt protocol.** Speak Bolt so Neo4j drivers, Browser and cypher-shell connect. Neo4j tooling cannot use the openCypher endpoint. It depends on item 20.
+
+**ISO GQL frontend.** Add a GQL frontend sharing item 20's property-graph lowering. F01 and F07 borrow only GQL path modes. It depends on item 20.
+
+**SQL/PGQ.** Add SQL/PGQ graph queries on top of *SQL surface over shape-derived tables with pgwire*'s SQL surface. Only F07's sources cite it. It depends on item 20.

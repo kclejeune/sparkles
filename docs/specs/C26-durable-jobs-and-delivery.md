@@ -457,3 +457,13 @@ change, and a `ManagedWrite` capability admits an owner's typed transaction. Job
 register as a second owner kind with its own settings file in the same registry and
 reader, and will use the reserved `hidden` visibility and `exclude` merge values that
 the current build refuses. No commit kind code is allocated by that boundary.
+
+### Roadmap follow-ups
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Scheduled stored queries and updates.** Run stored queries, updates and notebook runs on a schedule and deliver their results. Recurring reports and maintenance updates need an external scheduler today.
+
+**Kafka and MQTT ingestion connectors.** Ingest streams with offsets and exactly-once commits. No streaming source exists. It depends on item 339.

@@ -80,7 +80,9 @@ reasoning and validation.
 
 * **The HTTP server and CLI from Python.** `sparkles serve` stays a separate binary. A
   Python client for a remote server is a SPARQL client concern and is left to existing
-  libraries such as SPARQLWrapper.
+  libraries such as SPARQLWrapper. A client in the Python package for a remote server is
+  outside the design of this spec, and [ROADMAP](../ROADMAP.md) item 468 plans it in this
+  spec's Roadmap follow-ups.
 * **An rdflib `Store` plugin.** rdflib's plugin protocol is large and its triple-at-a-time
   model is slow over FFI. This is Phase 2 at the earliest (open question 2).
 * **Free-threaded CPython wheels.** abi3 does not cover the free-threaded build (3.14t).
@@ -1347,3 +1349,15 @@ Each regression test failed on the build before its fix, and
 one-triple one in a new process takes 6.4 ms instead of 2.7 ms, which roadmap item
 445 tracks. The [loading results](../benchmarks/loading/RESULTS.md#python-file-objects)
 record the measurements.
+
+### Scope changes
+
+**Python client for a remote server.** The non-goal in §1 left a Python client for a remote server to existing SPARQL libraries. A client in the Python package with the same API as the embedded store is now planned under [ROADMAP](../ROADMAP.md) item 468 in this spec's Roadmap follow-ups.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Python client for a remote server.** Give the Python package a client for a remote Sparkles server with the same API as the embedded store. Python users of a shared server currently need a generic SPARQL client.

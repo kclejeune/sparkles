@@ -83,8 +83,13 @@ The guarantee is about answers, not timing or plan shapes. Out of scope:
 **Non-goals**
 
 - Triple-level or resource-level rules, and rules that depend on data (Solid ACP's
-  matchers, attribute-based policies). The unit is a named graph.
-- Deny rules.
+  matchers, attribute-based policies). The unit is a named graph. Conditions on token
+  claims, the client IP and the request time are outside the design of this spec.
+  [ROADMAP](../ROADMAP.md) item 466 plans them in this spec's Roadmap follow-ups as
+  attribute-based control inside the existing protection model, with no separate policy
+  language.
+- Deny rules. They are outside the design of this spec, and item 466 plans them with
+  per-graph exceptions in this spec's Roadmap follow-ups.
 - Graph restrictions on minted token scopes. A token still narrows only levels; its view
   is its owner's view (§2.4).
 - Restricted `admin`. Admin operations (compaction, backups, cloning, reasoning runs,
@@ -595,6 +600,8 @@ predicates, plus a full-text index and vectors. The users are:
 - **Making `CLEAR ALL` fail for every restricted principal.** It acts on what the caller
   sees, as the rest of the view does.
 - **Deny rules or per-graph exceptions.** Grants stay a union for the reasons of C09 §14.
+  This spec keeps that design, and [ROADMAP](../ROADMAP.md) item 466 plans deny rules and
+  per-graph exceptions for protections in this spec's Roadmap follow-ups.
 - **Solid WAC ACL documents per graph.** They need WebIDs and per-resource discovery, and
   would split the policy between the configuration and the data.
 - **A Fuseki assembler parser for `access:` vocabularies.** The mapping table of §3.4 is
@@ -758,6 +765,12 @@ caller's view like SPARQL queries.
 `/$/stats` answer for the visible graphs remain open questions 1–3. Full-text scores
 still use the statistics of the whole index.
 
+### Scope changes
+
+**Protection conditions on request attributes.** The non-goal in §1.2 excluded attribute-based policies. Conditions on token claims, the client IP and the request time inside the existing protection model, with no separate policy language, are now planned under [ROADMAP](../ROADMAP.md) item 466 in this spec's Roadmap follow-ups.
+
+**Deny rules and per-graph exceptions.** The non-goal in §1.2 and the rejected alternative in §11 excluded deny rules and per-graph exceptions, so that grants stayed a union. Both are now planned under item 466 in this spec's Roadmap follow-ups, with a fixed precedence between allow and deny.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Restricted views: token scopes, validation, statistics and text scoring** (item 50,
@@ -843,3 +856,13 @@ evidence and the parts that entry leaves out.
   for `ex:email` on every person, and the answer says `scope: "view"`; a restricted
   writer's rejected write lists its own failing focus node and counts the others as
   hidden.
+
+#### Security and audit workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 466, the security and audit workstream, whose primary spec is [C34](C34-audit-and-erasure/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Value masking at query time.** Mask literal values by role with hashes, partial or generalized values. C12b hides whole triples only. Item 77 redacts ingested documents only. It depends on item 75.
+
+**ABAC over request and environment attributes.** Let protection conditions test token claims, the client IP and the request time inside the existing protection model, without a separate policy language. Protections bind only name, roles and groups. It depends on item 395.
+
+**Deny rules and per-graph exceptions.** Add deny rules and exceptions for single graphs to protections, with a fixed precedence between allow and deny. Administrators expect to carve exceptions out of broad grants.

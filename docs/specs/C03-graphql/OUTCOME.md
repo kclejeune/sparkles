@@ -190,7 +190,8 @@ and the MCP tools of stored queries come from C16 and C11 unchanged. A document 
 validated against the installed schema when stored and again when the schema changes;
 a document the new schema breaks is marked `invalid` and refuses to run.
 
-**Mutations.** §12 keeps them out of scope. A design would generate, per node type,
+**Mutations.** §12 keeps them out of this spec's design, and [ROADMAP](../../ROADMAP.md)
+item 465 plans them in the Roadmap follow-ups below. A design would generate, per node type,
 `create<T>`, `update<T>` and `delete<T>` from the same `@rdf` mapping, each compiled to
 one SPARQL update under the caller's write grant and protections, run as one commit
 per request through the guard of C10 and the previews of C15 (`dryRun: true`), with the
@@ -212,5 +213,25 @@ must bound rows produced per parent, rather than only slicing the assembled JSON
 
 Subscriptions are deferred under item 37 until a workload asks for them, and then use
 F13 as live queries. Mutations remain a separately approved design, as §12 and the follow-up
-above state. Neither conditional extension can be treated as delivered merely because
+above state, and item 465 plans them in the Roadmap follow-ups below. Neither conditional extension can be treated as delivered merely because
 Phase 2 completes, and declining one must be recorded explicitly.
+
+### Scope changes
+
+**GraphQL mutations generated from the mapping.** The non-goal in §1 and §12 of the spec kept mutations out of scope and left writes with SPARQL Update, the Graph Store Protocol and uploads. GraphQL mutations generated from the mapping are now planned under [ROADMAP](../../ROADMAP.md) item 465 in the Roadmap follow-ups below. They run as SPARQL updates under the same access rules.
+
+### Roadmap follow-ups
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**GraphQL response assembly overhead.** Replace per-object executor calls with a direct tree builder so responses stay within C03's 10% target, after re-measuring on a quiet host. It depends on item 37.
+
+**GraphQL keyset cursors.** Seek on the ordered key for deep pages instead of sorting and skipping. A cold deep page currently costs as much as every earlier item. It depends on item 37.
+
+**GraphQL aggregate fields.** Add count, sum, avg, min, max and group-by fields compiled to grouped SPARQL, plus min or max choice for multi-valued ordering. Dashboards need more than `totalCount`. It depends on item 37.
+
+**GraphQL mutations generated from the mapping.** Generate GraphQL mutations from the GraphQL mapping and run them as SPARQL updates under the same access rules. Applications that adopt GraphQL expect writes.
+
+**GraphQL edge annotations.** Expose RDF 1.2 annotations of an edge's triple as connection fields. Property-graph users expect edge properties. It depends on item 37.

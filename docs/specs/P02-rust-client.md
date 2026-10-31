@@ -69,6 +69,9 @@ cannot use. This spec adds `crates/sparkles-client`, a library that speaks the S
 - The MCP endpoint, the change feed's server-sent events and the web UI's session
   cookies.
 - Multi-request transactions. Neither Sparkles nor the SPARQL Protocol has them (§5.6).
+  They are outside the design of this spec, and [ROADMAP](../ROADMAP.md) item 465 plans
+  interactive multi-request transactions over HTTP in the Roadmap follow-ups of
+  [C15](C15-write-previews.md).
 
 ## 2. Generated or hand-written
 
@@ -351,7 +354,8 @@ because it cannot tell which limit class the next request belongs to.
 
 Jena's remote connections are transactional only on the client side. Their `begin` and
 `commit` take a local lock and send nothing. Sparkles has no multi-request transactions
-either. The client offers the two guarantees the server does have:
+either, and item 465 plans them in the Roadmap follow-ups of
+[C15](C15-write-previews.md). The client offers the two guarantees the server does have:
 - `Dataset::batch()` collects updates and `INSERT DATA`/`DELETE DATA` operations and
   sends them as one update request. The server runs one request as one commit, so the
   batch applies entirely or not at all.
@@ -611,6 +615,10 @@ cover both client forms, request bodies, options, encoded paths, cancellation, d
 and error responses. The client suite passed 40 tests and two doctests with default
 features, and 37 tests and one doctest without default features. Strict Clippy passed
 for both profiles. These are correctness results and make no performance claim.
+
+### Scope changes
+
+**Multi-request transactions.** The non-goal in §1 and the description in §5.6 stated that Sparkles has no multi-request transactions. Interactive multi-request transactions over HTTP are now planned under [ROADMAP](../ROADMAP.md) item 465 in the Roadmap follow-ups of [C15](C15-write-previews.md).
 
 ### Roadmap follow-ups (2026-10-12)
 

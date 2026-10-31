@@ -960,14 +960,18 @@ keeps its graph across compactions.
   can come with ingestion in Phase 2.
 - **Agents that save stored queries.** An agent that adds its own queries and example
   questions to the catalog would feed its mistakes back as examples for later
-  questions. Stored queries stay an `admin` operation that a person reviews.
+  questions. Stored queries stay an `admin` operation that a person reviews. Proposals
+  that an agent submits to a review queue are outside the design of this spec, and
+  [ROADMAP](../ROADMAP.md) item 462 plans them in this spec's Roadmap follow-ups.
 - **MCP sampling in Phase 1.** §10 gives the reasons. MCP revision 2026-07-28 later
   deprecated sampling, and C18 rejects it for every phase.
 - **Agents that add predicates and classes.** An agent that meets a fact the ontology
   cannot express would otherwise invent a term, and invented terms are the failure
   `check_query` exists to prevent. `assert_facts` has no option to accept unknown
   predicates or classes. A person extends the ontology with an update or a schema change,
-  and the agent then writes with the new terms.
+  and the agent then writes with the new terms. Ontology-change proposals that an agent
+  submits for review are outside the design of this spec, and
+  [ROADMAP](../ROADMAP.md) item 462 plans them in this spec's Roadmap follow-ups.
 
 ## 13. Decisions on the open questions
 
@@ -1575,3 +1579,33 @@ The richer evidence is information for contextual ranking and for deciding when 
 lookup is needed. It does not change `exact` or `ambiguous` advice, suppress clarification
 or authorize merging entities. Item 263 keeps contextual resolution and end-to-end
 accuracy and latency evaluation open.
+
+### Scope changes
+
+**Stored-query proposals under review.** The rejected alternative in §12 kept agents from saving stored queries, so that a person adds each one as an `admin` operation. Stored-query proposals that a person reviews are now planned under [ROADMAP](../ROADMAP.md) item 462 in this spec's Roadmap follow-ups.
+
+**Ontology-change proposals.** The decision in §12 kept agents from adding predicates and classes, so that only a person extends the ontology. Ontology-change proposals that an agent writes to a review branch are now planned under item 462 in this spec's Roadmap follow-ups. The write path still accepts no unknown predicates or classes.
+
+### Roadmap follow-ups
+
+#### Agent platform workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 462, the agent platform workstream, whose primary spec is [C33](C33-agent-platform-controls/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Synchronous remember(text) tool.** Extract, link and assert from text in one call and hold the result for review. Server ingestion is asynchronous and document-only. It depends on item 77.
+
+**Automatic contradiction invalidation.** Close the validity of a conflicting old fact when a new one arrives, under policy and with the record kept. Item 341 adds valid time but no automatic invalidation. It depends on items 81 and 341.
+
+**Entity history tool.** Return one resource's changes and superseded values across commits or valid time. It answers what was believed and when without composing `list_changes`. It depends on item 341.
+
+**Stored-query proposals under review.** Let agents propose stored queries to a review queue that a person accepts. The stored-query library then grows from agent work.
+
+**Per-row provenance in query results.** Add graph, source and reifier columns to `sparql_query` and `describe_resource` on request. Citations exist only in recall and community findings. It depends on item 81.
+
+**Bounded subgraph extraction.** Add `extract_subgraph` with more than two hops, per-predicate fan-out caps and a byte target. recall stops at two hops.
+
+**Ontology-change proposals.** Add `propose_terms`, which writes new classes or predicates to a review branch. It gives agents a path forward without inventing terms. It depends on item 81.
+
+**Mem0-style memory facade.** Offer add, search, `get_all` and delete over `assert_facts` and recall on HTTP and in SDKs. It eases migration from popular memory layers. C17 §12 rejects a single MCP memory tool with an action argument, so the facade stays outside MCP.
+
+**Memory decay that changes stored state.** Add per-dataset retention that moves expired facts out of the current state while history keeps them. The default stays ranking-only decay. Recall uses a recency half-life for ranking only. It depends on item 81. It ships only as an option, and the default stays ranking-only decay.

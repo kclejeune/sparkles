@@ -132,6 +132,13 @@ These read paths are tuned for queries over data that is not yet in memory
   the current release first opened it for writing. The offset is recorded in the
   generation's `commit.json` once the log, its vocabulary and its annotations are durable,
   so a torn modern record after it is never read as a legacy one.
+* A data directory belongs on a local file system. Sparkles does not support NFS for a
+  data directory, because the process lock is an advisory file lock and the index files
+  are memory-mapped, and neither is reliable across clients of a network file system.
+  Every open, including one that only reads, creates and writes `sparkles.lock` inside
+  the directory, and the lock file cannot be placed elsewhere. A read-only mount of a
+  copy therefore cannot be opened either. A copy can be served from a local directory
+  after a backup or a clone is restored there.
 
 ### Compaction, clones and integrity
 

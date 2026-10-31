@@ -681,3 +681,11 @@ copies, including quads, stored blank identities, prefixes, configuration and
 destination. A persistent clone carries the source's view definitions paused, as
 [F05](F05-snapshot-repositories/OUTCOME.md#recovery-of-managed-definitions) records, and
 item 401 tracks them for in-memory clones.
+
+### Roadmap follow-ups
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**In-memory clone carries validation and stored queries.** Seed in-memory clones with the source's guard and stored queries. A sandbox clone behaves unlike its source. It depends on item 401.

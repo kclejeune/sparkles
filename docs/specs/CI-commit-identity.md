@@ -1111,3 +1111,15 @@ image of both files with their zero tails after a commit of 3,000 new terms writ
 through the direct path. Another test opens a legacy file with a torn entry and reader 1,
 checks that reads leave the reader at 1, that the first new term raises it to 4 and
 rewrites the file framed, and that a dataset asking for reader 5 is refused.
+
+### Roadmap follow-ups
+
+#### Git sync and remotes workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 460, the git sync and remotes workstream, whose primary spec is [F25](F25-git-sync-and-remotes/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Signed commits and a verify command.** Sign commits with server keys or signed requests, add a verify command that checks the digest chain, and offer Merkle inclusion proofs. An opt-in SHA-256 digest chain exists, and `COMPARISON.md` says nothing is signed. It depends on item 65.
+
+**Per-graph entity tags.** Record the graphs a commit touched and derive Graph Store ETags per graph. Dataset-wide tags defeat conditional requests on busy multi-graph datasets. It depends on item 52.
+
+**Dataset id copy detection and clock-jump warning.** Detect a copied directory on open and mint or refuse an id, and warn on a backward clock jump. Two copies with one id corrupt watermarks, ETags and future sync. It depends on item 45.

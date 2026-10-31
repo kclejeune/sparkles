@@ -418,3 +418,13 @@ Acceptance requires late snapshots to work while active and nested callbacks ret
 their captured-view restrictions and reject a snapshot from the wrong family.
 Destroying the cleanup sentinel must not clear an active writer or silently bypass
 the family checks.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Persistent sandboxed server-side UDFs.** Register functions per dataset in a WASM sandbox and deploy them without recompiling. Rust registries are per query, item 25 adds dynamic dispatch and item 69 adds js: functions, which G06 excluded as a sandboxing problem. It depends on items 25 and 69.
+
+**Plugin API.** Load plugins for functions, SERVICE executors, endpoints and index types as WASM components or dylibs. There is no general server plugin interface (`COMPARISON.md`:40,51). It depends on items 25 and 60.

@@ -61,7 +61,10 @@ schema lists the parameters.
 
 **Non-goals.** Stored updates (parameterized writes), parameters that bind several
 values at once (lists bound through a multi-row `VALUES`), per-user private queries,
-query scheduling, and result caching beyond the engine's own cache.
+query scheduling, and result caching beyond the engine's own cache. Scheduled stored
+queries and updates with delivery of their results are outside the design of this spec,
+and [ROADMAP](../ROADMAP.md) item 467 plans them in the Roadmap follow-ups of
+[C26](C26-durable-jobs-and-delivery.md#roadmap-follow-ups).
 
 ## 2. Storage: a settings file, not a reserved graph
 
@@ -409,6 +412,10 @@ a `--server` mode for `sparkles queries` were not built.
 deleted through `notifications/tools/list_changed`, each stored query offered as a tool
 is also a resource with its definition, and the `run_stored_query` prompt explains its
 parameters ([C11](C11-mcp-server.md#outcome)).
+
+### Scope changes
+
+**Scheduled stored queries and updates.** The non-goal in §1 excluded query scheduling. Scheduled stored queries and updates, and notebook runs, with delivery of their results are now planned under [ROADMAP](../ROADMAP.md) item 467 in the Roadmap follow-ups of [C26](C26-durable-jobs-and-delivery.md#roadmap-follow-ups).
 
 ### Roadmap follow-ups (2026-10-12)
 

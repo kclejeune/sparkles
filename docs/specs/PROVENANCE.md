@@ -351,3 +351,71 @@ Read the [provenance record](shared/PROVENANCE.md#development-tools-not-linked-i
 ## Bounded preparation of read views
 
 Read the [design provenance](C29-bounded-view-preparation/SPEC.md#provenance).
+
+## Unified executor
+
+Read the [design provenance](X14-unified-executor/SPEC.md#provenance).
+
+## Join algorithms and estimation
+
+Read the [design provenance](X15-join-algorithms-and-estimation/SPEC.md#provenance).
+
+## Storage consolidation
+
+Read the [design provenance](X16-storage-consolidation/SPEC.md#provenance).
+
+## Tiered segments
+
+Read the [design provenance](X17-tiered-segments/SPEC.md#provenance).
+
+## Fragment composition
+
+Read the [design provenance](X18-fragment-composition/SPEC.md#provenance).
+
+## Reasoner core
+
+Read the [design provenance](F23-reasoner-core/SPEC.md#provenance).
+
+## OWL classification
+
+Read the [design provenance](F24-owl-classification/SPEC.md#provenance).
+
+## Git sync and remotes
+
+Read the [design provenance](F25-git-sync-and-remotes/SPEC.md#provenance).
+
+## Temporal paths
+
+Read the [design provenance](F26-temporal-paths/SPEC.md#provenance).
+
+## Impact and identity primitives
+
+Read the [design provenance](F27-impact-and-identity-primitives/SPEC.md#provenance).
+
+## ML and probabilistic integration
+
+Read the [design provenance](F28-ml-and-probabilistic-integration/SPEC.md#provenance).
+
+## Ontology workbench
+
+Read the [design provenance](U12-ontology-workbench/SPEC.md#provenance).
+
+## Resource catalog
+
+Read the [design provenance](C30-resource-catalog/SPEC.md#provenance).
+
+## Checks and protected merges
+
+Read the [design provenance](C31-checks-and-protected-merges/SPEC.md#provenance).
+
+## Linked-data publishing
+
+Read the [design provenance](C32-linked-data-publishing/SPEC.md#provenance).
+
+## Agent platform controls
+
+Read the [design provenance](C33-agent-platform-controls/SPEC.md#provenance).
+
+## Audit and erasure
+
+Read the [design provenance](C34-audit-and-erasure/SPEC.md#provenance).

@@ -205,3 +205,10 @@ The entity picker searches labels as Explore's search does and does not limit it
 the field's `sh:class`, which the server's check reports instead. Complex paths are shown
 without values. See the [screenshot](../../images/forms.png) of a form in Explore and the
 [screenshot](../../images/forms-branch.png) of a form saving to a session branch.
+
+## Scope changes
+
+**Ontology editing in the UI.** The non-goal in §1 of the spec excluded editing ontologies, leaving the shapes editor of the Validate panel as the only editor. Ontology editing in the UI is now planned under [ROADMAP](../../ROADMAP.md) item 457 and [U12](../U12-ontology-workbench/README.md).
+
+**Term editing forms for vocabulary terms.** The same non-goal also left out forms that edit vocabulary terms. These forms are now planned under item 458 and [C30](../C30-resource-catalog/README.md).
+

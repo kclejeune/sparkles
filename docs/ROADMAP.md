@@ -94,37 +94,95 @@ Wave A holds the work that most improves the engine against objective measures.
   [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records them. Durable commits and
   mixed-load writes follow through items 446 and 447, and cold point lookups
   through item 4.
+* The benchmark gates of item 452 exist before any engine rewrite starts. Items 469 to
+  473 add the eager-against-cursor forge matrix, the W3C suites under
+  `execution=streaming`, `incr_bench` as a mise task, a demand and RDFS-on-read latency
+  benchmark and an instruction-count screen. Each further loss that item 452's
+  competitive coverage finds becomes its own Wave A item.
 * Streaming execution and spill follow through items 7 and 93.
+* The first three stages of the unified executor, item 453, follow. Items 474 to 478
+  delete dead and superseded paths, item 479 sets the first-release format cutoff, and
+  items 480 to 484 consolidate the execution policy, the reasoning mode, request
+  building, rank fusion and the commit publish tail.
+* The reasoning quick fixes of item 456 are items 485 to 487. They add closure operators,
+  the missing OWL 2 RL rules and cost-based rule-body planning.
 * The remaining Stage A lanes of item 17 are items 414 to 417. They deliver internal
   circuits, the provenance algebra, reasoner witnesses and the fixed-point operator.
 * Small lanes that finish a capability run in free capacity. These are items 277 and
   77.
 
+### Wave A2: engine rewrites
+
+Wave A2 holds the rewrites that the Wave A gates protect. These are the accounting model,
+shared kernels and executor merge of item 453, the join algorithms and estimation of item
+454, the storage consolidation of item 455 and the reasoner core of item 456, which ends
+with the incremental-maintenance core it shares with views. Each rewrite is measured on
+forge before it lands. No query may be 5% or more slower on forge at 12 threads, and no
+query under 0.3 ms may be slower on an Intel host.
+
 ### Wave B: memory and entities
 
 Wave B starts with item 81 Phase 3, then items 341, 396 and 435 and the remaining C18
 work. Item 18 Phase 3 and item 12 follow once the item 17 lanes they need have landed.
-Item 12 needs item 414, and item 18 Phase 3 needs items 415 and 416.
+Item 12 needs item 414, and item 18 Phase 3 needs items 415 and 416. The cheap agent
+tools of item 462 also belong to Wave B. They are the `ask` MCP tool in item 488, MCP tool
+profiles in item 489 and a hybrid search tool that embeds query text in item 490.
+
+### Wave C: ontology and data platform
+
+Wave C builds the ontology and data platform of items 457 to 461. Item 71's axiom model
+comes first, followed by the ontology syntax readers, OWL classification and the
+ontology workbench. The resource catalog of item 458 comes first on the data side,
+followed by checks and protected merges, linked-data publishing and git export.
+Fragment composition follows the storage consolidation of item 455. Wave C runs
+alongside Wave A2 and starts once the policy plumbing of items 480 to 483 has landed and
+a second gate host is available.
+
+### How the waves share capacity
+
+The waves run in parallel, and each has its own capacity. Wave B always has one stream
+of work reserved for it. When work competes for gate, review or benchmark time, the
+dependency order and how ready the work is decide which goes first, not the wave it
+belongs to. The goal at the start of this section states what Sparkles optimizes
+for, and it does not order the waves.
+
+The waves group the work by delivery, and the tiers below rate its value. A wave can
+therefore hold items from several tiers. Within a wave, the order its section gives
+applies, and across waves the dependency order and readiness decide.
 
 ### Production readiness
 
-Production readiness runs alongside both waves. It covers items 60, 59 and 58 for the
+Production readiness runs alongside the waves. It covers items 60, 59 and 58 for the
 API policy, server artifacts and packages, item 61 for backups and item 65 for
 encryption, together with items 402 and 400. Item 64 and the adopted phases of 65 close
-startup and key workflows.
+startup and key workflows. The format cutoff of item 479 lands before the release
+artifacts of items 58 and 59, so the first release reads only the formats it supports.
 
 ### Deferred
 
 Items 339 and 340 for durable jobs and maintained analyses, item 100 for report
 configurations, the supply-chain application, item 20 for openCypher, item 72 for JSON
 query languages and item 344 for ChatGPT-plan model access wait for the work above. A
-prerequisite can bring one of them forward when a concrete use case needs it.
+prerequisite can bring one of them forward when a concrete use case needs it. Work
+that depends on them waits with them. The data-change triggers of item 462 wait for item
+339, the scheduled stored queries and updates of item 467 wait for item 339's durable
+jobs, and the Bolt protocol of item 465 waits for item 20.
 
 ### Sequencing
 
 Write-path competitive work goes before the commit-time maintenance lane of item 17,
 which is item 421, because both change the commit path. Item 421 then measures its cost
 against the improved baseline.
+
+Several workstreams have hard orderings.
+
+* Items 7 and 93 land before the executor merge of item 453.
+* Items 446 and 447 land before the commit-path merge of item 455, which is the long-term
+  half of its shared publish tail.
+* Storage consolidation in X16 lands before fragment composition in X18.
+* The format cutoff of item 479 lands before the release artifacts of items 58 and 59.
+* OWL classification in F24 stays separate from the reasoner core in F23. The two meet
+  only through the F21 axiom model of item 71.
 
 ### Acceptance by milestone
 
@@ -137,6 +195,8 @@ against the improved baseline.
 | Shared entity representation | Bounded private offline replay and selected fixture mappings are available over the entity, identifier, resolution and evolution resources. Item 396 retains authenticated managed integration. | Independent query fixtures preserve source claims through conflicting identifiers, merge and split decisions, source correction and mapping migrations. |
 | Reproducible assessments | Item 340 delivers F22 Phase 1 after C25's typed records and C26's fenced publication are available. Full recomputation is the initial execution model. | Inputs, outputs and methods are reproducible. New matching data, source withdrawals, expiry and authorization changes invalidate affected results. |
 | Unattended operation | Complete C26 Phase 2 and F22 Phase 2, including temporal scheduling. Item 100 supplies guarded report configurations when distinct audiences are required. | Fenced database publication rejects stale attempts and duplicate accepted database effects. External delivery is at least once with stable event IDs, so receivers deduplicate repeated deliveries. Recovery preserves current authorization. |
+| Unified engine | Item 453 merges the executors, with the stages before the merge and the gates of items 469 to 473 in place. | The single executor passes the gates of items 469 to 473. No query is 5% or more slower on forge at 12 threads, and no query under 0.3 ms is slower on an Intel host. |
+| Ontology and data platform | Items 457 to 461 deliver the axiom model, classification, the ontology workbench, the resource catalog, checks and linked-data publishing. | The catalog, checks, workbench and publishing pass the phase gates of their specs. |
 | Full partial-feature completion | Finish the other adopted partial-feature phases and release contracts, including explicitly scheduled large phases. | Required feature, compatibility, packaging and operational acceptance are complete before release. |
 
 Item 396 defines shared entities and domain mappings without duplicating C25 review
@@ -170,15 +230,60 @@ prerequisites for the first memory workflow.
 
 ## Tracks and decisions
 
-Four tracks run through the tiers. Dependencies apply to the named remaining phases,
+Seven tracks run through the tiers. Dependencies apply to the named remaining phases,
 not to every extension in a spec or to phases that have already shipped.
 
 | Track | Open items | Specs |
 |---|---|---|
 | **Performance** | 1 refreshes the evidence while 7 and 4 address their remaining gates. Item 93 controls the spill default, and 446 lowers the fence cost of indexed group commit. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
 | **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 414. | F14, C22, F13 |
-| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. | F16, F17, F13, F18 |
+| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. Item 456 completes OWL 2 RL and rebuilds the reasoner core, starting with items 485 to 487. | F16, F17, F13, F18, F23 |
+| **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, starting with items 474 to 484. Item 454 follows the executor merge, and 455 follows 446, 447, 4 and 14. | X14, X15, X16, X17, X05 |
+| **Ontology and data platform** | 71 is the root of the ontology workbench 457. Items 458 to 461 add the resource catalog, checks and protected merges, git sync and linked-data publishing once the policy plumbing of 480 to 483 has landed. | F21, F24, U12, C30, X18, C31, F25, C32 |
+| **Agent platform** | 462 adds tool profiles, review queues, handoff and framework adapters, starting with 488 to 490. Its data-change triggers wait for 339. | C33, C11, C17, C18 |
 | **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses the lanes of item 17. | C25, C26, A01, F22, C27, C22b |
+
+The workstreams depend on each other and on existing items as follows.
+
+```mermaid
+flowchart LR
+    G["452 · Benchmark gates"] --> XM["453 · Executor merge"]
+    G --> QF["485–487 · Reasoning quick fixes"]
+    S1["474–478 · Cheap deletions"] --> XM
+    FC["479 · Format cutoff"] --> XM
+    PL["480–483 · Policy plumbing"] --> XM
+    PT["484 · Commit publish tail"] --> XM
+    I7["7 · Batch execution and spill"] --> XM
+    I93["93 · Spill costs and default"] --> XM
+    XM --> JA["454 · Join algorithms and estimation"]
+    FC --> I58["58 · Packages"]
+    FC --> I59["59 · Server binaries and images"]
+    I446["446 · Group commit fences"] --> SC["455 · Storage consolidation"]
+    I447["447 · Group commit gaps"] --> SC
+    I4["4 · Cold sparse lookups"] --> SC
+    I14["14 · Compaction and progress"] --> SC
+    QF --> RC["456 · F23 reasoner core"]
+    I9["9 · Materialization at scale"] --> RC
+    RC --> IM["456 · Shared maintenance core"]
+    I417["417 · Fixed-point operator"] --> IM
+    IM --> IA["463 · Incremental algorithm results"]
+    I71["71 · OWL 2 ontology API"] --> OC["457 · F24 OWL classification"]
+    I71 --> WB["457 · U12 ontology workbench"]
+    OC --> WB
+    PL --> CA["458 · C30 resource catalog"]
+    CA --> CK["459 · C31 checks and protected merges"]
+    CA --> PB["461 · C32 linked-data publishing"]
+    CA --> FR["458 · X18 fragment composition"]
+    SC --> FR
+    I71 --> PB
+    I280["280 · Replication decisions"] --> GR["460 · F25 git remotes"]
+    I66["66 · Replication"] --> GR
+    I81["81 · Shared evidence"] --> AP["462 · C33 agent platform controls"]
+    I341["341 · Valid time"] --> AP
+    I396["396 · Shared entities"] --> AP
+    I435["435 · Scratch-branch limits"] --> AP
+    I339["339 · Durable jobs and delivery"] --> AP
+```
 
 The following dependencies describe the remaining phase contracts. Independent work can
 proceed in parallel, including full recomputation of maintained analyses before later
@@ -238,7 +343,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | Spec | Remaining items | Exit condition |
 |---|---|---|
 | [C01](specs/C01-observability-and-budgets.md#outcome) | 342, 402 | Startup reports a dataset whose derived index is unavailable as degraded, and the progress of a log replay, without losing readiness or access controls. JSON and OTLP include the Phase 2 work, memory-peak and rebuild series with the Prometheus units, labels and histogram semantics. |
-| [C03](specs/C03-graphql/SPEC.md#outcome) | 37 | Complete Phase 2's seeded execution, bounded per-parent windows, nested connections, UI/schema editing and persisted-query controls with differential and visibility tests. Subscriptions are deferred until a workload asks for them, and then use F13. Mutations require the separate scope decision recorded in the Outcome. |
+| [C03](specs/C03-graphql/SPEC.md#outcome) | 37 | Complete Phase 2's seeded execution, bounded per-parent windows, nested connections, UI/schema editing and persisted-query controls with differential and visibility tests. Subscriptions are deferred until a workload asks for them, and then use F13. Mutations generated from the mapping are planned under item 465 and are not part of this exit condition. |
 | [C06](specs/C06-clone-to-sandbox.md#outcome) | 45 | Remote and archive clones preserve a chosen branch/commit's data, stored blank identities, prefixes and configuration while creating correct new lineage. Interrupted, corrupt or cancelled transfers publish no destination. |
 | [C17](specs/C17-agent-memory.md#outcome) | 81, 435 | Scratch branches honor a per-principal limit, warnings before expiry and a keep option, beside the dataset-layered expiry that works over HTTP and stdio. Adopt the shared evidence profile with its source, review and independent-support acceptance queries; server model calls use the successor C18 contract. |
 | [C18](specs/C18-natural-language-questions-and-ingest/SPEC.md#outcome) | 6, 15, 27, 77, 81, 263, 318 | Finish the remaining evaluation matrix, multimodal ingestion, redaction and verified rewrites, and test grounding and VALUES changes against caller-visible data. Publish matching accuracy and latency evidence, preserving clarification for ambiguity and the original secret, budget and citation guarantees. |
@@ -315,8 +420,8 @@ continues within its caller-visible evidence and measured-latency scope.
 | 339 | **Durable jobs and delivery.** Planned checkpointed jobs, fenced external workers and a transactional outbox make collection, analysis and delivery resumable after a restart. Publication and delivery intent share the dataset transaction. | [C26](specs/C26-durable-jobs-and-delivery.md) | L | High |
 | 341 | **Valid time and observation history.** Versioned RDF resources, SHACL shapes and typed temporal templates are available. Phase 1 remains incomplete at A4 until C25 Phase 2 and protected writes establish server-owned availability and refuse backdating. Later phases add the projection helper, event-time UI and expiry integration. | [C27](specs/C27-valid-time-profiles.md) | M–L | High |
 | 340 | **Maintained analyses and evidence dependencies.** Planned immutable run manifests, conservative read dependencies and guarded publication track when assessments need review or recomputation. Begin with bounded full recomputation and add proven incremental maintenance through item 17. | [F22](specs/F22-analysis-lifecycle.md) | L | High |
-| 58 | **Packages and async coverage.** Python async queries, bounded cursors and transactions are available. Publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and further Python async administration and bulk coverage remain. The workflows exist with their publish jobs switched off. | [X12](specs/X12-release-engineering.md), [P01](specs/P01-python-bindings.md#async-datasets-and-cursors), [P04](specs/P04-jvm-bindings/OUTCOME.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L | High |
-| 59 | **Server binaries and published container images.** An unpublished GNU x86_64 archive pipeline passes packaging and installed persistence checks on pinned Debian 11 and Rocky Linux 8 runtimes. Other platforms, provenance, releases and container publication remain. The HTTP client should start without a system CA store, and the candidate workflow should run on demand, on a schedule and for packaging changes, with tests that import its preflight script. | [X12](specs/X12-release-engineering.md) | M | High |
+| 58 | **Packages and async coverage.** Python async queries, bounded cursors and transactions are available. Publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and further Python async administration and bulk coverage remain. The workflows exist with their publish jobs switched off. The format cutoff of item 479 lands before these artifacts are published. | [X12](specs/X12-release-engineering.md), [P01](specs/P01-python-bindings.md#async-datasets-and-cursors), [P04](specs/P04-jvm-bindings/OUTCOME.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L | High |
+| 59 | **Server binaries and published container images.** An unpublished GNU x86_64 archive pipeline passes packaging and installed persistence checks on pinned Debian 11 and Rocky Linux 8 runtimes. Other platforms, provenance, releases and container publication remain. The HTTP client should start without a system CA store, and the candidate workflow should run on demand, on a schedule and for packaging changes, with tests that import its preflight script. The format cutoff of item 479 lands before these artifacts are published. | [X12](specs/X12-release-engineering.md) | M | High |
 | 60 | **API stability policy.** The policy and HTTP and standard CLI development-baseline checks are available. Library and binding comparisons, CLI JSON and exit-code coverage, MCP and metrics guards, deprecation signals and release baseline integration remain under X12 Phase 4. | [X12](specs/X12-release-engineering.md) | S–M | High |
 | 61 | **Backup completion.** Whole-server and multi-dataset runs, remote CLI, repository copy and gated content-defined chunking remain. Add optional retained generations and pins, storage-class and Object Lock/WORM controls, and an explicit repository-zstd decision, with restoration and retention acceptance. | [F05](specs/F05-snapshot-repositories/OUTCOME.md#roadmap-follow-ups-2026-10-12), [X01](specs/X01-compression-codecs.md#remaining-codec-decisions) | L | High |
 | 263 | **Ask on DBpedia.** Question-aware grounding has mixed measured accuracy, while bounded versioned candidate evidence preserves full choice identities and supports conservative display ordering. General contextual resolution and further accuracy work remain, with genuine ambiguity kept as a clarification. Changes need offline and end-to-end checks. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-accuracy-item-263) | M | High |
@@ -334,8 +439,12 @@ continues within its caller-visible evidence and measured-latency scope.
 | 100 | **Reports for distinct audiences.** Planned named GraphRAG configurations have separate principals, projections, guarded reports and review histories, with an explicit default and shared dataset spending limits. | [C22b](specs/C22b-report-configurations.md) | M | High |
 | 65 | **Encryption.** Finish key workflows, Vault/cloud KMS and recovery export, then Phase 2 write-only age-recipient repositories and age identities. Phase 3 live-dataset and Phase 4 derived-index encryption follow; item 61 owns the shared chunking gate. A delayed initializer with the wrong key should remove its own leftover intent, and the marker-attachment branches should share one helper. | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
 | 7 | **Batch-oriented execution and disk spill.** The full-scale spill matrix passes, while execution follow-ups and the default decision remain under item 93. Spill stays opt-in, and several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
-| 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress, remaining algorithm surfaces, and the remaining algorithm surfaces remain. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
+| 453 | **Unified executor.** Sparkles runs queries through an eager columnar executor and a pull-cursor executor, so every kernel exists twice and each entry point encodes its own execution policy. This workstream merges them into one morsel-driven pull engine in six stages, from cheap deletions and policy plumbing through one accounting model and shared kernels to the merge itself. Items 474 to 484 hold the first three stages, and the merge needs items 7 and 93 and the gates of items 469 to 473. | [X14](specs/X14-unified-executor/README.md) | XL | Very high |
+| 454 | **Join algorithms and estimation.** The planner assumes independent patterns outside subject stars, stops exhaustive ordering at 16 inputs and runs cyclic patterns through binary joins. Correlation-aware estimation, a worst-case-optimal join, scalable enumeration, adaptive re-optimization, OPTIONAL reordering, a reachability index and factorized results remain. They follow the executor merge of item 453 so that each lands in one engine. | [X15](specs/X15-join-algorithms-and-estimation/README.md) | XL | High |
+| 455 | **Storage consolidation.** The store still reads every pre-release format, keeps about 80 twin readers and publishes commits through three paths. The format cutoff of item 479, budgeted readers through one Control trait, the shared publish tail of item 484 and one load plan remove that duplication, and partitioned vocabularies with per-range generations make maintenance follow the size of a change. Tiered segments in X17 add an object-store tier, and the work follows items 446, 447, 4 and 14. | [X16](specs/X16-storage-consolidation/README.md) | XL | High |
+| 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress and the remaining binding and JVM surfaces for the existing algorithms remain. New algorithms belong to item 463. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
 | 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. Representatives would also let derivation on demand read equality without the `eq-rep-*` rules. Today a demand on a small view where `owl:sameAs` relates classes and properties can take much longer than materializing the whole view. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
+| 456 | **Reasoning engine.** OWL 2 RL is incomplete, transitive relations run through generic rules, rule planning is greedy, and the reasoner's maintenance is separate from the incremental core of F13. Items 485 to 487 add closure operators, the missing rules and cost-based rule-body planning first. A columnar derived tier, compact provenance, a native n-ary Datalog core, SHACL-AF and translated SWRL, SPIN and N3 follow, and the shared maintenance core comes after item 417's LUBM measurements. | [F23](specs/F23-reasoner-core/README.md) | XL | High |
 | 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit remains planned and waits for item 414. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 14 | **Compaction and operation progress.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. Shared controlled load and compaction progress must also reach the Node callbacks without weakening cancellation or memory budgets. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#operation-progress) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
@@ -370,6 +479,28 @@ affect the write path measure with the `--views none|async:N|commit:Q|graph:N` o
 | 428 | **Data-dependent protections as views.** Compile protections that depend on data into views, so a live reader no longer recomputes its whole query. | [F13](specs/F13-incremental-views-and-provenance.md#62-live-queries) | L | 417 |
 | 429 | **View provenance.** Add `view:witness` and `view:why`, and provenance on one-off queries, together with item 221's views over inferred data. | [F13](specs/F13-incremental-views-and-provenance.md#53-uses) | M | 415, 417 |
 
+### Numbered phases of items 453, 455 and 456
+
+These phases of the engine workstreams are ready to start. Each row names its
+workstream, and the spec that holds the design gives its gates. They run in Wave A.
+
+| # | Item | Spec | Size | Workstream |
+|---|---|---|---|---|
+| 474 | **Dead compaction arm and one generation switch.** `rebuild_locked` takes a plain bulk commit and loses its unreachable compaction arm, `build_generation` splits from a shared `switch_generation`, and the lazy sync worker replaces the thread-per-call `sync_commit`. Behaviour does not change. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
+| 475 | **One join-order planner.** Keep `joinorder.rs` only, lift its 128-variable fallback, and delete the old DP and greedy planners with the `pruned_join_order` toggle, so that item 84 lands on one planner. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
+| 476 | **Superseded replacement toggles.** Remove the off paths of about 15 toggles whose replacements shipped, keep the algorithm toggles used for diagnosis and move reference evaluation into a test-only evaluator. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
+| 477 | **Shared format registry and small helpers.** One registry of format names, extensions and media types, one inferred-graph constant, one duration parser and one durable atomic-write helper replace their copies, and the draft mapping writer escapes Turtle strings as the main writer does. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | S | 453 |
+| 478 | **Test-only implementation switches.** Environment switches, implementation-only store options and measurement switches become test-only or go once item 4 closes X07. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | S | 453 |
+| 479 | **First-release format cutoff.** Fix the cutoff, refuse older formats with the dump-and-reload message or migrate each one, and drop the pre-release readers and the legacy WAL machinery. It lands after item 343 and before the release artifacts of items 58 and 59. | [X16](specs/X16-storage-consolidation/SPEC.md#candidate-phases) | M | 455 |
+| 480 | **One execution-policy function.** One core function chooses execution from what the consumer needs, so that HTTP, the CLI, MCP, GraphQL and the bindings state their needs instead of encoding a policy. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
+| 481 | **Typed reasoning mode and one inference view.** A typed reasoning mode and one inference view on `Dataset` replace about eight places that choose inferred data by string matching. Items 19 and 221 build on it. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
+| 482 | **Query request builder and caller context.** A library request builder with budgets and reasoning and a server caller context replace about 16 copies of the per-caller options recipe. The GraphRAG builder then applies the server's timeouts and limits. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
+| 483 | **Shared rank fusion and text hits.** One library rank-fusion function and one text-hit reader serve `spk:hybridSearch`, MCP search and the memory layer, which today generate `text:query` three times and fuse ranks five times. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
+| 484 | **Shared commit publish tail, short-term half.** Extract the WAL transaction encoder, a snapshot builder and the shared publish tail from the three publish paths and the compaction writer. The long-term half, in which the group leader writes through the direct handles, waits for item 446. | [X16](specs/X16-storage-consolidation/SPEC.md#candidate-phases) | M | 455 |
+| 485 | **Closure operators.** Evaluate transitive, symmetric and equivalence relations, `subClassOf`, `subPropertyOf` and `sameAs` through SCC condensation with a linear closure and union-find, so that OWL2Bench under OWL RL completes at 5 universities and above. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | M | 456 |
+| 486 | **The missing OWL 2 RL rules.** Add `prp-key`, `cls-maxqc4`, the cardinality-zero rules, the datatype rules and property chains of any length. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | S | 456 |
+| 487 | **Cost-based rule-body planning.** Plan rule bodies with the SPARQL estimator's characteristic sets and probes, use DP for bodies of up to about six atoms, and replan when delta ratios shift. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | S | 456 |
+
 ### Remaining work for item 7
 
 * Spill stays opt-in while item 93 closes execution costs and the default decision,
@@ -389,18 +520,43 @@ affect the write path measure with the `--views none|async:N|commit:Q|graph:N` o
 ## Tier 3: big bets
 
 These remaining reasoning and integration phases follow the foundation and shared
-capability work above. Each phase keeps its declared prerequisites and acceptance.
+capability work above. Each phase keeps its declared prerequisites and acceptance. The ontology and data platform workstreams follow them, rooted in item 71.
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
 | 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 after items 415 and 417, and adds `why` provenance on tables for F18. Items 190, 192 and 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
 | 25 | **Query extension completion.** Dynamic dispatch, foreign callbacks, batching, additional aggregate arities and measurements remain, including native Java dispatch beside ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. Its Phase 1 axiom model, mappings, profile checks and `/$/ontology/{ds}` are the root of the ontology workbench, item 457. | [F21](specs/F21-ontology-api.md) | L | High |
+| 457 | **Ontology workbench.** Sparkles reads and checks ontologies but cannot edit, classify or explain them as ontology tools do. Item 71's axiom model comes first, then OWL syntaxes, refactoring, diffs, module extraction and OWL and SHACL translation in F21, an EL classifier and DL bridge in F24, and the editor in U12. Classification stays separate from the reasoner core of item 456. | [F21](specs/F21-ontology-api.md#ontology-workbench-workstream) | XL | High |
+| 458 | **Resource catalog.** Loading a public dataset is manual and unrecorded, vocabularies have no lifecycle and licences are not tracked. A server-level catalog of versioned sources, vocabularies and datasets adds a content-addressed source store, recipes, load manifests, pinned imports, mirrors, IRI minting and licence records. Fragment composition in X18 follows item 455, and the catalog starts once items 480 to 483 have landed. | [C30](specs/C30-resource-catalog/README.md) | L–XL | High |
+| 459 | **Checks and protected merges.** Protected branches check only the write guard. Gate suites defined in RDF, required checks on merge candidates, breaking-change analysis for vocabularies, per-commit check records and review workflows add continuous integration inside the server. | [C31](specs/C31-checks-and-protected-merges/README.md) | L | Medium–high |
+| 460 | **Git sync and remotes.** Vocabularies kept in git cannot round-trip through Sparkles, and no operation moves divergent history between servers. A canonical serialization, git export and import, and remotes with fetch, push and pull add both, with remotes after items 280 and 66. | [F25](specs/F25-git-sync-and-remotes/README.md) | L | Medium |
+| 461 | **Linked-data publishing.** Hosted vocabularies have no resolvable IRIs, term pages or cross-catalog search. Content negotiation, term and ontology pages with generated documentation, term search and an OLS API subset publish one server's resources, while hub features wait for a reason to host a public hub. | [C32](specs/C32-linked-data-publishing/README.md) | M–L | Medium |
 
 ## Tier 4: worth doing, not urgent
 
-This tier has three groups. The features are user-facing work, the performance follow-ups
-investigate measured costs and planner losses, and the graph-interaction UI finishes a set
-of canvas features.
+This tier has four groups. The workstreams hold later capability work with a primary
+spec each, the features are user-facing work, the performance follow-ups investigate
+measured costs and planner losses, and the graph-interaction UI finishes a set of canvas
+features.
+
+### Workstreams
+
+Each workstream has a primary spec that lists its candidate phases. A phase gets its own
+numbered item when it is ready to start.
+
+| # | Item | Spec | Size |
+|---|---|---|---|
+| 462 | **Agent platform.** Every MCP session sees about 34 tools, only one tool has a review path, agents poll for changes, and agent frameworks reach memory only through the generic HTTP routes, without adapters of their own. Tool profiles, an approval queue, data-change resources, branch handoff, framework adapters, in-process memory APIs and A2A skills address this, with items 488 to 490 first. | [C33](specs/C33-agent-platform-controls/README.md) | XL |
+| 488 | **An `ask` MCP tool.** Expose the checked, self-repairing question-to-SPARQL pipeline as a tool, since MCP reaches Ask only through the `ask_graph` prompt. It belongs to item 462 and follows items 263 and 318. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#agent-platform-workstream) | S |
+| 489 | **MCP tool profiles.** Add `--mcp-tools` and `--mcp-profile` subsets such as explore, memory and admin, so a session loads only the tools it needs. It belongs to item 462. | [C33](specs/C33-agent-platform-controls/SPEC.md#candidate-phases) | S |
+| 490 | **A hybrid search tool that embeds query text.** Add `search_semantic`, which embeds the query text and runs hybrid search, since `similar_entities` needs a vector and `search_text` is BM25 only. It belongs to item 462. | [C11](specs/C11-mcp-server.md#agent-platform-workstream) | S |
+| 463 | **Analytics library.** The algorithm library lacks DAG tools, centralities, structural criticality, batched personalized PageRank and comparisons across commits. These extend F14, while temporal paths in F26, impact and identity primitives in F27 and ML and probabilistic integration in F28 add new capabilities. Incremental algorithm results follow the shared maintenance core of item 456. | [F14](specs/F14-graph-algorithms.md#analytics-library-workstream) | XL |
+| 464 | **Search depth.** Full-text search has no facets, synonyms or suggester, hybrid ranking offers only reciprocal rank fusion, and vectors have no product or binary quantization or sparse retrieval. These extend F04, F03, F08 and F12. | [F04](specs/F04-vector-search.md#search-depth-workstream) | L |
+| 465 | **Interop and query surfaces.** Columnar result transfer, HDT, archive inputs, SHACL 1.2 Core, GraphQL aggregates and mutations, interactive HTTP transactions, GQL and a SQL surface remain. Each part extends the spec that owns its surface, as the spec index lists. The Bolt protocol waits for item 20. | [Spec index](specs/README.md#interop-and-query-surfaces) | XL |
+| 466 | **Security and audit.** Reads, writes and tool calls have no audit stream, and personal data cannot be erased from history and backups. C34 adds both with field-level encryption and PII detection, and C09, C12 and F11 gain attribute conditions, deny rules, local user management and further key providers. | [C34](specs/C34-audit-and-erasure/README.md) | L–XL |
+| 467 | **Operations and streaming.** The access log records neither the query text nor a normalized hash, there are no per-statement statistics or per-principal budgets, and no connector delivers changes to a broker. These extend C01, C21, C26, F13 and X12, and the scheduled stored queries wait for item 339. | [C01](specs/C01-observability-and-budgets.md#operations-and-streaming-workstream) | L–XL |
+| 468 | **Developer ecosystem and UI.** Python has no remote client, there is no plugin API or crates.io release, and several Explore views read only `main`. These extend P01, the other binding and client specs and the U-series specs. | [P01](specs/P01-python-bindings.md#developer-ecosystem-and-ui-workstream) | L |
 
 ### Features
 
@@ -445,6 +601,12 @@ spec sections.
 |---|---|---|---|
 | 445 | **First-call cost of a Python file-object load.** A one-triple load from a file object in a new process measured 6.4 ms on atlas, against 2.7 ms for the previous binding's transaction. Find where the 4 ms go, such as the start of the signal watcher and of the request's thread, and remove the fixed cost. | [Loading results](benchmarks/loading/RESULTS.md#python-file-objects) | S |
 | 1 | **Benchmark refresh.** Later X06 batches, BSBM at 100M, a rerun of the BSBM BI driver cells and the regeneration of the published tables remain. | [X06](specs/X06-benchmark-coverage.md), [F16](specs/F16-materialization-at-scale.md), [X08](specs/X08-disk-spill-and-server-memory.md#33-the-default-and-small-profiles) §3.3 | M |
+| 452 | **Benchmark gates and competitive coverage.** Several areas that the engine rewrites touch have no performance gate, and several comparisons are missing, such as a reasoning suite and BSBM Explore throughput. Items 469 to 473 add the gates before any rewrite. Competitive coverage then runs one benchmark at a time, weakest claims first, and each loss it finds becomes a Wave A item. | [X06](specs/X06-benchmark-coverage.md#benchmark-gates-and-competitive-coverage-workstream) | XL |
+| 469 | **Eager-against-cursor forge matrix.** Pin the 33 synthetic queries at 1.05M and 10.5M triples with 12 threads and one on forge, for both executors, as the oracle of item 453. | [X06](specs/X06-benchmark-coverage.md#benchmark-gates-and-competitive-coverage-workstream) | S |
+| 470 | **W3C suites under `execution=streaming`.** Run the W3C conformance suites with streaming execution forced, beside the default run. | [X06](specs/X06-benchmark-coverage.md#benchmark-gates-and-competitive-coverage-workstream) | S |
+| 471 | **`incr_bench` as a mise task.** Make `incr_bench.rs` a mise task with a recorded baseline, so that incremental maintenance has a gate. | [X06](specs/X06-benchmark-coverage.md#benchmark-gates-and-competitive-coverage-workstream) | S |
+| 472 | **Demand and RDFS-on-read latency benchmark.** Turn item 190's forge measurements into a benchmark of derivation on demand and RDFS on read with a recorded baseline. | [X06](specs/X06-benchmark-coverage.md#benchmark-gates-and-competitive-coverage-workstream) | S–M |
+| 473 | **Instruction-count screen.** Count instructions for vocabulary scans and WAL replay, so that reader changes of item 455 can be checked below timing noise. | [X06](specs/X06-benchmark-coverage.md#benchmark-gates-and-competitive-coverage-workstream) | S |
 | 4 | **Cold sparse lookups.** Phase 4 adds an optional prewarm of the pages a server used before it stopped. Cold `star-join` at 10.5M is slower with index format 3 and that cost should be removed. The Oxigraph targets need measuring again, and the 1.01B dense-read gate and its window sweep are not measured. | [X07](specs/X07-cold-sparse-reads.md) | M |
 | 33 | **Per-call overhead in the bindings.** JNI calls cost 3 to 4 times Jena's in-memory store, and Node `has()` and export conversion are slower than published targets. Python value lookups trail by 0.67 µs, and some small queries by 11 to 20 µs. The scorecard in scripts/bench-bindings/scorecard.py can compare cases once the harness records the API layer, term consumption and oracle evidence and the scorecard accepts ordered and pooled fingerprints. The Python async cursor converts each row of a batch through a separate native call and reads the plan and statistics again for every batch, which is unmeasured. | [P01](specs/P01-python-bindings.md#current-source-per-call-assessment), [P04](specs/P04-jvm-bindings/OUTCOME.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M |
 | 40 | **Memory footprint.** Idle server RSS, Python process RSS and full-text index size. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 3 | M |
@@ -531,7 +693,6 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 55 | **Completions and OpenAPI.** Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas. This follow-up is outside the completion of formatting, linting and command-line tools. | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 56 | **Legacy MCP resource subscriptions.** | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
 | 435 | **Scratch-branch limits and warnings.** Add `scratchBranches.maxPerPrincipal` and `scratchBranches.notifyBefore` to the memory settings, a `keep` argument on `create_branch`, and an `admin` route that clears a scratch mark. The brief and the branches resource list the branches that expire within the window, and the `memory.review.pending` event names the ones that hold unreviewed proposals. | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
-| 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. | [F21](specs/F21-ontology-api.md) | L |
 | 74 | **RDF Patch.** Patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
 | 75 | **Access control.** Validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 76 | **Jena integration completion.** Complete assembler bodies, direct Graph Store naming per dataset, JVM metrics and batched fallback graph patterns. Expand the standalone HTTP harness to its full accepted cases, and record decisions for optional JVM module, allocator and transaction extensions. | [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings/OUTCOME.md#remaining-integration-contract) | M |

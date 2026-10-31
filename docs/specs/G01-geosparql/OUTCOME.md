@@ -265,16 +265,20 @@ opt-in mode for Jena's answers, and it is not adopted.
   * *Curved GML segments and solids.* `geo/xml.rs` reads straight segments only. Arcs
     (`gml:Arc`, `gml:ArcString`, `gml:Circle`) are linearized at read time with a
     chord error bound (default 0.1 m, or 1e-6 of the extent in a CRS without units),
-    recorded as a plan warning; `gml:Solid` reads as its boundary surfaces.
-  * *3D constructions.* Constructed geometries are 2D (*Deviations* above). Buffers,
-    hulls and overlays keep the Z values of input vertices that survive unchanged and
-    interpolate Z along the input segment for new vertices; a construction whose
-    output has new vertices in an area interior returns 2D, as now, with a warning.
-  * *Splitting lines at crossings.* `geof:union` of two crossing lines keeps the
-    covered points but does not split the lines at each crossing, unlike JTS. The
-    curve-against-curve step of `geo/ops/overlay.rs` already computes the crossings by
-    segment intersection; it nodes both lines at them before assembling the result,
-    so the output's line strings meet only at their ends, as in JTS.
+    recorded as a plan warning. A `gml:Solid` reads as its boundary surfaces, and a
+    solid as a volume is not adopted.
+  * *3D constructions.* Not adopted. Constructed geometries stay 2D (*Deviations*
+    above). The design considered had buffers, hulls and overlays keep the Z values of
+    input vertices that survive unchanged and interpolate Z along the input segment for
+    new vertices, with a construction that has new vertices in an area interior
+    returning 2D and a warning.
+  * *Splitting lines at crossings.* Not adopted. `geof:union` of two crossing lines
+    keeps the covered points but does not split the lines at each crossing, unlike JTS.
+    The design considered had the curve-against-curve step of `geo/ops/overlay.rs`,
+    which already computes the crossings by segment intersection, node both lines at
+    them before assembling the result, so that the output's line strings meet only at
+    their ends, as in JTS.
+
 **A Jena compatibility mode** (item 70, not adopted, [ROADMAP](../../ROADMAP.md)). The decisions in
 [COMPARISON.md](../../COMPARISON.md#geosparql) give different answers from Jena on purpose,
 and the Compliance Benchmark's misses trace to some of them (the Conformance paragraph
@@ -297,3 +301,11 @@ The mode is part of the index files' identity where it changes what is indexed (
 CRSs). It never changes a dataset without the setting. Acceptance: with the mode on,
 each of the benchmark's misses that the Conformance paragraph attributes to these
 choices passes, and the score with the mode is reported beside the default's.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Geometry validity and strict geometry writes.** Add `isValid`, `makeValid` and `simplify` and an opt-in rejection of ill-typed geometry literals. Invalid geometries give wrong topology. It depends on item 24.
+
+**GIS file import.** Load Shapefile, GeoPackage, GeoParquet and FlatGeobuf into geometry literals. Open geodata rarely arrives as RDF. It depends on items 24 and 237.

@@ -25,7 +25,8 @@ It formats:
 - N-Triples 1.2 and N-Quads 1.2;
 - JSON-LD 1.1 (Phase 2).
 
-RDF/XML is rejected (§4.5).
+RDF/XML is rejected in this design (§4.5), and [ROADMAP](../../ROADMAP.md) item 465 plans it
+separately.
 
 **Goals**
 
@@ -58,7 +59,10 @@ RDF/XML is rejected (§4.5).
   variables, undeclared prefixes, cartesian products and deprecated syntax.
 - Formatting SPARQL embedded in string literals (`sh:select """…"""`), because that
   changes the literal (§4.2).
-- Formatting N3, RDF/XML, SHACL compact syntax (`.shc`) or plain JSON.
+- Formatting N3, RDF/XML, SHACL compact syntax (`.shc`) or plain JSON. RDF/XML formatting
+  is outside the design of this spec, and [ROADMAP](../../ROADMAP.md) item 465 plans it in
+  the Roadmap follow-ups of its [delivery record](OUTCOME.md#roadmap-follow-ups). The other
+  formats stay non-goals.
 - Range formatting. The LSP in Phase 2 formats the whole document and returns a minimal
   edit.
 - Streaming Turtle/TriG larger than memory. Only the line formats stream.
@@ -1482,7 +1486,9 @@ to format". The endpoint answers 415 with the same text. There are four reasons:
 4. **Oxrdfxml cannot do it.** Its serializer does not abbreviate and would drop comments.
 
 A comment-free mode that re-serializes to canonical RDF/XML would add little, because
-users who want formatted data are better served by Turtle.
+users who want formatted data are better served by Turtle. This design keeps that
+reasoning, and [ROADMAP](../../ROADMAP.md) item 465 plans RDF/XML formatting as a separate
+addition in the Roadmap follow-ups of the [delivery record](OUTCOME.md#roadmap-follow-ups).
 
 ## 5. Normalizations
 
@@ -1928,7 +1934,7 @@ The two optional keys are not critical (§13). If either one needs much more tha
 estimate, for example because comments or annotation blocks do not fit the shared SPARQL
 triples printer, it is dropped rather than shipped approximately.
 
-RDF/XML stays rejected (§4.5).
+RDF/XML stays rejected in this design (§4.5).
 
 **Phase 3 (about 7 days)**
 
@@ -2001,7 +2007,9 @@ A `sparkles lint` needs its own spec.
   ecosystem, and consistent output is the product. The §2.2 keys are the bounded
   exception, decided item by item (§13). Each one maps to a convention that existing
   files and tools already use, so forcing the default would churn those files.
-- **Formatting RDF/XML** (§4.5).
+- **Formatting RDF/XML** (§4.5). This design rejects it, and [ROADMAP](../../ROADMAP.md)
+  item 465 plans it separately in the Roadmap follow-ups of the
+  [delivery record](OUTCOME.md#roadmap-follow-ups).
 - **Formatting SPARQL inside SHACL literals.** It changes the graph (§4.2).
 - **Canonicalizing literal lexical forms.** It changes RDF terms (N9).
 

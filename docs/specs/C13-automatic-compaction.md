@@ -887,10 +887,21 @@ binding compacts them in 0.07 to 0.14 s.
 
 **Not built.** Delta quads located per block, a vocabulary that takes new terms without a
 full build, adaptive thresholds and compaction in embedded use without a server remain
-later work. The vector indexes' graphs are still built after the switch, so their
-searches are exact for a while after each compaction. A bulk commit still builds the
-spatial index's base under the writer lock, because it holds the lock for its whole
-rebuild anyway.
+later work. A bulk commit still builds the spatial index's base under the writer lock,
+because it holds the lock for its whole rebuild anyway.
+
+A compaction carries a vector index's graph over to the new generation before the switch
+(`Store::prebuild_vectors`, [F04](F04-vector-search.md#outcome)) when at most 30% of its
+nodes changed and the old graph was built with the same settings, so a search after the
+compaction uses a graph at once. Otherwise the graph is built in the background after the
+switch, as §4.8 describes, and searches scan exactly until it is ready.
+
+**Current code path.** Every compaction, whether started by the scheduler or by hand,
+runs through `Store::compact_with` and `compact_inner` in `store/compaction.rs`, and
+`Store::compact` calls it. `rebuild_locked` in `store.rs` serves bulk commits only, since
+each of its callers passes a bulk commit. Its path for a rebuild without one is no longer
+reached, so §5.1's manual path for stores that cannot use the background path describes
+the original design and not the code.
 
 ### Roadmap follow-ups (2026-10-12)
 
