@@ -2275,3 +2275,18 @@ fn order_keys_equal_to_a_select_expression_order_by_its_variable() {
     );
     assert!(!has_desc(&r.plan, "(?w)"));
 }
+
+/// A later BIND gives a variable of the expression another value at the ORDER BY.
+#[test]
+fn order_keys_reading_a_later_binding_are_evaluated_again() {
+    let s = range_store();
+    for text in [
+        "SELECT ?i WHERE { VALUES ?i { 1 2 } BIND(COALESCE(?x, ?i) AS ?sort) BIND(-?i AS ?x) } ORDER BY COALESCE(?x, ?i)",
+        "SELECT ?i WHERE { VALUES ?i { 1 2 } BIND(COALESCE(?x, ?i) AS ?sort) BIND(-?i AS ?x) } ORDER BY COALESCE(?x, ?i) LIMIT 1",
+    ] {
+        let a = run(&s, text, Optimizations::ALL);
+        let rows: Vec<String> = a.rows().into_iter().map(|r| format!("{r:?}")).collect();
+        assert!(rows[0].contains("\"2\""), "{text}: {rows:?}");
+        assert!(!has_desc(&a.plan, "(?sort)"), "{text}");
+    }
+}

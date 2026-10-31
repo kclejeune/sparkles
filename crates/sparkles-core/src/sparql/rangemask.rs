@@ -221,9 +221,14 @@ pub(super) fn mask(
     exprs: &[Expr],
     report: &mut Report,
 ) -> Result<Option<(Vec<bool>, Vec<Expr>)>> {
-    if !ctx.opt.range_pushdown || t.len() < MIN_ROWS {
+    // An application callback in a conjunct must run in the conjunction's order, on the
+    // rows the generic filter gives it (spec P03 section 4).
+    if !ctx.opt.range_pushdown || ctx.calls_extensions || t.len() < MIN_ROWS {
         return Ok(None);
     }
+    let Ok(n) = u32::try_from(t.len()) else {
+        return Ok(None);
+    };
     let conj: Vec<Expr> = exprs.iter().cloned().flat_map(Expr::conjuncts).collect();
     let atom = |e: &Expr, v: VarId| compare_atom(e, v, ctx, decidable);
     // the variable of the first conjunct that is a comparison with a constant
@@ -243,22 +248,27 @@ pub(super) fn mask(
     let Some(rule) = rule(&atoms, ctx) else {
         return Ok(None);
     };
+    // the mask, the undecided rows' indices (in pieces, then together) and their
+    // values, at most one of each per row
+    let Ok(_held) = ctx.charge(u64::from(n) * (1 + 4 + 4 + 8)) else {
+        return Ok(None);
+    };
     let col = &t.cols[c];
     let mut keep = vec![false; col.len()];
     // pieces of the column, classified in parallel; each lists its undecided rows
-    let classify = |k: usize, part: &[Id], out: &mut [bool]| -> Result<Vec<usize>> {
+    let classify = |k: usize, part: &[Id], out: &mut [bool]| -> Result<Vec<u32>> {
         ctx.check()?;
         let mut tested = Vec::new();
         for (j, (&id, o)) in part.iter().zip(out.iter_mut()).enumerate() {
             let class = rule.class(id);
             *o = class == Class::Pass;
             if class == Class::Test {
-                tested.push(k * PIECE + j);
+                tested.push((k * PIECE + j) as u32);
             }
         }
         Ok(tested)
     };
-    let pieces: Vec<Vec<usize>> = if col.len() > PAR_THRESHOLD {
+    let pieces: Vec<Vec<u32>> = if col.len() > PAR_THRESHOLD {
         use rayon::prelude::*;
         col.par_chunks(PIECE)
             .zip(keep.par_chunks_mut(PIECE))
@@ -272,12 +282,14 @@ pub(super) fn mask(
             .map(|(k, (part, out))| classify(k, part, out))
             .collect::<Result<_>>()?
     };
-    let tested: Vec<usize> = pieces.concat();
+    let tested: Vec<u32> = pieces.concat();
     report.decided(ctx, &ranged, col.len(), tested.len());
     if !tested.is_empty() {
-        // the undecided rows, evaluated once per distinct value where the expression
-        // cache admits the conjuncts
-        let sub = t.take_rows(&tested);
+        // the undecided values, which the conjuncts alone read, evaluated once per
+        // distinct value where the expression cache admits the conjuncts
+        let mut sub = Table::new(vec![v]);
+        sub.cols[0] = tested.iter().map(|&i| col[i as usize]).collect();
+        sub.len = tested.len();
         let pass = match super::exprcache::filter(ctx, &sub, &ranged, report)? {
             Some((mut pass, rest)) => {
                 if !rest.is_empty() {
@@ -290,7 +302,7 @@ pub(super) fn mask(
             None => filter_mask(ctx, &sub, &ranged)?,
         };
         for (&i, ok) in tested.iter().zip(pass) {
-            keep[i] = ok;
+            keep[i as usize] = ok;
         }
     }
     Ok(Some((keep, rest)))

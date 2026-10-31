@@ -1790,7 +1790,9 @@ pub(super) fn run(
 /// leaves the key unbound, or probing the keys costs more than reading the pattern.
 /// The rows come in key order, as the scan returns them.
 pub(super) fn probe_for(ctx: &Ctx, probe: &Node, left: &Table) -> Result<Option<(Table, Stats)>> {
-    if !(ctx.opt.batched_join && ctx.opt.probed_optional) {
+    // an application callback in the pattern's filters runs once per row the pattern
+    // reads, which probing would change
+    if !(ctx.opt.batched_join && ctx.opt.probed_optional) || ctx.calls_extensions {
         return Ok(None);
     }
     let Some((_, scan, filter)) = probe_leaf(probe) else {

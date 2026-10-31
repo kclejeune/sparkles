@@ -4389,11 +4389,15 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
 /// SELECT expressions and BIND produce) bind to an expression whose value depends only
 /// on the row. An ORDER BY key equal to such an expression orders by its variable: the
 /// variable holds the expression's value, and is unbound where the expression is an
-/// error, which orders as the error does.
+/// error, which orders as the error does. An expression that reads a variable bound by
+/// its own or a later BIND of the chain would read another value at the ORDER BY, so it
+/// is left out.
 fn bound_expressions(
     gp: &GraphPattern,
 ) -> Vec<(&spargebra::term::Variable, &spargebra::algebra::Expression)> {
     let mut out = Vec::new();
+    // the variables bound between an Extend's input and the ORDER BY
+    let mut later: Vec<&spargebra::term::Variable> = Vec::new();
     let mut gp = gp;
     while let GraphPattern::Extend {
         inner,
@@ -4401,7 +4405,10 @@ fn bound_expressions(
         expression,
     } = gp
     {
-        if row_determined(expression) {
+        later.push(variable);
+        let mut read = Vec::new();
+        expression_vars(expression, &mut read);
+        if row_determined(expression) && !read.iter().any(|v| later.contains(v)) {
             out.push((variable, expression));
         }
         gp = inner;
@@ -4409,8 +4416,48 @@ fn bound_expressions(
     out
 }
 
+/// The variables an expression reads (outside EXISTS, which [`row_determined`] rejects).
+fn expression_vars<'e>(
+    e: &'e spargebra::algebra::Expression,
+    out: &mut Vec<&'e spargebra::term::Variable>,
+) {
+    use spargebra::algebra::Expression as E;
+    match e {
+        E::Variable(v) | E::Bound(v) => out.push(v),
+        E::NamedNode(_) | E::Literal(_) | E::Exists(_) => {}
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => {
+            expression_vars(a, out);
+            expression_vars(b, out);
+        }
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expression_vars(a, out),
+        E::In(a, l) => {
+            expression_vars(a, out);
+            l.iter().for_each(|x| expression_vars(x, out));
+        }
+        E::If(a, b, c) => {
+            expression_vars(a, out);
+            expression_vars(b, out);
+            expression_vars(c, out);
+        }
+        E::Coalesce(l) => l.iter().for_each(|x| expression_vars(x, out)),
+        E::FunctionCall(_, l) => l.iter().for_each(|x| expression_vars(x, out)),
+    }
+}
+
 /// Whether an expression's value is the same each time it is evaluated on a row: no
-/// random or fresh values, no EXISTS, and no function outside SPARQL and the XSD casts.
+/// random or fresh values, no EXISTS, and no function other than SPARQL's and the
+/// supported XSD casts.
 fn row_determined(e: &spargebra::algebra::Expression) -> bool {
     use spargebra::algebra::{Expression as E, Function as F};
     match e {
@@ -4435,9 +4482,7 @@ fn row_determined(e: &spargebra::algebra::Expression) -> bool {
         E::FunctionCall(f, args) => {
             let fixed = match f {
                 F::BNode | F::Rand | F::Uuid | F::StrUuid => false,
-                F::Custom(iri) => iri
-                    .as_str()
-                    .starts_with("http://www.w3.org/2001/XMLSchema#"),
+                F::Custom(iri) => super::expr::is_cast(iri.as_str()),
                 _ => true,
             };
             fixed && args.iter().all(row_determined)
