@@ -2234,3 +2234,252 @@ fn planning_a_predicate_pattern_decodes_no_block() {
     assert_eq!(plan.estimated_rows, 4.0, "{plan:?}");
     assert_eq!(snap.cache.misses(), before, "planning decoded a block");
 }
+
+/// Regression tests for two rows the engine dropped that SPARQL 1.1 produces (roadmap
+/// items 433 and 434). The F13 differential generator found both. Each expectation is
+/// derived from the algebra in the comments and matches Apache Jena's reference engine.
+mod generator_divergences {
+    use super::*;
+
+    fn store_with(ttl: &str) -> Store {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = format!("@prefix : <http://ex/> .\n{ttl}");
+        s.load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        s
+    }
+
+    fn rows(s: &Store, text: &str) -> Vec<String> {
+        let r = query(
+            s.snapshot(),
+            &format!("PREFIX : <http://ex/> {text}"),
+            &QueryOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("{text}: {e}"));
+        strs(&r)
+    }
+
+    /// Every query whose rows differ from its expectation, so that one run names them all.
+    fn check(s: &Store, cases: &[(String, Vec<&str>)]) {
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(text, want)| {
+                let got = rows(s, text);
+                (got != *want).then(|| format!("{text}\n  got {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    // Item 433. With `:a :p 1 . :a :q 1 . :c :r :a`, the UNION yields {x=a} and {y=a}.
+    // Joined with `?z :r ?x` ({z=c, x=a}) these give {x=a, z=c} and {x=a, y=a, z=c}, since
+    // the second branch shares no variable with the pattern. The filter is an error on
+    // the first row, where ?y is unbound, and true on the second, so one row survives.
+    const UNION_DATA: &str = ":a :p 1 . :a :q 1 . :c :r :a .";
+
+    #[test]
+    fn a_filter_across_union_branches_keeps_the_row_the_join_completes() {
+        let s = store_with(UNION_DATA);
+        let mut cases: Vec<(String, Vec<&str>)> = [
+            "sameTerm(?x, ?y)",
+            "?x = ?y",
+            "?y = ?x",
+            "sameTerm(?y, ?x)",
+            "!(?x != ?y)",
+            "STR(?x) = STR(?y)",
+            "BOUND(?x) && BOUND(?y)",
+            "BOUND(?y)",
+        ]
+        .into_iter()
+        .map(|f| {
+            (
+                format!(
+                    "SELECT ?x ?y ?z WHERE {{ {{ ?x :p 1 }} UNION {{ ?y :q 1 }} ?z :r ?x \
+                     FILTER({f}) }}"
+                ),
+                vec!["a a c"],
+            )
+        })
+        .collect();
+        // the pattern first, with the UNION after it
+        cases.push((
+            "SELECT ?x ?y ?z WHERE { ?z :r ?x { ?x :p 1 } UNION { ?y :q 1 } \
+             FILTER(sameTerm(?x, ?y)) }"
+                .into(),
+            vec!["a a c"],
+        ));
+        check(&s, &cases);
+    }
+
+    // OPTIONAL in place of UNION. `?z :r ?x OPTIONAL { ?y :q 1 }` gives {z=c, x=a, y=a},
+    // and the filter keeps it. In the braced form the OPTIONAL group gives {z=c, x=a}
+    // with ?y unbound, the join with `?y :q 1` adds y=a, and the filter keeps the row.
+    #[test]
+    fn a_filter_across_an_optional_keeps_the_joined_row() {
+        let s = store_with(UNION_DATA);
+        let mut cases: Vec<(String, Vec<&str>)> = [
+            "SELECT ?x ?y ?z WHERE { ?z :r ?x OPTIONAL { ?y :q 1 } FILTER(sameTerm(?x, ?y)) }",
+            "SELECT ?x ?y ?z WHERE { ?z :r ?x OPTIONAL { ?y :q 1 } FILTER(?x = ?y) }",
+            "SELECT ?x ?y ?z WHERE { OPTIONAL { ?y :q 1 } ?z :r ?x FILTER(?x = ?y) }",
+        ]
+        .into_iter()
+        .map(|t| (t.to_string(), vec!["a a c"]))
+        .collect();
+        for f in ["sameTerm(?x, ?y)", "?x = ?y", "BOUND(?y)"] {
+            cases.push((
+                format!(
+                    "SELECT ?x ?y ?z WHERE {{ {{ ?z :r ?x OPTIONAL {{ ?x :nope ?y }} }} \
+                     ?y :q 1 FILTER({f}) }}"
+                ),
+                vec!["a a c"],
+            ));
+        }
+        check(&s, &cases);
+    }
+
+    // A BIND whose expression fails leaves its variable unbound. `?x :p ?o` with the BIND
+    // gives {x=a, o=1}, the join with `?y :q 1` adds y=a, and the filter keeps the row.
+    #[test]
+    fn a_filter_after_a_failed_bind_keeps_the_joined_row() {
+        let s = store_with(UNION_DATA);
+        let cases: Vec<(String, Vec<&str>)> = ["BOUND(?y)", "?x = ?y"]
+            .into_iter()
+            .map(|f| {
+                (
+                    format!(
+                        "SELECT ?x ?y WHERE {{ ?x :p ?o BIND(?nope AS ?y) ?y :q 1 FILTER({f}) }}"
+                    ),
+                    vec!["a a"],
+                )
+            })
+            .collect();
+        check(&s, &cases);
+    }
+
+    // Item 434. VALUES ?x { UNDEF } is one solution with no bindings, the identity of
+    // join, so the group equals the path alone: {x=c, y=e}. BOUND(?x) holds on it. The
+    // `*` and `?` forms also match the zero-length path from every term of the graph to
+    // itself, here :c and :e.
+    #[test]
+    fn an_undef_values_row_leaves_a_path_subject_free() {
+        let s = store_with(":c :knows :e .");
+        let ce = vec!["c e"];
+        let star = vec!["c c", "c e", "e e"];
+        let cases: Vec<(String, Vec<&str>)> = [
+            ("VALUES ?x { UNDEF } ?x :knows+ ?y FILTER(BOUND(?x))", &ce),
+            ("VALUES ?x { UNDEF } ?x :knows+ ?y FILTER(?x = :c)", &ce),
+            ("VALUES ?x { UNDEF } ?x :knows ?y FILTER(BOUND(?x))", &ce),
+            ("VALUES ?x { UNDEF } ?x :knows+ ?y", &ce),
+            ("?x :knows+ ?y VALUES ?x { UNDEF } FILTER(BOUND(?x))", &ce),
+            ("VALUES ?y { UNDEF } ?x :knows+ ?y FILTER(BOUND(?y))", &ce),
+            (
+                "VALUES (?x ?y) { (UNDEF UNDEF) } ?x :knows+ ?y FILTER(BOUND(?x))",
+                &ce,
+            ),
+            (
+                "VALUES ?x { UNDEF } ?x :knows/:knows* ?y FILTER(BOUND(?x))",
+                &ce,
+            ),
+            (
+                "VALUES ?x { UNDEF } ?x :knows|:likes ?y FILTER(BOUND(?x))",
+                &ce,
+            ),
+            ("VALUES ?x { UNDEF } ?x :knows* ?y FILTER(BOUND(?x))", &star),
+            ("VALUES ?x { UNDEF } ?x :knows? ?y FILTER(BOUND(?x))", &star),
+            (
+                "VALUES ?x { UNDEF } ?x ^:knows ?y FILTER(?x = :e)",
+                &vec!["e c"],
+            ),
+        ]
+        .into_iter()
+        .map(|(body, want)| (format!("SELECT ?x ?y WHERE {{ {body} }}"), want.clone()))
+        .collect();
+        check(&s, &cases);
+    }
+
+    // Mixed rows. The UNDEF row joins every path row, and the bound row joins the rows
+    // that start at :c, so {x=c, y=e} comes back twice. A bound row that starts no path
+    // adds nothing.
+    #[test]
+    fn mixed_undef_and_bound_values_rows_each_join_the_path() {
+        let s = store_with(":c :knows :e . :d :knows :f .");
+        let twice = vec!["c e", "c e", "d f"];
+        let cases: Vec<(String, Vec<&str>)> = [
+            ("VALUES ?x { UNDEF :c } ?x :knows+ ?y", &twice),
+            ("VALUES ?x { :c UNDEF } ?x :knows+ ?y", &twice),
+            (
+                "VALUES ?x { UNDEF :c } ?x :knows+ ?y FILTER(BOUND(?x))",
+                &twice,
+            ),
+            (
+                "VALUES ?x { :c UNDEF } ?x :knows* ?y FILTER(?y != ?x)",
+                &twice,
+            ),
+            (
+                "VALUES ?x { UNDEF :zz } ?x :knows+ ?y FILTER(BOUND(?x))",
+                &vec!["c e", "d f"],
+            ),
+        ]
+        .into_iter()
+        .map(|(body, want)| (format!("SELECT ?x ?y WHERE {{ {body} }}"), want.clone()))
+        .collect();
+        check(&s, &cases);
+    }
+
+    // A FILTER on an object that a VALUES table leaves UNDEF in one row. Subject i has
+    // the object i mod 7. The row 2 joins the subjects whose object is 2, the UNDEF row
+    // joins every subject with its own object, and the row 1 joins those whose object is
+    // 1. `?o > 1` keeps the first set and the part of the second whose object exceeds 1,
+    // 34 rows in all. Run on the VALUES rows first, it drops the UNDEF row and keeps the
+    // 6 rows of object 2. A store of a few triples plans the scan first and hides this.
+    #[test]
+    fn a_filter_on_an_undef_values_object_tests_the_joined_value() {
+        let ttl: String = (0..40)
+            .map(|i| format!(":s{i} <urn:x-p> {} .\n", i % 7))
+            .collect();
+        let s = store_with(&ttl);
+        let rows_of = |keep: fn(u32) -> bool| {
+            (0..40u32)
+                .filter(move |i| keep(i % 7))
+                .map(|i| format!("s{i} {}", i % 7))
+        };
+        let mut want: Vec<String> = rows_of(|o| o == 2).chain(rows_of(|o| o > 1)).collect();
+        want.sort();
+        assert_eq!(want.len(), 34);
+        let want: Vec<&str> = want.iter().map(String::as_str).collect();
+        let cases: Vec<(String, Vec<&str>)> = [
+            // the FILTER outside the group of the VALUES
+            "{ VALUES ?o { 1 2 UNDEF } ?s <urn:x-p> ?o } FILTER(?o > 1)",
+            // the FILTER in the same group as the VALUES
+            "VALUES ?o { 1 2 UNDEF } ?s <urn:x-p> ?o FILTER(?o > 1)",
+            "?s <urn:x-p> ?o VALUES ?o { 1 2 UNDEF } FILTER(?o > 1)",
+        ]
+        .into_iter()
+        .map(|body| (format!("SELECT ?s ?o WHERE {{ {body} }}"), want.clone()))
+        .collect();
+        check(&s, &cases);
+    }
+
+    // A deferred FILTER still links two components that share no variable. Every
+    // element that binds ?x is in the first component, so once the components meet ?x
+    // has its final value and the equality can key their join. The UNDEF row joins all
+    // n `?s :p ?x` rows and the row :o0 one of them, and each ?x meets the one ?y equal
+    // to it, so n + 1 rows come back without the n² product.
+    #[test]
+    fn a_deferred_equality_still_keys_the_join_of_two_components() {
+        let n = 200;
+        let ttl: String = (0..n)
+            .map(|i| format!(":a{i} :p :o{i} . :o{i} :q {i} .\n"))
+            .collect();
+        let s = store_with(&ttl);
+        let text = "PREFIX : <http://ex/> SELECT * WHERE { VALUES (?x ?k) { (UNDEF 1) (:o0 2) } \
+                    ?s :p ?x . ?y :q ?v FILTER(?x = ?y) }";
+        let r = query(s.snapshot(), text, &QueryOptions::default()).unwrap();
+        assert_eq!(r.rows().len(), n + 1);
+        assert!(has_op(&r.plan, "KeyedJoin"), "{:#?}", r.plan);
+    }
+}
