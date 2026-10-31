@@ -63,12 +63,10 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     if let Some(quads) = &quads {
         let mut strings: HashMap<&str, Vec<&Str>> = HashMap::new();
         value_strings(&root, &mut strings);
-        let sources: HashMap<String, usize> = strings
-            .iter()
-            .map(|(v, s)| ((*v).to_string(), s.len()))
-            .collect();
-        let sites = query_sites(quads, &strings, text);
-        embedded::run(sites, &scan.prefixes(), Some(quads), &sources, out)?;
+        let facts = embedded::Facts::new(quads, out.opts.deadline)?;
+        let sites = query_sites(quads, &facts, &strings, text, out.opts.deadline)?;
+        // every site has its holder, so no count of source texts is needed
+        embedded::run(sites, &scan.prefixes(), &facts, &HashMap::new(), out)?;
     }
     context_rules(&scan, out);
     gate_fixes(
@@ -132,18 +130,26 @@ fn value_strings<'v>(v: &'v Val, out: &mut HashMap<&'v str, Vec<&'v Str>>) {
     }
 }
 
+/// The most source strings [`query_sites`] probes.
+const PROBES: usize = 256;
+
 /// The SHACL queries of the expanded document that map back to the source without doubt:
-/// an `xsd:string` object of a query property whose text is written by exactly one string
-/// of the document and held by exactly one node. Each becomes a site with that holder.
-/// Any other query is skipped.
+/// an `xsd:string` object of a query property whose text is written by exactly one value
+/// string of the document and held by exactly one node, and that string is the one that
+/// makes the quad. That is proved by a probe: the document with the string replaced by a
+/// fresh text expands to the same dataset with only that quad's literal replaced. A query
+/// made from anything else, such as the key of an `@index` map, fails the probe. Each query
+/// that passes becomes a site with its holder, and any other query is skipped.
 fn query_sites(
     quads: &[oxrdf::Quad],
+    facts: &embedded::Facts,
     strings: &HashMap<&str, Vec<&Str>>,
     text: &str,
-) -> Vec<embedded::Site> {
-    let facts = embedded::Facts::new(quads);
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<embedded::Site>, LintError> {
     let mut seen = HashSet::new();
     let mut sites = Vec::new();
+    let mut probes = 0;
     for q in quads {
         let p = q.predicate.as_str();
         let Some(v) = embedded::is_query_predicate(p)
@@ -155,10 +161,18 @@ fn query_sites(
         if !seen.insert((p, v)) {
             continue;
         }
-        let ([holder], Some([s])) = (facts.holders_of(p, v), strings.get(v).map(Vec::as_slice))
+        let (Some(holder), Some([s])) =
+            (facts.only_holder(p, v), strings.get(v).map(Vec::as_slice))
         else {
             continue;
         };
+        if probes == PROBES {
+            break;
+        }
+        probes += 1;
+        if !made_by(text, quads, q, s, probes, deadline)? {
+            continue;
+        }
         sites.push(embedded::Site {
             predicate: p.to_string(),
             text: embedded::decode_json(&text[s.start..s.end], s.start),
@@ -168,7 +182,48 @@ fn query_sites(
         });
     }
     sites.sort_by_key(|s| s.text.start());
-    sites
+    Ok(sites)
+}
+
+/// Whether the value string `s` is what makes quad `q`: replaced by a fresh text, the
+/// document expands to `quads` with exactly `q`'s literal replaced, within the deadline.
+fn made_by(
+    text: &str,
+    quads: &[oxrdf::Quad],
+    q: &oxrdf::Quad,
+    s: &Str,
+    n: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<bool, LintError> {
+    let fresh = format!("urn:x-sparkles-lint-probe:{n}");
+    if text.contains(&fresh) {
+        return Ok(false);
+    }
+    crate::check::deadline(deadline).map_err(|_| LintError::Timeout)?;
+    let probed = format!("{}\"{fresh}\"{}", &text[..s.start], &text[s.end..]);
+    let Some(after) = super::jsonld_quads(&probed) else {
+        return Ok(false);
+    };
+    let literal: oxrdf::Term = oxrdf::Literal::new_simple_literal(fresh).into();
+    let expected: Vec<oxrdf::Quad> = quads
+        .iter()
+        .map(|x| {
+            if x == q {
+                oxrdf::Quad::new(
+                    x.subject.clone(),
+                    x.predicate.clone(),
+                    literal.clone(),
+                    x.graph_name.clone(),
+                )
+            } else {
+                x.clone()
+            }
+        })
+        .collect();
+    match crate::check::graph::isomorphic_bounded(&expected, &after, deadline) {
+        Ok(same) => Ok(same == Some(true)),
+        Err(_) => Err(LintError::Timeout),
+    }
 }
 
 // ----------------------------------------------------------------------- model ------

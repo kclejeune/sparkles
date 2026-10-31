@@ -30,7 +30,7 @@ use crate::lex::TokenKind;
 use crate::syntax::NodeKind;
 use crate::tree::Element;
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
 
@@ -118,15 +118,37 @@ impl Builder {
 /// A Turtle string token at `at` in the document, decoded; and whether it is a long string.
 pub(super) fn decode_turtle(token: &str, at: usize) -> (Decoded, bool, char) {
     let quote = token.chars().next().unwrap_or('"');
+    let (q, inner) = turtle_inner(token);
+    let long = q == 3;
+    let mut b = Builder::new(at + q);
+    turtle_chars(inner, |ch, i, len| b.push(ch, at + q + i, len));
+    let plain = !inner.contains('\\');
+    (b.finish(at + q + inner.len(), plain), long, quote)
+}
+
+/// The length of a Turtle string token's quotes, and what is between them.
+fn turtle_inner(token: &str) -> (usize, &str) {
     let long = token.len() >= 6 && (token.starts_with("\"\"\"") || token.starts_with("'''"));
     let q = if long { 3 } else { 1 };
-    let inner = &token[q..token.len() - q];
-    let mut b = Builder::new(at + q);
+    (q, &token[q..token.len() - q])
+}
+
+/// The value of a Turtle string token, without the position tables of [`decode_turtle`].
+fn turtle_value(token: &str) -> String {
+    let (_, inner) = turtle_inner(token);
+    let mut out = String::with_capacity(inner.len());
+    turtle_chars(inner, |ch, _, _| out.push(ch));
+    out
+}
+
+/// Each character a Turtle string's content decodes to, with where its source starts in
+/// the content and how many bytes the source takes.
+fn turtle_chars(inner: &str, mut each: impl FnMut(char, usize, usize)) {
     let mut i = 0;
     while i < inner.len() {
         let ch = inner[i..].chars().next().expect("a character");
         if ch != '\\' {
-            b.push(ch, at + q + i, ch.len_utf8());
+            each(ch, i, ch.len_utf8());
             i += ch.len_utf8();
             continue;
         }
@@ -151,11 +173,9 @@ pub(super) fn decode_turtle(token: &str, at: usize) -> (Decoded, bool, char) {
             }
             _ => ('\\', 1),
         };
-        b.push(decoded, at + q + i, len);
+        each(decoded, i, len);
         i += len;
     }
-    let plain = !inner.contains('\\');
-    (b.finish(at + q + inner.len(), plain), long, quote)
 }
 
 /// A JSON string token at `at` in the document, decoded.
@@ -220,16 +240,6 @@ pub(super) type Prefixes = Vec<(String, String)>;
 pub(super) fn turtle_sites(c: &Cst<'_, '_>) -> (Vec<Site>, Prefixes, HashMap<String, usize>) {
     let mut sites = Vec::new();
     let mut prefixes = Vec::new();
-    let mut sources: HashMap<String, usize> = HashMap::new();
-    for i in 0..c.tree.tokens.len() {
-        let t = crate::tree::TokenId(i as u32);
-        if c.token_kind(t).is_string() {
-            let (s, _) = c.span(t);
-            *sources
-                .entry(decode_turtle(c.text(t), s).0.value)
-                .or_default() += 1;
-        }
-    }
     for n in c.nodes() {
         match c.kind(n) {
             NodeKind::PrefixDecl => {
@@ -273,7 +283,45 @@ pub(super) fn turtle_sites(c: &Cst<'_, '_>) -> (Vec<Site>, Prefixes, HashMap<Str
             _ => {}
         }
     }
+    let sources = source_counts(c, &sites);
     (sites, prefixes, sources)
+}
+
+/// How many string literals of the document have the text of each site that the source
+/// names no holder for. A string is compared as it is written when it has no escape, and
+/// decoded without position tables otherwise; one too long to decode to any of those texts
+/// is passed over, so a large data literal costs no copy.
+fn source_counts(c: &Cst<'_, '_>, sites: &[Site]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = sites
+        .iter()
+        .filter(|s| s.holder.is_none())
+        .map(|s| (s.text.value.clone(), 0))
+        .collect();
+    let Some(longest) = counts.keys().map(String::len).max() else {
+        return counts;
+    };
+    for i in 0..c.tree.tokens.len() {
+        let t = crate::tree::TokenId(i as u32);
+        if !c.token_kind(t).is_string() {
+            continue;
+        }
+        let token = c.text(t);
+        let (_, inner) = turtle_inner(token);
+        if !inner.contains('\\') {
+            if let Some(n) = counts.get_mut(inner) {
+                *n += 1;
+            }
+            continue;
+        }
+        // an escape takes at most ten bytes for one character of at least one byte
+        if inner.len() / 10 > longest {
+            continue;
+        }
+        if let Some(n) = counts.get_mut(&turtle_value(token)) {
+            *n += 1;
+        }
+    }
+    counts
 }
 
 /// The subject and graph of a property list entry, when the source names both: a
@@ -360,7 +408,11 @@ pub(super) fn turtle(
         return Ok(());
     }
     let quads = super::turtle_quads(text, trig, undeclared).ok();
-    run(sites, prefixes, quads.as_deref(), sources, out)
+    let Some(quads) = quads else {
+        return Ok(());
+    };
+    let facts = Facts::new(&quads, out.opts.deadline)?;
+    run(sites, prefixes, &facts, sources, out)
 }
 
 /// The string token of an object that is a plain string: one without a language tag, or
@@ -395,7 +447,7 @@ pub(super) struct Facts {
     by_subject: HashMap<Node, Vec<(String, Term)>>,
     parents: HashMap<Node, Vec<NamedOrBlankNode>>,
     /// the holders of each query property and query text, each once
-    holders: HashMap<(String, String), Vec<Node>>,
+    holders: HashMap<(String, String), HashSet<Node>>,
 }
 
 /// The prefixes and parameters a query sees.
@@ -422,13 +474,17 @@ pub(super) fn query_text(t: &Term) -> Option<&str> {
 }
 
 impl Facts {
-    pub fn new(quads: &[Quad]) -> Facts {
+    /// The facts of `quads`, with the deadline checked every so many quads.
+    pub fn new(quads: &[Quad], deadline: Option<std::time::Instant>) -> Result<Facts, LintError> {
         let mut f = Facts {
             by_subject: HashMap::new(),
             parents: HashMap::new(),
             holders: HashMap::new(),
         };
-        for q in quads {
+        for (i, q) in quads.iter().enumerate() {
+            if i % 1024 == 0 {
+                crate::check::deadline(deadline).map_err(|_| LintError::Timeout)?;
+            }
             let p = q.predicate.as_str();
             let g = q.graph_name.clone();
             f.by_subject
@@ -444,21 +500,31 @@ impl Facts {
             if is_query_predicate(p)
                 && let Some(v) = query_text(&q.object)
             {
-                let holders = f.holders.entry((p.to_string(), v.to_string())).or_default();
-                let h = (g, q.subject.clone());
-                if !holders.contains(&h) {
-                    holders.push(h);
-                }
+                f.holders
+                    .entry((p.to_string(), v.to_string()))
+                    .or_default()
+                    .insert((g, q.subject.clone()));
             }
         }
-        f
+        Ok(f)
     }
 
-    /// The holders of `predicate` with the query text `query`.
-    pub fn holders_of(&self, predicate: &str, query: &str) -> &[Node] {
+    /// Whether `holder` holds `predicate` with the query text `query`.
+    pub fn holds(&self, predicate: &str, query: &str, holder: &Node) -> bool {
         self.holders
             .get(&(predicate.to_string(), query.to_string()))
-            .map_or(&[][..], Vec::as_slice)
+            .is_some_and(|h| h.contains(holder))
+    }
+
+    /// The holder of `predicate` with the query text `query`, when there is exactly one.
+    pub fn only_holder(&self, predicate: &str, query: &str) -> Option<&Node> {
+        match self
+            .holders
+            .get(&(predicate.to_string(), query.to_string()))
+        {
+            Some(h) if h.len() == 1 => h.iter().next(),
+            _ => None,
+        }
     }
 
     /// The objects of `subject`'s `predicate` in `graph`.
@@ -575,24 +641,19 @@ fn writable(label: &str, ns: &str) -> bool {
 pub(super) fn run(
     sites: Vec<Site>,
     document_prefixes: &[(String, String)],
-    quads: Option<&[Quad]>,
+    facts: &Facts,
     sources: &HashMap<String, usize>,
     out: &mut Out<'_>,
 ) -> Result<(), LintError> {
-    let Some(quads) = quads.filter(|_| !sites.is_empty()) else {
-        return Ok(());
-    };
-    let facts = Facts::new(quads);
     for site in &sites {
         out.deadline()?;
         let query = site.text.value.as_str();
-        let holders = facts.holders_of(&site.predicate, query);
         let holder = match &site.holder {
-            Some(h) => holders.contains(h).then(|| h.clone()),
-            None => match holders {
-                [h] if sources.get(query) == Some(&1) => Some(h.clone()),
-                _ => None,
-            },
+            Some(h) => facts.holds(&site.predicate, query, h).then(|| h.clone()),
+            None if sources.get(query) == Some(&1) => {
+                facts.only_holder(&site.predicate, query).cloned()
+            }
+            None => None,
         };
         let Some(holder) = holder else {
             continue;

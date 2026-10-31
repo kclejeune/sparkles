@@ -468,3 +468,85 @@ fn json_ld_holders_come_from_the_expansion() {
         Vec::<usize>::new()
     );
 }
+
+#[test]
+fn many_holders_of_one_query_keep_to_the_deadline() {
+    // 40,000 nodes holding the same query: building the facts and matching the holders
+    // must not be quadratic, and must look at the clock
+    let mut doc = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n");
+    for i in 0..40_000 {
+        doc.push_str(&format!("<urn:s{i}> sh:ask \"ASK {{ ?s ?p ?o }}\" .\n"));
+    }
+    for lang in [Language::Turtle, Language::TriG] {
+        let opts = LintOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(800)),
+            ..LintOptions::default()
+        };
+        let start = std::time::Instant::now();
+        let r = lint(&doc, lang, &opts);
+        assert!(matches!(r, Ok(_) | Err(LintError::Timeout)), "{lang:?}");
+        // generous slack over the 800 ms deadline
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "{lang:?}: {:?}",
+            start.elapsed()
+        );
+    }
+    // and the same in JSON-LD
+    let mut doc =
+        String::from(r#"{"@context": {"sh": "http://www.w3.org/ns/shacl#"}, "@graph": ["#);
+    for i in 0..40_000 {
+        if i > 0 {
+            doc.push(',');
+        }
+        doc.push_str(&format!(
+            r#"{{"@id": "urn:s{i}", "sh:ask": "ASK {{ ?s ?p ?o }}"}}"#
+        ));
+    }
+    doc.push_str("]}");
+    let opts = LintOptions {
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(800)),
+        ..LintOptions::default()
+    };
+    let start = std::time::Instant::now();
+    let r = lint(&doc, Language::JsonLd, &opts);
+    assert!(matches!(r, Ok(_) | Err(LintError::Timeout)));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn source_texts_are_counted_only_for_anonymous_queries() {
+    let q = "SELECT $this { $this p:p ?o FILTER(?o) }";
+    // a named holder needs no count, so a document with only those counts nothing
+    let doc = ttl(&format!(
+        "<urn:a> sh:select \"{q}\" .\n<urn:x> <urn:c> \"{q}\" .\n"
+    ));
+    let tree = crate::turtle::parse::parse(
+        &doc,
+        crate::lex::lex(&doc, crate::lex::LexMode::Turtle),
+        false,
+    )
+    .unwrap();
+    let (sites, _, sources) = embedded::turtle_sites(&Cst::new(&tree));
+    assert_eq!(sites.len(), 1);
+    assert!(sources.is_empty(), "{sources:?}");
+    // an anonymous one counts its own text, escaped or not, and nothing else
+    let escaped = q.replace('$', "\\u0024");
+    let doc = ttl(&format!(
+        "[ sh:select \"{q}\" ] .\n<urn:x> <urn:c> \"{escaped}\" .\n<urn:y> <urn:c> \"{}\" .\n",
+        "z".repeat(1 << 16)
+    ));
+    let tree = crate::turtle::parse::parse(
+        &doc,
+        crate::lex::lex(&doc, crate::lex::LexMode::Turtle),
+        false,
+    )
+    .unwrap();
+    let (_, _, sources) = embedded::turtle_sites(&Cst::new(&tree));
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    assert_eq!(sources[q], 2);
+}

@@ -501,3 +501,29 @@ fn json_ld_without_an_expansion_has_no_query_findings() {
     );
     assert_eq!(queries(&doc), Vec::<String>::new());
 }
+
+#[test]
+fn a_query_made_from_a_key_is_not_placed_on_another_string() {
+    // a property-valued @index map makes sh:select from the key; a comment repeats the
+    // text, and must not get the query's findings
+    let q = "SELECT $this { $this p:bad ?o FILTER(?o) }";
+    let doc = format!(
+        r#"{{"@context": {{"sh": "http://www.w3.org/ns/shacl#", "shapes": {{"@id": "http://x/shapes", "@container": "@index", "@index": "sh:select"}}}}, "@id": "urn:s", "shapes": {{"{q}": {{"@id": "urn:inner"}}}}, "http://www.w3.org/2000/01/rdf-schema#comment": "{q}"}}"#
+    );
+    let comment = doc.rfind(q).unwrap();
+    let inside: Vec<_> = diags(&doc)
+        .into_iter()
+        .filter(|d| d.start >= comment && d.start < comment + q.len())
+        .collect();
+    assert!(inside.is_empty(), "{inside:?}");
+    // the same comment beside a query that is a value string is still left alone, and the
+    // query string itself is linted
+    let doc = format!(
+        r#"{{"@context": {{"sh": "http://www.w3.org/ns/shacl#"}}, "@id": "urn:s", "sh:select": "{q}"}}"#
+    );
+    assert!(
+        diags(&doc).iter().any(|d| d.rule == "undefined-prefix"),
+        "{:?}",
+        found(&doc)
+    );
+}
