@@ -382,8 +382,17 @@ impl Delta {
     /// Lower the statistics of predicate `p` by `n` inserted quads taken out of every
     /// permutation, as [`remove_inserted_all`](Self::remove_inserted_all) does for the
     /// quads of one predicate: `subjects` and `objects` are their distinct values.
-    pub(crate) fn forget_removed(&mut self, p: u64, n: u64, subjects: &[u64], objects: &[u64]) {
-        self.forget(p, n, subjects, objects);
+    /// `check` runs every 1024 values, and its error stops the update before the
+    /// statistics change.
+    pub(crate) fn forget_removed(
+        &mut self,
+        p: u64,
+        n: u64,
+        subjects: &[u64],
+        objects: &[u64],
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.forget_with(p, n, subjects, objects, check)
     }
 
     /// Take `q`, which is not in the base, out of the inserted quads.
@@ -402,14 +411,30 @@ impl Delta {
     /// `subjects` and `objects` of the removed quads that no inserted quad with `p` holds
     /// any longer.
     fn forget(&mut self, p: u64, n: u64, subjects: &[u64], objects: &[u64]) {
-        let gone_s = subjects
-            .iter()
-            .filter(|&&s| !self.ins_pair(Perm::Pso, p, s))
-            .count() as u64;
-        let gone_o = objects
-            .iter()
-            .filter(|&&o| !self.ins_pair(Perm::Pos, p, o))
-            .count() as u64;
+        self.forget_with(p, n, subjects, objects, &mut || Ok(()))
+            .expect("an unchecked update cannot fail");
+    }
+
+    fn forget_with(
+        &mut self,
+        p: u64,
+        n: u64,
+        subjects: &[u64],
+        objects: &[u64],
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let mut gone = |perm: Perm, values: &[u64]| -> Result<u64> {
+            let mut count = 0u64;
+            for (at, &value) in values.iter().enumerate() {
+                if at.is_multiple_of(1024) {
+                    check()?;
+                }
+                count += !self.ins_pair(perm, p, value) as u64;
+            }
+            Ok(count)
+        };
+        let gone_s = gone(Perm::Pso, subjects)?;
+        let gone_o = gone(Perm::Pos, objects)?;
         if let Some(e) = self.predicates.get_mut(&p) {
             e.count = e.count.saturating_sub(n);
             e.distinct_subjects = e.distinct_subjects.saturating_sub(gone_s);
@@ -418,6 +443,7 @@ impl Delta {
                 self.predicates.remove(&p);
             }
         }
+        Ok(())
     }
 
     /// Take the inserted quads `qs` out of the delta at once (a triple-level access

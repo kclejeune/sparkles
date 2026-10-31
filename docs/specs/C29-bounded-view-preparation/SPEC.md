@@ -203,7 +203,10 @@ entry in polled pieces, since hashing it could not be interrupted. The seven
 permutations of a cold mask are written in parallel, as the legacy path writes them,
 and hidden keys are sorted in pieces of 16,384 merged through an admitted buffer.
 Writes to the shared delta report the nodes they copy, split or grow, which is how
-each batch keeps only the bytes it allocated. A cached disclosure index is read in
+each batch keeps only the bytes it allocated. A batch that is refused or interrupted
+keeps its whole admission until the copied nodes are dropped, so a writer still
+running cannot reuse it. The statistics update for the hidden inserted quads polls
+its controls every 1,024 values. A cached disclosure index is read in
 place without charging the shared index to the request. A cold disclosure index skips
 a row whose graph and footprint match a row in a fixed table of 256 recent pairs,
 since a repeated pair cannot change the index.

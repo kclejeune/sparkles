@@ -535,10 +535,14 @@ fn forget_removed(
     hidden: &[Key],
     inserted: &[bool],
     preparation: &Preparation,
+    check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     let mut by_subject = Buffer::new(preparation)?;
     let mut by_object = Buffer::new(preparation)?;
-    for (key, &was_inserted) in hidden.iter().zip(inserted) {
+    for (at, (key, &was_inserted)) in hidden.iter().zip(inserted).enumerate() {
+        if at.is_multiple_of(1024) {
+            check()?;
+        }
         if was_inserted {
             let [s, p, o, _] = *key;
             by_subject.push([p, s, o, 0])?;
@@ -551,11 +555,14 @@ fn forget_removed(
     let mut objects = Buffer::new(preparation)?;
     let (mut a, mut b) = (0, 0);
     while a < by_subject.len() {
-        preparation.check()?;
+        check()?;
         let p = by_subject[a][0];
         let start = a;
         subjects.truncate(0);
         while a < by_subject.len() && by_subject[a][0] == p {
+            if a.is_multiple_of(1024) {
+                check()?;
+            }
             if subjects.last() != Some(&by_subject[a][1]) {
                 subjects.push(by_subject[a][1])?;
             }
@@ -563,14 +570,17 @@ fn forget_removed(
         }
         objects.truncate(0);
         while b < by_object.len() && by_object[b][0] == p {
+            if b.is_multiple_of(1024) {
+                check()?;
+            }
             if objects.last() != Some(&by_object[b][1]) {
                 objects.push(by_object[b][1])?;
             }
             b += 1;
         }
-        delta.forget_removed(p, (a - start) as u64, &subjects, &objects);
+        delta.forget_removed(p, (a - start) as u64, &subjects, &objects, check)?;
     }
-    preparation.check()
+    check()
 }
 
 /// Hide `hidden` in one permutation: remove the keys the delta inserted and add the
@@ -582,8 +592,11 @@ fn write_permutation(
     hidden: &[Key],
     inserted: &[bool],
     preparation: &Preparation,
-) -> Result<Reservation> {
-    let mut copies = preparation.reserve(0)?;
+    owned: &mut Reservation,
+) -> Result<()> {
+    // `owned` belongs to the caller, which keeps it until the sets these writes change
+    // are dropped. A refused or interrupted batch keeps its whole admission there too,
+    // so no other writer can reuse the allowance of nodes that are still alive.
     let mut at = 0;
     while at < hidden.len() {
         // One more level than either set has now covers a root split in the batch.
@@ -594,14 +607,14 @@ fn write_permutation(
         // A batch admits at most a quarter of what the writes already own, or an eighth
         // of the room the cap leaves each of the seven writers, so headroom stays small
         // next to the charge and the cap while admissions stay few.
-        let share = (copies.bytes() / 4).max(preparation.room() / 8 / Perm::ALL.len() as u64);
+        let share = (owned.bytes() / 4).max(preparation.room() / 8 / Perm::ALL.len() as u64);
         let batch = usize::try_from(share / bound.max(1))
             .unwrap_or(usize::MAX)
             .clamp(1, 4096)
             .min(hidden.len() - at);
         let mut headroom = preparation.reserve(bound.saturating_mul(batch as u64))?;
         let mut allocated = 0u64;
-        for index in at..at + batch {
+        let written = (at..at + batch).try_for_each(|index| {
             if index.is_multiple_of(64) {
                 preparation.check()?;
             }
@@ -611,14 +624,17 @@ fn write_permutation(
             } else {
                 del.insert_metered(key, &mut allocated);
             }
+            Ok(())
+        });
+        let grown = written.and_then(|()| headroom.grow_to(allocated));
+        if grown.is_ok() {
+            headroom.release_to(allocated);
         }
-        headroom.grow_to(allocated)?;
-        headroom.release_to(allocated);
-        copies.merge(headroom);
+        owned.merge(headroom);
+        grown?;
         at += batch;
     }
-    preparation.check()?;
-    Ok(copies)
+    preparation.check()
 }
 
 fn apply_controlled(
@@ -634,30 +650,39 @@ fn apply_controlled(
     // legacy path writes them. Each batch of key-set writes is admitted at an upper
     // bound before it runs and then keeps only the bytes it allocated, so the view is
     // charged for the nodes it owns and the cap holds at the peak of every batch.
-    let mut delta = snap.delta.clone();
     let mut inserted = Buffer::new(preparation)?;
     for key in hidden.iter() {
-        inserted.push(delta.ins[Perm::Spo.index()].contains(key))?;
+        inserted.push(snap.delta.ins[Perm::Spo.index()].contains(key))?;
     }
     let mut predicates = preparation.reserve(0)?;
     if inserted.iter().any(|&i| i) {
         // the statistics map is persistent too, and cannot copy more than its nodes
-        predicates.merge(preparation.reserve(delta.predicate_bytes_bound())?);
+        predicates.merge(preparation.reserve(snap.delta.predicate_bytes_bound())?);
     }
+    let mut copies = Perm::ALL
+        .iter()
+        .map(|_| preparation.reserve(0))
+        .collect::<Result<Vec<_>>>()?;
+    // Declared after the reservations, so an early return drops the copied nodes
+    // before it releases their admission.
+    let mut delta = snap.delta.clone();
     let sets: Vec<(Perm, &mut KeySet, &mut KeySet)> = Perm::ALL
         .into_iter()
         .zip(delta.ins.iter_mut().zip(delta.del.iter_mut()))
         .map(|(perm, (ins, del))| (perm, ins, del))
         .collect();
-    let copies = {
+    {
         use rayon::prelude::*;
         sets.into_par_iter()
-            .map(|(perm, ins, del)| {
-                write_permutation(perm, ins, del, &hidden, &inserted, preparation)
+            .zip(copies.par_iter_mut())
+            .map(|((perm, ins, del), owned)| {
+                write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
             })
-            .collect::<Result<Vec<Reservation>>>()?
+            .collect::<Result<()>>()?
     };
-    forget_removed(&mut delta, &hidden, &inserted, preparation)?;
+    forget_removed(&mut delta, &hidden, &inserted, preparation, &mut || {
+        preparation.check()
+    })?;
     drop(inserted);
     for copy in copies {
         held.merge(copy);
@@ -836,6 +861,81 @@ mod tests {
         assert!(legacy_mask.retained >= legacy.delta.unshared_bytes(|| Ok(())).unwrap().0);
         drop(prepared);
         assert_eq!(prep.inner_used(), before);
+    }
+
+    #[test]
+    fn a_writer_refused_mid_mask_keeps_the_charge_for_the_nodes_it_wrote() {
+        // A refused batch must not release the admission of nodes that stay alive in
+        // the caller's delta, or other writers could reuse it while they exist.
+        let key = |i: u64| [i, 1, i, 0];
+        let base: KeySet = (0..20_000).map(|i| key(i * 2)).collect();
+        let hidden: Vec<Key> = (0..20_000).map(|i| key(i * 2 + 1)).collect();
+        let inserted = vec![false; hidden.len()];
+        let prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let mut ins = KeySet::new();
+        let mut del = base.clone();
+        let mut copies = prep.reserve(0).unwrap();
+        let result = write_permutation(
+            Perm::Spo,
+            &mut ins,
+            &mut del,
+            &hidden,
+            &inserted,
+            &prep,
+            &mut copies,
+        );
+        assert!(
+            matches!(result, Err(Error::BudgetExceeded(_))),
+            "{result:?}"
+        );
+        let (owned, _) = del.unshared_bytes(|| Ok(())).unwrap();
+        assert!(owned > 0);
+        assert!(
+            prep.inner_used() >= owned,
+            "charged {} for {owned} live bytes",
+            prep.inner_used()
+        );
+        drop((ins, del));
+        drop(copies);
+    }
+
+    #[test]
+    fn statistics_of_one_large_predicate_poll_the_controls() {
+        // One predicate with many distinct subjects and objects is one statistics
+        // update, which must still poll its controls as it goes.
+        let store = crate::store::Store::in_memory(Default::default());
+        let rows: String = (0..20_000)
+            .map(|i| format!("<urn:s{i}> <urn:p> <urn:o{i}> . "))
+            .collect();
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {rows} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let mut delta = store.snapshot().delta.clone();
+        let hidden: Vec<Key> = delta.ins[Perm::Spo.index()].iter().copied().collect();
+        assert_eq!(hidden.len(), 20_000);
+        let inserted = vec![true; hidden.len()];
+        let prep = Preparation::new(Control::none(), 64 << 20).unwrap();
+        let mut checks = 0usize;
+        forget_removed(&mut delta, &hidden, &inserted, &prep, &mut || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        // two lists of 20,000 values, polled at least every 1024 steps
+        assert!(checks >= 2 * 20_000 / 1024, "{checks} checks");
+        let mut refused = 0usize;
+        let cancelled = forget_removed(&mut delta.clone(), &hidden, &inserted, &prep, &mut || {
+            refused += 1;
+            if refused > 20 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(cancelled, Err(Error::Cancelled)));
     }
 
     #[test]
