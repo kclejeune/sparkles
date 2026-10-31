@@ -386,8 +386,12 @@ graph, and a literal is linted only when that holder is certain.
 * *JSON-LD.* Which values are queries comes from oxjsonld's expansion of the document, so
   `@vocab`, keyword aliases, default and scoped languages, coercions and redefined terms
   are decided as JSON-LD decides them. A query quad is mapped back to the source when
-  exactly one value string of the document has its text and exactly one node holds it. A
-  document that cannot be expanded here gets no query findings.
+  exactly one value string of the document has its text, exactly one node holds it, and a
+  probe shows that the string makes the quad: the document with that string replaced by a
+  fresh text expands to the same dataset with only that quad's literal replaced. A query
+  made from something else, such as the key of an `@index` map, fails the probe. At most
+  256 strings are probed, and a document that cannot be expanded here gets no query
+  findings.
 * *Ambiguity.* Any other literal is skipped. The same query text on two anonymous nodes,
   or a text that another string of the document repeats, costs the findings of that query
   and never gives one node the findings of another.
@@ -451,7 +455,17 @@ the Format button.
   UTF-16 offsets of the HTTP endpoint and the MCP tool and the positions of the language
   server, so a document with many findings costs one scan rather than one per finding.
   Each of those passes checks the deadline as it goes, and the lint never returns findings
-  once the deadline has passed.
+  once the deadline has passed. The language server gives each diagnostics request one
+  deadline for the lint, the positions and the publication.
+* The isomorphism check behind the JSON-LD fixes, the provenance probes and the SHACLC
+  formatter never canonicalizes exactly, which takes factorial time on a few symmetric
+  blank nodes and cannot be stopped. Graphs of any size are compared by colour refinement
+  and a budgeted search that checks the deadline, and whatever that cannot verify is
+  refused.
+* Memory. Only the query literals that are linted get a position table, which holds two
+  offsets for each byte of the query. The texts of anonymous query literals are counted
+  among the document's strings without tables, and a string too long to be one of them is
+  not decoded, so a large data literal costs no copy.
 * N-Triples and N-Quads are not read for SHACL query literals. The three languages that
   can carry shapes in practice are covered.
 
@@ -470,7 +484,14 @@ the final placing of findings ran past the deadline. Queries and fixes in JSON-L
 on the real expansion, holders on identity or an unambiguous match, and the lint checks the
 deadline before every parse, on every error path, while placing findings and before it
 returns. The HTTP endpoint's and the MCP tool's UTF-16 offsets and the language server's
-positions are counted under the same deadline. Each case has a regression test.
+positions are counted under the same deadline. A third review found that the bounded
+isomorphism check still canonicalized small graphs without a deadline, that holders were
+deduplicated by a quadratic scan, that a JSON-LD query made from an `@index` key could be
+placed on an unrelated string with its text, that every Turtle string got a position
+table, and that the language server renewed its deadline for positions. The search
+replaced the exact canonicalization, holders are hash sets built under the deadline, each
+JSON-LD query's source is proved by a probe, only query literals get tables, and the
+language server keeps one deadline per request. Each case has a regression test.
 
 **Tests.** `crates/sparkles-fmt/src/lint` has unit tests for N-Triples, N-Quads, SHACLC,
 JSON-LD and the embedded queries. They cover the pre-bound variables, the prefix sources,
