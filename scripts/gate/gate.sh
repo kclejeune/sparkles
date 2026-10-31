@@ -368,6 +368,9 @@ if [ $auto = 1 ]; then
   # idle[h]=1 when h is reachable with its lock free and no gate units; full[h]=1 when h has
   # the disk for a whole gate and half[h]=1 when it has the disk for a conformance half.
   declare -A idle=() full=() half=() units=()
+  # GATE_HELPER=none or --helper none keeps every choice below a whole gate.
+  split_ok=1
+  [ "$helper" = none ] && split_ok=0
   report=
   for h in "${gate_hosts[@]}"; do
     p=$(probe "$h")
@@ -403,7 +406,7 @@ if [ $auto = 1 ]; then
     [ -n "$best" ] && primary=$best
     helper=none
     for h in "${gate_hosts[@]}"; do
-      [ "$h" != "$primary" ] && [ "${half[$h]:-0}" = 1 ] || continue
+      [ $split_ok = 1 ] && [ "$h" != "$primary" ] && [ "${half[$h]:-0}" = 1 ] || continue
       if [ "${units[$h]}" -le "${units[$primary]:-999}" ] && { [ "$helper" = none ] || [ "${units[$h]}" -lt "${units[$helper]}" ]; }; then
         helper=$h
       fi
