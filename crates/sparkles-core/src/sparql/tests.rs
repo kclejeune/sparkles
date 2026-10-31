@@ -2429,4 +2429,38 @@ mod generator_divergences {
         .collect();
         check(&s, &cases);
     }
+
+    // A FILTER on an object that a VALUES table leaves UNDEF in one row. Subject i has
+    // the object i mod 7. The row 2 joins the subjects whose object is 2, the UNDEF row
+    // joins every subject with its own object, and the row 1 joins those whose object is
+    // 1. `?o > 1` keeps the first set and the part of the second whose object exceeds 1,
+    // 34 rows in all. Run on the VALUES rows first, it drops the UNDEF row and keeps the
+    // 6 rows of object 2. A store of a few triples plans the scan first and hides this.
+    #[test]
+    fn a_filter_on_an_undef_values_object_tests_the_joined_value() {
+        let ttl: String = (0..40)
+            .map(|i| format!(":s{i} <urn:x-p> {} .\n", i % 7))
+            .collect();
+        let s = store_with(&ttl);
+        let rows_of = |keep: fn(u32) -> bool| {
+            (0..40u32)
+                .filter(move |i| keep(i % 7))
+                .map(|i| format!("s{i} {}", i % 7))
+        };
+        let mut want: Vec<String> = rows_of(|o| o == 2).chain(rows_of(|o| o > 1)).collect();
+        want.sort();
+        assert_eq!(want.len(), 34);
+        let want: Vec<&str> = want.iter().map(String::as_str).collect();
+        let cases: Vec<(String, Vec<&str>)> = [
+            // the FILTER outside the group of the VALUES
+            "{ VALUES ?o { 1 2 UNDEF } ?s <urn:x-p> ?o } FILTER(?o > 1)",
+            // the FILTER in the same group as the VALUES
+            "VALUES ?o { 1 2 UNDEF } ?s <urn:x-p> ?o FILTER(?o > 1)",
+            "?s <urn:x-p> ?o VALUES ?o { 1 2 UNDEF } FILTER(?o > 1)",
+        ]
+        .into_iter()
+        .map(|body| (format!("SELECT ?s ?o WHERE {{ {body} }}"), want.clone()))
+        .collect();
+        check(&s, &cases);
+    }
 }
