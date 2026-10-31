@@ -655,7 +655,9 @@ The workflows in `.github/workflows` run on standard GitHub-hosted runners, whic
 for public repositories: `ubuntu-24.04` for Linux x86_64 with 4 vCPUs and 16 GB,
 `ubuntu-24.04-arm` for Linux arm64 and `macos-15` for macOS arm64. Since runner time is
 free, the workflows split their work into parallel jobs to shorten the wait for a push,
-rather than to save runner minutes. `actionlint` checks the workflow files.
+rather than to save runner minutes. Two repository variables can move the Linux x86_64
+jobs of same-repository events to larger paid runners, as
+[Larger runners](#larger-runners) describes. `actionlint` checks the workflow files.
 
 `ci.yml` runs on every push to `main` and every pull request. Linux is the production
 server platform. Ordinary runs validate the default server and keep binding feature
@@ -666,9 +668,10 @@ manual **compatibility-features** input.
 |---|---|
 | Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, the API compatibility inventory and checker fixtures, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
 | Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
-| Build tests | `mbx nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
-| Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
-| Jena clients | Jena's own HTTP clients against the server binary from the archive (`mise run test:jena-clients`). |
+| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. |
+| Doctests | The workspace's doctests, which nextest does not run. They build in parallel with the test archive, so the test jobs do not wait for them. |
+| Test | Two heavy shards run the binaries with the slowest tests from the small archive. The `timing` shard runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. Four more shards split the other tests by count, and the `SPARKLES_TEST_SLICES` variable changes how many. |
+| Jena clients | Jena's own HTTP clients against the debug server binary (`mise run test:jena-clients`). |
 | Features | A manual run with **compatibility-features** checked runs six jobs through `scripts/test-features.sh`, with the default features off and one feature set each. They build apart from the archive and have a cache each. |
 
 The transcript import integration test reserves all test slots while it runs in its
@@ -712,6 +715,63 @@ versions. Substitution tests remain separate because their semantics differ.
 `nix.yml` builds the flake's `cacheable` output with nix-fast-build on x86_64 Linux,
 arm64 Linux and arm64 macOS only when started manually through `workflow_dispatch`.
 Pushes and pull requests do not start Nix jobs. The [Nix](#nix) section describes its build set.
+
+### Larger runners
+
+The compile-heavy Linux x86_64 jobs take their runner label from the repository variable
+`SPARKLES_RUNNER_LARGE`. These jobs are Build tests, Clippy, the server candidate build and
+the branch builds of the JVM natives, the Node addon and the Python wheels. Checks, the
+doctests, the test shards and the other Linux x86_64 binding jobs take theirs from
+`SPARKLES_RUNNER`. A job uses `ubuntu-24.04` when its variable is unset, for a fork pull
+request, for a binding release tag and for a manual run with **github-hosted** checked.
+Short jobs such as Changes, Jena clients and the installed server smoke tests always run on
+GitHub's runners, as do arm64, macOS and every publishing job. The workflows treat each
+value as an opaque label, so any provider that registers runners for the repository works.
+`SPARKLES_TEST_SLICES` sets how many shards split the tests outside the heavy and timing
+shards, from 1 to 16, and defaults to 4.
+
+A job on a runner with at least 24 GiB of memory adds no swap file. On a runner whose file
+system refuses one, the job warns and continues. On a large runner the server candidate's
+container keeps its process limit and drops its 4 CPU and 14 GB limits, and Cargo runs one
+compiler job for each CPU instead of two in total.
+
+The remote mbx cache authenticates with the GitHub OIDC token of the job. GitHub issues
+that token to jobs on self-hosted runners as it does on its own, and neither provider below
+documents a restriction. Both providers bill per second of runner time, while GitHub's
+standard runners are free for this public repository.
+
+Boat runs each job in a fresh Ubuntu 24.04 virtual machine with Docker, passwordless
+`sudo` and 4 GB of swap. Its machines are in Germany, Finland and France, so a job that
+downloads the remote cache from a server elsewhere may wait longer for it. Its CI needs
+the $20 plan, and the `boat-xlarge` size needs the $100 plan. The $20 plan starts 12 jobs
+a minute, 60 an hour and 200 a day. A job over the minute limit waits, and a job over the
+day limit fails. To set it up, the owner of the repository runs these steps.
+
+1. Start a Boat plan, then run `boat ci connect` and choose the repository in GitHub.
+2. Allow this public repository's runs with `boat ci public kclejeune on --users kclejeune`.
+   Boat refuses public-repository jobs by default, which also keeps other people's pull
+   requests off it.
+3. Set `SPARKLES_RUNNER_LARGE` to `boat-xlarge` (16 vCPU and 32 GB) or `boat-large`
+   (8 vCPU and 16 GB), and optionally `SPARKLES_RUNNER` to `boat` (4 vCPU and 8 GB) or
+   `boat-large`, under Settings, Secrets and variables, Actions, Variables. With
+   `SPARKLES_RUNNER` at `boat-large`, `SPARKLES_TEST_SLICES` at 2 gives about the same
+   shard times as four 4-vCPU shards with two fewer jobs.
+
+Namespace registers its runners through a GitHub app and selects them by profile, with the
+label `namespace-profile-<name>`. A profile can attach a cache volume, mounted at `/cache`,
+and configure swap, which its runners lack by default and which a swap file on their
+overlay file system cannot replace. The workflows do not use cache volumes. To set it up,
+the owner runs these steps.
+
+1. Install the Namespace GitHub app on the account from the dashboard's GitHub runners
+   page and grant it this repository.
+2. Create a Linux AMD64 profile named `sparkles-large` with the 16x32 shape and 8 GB of
+   swap, and optionally a profile named `sparkles` with the 8x16 shape.
+3. Set `SPARKLES_RUNNER_LARGE` to `namespace-profile-sparkles-large`, and optionally
+   `SPARKLES_RUNNER` to `namespace-profile-sparkles`.
+
+Fork pull requests never reach either provider, because every label expression falls back
+to `ubuntu-24.04` unless the pull request's head repository is this one.
 
 ### Caches
 
@@ -765,8 +825,8 @@ before temporary build data is collected.
 
 Gradle and pnpm retain their existing caches. Hermetic Nix builds retain their
 Crane dependency artifacts and Nix binary caches. The dev profile keeps line tables for
-workspace crates and disables dependency debug information. The largest test build retains
-16 GB of swap in addition to the runner's RAM.
+workspace crates and disables dependency debug information. The test build and the
+doctests add 16 GB of swap to a runner with less than 24 GiB of memory.
 
 ## Releases
 
