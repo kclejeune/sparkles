@@ -109,8 +109,9 @@ impl FamilyGate {
     /// Settle known pending group publications while waiting for family admission.
     /// This hook is for the fixed internal coordinator drainer, never a user callback.
     /// It runs outside the gate mutex, before the caller takes any branch writer.
-    /// It must be bounded and must not acquire a family permit or a branch writer.
-    #[cfg(test)]
+    /// It must be bounded and must not acquire a family permit or wait for a branch
+    /// writer. It may try a member's writer without waiting, to drive that member's
+    /// pending publications.
     pub(crate) fn admit_draining(
         self: &Arc<Self>,
         opts: &WriteOptions,
@@ -220,14 +221,12 @@ impl Drop for AdmissionPermit {
     }
 }
 
-#[cfg(test)]
 struct AdmissionWaiter {
     gate: Arc<FamilyGate>,
     identity: Arc<()>,
     queued: bool,
 }
 
-#[cfg(test)]
 impl Drop for AdmissionWaiter {
     fn drop(&mut self) {
         if self.queued {

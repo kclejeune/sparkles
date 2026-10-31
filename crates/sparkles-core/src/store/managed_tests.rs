@@ -672,3 +672,96 @@ fn an_uncertain_enablement_fences_the_running_dataset() {
         }
     }
 }
+
+/// Blocks each candidate in its check, after the managed-graph admission, until told.
+struct Paused {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl crate::guard::CommitGuard for Paused {
+    fn check(&self, _: &crate::guard::Candidate<'_>) -> Result<crate::guard::ValidationSummary> {
+        self.entered.send(()).unwrap();
+        self.release.lock().recv().unwrap();
+        Ok(crate::guard::ValidationSummary::empty(
+            crate::guard::GuardStatus::Passed,
+            crate::guard::GuardMode::Reject,
+            crate::guard::Severity::Violation,
+        ))
+    }
+
+    fn describe(&self) -> String {
+        "paused".into()
+    }
+}
+
+/// An enablement returns only after every writer of the family that may have been
+/// admitted against the previous registry has published or refused, including a
+/// writer of a branch deleted while its handle is retained.
+#[test]
+fn enablement_waits_for_detached_writers() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(if persistent {
+            Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap()
+        } else {
+            Store::in_memory(StoreOptions::default())
+        });
+        upd(&s, "INSERT DATA { <urn:a> <urn:p> 1 }").unwrap();
+        s.create_branch("dev", &BranchOptions::default()).unwrap();
+        let dev = s.branch("dev").unwrap().shared().unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        dev.set_guard(Some(Arc::new(Paused {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        })));
+        let writer = std::thread::spawn({
+            let dev = dev.clone();
+            move || {
+                let mut t = dev.write();
+                put(&mut t, Some(M), "admitted before");
+                t.commit().map(|r| r.committed)
+            }
+        });
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (deleted_tx, deleted) = mpsc::channel();
+        std::thread::spawn({
+            let s = s.clone();
+            move || {
+                let r = s.delete_branch_with(
+                    "dev",
+                    &crate::branch::DeleteOptions {
+                        force: true,
+                        reparent: false,
+                    },
+                );
+                deleted_tx.send(r.is_ok()).unwrap();
+            }
+        });
+        let deleted = deleted.recv_timeout(Duration::from_millis(500));
+        let (enabled_tx, enabled) = mpsc::channel();
+        let enabler = std::thread::spawn({
+            let s = s.clone();
+            move || {
+                enable(&s, &[M]);
+                enabled_tx.send(()).unwrap();
+            }
+        });
+        // while the admitted writer is paused, enablement must not return
+        let early = enabled.recv_timeout(Duration::from_millis(500)).is_ok();
+        release.send(()).unwrap();
+        let committed = writer.join().unwrap();
+        enabler.join().unwrap();
+        assert!(
+            !early,
+            "persistent {persistent}: enablement returned before the writer it raced (deleted: {deleted:?}, committed: {committed:?})"
+        );
+        // a later write of the retained handle is refused
+        let mut t = dev.write();
+        put(&mut t, Some(M), "after");
+        assert!(t.commit().is_err());
+    }
+}

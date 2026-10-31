@@ -277,18 +277,43 @@ impl Store {
         Ok(graphs)
     }
 
-    /// Wait until every resident branch has published or refused the commits it may
-    /// have admitted against the previous registry. A branch writer admits under its
-    /// own writer lock, so taking and releasing each lock, with its pending group
-    /// commits drained, is enough. A branch that is not resident has no writer.
+    /// Wait until every writer of the family that may have been admitted against the
+    /// previous registry has published or refused. Each writer holds a family permit
+    /// from before it takes its writer lock until its commit is durably published or
+    /// refused, including a pending group commit whose submitter has gone and a writer
+    /// of a branch that was deleted or retired while a handle to it is retained. One
+    /// exclusive family admission therefore waits for all of them. While it waits, the
+    /// pending group publications of each live member are driven when that member's
+    /// writer is free. The caller holds no writer of the family, and a thread that holds
+    /// a write transaction of the family must not enable or detach managed graphs.
     fn managed_barrier(&self) -> Result<()> {
-        let Some(set) = self.branch_set() else {
-            return Ok(());
-        };
         let o = crate::guard::WriteOptions::default();
-        for branch in set.open_stores() {
-            drop(branch.lock_writer(&o)?);
-        }
+        let set = self.branch_set();
+        let permit = self.family.gate.admit_draining(&o, || {
+            let mut members: Vec<Arc<Store>> = Vec::new();
+            if let Some(set) = &set {
+                members.extend(set.stores.lock().values().cloned());
+                members.extend(
+                    set.openings
+                        .lock()
+                        .values()
+                        .filter_map(|o| o.store.upgrade()),
+                );
+            }
+            let drive = |m: &Store| {
+                if let Some(mut w) = m.writer.try_lock() {
+                    m.drain_group(&mut w, None).ok();
+                }
+            };
+            drive(self);
+            for m in &members {
+                drive(m);
+            }
+            // Members are released after their writers, outside any lock.
+            drop(members);
+            Ok(())
+        })?;
+        drop(permit);
         Ok(())
     }
 
