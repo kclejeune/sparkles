@@ -25,7 +25,10 @@ const NODE_KINDS: [&str; 6] = [
     "IRIOrLiteral",
 ];
 
-pub(crate) fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxError> {
+pub(crate) fn parse(
+    text: &str,
+    base: Option<&str>,
+) -> Result<(Document, Vec<Triple>), SyntaxError> {
     let toks = tokenize(text)?;
     let base = match base {
         Some(b) => Some(Iri::parse(b.to_string()).map_err(|e| SyntaxError {
@@ -52,12 +55,14 @@ pub(crate) fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxEr
     for t in &p.out {
         graph.insert(t);
     }
-    Ok(Document {
-        graph,
-        triples: p.out,
-        prefixes: p.declared,
-        base: p.base.map(Iri::into_inner),
-    })
+    Ok((
+        Document {
+            graph,
+            prefixes: p.declared,
+            base: p.base.map(Iri::into_inner),
+        },
+        p.out,
+    ))
 }
 
 /// A node of the graph being built: a subject or object.

@@ -122,15 +122,21 @@ shared document model.
 * **Reference parse.** `sparkles_shaclc::parse` is the authority for syntax errors and for
   the shapes graph. The formatter's tree follows the reader's decisions, such as the
   `|` after a path continuing the path only before an IRI, a prefixed name, `(` or `^`.
-* **Bounded graph check.** The reader returns its triples in the order it made them, so
-  the input and the output number their blank nodes alike and the comparison takes the
-  fast path of the RDF check. When the order differs, a graph of at most eight blank
-  nodes is canonicalized exactly. A larger one is compared by colour refinement, which
-  takes polynomial time. Canonicalization of many symmetric blank nodes is factorial
-  and does not look at the deadline, which made a 211-byte input of two property shapes
-  with nine identical constraints each take 33 seconds. Refinement is weaker than an
-  isomorphism test, and the formatter's reordering does not produce the graphs where
-  the two differ.
+* **Bounded graph check.** The reader can return its triples in the order it made them
+  (`sparkles_shaclc::parse_ordered`), so the input and the output number their blank
+  nodes alike and the comparison takes the fast path of the RDF check. When the order
+  differs, a graph of at most eight blank nodes is canonicalized exactly. A larger one is
+  compared by colour refinement, which can only reject, and then by a backtracking search
+  for a blank node mapping that checks every quad under the mapping. The search has a
+  budget of 20 million steps, each a candidate try or a quad lookup. If the budget runs
+  out, the formatter refuses the output with the check `could not verify the formatted
+  output` and leaves the input unchanged. It never accepts a graph it did not verify.
+  Canonicalizing many symmetric blank nodes is factorial and does not look at the
+  deadline, which made a 211-byte input of two property shapes with nine identical
+  constraints each take 33 seconds. An earlier version accepted a graph whenever
+  refinement could not tell the two apart, which accepted two `in` lists that share 30
+  entries and end in exchanged values, and ten identical property shapes against nine.
+  Both are negative tests now.
 * **Layout.** Directives stay in the order written, and `BASE`, `PREFIX` and `IMPORTS`
   are written in upper case. One blank line separates shapes, and a shape's header stays
   on one line. A nested body is a block, and each property takes one line indented by

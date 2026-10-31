@@ -42,8 +42,6 @@ pub const EXTENSIONS: [&str; 2] = ["shaclc", "shc"];
 pub struct Document {
     /// the shapes graph (fresh blank nodes)
     pub graph: Graph,
-    /// the triples of the graph in the order the reader made them, duplicates included
-    pub triples: Vec<Triple>,
     /// the prefixes the document declares, in order
     pub prefixes: Vec<(String, String)>,
     /// the base at the end of the document (`BASE`, or the base given to the parser)
@@ -100,6 +98,17 @@ impl std::error::Error for NotCompact {}
 /// Parse a SHACLC document. `base` resolves relative IRIs until a `BASE` directive, and
 /// names the ontology (`<base> a owl:Ontology`) when the document has no `BASE`.
 pub fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxError> {
+    read::parse(text, base).map(|(doc, _)| doc)
+}
+
+/// Like [`parse`], and also returns the triples of the graph in the order the reader made
+/// them, duplicates included. A [`Graph`] does not keep the order, and two documents that
+/// differ only in layout make the same triples in the same order, which lets a caller
+/// compare their graphs without searching for a blank node mapping.
+pub fn parse_ordered(
+    text: &str,
+    base: Option<&str>,
+) -> Result<(Document, Vec<Triple>), SyntaxError> {
     read::parse(text, base)
 }
 

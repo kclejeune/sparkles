@@ -116,6 +116,9 @@ pub mod compact {
     pub struct Document { pub graph: Graph, pub prefixes: Vec<(String, String)>,
                           pub base: Option<String> }
     pub fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxError>;
+    // added for the formatter: the triples in the order the reader made them
+    pub fn parse_ordered(text: &str, base: Option<&str>)
+        -> Result<(Document, Vec<Triple>), SyntaxError>;
     pub fn write(graph: &Graph, prefixes: &[(String, String)]) -> Result<String, NotCompact>;
 }
 ```
@@ -530,6 +533,9 @@ the checks. Three points concern this spec.
   live in `crates/sparkles-shaclc`, which depends only on `oxrdf`, `oxiri` and
   `rustc-hash`. `sparkles-shacl` re-exports it as `sparkles_shacl::compact`, so every
   path and the conformance suites are unchanged.
+* **`Document` is unchanged.** `parse_ordered` is a separate function that returns the
+  document with its triples in the order the reader made them, which the formatter uses
+  to compare graphs without a search.
 * **The lexer keeps trivia on request.** `lex::lex_lossless` returns every byte of the
   input as lexemes, with whitespace and comments among them, and `lex_lossless_partial`
   returns the lexemes before the first error. The tokenizer that the reader uses is the
