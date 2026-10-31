@@ -181,6 +181,23 @@ class BoxingtonContracts(unittest.TestCase):
             self.mbx("clean", str(self.workspace))
             time.sleep(0.2)
 
+    def test_explicit_target_dir_needs_the_task_lease_after_collection(self):
+        # A collection that has moved the view away and dropped its record, but not yet the
+        # link, leaves `target` dangling. mbx does not place an explicitly named target, so
+        # a bare build fails, and the same build under sparkles-task gets a fresh view.
+        self.mbx("build", "--offline")
+        view = Path(os.readlink(self.workspace / "target"))
+        shutil.rmtree(view)
+        view.with_suffix(".json").unlink()
+        bare = subprocess.run(
+            [MBX, "build", "--offline", "--target-dir", "target"], cwd=self.workspace,
+            env=self.env, capture_output=True, text=True, timeout=45,
+        )
+        self.assertNotEqual(bare.returncode, 0, "the negative control built through the link")
+        self.assertIn("Not a directory", bare.stderr)
+        self.mbx("sparkles-task", "--", MBX, "build", "--offline", "--target-dir", "target")
+        self.assertTrue((self.workspace / "target/debug").is_dir())
+
     def test_container_checksum_failure_stops_even_in_conditional_source(self):
         fake = self.root / "fake-bin"
         fake.mkdir()
@@ -307,6 +324,21 @@ class JvmBindingContracts(unittest.TestCase):
         # The negative control: without the lock, the second task deletes the bindings
         # the first task's Gradle reads.
         self.assertEqual(self.run_two_jvm_tasks(locked=False)[0][0], 41)
+
+
+class ExplicitTargetTasks(unittest.TestCase):
+    def test_every_explicit_root_target_cargo_call_holds_the_task_lease(self):
+        tasks = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]
+        calls = []
+        for name, task in tasks.items():
+            run = task.get("run", [])
+            for line in "\n".join(run if isinstance(run, list) else [run]).splitlines():
+                if "--target-dir target" in line and line.lstrip().startswith("mbx "):
+                    calls.append((name, line.strip()))
+        self.assertTrue(calls)
+        for name, line in calls:
+            with self.subTest(task=name):
+                self.assertTrue(line.startswith("mbx sparkles-task -- "), line)
 
 
 class ArtifactRetentionContracts(unittest.TestCase):

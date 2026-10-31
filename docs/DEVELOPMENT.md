@@ -104,7 +104,10 @@ covers the prepare step and every check until the run ends, however the run stop
 on a build host. Tasks that consume a build also make it inside their own lease.
 `jvm:test`, `jvm:build` and `jvm:sample` run `scripts/jvm-native.sh` first, `node:test`
 and `ui:e2e` build the server, and the benchmark and screenshot tasks build the release
-binary again. A build that is already fresh takes a few seconds. While a run holds its
+binary again. The binding lint and test tasks that pass `--target-dir target` run under
+`mbx sparkles-task` as well. Boxington does not place a target directory that a command
+names explicitly, so after a collection such a command could find a dangling `target`
+link and fail with "Not a directory", while the task helper places a fresh target first. A build that is already fresh takes a few seconds. While a run holds its
 lease, low-disk collection cannot reclaim the run's own target and evicts shared cache
 objects instead, so a host whose disk is nearly full can still run out of space during a
 gate.

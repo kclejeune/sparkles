@@ -488,8 +488,8 @@ sources = ["@group:rust"]
 outputs = []
 description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
 run = [
-  "mbx clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
-  "mbx clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+  "mbx sparkles-task -- mbx clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "mbx sparkles-task -- mbx clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks."py:lock"]
@@ -503,6 +503,12 @@ run = [
 # crates/sparkles-ffi is its own cargo workspace (see its Cargo.toml), built in the root
 # target directory so that it reuses the workspace's compiled dependencies. jvm/ is the Gradle
 # build of the Kotlin library, run through its checked-in wrapper.
+#
+# Every Cargo call with --target-dir target, here and for the Python and Node bindings, runs
+# under `mbx sparkles-task` in the root workspace, which places the root's managed target
+# and holds its lease. An explicit target directory makes mbx leave the target alone, so
+# after a collection a bare call can find a dangling `target` link and fail with "Not a
+# directory".
 
 [tasks."jvm:native"]
 description = "Build the JVM bindings' native library (crates/sparkles-ffi, release; JVM_PROFILE=dev for an unoptimized one) and generate its Kotlin bindings into target/jvm/uniffi"
@@ -536,15 +542,15 @@ sources = ["@group:rust"]
 outputs = []
 description = "Clippy (warnings are errors) on the JVM bindings' native library, with its default features and with none"
 run = [
-  "mbx clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets -- -D warnings",
-  "mbx clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+  "mbx sparkles-task -- mbx clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "mbx sparkles-task -- mbx clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks."jvm:rust-test"]
 sources = ["@group:rust"]
 outputs = []
 description = "The native library's Rust tests (the batch encoding and the objects the Kotlin library uses)"
-run = "mbx test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
+run = "mbx sparkles-task -- mbx test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
 
 [tasks."jvm:lock"]
 description = "Refresh crates/sparkles-ffi/Cargo.lock from the root Cargo.lock, after the workspace's dependencies change"
@@ -599,8 +605,8 @@ sources = ["@group:rust"]
 outputs = []
 description = "Clippy on the Node addon with default features and with none"
 run = [
-  "mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets -- -D warnings",
-  "mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+  "mbx sparkles-task -- mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "mbx sparkles-task -- mbx clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks."client:types"]
