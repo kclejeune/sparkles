@@ -96,7 +96,55 @@ class BoxingtonContracts(unittest.TestCase):
         self.assertIn("before", streamed.stdout)
         self.assertNotIn("after", streamed.stdout)
 
+    def ci_run(self, leased):
+        """Run scripts/ci.sh on `jvm:test` in the contract workspace, with a mise stand-in
+        whose prepare step builds and whose check collects the target before it reads it."""
+        (self.workspace / "scripts").mkdir(exist_ok=True)
+        for name in ("ci.sh", "cargo-sparkles-task"):
+            shutil.copy2(ROOT / "scripts" / name, self.workspace / "scripts" / name)
+        bin_dir = self.root / "ci-bin"
+        bin_dir.mkdir(exist_ok=True)
+        frontend = bin_dir / "mise"
+        frontend.write_text(
+            "#!/bin/sh\n"
+            "for task; do :; done\n"
+            'case "$task" in\n'
+            "  jvm:native) exec mbx build --offline ;;\n"
+            # The collection that removed a gate's target between two of its tasks, forced.
+            '  jvm:test) mbx clean "$PWD" || exit 9\n'
+            "    test -e target/debug/libsparkles_mbx_contract.rlib ;;\n"
+            "  *) exit 8 ;;\n"
+            "esac\n"
+        )
+        frontend.chmod(0o755)
+        env = dict(self.env, PATH=str(bin_dir) + os.pathsep + self.env["PATH"])
+        env.pop("SPARKLES_CI_LEASED", None)
+        if not leased:
+            # A run that takes an outer command's lease for granted, as every run of
+            # ci.sh did before it took one itself.
+            env["SPARKLES_CI_LEASED"] = "1"
+        result = subprocess.run(
+            ["bash", "scripts/ci.sh", "jvm:test"], cwd=self.workspace, env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        summary = (self.workspace / ".artifacts/ci/summary.txt").read_text()
+        return result, summary
 
+    def test_ci_run_holds_managed_target_lease_between_tasks(self):
+        result, summary = self.ci_run(leased=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(summary, r"prepare\s+pass")
+        self.assertRegex(summary, r"jvm:test\s+pass")
+        self.assertTrue((self.workspace / "target").exists(), "collector removed a leased target")
+        self.mbx("clean", str(self.workspace))
+        self.assertFalse((self.workspace / "target").exists(), "ci.sh did not release its lease")
+
+    def test_ci_run_without_the_lease_loses_prepared_outputs(self):
+        # The negative control: the same run without the lease loses what prepare built.
+        result, summary = self.ci_run(leased=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(summary, r"prepare\s+pass")
+        self.assertRegex(summary, r"jvm:test\s+FAIL")
 
     def test_container_checksum_failure_stops_even_in_conditional_source(self):
         fake = self.root / "fake-bin"
@@ -177,10 +225,19 @@ class ArtifactRetentionContracts(unittest.TestCase):
             frontend = root / "bin/mise"
             frontend.write_text('#!/bin/sh\nprintf "retained-ci-output\\n"\n')
             frontend.chmod(0o755)
-            env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
+            leaser = root / "bin/mbx"
+            leaser.write_text(
+                '#!/bin/sh\n[ "$1" = sparkles-task ] || exit 23\nshift\n[ "$1" != -- ] || shift\n'
+                'touch "$LEASE_MARKER"\nexec "$@"\n'
+            )
+            leaser.chmod(0o755)
+            env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                       LEASE_MARKER=str(root / "leased"))
+            env.pop("SPARKLES_CI_LEASED", None)
             result = subprocess.run(["bash", str(script), "lint:doc-paths"], cwd=root,
                                     env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "leased").exists(), "ci.sh ran without the target lease")
             summaries = list(root.glob("**/ci/summary.txt"))
             self.assertEqual(len(summaries), 1, result.stdout)
             summary = summaries[0]

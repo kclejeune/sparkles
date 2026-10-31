@@ -51,7 +51,9 @@ class CiProfiles(unittest.TestCase):
             frontend.chmod(0o755)
             calls = root / "calls"
             env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
-                       CI_CALLS=str(calls), CI_FAIL_TASK=failing)
+                       CI_CALLS=str(calls), CI_FAIL_TASK=failing,
+                       # Profile selection only; test_build_tooling covers the lease.
+                       SPARKLES_CI_LEASED="1")
             result = subprocess.run(["bash", str(script), "--jobs", "2", *args],
                                     cwd=root, env=env, capture_output=True, text=True, timeout=20)
             lines = calls.read_text().splitlines()

@@ -92,6 +92,23 @@ processes do not hold Boxington's target lease unless the task helper wraps them
 [managed-target guide](https://mr-boxington.jdx.dev/managed-targets) for the placement
 and collection rules.
 
+Boxington collects a whole managed target at once, including the target of a live
+checkout. It does so when the targets exceed their size budget or when the cache disk has
+less free space than `gc.min_free_size`. The only protection is the target's lease, which
+each `mbx` command holds from its start until it exits. Two `mbx` commands in a row
+therefore leave a gap in which a background collection can remove everything the first
+one built, such as `target/release/libsparkles_ffi.so` or `target/jvm/uniffi`. The next
+command then starts from an empty target. `scripts/ci.sh` closes the gap by running
+itself under `mbx sparkles-task`, so one lease covers the prepare step and every check
+until the run ends. This holds however the script is started, including the batch gate
+on a build host. Tasks that consume a build also make it inside their own lease.
+`jvm:test`, `jvm:build` and `jvm:sample` run `scripts/jvm-native.sh` first, `node:test`
+and `ui:e2e` build the server, and the benchmark and screenshot tasks build the release
+binary again. A build that is already fresh takes a few seconds. While a run holds its
+lease, low-disk collection cannot reclaim the run's own target and evicts shared cache
+objects instead, so a host whose disk is nearly full can still run out of space during a
+gate.
+
 Each machine has its own cache.
 GitHub Actions cache restoration is configured separately. See the
 [Boxington setup guide](https://mr-boxington.jdx.dev/setup) for editor integration.
@@ -487,7 +504,8 @@ UniFFI version. `mise run jvm:lock` refreshes the lock from the root one.
 
 `mise run jvm:native` (`scripts/jvm-native.sh`) builds the library in release mode in the
 root `target` directory and writes its generated Kotlin to `target/jvm/uniffi`.
-`JVM_PROFILE=dev` builds it without optimizations. The Gradle build in `jvm/` runs through
+`jvm:build`, `jvm:test` and `jvm:sample` run the same script first, inside the
+target lease that Gradle then runs in. `JVM_PROFILE=dev` builds it without optimizations. The Gradle build in `jvm/` runs through
 its checked-in wrapper and reads both paths, which the Gradle properties
 `sparkles.nativeLib` and `sparkles.bindings` can change. It compiles the generated code
 on its own, puts the library into the jar under
@@ -756,9 +774,12 @@ Production profiles, compiler optimization and linker selection stay unchanged.
 Mise tasks that use compiled outputs after a build internally wrap the downstream
 command with a small Cargo subcommand, `sparkles-task`. It keeps the workspace's
 managed-target lease alive for the full command, including benchmarks, binding
-tests, browser tests and the local CI gate. Collection cannot remove their target
-files while they run. A regression check covers collection both without and with
-the lease. Mise's cached validation keys also include the effective non-secret
+tests and browser tests. Each such task also builds what it consumes inside that
+lease, since a build made by a dependency task in an earlier lease can be collected
+before the task starts. `scripts/ci.sh` takes the lease itself for the whole run.
+Collection cannot remove their target files while they run. Regression checks cover
+collection both without and with the lease, for a single task and between two
+`scripts/ci.sh` tasks. Mise's cached validation keys also include the effective non-secret
 Boxington build policy, so changing a global linker or incremental setting reruns
 a check. Raw benchmark evidence still needs to be retained in its immutable record
 before temporary build data is collected.

@@ -224,9 +224,10 @@ pnpm exec playwright install chromium
 description = "UI end-to-end tests (Playwright) against a real `sparkles serve` (debug build; SPARKLES_BIN=… for another); extra args go to `playwright test`"
 depends = ["ui:build", "ui:e2e:browsers"]
 dir = "ui"
+# The server is built inside the lease that the tests run in, so collection cannot remove
+# the binary before they start it.
 run = '''
-[ -n "${SPARKLES_BIN:-}" ] || mbx build -p sparkles-server
-mbx sparkles-task -- pnpm e2e
+mbx sparkles-task -- bash -ec '[ -n "${SPARKLES_BIN:-}" ] || mbx build -p sparkles-server; exec pnpm e2e "$@"' e2e
 '''
 
 [tasks."ui:e2e:mock"]
@@ -451,11 +452,12 @@ flag "--force" help="run every check even when the task cache has a pass for it"
 flag "--jobs <n>" help="tasks run at once" default="2"
 arg "[task]..." help="run only these CI tasks" var=#true
 '''
-run = 'mbx sparkles-task -- scripts/ci.sh --jobs "$usage_jobs" ${usage_exhaustive_features:+--exhaustive-features} ${usage_fail_fast:+--fail-fast} ${usage_force:+--force} ${usage_task:-}'
+# scripts/ci.sh holds the managed target's lease for the whole run itself.
+run = 'scripts/ci.sh --jobs "$usage_jobs" ${usage_exhaustive_features:+--exhaustive-features} ${usage_fail_fast:+--fail-fast} ${usage_force:+--force} ${usage_task:-}'
 
 [tasks."ci:fast"]
 description = "The quick CI subset for iterating: formatting, cited doc paths, Clippy on the workspace and the Rust tests"
-run = "mbx sparkles-task -- scripts/ci.sh --fast"
+run = "scripts/ci.sh --fast"
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
@@ -508,23 +510,26 @@ run = "mbx sparkles-task -- scripts/jvm-native.sh"
 
 [tasks."jvm:build"]
 description = "Build the sparkles-jena jar (jvm/sparkles-jena/build/libs), with the host's native library inside"
-depends = ["jvm:native"]
 dir = "jvm"
-run = "mbx sparkles-task -- ./gradlew --console=plain :sparkles-jena:assemble"
+# The native library is built again inside this lease, so collection cannot remove it
+# before Gradle reads it. A fresh build takes seconds.
+run = "mbx sparkles-task -- bash -ec '../scripts/jvm-native.sh && exec ./gradlew --console=plain :sparkles-jena:assemble \"$@\"' jvm"
 
 [tasks."jvm:test"]
 sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh"]
 outputs = []
 description = "Jena's contract tests and the binding's own tests on the host's native library, once with the hand-written JNI calls and once without; extra args go to Gradle"
-depends = ["jvm:native"]
 dir = "jvm"
-run = "mbx sparkles-task -- ./gradlew --console=plain :sparkles-jena:test :sparkles-jena:testUniffi"
+# The native library is built again inside this lease, so collection cannot remove it
+# before Gradle reads it. A fresh build takes seconds.
+run = "mbx sparkles-task -- bash -ec '../scripts/jvm-native.sh && exec ./gradlew --console=plain :sparkles-jena:test :sparkles-jena:testUniffi \"$@\"' jvm"
 
 [tasks."jvm:sample"]
 description = "Compile the Java sample (jvm/sample-java) with -Xlint:all -Werror against the library, run its tests, and run it"
-depends = ["jvm:native"]
 dir = "jvm"
-run = "mbx sparkles-task -- ./gradlew --console=plain :sample-java:build :sample-java:run"
+# The native library is built again inside this lease, so collection cannot remove it
+# before Gradle reads it. A fresh build takes seconds.
+run = "mbx sparkles-task -- bash -ec '../scripts/jvm-native.sh && exec ./gradlew --console=plain :sample-java:build :sample-java:run \"$@\"' jvm"
 
 [tasks."jvm:lint"]
 sources = ["@group:rust"]
@@ -582,11 +587,16 @@ tools = { node = "24" }
 description = "Test Node bindings, remote client and transaction/lifecycle contracts, with the remote client's tests against a debug server"
 depends = ["node:build"]
 dir = "js"
-run = [
-  "mbx build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles",
-  # the server cargo just built, under CARGO_TARGET_DIR when one is set
-  'SPARKLES_CLIENT_TEST_SERVER_BIN="${SPARKLES_CLIENT_TEST_SERVER_BIN:-${CARGO_TARGET_DIR:-{{config_root}}/target}/debug/sparkles}" mbx sparkles-task -- node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs',
-]
+# The server is built and tested inside one lease, so collection cannot remove the binary
+# in between. SPARKLES_CLIENT_TEST_SERVER_BIN defaults to the server cargo just built,
+# under CARGO_TARGET_DIR when one is set.
+run = """
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+mbx build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles
+SPARKLES_CLIENT_TEST_SERVER_BIN="${SPARKLES_CLIENT_TEST_SERVER_BIN:-${CARGO_TARGET_DIR:-{{config_root}}/target}/debug/sparkles}" \\
+  node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs
+SPARKLES_TASK
+"""
 
 [tasks."node:lint"]
 sources = ["@group:rust"]
@@ -734,7 +744,7 @@ depends = ["build", "ui:e2e:browsers", "ui:wasm"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }
 run = '''
-mbx sparkles-task -- pnpm screenshots
+mbx sparkles-task -- bash -ec 'mbx build --release -p sparkles-server && exec pnpm screenshots'
 pnpm screenshots:mock
 oxipng --quiet --opt 4 --strip safe ../docs/images/*.png
 '''
@@ -789,6 +799,8 @@ flag "--port-base <port>" default="3931" help="the first of the five server port
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
 SKIP_LOAD="${usage_skip_load:+1}" SKIP_QUERIES="${usage_skip_queries:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" MODE="$usage_mode" CHURN="$usage_churn" \
@@ -814,6 +826,8 @@ flag "--port-base <n>" default="3940" help="the servers listen on the three port
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
 SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 DATA="${usage_data:+$(realpath "$usage_data")}" PORT_BASE="$usage_port_base" \
@@ -839,6 +853,8 @@ flag "--port <n>" default="4800" help="the server's port"
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 QUERIES="$usage_queries" EFS="$usage_efs" RUNS="$usage_runs" WARMUP="$usage_warmup" M="$usage_m" \
 EFC="$usage_ef_construction" SKIP_LOAD="${usage_skip_load:+1}" PORT="$usage_port" \
 scripts/bench-vector.sh "$usage_n" "$usage_dim" "$(realpath -m "$usage_workdir")"
@@ -861,6 +877,8 @@ flag "--queries <list>" help="only these templates or instances (L1 S3-2 …)"
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 RUNS="$usage_runs" WARMUP="$usage_warmup" INSTANCES="$usage_instances" ENGINES="$usage_engines" \
 QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 scripts/bench-watdiv.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
@@ -884,6 +902,8 @@ flag "--port-base <port>" default="28300" help="the first of the five server por
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" ENGINES="$usage_engines" \
 QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 PORT_BASE="$usage_port_base" scripts/bench-sp2b.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
@@ -910,6 +930,8 @@ flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 PROFILE="$usage_profile" RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
 ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" \
@@ -936,6 +958,8 @@ flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
 ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" JENA_REASONERS="${usage_jena_reasoners:-}" \
@@ -959,6 +983,8 @@ flag "--port-base <port>" default="28400" help="the first of the five server por
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 SECONDS_RUN="$usage_seconds" READERS="$usage_readers" WRITERS="$usage_writers" WRITE_RATE="$usage_write_rate" \
 ENGINES="$usage_engines" SKIP_LOAD="${usage_skip_load:+1}" PORT_BASE="$usage_port_base" \
 scripts/bench-longwrite.sh "$usage_data" "$(realpath -m "$usage_workdir")"
@@ -988,6 +1014,8 @@ flag "--port-base <port>" default="28300" help="the first of the five server por
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 USECASE="$usage_usecase" INSTANCES="$usage_instances" CLIENTS="$usage_clients" BSBM_RUNS="$usage_bsbm_runs" \
 BSBM_WARMUP="$usage_bsbm_warmup" SKIP_QMPH="${usage_skip_qmph:+1}" RUNS="$usage_runs" WARMUP="$usage_warmup" \
 COLD_RUNS="$usage_cold_runs" QUERIES="${usage_queries:-}" \
@@ -1013,6 +1041,8 @@ flag "--queries <list>" help="only these queries (names in scripts/bench-billion
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 SCALE="$usage_scale" WORKDIR="$(realpath -m "$usage_workdir")" ENGINES="$usage_engines" \
 RELOAD="${usage_reload:+1}" RUNS="$usage_runs" WARMUP="$usage_warmup" COLD="${usage_no_cold:+0}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" QUERIES="${usage_queries:-}" \
@@ -1072,6 +1102,8 @@ flag "--delta <n>" default="10000" help="pending delta quads of the second round
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh "$usage_people" "$(realpath -m "$usage_workdir")"
 SPARKLES_TASK
 '''
@@ -1088,6 +1120,8 @@ flag "--delta <n>" default="10000" help="pending delta quads of the second round
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh --lang shex "$usage_people" "$(realpath -m "$usage_workdir")"
 SPARKLES_TASK
 '''
@@ -1171,6 +1205,8 @@ flag "--commits <n>" default="1000" help="single-quad commits before the increme
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+# Built again inside this lease, so collection cannot remove the binary before it runs.
+mbx build --release -p sparkles-server
 RUNS="$usage_runs" COMMITS="$usage_commits" scripts/backup-bench.sh "$usage_db" "$(realpath -m "$usage_workdir")"
 SPARKLES_TASK
 '''

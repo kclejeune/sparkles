@@ -34,6 +34,17 @@ set -euo pipefail
 main() {
   cd "$(dirname "$0")/.."
 
+  # The run holds one lease on the checkout's managed target from here to its end. Boxington
+  # collects a whole target whose lease nobody holds, for its size budget or a short disk,
+  # and every task is a separate mbx command. Without this lease, a collection between two
+  # tasks removes what the earlier ones built, such as the JVM library that prepare built
+  # for jvm:test. `mbx sparkles-task` (scripts/cargo-sparkles-task) runs this script again
+  # under the lease, and SPARKLES_CI_LEASED tells that second run it holds it.
+  if [ -z "${SPARKLES_CI_LEASED:-}" ]; then
+    export SPARKLES_CI_LEASED=1
+    PATH="$PWD/scripts:$PATH" exec mbx sparkles-task -- "$BASH" "$PWD/scripts/ci.sh" "$@"
+  fi
+
   full=(
     fmt:check ui:fmt:check node:fmt:check lint:shell lint:doc-paths api:check test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
