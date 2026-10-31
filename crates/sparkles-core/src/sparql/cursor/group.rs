@@ -125,7 +125,7 @@ pub(super) struct Group {
     /// Where rows of groups that do not fit go, when the query may spill.
     query: Option<Arc<QuerySpill>>,
     /// The state's bytes at which a pass takes no new groups, half the room the query
-    /// had when the grouping started.
+    /// had when the grouping or, for a later pass, the pass started.
     threshold: u64,
     /// Whether this pass takes no new groups.
     frozen: bool,
@@ -435,7 +435,9 @@ impl Group {
             .any(|agg| matches!(agg.func, AggregateFunction::Min | AggregateFunction::Max));
         let mut key = vec![Id::UNDEF; self.keys.len()];
         let mut report = Report::default();
-        if self.query.is_some() && self.threshold == 0 {
+        // A later pass sizes itself from the room it has when it starts, once the input
+        // it read and the pass before it have given their memory back.
+        if self.query.is_some() && (self.threshold == 0 || self.source.is_some()) {
             self.threshold = (ctx.memory_room() / 2).max(MIN_PASS_BYTES);
         }
         // Every input row contributes even when a parent requests a tiny prefix.

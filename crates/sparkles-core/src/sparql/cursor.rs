@@ -2838,6 +2838,28 @@ impl Operator {
         })
     }
 
+    /// Release what an operator that produces no more rows holds for reading, and the
+    /// same for the operators below it that did not reach their own end, such as the
+    /// other input of a merge join whose first input ended. Nothing pulls them again.
+    /// Each scan otherwise keeps the charge of a decoded block, about a megabyte, for
+    /// the rest of the query, which left a grouping above a finished join with a
+    /// fraction of a small budget for all of its later passes (item 93). Plan
+    /// metadata stays.
+    fn release_finished(&mut self) {
+        match &mut self.state {
+            State::Scan(scan) => scan.base = None,
+            State::Binary(binary) => binary.release_working_sets(),
+            State::Ripple(ripple) => ripple.release_working_sets(),
+            _ => {}
+        }
+        for child in &mut self.children {
+            // A child that ended released its own operators then.
+            if !child.done {
+                child.release_finished();
+            }
+        }
+    }
+
     /// Check, in debug builds, that a batch keeps the operator's order, within the
     /// batch and from the last row of the previous one.
     #[cfg(debug_assertions)]
@@ -3137,6 +3159,7 @@ impl Operator {
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
                 self.done = true;
+                self.release_finished();
             }
             ctx.check()?;
             Ok(batch)

@@ -278,6 +278,16 @@ fn spilled_hash_joins_match_eager_at_every_batch_size() {
                 // Nothing relies on the order, so the join emits partition by partition.
                 assert!(!spilled.plan.contains("spillMergePasses"), "{q}");
             }
+            // A grouping above the join groups many rows in each pass once the join
+            // and its scans have given their memory back (item 93). It used to take
+            // one group per pass.
+            if let Some(passes) = counter(&spilled.plan, "spillPasses") {
+                assert!(
+                    passes as usize * 20 < expected.len(),
+                    "{q}: {passes} passes for {} groups",
+                    expected.len()
+                );
+            }
             assert_eq!(sorted(spilled.rows), expected, "{q} at batch size {batch}");
             assert_eq!(spill.reserved_bytes(), 0, "{q}");
         }
@@ -576,6 +586,32 @@ fn failures_in_a_spilled_join_leave_nothing_behind() {
     spill.inject_fault(Fault::Read, 20);
     let error = drain(&opts).unwrap_err();
     assert!(matches!(&error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
+/// A grouping above a hash join whose probe input is a merge join of two scans, the
+/// shape of a GROUP BY over a subquery's join. Once the joins end, their scans give back
+/// the charge of their decoded blocks, about a megabyte each, so that the grouping's
+/// later passes have the budget's room. They used to keep it, and under 4 MiB every
+/// later pass took one group (item 93).
+#[test]
+fn a_grouping_above_finished_joins_has_their_room_for_its_passes() {
+    let s = store(60_000, false);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT ?b (COUNT(*) AS ?n) (SUM(?v) AS ?vs) { ?a <urn:v> ?v . \
+             { SELECT ?a ?b { ?a <urn:p> ?k . ?b <urn:q> ?k } } } GROUP BY ?b";
+    let expected = eager(&s, q);
+    let spilled = run(&s, q, 4 << 20, Some(spill.clone()), 4096).unwrap();
+    assert_eq!(sorted(spilled.rows), expected);
+    let passes = counter(&spilled.plan, "spillPasses").expect("the grouping spills");
+    assert!(
+        passes as usize * 20 < expected.len(),
+        "{passes} passes for {} groups: {}",
+        expected.len(),
+        spilled.plan
+    );
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
 }

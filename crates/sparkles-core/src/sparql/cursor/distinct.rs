@@ -194,6 +194,8 @@ impl Distinct {
             self.seen = None;
             self.frozen = false;
             self.retain(self.base)?;
+            // The pass sizes its set from the room it has when it starts.
+            self.threshold = 0;
             self.depth = depth;
             self.source = Some(run.reader()?);
             self.passes += 1;
