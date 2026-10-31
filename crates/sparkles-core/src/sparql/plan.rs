@@ -924,8 +924,23 @@ impl<'a> Planner<'a> {
                             _ => false,
                         })
                 };
+                // the named graphs a table moving into `GRAPH ?g` is copied into, one
+                // plan of the inner pattern for each
+                let graphs = || {
+                    self.ctx.snap.graph_ids().map_or(usize::MAX, |ids| {
+                        ids.iter()
+                            .filter(|gid| {
+                                self.ctx
+                                    .dataset
+                                    .named
+                                    .as_ref()
+                                    .is_none_or(|s| s.contains(gid))
+                            })
+                            .count()
+                    })
+                };
                 if let Some(pushed) =
-                    super::valuespush::rewrite(gp, &|patterns| calls(self.ctx, patterns))
+                    super::valuespush::rewrite(gp, &|patterns| calls(self.ctx, patterns), &graphs)
                 {
                     return self.plan(&pushed, g, filters);
                 }
@@ -5420,7 +5435,7 @@ pub fn certain_vars(gp: &GraphPattern, ctx: &Ctx) -> FxHashSet<VarId> {
     names.iter().map(|n| ctx.var(n)).collect()
 }
 
-fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
+pub(super) fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
     use GraphPattern as GP;
     match gp {
         GP::Bgp { patterns } => {

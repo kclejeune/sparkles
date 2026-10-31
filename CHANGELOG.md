@@ -40,6 +40,15 @@ again at each commit that touches it. The outer graph variable was unbound in ev
 before, and a constant outer graph was not required to exist. View checkpoints of the
 older compiler are built again from the data.
 
+The planner moves a VALUES table into a `GRAPH` that holds a UNION, joins a table and a
+UNION that are both under a named `GRAPH` in the same group, and moves a table through a
+FILTER or BIND that reads its variables when the pattern under it binds them in every
+solution. The memory reader's union of the default graph and the named graphs, with its
+graphs in a table, now looks up the table's rows inside each branch. A table that names
+the graph variable, that the pattern may leave unbound or that has an UNDEF cell the
+FILTER reads stays outside, so answers do not change. On 10.1 million quads on atlas,
+these shapes took 42 to 522 ms before the change and under 0.5 ms after it.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.

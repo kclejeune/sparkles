@@ -114,6 +114,17 @@ check them against the W3C suites and Jena's own answers.
   that each branch uses its bindings to choose a join order. It keeps duplicates and
   FILTER scope, and it keeps the ordinary plan when that plan is estimated to be cheaper.
   This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b`.
+* A VALUES table joined with a UNION moves into each branch, so that each branch looks up
+  the table's rows by index instead of reading its whole pattern. The table also moves
+  into a `GRAPH` that holds a UNION and through a BIND or FILTER whose expression reads
+  none of its variables or only variables that the pattern under it always binds. A table
+  stays outside a BIND or FILTER that reads a variable an OPTIONAL, a MINUS or one UNION
+  branch may leave unbound, outside a `GRAPH ?g` when it binds `?g`, and outside a FILTER
+  that reads one of its UNDEF cells. It also stays outside a BIND or FILTER that calls
+  `RAND`, `UUID`, `STRUUID`, `BNODE` or a custom function, and outside a UNION that holds
+  a SERVICE, a LATERAL or a property function call. At most 10,000 rows move, and at most
+  20,000 over all the copies made for the branches and for the named graphs of a
+  `GRAPH ?g`.
 * Eager ASK execution can visit a pure UNION branch with lower estimated work before
   its first answer. On an unchanged snapshot without a total produced-row cap, a
   bounded whitelist of the whole ASK lets pure input operators request only the rows
@@ -287,6 +298,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A template lookup that binds a blank node of the dataset writes a new node, and a JSON
   number with a fraction or an exponent loses its source form. Roadmap items 238 and 239.
 * Tables and databases are imported, not queried in place. Roadmap item 43.
+* The planner tests a group's FILTER on the rows of a VALUES table before the join fills
+  the table's UNDEF cells, so the solutions that an UNDEF row joins can be lost.
+  Roadmap item 436.
 
 * Incremental views are `table` views on `main`, maintained after the commit. There are
   no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node

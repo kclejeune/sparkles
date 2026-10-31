@@ -82,3 +82,30 @@ exists, and the judge found 44% of the claims of fine answers fully supported an
 partly supported.
 [C22](../../specs/C22-graph-rag-community-summaries.md#paid-acceptance-and-evaluation-2026-10-24)
 gives the intervals and the other measures.
+
+### VALUES tables in the memory reader's unions
+
+The memory tools and Ask read the default graph and the named graphs through one UNION
+and pass the terms they look up as VALUES tables. This A/B measured roadmap item 90, which
+moves such tables into `GRAPH` patterns and through FILTERs on the tables' variables, on
+10.1 million generated quads. Two million entities in the default graph and 300,000 in
+each of ten named graphs have an English label and a type, and an inferred graph holds
+100,000 more types. Each query looks up ten labels or ten entities.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-10-30 on atlas, an Intel Core i5-13500, with nothing else running |
+| Builds | Commit 34b69139 against commit 4e21d168, both release builds in `nix develop` with rustc 1.99.1, Clang 23.1 and GCC 15.3 |
+| Method | 12 fresh server processes in three rounds of A, B, B, A, each with 2 untimed and 10 timed requests per query, timed by the server's `execMs` with the result cache off |
+
+| Query | Before (ms) | After (ms) | Answers |
+|---|---|---|---|
+| The reader's union with its graphs and labels in tables | 150 | 0.16 | 11 rows, the same |
+| A branch FILTER on the entity over a two-pattern join | 417 | 0.22 | 42 rows, the same |
+| A table and a UNION under one named GRAPH | 42 | 0.08 | 4 rows, the same |
+| A table outside a `GRAPH ?g` that holds a UNION | 522 | 0.41 | 64 rows, the same |
+| The reader's union with its labels in a table, which the earlier rewrite moved | 0.15 | 0.15 | 42 rows, the same |
+
+Each round gave the same ratio within 0.0002 for the first four queries. The last query
+takes under 0.3 ms, and its rounds ranged from 0.95 to 1.28 of the earlier build, which
+is within the noise of a query that short.
