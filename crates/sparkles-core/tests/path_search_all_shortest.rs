@@ -531,3 +531,38 @@ fn all_shortest_with_weights_too_wide_to_add_exactly() {
     let want = BTreeSet::from(["s a b c t".to_string(), "s d e f t".to_string()]);
     assert_eq!(sequences(&s, &format!("{params} ; path:target ex:t")), want);
 }
+
+/// A complete graph of 200 nodes where every edge weighs zero has a tie at every node.
+/// `path:shortest` from a node to itself keeps first parents and one meeting, so it holds
+/// about as much memory as the cheapest path between two of the nodes, while
+/// `path:allShortest` keeps every tied parent and meeting.
+#[test]
+fn one_cheapest_cycle_in_a_dense_zero_weight_graph() {
+    let n = 200;
+    let mut ttl = String::new();
+    for i in 0..n {
+        for j in (0..n).filter(|&j| j != i) {
+            ttl += &format!("ex:n{i} ex:p ex:n{j} . ");
+        }
+    }
+    let s = store_of(&ttl);
+    let peak = |target: &str, alg: &str| {
+        let r = query(
+            s.snapshot(),
+            &format!(
+                "{PREFIXES}SELECT ?c WHERE {{ SERVICE path:search {{ [] path:source ex:n0 ; \
+                 path:target {target} ; path:weight ex:w ; path:defaultWeight 0 ; \
+                 path:algorithm {alg} ; path:limit 1 ; path:cost ?c }} }}"
+            ),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(r.rows().len(), 1, "{target} {alg}");
+        r.mem_peak_bytes
+    };
+    let pair = peak("ex:n1", "path:shortest");
+    let cycle = peak("ex:n0", "path:shortest");
+    let all = peak("ex:n0", "path:allShortest");
+    assert!(cycle <= 2 * pair, "cycle {cycle}, pair {pair}");
+    assert!(all > 4 * cycle, "all {all}, cycle {cycle}");
+}

@@ -2475,6 +2475,7 @@ impl<'a> Engine<'a> {
         // backward side reached, and the cheapest path through one of them so far
         let mut meets: FxHashSet<Edge> = FxHashSet::default();
         let mut best: Option<Cost> = None;
+        let mut best_edge: Option<Edge> = None;
         let mut n = 0u64;
         // the least cost in each queue, infinite when it is empty
         let mut tops = [Cost::INFINITE; 2];
@@ -2495,6 +2496,11 @@ impl<'a> Engine<'a> {
             // least cost is above zero, so that its region holds at least its root.
             let empty = [heaps[0].is_empty(), heaps[1].is_empty()];
             if (empty[0] && empty[1]) || (best.is_none() && (empty[0] || empty[1])) {
+                break;
+            }
+            // one path needs no ties, so the test of the cheapest path from both ends
+            // suffices
+            if !all && best.is_some_and(|mu| tops[0].add(tops[1]) >= mu) {
                 break;
             }
             if best.is_some_and(|mu| tops[0].add(tops[1]) > mu)
@@ -2565,7 +2571,9 @@ impl<'a> Engine<'a> {
                 match dist[side].get(&y) {
                     Some(&cur) if nd > cur => {}
                     Some(&cur) if nd == cur => {
-                        trees[side].extra.entry(y).or_default().push(parent);
+                        if all {
+                            trees[side].extra.entry(y).or_default().push(parent);
+                        }
                     }
                     // a settled node has its final cost
                     _ if settled[side].contains(&y) => {}
@@ -2585,8 +2593,9 @@ impl<'a> Engine<'a> {
                     let c = if forward { nd.add(o) } else { o.add(w).add(d) };
                     if best.is_none_or(|mu| c < mu) {
                         best = Some(c);
+                        best_edge = Some(e);
                     }
-                    if meets.insert(e) {
+                    if all && meets.insert(e) {
                         self.charge.add(STEP_BYTES)?;
                     }
                 }
@@ -2601,6 +2610,30 @@ impl<'a> Engine<'a> {
         // from the source alone answers, which adds every cost in one order.
         if wmax > wmin * WIDE_WEIGHTS {
             return Ok(false);
+        }
+        let to_real = |p: Vec<Edge>| -> Vec<Edge> { p.into_iter().map(|e| e.map(real)).collect() };
+        let check = || self.ctx.check();
+        if !all {
+            // path:shortest: the first parents through the cheapest meeting, which only
+            // got cheaper after it was found, so the halves cost at most the meeting's
+            // cost. Zero-weight edges can make them share a node, which is cut out.
+            let (Some(mu), Some(e)) = (best, best_edge) else {
+                return Ok(false);
+            };
+            if mu.hi.is_infinite() {
+                return Ok(false);
+            }
+            let (Some(a), Some(z)) = (
+                trees[0].paths(e.from, false, 1, None, &check)?.pop(),
+                trees[1].paths(e.to, false, 1, None, &check)?.pop(),
+            ) else {
+                return Ok(false);
+            };
+            let mut p = a;
+            p.push(e);
+            p.extend(z);
+            emit(to_real(without_loops(s, p)))?;
+            return Ok(true);
         }
         // only settled nodes have final parents
         for i in 0..2 {
@@ -2635,8 +2668,6 @@ impl<'a> Engine<'a> {
             self.prune(&trees[1], Some(&dist[1]), all)?,
         ];
         let cap = |left: usize| if all { left } else { left.min(1) };
-        let check = || self.ctx.check();
-        let to_real = |p: Vec<Edge>| -> Vec<Edge> { p.into_iter().map(|e| e.map(real)).collect() };
         if at_end == Some(mu) {
             let left = self.left.get();
             for p in trees[0].paths(tt, all, cap(left), prunes[0].as_ref(), &check)? {
