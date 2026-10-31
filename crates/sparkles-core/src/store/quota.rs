@@ -74,6 +74,17 @@ pub(crate) struct Quota {
     preallocated: AtomicU64,
     /// the same after the last chunk of the delta vocabulary
     vocab_preallocated: AtomicU64,
+    /// the records of grouped commits queued for their fence, which the leader writes to
+    /// the log later: counted as if they were in it
+    queued: AtomicU64,
+    /// the space that running group commit fences may preallocate, which the free-space
+    /// reserve counts with the queued commits until the fence has written
+    promised: AtomicU64,
+    /// directory walks completed so far
+    measures: AtomicU64,
+    /// runs inside the next walk, before it reads the directory (for tests)
+    #[cfg(test)]
+    walking: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Quota {
@@ -93,6 +104,11 @@ impl Quota {
             excluded: Mutex::new(None),
             preallocated: AtomicU64::new(0),
             vocab_preallocated: AtomicU64::new(0),
+            queued: AtomicU64::new(0),
+            promised: AtomicU64::new(0),
+            measures: AtomicU64::new(0),
+            #[cfg(test)]
+            walking: Mutex::new(None),
         })
     }
 
@@ -111,17 +127,115 @@ impl Quota {
         let Some(root) = &self.root else { return 0 };
         let mut m = self.measured.lock();
         if m.is_none_or(|t| t.elapsed() >= MAX_AGE) {
+            #[cfg(test)]
+            if let Some(hook) = self.walking.lock().take() {
+                hook();
+            }
             let building = self.excluded.lock().as_deref().map_or(0, dir_size);
             self.used
                 .store(dir_size(root).saturating_sub(building), Ordering::Relaxed);
             *m = Some(Instant::now());
+            // counted once the walk is done, so that a fence that read the count while
+            // this walk was reading the directory sees it change
+            self.measures.fetch_add(1, Ordering::Relaxed);
         }
         // the zero bytes preallocated after the last commit of the log, and after the
         // last chunk of the delta vocabulary, are not data
-        self.used.load(Ordering::Relaxed).saturating_sub(
+        (self.used.load(Ordering::Relaxed) + self.queued.load(Ordering::Relaxed)).saturating_sub(
             self.preallocated.load(Ordering::Relaxed)
                 + self.vocab_preallocated.load(Ordering::Relaxed),
         )
+    }
+
+    /// How many walks of the directory have finished, so that a group commit fence can
+    /// tell whether a walk saw part of its growth. A walk that finishes after the fence
+    /// read this count may have seen it, and a walk that finished before cannot have.
+    pub(crate) fn measures(&self) -> u64 {
+        self.measures.load(Ordering::Relaxed)
+    }
+
+    /// Measure the directory again on the next use: a walk during a fence may have seen
+    /// the fence's growth, which the fence then counted again.
+    pub(crate) fn remeasure(&self) {
+        *self.measured.lock() = None;
+    }
+
+    /// Run `hook` inside the next directory walk, while it holds the measurement's lock
+    /// and before it reads the directory (for tests).
+    #[cfg(test)]
+    pub(crate) fn on_next_walk(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.walking.lock() = Some(Box::new(hook));
+    }
+
+    /// The bytes of records and terms that queued grouped commits will write.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> u64 {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// The bytes that queued grouped commits and the preallocations of running fences
+    /// will add to the disk, which the free-space reserve counts. A commit reserves its
+    /// bytes, and a fence promises its preallocation, before checking the reserve with
+    /// this sum, so of two that race the later check sees both. The increments and these
+    /// loads are sequentially consistent, which that argument needs on a weakly ordered
+    /// CPU: with relaxed ones, each could read the other's counter before its increment.
+    pub(crate) fn unwritten(&self) -> u64 {
+        self.queued
+            .load(Ordering::SeqCst)
+            .saturating_add(self.promised.load(Ordering::SeqCst))
+    }
+
+    /// A group commit fence may preallocate up to `bytes` after its prefix. The
+    /// free-space reserve counts them until the promise is dropped, after the fence's
+    /// write, but the quota does not, since it never counts preallocated space.
+    pub(crate) fn promise(self: &std::sync::Arc<Self>, bytes: u64) -> Promise {
+        self.promised.fetch_add(bytes, Ordering::SeqCst);
+        Promise {
+            quota: self.clone(),
+            bytes,
+        }
+    }
+
+    /// A grouped commit queued `bytes` of records and new terms for its fence to write.
+    /// The quota counts them until the fence has written them, or until the reservation
+    /// is dropped with a commit that is never written.
+    pub(crate) fn reserve(self: &std::sync::Arc<Self>, bytes: u64) -> Reservation {
+        self.queued.fetch_add(bytes, Ordering::SeqCst);
+        Reservation {
+            quota: self.clone(),
+            bytes: AtomicU64::new(bytes),
+        }
+    }
+
+    /// A fence wrote the commits of `reservations`: their bytes leave the queued count as
+    /// the files' growth `grew` enters the measured one, with the new preallocated space
+    /// of the log and the vocabulary. One step under the measurement's lock, so that no
+    /// use of the quota counts the prefix twice or not at all.
+    pub(crate) fn written<'a>(
+        &self,
+        reservations: impl IntoIterator<Item = &'a Reservation>,
+        grew: u64,
+        preallocated: u64,
+        vocab_preallocated: u64,
+    ) {
+        let _m = self.measured.lock();
+        let released: u64 = reservations.into_iter().map(Reservation::take).sum();
+        self.dequeue(released);
+        self.add(grew);
+        self.set_preallocated(preallocated);
+        self.set_vocab_preallocated(vocab_preallocated);
+    }
+
+    fn dequeue(&self, bytes: u64) {
+        let mut q = self.queued.load(Ordering::Relaxed);
+        while let Err(now) = self.queued.compare_exchange_weak(
+            q,
+            q.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            q = now;
+        }
     }
 
     /// Leave `dir` (a generation being built in the background) out of the measured
@@ -302,6 +416,40 @@ impl Store {
         let _w = self.guarded_writer();
         self.quota.set(max_bytes)?;
         Ok(self.quota.status())
+    }
+}
+
+/// Bytes of a queued grouped commit that the quota counts before its fence writes them
+/// (see [`Quota::reserve`]). Dropping it releases what was not written.
+pub(crate) struct Reservation {
+    quota: std::sync::Arc<Quota>,
+    bytes: AtomicU64,
+}
+
+impl Reservation {
+    fn take(&self) -> u64 {
+        self.bytes.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Space a fence may preallocate (see [`Quota::promise`]).
+pub(crate) struct Promise {
+    quota: std::sync::Arc<Quota>,
+    bytes: u64,
+}
+
+impl Drop for Promise {
+    fn drop(&mut self) {
+        self.quota.promised.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let bytes = self.take();
+        if bytes > 0 {
+            self.quota.dequeue(bytes);
+        }
     }
 }
 

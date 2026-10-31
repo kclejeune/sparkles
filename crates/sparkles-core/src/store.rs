@@ -1399,12 +1399,12 @@ impl Default for StoreOptions {
 
 struct WriterState {
     wal: Option<BufWriter<File>>,
-    /// bytes of complete transactions in the current generation's WAL
+    /// bytes of complete transactions in the current generation's WAL, those of grouped
+    /// commits still queued for their fence included
     wal_len: u64,
-    /// the WAL file's length: past `wal_len` it holds preallocated zero bytes
-    wal_alloc: u64,
-    /// the write-through handle of `wal` (reset whenever `wal` is replaced)
-    wal_direct: wal::Direct,
+    /// where the log's file was written up to, its length and its write-through handle
+    /// (replaced whenever `wal` is)
+    tail: Arc<wal::Tail>,
     next_bnode: u64,
     /// Latest admitted commit; speculative only while `staged` exists.
     /// General writer admission drains before exposing it as durable metadata.
@@ -1427,14 +1427,18 @@ impl WriterState {
     /// written ends at its last commit (an open truncates it as well). Not after a
     /// failed write, whose bytes the next open sorts out.
     fn trim_wal(&mut self) {
-        let (len, alloc) = (self.wal_len, self.wal_alloc);
+        let len = self.wal_len;
+        let mut io = self.tail.lock();
+        // a commit still queued for its fence would be written past the cut
         if !self.poisoned
-            && alloc > len
+            && io.end == len
+            && io.alloc > len
             && let Some(wal) = self.wal.as_mut()
             && wal.flush().is_ok()
             && wal.get_ref().set_len(len).is_ok()
         {
-            self.wal_alloc = len;
+            io.alloc = len;
+            self.tail.release(&io);
         }
     }
 }
@@ -1854,8 +1858,7 @@ impl Store {
             writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
                 wal_len: 0,
-                wal_alloc: 0,
-                wal_direct: Default::default(),
+                tail: wal::Tail::new(0, 0),
                 next_bnode,
                 head: root,
                 poisoned: false,
@@ -2340,8 +2343,7 @@ impl Store {
             writer: Arc::new(Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
                 wal_len,
-                wal_alloc: wal_len,
-                wal_direct: Default::default(),
+                tail: wal::Tail::new(wal_len, wal_len),
                 next_bnode,
                 head,
                 poisoned: false,
@@ -5415,9 +5417,8 @@ impl Store {
             // the old generation's vocabulary takes no more writes either
             self.snapshot().generation.dvocab.trim();
             self.quota.set_vocab_preallocated(0);
-            w.wal_alloc = wal.metadata()?.len();
+            w.tail = wal::Tail::new(wal.metadata()?.len(), wal::HEADER_BYTES);
             w.wal = Some(BufWriter::new(wal));
-            w.wal_direct = Default::default();
             // the new log holds its header record
             w.wal_len = wal::HEADER_BYTES;
             self.wal_end.store(wal::HEADER_BYTES, Ordering::Relaxed);
@@ -5747,7 +5748,7 @@ impl Store {
     /// small commits into preallocated space use direct writes (for tests).
     #[doc(hidden)]
     pub fn wal_direct_active(&self) -> bool {
-        matches!(self.writer.lock().wal_direct, wal::Direct::Open(_))
+        matches!(self.writer.lock().tail.lock().direct, wal::Direct::Open(_))
     }
 
     /// Whether the current generation's delta vocabulary has its write-through handle
@@ -6723,7 +6724,10 @@ impl WriteTxn<'_> {
             data.extend_from_slice(&rec);
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
-            let alloc_before = w.wal_alloc;
+            let tail = w.tail.clone();
+            let mut io = tail.lock();
+            debug_assert_eq!(io.end, w.wal_len, "an ordinary commit after unwritten ones");
+            let alloc_before = io.alloc;
             let vocab_before = gen_.dvocab.allocated();
             let direct_on = self.store.opts.wal_direct_writes;
             let path = gen_
@@ -6733,8 +6737,8 @@ impl WriteTxn<'_> {
                 .map(|d| d.join("wal.log"));
             gen_.dvocab.set_prealloc(prealloc);
             let written = wal.flush().map_err(Error::from).and_then(|_| {
-                if wal::DirectLog::fits(w.wal_len, data.len(), w.wal_alloc)
-                    && let Some(direct) = w.wal_direct.handle(path.as_deref(), wal.get_ref())
+                if wal::DirectLog::fits(w.wal_len, data.len(), io.alloc)
+                    && let Some(direct) = io.direct.handle(path.as_deref(), wal.get_ref())
                 {
                     let t = std::time::Instant::now();
                     let direct_written = {
@@ -6746,6 +6750,7 @@ impl WriteTxn<'_> {
                                 &data,
                                 &gen_.dvocab,
                                 &mut w.vocab_sync,
+                                u64::MAX,
                             )?
                         }
                         #[cfg(test)]
@@ -6761,6 +6766,7 @@ impl WriteTxn<'_> {
                                     &data,
                                     &gen_.dvocab,
                                     &mut w.vocab_sync,
+                                    u64::MAX,
                                 )?
                             }
                         }
@@ -6773,7 +6779,7 @@ impl WriteTxn<'_> {
                     }
                     // the file system refused direct I/O: write this commit and the
                     // later ones the buffered way
-                    w.wal_direct = wal::Direct::Off;
+                    io.direct = wal::Direct::Off;
                 }
                 // The terms are written before the records, so that a reader of the
                 // WAL (`sparkles check`, a linked branch opening) finds every term
@@ -6781,14 +6787,16 @@ impl WriteTxn<'_> {
                 if gen_.dvocab.needs_sync() {
                     gen_.dvocab.flush()?;
                 }
-                wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)?;
+                wal::write_commit(wal.get_ref(), w.wal_len, &mut io.alloc, &data, prealloc)?;
                 let t = std::time::Instant::now();
-                let synced = sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync);
+                let synced =
+                    sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync, u64::MAX);
                 *sync = Some((SyncPath::Buffered, t.elapsed()));
                 #[cfg(test)]
                 ordinary_sync_probe::captured(self.store);
                 synced
             });
+            tail.release(&io);
             if let Err(e) = written {
                 // The records may have reached the file, and the commit may then come back
                 // at the next open. Its annotation and merge record stay, so a recovered
@@ -6801,12 +6809,14 @@ impl WriteTxn<'_> {
             // the bytes the file grew by: the records past its end and any zeros after,
             // which the quota does not count
             // and the bytes the vocabulary file grew by
-            self.store.quota.add(w.wal_alloc - alloc_before);
+            self.store.quota.add(io.alloc - alloc_before);
             self.store
                 .quota
                 .add(gen_.dvocab.allocated().saturating_sub(vocab_before));
             w.wal_len += data.len() as u64;
-            self.store.quota.set_preallocated(w.wal_alloc - w.wal_len);
+            io.end = w.wal_len;
+            self.store.quota.set_preallocated(io.alloc - io.end);
+            drop(io);
             self.store
                 .quota
                 .set_vocab_preallocated(gen_.dvocab.preallocated());
@@ -6907,7 +6917,7 @@ impl WriteTxn<'_> {
     fn wal_prealloc(&self) -> u64 {
         let p = self.store.opts.wal_prealloc_bytes;
         let wal_bytes = self.wal_bytes();
-        if p == 0 || self.guard.wal_len + wal_bytes <= self.guard.wal_alloc {
+        if p == 0 || self.guard.wal_len + wal_bytes <= self.guard.tail.alloc() {
             return p;
         }
         if self.store.check_disk(wal_bytes + p + 4096).is_err() {
@@ -6929,7 +6939,11 @@ impl WriteTxn<'_> {
     }
 
     fn check_storage_for(&self, inserts: bool, wal_bytes: u64) -> Result<()> {
-        self.store.check_disk(wal_bytes)?;
+        // grouped commits queued for their fence have not written their records and terms
+        // yet, nor running fences their preallocation, so the free space on disk does not
+        // show them
+        self.store
+            .check_disk(wal_bytes.saturating_add(self.store.quota.unwritten()))?;
         if inserts {
             self.store.quota.check_commit(wal_bytes)?;
         }
@@ -7353,19 +7367,23 @@ pub(crate) fn wal_point(
 /// durable without the terms it names: replay treats a last commit naming delta ids
 /// that `delta.vocab` lacks as a torn tail, like one whose checksum fails. The commit is
 /// acknowledged only after both syncs succeed, so no acknowledged commit is dropped.
+///
+/// `upto` bounds the terms to the vocabulary's first `upto` entries (`u64::MAX`: all), so
+/// that a group commit fence writes only its prefix's terms (see [`DeltaVocab::sync_on`]).
 fn sync_commit_reused(
     wal: &File,
     dvocab: &DeltaVocab,
     worker: &mut crate::vocab::LazySync,
+    upto: u64,
 ) -> Result<()> {
-    if !dvocab.needs_sync() {
+    if !dvocab.needs_sync_to(upto) {
         return Ok(wal.sync_data()?);
     }
-    let pending = dvocab.sync_on(worker, false);
+    let pending = dvocab.sync_on(worker, false, upto);
     let synced = wal.sync_data();
     let vocab = match pending {
         Some(pending) => pending.wait(),
-        None => dvocab.sync(),
+        None => dvocab.sync_to(upto),
     };
     // Always await both, including when WAL sync fails, before releasing ownership.
     synced?;
@@ -7382,21 +7400,23 @@ fn sync_commit_reused(
 /// the buffered way. The commit is acknowledged only after both succeed. A crash in
 /// between can leave either file ahead of the other, which replay handles as it does
 /// for [`sync_commit_reused`].
+/// `upto` bounds the terms as for [`sync_commit_reused`].
 fn commit_direct(
     direct: &mut wal::DirectLog,
     at: u64,
     data: &[u8],
     dvocab: &DeltaVocab,
     worker: &mut crate::vocab::LazySync,
+    upto: u64,
 ) -> Result<bool> {
-    if !dvocab.needs_sync() {
+    if !dvocab.needs_sync_to(upto) {
         return Ok(direct.write(at, data)?);
     }
-    let pending = dvocab.sync_on(worker, true);
+    let pending = dvocab.sync_on(worker, true, upto);
     let written = direct.write(at, data);
     let vocab = match pending {
         Some(pending) => pending.wait(),
-        None => dvocab.sync_direct(),
+        None => dvocab.sync_direct_to(upto),
     };
     // Always await both, including when the WAL write fails, before releasing ownership.
     let written = written?;
@@ -9254,7 +9274,7 @@ mod ordinary_sync_tests {
             wal::DirectLog::fits(
                 txn.guard.wal_len,
                 txn.wal_bytes() as usize,
-                txn.guard.wal_alloc,
+                txn.guard.tail.alloc(),
             ),
             "the selected ordinary write must fit its allocated direct window"
         );
@@ -9268,11 +9288,11 @@ mod ordinary_sync_tests {
         let wal_path = dir.join("wal.log");
         let before = std::fs::read(&wal_path).unwrap();
         let mut state = wal::Direct::Untried;
-        let mut writer = store.writer.lock();
+        let writer = store.writer.lock();
         let descriptor = writer.wal.as_ref().unwrap().get_ref();
         assert!(state.handle(Some(&missing), descriptor).is_none());
         assert!(matches!(state, wal::Direct::Off));
-        writer.wal_direct = state;
+        writer.tail.lock().direct = state;
         drop(writer);
         assert_eq!(std::fs::read(&wal_path).unwrap(), before);
         eprintln!(
@@ -9315,7 +9335,7 @@ mod ordinary_sync_tests {
     }
 
     fn selected_path(store: &Store, calibrated_direct: bool) -> SyncPath {
-        match &store.writer.lock().wal_direct {
+        match &store.writer.lock().tail.lock().direct {
             wal::Direct::Open(_) => {
                 assert!(
                     calibrated_direct,
@@ -9461,7 +9481,10 @@ mod ordinary_sync_tests {
             // This labeled control selects false before any helper mutation. If
             // acquisition was unavailable it is not called; Buffered still runs.
             assert_eq!(probe.skipped.get(), calibrated);
-            assert!(matches!(store.writer.lock().wal_direct, wal::Direct::Off));
+            assert!(matches!(
+                store.writer.lock().tail.lock().direct,
+                wal::Direct::Off
+            ));
             let mut expected = before;
             expected[SyncPath::Buffered as usize] += 1;
             assert_eq!(counts(&store), expected);
@@ -9612,7 +9635,7 @@ mod ordinary_sync_tests {
             if direct && actual == SyncPath::Direct {
                 assert!(calibrated);
                 assert!(matches!(
-                    store.writer.lock().wal_direct,
+                    store.writer.lock().tail.lock().direct,
                     wal::Direct::Open(_)
                 ));
                 eprintln!("{case}: actual Direct EIO after successful real Direct calibration");

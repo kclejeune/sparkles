@@ -359,6 +359,60 @@ impl Direct {
     }
 }
 
+/// The written end of the current generation's log, which every write to the log's file
+/// goes through. The writer's ordinary path and the group commit leader share it. A grouped
+/// transaction does not write its records itself. It hands them to the queue, and the
+/// leader of its fence writes the whole sealed prefix at the tail, through the
+/// write-through handle when the prefix fits in preallocated space, and with a buffered
+/// write and `fdatasync` otherwise (X09 item 446). So one thread writes at a time, each
+/// fence's bytes start where the last durable write ended, and nothing lies after `end`
+/// but preallocated zeros, as [`DirectLog::write`] requires. An ordinary commit runs only
+/// when no grouped commit is in flight, so it never waits for the lock.
+pub(crate) struct Tail {
+    io: Mutex<TailIo>,
+    /// the file's length as of the last finished write, for a transaction that only
+    /// decides how much to preallocate and must not wait for a fence's I/O
+    alloc: AtomicU64,
+}
+
+pub(crate) struct TailIo {
+    /// the file's length: past `end` it holds preallocated zero bytes
+    pub alloc: u64,
+    /// the bytes of the log written to the file, where the next write starts
+    pub end: u64,
+    /// the write-through handle (`Untried` for a new log)
+    pub direct: Direct,
+}
+
+impl Tail {
+    /// The tail of a log whose file is `alloc` bytes long and whose records end at `end`.
+    pub fn new(alloc: u64, end: u64) -> Arc<Tail> {
+        Arc::new(Tail {
+            io: Mutex::new(TailIo {
+                alloc,
+                end,
+                direct: Direct::Untried,
+            }),
+            alloc: AtomicU64::new(alloc),
+        })
+    }
+
+    /// Hold the tail to write at it. [`Tail::release`] records the file's new length.
+    pub fn lock(&self) -> MutexGuard<'_, TailIo> {
+        self.io.lock()
+    }
+
+    /// Record the file's length after a write under `io`.
+    pub fn release(&self, io: &TailIo) {
+        self.alloc.store(io.alloc, Ordering::Release);
+    }
+
+    /// The file's length as of the last finished write.
+    pub fn alloc(&self) -> u64 {
+        self.alloc.load(Ordering::Acquire)
+    }
+}
+
 /// The outcome of a failed direct read or write: `EINVAL`, which a file system returns
 /// for an alignment it does not accept before it writes anything, makes the caller fall
 /// back to the buffered path. Any other error is the commit's error.

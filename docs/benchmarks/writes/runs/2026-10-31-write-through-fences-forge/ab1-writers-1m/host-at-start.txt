@@ -1,0 +1,17 @@
+Sat Oct 31 05:36:03 PM EDT 2026
+ 17:36:03  up 7 days  0:56,  0 users,  load average: 0.88, 3.25, 2.38
+    PID %CPU     ELAPSED COMMAND
+ 713806  0.9    13:27:05 /nix/store/wfi3zyi4p723ib7qvpzclr1lyxhysywg-tailscale-1.104.2/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641 --tun tailscale0
+3976727  0.6       06:25 [kworker/u81:23-kcryptd-254:0-1]
+3973792  0.4       14:23 [kworker/u81:10-kcryptd-254:0-1]
+3976676  0.4       06:32 [kworker/u81:9-kcryptd-254:0-1]
+3973794  0.3       14:23 [kworker/u81:13-flush-254:2]
+3973795  0.3       14:23 [kworker/u81:14-kcryptd-254:0-1]
+3973798  0.3       14:23 [kworker/u81:16-kcryptd-254:0-1]
+3973793  0.3       14:23 [kworker/u81:11-kcryptd-254:0-1]
+3973796  0.3       14:23 [kworker/u81:15-kcryptd-254:0-1]
+3973801  0.3       14:23 [kworker/u81:21-kcryptd-254:0-1]
+3973800  0.3       14:23 [kworker/u81:19-kcryptd-254:0-1]
+3971908  0.2       20:26 [kworker/u81:4-kcryptd-254:0-1]
+ 713759  0.2    13:27:05 /nix/store/1l6pk0v0fwdd7irylacnjrsyvvfyhfyz-netbird-client-0.81.5/bin/netbird service run
+3975301  0.2       10:25 [kworker/u82:14-kcryptd-254:0-1]

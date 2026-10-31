@@ -135,10 +135,13 @@ schedule. The [rerun on forge](#rerun-on-forge) met both, with a rate calibrated
 drive's slow state, and met the throughput and memory gates of the full-text and spatial
 cells at 1.05M again. The [rerun on atlas](#rerun-on-atlas), a host with the same CPU and
 drive model, found the slow state in more of its processes and supports the same verdicts.
+With [write-through fences](#write-through-fences) the four writers of both cells at 1.05M
+met their throughput gates on `forge` again, with the drive in its slow state.
 
 *The serial, writer and memory cells were measured on forge on 2026-10-23 at commit
-5b40d0ec, the mixed cells on forge on 2026-10-24 with the bounded full-text checkpoint, and
-the reruns on forge and atlas on 2026-10-31 at commit a202e8f2.*
+5b40d0ec, the mixed cells on forge on 2026-10-24 with the bounded full-text checkpoint, the
+reruns on forge and atlas on 2026-10-31 at commit a202e8f2, and the
+[write-through fences](#write-through-fences) on forge on 2026-10-31 at commit 3da475a9.*
 
 #### Serial commits
 
@@ -297,16 +300,60 @@ the lag in four blocks, and in its fifth every process of both settings saw devi
 of 7 to 12 ms and fell behind by up to 2.5 s. The stall hit both settings alike, which
 points to I/O from outside the campaign, and the run record keeps it.
 
-The fence's synchronization explains the smaller gain in the slow state. A fence writes
-with buffered writes and an `fdatasync` of the log and of the vocabulary, which is two
-device cache flushes, while an ordinary commit writes both files through `O_DIRECT` and
-`O_DSYNC` with no flush. Idle, the drive takes 0.30 ms for a write and its flush and 0.24 ms for a
+The fence's synchronization explained the smaller gain in the slow state. At that commit
+a fence wrote with buffered writes and an `fdatasync` of the log and of the vocabulary,
+which is two device cache flushes, while an ordinary commit wrote both files through
+`O_DIRECT` and `O_DSYNC` with no flush. Fences now write through as well, which the
+[write-through fence runs](#write-through-fences) measure. Idle, the drive takes 0.30 ms for a write and its flush and 0.24 ms for a
 write-through write. In its slow state these take about 1.0 and 0.9 ms, and the fence's
 two flushes in parallel take 1.3 to 1.5 ms. A fence that let the log's flush cover the
 vocabulary measured no faster, as [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#writes)
 records. Serial commits take the ordinary path in both settings, and `perf stat` counted
 0.1% more user instructions per serial IRI insert with grouping and 0.3% more per geometry
 insert, the admission checks of the group.
+
+#### Write-through fences
+
+A fence's leader now writes its prefix's records and terms through the `O_DIRECT` and
+`O_DSYNC` handles when they fit in preallocated space. These campaigns ran on `forge` with
+release builds of commit `8127961f`, whose fences write and flush, and of commit
+`3da475a9`, whose fences write through. Each campaign had five blocks of four processes
+at 1.05M, in the order A, B, B, A, under the host's heavy-job lock with nothing else
+running. The [run record](runs/2026-10-31-write-through-fences-forge/README.md) holds the
+results, the per-process counters of `/proc/diskstats` and the process list at the start
+of each campaign.
+
+| Cell | Measurement | Flushing fences | Write-through fences | Paired ratio |
+|---|---|---:|---:|---:|
+| Spatial, four grouped writers | tx/s | 1,233 (1,157–3,754) | 2,614 (2,458–2,681) | 2.053 |
+| Spatial, four grouped writers | Fence time (ms) | 1.48–1.67 in six processes, 0.44–0.67 in four | 0.58–0.64 | 0.406 |
+| Full-text, four grouped writers | tx/s | 1,436 (1,162–3,098) | 1,471 (1,280–2,459) | 1.020 |
+| Full-text, four grouped writers | Fence time (ms) | 1.13–1.64 in nine processes, 0.54 in one | 1.10–1.48 in eight processes, 0.63 and 0.64 in two | 0.968 |
+| Spatial, serial literal inserts | p50 and p90 (ms) | 0.442, 1.125 | 0.437, 0.476 | 1.005, 0.996 |
+
+A flushing fence issued 1.00 to 1.14 device cache flushes per commit and a write-through
+fence 0.001 to 0.005, so the fence no longer flushes the device. The spatial cell shows
+the gain in the drive's slow state, where six flushing processes took 1.48 to 1.67 ms a
+fence and committed 1,157 to 1,287 transactions/s, and every write-through process took
+0.58 to 0.64 ms and committed 2,458 to 2,681. In the fast state four flushing processes
+took 0.44 to 0.67 ms a fence and committed 2,566 to 3,754 transactions/s. Three of them
+outran every write-through process, and their pairs have ratios of 0.69 to 0.73. No
+write-through process ran with fences that short, because each fence's write-through
+writes took about 0.47 ms under this load. [Roadmap](../../ROADMAP.md) item 502
+measures write-through fences with the drive held in each state. In the full-text cell
+the write-through fences of eight processes took 1.10 to 1.48 ms, with device writes of
+0.76 to 1.20 ms each, and the paired gain is 1.020. Serial commits take the ordinary path
+with both builds and kept their latency. Their p90 medians differ because one flushing
+process ran in the slow state, and the paired ratios compare neighbours. The peak resident memory medians were 192.8 and
+228.7 MiB with write-through fences and 199.1 and 238.5 MiB with flushing ones, so the
+records queued on the heap did not raise the peak.
+
+The gate campaign compared grouped and ordinary commits of commit `3da475a9` with the
+drive in its slow state, where an ordinary write-through commit synchronized in 0.95 to
+1.47 ms. Four grouped writers committed 1,581 against 741 transactions/s on the spatial
+dataset, a paired ratio of 2.135, and 1,433 against 726 on the full-text dataset, a paired
+ratio of 1.927, both above the required 1.5. The certified peak resident memory
+differences were 1.4 and 7.3 MiB, under the limit of 64 MiB.
 
 #### Limits of these runs
 

@@ -1382,9 +1382,8 @@ impl Store {
             self.quota
                 .set_vocab_preallocated(cu.gen_.dvocab.preallocated());
             w.wal = Some(wal);
-            w.wal_direct = Default::default();
+            w.tail = wal::Tail::new(cu.wal_len, cu.wal_len);
             w.wal_len = cu.wal_len;
-            w.wal_alloc = cu.wal_len;
             self.wal_end.store(cu.wal_len, Ordering::Relaxed);
             self.quota.set_preallocated(0);
             *gen_.wal_index.lock() = Some(std::mem::replace(

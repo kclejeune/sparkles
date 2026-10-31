@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 pub fn free_bytes(dir: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    if let Some(free) = fake::free(dir) {
+        return Ok(free);
+    }
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     let mut s = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `path` is NUL-terminated and `s` is valid for writes; statvfs initializes
@@ -72,6 +76,10 @@ pub fn in_memory_file_system(name: &str) -> bool {
 pub fn free_bytes_cached(dir: &Path, max_age: Duration) -> std::io::Result<u64> {
     static CACHE: parking_lot::Mutex<Option<HashMap<PathBuf, (Instant, u64)>>> =
         parking_lot::Mutex::new(None);
+    #[cfg(test)]
+    if let Some(free) = fake::free(dir) {
+        return Ok(free);
+    }
     let now = Instant::now();
     if let Some((at, free)) = CACHE.lock().as_ref().and_then(|c| c.get(dir).copied())
         && now.duration_since(at) < max_age
@@ -300,5 +308,35 @@ mod open_file_tests {
             assert!(e.contains("ulimit -n"), "{e}");
         }
         assert!(raise_open_file_limit().unwrap() >= soft);
+    }
+}
+
+/// A small disk for tests: the free space under a directory is a capacity less what the
+/// directory holds, measured at every call.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::path::{Path, PathBuf};
+
+    static DISKS: parking_lot::Mutex<Vec<(PathBuf, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Removes its disk when dropped.
+    pub(crate) struct Disk(PathBuf);
+
+    impl Drop for Disk {
+        fn drop(&mut self) {
+            DISKS.lock().retain(|(root, _)| root != &self.0);
+        }
+    }
+
+    /// Make `root` a disk of `capacity` bytes.
+    pub(crate) fn install(root: &Path, capacity: u64) -> Disk {
+        DISKS.lock().push((root.to_path_buf(), capacity));
+        Disk(root.to_path_buf())
+    }
+
+    pub(super) fn free(dir: &Path) -> Option<u64> {
+        let disks = DISKS.lock();
+        let (root, capacity) = disks.iter().find(|(root, _)| dir.starts_with(root))?;
+        Some(capacity.saturating_sub(crate::store::dir_size(root)))
     }
 }

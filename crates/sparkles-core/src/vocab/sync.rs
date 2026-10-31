@@ -9,6 +9,8 @@ struct Job {
     file: Arc<Mutex<DeltaFile>>,
     /// through the write-through handle when it can
     direct: bool,
+    /// the entries before this one (`u64::MAX`: all)
+    upto: u64,
     done: mpsc::Sender<Result<()>>,
 }
 
@@ -49,6 +51,7 @@ impl LazySync {
         &mut self,
         file: Arc<Mutex<DeltaFile>>,
         direct: bool,
+        upto: u64,
     ) -> Option<PendingSync> {
         if !self.attempted {
             self.attempted = true;
@@ -64,9 +67,9 @@ impl LazySync {
                         .spawn(move || {
                             while let Ok(job) = receive.recv() {
                                 let result = if job.direct {
-                                    DeltaFile::sync_direct(&job.file)
+                                    DeltaFile::sync_direct(&job.file, job.upto)
                                 } else {
-                                    DeltaFile::sync(&job.file)
+                                    DeltaFile::sync(&job.file, job.upto)
                                 };
                                 let _ = job.done.send(result);
                             }
@@ -83,11 +86,12 @@ impl LazySync {
         let (done, receive) = mpsc::channel();
         // A dead worker closes the reply, which becomes an error rather than
         // silently retrying an admitted synchronization with an unknown outcome.
-        let _ = worker
-            .send
-            .as_ref()
-            .expect("live worker sender")
-            .send(Job { file, direct, done });
+        let _ = worker.send.as_ref().expect("live worker sender").send(Job {
+            file,
+            direct,
+            upto,
+            done,
+        });
         Some(PendingSync(receive))
     }
 
@@ -129,7 +133,7 @@ mod tests {
         v.insert(b"<urn:first>").unwrap();
         let (observed, release) = pause(&v);
         let mut worker = LazySync::default();
-        let pending = v.sync_on(&mut worker, false).unwrap();
+        let pending = v.sync_on(&mut worker, false, u64::MAX).unwrap();
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
         let (done, arrived) = mpsc::channel();
         let writer = {
@@ -147,7 +151,10 @@ mod tests {
         writer.join().unwrap();
         assert!(progress.is_ok(), "mark/append blocked behind fdatasync");
         assert!(v.needs_sync(), "old prefix cannot clean a newer append");
-        v.sync_on(&mut worker, false).unwrap().wait().unwrap();
+        v.sync_on(&mut worker, false, u64::MAX)
+            .unwrap()
+            .wait()
+            .unwrap();
         assert!(!v.needs_sync());
         assert_eq!(DeltaVocab::open(&path).unwrap().len(), 2);
     }
@@ -163,7 +170,7 @@ mod tests {
         v.insert(b"<urn:temporary>").unwrap();
         let (observed, release) = pause(&v);
         let mut worker = LazySync::default();
-        let pending = v.sync_on(&mut worker, false).unwrap();
+        let pending = v.sync_on(&mut worker, false, u64::MAX).unwrap();
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
         let (done, arrived) = mpsc::channel();
         let rollback = {
@@ -180,7 +187,10 @@ mod tests {
         rollback.join().unwrap();
         assert!(!v.needs_sync(), "the rollback zeroed and synced the chunk");
         v.insert(b"<urn:replacement>").unwrap();
-        v.sync_on(&mut worker, false).unwrap().wait().unwrap();
+        v.sync_on(&mut worker, false, u64::MAX)
+            .unwrap()
+            .wait()
+            .unwrap();
         let reopened = DeltaVocab::open(&path).unwrap();
         assert_eq!(reopened.len(), 2);
         assert_eq!(reopened.get(1).unwrap(), b"<urn:replacement>");
@@ -197,7 +207,7 @@ mod tests {
             let v = DeltaVocab::open(&path).unwrap();
             v.insert(format!("<urn:g{generation}>").as_bytes()).unwrap();
             v.flush().unwrap();
-            let pending = v.sync_on(&mut worker, false).unwrap();
+            let pending = v.sync_on(&mut worker, false, u64::MAX).unwrap();
             let id = worker.thread_id().unwrap();
             assert_eq!(*first.get_or_insert(id), id);
             drop(v);
@@ -215,10 +225,18 @@ mod tests {
         v.insert(b"<urn:failed>").unwrap();
         v.flush().unwrap();
         v.fail_next_sync();
-        assert!(v.sync_on(&mut worker, false).unwrap().wait().is_err());
+        assert!(
+            v.sync_on(&mut worker, false, u64::MAX)
+                .unwrap()
+                .wait()
+                .is_err()
+        );
         assert!(v.needs_sync());
         let id = worker.thread_id();
-        v.sync_on(&mut worker, false).unwrap().wait().unwrap();
+        v.sync_on(&mut worker, false, u64::MAX)
+            .unwrap()
+            .wait()
+            .unwrap();
         assert_eq!(worker.thread_id(), id);
         assert!(!v.needs_sync());
     }
@@ -232,7 +250,7 @@ mod tests {
         let file = v.file_handle();
         let held = file.lock();
         let mut worker = LazySync::default();
-        let pending = v.sync_on(&mut worker, false).unwrap();
+        let pending = v.sync_on(&mut worker, false, u64::MAX).unwrap();
         let (done, finish) = mpsc::channel();
         let closer = std::thread::spawn(move || {
             drop(worker);
@@ -258,11 +276,11 @@ mod tests {
             ..Default::default()
         };
         v.insert(b"<urn:first>").unwrap();
-        assert!(v.sync_on(&mut worker, false).is_none());
+        assert!(v.sync_on(&mut worker, false, u64::MAX).is_none());
         v.sync().unwrap();
         worker.fail_spawn = false;
         v.insert(b"<urn:second>").unwrap();
-        assert!(v.sync_on(&mut worker, false).is_none());
+        assert!(v.sync_on(&mut worker, false, u64::MAX).is_none());
         v.sync().unwrap();
         assert!(worker.thread_id().is_none());
         assert!(!v.needs_sync());

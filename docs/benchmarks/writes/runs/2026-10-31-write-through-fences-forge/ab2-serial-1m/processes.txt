@@ -1,0 +1,12 @@
+ab2-serial-1m/geo-100000/b0-serial-literal-0                  g=1 tps=   535.9 p50=1.843 p90=1.987 direct=1.615ms/2197 buf=5.901ms/3 group=- size=- w/c=2.26 fl/c=0.007 probe=1.79/1.87 wms/w=1.488 fms/f=1.800
+ab2-serial-1m/geo-100000/b0-serial-literal-1                  g=1 tps=   543.6 p50=1.850 p90=1.937 direct=1.541ms/2197 buf=5.425ms/3 group=- size=- w/c=2.25 fl/c=0.006 probe=1.64/1.73 wms/w=1.391 fms/f=1.583
+ab2-serial-1m/geo-100000/b0-serial-literal-2                  g=1 tps=   649.8 p50=1.775 p90=2.061 direct=1.273ms/2197 buf=4.716ms/3 group=- size=- w/c=2.25 fl/c=0.005 probe=0.89/1.00 wms/w=0.855 fms/f=1.545
+ab2-serial-1m/geo-100000/b0-serial-literal-3                  g=1 tps=   660.7 p50=1.765 p90=1.929 direct=1.288ms/2197 buf=5.153ms/3 group=- size=- w/c=2.25 fl/c=0.005 probe=0.93/1.22 wms/w=0.875 fms/f=1.818
+ab2-serial-1m/geo-100000/b1-serial-literal-0                  g=1 tps=  1064.3 p50=0.455 p90=1.779 direct=0.756ms/2197 buf=4.038ms/3 group=- size=- w/c=2.25 fl/c=0.005 probe=0.94/1.03 wms/w=0.517 fms/f=1.100
+ab2-serial-1m/geo-100000/b1-serial-literal-1                  g=1 tps=  2263.7 p50=0.430 p90=0.461 direct=0.246ms/2197 buf=1.327ms/3 group=- size=- w/c=2.24 fl/c=0.004 probe=0.23/0.32 wms/w=0.192 fms/f=0.250
+ab2-serial-1m/geo-100000/b1-serial-literal-2                  g=1 tps=  2254.5 p50=0.427 p90=0.453 direct=0.252ms/2197 buf=1.708ms/3 group=- size=- w/c=2.25 fl/c=0.004 probe=0.24/0.35 wms/w=0.197 fms/f=0.222
+ab2-serial-1m/geo-100000/b1-serial-literal-3                  g=1 tps=  2252.8 p50=0.430 p90=0.456 direct=0.252ms/2197 buf=1.600ms/3 group=- size=- w/c=2.24 fl/c=0.004 probe=0.24/0.30 wms/w=0.193 fms/f=0.333
+ab2-serial-1m/geo-100000/b2-serial-literal-0                  g=1 tps=  2275.5 p50=0.424 p90=0.449 direct=0.251ms/2197 buf=1.540ms/3 group=- size=- w/c=2.24 fl/c=0.004 probe=0.24/0.30 wms/w=0.196 fms/f=0.222
+ab2-serial-1m/geo-100000/b2-serial-literal-1                  g=1 tps=  2208.5 p50=0.435 p90=0.480 direct=0.246ms/2197 buf=2.190ms/3 group=- size=- w/c=2.34 fl/c=0.004 probe=0.24/0.30 wms/w=0.187 fms/f=0.444
+ab2-serial-1m/geo-100000/b2-serial-literal-2                  g=1 tps=  2186.8 p50=0.438 p90=0.471 direct=0.250ms/2197 buf=1.495ms/3 group=- size=- w/c=2.24 fl/c=0.004 probe=0.24/0.30 wms/w=0.194 fms/f=0.222
+ab2-serial-1m/geo-100000/b2-serial-literal-3                  g=1 tps=  2242.7 p50=0.428 p90=0.472 direct=0.253ms/2197 buf=1.465ms/3 group=- size=- w/c=2.24 fl/c=0.004 probe=0.24/0.30 wms/w=0.196 fms/f=0.250

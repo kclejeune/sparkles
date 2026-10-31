@@ -71,8 +71,10 @@ pub const HEADER: usize = 16;
 pub const CHUNK_HEADER: usize = 24;
 /// The dataset reader (`minimumReader` of `dataset.json`) that reads framed files.
 pub const FRAMED_READER: u32 = 4;
-/// The most payload one chunk of a converted legacy file holds.
-const CONVERT_CHUNK: usize = 1 << 20;
+/// The most payload one chunk holds, unless a single entry is larger. A write of more
+/// entries, such as a group commit fence's terms, spans several chunks, since a chunk's
+/// header records its payload length in 32 bits.
+const MAX_CHUNK: usize = 1 << 20;
 /// The most a delta vocabulary grows ahead of its chunks at once.
 pub const MAX_PREALLOC: u64 = 1 << 20;
 
@@ -266,11 +268,43 @@ fn chunk_crc(header: &[u8], payload: &[u8]) -> u32 {
     c.sum()
 }
 
-/// A chunk holding `keys`, whose first entry has id `first` within the file, preceded by
-/// the file header when `header` is set.
-fn encode_chunk(first: u64, keys: &[Arc<[u8]>], header: bool) -> Vec<u8> {
+/// `keys` as chunks of at most [`MAX_CHUNK`] bytes of payload each (one entry when it is
+/// larger), the first numbered `first`, after the file header when `header` is set.
+/// Refuses an entry whose length a chunk cannot record.
+fn encode_chunks(first: u64, keys: &[Arc<[u8]>], header: bool) -> Result<Vec<u8>> {
+    if let Some(k) = keys
+        .iter()
+        .find(|k| k.len() > u32::MAX as usize - 4 - CHUNK_HEADER)
+    {
+        return Err(Error::Unsupported(format!(
+            "a term of {} bytes is too large for the delta vocabulary",
+            k.len()
+        )));
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < keys.len() {
+        let (mut end, mut size) = (start, 0usize);
+        while end < keys.len() && (end == start || size + 4 + keys[end].len() <= MAX_CHUNK) {
+            size += 4 + keys[end].len();
+            end += 1;
+        }
+        chunks.push(start..end);
+        start = end;
+    }
+    let total: usize = keys.iter().map(|k| 4 + k.len()).sum();
+    let mut out = Vec::with_capacity(HEADER + total + CHUNK_HEADER * chunks.len());
+    for range in chunks {
+        let header = header && range.start == 0;
+        encode_chunk(&mut out, first + range.start as u64, &keys[range], header);
+    }
+    Ok(out)
+}
+
+/// Append a chunk holding `keys`, whose first entry has id `first` within the file,
+/// preceded by the file header when `header` is set.
+fn encode_chunk(out: &mut Vec<u8>, first: u64, keys: &[Arc<[u8]>], header: bool) {
     let plen: usize = keys.iter().map(|k| 4 + k.len()).sum();
-    let mut out = Vec::with_capacity(HEADER + CHUNK_HEADER + plen);
     if header {
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
@@ -288,7 +322,6 @@ fn encode_chunk(first: u64, keys: &[Arc<[u8]>], header: bool) -> Vec<u8> {
     }
     let crc = chunk_crc(&out[at + 4..at + CHUNK_HEADER], &out[at + CHUNK_HEADER..]);
     out[at..at + 4].copy_from_slice(&crc.to_le_bytes());
-    out
 }
 
 /// The end of a delta vocabulary at some moment (see [`DeltaVocab::mark`]).
@@ -300,6 +333,13 @@ pub struct VocabMark {
     end: u64,
     /// the file was still a legacy one
     legacy: bool,
+}
+
+impl VocabMark {
+    /// The vocabulary's entries when the mark was taken.
+    pub(crate) fn entries(&self) -> u64 {
+        self.entries
+    }
 }
 
 /// The persisted, append-only delta vocabulary (terms introduced by updates).
@@ -336,6 +376,8 @@ pub(crate) struct DeltaFile {
     /// the most the file grows ahead of its chunks at once
     prealloc: u64,
     direct: wal::Direct,
+    /// a chunk is being written through the write-through handle, without the mutex
+    writing: bool,
     /// a write failed: the file's state past `durable` is unknown
     failed: bool,
     /// Serializes syncs and destructive rollback, not inserts or marks.
@@ -347,15 +389,19 @@ pub(crate) struct DeltaFile {
 }
 
 impl DeltaFile {
-    /// Entries of the vocabulary not written to the file yet.
-    fn pending(&self) -> Vec<Arc<[u8]>> {
+    /// Entries of the vocabulary not written to the file yet, before entry `upto` of the
+    /// vocabulary (`u64::MAX`: all of them).
+    fn pending(&self, upto: u64) -> Vec<Arc<[u8]>> {
         let v = self.vocab.read();
         let from = (self.base + self.written) as usize;
-        v.keys.get(from..).map_or_else(Vec::new, <[_]>::to_vec)
+        let to = (upto.min(v.len())).max(self.base + self.written) as usize;
+        v.keys.get(from..to).map_or_else(Vec::new, <[_]>::to_vec)
     }
 
-    fn needs_sync(&self) -> bool {
-        self.durable < self.end || self.base + self.written < self.vocab.read().len()
+    /// Whether a written chunk is not durable yet, or an entry before `upto` is not
+    /// written yet.
+    fn needs_sync(&self, upto: u64) -> bool {
+        self.durable < self.end || self.base + self.written < self.vocab.read().len().min(upto)
     }
 
     /// Make the file framed before its first write: require the reader that reads
@@ -392,16 +438,25 @@ impl DeltaFile {
         Ok(())
     }
 
-    /// Write the pending entries as a chunk at the logical end, with a buffered write,
-    /// growing the file by zero bytes when the chunk runs past its length. Not synced.
-    fn write_pending(&mut self) -> Result<()> {
-        let keys = self.pending();
+    /// Write the pending entries before entry `upto` as a chunk at the logical end, with a
+    /// buffered write, growing the file by zero bytes when the chunk runs past its length.
+    /// Not synced.
+    fn write_pending(&mut self, upto: u64) -> Result<()> {
+        let keys = self.pending(upto);
         if keys.is_empty() {
             return Ok(());
         }
+        if self.writing {
+            // only a sync writes while a fence's chunk is in flight, and the gate holds
+            // syncs back, so this is a caller outside the sync protocol
+            return Err(std::io::Error::other(
+                "the delta vocabulary is being written through its write-through handle",
+            )
+            .into());
+        }
         self.ensure_framed()?;
         self.forget_direct_block();
-        let chunk = encode_chunk(self.written, &keys, self.end == 0);
+        let chunk = encode_chunks(self.written, &keys, self.end == 0)?;
         if let Err(e) =
             wal::write_commit(&self.file, self.end, &mut self.alloc, &chunk, self.prealloc)
         {
@@ -425,13 +480,13 @@ impl DeltaFile {
     /// The caller holds the sync gate. The mutex is released for the `fdatasync`, so the
     /// writer can mark and insert meanwhile, and a later chunk written then is not
     /// counted durable.
-    fn sync_gated(file: &Arc<Mutex<Self>>) -> Result<()> {
+    fn sync_gated(file: &Arc<Mutex<Self>>, upto: u64) -> Result<()> {
         let (fd, end) = {
             let mut f = file.lock();
-            if !f.needs_sync() {
+            if !f.needs_sync(upto) {
                 return Ok(());
             }
-            f.write_pending()?;
+            f.write_pending(upto)?;
             (f.file.try_clone()?, f.end)
         };
         #[cfg(test)]
@@ -448,70 +503,92 @@ impl DeltaFile {
         Ok(())
     }
 
-    pub(crate) fn sync(file: &Arc<Mutex<Self>>) -> Result<()> {
+    /// Write and synchronize the entries before entry `upto` (`u64::MAX`: all).
+    pub(crate) fn sync(file: &Arc<Mutex<Self>>, upto: u64) -> Result<()> {
         // Never acquire this gate while retaining the mutex. Rollback uses the same
         // order, so a captured prefix cannot be cut under its fence.
         let gate = file.lock().sync_gate.clone();
         let _fence = gate.lock();
-        Self::sync_gated(file)
+        Self::sync_gated(file, upto)
     }
 
     /// [`sync`](Self::sync) through the write-through handle when it can: the pending
     /// entries as one chunk that fits in the preallocated zeros, after a durable
     /// prefix. The mutex stays held for the write, so no buffered write can land in
     /// the block it rewrites.
-    pub(crate) fn sync_direct(file: &Arc<Mutex<Self>>) -> Result<()> {
+    pub(crate) fn sync_direct(file: &Arc<Mutex<Self>>, upto: u64) -> Result<()> {
         let gate = file.lock().sync_gate.clone();
         let _fence = gate.lock();
-        {
+        // The chunk is encoded under the mutex and written without it, so that the writer
+        // can mark and insert while the write runs: a group commit fence writes its terms
+        // while the next transaction starts (X09 item 446). The handle is taken out of the
+        // file for the write and `writing` is set, so no buffered write can land in the
+        // block it rewrites, and the sync gate keeps every other sync and rollback out.
+        let attempt = {
             let mut guard = file.lock();
             let f = &mut *guard;
-            if !f.needs_sync() {
+            if !f.needs_sync(upto) {
                 return Ok(());
             }
-            let keys = f.pending();
+            let keys = f.pending(upto);
+            let mut attempt = None;
             if f.format == DeltaFormat::Framed
                 && f.end >= HEADER as u64
                 && f.durable == f.end
                 && !keys.is_empty()
             {
-                let chunk = encode_chunk(f.written, &keys, false);
+                let chunk = encode_chunks(f.written, &keys, false)?;
                 if DirectLog::fits(f.end, chunk.len(), f.alloc)
-                    && let Some(direct) = f.direct.handle(Some(&f.path), &f.file)
+                    && f.direct.handle(Some(&f.path), &f.file).is_some()
                 {
+                    let wal::Direct::Open(direct) =
+                        std::mem::replace(&mut f.direct, wal::Direct::Untried)
+                    else {
+                        unreachable!("the handle was opened above")
+                    };
+                    f.writing = true;
+                    attempt = Some((direct, chunk, f.end, keys.len() as u64));
+                }
+            }
+            attempt
+        };
+        if let Some((mut direct, chunk, at, n)) = attempt {
+            #[cfg(test)]
+            {
+                let hook = file.lock().sync_hook.clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let written = direct.write(at, &chunk);
+            let mut f = file.lock();
+            f.writing = false;
+            match written {
+                Ok(true) => {
+                    f.direct = wal::Direct::Open(direct);
+                    debug_assert_eq!(f.end, at, "the vocabulary moved during a direct write");
+                    f.end += chunk.len() as u64;
+                    f.written += n;
                     #[cfg(test)]
                     {
-                        if let Some(hook) = f.sync_hook.clone() {
-                            hook();
-                        }
-                    }
-                    match direct.write(f.end, &chunk) {
-                        Ok(true) => {
-                            f.end += chunk.len() as u64;
-                            f.written += keys.len() as u64;
-                            #[cfg(test)]
-                            {
-                                if std::mem::take(&mut f.fail_next_sync) {
-                                    f.failed = true;
-                                    return Err(
-                                        std::io::Error::other("injected sync failure").into()
-                                    );
-                                }
-                            }
-                            f.durable = f.end;
-                            return Ok(());
-                        }
-                        // the file system refused direct I/O: buffered from now on
-                        Ok(false) => f.direct = wal::Direct::Off,
-                        Err(e) => {
+                        if std::mem::take(&mut f.fail_next_sync) {
                             f.failed = true;
-                            return Err(e.into());
+                            return Err(std::io::Error::other("injected sync failure").into());
                         }
                     }
+                    f.durable = f.end;
+                    return Ok(());
+                }
+                // the file system refused direct I/O: buffered from now on
+                Ok(false) => f.direct = wal::Direct::Off,
+                Err(e) => {
+                    f.direct = wal::Direct::Open(direct);
+                    f.failed = true;
+                    return Err(e.into());
                 }
             }
         }
-        Self::sync_gated(file)
+        Self::sync_gated(file, upto)
     }
 
     #[cfg(test)]
@@ -533,17 +610,7 @@ impl DeltaFile {
 /// Write `keys` as a framed file in a new file renamed over `path`, synced with its
 /// directory, and return the file's bytes.
 fn replace_framed(path: &Path, keys: &[Arc<[u8]>]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut start = 0usize;
-    while start < keys.len() {
-        let (mut end, mut size) = (start, 0usize);
-        while end < keys.len() && (end == start || size + 4 + keys[end].len() <= CONVERT_CHUNK) {
-            size += 4 + keys[end].len();
-            end += 1;
-        }
-        bytes.extend_from_slice(&encode_chunk(start as u64, &keys[start..end], start == 0));
-        start = end;
-    }
+    let bytes = encode_chunks(0, keys, true)?;
     let tmp = path.with_file_name("delta.vocab.tmp");
     crate::store::write_synced(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)?;
@@ -756,6 +823,7 @@ impl DeltaVocab {
                 durable: end,
                 prealloc: MAX_PREALLOC,
                 direct: wal::Direct::Untried,
+                writing: false,
                 failed: false,
                 sync_gate: Default::default(),
                 #[cfg(test)]
@@ -897,6 +965,16 @@ impl DeltaVocab {
         Ok(self.inner.write().insert(key).0)
     }
 
+    /// The bytes that entries `from` onwards take in a chunk of the file, without the
+    /// chunk's header: what a group commit's quota counts for its terms before its fence
+    /// writes them.
+    pub(crate) fn key_bytes(&self, from: u64) -> u64 {
+        let v = self.inner.read();
+        v.keys
+            .get(from as usize..)
+            .map_or(0, |k| k.iter().map(|k| 4 + k.len() as u64).sum())
+    }
+
     /// Where the vocabulary ends now, for a later [`rollback`](Self::rollback).
     pub fn mark(&self) -> VocabMark {
         match &self.file {
@@ -962,7 +1040,7 @@ impl DeltaVocab {
     /// cache flush on some file systems, and every commit calls this.
     pub fn sync(&self) -> Result<()> {
         match &self.file {
-            Some(file) => DeltaFile::sync(file),
+            Some(file) => DeltaFile::sync(file, u64::MAX),
             None => Ok(()),
         }
     }
@@ -970,25 +1048,56 @@ impl DeltaVocab {
     /// [`sync`](Self::sync), writing the entries through the write-through handle when
     /// they fit in the file's preallocated space (see the module documentation).
     pub fn sync_direct(&self) -> Result<()> {
+        self.sync_direct_to(u64::MAX)
+    }
+
+    /// [`sync_direct`](Self::sync_direct) of the entries before entry `upto` only, or
+    /// [`sync`](Self::sync) of them when they cannot go through the write-through handle.
+    pub(crate) fn sync_direct_to(&self, upto: u64) -> Result<()> {
         match &self.file {
-            Some(file) => DeltaFile::sync_direct(file),
+            Some(file) => DeltaFile::sync_direct(file, upto),
             None => Ok(()),
         }
     }
 
-    /// Schedule this exact generation's sync on a reusable worker, through the
-    /// write-through handle when `direct` is set. Publication still waits for
-    /// completion; grouped writers may append a suffix.
-    pub(crate) fn sync_on(&self, worker: &mut LazySync, direct: bool) -> Option<PendingSync> {
+    /// [`sync`](Self::sync) of the entries before entry `upto` only.
+    pub(crate) fn sync_to(&self, upto: u64) -> Result<()> {
+        match &self.file {
+            Some(file) => DeltaFile::sync(file, upto),
+            None => Ok(()),
+        }
+    }
+
+    /// Schedule this exact generation's sync of the entries before entry `upto` on a
+    /// reusable worker, through the write-through handle when `direct` is set.
+    /// Publication still waits for completion; grouped writers may append a suffix.
+    ///
+    /// A group commit fence passes the end of its prefix's terms. The terms that a later
+    /// transaction inserted meanwhile stay unwritten, so a rollback of that transaction
+    /// never cuts a chunk that holds terms of the fenced commits, which its mark, taken
+    /// before they were written, would place after the cut (X09 item 446).
+    pub(crate) fn sync_on(
+        &self,
+        worker: &mut LazySync,
+        direct: bool,
+        upto: u64,
+    ) -> Option<PendingSync> {
         self.file
             .as_ref()
-            .and_then(|file| worker.start(file.clone(), direct))
+            .and_then(|file| worker.start(file.clone(), direct, upto))
     }
 
     /// Whether entries were inserted or written since the last [`sync`](Self::sync), that
     /// is, whether the next one writes and syncs anything.
     pub fn needs_sync(&self) -> bool {
-        self.file.as_ref().is_some_and(|f| f.lock().needs_sync())
+        self.needs_sync_to(u64::MAX)
+    }
+
+    /// [`needs_sync`](Self::needs_sync) for the entries before entry `upto` only.
+    pub(crate) fn needs_sync_to(&self, upto: u64) -> bool {
+        self.file
+            .as_ref()
+            .is_some_and(|f| f.lock().needs_sync(upto))
     }
 
     /// The most the file grows ahead of its chunks at once (0: it grows by each chunk).
@@ -1073,10 +1182,15 @@ impl DeltaVocab {
     /// the file's logical end: every entry inserted so far lies before it. 0 for an
     /// in-memory vocabulary.
     pub fn flush(&self) -> Result<u64> {
+        self.flush_to(u64::MAX)
+    }
+
+    /// [`flush`](Self::flush) of the entries before entry `upto` only.
+    pub(crate) fn flush_to(&self, upto: u64) -> Result<u64> {
         match &self.file {
             Some(f) => {
                 let mut f = f.lock();
-                f.write_pending()?;
+                f.write_pending(upto)?;
                 Ok(f.end)
             }
             None => Ok(0),
@@ -1089,7 +1203,7 @@ impl DeltaVocab {
         match &self.file {
             Some(f) => {
                 let mut f = f.lock();
-                f.write_pending()?;
+                f.write_pending(u64::MAX)?;
                 Ok(Some((f.file.try_clone()?, f.end)))
             }
             None => Ok(None),
@@ -1138,6 +1252,64 @@ mod tests {
 
     fn entry(k: &[u8]) -> Vec<u8> {
         [&(k.len() as u32).to_le_bytes()[..], k].concat()
+    }
+
+    /// The buffer of a write spanning many chunks is allocated once, at its size.
+    #[test]
+    fn a_write_of_many_chunks_allocates_its_size() {
+        let keys: Vec<Arc<[u8]>> = (0..8u8)
+            .map(|n| Arc::from(vec![b'a' + n; MAX_CHUNK / 2 + 1]))
+            .collect();
+        let out = encode_chunks(0, &keys, true).unwrap();
+        assert_eq!(
+            out.len(),
+            HEADER + 8 * (CHUNK_HEADER + 4 + MAX_CHUNK / 2 + 1)
+        );
+        assert_eq!(out.capacity(), out.len());
+    }
+
+    /// A write of more terms than one chunk holds, such as a group commit fence's, spans
+    /// several chunks that all read back, each within the chunk limit.
+    #[test]
+    fn a_large_write_spans_bounded_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.vocab");
+        let vocab = DeltaVocab::open(&path).unwrap();
+        vocab.insert(b"<urn:first>").unwrap();
+        vocab.sync().unwrap();
+        let big: Vec<Vec<u8>> = (0..5u8)
+            .map(|n| vec![b'a' + n; MAX_CHUNK / 2 + 1000])
+            .collect();
+        for k in &big {
+            vocab.insert(k).unwrap();
+        }
+        vocab.insert(b"<urn:last>").unwrap();
+        vocab.sync().unwrap();
+        drop(vocab);
+        let bytes = std::fs::read(&path).unwrap();
+        let (mut pos, mut chunks) = (HEADER, Vec::new());
+        while let Some(h) = bytes.get(pos..pos + CHUNK_HEADER) {
+            let word = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
+            if word(4) == 0 {
+                break;
+            }
+            let (n, plen) = (word(4), word(8) as usize);
+            chunks.push((n, plen));
+            pos += CHUNK_HEADER + plen;
+        }
+        // the first sync's chunk, then one per big term (two of them do not fit in one)
+        assert_eq!(chunks.len(), 1 + big.len(), "{chunks:?}");
+        assert!(
+            chunks.iter().all(|&(_, plen)| plen <= MAX_CHUNK),
+            "{chunks:?}"
+        );
+        let vocab = DeltaVocab::open(&path).unwrap();
+        assert_eq!(vocab.len(), 2 + big.len() as u64);
+        assert_eq!(vocab.get(0).unwrap(), b"<urn:first>");
+        for (i, k) in big.iter().enumerate() {
+            assert_eq!(&vocab.get(1 + i as u64).unwrap(), k);
+        }
+        assert_eq!(vocab.get(1 + big.len() as u64).unwrap(), b"<urn:last>");
     }
 
     #[test]

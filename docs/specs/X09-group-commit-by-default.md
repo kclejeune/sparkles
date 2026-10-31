@@ -1780,3 +1780,117 @@ section 17.10. The rerun after item 110 had no text process above the 50 ms lag 
 size, so this delay stays within the load-quality rule there. The model test has no write
 transaction that searches text, so the wait of a search on a speculative head has only
 unit tests.
+
+**Write-through fences (item 446).** A grouped transaction no longer writes to the log.
+It encodes its records and its commit record, with the unfenced count of section 6, takes
+its place in the log by advancing the writer's logical end, and hands the records to the
+queue. Its new terms stay in the vocabulary's memory. The log's file is written only at
+its tail, `wal::Tail`, which holds the file's written end, its length and the
+write-through handle, and which the ordinary path and the group's leader share. The leader
+of a fence takes the tail, checks that its prefix starts at the written end and is
+contiguous, and writes the whole prefix there. When the prefix fits in the space the log
+has preallocated and in one direct write of at most 64 KiB, the records go through the
+log's `O_DIRECT | O_DSYNC` handle and the prefix's terms through the vocabulary's on its
+worker, at the same time, as `commit_direct` does for an ordinary commit. Both are
+write-through writes into allocated space, which a device with FUA persists without a
+cache flush. Otherwise, as for the first fence after the log grows, a prefix larger than
+the direct write or a file system that refuses direct I/O, the leader writes the terms and
+then the records with buffered writes and synchronizes both files with `fdatasync`, as
+fences did before. A fence whose commits carry an annotation still synchronizes
+`annotations.bin` with `fdatasync` in parallel.
+
+A fence writes only the terms of its own prefix, those before the vocabulary entry at
+which its last commit's snapshot ends. A transaction that starts from the speculative head
+marks the vocabulary before the fence has written the prefix's terms, so its mark places
+them after its rollback point. If the fence also wrote the running transaction's own new
+terms and that transaction then rolled back, the rollback would cut the chunk at its mark,
+and with it the terms of an acknowledged commit. The vocabulary's write-through write runs
+without the file's mutex, under the sync gate that every synchronization and rollback
+takes, so the next transaction can mark and insert while a fence writes. A buffered write
+that met a write-through write in flight is refused, and none happens outside a
+synchronization while a fence runs.
+
+The durability argument is the following. One fence runs its I/O at a time, and the next
+fence seals only after the last one's write and synchronization returned, so the bytes of
+a fence never reach the file before those of the fences before it are durable. A fence's
+commits are acknowledged only after its write-through writes returned or its `fdatasync`
+calls succeeded, both of which promise the data and the metadata needed to read it. A
+crash during a fence can leave any part of its records and terms on disk, in any order of
+pages. None of its commits is acknowledged, and every commit record of the prefix counts
+the commits before it back to the published head as possibly not durable, so replay
+treats damage there as a torn tail, as it did for a buffered prefix. A direct write
+rewrites the committed bytes of the log's last block in front of the new records, and
+those bytes are unchanged, so a torn block can damage only the new records. A record that
+names a term which did not reach `delta.vocab` is a torn tail by the same rule. The format
+of the log, of the vocabulary and of the commit record is unchanged, so no version moved.
+
+The tests cover the ordering, and the free-space tests run on a test disk whose free
+space is a capacity less what the dataset's directory holds. `crash_images_keep_every_acknowledged_commit` in
+`tests/power_loss.rs` gains a run in which every commit groups and fences write through.
+It requires the I/O log to hold more write-through than buffered writes of the log and
+write-through writes of the vocabulary, and every crash image to keep every acknowledged
+commit. A fence that acknowledged records it wrote with a buffered write and no
+synchronization makes it fail. `a_rollback_after_a_fence_keeps_the_fenced_terms` takes
+a crash image right after a rollback of a transaction that marked the vocabulary before
+the fence and fails when a fence writes every term. The model test of section 10.1 runs
+with write-through writes on and off. The tests that copied a crash image while a fence
+was paused now copy the files after the fences wrote them, since the writers leave the
+records to the leaders.
+
+The queued records, at most 4 MiB per dataset, now stay on the heap until their fence
+writes them, where before they waited in the page cache. The quota and the free-space
+reserve of `min_free_disk_bytes` count them with the queued commits' new terms until the
+fence writes both. A grouped commit reserves its bytes before it checks, and a fence
+promises the space it may preallocate after its prefix before it checks the reserve with
+every queued commit and every promise, so of a commit and a fence that race, the later
+check sees both. A fence that the reserve cannot hold preallocates nothing. The quota
+does not count the promise, since it never counts preallocated space. A fence that sees
+a walk of the dataset's directory for the quota finish during its I/O makes the next use
+walk it again, so its growth is not counted twice.
+
+A fence writes the terms of its whole prefix at once, which can be far more than one
+commit's. The vocabulary now writes any set of terms as chunks of at most 1 MiB of
+payload, or of one term when that term alone is larger, since a chunk's header records
+its payload length in 32 bits. It refuses a term too large for a chunk's header before it
+writes anything. The file was always a sequence of
+chunks, so its format is unchanged.
+
+**Fences in two stages (item 447).** A fence now has two stages. Its leader writes and
+synchronizes the prefix, and then publishes it, which applies its commits' full-text
+changes and may commit a Tantivy batch. The next fence may seal, write and synchronize
+while the last one publishes, which answers question 4 of section 17.10 without a
+separate thread. It publishes only after the last one has, since it takes over
+publication from it, so commits are still published in order. A waiter whose own commit
+is publishing never leads the next fence, because a failure of that fence would make it
+report a failure for a commit that its own prefix then publishes. A synchronization that
+fails takes back its own prefix and the queue, and a prefix that is already publishing
+keeps its outcome. A publisher that panics takes back its unpublished commits and the
+prefix synchronized behind it, which is durable but must not be seen without the commits
+before it. A caller that drains the group and leads a fence that fails returns only once
+the prefix before it has published, so an installer that drains never installs a view
+that the earlier prefix's publication replaces. Tests cover each of these orders.
+
+A grouped commit now stages its full-text documents before it is admitted to the queue,
+and the queue's limit of 4 MiB counts the heap that its staged documents hold with its
+records. A queue of long literals then drains instead of holding far more than the limit.
+A commit larger than the limit on its own drains the queue and is queued alone. The
+indexed model run gains inserts whose transaction first searches the full-text index of
+the state it starts from, which is often a speculative head whose fence is still running,
+and the hits must be exactly that state's labelled subjects.
+
+Campaigns on `forge` measured the write-through fences of commit `3da475a9` against the
+flushing fences of commit `8127961f` with four grouped writers at 1.05M, as the
+[write-through fence results](../benchmarks/writes/RESULTS.md#write-through-fences) record.
+A flushing fence issued 1.00 to 1.14 device cache flushes per commit and a write-through
+fence 0.001 to 0.005. On the spatial dataset the write-through processes committed 2,458
+to 2,681 transactions/s with fences of 0.58 to 0.64 ms, against 1,157 to 1,287 and fences
+of 1.48 to 1.67 ms for the flushing processes that ran with the drive in its slow state, a
+paired ratio of 2.053. Four flushing processes ran in the drive's fast state with fences
+of 0.44 to 0.67 ms and committed up to 3,754 transactions/s, which no write-through
+process reached, and item 502 measures fences in each state. On the full-text
+dataset the paired ratio was 1.020, because the write-through fences of eight processes
+still took 1.10 to 1.48 ms. With the drive in its slow state, grouped commits of
+`3da475a9` committed 2.135 and 1.927 times as many transactions/s as ordinary ones on the
+spatial and full-text datasets, above the 1.5 that the gate requires there, with certified
+peak resident memory differences of 1.4 and 7.3 MiB. Serial spatial commits kept paired p50
+and p90 ratios of 1.005 and 0.996.

@@ -1,0 +1,46 @@
+{
+  "settings": {
+    "provider": null,
+    "binary": "/home/kclejeune/lanes/group-commit-446-447-20261031/bin/sparkles-base-8127961f",
+    "compare_binary": "/home/kclejeune/lanes/group-commit-446-447-20261031/bin/sparkles-tip-3da475a9",
+    "write_bench": "/home/kclejeune/lanes/group-commit-446-447-20261031/bin/write-bench",
+    "out": "runs/ab2-serial-1m",
+    "source_commit": "8127961f-vs-3da475a9",
+    "blocks": 3,
+    "people": [
+      100000
+    ],
+    "indexes": [
+      "geo"
+    ],
+    "scenarios": [
+      "serial-literal"
+    ],
+    "serial_changes": 2000,
+    "warmup": 200,
+    "writer_changes": 50000,
+    "write_rate": 0,
+    "rate_fraction": 0.8,
+    "slow_sync_ms": 0,
+    "drive_probe": 64,
+    "port": 42800,
+    "provider_port": 42801,
+    "server_cpus": "0-11",
+    "client_cpus": "12-13",
+    "provider_cpus": "14",
+    "heavy_lock": "/home/kclejeune/lanes/.heavy.lock"
+  },
+  "binary_sha256": "7fa2222d797147792721acd0a6ebb4f550833d67233866b49e9e62516e90fa9f",
+  "compare_binary_sha256": "5f645168675418701e04ebad630e372ff1fde7efc9c2c4c5fce33991165c6dec",
+  "client_sha256": "09f1991ab56a64d25e8c2fe6f93d71bb3a915f3ab8d8799327cbd0608707d5c9",
+  "harness_sha256": "020f1f28e22ae447903adf9f3de192144f86f652ff05451f25e4e51967ec3e33",
+  "uname": [
+    "Linux",
+    "forge",
+    "7.2.9",
+    "#1-NixOS SMP PREEMPT_DYNAMIC Sat Oct  3 10:43:16 UTC 2026",
+    "x86_64"
+  ],
+  "started_unix": 1793486092.3353388,
+  "scope": "native storage; no injected sync delay"
+}
