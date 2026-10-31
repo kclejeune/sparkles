@@ -618,6 +618,33 @@ fn decode_inner(
     .map_err(|e| (e.to_string(), false))
 }
 
+/// The owners a `managed.json` names, when this build reads its format and knows
+/// every owner, else why not.
+pub(crate) fn recorded_owners(bytes: &[u8]) -> std::result::Result<Vec<OwnerKind>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("{FILE} is not JSON: {e}"))?;
+    match v.get("format") {
+        None => {}
+        Some(f) if f.as_u64() == Some(u64::from(FORMAT)) => {}
+        Some(f) => {
+            return Err(format!(
+                "{FILE} has format {f}, which this build does not read"
+            ));
+        }
+    }
+    let Some(owners) = v.get("owners").and_then(serde_json::Value::as_object) else {
+        return Err(format!("{FILE} has no owners"));
+    };
+    owners
+        .keys()
+        .map(|name| {
+            OwnerKind::parse(name).ok_or_else(|| {
+                format!("{FILE} names the owner {name:?}, which this build does not know")
+            })
+        })
+        .collect()
+}
+
 /// Refuse graph lists that are not absolute IRIs within the bounds.
 pub(crate) fn check_graphs(graphs: &[String]) -> Result<()> {
     if graphs.len() > MAX_GRAPHS {

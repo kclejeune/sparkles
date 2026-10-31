@@ -808,3 +808,57 @@ fn an_unsupported_owner_settings_version_is_not_enforced() {
         );
     }
 }
+
+/// A registry that names an owner this build does not know cannot be copied whole,
+/// since its settings file cannot be identified: backups and clones refuse it. A
+/// registry of known owners that cannot be enforced is copied as it is.
+#[test]
+fn copies_of_unknown_owners_are_refused() {
+    let (dir, s) = setup();
+    enable(&s, &[M]);
+    drop(s);
+    let root = dir.path().join("ds");
+    let good = std::fs::read(root.join("managed.json")).unwrap();
+    for (name, unknown) in [
+        ("unknown owner", true),
+        ("newer format", true),
+        ("mismatch", false),
+    ] {
+        std::fs::write(root.join("managed.json"), &good).unwrap();
+        match name {
+            "unknown owner" => {
+                edit(&root, "managed.json", |v| {
+                    v["owners"]["jobs"] = v["owners"]["evidence"].clone()
+                });
+                std::fs::write(root.join("jobs.json"), b"{}").unwrap();
+            }
+            "newer format" => edit(&root, "managed.json", |v| v["format"] = 2.into()),
+            _ => edit(&root, "managed.json", |v| {
+                v["owners"]["evidence"]["settingsDigest"] = "sha256:00".into()
+            }),
+        }
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let backup = s.backup_capture(name).map(|_| ());
+        let cloned = dir.path().join(format!("clone-{}", name.replace(' ', "-")));
+        let clone = s.clone_to(&cloned, &Default::default()).map(|_| ());
+        let memory = s
+            .clone_to_memory(&Default::default(), StoreOptions::default())
+            .map(|_| ());
+        if unknown {
+            assert_eq!(managed_code(backup), "managed-unavailable", "{name}");
+            assert_eq!(managed_code(clone), "managed-unavailable", "{name}");
+            assert_eq!(managed_code(memory), "managed-unavailable", "{name}");
+            assert!(!cloned.exists() || std::fs::read_dir(&cloned).unwrap().next().is_none());
+        } else {
+            backup.unwrap();
+            clone.unwrap();
+            memory.unwrap();
+            // the copy fails closed too
+            let c = Store::open(&cloned, StoreOptions::default()).unwrap();
+            assert_eq!(
+                managed_code(upd(&c, "INSERT DATA { <urn:x> <urn:p> 1 }")),
+                "managed-unavailable"
+            );
+        }
+    }
+}

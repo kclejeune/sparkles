@@ -402,10 +402,29 @@ impl Store {
                         "the managed-graph registry cannot be enforced or copied",
                     ));
                 };
-                let mut out = Vec::new();
-                for name in std::iter::once(crate::managed::FILE)
-                    .chain(OwnerKind::ALL.iter().map(|o| o.settings_file()))
-                {
+                // Only a registry whose owners, and so whose settings files, this
+                // build can name is copied whole. Anything else would make a copy
+                // without some of the registry's dependencies.
+                let refuse = |why: &str| {
+                    Err(ManagedError::error(
+                        ManagedErrorKind::Unavailable,
+                        format!("the managed-graph registry cannot be copied: {why}"),
+                    ))
+                };
+                let bytes = match std::fs::read(root.join(crate::managed::FILE)) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return refuse("its change did not complete; enable the owner again");
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let owners = match crate::managed::recorded_owners(&bytes) {
+                    Ok(owners) => owners,
+                    Err(why) => return refuse(&why),
+                };
+                let mut out = vec![(crate::managed::FILE, bytes)];
+                for owner in owners {
+                    let name = owner.settings_file();
                     match std::fs::read(root.join(name)) {
                         Ok(b) => out.push((name, b)),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
