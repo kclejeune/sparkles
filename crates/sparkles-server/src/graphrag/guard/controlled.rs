@@ -307,6 +307,10 @@ fn read_index(snap: &Snapshot, preparation: &Preparation) -> Result<OwnedIndex> 
     drop(covers);
     drop(json);
     drop(inputs);
+    // A disclosure row's effect depends only on its graph and object, and repeating
+    // a pair changes nothing, so recently seen pairs skip decoding and hashing. The
+    // table has a fixed size and lives on the stack.
+    let mut seen = [None::<(Id, Id)>; SEEN_PAIRS];
     predicate(
         snap,
         &gr("disclosure"),
@@ -315,6 +319,11 @@ fn read_index(snap: &Snapshot, preparation: &Preparation) -> Result<OwnedIndex> 
             if Some(graph_id) == dg {
                 return Ok(());
             }
+            let slot = seen_slot(graph_id, object);
+            if seen[slot] == Some((graph_id, object)) {
+                return Ok(());
+            }
+            seen[slot] = Some((graph_id, object));
             let mut row = Workspace::new(preparation)?;
             let Some(name) = iri(snap, graph_id, &mut row)?
                 .filter(|name| super::super::settings::is_guarded(name))
@@ -337,6 +346,14 @@ fn read_index(snap: &Snapshot, preparation: &Preparation) -> Result<OwnedIndex> 
         value: index,
         _held: workspace.held,
     })
+}
+
+const SEEN_PAIRS: usize = 256;
+
+fn seen_slot(graph: Id, object: Id) -> usize {
+    let mixed = (graph.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ object.0)
+        .wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    (mixed >> 56) as usize % SEEN_PAIRS
 }
 
 struct ControlledRead<'a> {
