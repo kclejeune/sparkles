@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct LintArgs {
-    /// Files or directories. Directories are walked recursively (.rq, .ru, .sparql, .ttl
-    /// and .trig; .gitignore and .sparklesfmtignore apply). With no PATH, reads stdin
+    /// Files or directories. Directories are walked recursively (.rq, .ru, .sparql, .ttl,
+    /// .trig, .nt, .nq, .jsonld, .shaclc and .shc; .gitignore and .sparklesfmtignore
+    /// apply). With no PATH, reads stdin
     #[arg(value_name = "PATH")]
     pub paths: Vec<PathBuf>,
     /// sparql | turtle | trig | ntriples | nquads | jsonld | shaclc (default: from the
@@ -81,7 +82,9 @@ fn walk_takes(path: &Path) -> bool {
     matches!(sparkles_fmt::detect_path(path), Some(Detection::Lang(l)) if lint::lints(l))
 }
 
-const EXTENSIONS: [&str; 7] = [".rq", ".ru", ".sparql", ".ttl", ".trig", ".nt", ".nq"];
+const EXTENSIONS: [&str; 10] = [
+    ".rq", ".ru", ".sparql", ".ttl", ".trig", ".nt", ".nq", ".jsonld", ".shaclc", ".shc",
+];
 
 /// Run `sparkles lint`.
 pub fn run(args: LintArgs) -> Result<()> {

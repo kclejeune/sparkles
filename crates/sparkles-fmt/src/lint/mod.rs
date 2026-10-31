@@ -1,6 +1,6 @@
 //! `sparkles lint`: rules over the lossless syntax tree of SPARQL queries and updates and
-//! of Turtle, TriG and SHACLC documents, and the term rules over N-Triples and N-Quads
-//! (spec X04). A document is lexed and checked by the reference parser first. A syntax
+//! of Turtle, TriG and SHACLC documents, and the term rules over N-Triples, N-Quads and
+//! JSON-LD, which has two rules of its own (spec X04). A document is lexed and checked by the reference parser first. A syntax
 //! error is the only diagnostic then, except where a rule explains it better (a
 //! `SELECT *` with `GROUP BY`, an IRI with a space, a prefix that is not declared). A
 //! document that parses gets the formatter's syntax tree, and every rule runs over it.
@@ -10,6 +10,7 @@
 //! and keeps the result only when it parses to the same SPARQL algebra, or to an
 //! isomorphic graph or dataset, as the input.
 
+mod jsonld;
 mod lines;
 mod prefixes;
 mod shaclc;
@@ -96,6 +97,7 @@ const PREFIXED: &[Language] = &[
     Language::Shaclc,
 ];
 const SPARQL: &[Language] = &[Language::Sparql];
+const JSONLD: &[Language] = &[Language::JsonLd];
 
 /// Every rule, in the order of the docs. `syntax` stands for the reference parser's
 /// errors; it is always on.
@@ -236,6 +238,22 @@ pub const RULES: &[Rule] = &[
         safe_fix: false,
         summary: "A deprecated name: Jena's `jena.hpl.hp.com` function namespaces or OWL's `owl:DataRange`.",
     },
+    Rule {
+        id: "unused-context-term",
+        languages: JSONLD,
+        embedded: false,
+        default: Severity::Hint,
+        safe_fix: true,
+        summary: "A term of a JSON-LD @context that no key, value or other definition of the document uses. The fix removes it.",
+    },
+    Rule {
+        id: "unmapped-key",
+        languages: JSONLD,
+        embedded: false,
+        default: Severity::Warning,
+        safe_fix: false,
+        summary: "A JSON-LD key that no context in effect maps, which JSON-LD drops with its value without saying so.",
+    },
 ];
 
 /// The rule named `id`.
@@ -351,7 +369,7 @@ impl LintError {
 
 /// Whether `lint` takes `lang`.
 pub fn lints(lang: Language) -> bool {
-    lang != Language::JsonLd
+    Language::ALL.contains(&lang)
 }
 
 /// Lint `text` as `lang`.
@@ -372,7 +390,7 @@ pub fn lint(text: &str, lang: Language, opts: &LintOptions) -> Result<Linted, Li
         Language::Turtle | Language::TriG => lint_turtle(text, lang == Language::TriG, &mut out)?,
         Language::NTriples | Language::NQuads => lines::run(text, lang, &mut out)?,
         Language::Shaclc => shaclc::run(text, &mut out)?,
-        Language::JsonLd => return Err(LintError::UnsupportedLanguage(lang.display_name())),
+        Language::JsonLd => jsonld::run(text, &mut out)?,
     }
     let mut diagnostics = out.found;
     diagnostics.sort_by(|a, b| (a.start, a.end, a.rule).cmp(&(b.start, b.end, b.rule)));
@@ -390,6 +408,7 @@ pub fn fix(text: &str, lang: Language, opts: &LintOptions) -> Result<Fixed, Lint
     let mut current = text.to_string();
     let mut applied = 0;
     let mut linted = lint(&current, lang, opts)?;
+    let original = linted.diagnostics.clone();
     for _ in 0..4 {
         let edits = safe_edits(&linted.diagnostics);
         if edits.is_empty() {
@@ -400,6 +419,15 @@ pub fn fix(text: &str, lang: Language, opts: &LintOptions) -> Result<Fixed, Lint
         linted = lint(&current, lang, opts)?;
     }
     if applied > 0 && !same_meaning(text, &current, lang) {
+        // a JSON-LD document that cannot be expanded here (it names a context by URL)
+        // has no fix that could be checked, so it keeps its text
+        if lang == Language::JsonLd && jsonld_quads(text).is_none() {
+            return Ok(Fixed {
+                text: text.to_string(),
+                applied: 0,
+                diagnostics: original,
+            });
+        }
         return Err(LintError::UnsafeFix);
     }
     Ok(Fixed {
@@ -451,6 +479,19 @@ pub fn apply(text: &str, edits: &[Edit]) -> String {
     out
 }
 
+/// The dataset of a JSON-LD document, expanded without fetching anything (relative IRIs
+/// resolve against a synthetic base); `None` when it cannot be, for example because a
+/// context is given by URL.
+fn jsonld_quads(text: &str) -> Option<Vec<oxrdf::Quad>> {
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    oxjsonld::JsonLdParser::new()
+        .with_base_iri(crate::check::graph::RDF_BASE)
+        .ok()?
+        .for_slice(body)
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
 /// Whether `a` and `b` parse to the same algebra (SPARQL) or isomorphic data. A prefix
 /// that is undeclared in either is declared for both parses, as the lint does, so a
 /// document with an `undefined-prefix` finding can still be fixed.
@@ -479,6 +520,10 @@ fn same_meaning(a: &str, b: &str, lang: Language) -> bool {
                 _ => false,
             }
         }
+        Language::JsonLd => match (jsonld_quads(a), jsonld_quads(b)) {
+            (Some(qa), Some(qb)) => crate::check::graph::isomorphic(&qa, &qb),
+            _ => false,
+        },
         Language::Shaclc => {
             let mut undeclared = shaclc::undeclared_labels(a, &lex(a, LexMode::Shaclc));
             for l in shaclc::undeclared_labels(b, &lex(b, LexMode::Shaclc)) {
@@ -950,3 +995,5 @@ pub(crate) fn unescape_iri(s: &str) -> String {
 mod tests;
 #[cfg(test)]
 mod tests_formats;
+#[cfg(test)]
+mod tests_jsonld;

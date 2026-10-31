@@ -9,9 +9,9 @@ use crate::sparql::keywords::Kw;
 use crate::syntax::NodeKind;
 use crate::tree::TokenId;
 
-const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
-const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-const OWL_DATA_RANGE: &str = "http://www.w3.org/2002/07/owl#DataRange";
+pub(super) const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+pub(super) const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+pub(super) const OWL_DATA_RANGE: &str = "http://www.w3.org/2002/07/owl#DataRange";
 
 pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
     for n in c.nodes() {
@@ -43,6 +43,11 @@ fn iri_ref(c: &Cst<'_, '_>, t: TokenId, out: &mut Out<'_>) {
     let text = c.text(t);
     let iri = unescape_iri(&text[1..text.len() - 1]);
     let (s, e) = c.span(t);
+    iri_checks(&iri, s, e, out);
+}
+
+/// The checks of one IRI, written or expanded, whose text is at `s..e`.
+pub(super) fn iri_checks(iri: &str, s: usize, e: usize, out: &mut Out<'_>) {
     if iri.chars().any(char::is_whitespace) {
         out.report(
             "iri-space",
@@ -125,19 +130,31 @@ fn literal(c: &Cst<'_, '_>, n: crate::tree::NodeId, out: &mut Out<'_>) {
 fn language_tag(c: &Cst<'_, '_>, t: TokenId, out: &mut Out<'_>) {
     let written = &c.text(t)[1..];
     let (s, e) = c.span(t);
+    language_tag_at(written, s, e, &|tag| format!("@{tag}"), out);
+}
+
+/// The checks of the language tag `written`, whose text `render`ed is at `s..e`.
+pub(super) fn language_tag_at(
+    written: &str,
+    s: usize,
+    e: usize,
+    render: &dyn Fn(&str) -> String,
+    out: &mut Out<'_>,
+) {
     let canonical = canonical_case(written);
     if canonical != written {
+        let spelled = render(&canonical);
         out.report_fix(
             "language-tag-case",
             s,
             e,
             format!("write the language tag {written} as {canonical}"),
             Some(Fix {
-                title: format!("Write @{canonical}"),
+                title: format!("Write {spelled}"),
                 edits: vec![Edit {
                     start: s,
                     end: e,
-                    insert: format!("@{canonical}"),
+                    insert: spelled,
                 }],
             }),
         );
@@ -267,23 +284,59 @@ fn datatype(
 ) {
     let (ds, de) = c.span(dt);
     let (ls, _) = c.span(string);
+    let (hs, _) = c.span(hat);
     let lexical = string_value(c.text(string));
-    let dt_text = c.text(dt);
+    datatype_site(
+        &Site {
+            lexical: &lexical,
+            lexical_span: (ls, de),
+            datatype_text: c.text(dt),
+            datatype_span: (ds, de),
+            redundant_span: (hs, de),
+            drop: Edit {
+                start: hs,
+                end: de,
+                insert: String::new(),
+            },
+            drop_title: format!("Remove ^^{}", c.text(dt)),
+        },
+        iri,
+        out,
+    );
+}
+
+/// Where the parts of a typed literal are, for the findings about them.
+pub(super) struct Site<'a> {
+    /// the lexical form, decoded
+    pub lexical: &'a str,
+    /// where findings about the lexical form go
+    pub lexical_span: (usize, usize),
+    /// the datatype as written
+    pub datatype_text: &'a str,
+    pub datatype_span: (usize, usize),
+    /// where a datatype that is `xsd:string` is reported
+    pub redundant_span: (usize, usize),
+    /// the edit that drops the datatype, and the title of the fix
+    pub drop: Edit,
+    pub drop_title: String,
+}
+
+/// A typed literal's datatype `iri` against its lexical form.
+pub(super) fn datatype_site(site: &Site<'_>, iri: &str, out: &mut Out<'_>) {
+    let (ds, de) = site.datatype_span;
+    let (ls, le) = site.lexical_span;
+    let lexical = site.lexical;
+    let dt_text = site.datatype_text;
     if let Some(local) = iri.strip_prefix(XSD) {
         if local == "string" {
-            let (hs, _) = c.span(hat);
             out.report_fix(
                 "redundant-datatype",
-                hs,
-                de,
+                site.redundant_span.0,
+                site.redundant_span.1,
                 format!("{dt_text} is the datatype of every plain string; it can be left out"),
                 Some(Fix {
-                    title: format!("Remove ^^{dt_text}"),
-                    edits: vec![Edit {
-                        start: hs,
-                        end: de,
-                        insert: String::new(),
-                    }],
+                    title: site.drop_title.clone(),
+                    edits: vec![site.drop.clone()],
                 }),
             );
             return;
@@ -297,23 +350,7 @@ fn datatype(
             );
             return;
         }
-        if local == "anyURI" && lexical.chars().any(char::is_whitespace) {
-            out.report(
-                "iri-space",
-                ls,
-                de,
-                "this xsd:anyURI holds whitespace; percent-encode it (a space is %20)".to_string(),
-            );
-            return;
-        }
-        if let Some(problem) = lexical_problem(local, &lexical) {
-            out.report(
-                "suspicious-datatype",
-                ls,
-                de,
-                format!("\"{lexical}\" is not a valid xsd:{local}: {problem}"),
-            );
-        }
+        lexical_check(local, lexical, ls, le, out);
         return;
     }
     if iri == format!("{RDF}langString") || iri == format!("{RDF}dirLangString") {
@@ -343,8 +380,30 @@ fn datatype(
     }
 }
 
+/// The lexical form `lexical` against the XML Schema datatype `xsd:{local}` (a known
+/// one), reported over `ls..le`: whitespace in an `xsd:anyURI`, or an invalid form.
+pub(super) fn lexical_check(local: &str, lexical: &str, ls: usize, le: usize, out: &mut Out<'_>) {
+    if local == "anyURI" && lexical.chars().any(char::is_whitespace) {
+        out.report(
+            "iri-space",
+            ls,
+            le,
+            "this xsd:anyURI holds whitespace; percent-encode it (a space is %20)".to_string(),
+        );
+        return;
+    }
+    if let Some(problem) = lexical_problem(local, lexical) {
+        out.report(
+            "suspicious-datatype",
+            ls,
+            le,
+            format!("\"{lexical}\" is not a valid xsd:{local}: {problem}"),
+        );
+    }
+}
+
 /// The XML Schema datatypes, as RDF 1.1 lists them and the ones it leaves out.
-const XSD_TYPES: &[&str] = &[
+pub(super) const XSD_TYPES: &[&str] = &[
     "string",
     "boolean",
     "decimal",

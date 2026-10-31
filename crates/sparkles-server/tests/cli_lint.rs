@@ -54,6 +54,16 @@ fn setup() -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::write(d.path().join("q/d.rdf"), "<rdf:RDF/>").unwrap();
+    std::fs::write(
+        d.path().join("q/e.jsonld"),
+        "{\"@context\": {\"a\": \"http://x/a\"}, \"@id\": \"http://x/s\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("q/f.shaclc"),
+        "PREFIX u: <http://u/>\nshape <http://x/S> { <http://x/p> IRI . }\n",
+    )
+    .unwrap();
     d
 }
 
@@ -85,6 +95,14 @@ fn reports_and_exit_statuses() {
         "{text}"
     );
     assert!(!text.contains("d.rdf"), "{text}");
+    assert!(
+        text.contains("q/e.jsonld:1:15: hint [unused-context-term]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("q/f.shaclc:1:1: warning [unused-prefix]"),
+        "{text}"
+    );
     assert!(err(&o).contains("problems ("), "{}", err(&o));
     // --strict fails on warnings, and --rule raises one to an error
     assert_eq!(run(dir, &["lint", "--strict", "q"]).status.code(), Some(1));

@@ -21,7 +21,7 @@ const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 #[test]
 fn every_language_lints() {
     for lang in Language::ALL {
-        assert_eq!(lints(lang), lang != Language::JsonLd, "{lang:?}");
+        assert!(lints(lang), "{lang:?}");
     }
 }
 

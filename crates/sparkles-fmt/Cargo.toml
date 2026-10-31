@@ -22,6 +22,8 @@ oxiri.workspace = true
 sparkles-shaclc.workspace = true
 # the reference parser of JSON-LD (strict JSON)
 json-event-parser.workspace = true
+# the dataset of a JSON-LD document, to check that a lint fix keeps its meaning
+oxjsonld.workspace = true
 # the sorted runs the line formats spill to disk
 lz4_flex.workspace = true
 # the line formats' chunks on every core (feature `parallel`)
@@ -32,8 +34,6 @@ rayon = { workspace = true, optional = true }
 sparkles-fmt = { path = ".", features = ["fault-injection"] }
 proptest.workspace = true
 toml.workspace = true
-# the datasets of JSON-LD documents, to compare inputs and golden outputs
-oxjsonld.workspace = true
 
 [features]
 default = ["parallel"]
