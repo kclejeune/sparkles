@@ -596,7 +596,7 @@ esac
 
     def test_each_timed_server_answers_every_selected_query_first(self):
         stubs = """
-        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
+        resolve_tools() { :; }; use_hyperfine() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
         answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
         start() { echo "start $1"; URL[$1]=u; }
         start_all() { echo "check-start $ENGINES"; }; answer_check() { echo "check $ENGINES"; }; stop_all() { echo "check-stop $ENGINES"; }
@@ -621,7 +621,7 @@ esac
 
     def test_answer_only_check_never_has_two_servers_running(self):
         stubs = """
-        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }
+        resolve_tools() { :; }; use_hyperfine() { :; }; suite_manifest() { :; }; load_all() { :; }
         python3() { :; }; log() { :; }; sleep() { :; }; setj() { :; }; rss_of() { echo 1; }
         start() { [ ! -f active ] || return 1; echo "$1" > active; echo "start $1"; }
         stop() { if [ -f active ]; then echo "stop $1"; rm active; fi; }
@@ -639,7 +639,7 @@ esac
 
     def test_successful_timing_start_recovers_after_a_failed_correctness_restart(self):
         stubs = """
-        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }
+        resolve_tools() { :; }; use_hyperfine() { :; }; suite_manifest() { :; }; load_all() { :; }
         python3() { :; }; log() { :; }; sleep() { :; }; setj() { :; }; rss_of() { echo 1; }
         start() { touch up; URL[$1]=u; }
         stop() { rm -f up; }
@@ -665,7 +665,7 @@ esac
 
     def test_an_engine_that_does_not_start_is_left_out_and_the_run_fails(self):
         stubs = """
-        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
+        resolve_tools() { :; }; use_hyperfine() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
         answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
         start() { echo "start $1"; if [ "$1" = jena ]; then start_failed "jena: no"; return 1; fi; URL[$1]=u; }
         stop() { echo "stop $1"; }
@@ -688,7 +688,7 @@ esac
 
     def test_an_engine_that_cannot_be_restarted_fails_the_run(self):
         stubs = """
-        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
+        resolve_tools() { :; }; use_hyperfine() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
         answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
         start() { if [ -f started-$1 ]; then return 1; fi; touch started-$1; URL[$1]=u; }
         stop() { :; }

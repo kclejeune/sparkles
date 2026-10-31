@@ -102,7 +102,8 @@ can explicitly select other executables. The billion-triple loader also accepts 
 Jena loaders and servers clear `JAVA_HOME` so their wrappers use the packaged JDK.
 The RDFS oracle also defaults to the locked JDK, with `JAVA` as an explicit override.
 The hyperfine timer also comes from the flake, since hyperfine 2 writes its samples in a
-format the run records do not read. `HYPERFINE` can select another executable. The probe,
+format the run records do not read. `HYPERFINE` can select another executable under any file name. Runs that time nothing, such
+as the long-write runner and the load step of the billion-triple runner, do not resolve it. The probe,
 geospatial, vector and SHACL write runners call the `hyperfine` on `PATH`, which the mise
 pin supplies at the same version. Other auxiliary tools prefer `PATH` and otherwise use the
 repository's locked nixpkgs.

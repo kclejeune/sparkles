@@ -66,11 +66,14 @@ fluree_bin() {
 
 # Put the flake's hyperfine first on PATH, so the runners' bare `hyperfine` calls, including
 # those behind a CPU-pinning client prefix, time with the pinned version. HYPERFINE names
-# another binary instead.
+# another executable, which runs whatever its file name. Runners that time requests call
+# this after resolve_tools.
 use_hyperfine() {
   local binary=${HYPERFINE:-}
   if [ -z "$binary" ]; then binary=$(nixbin hyperfine hyperfine) || return; fi
-  PATH="$(dirname "$binary"):$PATH"
+  mkdir -p "$WORK/timer" || return
+  ln -sfn "$binary" "$WORK/timer/hyperfine" || return
+  PATH="$WORK/timer:$PATH"
 }
 
 resolve_tools() {
@@ -84,7 +87,6 @@ resolve_tools() {
   fi
   if has oxigraph; then OXIGRAPH=${OXIGRAPH:-$(nixbin oxigraph oxigraph)} || return; fi
   if has fluree; then FLUREE=${FLUREE:-$(fluree_bin)} || return; fi
-  use_hyperfine
 }
 
 # GNU time, rather than the shell keyword. It cannot go through nixbin, because command -v

@@ -146,18 +146,35 @@ for output in outputs:
                        'has() { [[ " $ENGINES " == *" $1 "* ]]; }; resolve_tools',
                        TDBLOADER="/custom/loader", FUSEKI="/custom/fuseki", QINDEX="/custom/index",
                        QSERVER="/custom/server", OXIGRAPH="/custom/oxigraph", FLUREE="/custom/fluree",
-                       HYPERFINE="/custom/hyperfine", FLUREE_VERSION="other", FAIL_NIX="1")
+                       FLUREE_VERSION="other", FAIL_NIX="1")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.nix_calls(), [])
 
-    def test_resolve_tools_puts_the_flake_hyperfine_first(self):
+    def test_use_hyperfine_puts_the_flake_hyperfine_first(self):
         on_path = self.bin / "hyperfine"
         on_path.write_text("#!/bin/sh\nexit 99\n")
         on_path.chmod(0o755)
-        p = self.shell('has() { false; }; resolve_tools; command -v hyperfine')
+        p = self.shell('use_hyperfine; readlink "$(command -v hyperfine)"; hyperfine')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.strip(), str(self.store / "hyperfine" / "bin" / "hyperfine"))
         self.assertIn(f"{ROOT}#hyperfine", self.nix_calls()[-1])
+
+    def test_hyperfine_override_runs_under_any_name(self):
+        on_path = self.bin / "hyperfine"
+        on_path.write_text("#!/bin/sh\nexit 99\n")
+        on_path.chmod(0o755)
+        chosen = self.work / "hyperfine-1.20"
+        chosen.write_text("#!/bin/sh\necho chosen\n")
+        chosen.chmod(0o755)
+        p = self.shell("use_hyperfine; hyperfine", HYPERFINE=str(chosen), FAIL_NIX="1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "chosen")
+        self.assertEqual(self.nix_calls(), [])
+
+    def test_resolve_tools_leaves_the_timer_to_runners_that_time(self):
+        p = self.shell("has() { false; }; resolve_tools", FAIL_NIX="1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.nix_calls(), [])
 
     def test_resolve_tools_propagates_build_failure(self):
         p = self.shell('has() { [[ "$1" == qlever ]]; }; resolve_tools; echo started', FAIL_NIX="1")

@@ -255,6 +255,7 @@ suite_run() {
     "sparklesArgs=${SPARKLES_ARGS:-}" "answerStreamTSVQueries=${ANSWERS_TSV_QUERIES:-}" "correctnessEngineIsolation=true" \
     "jenaHeap=${JENA_HEAP:-8G}" "jenaStack=${JENA_STACK:-default}" "qleverMemory=${QLEVER_MEMORY:-8G}"
   resolve_tools
+  use_hyperfine
   trap stop_all EXIT
   suite_manifest
   [ -n "${SKIP_LOAD:-}" ] || load_all

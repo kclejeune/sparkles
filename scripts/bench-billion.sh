@@ -468,6 +468,7 @@ EOF
 }
 step_queries() {
   resolve_tools
+  use_hyperfine
   local e n r all=$ENGINES
   local ENGINES=$all
   for e in $ENGINES; do

@@ -164,6 +164,7 @@ selected() { # selected <instance>: QUERIES lists templates or instances
 
 # ---------------------------------------------------------------------------- engines
 resolve_tools
+use_hyperfine
 
 # merge <new.json> <dest.json>: replace/add hyperfine results by command name
 merge() {

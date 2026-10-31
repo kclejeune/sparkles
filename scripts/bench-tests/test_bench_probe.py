@@ -31,6 +31,7 @@ touch sparkles.loaded qlever.loaded
 starts=0 hung=0
 event() { printf '%s|%s\n' "$*" "${!PORT[*]}" >> events; }
 resolve_tools() { :; }
+use_hyperfine() { :; }
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 selected() { return 0; }
 start() {

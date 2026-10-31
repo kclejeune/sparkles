@@ -82,6 +82,7 @@ cd "$WORK"
 # shellcheck source=scripts/bench-lib.sh
 source "$ROOT/scripts/bench-lib.sh"
 resolve_tools
+use_hyperfine
 export CONC NREQ
 
 if [ ! -f data.nt ]; then

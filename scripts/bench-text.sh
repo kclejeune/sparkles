@@ -79,6 +79,7 @@ source "$ROOT/scripts/bench-tools.sh"
 ENGINES=${ENGINES:-sparkles jena qlever}
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 resolve_tools
+use_hyperfine
 if has jena; then
   # jena.textindexer runs from the Fuseki jar, with the Java the Fuseki wrapper uses
   FHOME=$(dirname "$(readlink -f "$FUSEKI")")
