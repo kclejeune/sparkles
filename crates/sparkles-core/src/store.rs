@@ -4851,8 +4851,18 @@ impl Store {
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
         let snap = self.snapshot();
+        // A stream that ends within a few thousand quads goes into an empty store by a
+        // transaction, which costs less than the fixed cost of a rebuild. Its bytes are
+        // read ahead to tell, as only a read can.
+        let small_streams = snap.is_empty()
+            && !sources.is_empty()
+            && sources
+                .iter()
+                .all(|s| matches!(s.data, crate::io::SourceData::Reader(_)))
+            && !streams_exceed_bytes(sources, SMALL_STREAM_BYTES)?;
         // a write limited to some graphs checks each quad, which a rebuild does not
         if o.graphs.is_none()
+            && !small_streams
             && (snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold)
         {
             let mut w = self.lock_writer(o)?;
@@ -7013,6 +7023,12 @@ fn estimated_quads(sources: &[Source]) -> u64 {
     bytes / 80
 }
 
+/// Decoded bytes of streams, about 100,000 quads, below which a load into an empty store
+/// takes a transaction instead of a rebuild. A rebuild has a fixed cost of about 20 ms,
+/// and it parses a stream shorter than one parallel chunk of 8 MiB on one thread, so a
+/// transaction is faster up to about that size.
+const SMALL_STREAM_BYTES: u64 = 8 << 20;
+
 /// Whether the streams among `sources`, whose length is unknown, hold more than `quads`
 /// quads by the estimate of [`estimated_quads`]. Each stream is read ahead until it ends
 /// or passes its share of the estimate, about 80 bytes per quad, and the bytes read ahead
@@ -7020,12 +7036,17 @@ fn estimated_quads(sources: &[Source]) -> u64 {
 /// instead of holding all its quads in memory, and holds at most that read-ahead of a
 /// small one.
 fn streams_exceed(sources: &[Source], quads: u64) -> Result<bool> {
+    streams_exceed_bytes(sources, quads.saturating_mul(80))
+}
+
+/// Whether the streams among `sources` hold more than `limit` bytes as decoded, reading
+/// them ahead as [`streams_exceed`] does.
+fn streams_exceed_bytes(sources: &[Source], limit: u64) -> Result<bool> {
     let mut bytes = 0u64;
     for s in sources {
         let crate::io::SourceData::Reader(r) = &s.data else {
             continue;
         };
-        let limit = quads.saturating_mul(80);
         let expansion = s.codec()?.expansion().max(1);
         let want = (limit + 1).saturating_sub(bytes).div_ceil(expansion);
         let held = r.read_ahead(usize::try_from(want).unwrap_or(usize::MAX))? as u64;
@@ -7832,6 +7853,26 @@ pub(crate) fn replay_wal(
 mod tests {
     use super::*;
     use crate::io::RdfFormat;
+
+    #[test]
+    fn a_short_stream_loads_an_empty_store_by_a_transaction() {
+        let lines = |n: usize| {
+            (0..n)
+                .map(|i| format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        for (n, transactional) in [(3usize, true), (400_000, false)] {
+            let store = Store::in_memory(StoreOptions::default());
+            let src =
+                Source::from_reader(std::io::Cursor::new(lines(n)), RdfFormat::NTriples, None);
+            assert_eq!(store.load(&[src]).unwrap(), n as u64);
+            let snap = store.snapshot();
+            assert_eq!(snap.len(), n as u64);
+            // a rebuild leaves the quads in the base, a transaction in the delta
+            assert_eq!(!snap.delta.is_empty(), transactional, "{n}");
+        }
+    }
 
     #[test]
     fn a_large_stream_replaces_through_the_bulk_path() {
