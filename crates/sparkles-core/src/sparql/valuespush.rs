@@ -98,21 +98,18 @@ impl Cx<'_> {
             }
         }
         // a GRAPH operand's inner join is flattened into this group without being planned
-        let mut changed = false;
-        let next: Vec<GraphPattern> = operands
-            .iter()
-            .map(|o| match o {
-                GraphPattern::Graph { .. } => match self.rewrite(o) {
-                    Some(r) => {
-                        changed = true;
-                        r
-                    }
-                    None => (*o).clone(),
-                },
-                _ => (*o).clone(),
-            })
-            .collect();
-        changed.then(|| joined(next))
+        // the operands are copied only once a GRAPH among them has changed
+        let mut next: Option<Vec<GraphPattern>> = None;
+        for (i, o) in operands.iter().enumerate() {
+            if matches!(o, GraphPattern::Graph { .. })
+                && let Some(r) = self.rewrite(o)
+            {
+                let out =
+                    next.get_or_insert_with(|| operands.iter().map(|o| (*o).clone()).collect());
+                out[i] = r;
+            }
+        }
+        next.map(joined)
     }
 
     /// The join with its tables that share variables with `operands[target]` moved into
