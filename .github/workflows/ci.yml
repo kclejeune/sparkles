@@ -311,10 +311,11 @@ jobs:
             echo "$((memory_kib / 1024 / 1024)) GiB of memory, so no swap file"
             exit 0
           fi
-          sudo fallocate -l 16G /swapfile-ci
-          sudo chmod 600 /swapfile-ci
-          sudo mkswap /swapfile-ci > /dev/null
-          sudo swapon /swapfile-ci || echo '::warning::the runner refused a swap file'
+          if ! { sudo fallocate -l 16G /swapfile-ci && sudo chmod 600 /swapfile-ci &&
+            sudo mkswap /swapfile-ci > /dev/null && sudo swapon /swapfile-ci; }; then
+            echo '::warning::the runner refused a swap file'
+            sudo rm -f /swapfile-ci
+          fi
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
