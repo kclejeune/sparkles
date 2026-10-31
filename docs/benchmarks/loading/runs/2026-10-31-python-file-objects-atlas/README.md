@@ -46,3 +46,19 @@ number of quads.
 ```
 ROUNDS=5 ./ab-review-fixes.sh
 ```
+
+## Rerun after the second review
+
+The second review's fixes add the store's check before publication, which runs the
+signal handlers, measure the read-ahead in decompressed bytes and keep the carried line
+inside the two block buffers. This rerun compares commit `99fb6e95` with commit
+`b893af19` for the 5M-triple N-Triples and Turtle file objects and a one-triple one, as
+`heavy-rereview-fixes.sh` builds and runs them under the same lock. The load average was
+below 13 at its start, from its own builds, and below 2 at its end.
+
+```
+ROUNDS=5 ./ab-rereview-fixes.sh
+```
+
+`results-rereview-fixes.jsonl` holds one line for each load. Every load left the
+expected number of quads.

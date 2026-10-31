@@ -3647,7 +3647,10 @@ into bounded parallel blocks when it is N-Triples or N-Quads, whatever its compr
 In another syntax it is read ahead up to the cutoff, as a compressed document is. Block
 parsing holds at most two blocks, one parsed while the next is filled, and a block buffer
 grows from 64 KiB as it fills. Buffered mode decodes a stream into memory up to the
-cutoff and into an unnamed temporary file past it. `--parse-mode streaming` always uses a sequential reader, and
+cutoff and into an unnamed temporary file past it. `guard::WriteOptions::before_publish`
+takes a `PublishHook` that the store runs after a write is parsed, indexed and validated,
+right before it is published, for transactions and bulk rebuilds alike. An `Err` from it
+abandons the write. `--parse-mode streaming` always uses a sequential reader, and
 `--parse-mode buffered` always reads the whole document into memory first. A buffered
 compressed input needs RAM for its full decompressed size. These modes only affect
 parsing. Transactional changes, the vocabulary, the map of blank-node labels and

@@ -1305,16 +1305,21 @@ No loader path reads its source twice, so no other path spills.
 
 The reader takes the GIL for each read of at most 64 KiB, and a Python exception that
 `read` raises reaches the caller as itself. A load or replacement from a file object runs
-on a thread of its own while the main thread waits and runs the signal handlers. A signal
-sets a flag through the watcher of Python's signal wakeup descriptor. The reader then asks
-the main thread to run the handlers before it calls into Python again, and it asks again
-at the end of the stream, so an interrupt raised during any read cancels the request
-before it commits. A handler that returns lets the request go on, and a handler may query
-other datasets because the request does not occupy the helper thread of other calls.
-`replace` also passes its token and timeout to the reader and the store. A signal that
-arrives after the store's last check before publication can still raise after the
-commit. N-Triples and N-Quads streams are parsed in blocks, of which at most two are in
-memory, and a block buffer grows from 64 KiB as it fills.
+on a thread of its own while the main thread waits and runs the signal handlers. The
+watcher of Python's signal wakeup descriptor starts before that thread, and a signal sets
+its flag. The reader then asks the main thread to run the handlers before it calls into
+Python again. The store write carries `WriteOptions::before_publish`, a hook that the
+store runs after parsing, indexing and validation, right before publication, for the
+transaction and the bulk path. The binding's hook asks the main thread to run the
+handlers and fails with `Cancelled` when one raised, so an interrupt during the request
+abandons the write whatever decoder read the stream last. A handler that returns lets the
+request go on, and a handler may query other datasets because the request does not
+occupy the helper thread of other calls. `replace` also passes its token and timeout to
+the reader, the read-ahead and the store. A signal that arrives during publication itself
+can still raise after the commit. N-Triples and N-Quads streams are parsed in blocks, of
+which at most two buffers exist, including the partial line carried into the next block,
+and a block buffer grows from 64 KiB as it fills. The cutoffs of the transaction and the
+bulk replacement count decompressed bytes, read ahead through the decoder and replayed.
 
 `tests/test_file_object_loads.py` loads binary and text file objects in Turtle,
 N-Triples, N-Quads, TriG, RDF/XML, JSON-LD, RDF Thrift and RDF Protobuf in every parse
@@ -1323,10 +1328,12 @@ end of the stream, a signal handler that queries another dataset, Ctrl-C and a t
 during a replacement, the memory of a one-triple load, buffered spilling, and loads in a
 child process whose `TMPDIR` does not exist. The tests that could hang run in a child
 process with a timeout. The core tests cover the two-block bound, buffered spilling and
-the bulk replacement of a long stream. An independent review found the commit after an
-interrupt at the end of the stream, the deadlock of a querying handler, the replacement
-that ignored Ctrl-C and the memory costs, and each regression test failed on the build
-before its fix. A 5M-triple N-Triples file object loads in 2.21 s instead of 19.39 s on atlas, and a
-one-triple one in a new process takes 7.6 ms instead of 3.6 ms, which roadmap item
+the bulk replacement of a long stream. Two independent reviews found the commit after an
+interrupt at the end of the stream and after a compressed final read, the lost interrupt
+of a cold process, the deadlock of a querying handler, the replacement that ignored
+Ctrl-C and its deadline, the cutoffs that counted compressed bytes and the memory costs.
+Each regression test failed on the build before its fix, and
+`tests/block_reader_memory.rs` counts the live block buffers with a global allocator. A 5M-triple N-Triples file object loads in 2.25 s instead of 21.07 s on atlas, and a
+one-triple one in a new process takes 6.4 ms instead of 2.7 ms, which roadmap item
 NEW-ITEM tracks. The [loading results](../benchmarks/loading/RESULTS.md#python-file-objects)
 record the measurements.

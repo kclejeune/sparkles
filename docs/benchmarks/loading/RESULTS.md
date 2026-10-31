@@ -98,16 +98,18 @@ database, with the two builds interleaved.
 
 | Input | Before | After | Peak RSS before and after |
 |---|---:|---:|---:|
-| N-Triples file object, 5M triples | 19.39 s | **2.21 s** | 3,066 and 1,145 MiB |
-| Turtle file object, 5M triples | 18.22 s | **6.00 s** | 3,071 and 558 MiB |
+| N-Triples file object, 5M triples | 21.07 s | **2.25 s** | 3,067 and 1,195 MiB |
+| Turtle file object, 5M triples | 20.22 s | **5.86 s** | 3,066 and 581 MiB |
 | N-Triples file object, 120,000 triples | 251 ms | **222 ms** | 136 and 167 MiB |
 | N-Triples file object, 80,000 triples | 172 ms | 175 ms | 106 and 137 MiB |
 | N-Triples file object, 20,000 triples | 51 ms | 52 ms | 64 and 69 MiB |
-| N-Triples file object, one triple | **3.6 ms** | 7.6 ms | 48 and 50 MiB |
+| N-Triples file object, one triple | **2.7 ms** | 6.4 ms | 48 and 52 MiB |
 | Gzip N-Triples path, 5M triples | 1.85 s | 1.84 s | 1,232 and 1,185 MiB |
 
 *The measurements are from atlas, an Intel Core i5-13500 with 20 logical CPUs, under the
-host's lock for heavy jobs. The records and the scripts are in
+host's lock for heavy jobs. The 5M and one-triple rows are from the final build, and the
+other rows from the build before the store's check before publication, which does not
+change them. The records and the scripts are in
 [`runs/2026-10-31-python-file-objects-atlas`](runs/2026-10-31-python-file-objects-atlas/README.md),
 with an earlier run of the first version of the reader that also covers RDF Thrift and
 buffered mode. An N-Triples stream is parsed in blocks of 256 MiB, at most two at a time,

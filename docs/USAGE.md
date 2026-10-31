@@ -5978,12 +5978,13 @@ iteration, after the quads that came before it.
 `Dataset.load` and `Dataset.replace` read a file object once, as it arrives, in every
 syntax. In automatic and streaming mode they never copy it to a temporary file. Into an
 empty dataset `load` runs the bulk loader with its parallel encoders, as a load from a
-path does. A stream that ends within 8 MiB, about 100,000 quads, goes in by a
-transaction instead, since a rebuild has a fixed cost of about 20 ms and parses such a
+path does. A stream whose decompressed bytes end within 8 MiB, about 100,000 quads,
+goes in by a transaction instead, since a rebuild has a fixed cost of about 20 ms and parses such a
 stream on one thread. Into a dataset that holds data it inserts the quads in one transaction, since
 the size of a stream is not known before it is read. `replace` reads up to about 20 MB of
-the stream ahead, and a longer stream goes through the bounded bulk replacement instead
-of being held in memory. Each read asks the file object for at most 64 KiB, or 64 Ki
+the decompressed stream ahead, and a longer stream goes through the bounded bulk
+replacement instead of being held in memory. The bytes read ahead are parsed afterwards,
+and the read-ahead stops at the write's cancellation and deadline. Each read asks the file object for at most 64 KiB, or 64 Ki
 characters of a text-mode file, whose text is encoded as UTF-8. The compression is
 detected from the first bytes of the stream.
 
@@ -6001,10 +6002,12 @@ when the parse ends. Only a buffered stream longer than its allowance writes tha
 
 An exception that the file object's `read` raises propagates as itself and leaves the
 dataset unchanged. Ctrl-C stops the reading at the next read and raises
-`KeyboardInterrupt`. The end of the stream waits until the main thread has run the
-handlers of the signals that arrived during the reads, so an interrupt during a read
-changes nothing. A signal handler whose function returns lets the load go on, and it
-may query other datasets. `replace` from a file object also stops for its `cancel` token
+`KeyboardInterrupt`. Right before the store publishes a load or replacement from a file
+object, it waits until the main thread has run the handlers of the signals that arrived,
+so an interrupt at any point before publication changes nothing, whatever decoder read
+the stream. A signal that arrives during publication itself can raise after the commit.
+A signal handler whose function returns lets the load go on, and it may query other
+datasets. `replace` from a file object also stops for its `cancel` token
 and `timeout`.
 
 ### Terms

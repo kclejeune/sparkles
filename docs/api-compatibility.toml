@@ -4,6 +4,8 @@ schema_version = 1
 # Reviewed Rust additions that a release comparison must accept:
 # - sparkles::io::SourceData::Reader, a new variant of an exhaustive public enum, with
 #   sparkles::io::ReaderSource and Source::from_reader (roadmap item 438, CHANGELOG).
+# - sparkles::guard::WriteOptions::before_publish, a new public field of a struct that
+#   callers may build with a literal, with sparkles::guard::PublishHook (item 438).
 enforced = ["http", "cli"]
 pending = ["rust", "bindings", "mcp", "metrics", "cli-json-exit", "deprecation", "release-install"]
 

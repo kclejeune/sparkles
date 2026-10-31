@@ -113,16 +113,19 @@ file object to a temporary file, and Jena's syntaxes no longer pass through an N
 pipe. Buffered mode keeps the stream in memory up to `auto_buffer_bytes` and continues
 into a temporary file past it. `Dataset.replace` from a file object replaces a long
 stream through the bounded bulk path, and it now stops for Ctrl-C, its cancel token and
-its timeout. A load of a 5M-triple N-Triples file object takes 2.2 s instead of 19 s and
-peaks at 1.1 GiB instead of 3 GiB of RSS, and a stream that ends within 8 MiB still
+its timeout. A load of a 5M-triple N-Triples file object takes 2.2 s instead of 21 s and
+peaks at 1.2 GiB instead of 3 GiB of RSS, and a stream that ends within 8 MiB still
 goes into an empty dataset by a transaction. N-Triples and N-Quads streams are parsed in
 parallel blocks, at most two at a time, which hold more memory than a load of the same
 file by its path. A block buffer grows as it fills, which also spares small compressed
 line-based files a 256 MiB buffer. An exception that the file object's `read` raises now
-propagates as itself. Ctrl-C stops the load at the next read, and an interrupt during
-the last read no longer lets the load commit. In Rust, `SourceData::Reader` and
-`Source::from_reader` give the loader a stream that it reads once. Code that matches
-every variant of `SourceData` needs an arm for the new one.
+propagates as itself. Ctrl-C stops the load at the next read, and the store runs the
+main thread's signal handlers right before it publishes, so an interrupt during the load
+no longer lets it commit. In Rust, `SourceData::Reader` and `Source::from_reader` give
+the loader a stream that it reads once, and `WriteOptions::before_publish` takes a hook
+that the store runs right before it publishes a write. Code that matches every variant of
+`SourceData`, or builds a `WriteOptions` without `..Default::default()`, needs the new
+variant or field.
 
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
