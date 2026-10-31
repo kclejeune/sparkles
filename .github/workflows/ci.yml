@@ -356,7 +356,7 @@ jobs:
           if [ "$SHARD" = timing ]; then
             select=(-E "$timing")
           else
-            select=(-E "not $timing" --partition "slice:$SHARD")
+            select=(-E "not ($timing)" --partition "slice:$SHARD")
           fi
           cargo-nextest nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" \
             --workspace-remap . --extract-to . --profile ci "${select[@]}"
