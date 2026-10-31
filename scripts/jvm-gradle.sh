@@ -12,13 +12,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-if command -v flock > /dev/null; then
-  mkdir -p .artifacts
-  exec 8> .artifacts/jvm-native.lock
-  flock 8
-  export SPARKLES_JVM_LOCKED=1
+if [ -z "${SPARKLES_JVM_LOCKED:-}" ]; then
+  SPARKLES_JVM_LOCKED=1 exec python3 scripts/with-lock.py .artifacts/jvm-native.lock \
+    "$BASH" scripts/jvm-gradle.sh "$@"
 fi
 scripts/jvm-native.sh
 cd jvm
-# Gradle and its daemon do not need the lock descriptor.
-./gradlew --console=plain "$@" 8>&-
+exec ./gradlew --console=plain "$@"

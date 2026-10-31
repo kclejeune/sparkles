@@ -226,11 +226,12 @@ main() {
     return 0
   }
   # Bash can retire a completed job notification before wait -n observes it.
-  # Its recorded PID still retains the status for an explicit wait.
+  # Its recorded PID still retains the status for an explicit wait. The wait names the
+  # task PIDs, because the lease holder is a job too and ends only with this script.
   wait_recorded() {
     done_pid=
     set +e
-    wait -n -p done_pid
+    wait -n -p done_pid "${!pids[@]}"
     rc=$?
     if [ -z "${done_pid:-}" ]; then
       for done_pid in "${!pids[@]}"; do break; done

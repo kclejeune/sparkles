@@ -248,12 +248,12 @@ class TaskFailureContracts(unittest.TestCase):
             self.assertEqual(result.returncode, 23, result.stderr)
 
 
-@unittest.skipUnless(shutil.which("flock"), "flock is required")
 class JvmBindingContracts(unittest.TestCase):
-    def test_concurrent_jvm_tasks_do_not_regenerate_bindings_under_each_other(self):
+    def run_two_jvm_tasks(self, locked):
+        """Start two JVM tasks a second apart and return their exit codes and errors."""
         with tempfile.TemporaryDirectory(prefix="sparkles-jvm-lock-") as directory:
             root = Path(directory)
-            for name in ("jvm-native.sh", "jvm-gradle.sh"):
+            for name in ("jvm-native.sh", "jvm-gradle.sh", "with-lock.py"):
                 (root / "scripts").mkdir(exist_ok=True)
                 shutil.copy2(ROOT / "scripts" / name, root / "scripts" / name)
             tools = {
@@ -282,6 +282,9 @@ class JvmBindingContracts(unittest.TestCase):
             (root / "target/release/libsparkles_ffi.so").touch()
             env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
             env.pop("SPARKLES_JVM_LOCKED", None)
+            if not locked:
+                # Each task believes a caller already holds the lock.
+                env["SPARKLES_JVM_LOCKED"] = "1"
             runs = []
             for n in range(2):
                 runs.append(subprocess.Popen(
@@ -290,9 +293,20 @@ class JvmBindingContracts(unittest.TestCase):
                 ))
                 # The first task's Gradle is running when the second task starts.
                 time.sleep(1)
+            results = []
             for run in runs:
                 _, stderr = run.communicate(timeout=30)
-                self.assertEqual(run.returncode, 0, stderr)
+                results.append((run.returncode, stderr))
+            return results
+
+    def test_concurrent_jvm_tasks_do_not_regenerate_bindings_under_each_other(self):
+        for code, stderr in self.run_two_jvm_tasks(locked=True):
+            self.assertEqual(code, 0, stderr)
+
+    def test_unlocked_jvm_tasks_lose_bindings_to_each_other(self):
+        # The negative control: without the lock, the second task deletes the bindings
+        # the first task's Gradle reads.
+        self.assertEqual(self.run_two_jvm_tasks(locked=False)[0][0], 41)
 
 
 class ArtifactRetentionContracts(unittest.TestCase):

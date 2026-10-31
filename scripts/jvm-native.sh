@@ -14,10 +14,9 @@ cd "$(dirname "$0")/.."
 
 # Another build of the bindings deletes target/jvm/uniffi, so builds take turns.
 # scripts/jvm-gradle.sh already holds the lock when it runs this script.
-if [ -z "${SPARKLES_JVM_LOCKED:-}" ] && command -v flock > /dev/null; then
-  mkdir -p .artifacts
-  exec 8> .artifacts/jvm-native.lock
-  flock 8
+if [ -z "${SPARKLES_JVM_LOCKED:-}" ]; then
+  SPARKLES_JVM_LOCKED=1 exec python3 scripts/with-lock.py .artifacts/jvm-native.lock \
+    "$BASH" scripts/jvm-native.sh "$@"
 fi
 
 crate=crates/sparkles-ffi

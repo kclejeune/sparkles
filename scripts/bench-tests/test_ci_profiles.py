@@ -36,7 +36,7 @@ class CiProfiles(unittest.TestCase):
                 source = source.replace(
                     "  set -m\n",
                     "  set -m\n  set -T\n"
-                    "  trap 'if [[ $BASH_COMMAND == \"wait -n -p done_pid\" ]]; then "
+                    "  trap 'if [[ $BASH_COMMAND == \"wait -n -p done_pid\"* ]]; then "
                     "for ci_pid in \"${!pids[@]}\"; do "
                     "while kill -0 \"$ci_pid\" 2>/dev/null; do sleep 0.001; done; done; "
                     "jobs > /dev/null; fi' DEBUG\n",
@@ -49,11 +49,14 @@ class CiProfiles(unittest.TestCase):
                 'if [[ -n "$CI_FAIL_TASK" && " ${*: -1} " == " $CI_FAIL_TASK " ]]; then exit 29; fi\n'
             )
             frontend.chmod(0o755)
+            # The lease holder, as mbx runs it: the command after `sparkles-task --`.
+            leaser = root / "bin/mbx"
+            leaser.write_text('#!/bin/sh\n[ "$1" = sparkles-task ] || exit 23\nshift 2\nexec "$@"\n')
+            leaser.chmod(0o755)
             calls = root / "calls"
             env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
-                       CI_CALLS=str(calls), CI_FAIL_TASK=failing,
-                       # Profile selection only; test_build_tooling covers the lease.
-                       SPARKLES_CI_LEASED="1")
+                       CI_CALLS=str(calls), CI_FAIL_TASK=failing)
+            env.pop("SPARKLES_CI_LEASED", None)
             result = subprocess.run(["bash", str(script), "--jobs", "2", *args],
                                     cwd=root, env=env, capture_output=True, text=True, timeout=20)
             lines = calls.read_text().splitlines()
