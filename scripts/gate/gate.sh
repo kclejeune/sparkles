@@ -43,19 +43,8 @@ set -euo pipefail
 
 self=$(readlink -f "${BASH_SOURCE[0]}")
 here=$(dirname "$self")
-config=${SPARKLES_GATE_CONFIG:-$HOME/.config/sparkles/gate.env}
-if [ -f "$config" ]; then
-  while IFS='=' read -r k v; do
-    case $k in
-      SPARKLES_BENCH_HOST | GATE_HOSTS | GATE_PRIMARY | GATE_HELPER | GATE_MIN_FREE_GB | GATE_MIN_FREE_HALF_GB)
-        [ -n "${!k+x}" ] || export "$k=$v"
-        ;;
-    esac
-  done < <(grep -E '^[A-Z_]+=' "$config")
-fi
-bench=${SPARKLES_BENCH_HOST:-forge}
-gate_hosts=()
-for h in ${GATE_HOSTS:-wally atlas forge}; do [ "$h" = "$bench" ] || gate_hosts+=("$h"); done
+# shellcheck source=scripts/gate/config.sh
+. "$here/config.sh"
 primary=${GATE_PRIMARY:-${WALLY_HOST:-${gate_hosts[0]:-wally}}}
 default_helper() {
   local h
@@ -173,11 +162,13 @@ if [ $mode = status ] || [ $mode = fetch ]; then
   fi
 fi
 
-for h in "$primary" "$helper"; do
-  if [ "$h" = "$bench" ] || [ "${h%%.*}" = "$bench" ]; then
-    die "$h is the benchmark host (SPARKLES_BENCH_HOST) and never runs gate work"
-  fi
-done
+refuse_bench() {
+  local h
+  for h in "$primary" "$helper"; do
+    if is_bench "$h"; then die "$h is the benchmark host (SPARKLES_BENCH_HOST) and never runs gate work"; fi
+  done
+}
+refuse_bench
 
 pout=gate/out/$name
 hname=${hname:-$name-conf}
@@ -231,6 +222,11 @@ status() {
   local ps hs
   ps=$(status_of "$primary" "$name" || echo "unreachable")
   hs=$(status_of "$helper" "$hname" || echo "unreachable")
+  # Once both halves have stopped, merge them so that the primary holds gate.exit.
+  if [ "$(echo "$ps" | tail -n1)" != active ] && [ "$(echo "$hs" | tail -n1)" != active ]; then
+    fetch > /dev/null 2>&1 || true
+    ps=$(status_of "$primary" "$name" || echo "unreachable")
+  fi
   echo "== ci on $primary"
   echo "$ps" | sed '$d'
   echo "== conformance on $helper"
@@ -260,7 +256,8 @@ wall() {
 fetch() {
   mkdir -p "$dest"
   if [ "$helper" = none ]; then
-    rsync -a "$primary:$pout/" "$dest/"
+    # --delete keeps an earlier run's gate.exit from standing in for a rerun's result.
+    rsync -a --delete "$primary:$pout/" "$dest/"
     wall "$dest" > "$dest/wall.txt"
     echo "results in $dest"
     return 0
@@ -268,7 +265,7 @@ fetch() {
   # A split gate whose merge was already copied back to the primary needs no new merge.
   # shellcheck disable=SC2029
   if ssh "${ssh_opts[@]}" "$primary" "test -e ~/$pout/gate.exit"; then
-    rsync -a "$primary:$pout/" "$dest/"
+    rsync -a --delete "$primary:$pout/" "$dest/"
     echo "results in $dest"
     return 0
   fi
@@ -302,7 +299,15 @@ fetch() {
     code=0
     for f in "$tmp/part.exit" "$conf/part.exit"; do [ "$(cat "$f")" = 0 ] || code=1; done
   elif finished "$primary" "$name" && finished "$helper" "$hname"; then
-    # A half stopped without writing its exit file, for example on a timeout.
+    # Both units have stopped, but a half may have written its exit file after the copy
+    # above. Look again before taking a missing file as a run that stopped without one.
+    # shellcheck disable=SC2029
+    if ssh "${ssh_opts[@]}" "$primary" "test -e ~/$pout/part.exit" &&
+      ssh "${ssh_opts[@]}" "$helper" "test -e ~/$hout/part.exit"; then
+      rm -rf "$tmp"
+      fetch
+      return
+    fi
     code=99
   fi
   if [ -n "$code" ]; then
@@ -355,6 +360,7 @@ if [ $auto = 1 ]; then
   fi
   if [ -z "$chosen" ] && [ "$helper" != none ] && [ "${half[$helper]:-0}" = 0 ]; then helper=none; fi
   echo "auto: ${report}-> primary $primary helper $helper"
+  refuse_bench
   dest=$root/.artifacts/gates/main-gate-$name-$primary
 fi
 

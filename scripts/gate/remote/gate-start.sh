@@ -76,7 +76,11 @@ if [ -d "$out" ]; then mv "$out" "$out.old-$(date +%s)"; fi
 mkdir -p "$out"
 git -C "$G/repo.git" cat-file -e "$full^{commit}"
 git -C "$G/repo.git" worktree prune
-[ -d "$wt" ] || git -C "$G/repo.git" worktree add -q --detach "$wt" "$full"
+# A failed run keeps its worktree for inspection. Recreate it, so that nothing left there
+# can change a rerun.
+if [ -d "$wt" ]; then git -C "$G/repo.git" worktree remove --force "$wt" 2> /dev/null || rm -rf "$wt"; fi
+git -C "$G/repo.git" worktree prune
+git -C "$G/repo.git" worktree add -q --detach "$wt" "$full"
 date +%s > "$out/queued_at"
 if [ -n "$note" ]; then echo "$(date -u +%FT%TZ) $note" >> "$out/progress.log"; fi
 echo "$(date -u +%FT%TZ) queued $full part=$part jobs=$jobs host=$(hostname)" >> "$out/progress.log"

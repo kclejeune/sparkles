@@ -99,7 +99,13 @@ export PATH="$G/py-venv/bin:$PATH"
 
 if [ "$part" != conformance ]; then
   step ci scripts/ci.sh --force --jobs "$jobs"
-  cp -a target/ci "$out/ci-receipts" 2> /dev/null
+  # scripts/ci.sh keeps its summary and task logs in .artifacts/ci, and older revisions in
+  # target/ci. Copy them before the cleanup below removes the worktree.
+  if [ -d .artifacts/ci ]; then
+    cp -a .artifacts/ci "$out/ci-receipts" 2> /dev/null
+  else
+    cp -a target/ci "$out/ci-receipts" 2> /dev/null
+  fi
 fi
 if [ "$part" != ci ]; then
   for t in w3c shacl shex; do step "$t" mise run --force "test:$t"; done
