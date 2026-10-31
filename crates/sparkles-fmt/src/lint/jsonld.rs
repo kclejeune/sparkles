@@ -58,14 +58,17 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     scan.value(&root);
     out.deadline()?;
     // the real expansion decides which values are queries and who holds them
-    let started = std::time::Instant::now();
+    // the clock is read only with a deadline: the browser's build has none, and no clock
+    let started = out.opts.deadline.map(|_| std::time::Instant::now());
     // a document over the limit is not expanded at all: nothing here would use it
     let quads = match text.len() <= PROBE_LIMIT {
         true => super::jsonld_quads_within(text, out.opts.deadline)?,
         false => None,
     };
     let mut work = Work::new(text.len());
-    work.expansion_takes(started.elapsed(), out.opts.deadline);
+    if let (Some(started), Some(deadline)) = (started, out.opts.deadline) {
+        work.expansion_takes(started.elapsed(), deadline);
+    }
     if let Some(quads) = &quads {
         let mut strings: HashMap<&str, Vec<&Str>> = HashMap::new();
         value_strings(&root, &mut strings);
@@ -114,9 +117,9 @@ impl Work {
     pub(super) fn expansion_takes(
         &mut self,
         took: std::time::Duration,
-        deadline: Option<std::time::Instant>,
+        deadline: std::time::Instant,
     ) {
-        self.expansion = deadline.map(|d| (took, d));
+        self.expansion = Some((took, deadline));
     }
 
     /// Take `bytes` of the budget, or `false` when they do not fit or there is no time

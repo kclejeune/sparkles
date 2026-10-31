@@ -605,7 +605,7 @@ fn a_probe_stops_at_the_deadline_inside_the_expansion() {
     let whole = t0.elapsed();
     let deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(25));
     let mut work = jsonld::Work::new(doc.len());
-    work.expansion_takes(whole, deadline);
+    work.expansion_takes(whole, deadline.unwrap());
     let start = std::time::Instant::now();
     let r = jsonld::probe(
         &doc,

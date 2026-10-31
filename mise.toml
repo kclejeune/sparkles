@@ -315,8 +315,13 @@ run = 'crates/sparkles-fmt/fuzz/run.sh --time "$usage_time" --jobs "$usage_jobs"
 [tasks."fmt:wasm"]
 sources = ["@group:rust"]
 outputs = []
-description = "Check that the formatter builds for the browser (wasm32-unknown-unknown, which rust-toolchain.toml installs), with Clippy"
-run = "mbx clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings"
+description = "Check that the formatter builds for the browser (wasm32-unknown-unknown, which rust-toolchain.toml installs), with Clippy, and run its entry points in node, where std has no clock"
+# the test runner must be the version of the wasm-bindgen crate in Cargo.lock
+tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
+run = [
+  "mbx clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings",
+  "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner mbx test -p sparkles-fmt-wasm --target wasm32-unknown-unknown --test wasm_runtime",
+]
 
 [tasks.lint]
 sources = ["@group:rust", "@group:ui"]
