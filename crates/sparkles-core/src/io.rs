@@ -754,14 +754,11 @@ fn pipe_quads<S: QuadSink, F: Fn() -> S + Sync>(
                     }
                     for q in batch {
                         if let Err(e) = sink.quad(q) {
-                            failure.lock().get_or_insert(e);
+                            fail(e);
                             broken = true;
                             break;
                         }
                     }
-                }
-                if broken {
-                    failed.store(true, Ordering::Release);
                 }
                 if !broken && let Err(e) = sink.finish() {
                     fail(e);
@@ -777,7 +774,7 @@ fn pipe_quads<S: QuadSink, F: Fn() -> S + Sync>(
             }
             batch.push(q);
             batch_bytes += bytes;
-            if batch.len() == JENA_BATCH {
+            if batch.len() == JENA_BATCH || batch_bytes >= JENA_BATCH_BYTES {
                 let full = std::mem::replace(&mut batch, Vec::with_capacity(JENA_BATCH));
                 batch_bytes = 0;
                 tx.send(full).map_err(|_| Error::Cancelled)?;
@@ -1301,5 +1298,91 @@ mod tests {
                 ["<http://e/s> <http://e/p> <http://e/a\u{fffd}b>"]
             );
         }
+    }
+    fn probe_quad(i: u64) -> Quad {
+        let n = |s: &str| NamedNode::new(format!("http://e/{s}")).unwrap();
+        Quad::new(n(&format!("s{i}")), n("p"), n("o"), GraphName::DefaultGraph)
+    }
+
+    /// A sink that runs `on_quad` for each quad.
+    struct Probe<F>(F);
+
+    impl<F: FnMut() -> Result<()> + Send> QuadSink for Probe<F> {
+        fn quad(&mut self, _: Quad) -> Result<()> {
+            (self.0)()
+        }
+        fn finish(self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_sink_stops_the_decoder_at_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let emitted = AtomicU64::new(0);
+        let total = 2_000_000;
+        let result = pipe_quads(
+            4,
+            || Probe(|| Err(Error::Unsupported("sink failed".into()))),
+            |emit| {
+                for i in 0..total {
+                    emitted.fetch_add(1, Ordering::Relaxed);
+                    emit(probe_quad(i), 100)?;
+                }
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(&result, Err(Error::Unsupported(m)) if m == "sink failed"),
+            "{result:?}"
+        );
+        // the channel and the batches under way hold at most a few dozen thousand quads
+        let n = emitted.load(Ordering::Relaxed);
+        assert!(n < 200_000, "the decoder went on to {n} of {total} quads");
+    }
+
+    #[test]
+    fn batches_in_flight_are_bounded_by_bytes() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let (emitted, release, stalled) =
+            (AtomicU64::new(0), AtomicBool::new(false), AtomicU64::new(0));
+        let workers = 2u64;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // wait until the decoder has stopped for want of room
+                let (mut last, mut steady) = (u64::MAX, 0);
+                while steady < 6 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let now = emitted.load(Ordering::Relaxed);
+                    steady = if now == last { steady + 1 } else { 0 };
+                    last = now;
+                }
+                stalled.store(last, Ordering::Relaxed);
+                release.store(true, Ordering::Relaxed);
+            });
+            pipe_quads(
+                workers as usize,
+                || {
+                    Probe(|| {
+                        while !release.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Ok(())
+                    })
+                },
+                |emit| {
+                    // quads of 1 MiB each, which a count of 4096 quads would batch into 4 GiB
+                    for i in 0..100 {
+                        emitted.fetch_add(1, Ordering::Relaxed);
+                        emit(probe_quad(i), JENA_BATCH_BYTES)?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        // the channel, a batch in each sink and the one being filled
+        let held = stalled.load(Ordering::Relaxed);
+        assert!(held <= 3 * workers + 2, "{held} quads of 1 MiB were held");
     }
 }
