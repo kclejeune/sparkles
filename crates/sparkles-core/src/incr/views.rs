@@ -46,6 +46,17 @@ pub enum Maintenance {
     Commit,
 }
 
+/// What a failed pass of a view maintained at commit does (spec F13 §3.3, Phase 2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnFailure {
+    /// suspend the view and let the commit through
+    #[default]
+    Suspend,
+    /// refuse the commit
+    Reject,
+}
+
 fn main_branch() -> Vec<String> {
     vec!["main".into()]
 }
@@ -83,6 +94,13 @@ pub struct ViewDef {
     pub memory_bytes: u64,
     #[serde(default)]
     pub keep_commits: u64,
+    /// what a failed pass at commit does (Phase 2, `view.json` format 3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<OnFailure>,
+    /// whether a `graph` view's output is released to whoever reads its graph (Phase
+    /// 2, `view.json` format 3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declassify: Option<bool>,
 }
 
 impl Default for ViewDef {
@@ -98,6 +116,8 @@ impl Default for ViewDef {
             branches: main_branch(),
             memory_bytes: DEFAULT_MEMORY_BYTES,
             keep_commits: 0,
+            on_failure: None,
+            declassify: None,
         }
     }
 }
@@ -112,6 +132,10 @@ impl ViewDef {
     }
 
     /// Refuse what Phase 1 does not do, with the reason (`400 unsupported-option`).
+    /// `put` runs it, and so do the runtime when a definition loads or attaches and a
+    /// restore, so a `view.json` that holds a member of a later phase at format 1 never
+    /// runs as an asynchronous table view. A member set to its default, which means
+    /// what Phase 1 does, is accepted.
     pub fn check(&self) -> Result<()> {
         let no = |what: &str| -> Result<()> {
             Err(super::error(
@@ -148,6 +172,12 @@ impl ViewDef {
         }
         if self.keep_commits != 0 {
             return no("keepCommits");
+        }
+        if self.on_failure.is_some_and(|f| f != OnFailure::Suspend) {
+            return no("onFailure other than suspend");
+        }
+        if self.declassify == Some(true) {
+            return no("declassify");
         }
         if self.memory_bytes == 0 {
             return Err(super::error("invalid-view", "memoryBytes must be positive"));

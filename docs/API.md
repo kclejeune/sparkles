@@ -3059,7 +3059,7 @@ directory as `views/{name}/view.json`, and the state is checkpointed beside them
 | `storedQuery` | The name of a stored query, in place of `query`. The view follows its current version when the view is attached. |
 | `principal` | The user whose view of the dataset the query reads. The default is the definer. A definer whose grants cover every graph defines a view without a principal, which reads every quad. |
 | `memoryBytes` | The budget of the view's state, 256 MiB by default. A view over its budget is suspended. |
-| `mode`, `provenance`, `maintenance`, `branches`, `keepCommits` | Phase 1 takes only `table`, `none`, `async`, `["main"]` and `0`. Other values are refused with `400 unsupported-option`. A stored `view.json` with another value is listed as failed with `unsupported-option` and does not run until the view is defined again. |
+| `mode`, `graph`, `provenance`, `maintenance`, `onFailure`, `declassify`, `branches`, `keepCommits` | Phase 1 takes only `table`, no `graph`, `none`, `async`, `suspend`, `false`, `["main"]` and `0`. Other values are refused with `400 unsupported-option`. A stored `view.json` with another value is listed as failed with `unsupported-option` and does not run until the view is defined again. |
 
 Unknown members are refused. A query outside the incremental fragment is refused with
 `400 not-incremental` and names the construct: `NOW`, `RAND`, `UUID`, `STRUUID`, `BNODE`,

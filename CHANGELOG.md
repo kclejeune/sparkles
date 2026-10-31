@@ -34,6 +34,11 @@ such as a `graph` view, maintenance at commit, other branches, `keepCommits` or
 provenance, no longer runs as a `table` view on `main`. The views are checked when they
 load and on every attach, and such a view is listed as failed with `unsupported-option`
 until it is defined again. The other views of the dataset open and run as before.
+A view definition may now name `onFailure` and `declassify`, the members that spec F13
+adds for commit-time and graph views. Their defaults, `suspend` and `false`, run as
+before, and other values are refused with `unsupported-option`. A stored `view.json` of
+format 1 with such a member used to make every view of the dataset unreadable and now
+marks only that view failed.
 
 A view or live query with a `GRAPH` inside another `GRAPH` now evaluates that group
 again at each commit that touches it. The outer graph variable was unbound in every row

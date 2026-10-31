@@ -10111,9 +10111,10 @@ export interface components {
             /** @description On a PUT: the task of the first evaluation. */
             task?: string;
         };
-        /** @description A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0. */
+        /** @description A view's definition. Phase 1 takes `table` views without `graph`, maintained `async` on `main`, without provenance, with `onFailure` `suspend`, `declassify` false and `keepCommits` 0. */
         ViewDefinition: {
             branches?: string[];
+            declassify?: boolean;
             graph?: string;
             keepCommits?: number;
             /** @enum {string} */
@@ -10122,6 +10123,8 @@ export interface components {
             memoryBytes?: number;
             /** @enum {string} */
             mode?: "table" | "graph";
+            /** @enum {string} */
+            onFailure?: "suspend" | "reject";
             /** @description The user whose view of the dataset the query reads; the definer by default. */
             principal?: string;
             /** @enum {string} */
