@@ -3776,6 +3776,8 @@ async fn upload(
                     if let Some(format) = plain_format {
                         s.format = format.into();
                     }
+                    // an upload aimed at one graph is a graph, as a Graph Store write is
+                    s.triples_only = g.is_some();
                     s.max_decompressed = st.limits.max_decompressed_bytes;
                     s
                 })

@@ -452,6 +452,75 @@ async fn a_jena_body_that_expands_past_the_decompressed_limit_is_refused() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
 
+/// An upload aimed at one graph takes the triples of Jena's syntaxes and refuses a named
+/// graph, as a write to a single graph does, whether the file is the body or a part of a
+/// multipart form.
+#[tokio::test]
+async fn a_targeted_upload_refuses_a_named_graph_in_jena_syntaxes() {
+    let s = server();
+    let doc = r#"<trix xmlns="http://www.w3.org/2004/03/trix/trix-1/">
+  <graph>
+    <uri>urn:t:other</uri>
+    <triple><uri>urn:t:s</uri><uri>urn:t:p</uri><plainLiteral>x</plainLiteral></triple>
+  </graph>
+</trix>"#;
+    let r = call(
+        &s.app,
+        "POST",
+        "/ds/upload?graph=urn:t:target",
+        Some("application/trix+xml"),
+        doc.into(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let b = "sparkles-test-boundary";
+    let form = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"g.trix\"\r\n\r\n{doc}\r\n--{b}--\r\n"
+    );
+    let r = send(
+        &s.app,
+        Request::post("/ds/upload?graph=urn:t:target")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={b}"),
+            )
+            .body(Body::from(form.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // nothing reached either graph
+    for g in ["urn:t:other", "urn:t:target"] {
+        let r = get(
+            &s.app,
+            &format!("/ds/data?graph={g}"),
+            "application/n-triples",
+        )
+        .await;
+        assert!(!r.text().contains("urn:t:s"), "{g}: {}", r.text());
+    }
+    // without a target the named graph stays
+    let r = send(
+        &s.app,
+        Request::post("/ds/upload")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={b}"),
+            )
+            .body(Body::from(form))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(
+        &s.app,
+        "/ds/data?graph=urn:t:other",
+        "application/n-triples",
+    )
+    .await;
+    assert!(r.text().contains("urn:t:s"), "{}", r.text());
+}
+
 #[tokio::test]
 async fn the_union_graph_is_read_only() {
     let s = server();
