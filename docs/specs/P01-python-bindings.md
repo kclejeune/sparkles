@@ -1294,22 +1294,39 @@ included in this delivery.
 
 `Dataset.load` hands a file object to the loader as `SourceData::Reader`, a stream that
 the loader reads once. The binding's per-quad stream into a transaction, the temporary
-copy of buffered loads and of Jena's syntaxes, and the N-Quads pipe of Jena's syntaxes
-are no longer used by `load`. An empty dataset takes the stream through the bulk loader
-with parallel encoders, and a dataset that holds data takes it in one transaction. The
-reader takes the GIL for each read of at most 64 KiB. A Python exception that `read`
-raises reaches the caller as itself. Ctrl-C sets a flag through the watcher of Python's
-signal wakeup descriptor, the reader leaves the GIL to the main thread while a signal is
-pending, and a handler that raises cancels the load. Compression detection reads the
-first bytes of the stream ahead, and automatic parsing reads at most the source's
-buffering allowance ahead. No loader path reads its source twice, so no stream is
-spilled to disk.
+copy of Jena's syntaxes and their N-Quads pipe are no longer used by `load`. An empty
+dataset takes the stream through the bulk loader with parallel encoders, unless the
+stream ends within 8 MiB, and a dataset that holds data takes it in one transaction.
+`Dataset.replace` reads a stream ahead up to
+the bulk threshold's estimate and replaces a longer one through the bounded bulk path.
+Automatic and streaming mode never write a temporary file. Buffered mode decodes the
+stream into memory up to `auto_buffer_bytes` and into an unnamed temporary file past it.
+No loader path reads its source twice, so no other path spills.
+
+The reader takes the GIL for each read of at most 64 KiB, and a Python exception that
+`read` raises reaches the caller as itself. A load or replacement from a file object runs
+on a thread of its own while the main thread waits and runs the signal handlers. A signal
+sets a flag through the watcher of Python's signal wakeup descriptor. The reader then asks
+the main thread to run the handlers before it calls into Python again, and it asks again
+at the end of the stream, so an interrupt raised during any read cancels the request
+before it commits. A handler that returns lets the request go on, and a handler may query
+other datasets because the request does not occupy the helper thread of other calls.
+`replace` also passes its token and timeout to the reader and the store. A signal that
+arrives after the store's last check before publication can still raise after the
+commit. N-Triples and N-Quads streams are parsed in blocks, of which at most two are in
+memory, and a block buffer grows from 64 KiB as it fills.
 
 `tests/test_file_object_loads.py` loads binary and text file objects in Turtle,
 N-Triples, N-Quads, TriG, RDF/XML, JSON-LD, RDF Thrift and RDF Protobuf in every parse
-mode. It also covers sniffed compression, exceptions from `read`, Ctrl-C, signals whose
-handlers return, and loads in a child process whose `TMPDIR` does not exist. Against the
-previous binding, the tests of exceptions in RDF Thrift and of the missing `TMPDIR`
-failed. A load of a 5M-triple N-Triples file object took 1.81 s
-instead of 22.19 s on atlas, as the
-[loading results](../benchmarks/loading/RESULTS.md#python-file-objects) record.
+mode. It also covers sniffed compression, exceptions from `read`, Ctrl-C during and at the
+end of the stream, a signal handler that queries another dataset, Ctrl-C and a token
+during a replacement, the memory of a one-triple load, buffered spilling, and loads in a
+child process whose `TMPDIR` does not exist. The tests that could hang run in a child
+process with a timeout. The core tests cover the two-block bound, buffered spilling and
+the bulk replacement of a long stream. An independent review found the commit after an
+interrupt at the end of the stream, the deadlock of a querying handler, the replacement
+that ignored Ctrl-C and the memory costs, and each regression test failed on the build
+before its fix. A 5M-triple N-Triples file object loads in 2.21 s instead of 19.39 s on atlas, and a
+one-triple one in a new process takes 7.6 ms instead of 3.6 ms, which roadmap item
+NEW-ITEM tracks. The [loading results](../benchmarks/loading/RESULTS.md#python-file-objects)
+record the measurements.

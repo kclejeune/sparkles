@@ -3644,7 +3644,10 @@ memory budget. Plain bytes that the caller already holds in memory are parsed wi
 copy. In automatic mode, small transactional loads are parsed from a reader. A stream
 that is read once, such as a Python file object or `SourceData::Reader` in Rust, is cut
 into bounded parallel blocks when it is N-Triples or N-Quads, whatever its compression.
-In another syntax it is read ahead up to the cutoff, as a compressed document is. `--parse-mode streaming` always uses a sequential reader, and
+In another syntax it is read ahead up to the cutoff, as a compressed document is. Block
+parsing holds at most two blocks, one parsed while the next is filled, and a block buffer
+grows from 64 KiB as it fills. Buffered mode decodes a stream into memory up to the
+cutoff and into an unnamed temporary file past it. `--parse-mode streaming` always uses a sequential reader, and
 `--parse-mode buffered` always reads the whole document into memory first. A buffered
 compressed input needs RAM for its full decompressed size. These modes only affect
 parsing. Transactional changes, the vocabulary, the map of blank-node labels and

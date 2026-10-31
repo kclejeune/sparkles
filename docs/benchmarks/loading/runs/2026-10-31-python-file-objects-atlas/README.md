@@ -26,3 +26,23 @@ ROUNDS=3 ./ab.sh
 `results.jsonl` holds one line for each load, with its wall time in seconds and the peak
 RSS of the process in bytes. Every load of both builds left 5,000,000 quads in the
 dataset.
+
+## Rerun after the review fixes
+
+The review fixes bound the block reader to two growing buffers, load a stream that ends
+within 8 MiB into an empty dataset by a transaction, and run the request on a thread of
+its own with signal checkpoints. The rerun compares commit `99fb6e95` with commit
+`bcef8114`, both release wheels built by `maturin build --release` through
+`mbx sparkles-task` from a source archive, as `heavy-review-fixes.sh` does. It ran
+under `flock ~/lanes/.heavy.lock`, so no other heavy job ran on atlas, and the load
+average was below 9 at its start, from its own builds, and below 4 at its end.
+
+The inputs are `gen.py 5000000` as before, its first 1, 20,000, 80,000 and 120,000 lines,
+a Turtle file written from it by the new build, and a gzip copy at level 1.
+`ab-review-fixes.sh` runs five interleaved rounds of every case, and
+`results-review-fixes.jsonl` holds one line for each load. Every load left the expected
+number of quads.
+
+```
+ROUNDS=5 ./ab-review-fixes.sh
+```

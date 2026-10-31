@@ -5975,21 +5975,37 @@ ds.mappings.run("people", sources={"people.csv": "data/people.csv"}, replace=Tru
 quads come before the input has been read to the end. A syntax error is raised by the
 iteration, after the quads that came before it.
 
-`Dataset.load` reads a file object once, as it arrives, in every syntax and parse mode,
-and never copies it to a temporary file. Into an empty dataset it runs the bulk loader
-with its parallel encoders, as a load from a path does. Into a dataset that holds data
-it inserts the quads in one transaction, since the size of a stream is not known before
-it is read. Each read asks the file object for at most 64 KiB, or 64 Ki characters of a
-text-mode file, whose text is encoded as UTF-8. The compression is detected from the
-first bytes of the stream. N-Triples and N-Quads are cut into blocks of at least 256 MiB
-that are parsed in parallel, as compressed files are. Two blocks can be in memory at
-once, so such a load holds up to about 512 MiB of input, where a load by path maps the
-file instead. The memory buys a parallel parse. A stream in
-another syntax is read ahead up to `auto_buffer_bytes`, and parsed in memory when it
-ends within that allowance or from the stream otherwise. `parse_mode="buffered"` reads
-the whole stream into memory first. An exception that the file object's `read` raises
-propagates as itself and leaves the dataset unchanged. Ctrl-C stops the reading at the
-next read and raises `KeyboardInterrupt`, and the load changes nothing.
+`Dataset.load` and `Dataset.replace` read a file object once, as it arrives, in every
+syntax. In automatic and streaming mode they never copy it to a temporary file. Into an
+empty dataset `load` runs the bulk loader with its parallel encoders, as a load from a
+path does. A stream that ends within 8 MiB, about 100,000 quads, goes in by a
+transaction instead, since a rebuild has a fixed cost of about 20 ms and parses such a
+stream on one thread. Into a dataset that holds data it inserts the quads in one transaction, since
+the size of a stream is not known before it is read. `replace` reads up to about 20 MB of
+the stream ahead, and a longer stream goes through the bounded bulk replacement instead
+of being held in memory. Each read asks the file object for at most 64 KiB, or 64 Ki
+characters of a text-mode file, whose text is encoded as UTF-8. The compression is
+detected from the first bytes of the stream.
+
+N-Triples and N-Quads streams are cut into blocks that are parsed in parallel, as
+compressed files are. A block holds at least 256 MiB, or 8 MiB for each loader thread
+when that is more, and a line longer than a block extends it. At most two blocks are in
+memory, one parsed while the next is filled, so such a load holds up to about 512 MiB of
+input where a load by path maps the file instead. The memory buys a parallel parse. A
+block buffer grows as it fills, so a small stream takes a small buffer. A stream in
+another syntax is read ahead up to `auto_buffer_bytes`, and parsed in memory when it ends
+within that allowance or from the stream otherwise. `parse_mode="buffered"` reads the
+whole decoded stream into memory up to `auto_buffer_bytes`, and continues into an
+unnamed temporary file in the system's temporary directory past it, which is removed
+when the parse ends. Only a buffered stream longer than its allowance writes that file.
+
+An exception that the file object's `read` raises propagates as itself and leaves the
+dataset unchanged. Ctrl-C stops the reading at the next read and raises
+`KeyboardInterrupt`. The end of the stream waits until the main thread has run the
+handlers of the signals that arrived during the reads, so an interrupt during a read
+changes nothing. A signal handler whose function returns lets the load go on, and it
+may query other datasets. `replace` from a file object also stops for its `cancel` token
+and `timeout`.
 
 ### Terms
 
