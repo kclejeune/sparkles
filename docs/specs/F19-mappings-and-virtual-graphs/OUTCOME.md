@@ -206,7 +206,7 @@ Tests and conformance:
   literals and successful receipts after publication.
 * The CSVW processing rules for a problem in the metadata or in a cell are available to
   the library only. The `sparkles csv`, `sparkles load` and upload entry points read
-  metadata and cells strictly, which is roadmap item NEW-ITEM-1.
+  metadata and cells strictly, which is roadmap item 450.
 
 Measurements:
 

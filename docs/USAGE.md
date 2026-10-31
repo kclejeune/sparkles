@@ -1474,7 +1474,7 @@ the load with the file, row and column, and nothing is committed. The library ca
 instead follow CSVW's own processing rules with `tabular::Options.lenient`. A property or
 cell that does not conform then gives a warning and takes its default, and a cell that
 fails its datatype stays a plain string. The command line and uploads do not offer this,
-which is [roadmap](ROADMAP.md) item NEW-ITEM-1. `sparkles csv convert`
+which is [roadmap](ROADMAP.md) item 450. `sparkles csv convert`
 writes the triples without loading them, as N-Triples, N-Quads (`--graph`) or Turtle.
 Its `--output` file replaces an existing file only when the conversion succeeds, and an
 input given as the output is refused.
