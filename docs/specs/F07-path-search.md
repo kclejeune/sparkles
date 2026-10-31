@@ -273,8 +273,10 @@ enumerates in cost order.
 
 The cost of a path is the sum of its weights, added in double-double arithmetic, and
 `path:cost` is that sum rounded to the nearest double. Two paths tie in the shortest modes
-when their sums are equal, whatever order the weights are added in. This paragraph was
-added with [ROADMAP](../ROADMAP.md) item 277.
+when their sums are equal, whatever order the weights are added in, as long as the weights
+lie within a factor of 2^28 of each other. Beyond that a double-double sum can round, and
+ties are decided on the sums added from the source. This paragraph was added with
+[ROADMAP](../ROADMAP.md) item 277.
 
 ### 4.6 Access control
 
@@ -835,10 +837,14 @@ search from both ends therefore records the smallest and largest positive weight
 relaxes, and when they lie further apart, when the cheapest cost is past the largest
 double, or when a meeting yields no join, it returns nothing and the search from the
 source alone answers on the same visit budget. Both searches then always return the same
-paths. In plain doubles `0.1 + 0.2 + 0.3` and `0.3 + 0.2 + 0.1` differ, so
+paths, but beyond that range the search from the source alone can round too, so a tie of
+exact sums can still be missed. NEW-ITEM-3 would decide ties exactly at any range. In
+plain doubles `0.1 + 0.2 + 0.3` and `0.3 + 0.2 + 0.1` differ, so
 the search from one end used to return only one of two equally cheap paths. `path:cost` now
 reports the double-double sum rounded to the nearest double in every weighted mode, so
-equally cheap paths report the same cost. Costs of integer weights do not change.
+equally cheap paths report the same cost. Costs of integer weights do not change while
+every partial sum stays below 2^53, and above that the reported cost can differ from the
+plain double sum, as `10^16 + 1 + 1` reports 10000000000000002 where it reported 10^16.
 
 **Cycles and several targets.**
 
@@ -851,6 +857,11 @@ equally cheap paths report the same cost. Costs of integer weights do not change
   costs less depends on the number of targets and how far apart they are. NEW-ITEM-1 would
   choose between them. A source with an unbound target and a target without a source have
   only one end to search from.
+
+**Budgets.** The product of the halves can be far larger than either, so `join_halves`
+counts each joined path against the deadline and cancellation, as the listing of the
+halves counts its steps. The unit test `joining_halves_is_checked_against_the_deadline`
+covers it.
 
 **Tests.** `crates/sparkles-core/tests/path_search_all_shortest.rs` compares the search
 from both ends on 120 random weighted graphs, in every direction, with skipped predicates,
@@ -894,4 +905,5 @@ reachable person took 1,846 and 1,694 ms, so adding costs in double-double measu
 slower. The unweighted `ps-pair-all`, whose search did not change, measured 20.6% slower in
 this screen with a spread of 92 to 131% between server processes. A rerun of four rounds of
 30 requests measured it 1.9% slower, at 1.20 and 1.23 ms, and the weighted cheapest pair
-0.5% slower, at 24.1 and 24.3 ms, so neither change is above the noise.
+0.5% slower, at 24.1 and 24.3 ms, so neither change is above the noise. Item 276 rechecks
+both on forge.

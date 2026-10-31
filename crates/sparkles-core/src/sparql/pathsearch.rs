@@ -1198,6 +1198,31 @@ impl Ord for Cost {
     }
 }
 
+/// Every path of a front half from `front`, the edge `e` and a back half from `back`,
+/// given to `emit` until it returns false, which this returns too. Each path counts
+/// against `budget`, since the product can be far larger than the halves.
+fn join_halves(
+    front: &[Vec<Edge>],
+    e: Edge,
+    back: &[Vec<Edge>],
+    budget: &mut Budget<'_>,
+    emit: &mut dyn FnMut(Vec<Edge>) -> Result<bool>,
+) -> Result<bool> {
+    for a in front {
+        for z in back {
+            budget.tick()?;
+            let mut p = Vec::with_capacity(a.len() + 1 + z.len());
+            p.extend_from_slice(a);
+            p.push(e);
+            p.extend_from_slice(z);
+            if !emit(p)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// A path from `s` with every cycle cut out, so each node appears once. Two halves of a
 /// bidirectional search can share a node only through edges of weight zero, so the cut
 /// path costs the same.
@@ -2678,6 +2703,12 @@ impl<'a> Engine<'a> {
         }
         // the backward halves from each node, kept while their joins are emitted
         let mut back: FxHashMap<u64, Rc<[Vec<Edge>]>> = FxHashMap::default();
+        // the product of the halves can be far larger than either, so its paths count
+        // against the deadline and cancellation as the halves' steps do
+        let mut joined = Budget {
+            steps: 0,
+            check: &check,
+        };
         let mut i = 0;
         while i < joins.len() {
             let u = joins[i].0.from;
@@ -2704,16 +2735,8 @@ impl<'a> Engine<'a> {
                         h
                     }
                 };
-                for a in &front {
-                    for z in halves.iter() {
-                        let mut p = Vec::with_capacity(a.len() + 1 + z.len());
-                        p.extend_from_slice(a);
-                        p.push(e);
-                        p.extend_from_slice(z);
-                        if !emit(to_real(p))? {
-                            return Ok(true);
-                        }
-                    }
+                if !join_halves(&front, e, &halves, &mut joined, &mut |p| emit(to_real(p)))? {
+                    return Ok(true);
                 }
             }
         }
@@ -3513,6 +3536,45 @@ mod tree_tests {
             p: 0,
             rev: false,
         }
+    }
+
+    #[test]
+    fn joining_halves_is_checked_against_the_deadline() {
+        let edge = |from, to| Edge {
+            from,
+            to,
+            p: 0,
+            rev: false,
+        };
+        let front: Vec<Vec<Edge>> = (0..100).map(|i| vec![edge(0, 10 + i)]).collect();
+        let back: Vec<Vec<Edge>> = (0..100).map(|i| vec![edge(1000 + i, 1)]).collect();
+        let stop = || Err(Error::Cancelled);
+        let mut budget = Budget {
+            steps: 0,
+            check: &stop,
+        };
+        let mut n = 0;
+        let r = join_halves(&front, edge(5, 6), &back, &mut budget, &mut |_| {
+            n += 1;
+            Ok(true)
+        });
+        assert!(r.is_err());
+        assert!(n < 4096, "{n} paths joined before the check");
+        // without a failing check every pair is joined once
+        let go = || Ok(());
+        let mut budget = Budget {
+            steps: 0,
+            check: &go,
+        };
+        let mut n = 0;
+        assert!(
+            join_halves(&front, edge(5, 6), &back, &mut budget, &mut |_| {
+                n += 1;
+                Ok(true)
+            })
+            .unwrap()
+        );
+        assert_eq!(n, 10_000);
     }
 
     #[test]

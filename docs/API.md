@@ -6414,8 +6414,10 @@ described under "Edges from a pattern" below.
   Dijkstra's. The cheapest path of one pair, every cheapest path of one pair, the cheapest
   cycles through a node and Yen's spur searches between two nodes run from both ends.
   Weights are added with about twice the precision of a double, so two paths whose
-  weights have equal sums tie whatever order the weights come in. Lengths still count
-  edges.
+  weights have equal sums tie whatever order the weights come in, as long as the weights
+  lie within a factor of 2^28 of each other. With weights further apart, the sums are
+  added from the source and can round, so an equally cheap path can be missed. Lengths
+  still count edges.
 * **Graphs and access.** The search reads the active graph, as a triple pattern would.
   Under `GRAPH ?g` each named graph is searched on its own and `?g` is bound to it. A
   path never uses a triple that the caller's grants or protections hide, and a hidden

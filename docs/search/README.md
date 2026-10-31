@@ -91,7 +91,8 @@ rest of a query.
   runs from both ends, as a breadth-first search over the PSO and POS permutations
   without weights and as Dijkstra's algorithm with them, for one shortest path, every
   shortest path or the shortest cycles through a node. Yen's spur searches run from both
-  ends too. Ties between weighted paths are decided on the exact sums of their weights.
+  ends too. Ties between weighted paths are decided on the exact sums of their weights
+  while the weights lie within a factor of 2^28 of each other.
 * `path:excludePredicate` skips predicates such as `rdf:type`, and `path:maxDegree` keeps
   paths from passing through hubs. Paths never use triples the caller cannot see.
 
@@ -216,6 +217,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   weights, rather than a search from both ends for each pair. Roadmap item NEW-ITEM-1.
 * Yen's weighted spur searches that close a cycle through the source, in
   `path:kShortest`, run Dijkstra's algorithm from one end. Roadmap item NEW-ITEM-2.
+* Weighted costs are double-double sums, which are exact only while a path's weights lie
+  within a factor of about 2^28 of each other. With weights further apart a sum can round,
+  so two equally cheap paths can rank apart and one of them is missed. Roadmap item
+  NEW-ITEM-3.
 * Graph algorithms match the Graphalytics reference outputs for BFS, WCC and PageRank on
   the two small official example graphs, through `scripts/graphalytics-reference.py`.
   There is no full Graphalytics driver, no run on the larger datasets, no reference check
@@ -272,7 +277,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 8](../ROADMAP.md), [item 20](../ROADMAP.md), [item 23](../ROADMAP.md), [item 24](../ROADMAP.md), [item 34](../ROADMAP.md), [item 35](../ROADMAP.md), [item 79](../ROADMAP.md), [item 80](../ROADMAP.md), [item 82](../ROADMAP.md), [item 250](../ROADMAP.md), [item 251](../ROADMAP.md), [item 275](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md).
+The remaining work described above refers to [item 8](../ROADMAP.md), [item 20](../ROADMAP.md), [item 23](../ROADMAP.md), [item 24](../ROADMAP.md), [item 34](../ROADMAP.md), [item 35](../ROADMAP.md), [item 79](../ROADMAP.md), [item 80](../ROADMAP.md), [item 82](../ROADMAP.md), [item 250](../ROADMAP.md), [item 251](../ROADMAP.md), [item 275](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md), [item NEW-ITEM-3](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
