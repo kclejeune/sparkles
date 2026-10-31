@@ -1,11 +1,12 @@
 # G03: SHACL Compact Syntax and SHACL 1.2 list constraints
 
-> **Status:** implemented in part (Phase 1 and two of the later items)
+> **Status:** implemented in part (Phase 1 and the later items, without the Working Group's own SHACL 1.2 Core tests)
 >
 > **Phases:** Phase 1 is the SHACLC reader and writer in `sparkles-shacl`, SHACLC wherever
 > shapes are read or shown, and the four SHACL 1.2 list constraint components. Of the
 > later items of §9, `sparkles shacl parse` converts shapes between syntaxes and the MCP
-> tool `draft_shapes` returns SHACLC. A comment-preserving SHACLC formatter is not built.
+> tool `draft_shapes` returns SHACLC. A comment-preserving SHACLC formatter is part of
+> `sparkles fmt`, with the design in [X02](X02-formatter/SPEC.md).
 >
 > **User docs:** [API: SHACL Compact Syntax](../API.md#shacl-compact-syntax-shaclc) ·
 > [API: SHACL validation](../API.md#shacl-validation) ·
@@ -53,9 +54,9 @@ list components are added to the validator in the same change.
 
 **Non-goals**
 
-* A comment-preserving SHACLC formatter in `sparkles fmt`. The formatter handles SPARQL
-  and RDF syntaxes, and shapes written in Turtle are formatted as Turtle. It has no other
-  shape syntax, ShExC included. Formatting SHACLC is left for a later phase (§9).
+* A comment-preserving SHACLC formatter in phase 1. The formatter was added in a later
+  phase (§9). It handles SHACLC next to SPARQL and the RDF syntaxes, and has no other
+  shape syntax, ShExC included.
 * SHACLC as a general RDF syntax for data endpoints. Graph Store uploads and `LOAD` stay
   limited to the RDF syntaxes, because a SHACLC document can only express shapes.
 * Extending SHACLC beyond what Jena reads, except for the list parameters (§3.3).
@@ -115,6 +116,9 @@ pub mod compact {
     pub struct Document { pub graph: Graph, pub prefixes: Vec<(String, String)>,
                           pub base: Option<String> }
     pub fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxError>;
+    // added for the formatter: the triples in the order the reader made them
+    pub fn parse_ordered(text: &str, base: Option<&str>)
+        -> Result<(Document, Vec<Triple>), SyntaxError>;
     pub fn write(graph: &Graph, prefixes: &[(String, String)]) -> Result<String, NotCompact>;
 }
 ```
@@ -222,7 +226,7 @@ following.
 ## 4. Reader
 
 The reader is a hand-written lexer and recursive-descent parser in
-`crates/sparkles-shacl/src/compact/`. It follows the grammar of §3.2 with the Jena
+`crates/sparkles-shaclc/`, which `sparkles-shacl` re-exports as `compact`. It follows the grammar of §3.2 with the Jena
 extensions of §3.3, and builds triples directly by the production rules.
 
 * **Tokens.** IRIs, prefixed names, `@`-prefixed names, strings in the four Turtle
@@ -380,10 +384,9 @@ and the graph writes back to the same line.
 
 ## 9. Phasing
 
-Phase 1 is everything above. A later phase may add a lossless SHACLC formatter to
-`sparkles fmt`, `POST /$/format` and the editor, if users ask for it. It would follow
-the X02 design and keep comments. Converting between SHACLC and Turtle in the CLI is
-also left for later, unless a generic `shacl parse` command appears first.
+Phase 1 is everything above. A later phase added a lossless SHACLC formatter to
+`sparkles fmt`, `POST /$/format` and the editor. It follows the X02 design and keeps
+comments. Converting between SHACLC and Turtle in the CLI landed as `shacl parse`.
 
 ## 10. Rejected alternatives
 
@@ -472,8 +475,8 @@ was already a workspace dependency.
   an order.
 * **The UI** offers the syntax as a select next to the Format button rather than as tabs.
   Switching the syntax does not convert the editor's text. It only swaps the example
-  shapes when they are untouched. The Format button is disabled for SHACLC, because the
-  formatter has no SHACLC.
+  shapes when they are untouched. The Format button formats the editor's text in the
+  selected syntax.
 * **The test harness** compares results without `sh:detail`, and so does the guard's
   differential test, because the guard matches results without their details. Unit tests
   in `tests/components.rs` check the details.
@@ -521,9 +524,26 @@ A list constraint costs two index scans per list cell and value node.
   `/$/schema/{ds}/shapes`, so no new code renders it. `shapesFormat` with
   `language: "shex"` is a `bad-argument`.
 
-**Not built.** A comment-preserving SHACLC formatter for `sparkles fmt`, `POST /$/format`
-and the editor. §9 makes it wait for users who ask for it, and it needs a lossless
-SHACLC parser in `sparkles-fmt` next to the one in `sparkles-shacl`.
+**Formatter (roadmap item 48, part a).** `Language::Shaclc` in `sparkles-fmt` formats
+SHACLC with comments kept. The roadmap item 48 follow-up in
+[X02](X02-formatter/OUTCOME.md#shaclc-formatting-item-48-part-a) records the layout and
+the checks. Three points concern this spec.
+* **The reader moved to its own crate.** `sparkles-fmt` builds for WebAssembly and
+  `sparkles-shacl` depends on the engine, so the SHACLC lexer, reader and writer now
+  live in `crates/sparkles-shaclc`, which depends only on `oxrdf`, `oxiri` and
+  `rustc-hash`. `sparkles-shacl` re-exports it as `sparkles_shacl::compact`, so every
+  path and the conformance suites are unchanged.
+* **`Document` is unchanged.** `parse_ordered` is a separate function that returns the
+  document with its triples in the order the reader made them, which the formatter uses
+  to compare graphs without a search.
+* **The lexer keeps trivia on request.** `lex::lex_lossless` returns every byte of the
+  input as lexemes, with whitespace and comments among them, and `lex_lossless_partial`
+  returns the lexemes before the first error. The tokenizer that the reader uses is the
+  same code with trivia dropped, and a test checks that both agree on every token.
+* **The reader is the authority.** The formatter parses with `sparkles_shaclc::parse`,
+  so a document the reader refuses is refused with the same message and position, and
+  the formatter's own syntax tree follows the reader's decisions for paths, counts and
+  node constraints.
 
 ### Roadmap follow-ups (2026-10-12)
 
@@ -642,11 +662,6 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
 
 
 ### Completion path
-
-Roadmap item 48 owns the remaining comment-preserving SHACLC formatter. It requires
-a lossless parser and the CLI, HTTP and editor surfaces named above. Acceptance must
-retain comments and formatting stability while preserving the reader/writer's
-semantic round trips and existing SHACLC and constraint conformance tests.
 
 Completed item 13 covers the adopted list and node-expression contracts. The draft
 SHACL 1.2 Core constraints listed above were not part of that node-expression phase,

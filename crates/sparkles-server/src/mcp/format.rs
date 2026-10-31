@@ -34,7 +34,7 @@ fn language(name: Option<&str>, text: &str) -> Result<Language, ToolError> {
         }
         return Language::from_name(name).ok_or_else(|| {
             ToolError::bad_argument(format!(
-                "unknown language '{name}': sparql, turtle, trig, ntriples, nquads or jsonld"
+                "unknown language '{name}': sparql, turtle, trig, ntriples, nquads, jsonld or shaclc"
             ))
         });
     }
@@ -43,7 +43,7 @@ fn language(name: Option<&str>, text: &str) -> Result<Language, ToolError> {
         Detection::RdfXml => Err(rdf_xml()),
         _ => Err(
             ToolError::bad_argument("cannot tell the language of the text")
-                .hint("set language: sparql, turtle, trig, ntriples, nquads or jsonld"),
+                .hint("set language: sparql, turtle, trig, ntriples, nquads, jsonld or shaclc"),
         ),
     }
 }

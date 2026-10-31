@@ -101,29 +101,82 @@ config file, which the formatter ignores, lint diagnostics and quick fixes to
 
 ### Roadmap follow-ups (2026-10-12)
 
-**SHACLC formatting** (item 48, Tier 5, [ROADMAP](../../ROADMAP.md)). The linter's half
-of item 48 is in [X04](../X04-linter.md#roadmap-follow-ups-2026-10-12).
+**SHACLC formatting** (item 48, Tier 5, [ROADMAP](../../ROADMAP.md)). The formatter half
+of item 48 is delivered, and its record follows in
+[SHACLC formatting](#shaclc-formatting-item-48-part-a). The linter's half of item 48 is
+in [X04](../X04-linter.md#roadmap-follow-ups-2026-10-12).
 
-* **What is missing today.** `sparkles_fmt::Language` has six languages: SPARQL,
-  Turtle, TriG, N-Triples, N-Quads and JSON-LD (`crates/sparkles-fmt/src/lib.rs`).
-  SHACLC has a reader and a writer in `sparkles-shacl/src/compact` ([G03](../G03-shaclc.md)),
-  but the writer works from a shapes graph: it drops comments and the author's order,
-  so it is a conversion, not a formatter. The UI's shapes editor accepts SHACLC and its
-  Format button cannot format it.
-* **Design.** A seventh language, `Language::Shaclc`, with a lossless syntax tree in
-  `crates/sparkles-fmt/src/shaclc/` built like the Turtle one: the lexer of
-  `sparkles-shacl/src/compact/lex.rs` extended to keep trivia, a tree that holds every
-  token, and a printer over the shared document model of §4. Layout: directives first
-  as written, one blank line between shapes, a shape's header on one line, one property
-  per line indented by `indent`, and a property's constraints on its line until
-  `line-width`, then one per line. Node constraints, paths and arrays break by the same
-  rules as Turtle's lists. `prune-prefixes` and `align-values` apply; the sorting keys
-  do not.
-* **Checks.** The same as for the other languages: the output parses with
-  `sparkles_shacl::compact::parse`, produces an isomorphic shapes graph, keeps every
-  comment, and formats to itself. The corpus is G03's test files and the SHACLC
-  documents of the W3C draft's examples.
-* **Surfaces.** `sparkles fmt` by the `.shaclc` extension and `--language shaclc`,
-  `POST /$/format` with `language: "shaclc"`, the MCP `format` tool, `sparkles lsp`,
-  the WebAssembly module and the shapes editor, which picks the language from the
-  editor's syntax switch.
+### SHACLC formatting (item 48, part a)
+
+`Language::Shaclc` formats SHACL Compact Syntax with comments kept. It is built like the
+Turtle module, as a lossless syntax tree in `crates/sparkles-fmt/src/shaclc/` over the
+shared document model.
+
+* **Lexer and crate.** The X02 design extended the lexer in `sparkles-shacl`. That crate
+  depends on the engine, and `sparkles-fmt` must build for WebAssembly, so the SHACLC
+  lexer, reader and writer moved to `crates/sparkles-shaclc` with only `oxrdf`, `oxiri`
+  and `rustc-hash` as dependencies. `sparkles-shacl` re-exports it as
+  `sparkles_shacl::compact`, so no caller changed. The lexer gained `lex_lossless`
+  and `lex_lossless_partial`, which keep whitespace and comments, and the reader's
+  tokenizer shares that code. A test compares both on every token of the corpus.
+* **Reference parse.** `sparkles_shaclc::parse` is the authority for syntax errors and for
+  the shapes graph. The formatter's tree follows the reader's decisions, such as the
+  `|` after a path continuing the path only before an IRI, a prefixed name, `(` or `^`.
+* **Bounded graph check.** The reader can return its triples in the order it made them
+  (`sparkles_shaclc::parse_ordered`), so the input and the output number their blank
+  nodes alike and the comparison takes the fast path of the RDF check. When the order
+  differs, a graph of at most eight blank nodes is canonicalized exactly. A larger one is
+  compared by colour refinement, which can only reject, and then by a backtracking search
+  for a blank node mapping that checks every quad under the mapping. The search has a
+  budget of 20 million steps, each a candidate try or a quad lookup. The terms are
+  numbered once before the comparison, so a step never hashes or copies a term, and
+  refinement and the search look at the request deadline every 1,024 steps. A passed
+  deadline gives the normal timeout error. If the budget runs out, the formatter refuses
+  the output as a failed graph check (`unsafe-format`, `graph differs`) and leaves the
+  input unchanged. It never accepts a graph it did not verify, and it cannot tell that
+  refusal apart from a real difference, because a new check or error variant would break
+  exhaustive matches on the public enums.
+  Canonicalizing many symmetric blank nodes is factorial and does not look at the
+  deadline, which made a 211-byte input of two property shapes with nine identical
+  constraints each take 33 seconds. An earlier version accepted a graph whenever
+  refinement could not tell the two apart, which accepted two `in` lists that share 30
+  entries and end in exchanged values, and ten identical property shapes against nine.
+  Both are negative tests now.
+* **Layout.** Directives stay in the order written, and `BASE`, `PREFIX` and `IMPORTS`
+  are written in upper case. One blank line separates shapes, and a shape's header stays
+  on one line. A nested body is a block, and each property takes one line indented by
+  `indent-width`. The constraints of a property stay on its line until `line-width` and
+  then take one line each, with a `|` chain breaking before each bar. Arrays are written
+  as `[a b]` or one entry per line. The keywords `shape` and `shapeClass` and the
+  booleans are written in their canonical case. A blank line between two properties is
+  kept as one blank line.
+* **Options.** `prune-prefixes` drops a `PREFIX` that nothing uses, has no comment and
+  does not hide an earlier declaration of the same label. A document whose header
+  holds directives never loses its first one, which keeps the result stable. The
+  IRI that follows `@` is written as it stands and never compacted. `compact-iris`,
+  `quote-style`, `line-width` and `indent-width` apply as for Turtle. `align-values`
+  pads runs of two or more one-line property shapes into columns by path and by atom,
+  and leaves a run alone when a padded row would pass `line-width`. The sort keys do not
+  apply. The spec did not define `align-values` for SHACLC, so this reading is a choice.
+* **Comments.** Comments attach to the nearest node by the shared rules. A comment
+  before the first constraint of a property is lifted above its group so that the group
+  can stay on one line, and a constraint that follows a comment starts on a new line.
+  The idempotence check found both rules.
+* **Detection.** The extensions `.shaclc` and `.shc` name SHACLC, and `.shc` was skipped
+  in walks before. Sniffing recognises a first word of `shape` or `shapeClass`, and a document of
+  directives alone with an `IMPORTS` among them. The media type is `text/shaclc`.
+* **Surfaces.** `sparkles fmt` by extension and `--language shaclc`, `POST /$/format` with
+  `language: "shaclc"` or the media type `text/shaclc`, the MCP `format` tool, `sparkles lsp` with the
+  language id `shaclc`, `sparkles-fmt-wasm`, and the shapes editor, whose Format button
+  picks the language from the syntax switch. The OpenAPI document and the TypeScript
+  client list the new language. The linter does not support SHACLC, which stays with
+  the linter part of item 48.
+* **Checks.** `crates/sparkles-fmt/tests/shaclc.rs` runs the corpus under 32 option sets.
+  Each output parses, gives a shapes graph isomorphic to the input's, keeps every
+  comment and formats to itself. The corpus is Jena's `shaclc-valid` pairs and syntax
+  tests, the documents of the G03 spec and of the compact syntax draft's examples, and
+  documents that the SHACLC writer produces from the `shaclc-valid` shapes graphs. Three
+  sweeps insert a comment after every token, on its own line and with blank lines, and
+  a generator test formats 6,000 random documents. Golden files under
+  `tests/golden/shaclc` cover layout, wrapping at three widths, alignment, pruning,
+  nested bodies, paths, strings and the ignore pragma.

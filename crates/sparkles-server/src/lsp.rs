@@ -732,7 +732,7 @@ fn language(language_id: &str, uri: &str, text: &str) -> Result<Language, String
         Detection::Compressed => Err("compressed input: decompress first".to_string()),
         Detection::SkipInWalk => Err(format!(
             "cannot tell the language of {name}; set the editor's language to one of \
-             sparql, turtle, trig, ntriples, nquads or jsonld"
+             sparql, turtle, trig, ntriples, nquads, jsonld or shaclc"
         )),
         Detection::Unknown => Err("cannot tell the language of this document".to_string()),
     }
@@ -773,6 +773,8 @@ mod tests {
         assert_eq!(l("ttl", "file:///x", ""), Ok(Language::Turtle));
         assert_eq!(l("json-ld", "file:///x", ""), Ok(Language::JsonLd));
         assert_eq!(l("TriG", "file:///x", ""), Ok(Language::TriG));
+        assert_eq!(l("shaclc", "file:///x", ""), Ok(Language::Shaclc));
+        assert_eq!(l("plaintext", "file:///s.shaclc", ""), Ok(Language::Shaclc));
         // an unknown id: the extension, then the content
         assert_eq!(l("plaintext", "file:///q.ru", ""), Ok(Language::Sparql));
         assert_eq!(l("", "untitled:Untitled-1.nq", ""), Ok(Language::NQuads));

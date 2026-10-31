@@ -15,6 +15,7 @@ sparkles = { path = "crates/sparkles" }
 sparkles-core = { path = "crates/sparkles-core" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 sparkles-shacl = { path = "crates/sparkles-shacl" }
+sparkles-shaclc = { path = "crates/sparkles-shaclc" }
 sparkles-shex = { path = "crates/sparkles-shex" }
 sparkles-backup = { path = "crates/sparkles-backup" }
 sparkles-fmt = { path = "crates/sparkles-fmt" }

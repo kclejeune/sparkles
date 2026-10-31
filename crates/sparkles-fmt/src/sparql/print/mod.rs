@@ -557,7 +557,21 @@ pub fn node(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             | K::JsonObject
             | K::JsonMember
             | K::JsonArray
-            | K::JsonScalar => cx.verbatim(n),
+            | K::JsonScalar
+            | K::ShaclcDoc
+            | K::ShaclcImports
+            | K::ShaclcShape
+            | K::ShaclcBody
+            | K::ShaclcNodeConstraint
+            | K::ShaclcPropertyShape
+            | K::ShaclcShapeRef
+            | K::ShaclcPath
+            | K::ShaclcCount
+            | K::ShaclcOr
+            | K::ShaclcAtom
+            | K::ShaclcArray
+            | K::ShaclcArrayItem
+            | K::ShaclcLiteral => cx.verbatim(n),
         }
     };
     crate::trivia::wrap(&mut cx.arena, cx.comments, n, doc)

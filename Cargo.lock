@@ -5839,6 +5839,7 @@ dependencies = [
  "rayon",
  "spargebra",
  "sparkles-fmt",
+ "sparkles-shaclc",
  "thiserror 2.0.21",
  "toml",
  "unicode-width",
@@ -6035,9 +6036,20 @@ dependencies = [
  "sha2",
  "spargebra",
  "sparkles-core",
+ "sparkles-shaclc",
  "stacker",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "sparkles-shaclc"
+version = "0.1.0"
+dependencies = [
+ "oxiri",
+ "oxrdf",
+ "oxrdfio",
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]

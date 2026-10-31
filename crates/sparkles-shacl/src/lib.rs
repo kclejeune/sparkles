@@ -31,7 +31,9 @@
 //! # Ok(()) }
 //! ```
 
-pub mod compact;
+/// The SHACL Compact Syntax reader and writer, which live in `sparkles-shaclc` so that the
+/// formatter can use them without this crate's dependencies.
+pub use sparkles_shaclc as compact;
 pub mod constraints;
 mod data;
 pub mod form;

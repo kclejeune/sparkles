@@ -401,7 +401,7 @@ fn language(name: Option<&J>, text: &str) -> Result<Language, J> {
         Some(J::String(n)) => Language::from_name(n).ok_or_else(|| {
             bad_request(
                 &format!(
-                    "unknown language '{n}': sparql, turtle, trig, ntriples, nquads or jsonld"
+                    "unknown language '{n}': sparql, turtle, trig, ntriples, nquads, jsonld or shaclc"
                 ),
                 None,
             )
@@ -565,6 +565,10 @@ mod tests {
             ("ntriples", "<http://a>   <http://b> <http://c>."),
             ("nquads", "<http://a> <http://b> \"c\"   <http://g>  ."),
             ("jsonld", r#"{"@id":"http://a","http://b":1}"#),
+            (
+                "shaclc",
+                "PREFIX ex: <http://example.org/>\nshape ex:S -> ex:C { ex:p IRI [1..1] . }",
+            ),
         ] {
             let r = call(json!({ "text": text, "language": language }));
             assert_eq!(

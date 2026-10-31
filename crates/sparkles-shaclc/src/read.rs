@@ -1,9 +1,9 @@
 //! The SHACLC parser: the grammar and production rules of the SHACL Compact Syntax,
 //! building the triples directly (see spec G03 §4).
 
-use super::lex::{Spanned, Tok, tokenize};
-use super::{Document, SyntaxError, is_datatype_iri, node_param, property_param};
+use crate::lex::{Spanned, Tok, tokenize};
 use crate::vocab::{SH_NS, owl, rdf, rdfs, sh};
+use crate::{Document, SyntaxError, is_datatype_iri, node_param, property_param};
 use oxiri::Iri;
 use oxrdf::vocab::xsd;
 use oxrdf::{BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
@@ -25,7 +25,10 @@ const NODE_KINDS: [&str; 6] = [
     "IRIOrLiteral",
 ];
 
-pub(crate) fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxError> {
+pub(crate) fn parse(
+    text: &str,
+    base: Option<&str>,
+) -> Result<(Document, Vec<Triple>), SyntaxError> {
     let toks = tokenize(text)?;
     let base = match base {
         Some(b) => Some(Iri::parse(b.to_string()).map_err(|e| SyntaxError {
@@ -52,11 +55,14 @@ pub(crate) fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxEr
     for t in &p.out {
         graph.insert(t);
     }
-    Ok(Document {
-        graph,
-        prefixes: p.declared,
-        base: p.base.map(Iri::into_inner),
-    })
+    Ok((
+        Document {
+            graph,
+            prefixes: p.declared,
+            base: p.base.map(Iri::into_inner),
+        },
+        p.out,
+    ))
 }
 
 /// A node of the graph being built: a subject or object.

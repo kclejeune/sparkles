@@ -1212,7 +1212,9 @@ pub(super) fn schemas() -> Map<String, J> {
     );
     put(
         "FormatLanguage",
-        string_enum(&["sparql", "turtle", "trig", "ntriples", "nquads", "jsonld"]),
+        string_enum(&[
+            "sparql", "turtle", "trig", "ntriples", "nquads", "jsonld", "shaclc",
+        ]),
     );
     put(
         "FormatResult",

@@ -1454,8 +1454,8 @@ enum Cmd {
     /// print their status and titles
     #[cfg(feature = "memory")]
     Graphrag(graphrag::cli::GraphragArgs),
-    /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD: print, check (--check,
-    /// -l) or rewrite (--write)
+    /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads, JSON-LD and SHACLC: print, check
+    /// (--check, -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
     Fmt(fmt::FmtArgs),
     /// Lint SPARQL, Turtle and TriG: unused and undefined prefixes, unused and unbound

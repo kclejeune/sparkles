@@ -49,6 +49,16 @@ the graph variable, that the pattern may leave unbound or that has an UNDEF cell
 FILTER reads stays outside, so answers do not change. On 10.1 million quads on atlas,
 these shapes took 42 to 522 ms before the change and under 0.5 ms after it.
 
+`sparkles fmt`, `POST /$/format`, the MCP `format` tool, `sparkles lsp`, the
+WebAssembly module and the shapes editor's Format button now format SHACL Compact
+Syntax. The formatter keeps every comment, checks that its output reads back to an
+isomorphic shapes graph and that formatting it again changes nothing, and applies
+`prune-prefixes` and `align-values`. `.shaclc` and `.shc` files and the media type
+`text/shaclc` name the language, and the new `shaclc` value joins the `language`
+fields of the HTTP and MCP formatters. Directory walks now format `.shc` files, which
+they skipped before. The SHACLC lexer, reader and writer moved to the new
+`sparkles-shaclc` crate, which `sparkles-shacl` re-exports as `compact`.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.

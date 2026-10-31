@@ -719,8 +719,15 @@ export const metricsSnapshot = (signal?: AbortSignal) =>
 
 // --- formatting ---------------------------------------------------------------
 
-/** The languages `POST /$/format` knows (only `sparql` formats so far). */
-export type FormatLanguage = 'sparql' | 'turtle' | 'trig' | 'ntriples' | 'nquads' | 'jsonld';
+/** The languages `POST /$/format` knows. */
+export type FormatLanguage =
+  | 'sparql'
+  | 'turtle'
+  | 'trig'
+  | 'ntriples'
+  | 'nquads'
+  | 'jsonld'
+  | 'shaclc';
 
 /** The style options (the `.sparklesfmt.toml` keys in camelCase); omitted ones take the defaults. */
 export type FormatOptions = {

@@ -301,3 +301,29 @@ fn writer_refuses_what_compact_cannot_express() {
         "maxCount",
     );
 }
+
+#[test]
+fn the_ordered_parse_returns_the_graphs_triples_and_document_keeps_its_fields() {
+    let text = "PREFIX ex: <http://ex.org/>\nshape ex:S -> ex:C { ex:p IRI [1..1] . ex:q in=[ex:a ex:b] . }\n";
+    // the three public fields, destructured exhaustively
+    let Document {
+        graph,
+        prefixes,
+        base,
+    } = parse(text, None).unwrap();
+    let (doc, triples) = crate::parse_ordered(text, None).unwrap();
+    assert_eq!(doc.prefixes, prefixes);
+    assert_eq!(doc.base, base);
+    assert_eq!(doc.graph.len(), graph.len());
+    // every triple of the graph is among them, in the order the reader made them
+    assert_eq!(triples.len(), graph.len());
+    assert!(triples.iter().all(|t| doc.graph.contains(t)));
+    // a second parse numbers nothing the same, but makes the same shape in the same order
+    let (_, again) = crate::parse_ordered(text, None).unwrap();
+    let shape = |ts: &[oxrdf::Triple]| {
+        ts.iter()
+            .map(|t| (t.predicate.as_str().to_string(), t.object.is_blank_node()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shape(&triples), shape(&again));
+}

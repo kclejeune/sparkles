@@ -182,4 +182,35 @@ pub enum NodeKind {
     AntiJoin,
     /// `distinct(path)`, `multi(path)` or `shortest(path)`
     PathFunction,
+
+    // ---- SHACLC (directives reuse BaseDecl and PrefixDecl, literals reuse Literal)
+    /// the root of a SHACLC document; its range is the whole input, trivia included
+    ShaclcDoc,
+    /// `IMPORTS iri`
+    ShaclcImports,
+    /// `shape iri [-> iri+] { … }` or `shapeClass iri { … }`
+    ShaclcShape,
+    /// `{ constraint* }`: a shape body, or a nested shape in a property shape
+    ShaclcBody,
+    /// node parameters and `|` chains, then `.`
+    ShaclcNodeConstraint,
+    /// a path, its atoms and counts, then `.`
+    ShaclcPropertyShape,
+    /// a shape reference standing alone, then `.`
+    ShaclcShapeRef,
+    /// a property path, tokens only
+    ShaclcPath,
+    /// `[min..max]`
+    ShaclcCount,
+    /// `a | b | c` over atoms
+    ShaclcOr,
+    /// `!`? and a parameter `name=value`, a type, a node kind, a shape reference or a
+    /// nested body
+    ShaclcAtom,
+    /// `[ item* ]` as the value of a parameter
+    ShaclcArray,
+    /// one IRI or literal of an array
+    ShaclcArrayItem,
+    /// a string with its language tag or `^^` datatype
+    ShaclcLiteral,
 }

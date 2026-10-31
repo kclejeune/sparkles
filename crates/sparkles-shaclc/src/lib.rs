@@ -10,7 +10,7 @@
 //! `maxListLength` and `uniqueMembers` to both parameter lists.
 //!
 //! ```
-//! let doc = sparkles_shacl::compact::parse(
+//! let doc = sparkles_shaclc::parse(
 //!     "PREFIX ex: <http://ex.org/>
 //!      shape ex:PersonShape -> ex:Person {
 //!          ex:name xsd:string [1..1] .
@@ -19,12 +19,13 @@
 //! )
 //! .unwrap();
 //! assert_eq!(doc.graph.len(), 7);
-//! let text = sparkles_shacl::compact::write(&doc.graph, &doc.prefixes).unwrap();
+//! let text = sparkles_shaclc::write(&doc.graph, &doc.prefixes).unwrap();
 //! assert!(text.contains("ex:name xsd:string [1..1] ."));
 //! ```
 
-mod lex;
+pub mod lex;
 mod read;
+mod vocab;
 mod write;
 
 use oxrdf::{Graph, Triple};
@@ -97,6 +98,17 @@ impl std::error::Error for NotCompact {}
 /// Parse a SHACLC document. `base` resolves relative IRIs until a `BASE` directive, and
 /// names the ontology (`<base> a owl:Ontology`) when the document has no `BASE`.
 pub fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxError> {
+    read::parse(text, base).map(|(doc, _)| doc)
+}
+
+/// Like [`parse`], and also returns the triples of the graph in the order the reader made
+/// them, duplicates included. A [`Graph`] does not keep the order, and two documents that
+/// differ only in layout make the same triples in the same order, which lets a caller
+/// compare their graphs without searching for a blank node mapping.
+pub fn parse_ordered(
+    text: &str,
+    base: Option<&str>,
+) -> Result<(Document, Vec<Triple>), SyntaxError> {
     read::parse(text, base)
 }
 

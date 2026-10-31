@@ -1,5 +1,6 @@
 //! `sparkles-fmt`: an opinionated formatter for SPARQL 1.2 queries and updates, Turtle 1.2
-//! and TriG 1.2, N-Triples 1.2 and N-Quads 1.2, and JSON-LD 1.1. Each language formats
+//! and TriG 1.2, N-Triples 1.2 and N-Quads 1.2, JSON-LD 1.1 and the SHACL Compact Syntax.
+//! Each language formats
 //! once its module says so ([`Language::is_implemented`]); the others are refused with
 //! [`FormatError::UnsupportedLanguage`].
 //!
@@ -46,6 +47,8 @@ pub mod pattern;
 #[doc(hidden)]
 pub mod pragma;
 #[doc(hidden)]
+pub mod shaclc;
+#[doc(hidden)]
 pub mod sparql;
 #[doc(hidden)]
 pub mod syntax;
@@ -67,19 +70,22 @@ pub enum Language {
     NTriples,
     NQuads,
     JsonLd,
+    /// the SHACL Compact Syntax
+    Shaclc,
 }
 
 impl Language {
-    pub const ALL: [Language; 6] = [
+    pub const ALL: [Language; 7] = [
         Language::Sparql,
         Language::Turtle,
         Language::TriG,
         Language::NTriples,
         Language::NQuads,
         Language::JsonLd,
+        Language::Shaclc,
     ];
 
-    /// `sparql`, `turtle`, `trig`, `ntriples`, `nquads`, `jsonld`: the names of
+    /// `sparql`, `turtle`, `trig`, `ntriples`, `nquads`, `jsonld`, `shaclc`: the names of
     /// `--language` and of the HTTP `language` parameter.
     pub fn name(self) -> &'static str {
         match self {
@@ -89,6 +95,7 @@ impl Language {
             Language::NTriples => "ntriples",
             Language::NQuads => "nquads",
             Language::JsonLd => "jsonld",
+            Language::Shaclc => "shaclc",
         }
     }
 
@@ -101,6 +108,7 @@ impl Language {
             Language::NTriples => "N-Triples",
             Language::NQuads => "N-Quads",
             Language::JsonLd => "JSON-LD",
+            Language::Shaclc => "SHACLC",
         }
     }
 
@@ -128,6 +136,7 @@ impl Language {
             "application/n-triples" => Language::NTriples,
             "application/n-quads" => Language::NQuads,
             "application/ld+json" => Language::JsonLd,
+            "text/shaclc" => Language::Shaclc,
             _ => return None,
         })
     }
@@ -140,6 +149,7 @@ impl Language {
             Language::Turtle | Language::TriG => turtle::IMPLEMENTED,
             Language::NTriples | Language::NQuads => lines::IMPLEMENTED,
             Language::JsonLd => jsonld::IMPLEMENTED,
+            Language::Shaclc => shaclc::IMPLEMENTED,
         }
     }
 
@@ -158,8 +168,7 @@ pub enum Detection {
     RdfXml,
     /// `.gz`, `.zst`, `.br`, `.lz4`: decompress first
     Compressed,
-    /// `.n3`, `.shc`, `.json`: skipped in directory walks; an explicit path needs a
-    /// language
+    /// `.n3` and `.json`: skipped in directory walks; an explicit path needs a language
     SkipInWalk,
     /// nothing to go by (an empty or comment-only text without a known extension)
     Unknown,
@@ -180,8 +189,9 @@ pub fn detect_path(path: &Path) -> Option<Detection> {
         "nt" => Detection::Lang(Language::NTriples),
         "nq" => Detection::Lang(Language::NQuads),
         "jsonld" => Detection::Lang(Language::JsonLd),
+        "shaclc" | "shc" => Detection::Lang(Language::Shaclc),
         "rdf" | "owl" | "xml" => Detection::RdfXml,
-        "n3" | "shc" | "json" => Detection::SkipInWalk,
+        "n3" | "json" => Detection::SkipInWalk,
         "gz" | "zst" | "br" | "lz4" => Detection::Compressed,
         _ => return None,
     })
@@ -222,11 +232,17 @@ fn sniff(text: &str) -> Detection {
     // the prologue: SPARQL-style directives, and Turtle's `@prefix` family (lexed as
     // language tags here) with their final `.`
     let mut i = 0;
+    let mut imports = false;
     loop {
         let turtle = at(i) == T::LangDir;
         let skip = match word(i).as_str() {
             "prefix" => 3,
             "base" | "version" => 2,
+            // no other syntax has the directive
+            "imports" => {
+                imports = true;
+                2
+            }
             _ => break,
         };
         i += skip;
@@ -252,6 +268,14 @@ fn sniff(text: &str) -> Detection {
     ];
     if at(i) == T::Word && SPARQL.contains(&word(i).as_str()) {
         return Detection::Lang(Language::Sparql);
+    }
+    // SHACLC: `shape` and `shapeClass` are bare words no other syntax starts with
+    if at(i) == T::Word && matches!(word(i).as_str(), "shape" | "shapeclass") {
+        return Detection::Lang(Language::Shaclc);
+    }
+    // a document of directives alone, with an `IMPORTS` among them
+    if imports && at(i) == T::Eof {
+        return Detection::Lang(Language::Shaclc);
     }
     if word(i) == "graph" || at(i) == T::LBrace || at(i + 1) == T::LBrace {
         return Detection::Lang(Language::TriG);
@@ -552,6 +576,7 @@ pub fn format(text: &str, lang: Language, opts: &Options) -> Result<Formatted, F
         Language::TriG => check::run(&turtle::Turtle { trig: true }, text, &opts),
         Language::NTriples | Language::NQuads => lines::format_str(text, lang, &opts),
         Language::JsonLd => check::run(&jsonld::JsonLd, text, &opts),
+        Language::Shaclc => check::run(&shaclc::Shaclc, text, &opts),
     }
 }
 
@@ -719,6 +744,13 @@ mod tests {
             Some(Language::Turtle)
         );
         assert_eq!(Language::from_media_type("text/plain"), None);
+        assert_eq!(Language::from_name("SHACLC"), Some(Language::Shaclc));
+        assert_eq!(
+            Language::from_media_type("text/shaclc; charset=utf-8"),
+            Some(Language::Shaclc)
+        );
+        assert!(Language::Shaclc.is_implemented() && !Language::Shaclc.is_line_format());
+        assert_eq!(Language::Shaclc.display_name(), "SHACLC");
         assert!(Language::Sparql.is_implemented());
         assert!(Language::Turtle.is_implemented() && Language::TriG.is_implemented());
     }
@@ -735,6 +767,8 @@ mod tests {
         assert_eq!(d("x.nt"), Detection::Lang(Language::NTriples));
         assert_eq!(d("x.nq"), Detection::Lang(Language::NQuads));
         assert_eq!(d("x.jsonld"), Detection::Lang(Language::JsonLd));
+        assert_eq!(d("x.shaclc"), Detection::Lang(Language::Shaclc));
+        assert_eq!(d("X.SHC"), Detection::Lang(Language::Shaclc));
         assert_eq!(d("x.owl"), Detection::RdfXml);
         assert_eq!(d("x.n3"), Detection::SkipInWalk);
         assert_eq!(d("x.ttl.gz"), Detection::Compressed);
@@ -786,6 +820,20 @@ mod tests {
         assert_eq!(
             s("ex:g { ex:a ex:b ex:c }"),
             Detection::Lang(Language::TriG)
+        );
+        // SHACLC starts with `shape` or `shapeClass` after its directives
+        assert_eq!(
+            s("# c\nBASE <http://e/>\nIMPORTS <http://e/o>\nPREFIX ex: <http://e/>\nshape ex:S {}"),
+            Detection::Lang(Language::Shaclc)
+        );
+        assert_eq!(
+            s("shapeClass <http://e/S> { }"),
+            Detection::Lang(Language::Shaclc)
+        );
+        // a prefixed name that starts with `shape` is Turtle
+        assert_eq!(
+            s("@prefix shape: <http://e/> .\nshape:a shape:b shape:c ."),
+            Detection::Lang(Language::Turtle)
         );
     }
 

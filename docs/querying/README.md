@@ -235,8 +235,8 @@ tools.
 The formatter and linter check their own output and serve the command line, the server,
 the UI and editors.
 
-* `sparkles-fmt` formats SPARQL queries and updates, Turtle, TriG, N-Triples, N-Quads and
-  JSON-LD, through `sparkles fmt` and `POST /$/format` with the `fmt` cargo feature, on by
+* `sparkles-fmt` formats SPARQL queries and updates, Turtle, TriG, N-Triples, N-Quads,
+  JSON-LD and SHACL Compact Syntax, through `sparkles fmt` and `POST /$/format` with the `fmt` cargo feature, on by
   default ([USAGE.md](../USAGE.md#formatting), [API.md](../API.md#formatting)). It keeps
   comments, and its output must parse to the same SPARQL algebra, RDF dataset or JSON and
   format to itself. Style options cover line width, indentation, prefix groups, the `a`
@@ -251,6 +251,10 @@ the UI and editors.
   on every core. `--sort` merges identical statements with an external sort past
   `--sort-memory`, and `--canonicalize` writes RDFC-1.0 blank node labels.
 * JSON-LD uses Prettier's JSON layout with keywords first, and `--sort` sorts terms.
+* SHACL Compact Syntax keeps directives as written, separates shapes with one blank line,
+  and puts one property on each line. A property's constraints wrap at `line-width`.
+  `prune-prefixes` and `align-values` apply, and the sort keys do not. The shapes editor
+  in the UI formats SHACLC as well. The linter does not check SHACLC.
 * `sparkles lint` checks SPARQL, Turtle and TriG with seventeen rules
   ([X04](../specs/X04-linter.md), [USAGE.md](../USAGE.md#linting)). They cover undefined and
   unused prefixes, unused, single-use and unbound variables, cartesian products,

@@ -1,0 +1,13 @@
+# header
+
+PREFIX ex: <http://example.com/ns#>
+
+shape ex:S {
+  ex:a xsd:string [1..1] .
+  # sparkles-fmt: ignore
+  ex:b    xsd:string    [1..1]   .
+  ex:c xsd:string [1..1] .
+}
+
+# sparkles-fmt: ignore
+shape   ex:T  {   ex:d IRI .  }

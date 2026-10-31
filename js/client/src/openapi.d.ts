@@ -990,7 +990,7 @@ export interface paths {
         put?: never;
         /**
          * Format SPARQL or RDF
-         * @description Formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads or JSON-LD document. A JSON body gets a `FormatResult`. A raw body is answered with the formatted text in the same media type. `--format-endpoint` may limit or turn off the route.
+         * @description Formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACL Compact Syntax (SHACLC) document. A JSON body gets a `FormatResult`. A raw body is answered with the formatted text in the same media type. `--format-endpoint` may limit or turn off the route.
          */
         post: operations["format"];
         delete?: never;
@@ -6051,7 +6051,7 @@ export interface components {
             trees?: components["schemas"]["Derivation"][];
         };
         /** @enum {string} */
-        FormatLanguage: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld";
+        FormatLanguage: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld" | "shaclc";
         FormatOptions: {
             /** @default false */
             alignValues: boolean;
@@ -12872,6 +12872,7 @@ export interface operations {
                 "application/sparql-update": string;
                 "application/trig": string;
                 "text/plain": string;
+                "text/shaclc": string;
                 "text/turtle": string;
             };
         };
@@ -12892,6 +12893,7 @@ export interface operations {
                     "application/sparql-update": string;
                     "application/trig": string;
                     "text/plain": string;
+                    "text/shaclc": string;
                     "text/turtle": string;
                 };
             };

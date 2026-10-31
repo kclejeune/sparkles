@@ -1,0 +1,14 @@
+
+
+BASE   <http://example.com/ns>
+
+IMPORTS <http://example.com/a>
+imports <http://example.com/b>
+prefix a: <http://example.com/a#>
+
+PREFIX b: <http://example.com/b#>
+PREFIX a: <http://example.com/other#>
+shapeclass a:One { }
+shape  b:Two  ->   a:One   b:Three { closed = true  .  }
+PREFIX c: <http://example.com/c#>
+shape c:Three { c:p IRI . }

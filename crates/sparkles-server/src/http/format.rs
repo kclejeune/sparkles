@@ -315,7 +315,7 @@ fn language(name: Option<&str>, by_type: Option<Language>, text: &str) -> ApiRes
         }
         return Language::from_name(name).ok_or_else(|| {
             bad_request(format!(
-                "unknown language '{name}': sparql, turtle, trig, ntriples, nquads or jsonld"
+                "unknown language '{name}': sparql, turtle, trig, ntriples, nquads, jsonld or shaclc"
             ))
         });
     }

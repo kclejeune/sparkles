@@ -8994,12 +8994,12 @@ does not say. SPARQL selectors on the command line have no row or memory budgets
 
 The design and its rationale are in [X02 Formatter](specs/X02-formatter/README.md).
 
-`POST /$/format` formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads
-or JSON-LD document. It returns the formatted text in the style of `sparkles fmt` (see
+`POST /$/format` formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads,
+JSON-LD or SHACL Compact Syntax (SHACLC) document. It returns the formatted text in the style of `sparkles fmt` (see
 [USAGE.md](USAGE.md#formatting)). It reads no dataset and no config file. The style
 options come with the request, and omitted ones take their defaults. The formatter checks
 its own output before answering. The output must parse to the same SPARQL algebra, RDF
-dataset or JSON as the input, keep every comment, and format to itself. When a check
+dataset, SHACL shapes graph or JSON as the input, keep every comment, and format to itself. When a check
 fails, the request fails and nothing is returned.
 
 When the UI is built with the formatter's WebAssembly module, it formats in the page
@@ -9017,7 +9017,7 @@ The MCP server offers the same formatter as its `format` tool, with the same opt
 ```ts
 type FormatRequest = {
   text: string;
-  language?: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld"; // default: detected
+  language?: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld" | "shaclc"; // default: detected
   cursorOffset?: number;   // in UTF-16 code units, like the editor's
   options?: FormatOptions;
 };
@@ -9029,8 +9029,8 @@ type FormatOptions = {
   compactIris?: boolean;         // default true: full IRI → prefixed name
   quoteStyle?: "double" | "preserve";           // default "double"
   operatorPosition?: "leading" | "trailing";    // default "leading": where a broken || or && chain puts its operator
-  alignValues?: boolean;         // default false; SPARQL: pad multi-variable VALUES rows into columns
-  prunePrefixes?: boolean;       // default false; SPARQL, Turtle, TriG: drop prefix declarations nothing uses
+  alignValues?: boolean;         // default false; SPARQL: pad multi-variable VALUES rows into columns, SHACLC: pad consecutive property shapes into columns
+  prunePrefixes?: boolean;       // default false; SPARQL, Turtle, TriG, SHACLC: drop prefix declarations nothing uses
   directiveStyle?: "sparql" | "turtle";         // default "sparql"; Turtle, TriG: PREFIX and GRAPH, or @prefix
   turtleLayout?: "diff" | "conventional";       // default "diff"; Turtle, TriG
   sort?: boolean;                // default false; Turtle, TriG, JSON-LD terms, N-Triples, N-Quads
@@ -9052,8 +9052,9 @@ curl -s localhost:3030/'$/format' -H 'Content-Type: application/json' \
 ```
 
 Without `language`, the text decides. Its first significant token after comments and a
-`PREFIX`/`BASE`/`VERSION` prologue sets the language. For example, `SELECT` or `INSERT`
-means SPARQL. N-Triples is also valid Turtle, so it needs `language` or its media type.
+`PREFIX`/`BASE`/`VERSION`/`IMPORTS` prologue sets the language. For example, `SELECT` or `INSERT`
+means SPARQL, and `shape` or `shapeClass` means SHACLC. A document of directives alone is SHACLC
+when an `IMPORTS` is among them. N-Triples is also valid Turtle, so it needs `language` or its media type.
 The cursor stays next to the same token. A byte order mark is dropped.
 
 **Raw body.** This is the form to use with curl. The body is the document, and its media
@@ -9064,7 +9065,7 @@ with the same media type and the formatted text as the body. It carries
 | `Content-Type` | Language |
 |---|---|
 | `application/sparql-query`, `application/sparql-update` | `sparql` |
-| `text/turtle`, `application/trig`, `application/n-triples`, `application/n-quads`, `application/ld+json` | `turtle`, `trig`, `ntriples`, `nquads`, `jsonld` |
+| `text/turtle`, `application/trig`, `application/n-triples`, `application/n-quads`, `application/ld+json`, `text/shaclc` | `turtle`, `trig`, `ntriples`, `nquads`, `jsonld`, `shaclc` |
 | `text/plain` | needs `?language=` |
 
 ```sh

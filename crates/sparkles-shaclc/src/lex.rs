@@ -1,7 +1,13 @@
 //! The SHACLC lexer: Turtle's terms (IRIs, prefixed names, strings, numbers, language
 //! tags) plus the punctuation and the bare words of the compact syntax.
+//!
+//! [`tokenize`] gives the reader its tokens with decoded values and drops the trivia.
+//! [`lex_lossless`] runs the same scanner and keeps the trivia: every byte of the input
+//! after a leading byte order mark belongs to exactly one [`Lexeme`], whitespace runs and
+//! `#` comments included, so the formatter can rebuild the text and keep every comment.
+//! The two functions share one scanner, so they cannot disagree about where a token ends.
 
-use super::SyntaxError;
+use crate::SyntaxError;
 
 /// A token. Bare words are keywords, parameter names, node kinds and booleans; which
 /// one is decided by the parser from the position.
@@ -43,19 +49,75 @@ impl Tok {
     }
 }
 
+/// What a [`Lexeme`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LexKind {
+    /// a run of whitespace
+    Whitespace,
+    /// `#` to the end of the line, without the line break
+    Comment,
+    /// `<…>`
+    IriRef,
+    /// `prefix:local`, `:local`, `prefix:` or `:`
+    PName,
+    /// `@prefix:local`
+    AtPName,
+    /// the `@` before an IRI reference
+    At,
+    /// `@en-US`
+    LangTag,
+    /// a string in any of the four Turtle forms
+    String,
+    Integer,
+    Decimal,
+    Double,
+    /// a bare word: a keyword, a parameter name, a node kind or a boolean
+    Word,
+    /// `{ } [ ] ( ) | / ^ ^^ * + ? ! = . .. ->`
+    Punct,
+}
+
+impl LexKind {
+    /// Whitespace and comments.
+    pub fn is_trivia(self) -> bool {
+        matches!(self, LexKind::Whitespace | LexKind::Comment)
+    }
+}
+
+/// A token or a piece of trivia: its kind and its byte range in the text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lexeme {
+    pub kind: LexKind,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Tok {
+    fn lex_kind(&self) -> LexKind {
+        match self {
+            Tok::IriRef(_) => LexKind::IriRef,
+            Tok::PName(..) => LexKind::PName,
+            Tok::AtPName(..) => LexKind::AtPName,
+            Tok::At => LexKind::At,
+            Tok::LangTag(_) => LexKind::LangTag,
+            Tok::String(_) => LexKind::String,
+            Tok::Integer(_) => LexKind::Integer,
+            Tok::Decimal(_) => LexKind::Decimal,
+            Tok::Double(_) => LexKind::Double,
+            Tok::Word(_) => LexKind::Word,
+            Tok::P(_) => LexKind::Punct,
+        }
+    }
+}
+
 /// A token and the line and column (1-based, in characters) where it starts.
 pub(crate) type Spanned = (Tok, usize, usize);
 
 pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, SyntaxError> {
-    let mut l = Lexer {
-        chars: text.trim_start_matches('\u{feff}').chars().collect(),
-        i: 0,
-        line: 1,
-        col: 1,
-    };
+    let mut l = Lexer::new(text);
     let mut out = Vec::new();
     loop {
-        l.skip_space();
+        while l.trivia().is_some() {}
         if l.i >= l.chars.len() {
             return Ok(out);
         }
@@ -65,9 +127,51 @@ pub(crate) fn tokenize(text: &str) -> Result<Vec<Spanned>, SyntaxError> {
     }
 }
 
+/// Every token and every piece of trivia of `text`, in order, with byte ranges. A leading
+/// byte order mark belongs to no lexeme. The significant lexemes are exactly the tokens
+/// [`tokenize`] gives the reader, and an error is the one the reader reports.
+pub fn lex_lossless(text: &str) -> Result<Vec<Lexeme>, SyntaxError> {
+    match lex_lossless_partial(text) {
+        (lexemes, None) => Ok(lexemes),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// [`lex_lossless`] that also gives the lexemes before a lexical error, so that a caller
+/// can still read the comments of a document the reader rejects. The error, if any, is
+/// the reader's, and the text from the end of the last lexeme on is what it rejected.
+pub fn lex_lossless_partial(text: &str) -> (Vec<Lexeme>, Option<SyntaxError>) {
+    let mut l = Lexer::new(text);
+    let mut out = Vec::new();
+    loop {
+        let start = l.byte;
+        if let Some(kind) = l.trivia() {
+            out.push(Lexeme {
+                kind,
+                start,
+                end: l.byte,
+            });
+            continue;
+        }
+        if l.i >= l.chars.len() {
+            return (out, None);
+        }
+        match l.token() {
+            Ok(t) => out.push(Lexeme {
+                kind: t.lex_kind(),
+                start,
+                end: l.byte,
+            }),
+            Err(e) => return (out, Some(e)),
+        }
+    }
+}
+
 struct Lexer {
     chars: Vec<char>,
     i: usize,
+    /// the byte offset of `chars[i]` in the text given to [`Lexer::new`]
+    byte: usize,
     line: usize,
     col: usize,
 }
@@ -97,6 +201,17 @@ fn is_pn_chars(c: char) -> bool {
 const LOCAL_ESCAPES: &str = "_~.-!$&'()*+,;=/?#@%";
 
 impl Lexer {
+    fn new(text: &str) -> Lexer {
+        let body = text.trim_start_matches('\u{feff}');
+        Lexer {
+            chars: body.chars().collect(),
+            i: 0,
+            byte: text.len() - body.len(),
+            line: 1,
+            col: 1,
+        }
+    }
+
     fn peek(&self, k: usize) -> Option<char> {
         self.chars.get(self.i + k).copied()
     }
@@ -104,6 +219,7 @@ impl Lexer {
     fn bump(&mut self) -> Option<char> {
         let c = self.chars.get(self.i).copied()?;
         self.i += 1;
+        self.byte += c.len_utf8();
         if c == '\n' {
             self.line += 1;
             self.col = 1;
@@ -121,20 +237,24 @@ impl Lexer {
         }
     }
 
-    fn skip_space(&mut self) {
-        while let Some(c) = self.peek(0) {
-            if c.is_whitespace() {
+    /// Consume one run of whitespace or one comment, and say which.
+    fn trivia(&mut self) -> Option<LexKind> {
+        let c = self.peek(0)?;
+        if c.is_whitespace() {
+            while self.peek(0).is_some_and(char::is_whitespace) {
                 self.bump();
-            } else if c == '#' {
-                while let Some(c) = self.peek(0) {
-                    if c == '\n' || c == '\r' {
-                        break;
-                    }
-                    self.bump();
-                }
-            } else {
-                break;
             }
+            Some(LexKind::Whitespace)
+        } else if c == '#' {
+            while let Some(c) = self.peek(0) {
+                if c == '\n' || c == '\r' {
+                    break;
+                }
+                self.bump();
+            }
+            Some(LexKind::Comment)
+        } else {
+            None
         }
     }
 
@@ -311,14 +431,14 @@ impl Lexer {
             }
             Some(c) if is_pn_chars_base(c) => {
                 // a prefixed name if a colon follows its prefix, else a language tag
-                let save = (self.i, self.line, self.col);
+                let save = (self.i, self.byte, self.line, self.col);
                 let word = self.prefix_chars();
                 if self.peek(0) == Some(':') {
                     self.bump();
                     let local = self.local()?;
                     return Ok(Tok::AtPName(word, local));
                 }
-                (self.i, self.line, self.col) = save;
+                (self.i, self.byte, self.line, self.col) = save;
                 let mut tag = String::new();
                 while let Some(c) = self.peek(0) {
                     if c.is_ascii_alphabetic() {
@@ -598,5 +718,105 @@ mod tests {
         assert_eq!((e.line, e.column), (2, 8), "{e}");
         assert!(tokenize("<a b>").is_err());
         assert!(tokenize("ex:a%zz").is_err());
+    }
+
+    /// The corpus of the lossless tests: every construct, comments in odd places, a
+    /// byte order mark, multi-byte characters and CRLF line ends.
+    const DOCS: [&str; 6] = [
+        "\u{feff}# header\nBASE <http://ex.org/> # base\nPREFIX ex: <http://ex.org/ns#>\n\n\
+         shape ex:S -> ex:C ex:D { # open\n  ex:p xsd:string [1..*] # why\n    pattern=\"é\\\\d\" . # end\n}\n",
+        "shapeClass ex:C {\r\n\tclosed=true ignoredProperties=[rdf:type ex:a] .\r\n  !minLength=2 | maxLength=9 .\r\n}\r\n",
+        "shape <s> { ^ex:p/(ex:q|ex:r)* IRI | Literal @ex:T @<http://x/> { ex:z .5 -1 1e3 'x'@en-GB \"y\"^^xsd:string . } . }",
+        "",
+        "   \n# only a comment",
+        "shape ex:S { ex:p ex:a.b ex:c\\.d : :x ex:p% . }",
+    ];
+
+    #[test]
+    fn lossless_lexemes_cover_the_text_and_agree_with_the_reader() {
+        for doc in DOCS {
+            let Ok(toks) = tokenize(doc) else {
+                // the reader's lexical errors are the lossless lexer's, at the same place
+                let (a, b) = (tokenize(doc).unwrap_err(), lex_lossless(doc).unwrap_err());
+                assert_eq!(a, b, "{doc:?}");
+                continue;
+            };
+            let lexemes = lex_lossless(doc).unwrap();
+            let bom = doc.len() - doc.trim_start_matches('\u{feff}').len();
+            // every byte after the BOM is in exactly one lexeme
+            let mut at = bom;
+            for l in &lexemes {
+                assert_eq!(l.start, at, "{doc:?}");
+                assert!(l.end > l.start, "{doc:?}");
+                assert!(doc.is_char_boundary(l.end), "{doc:?}");
+                at = l.end;
+            }
+            assert_eq!(at, doc.len(), "{doc:?}");
+            // the significant ones are the reader's tokens, in the same places
+            let significant: Vec<&Lexeme> =
+                lexemes.iter().filter(|l| !l.kind.is_trivia()).collect();
+            assert_eq!(significant.len(), toks.len(), "{doc:?}");
+            for (l, (t, line, col)) in significant.iter().zip(&toks) {
+                assert_eq!(l.kind, t.lex_kind(), "{doc:?}");
+                let before = &doc[..l.start];
+                let l_line = before.matches('\n').count() + 1;
+                let l_col = before[before.rfind('\n').map_or(bom.min(before.len()), |i| i + 1)..]
+                    .chars()
+                    .filter(|c| *c != '\u{feff}')
+                    .count()
+                    + 1;
+                assert_eq!((l_line, l_col), (*line, *col), "{doc:?} at {}", l.start);
+            }
+        }
+    }
+
+    #[test]
+    fn comments_and_whitespace_are_lexemes() {
+        let doc = "shape ex:S {# a\n}  # b\r\n";
+        let kinds: Vec<(LexKind, &str)> = lex_lossless(doc)
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.kind, &doc[l.start..l.end]))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (LexKind::Word, "shape"),
+                (LexKind::Whitespace, " "),
+                (LexKind::PName, "ex:S"),
+                (LexKind::Whitespace, " "),
+                (LexKind::Punct, "{"),
+                (LexKind::Comment, "# a"),
+                (LexKind::Whitespace, "\n"),
+                (LexKind::Punct, "}"),
+                (LexKind::Whitespace, "  "),
+                (LexKind::Comment, "# b"),
+                (LexKind::Whitespace, "\r\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_lexing_keeps_what_precedes_an_error() {
+        let doc = "# keep\nshape ex:S { # also\n ex:p \"open";
+        let (lexemes, err) = lex_lossless_partial(doc);
+        assert_eq!(err, tokenize(doc).err());
+        let last = lexemes.last().unwrap();
+        assert_eq!(&doc[last.start..last.end], " ");
+        assert_eq!(
+            lexemes
+                .iter()
+                .filter(|l| l.kind == LexKind::Comment)
+                .count(),
+            2
+        );
+        assert_eq!(last.end, doc.find('"').unwrap());
+    }
+
+    #[test]
+    fn lossless_errors_are_the_readers() {
+        for bad in ["shape ex:S {\n  ex:p \"open\n", "<a b>", "ex:a%zz", "§"] {
+            assert_eq!(lex_lossless(bad).unwrap_err(), tokenize(bad).unwrap_err());
+        }
     }
 }

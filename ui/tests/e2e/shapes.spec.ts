@@ -1,5 +1,5 @@
 // The SHACL panel of the dataset page: the shapes graph is a code editor whose text
-// Validate sends, and which formats as Turtle through the server.
+// Validate sends, and which formats as Turtle or SHACLC through the server.
 
 import { expect, test } from './fixtures';
 import { DATASET, EX } from './data';
@@ -77,4 +77,25 @@ ex:PersonShape
   await page.keyboard.press('Shift+Alt+F');
   await expect(page.getByText(/^Cannot format: syntax error at line \d/)).toBeVisible();
   await expect(page.locator('.cm-error-line')).toHaveCount(1);
+});
+
+test('Format formats SHACLC shapes when the syntax switch says SHACLC', async ({ page }) => {
+  await page.goto(`/ui/datasets/${DATASET}`);
+  await page.getByLabel('Shapes syntax').selectOption('shaclc');
+  const editor = page.getByRole('textbox', { name: 'Shapes graph (SHACLC)' });
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+a');
+  await page.keyboard.press('Delete');
+  await page.keyboard.insertText(
+    `prefix ex: <${EX}>\nshape   ex:PersonShape -> ex:Person {ex:age xsd:integer [1..1] . # age\n}\n`,
+  );
+  await page.keyboard.press('Shift+Alt+F');
+  const text = async () =>
+    (await editor.locator('.cm-line').allInnerTexts()).map((l) => l.replace(/\n$/, '')).join('\n');
+  await expect.poll(text).toBe(`PREFIX ex: <${EX}>
+
+shape ex:PersonShape -> ex:Person {
+  ex:age xsd:integer [1..1] . # age
+}
+`);
 });

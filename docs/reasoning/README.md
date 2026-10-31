@@ -229,7 +229,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   over it take 1.6 to 2.3 times as long as with a closure that also holds the explicit
   facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. Roadmap item
   113.
-* `sparkles fmt` and the UI's Format button do not format SHACLC. Roadmap item 48.
 * Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints not
   anchored at the focus node, in full on every write. Roadmap item 78.
 * ShEx keeps no typing when the process is killed or exits without closing the store, so

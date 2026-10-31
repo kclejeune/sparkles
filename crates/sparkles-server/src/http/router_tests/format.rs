@@ -237,6 +237,40 @@ async fn raw_bodies() {
 }
 
 #[tokio::test]
+async fn formats_shaclc_in_both_body_forms() {
+    let (_d, app) = fmt_server(|_| {});
+    let text = "prefix ex: <http://example.org/>\nshape   ex:S -> ex:C {ex:p IRI [1..1].}\n";
+    let want = "PREFIX ex: <http://example.org/>\n\nshape ex:S -> ex:C {\n  ex:p IRI [1..1] .\n}\n";
+    let r = post_json(
+        &app,
+        "/$/format",
+        json!({ "text": text, "language": "shaclc" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["language"], "shaclc");
+    assert_eq!(j["changed"], true);
+    assert_eq!(j["text"], want);
+    // the media type names the language of a raw body, and the output is a fixpoint
+    let r = post_as(&app, "/$/format", "text/shaclc", text).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.content_type, "text/shaclc");
+    assert_eq!(r.text(), want);
+    let r = post_as(&app, "/$/format", "text/shaclc", want).await;
+    assert_eq!(r.text(), want);
+    // a syntax error keeps the JSON error shape and its position
+    let r = post_json(
+        &app,
+        "/$/format",
+        json!({ "text": "shape ex:S {", "language": "shaclc" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["code"], "syntax");
+}
+
+#[tokio::test]
 async fn body_limit_and_endpoint_switch() {
     let (_d, app) = fmt_server(|st| st.format.max_bytes = Some(64));
     let text = format!("ASK {{}} # {}", "x".repeat(100));

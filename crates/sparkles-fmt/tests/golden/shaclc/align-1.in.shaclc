@@ -1,0 +1,16 @@
+PREFIX ex: <http://example.com/ns#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+shape ex:Person -> ex:Human {
+  ex:name xsd:string [1..1] .
+  ex:age xsd:integer [0..1] minInclusive=0 .
+  ex:email-address xsd:string .
+
+  ex:x IRI .
+  ex:yy IRI .
+  # a comment keeps its row out of the columns
+  ex:zzz IRI .
+  ex:w IRI .
+  ex:address { ex:city xsd:string . } [0..1] .
+  ex:too-long-to-align-with-the-others-in-a-narrow-column xsd:string [0..1] pattern="^[a-z]+$" .
+}

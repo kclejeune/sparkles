@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   readShaclSyntax,
   shaclSyntaxKey,
+  shapesFormatLanguage,
   shapesLabel,
   shapesMediaType,
   shapesPrefixes,
@@ -20,6 +21,11 @@ describe('shapes syntax', () => {
     expect(shapesMediaType('shaclc')).toBe('text/shaclc');
     expect(shapesMediaType('turtle')).toBe('text/turtle');
     expect(shapesLabel('shaclc')).toContain('SHACLC');
+  });
+
+  it('asks the formatter for the language of the syntax', () => {
+    expect(shapesFormatLanguage('turtle')).toBe('turtle');
+    expect(shapesFormatLanguage('shaclc')).toBe('shaclc');
   });
 
   it('collects the declared prefixes of both syntaxes', () => {

@@ -1,0 +1,8 @@
+shape <http://example.com/s> {
+  <p> IRI pattern="^a$" message="it's" .
+  <q> IRI message='say "hi"' flags="i" .
+  <r> IRI message="""long
+string""" description="""long ' string""" .
+  <t> IRI hasValue="x"@en-GB defaultValue="5"^^<http://www.w3.org/2001/XMLSchema#integer> .
+  <u> IRI hasValue=true minInclusive=-1 maxInclusive=+2.50 minExclusive=.5e3 .
+}

@@ -20,6 +20,7 @@
     DEFAULT_SHACLC,
     readShaclSyntax,
     shaclSyntaxKey,
+    shapesFormatLanguage,
     shapesLabel,
     shapesPrefixes,
     type ShaclSyntax,
@@ -479,11 +480,12 @@ ex:PersonShape a sh:NodeShape ;
   /** Format the shapes graph, in the browser or on the server (Format and Shift+Alt+F). */
   async function formatShapes() {
     const ed = shapesEditor;
-    // the formatter has no SHACLC
-    if (!ed || formattingShapes || shapesSyntax !== 'turtle' || !ed.snapshot().text.trim()) return;
+    if (!ed || formattingShapes || !ed.snapshot().text.trim()) return;
+    // the editor's syntax is the formatter's language
+    const language = shapesFormatLanguage(shapesSyntax);
     formattingShapes = true;
     try {
-      await formatEditor(ed, (req) => formatAny({ ...req, language: 'turtle' }));
+      await formatEditor(ed, (req) => formatAny({ ...req, language }));
       ed.showError(undefined);
     } catch (e) {
       const failure = formatFailure(e, 'these shapes');
@@ -1061,10 +1063,8 @@ ex:PersonShape a sh:NodeShape ;
               <button
                 class="btn"
                 onclick={() => formatShapes()}
-                disabled={formattingShapes || !shapes.trim() || shapesSyntax !== 'turtle'}
-                title={shapesSyntax === 'turtle'
-                  ? 'Format (Shift+Alt+F)'
-                  : 'The formatter handles Turtle shapes, not SHACLC'}
+                disabled={formattingShapes || !shapes.trim()}
+                title="Format (Shift+Alt+F)"
               >
                 {#if formattingShapes}<span class="spinner"></span>{:else}<Icon
                     name="wand"

@@ -46,7 +46,7 @@ pub struct FmtArgs {
     /// Name of the stdin input, for language detection, config and ignore files
     #[arg(long, value_name = "NAME", conflicts_with = "paths")]
     pub stdin_filepath: Option<PathBuf>,
-    /// sparql | turtle | trig | ntriples | nquads | jsonld
+    /// sparql | turtle | trig | ntriples | nquads | jsonld | shaclc
     #[arg(long, value_name = "LANG", value_parser = parse_language)]
     pub language: Option<Language>,
     /// Line width, 40 to 400 (default 100)
@@ -128,8 +128,9 @@ pub struct FmtArgs {
 }
 
 pub(crate) fn parse_language(s: &str) -> Result<Language, String> {
-    Language::from_name(s)
-        .ok_or_else(|| "expected sparql, turtle, trig, ntriples, nquads or jsonld".to_string())
+    Language::from_name(s).ok_or_else(|| {
+        "expected sparql, turtle, trig, ntriples, nquads, jsonld or shaclc".to_string()
+    })
 }
 
 /// A size: bytes, or a number with a binary suffix (`K`/`KiB`, `M`/`MiB`, `G`/`GiB`,
