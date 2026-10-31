@@ -1433,7 +1433,53 @@ correction and the schema change above fixed those. Two limits remain. An ingest
 profile without a predicate list gives every predicate any object on such a report,
 which [API.md](../../API.md#schema-reports-from-statistics) states, and the VALUES rewrite
 misses a table under `GRAPH` and a branch filter that reads the table, which
-[Roadmap](../../ROADMAP.md) item 90 tracks.
+[Roadmap](../../ROADMAP.md) item 90 tracks. Item 90 below removed the second limit.
+
+<a id="item-90-values-pushdown-in-more-shapes"></a>
+**Item 90: VALUES pushdown in more shapes.** The rewrite in `sparql/valuespush.rs` now
+reaches three shapes that it missed. A table joined with a `GRAPH` that holds a UNION
+moves into the GRAPH and on into the branches, for a named graph and for `GRAPH ?g`. The
+rewrite also looks into the `GRAPH` operands of a join, because the planner flattens a
+named GRAPH's inner join into the outer group without planning it on its own, so a table
+and a UNION that are both under `GRAPH <g>` used to stay apart. Third, a table passes a
+FILTER or BIND that reads its variables when the pattern under that FILTER or BIND binds
+those variables in every solution. A solution joined with the table then has the values
+it had before the join, so the expression gives the same value or the same error. The
+reader's union of the default graph and the named graphs, with its graphs in a table,
+therefore keeps both tables inside the FILTER on `?g`. Each table now moves on its own,
+so a table on `?g` stays outside the BIND of `?g` while a table on the label goes in.
+
+The cases where a move would change answers keep the table outside. A variable that an
+OPTIONAL, a MINUS, a BIND or one branch of a UNION may leave unbound would be bound by
+the table, and a FILTER that failed on the unbound variable would pass. The `GRAPH`
+binds its graph variable and its inner pattern does not, so a table that names the graph
+variable stays outside the GRAPH. A `GRAPH ?g` plans its inner pattern once per named
+graph, so the copied-rows bound counts one copy of the table per graph. The review of the
+UNDEF case found that the planner tests a group's FILTER on the rows of a VALUES table
+before the join fills the table's UNDEF cells, so
+`{ { VALUES ?o { 1 2 UNDEF } ?s <urn:p> ?o } FILTER(?o > 1) }` loses the solutions of
+the UNDEF row. That is older than this item and is roadmap item 431. Until it is fixed,
+a table with an UNDEF cell in a variable that a FILTER reads stays outside that FILTER.
+
+Tests compare the rewritten pattern with the expected one for each shape, check that the
+negative shapes keep the table outside, and run 18 more queries with the rewrite on and
+off, with UNDEF cells, duplicate rows and values on which the FILTER fails. Over 300,000
+quads, each new shape plans no index scan above 1,000 estimated rows and answers within a
+1 MiB query budget, while the same query without the rewrite scans a whole pattern and
+passes the budget. Those planner tests fail on the commit before the change.
+
+A focused A/B on atlas compared the commit before the change with the change, on 10.1
+million generated quads of labelled and typed entities in the default graph, ten named
+graphs and an inferred graph. Each query ran 10 timed requests after 2 untimed ones in
+each of 12 fresh server processes, in three rounds of A, B, B, A. The reader's union with
+three graphs and ten labels in tables went from 150 ms to 0.16 ms. A branch FILTER that
+reads the table's variable over a two-pattern join went from 417 ms to 0.22 ms, a table
+and a UNION under one named GRAPH from 42 ms to 0.08 ms, and a table outside a
+`GRAPH ?g` that holds a UNION from 522 ms to 0.41 ms. Every round gave the same ratio
+within 0.0002, and the answers were the same. The reader's union without a table on its
+graphs, which the earlier rewrite already moved, took 0.15 ms on both builds. The
+[natural-language results](../../benchmarks/natural-language/RESULTS.md#values-tables-in-the-memory-readers-unions)
+give the queries and the build.
 
 **Item 15: multimodal ingestion, more transcript adapters and CSV entity linking.**
 §7.1 converts text, Markdown, HTML and PDF (`ingest/convert.rs`, `Format`), the
