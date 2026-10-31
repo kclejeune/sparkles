@@ -71,8 +71,10 @@ pub const HEADER: usize = 16;
 pub const CHUNK_HEADER: usize = 24;
 /// The dataset reader (`minimumReader` of `dataset.json`) that reads framed files.
 pub const FRAMED_READER: u32 = 4;
-/// The most payload one chunk of a converted legacy file holds.
-const CONVERT_CHUNK: usize = 1 << 20;
+/// The most payload one chunk holds, unless a single entry is larger. A write of more
+/// entries, such as a group commit fence's terms, spans several chunks, since a chunk's
+/// header records its payload length in 32 bits.
+const MAX_CHUNK: usize = 1 << 20;
 /// The most a delta vocabulary grows ahead of its chunks at once.
 pub const MAX_PREALLOC: u64 = 1 << 20;
 
@@ -268,6 +270,37 @@ fn chunk_crc(header: &[u8], payload: &[u8]) -> u32 {
 
 /// A chunk holding `keys`, whose first entry has id `first` within the file, preceded by
 /// the file header when `header` is set.
+/// `keys` as chunks of at most [`MAX_CHUNK`] bytes of payload each (one entry when it is
+/// larger), the first numbered `first`, after the file header when `header` is set.
+/// Refuses an entry whose length a chunk cannot record.
+fn encode_chunks(first: u64, keys: &[Arc<[u8]>], header: bool) -> Result<Vec<u8>> {
+    if let Some(k) = keys
+        .iter()
+        .find(|k| k.len() > u32::MAX as usize - 4 - CHUNK_HEADER)
+    {
+        return Err(Error::Unsupported(format!(
+            "a term of {} bytes is too large for the delta vocabulary",
+            k.len()
+        )));
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < keys.len() {
+        let (mut end, mut size) = (start, 0usize);
+        while end < keys.len() && (end == start || size + 4 + keys[end].len() <= MAX_CHUNK) {
+            size += 4 + keys[end].len();
+            end += 1;
+        }
+        out.extend_from_slice(&encode_chunk(
+            first + start as u64,
+            &keys[start..end],
+            header && start == 0,
+        ));
+        start = end;
+    }
+    Ok(out)
+}
+
 fn encode_chunk(first: u64, keys: &[Arc<[u8]>], header: bool) -> Vec<u8> {
     let plen: usize = keys.iter().map(|k| 4 + k.len()).sum();
     let mut out = Vec::with_capacity(HEADER + CHUNK_HEADER + plen);
@@ -423,7 +456,7 @@ impl DeltaFile {
         }
         self.ensure_framed()?;
         self.forget_direct_block();
-        let chunk = encode_chunk(self.written, &keys, self.end == 0);
+        let chunk = encode_chunks(self.written, &keys, self.end == 0)?;
         if let Err(e) =
             wal::write_commit(&self.file, self.end, &mut self.alloc, &chunk, self.prealloc)
         {
@@ -504,7 +537,7 @@ impl DeltaFile {
                 && f.durable == f.end
                 && !keys.is_empty()
             {
-                let chunk = encode_chunk(f.written, &keys, false);
+                let chunk = encode_chunks(f.written, &keys, false)?;
                 if DirectLog::fits(f.end, chunk.len(), f.alloc)
                     && f.direct.handle(Some(&f.path), &f.file).is_some()
                 {
@@ -577,17 +610,7 @@ impl DeltaFile {
 /// Write `keys` as a framed file in a new file renamed over `path`, synced with its
 /// directory, and return the file's bytes.
 fn replace_framed(path: &Path, keys: &[Arc<[u8]>]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut start = 0usize;
-    while start < keys.len() {
-        let (mut end, mut size) = (start, 0usize);
-        while end < keys.len() && (end == start || size + 4 + keys[end].len() <= CONVERT_CHUNK) {
-            size += 4 + keys[end].len();
-            end += 1;
-        }
-        bytes.extend_from_slice(&encode_chunk(start as u64, &keys[start..end], start == 0));
-        start = end;
-    }
+    let bytes = encode_chunks(0, keys, true)?;
     let tmp = path.with_file_name("delta.vocab.tmp");
     crate::store::write_synced(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)?;
@@ -1229,6 +1252,50 @@ mod tests {
 
     fn entry(k: &[u8]) -> Vec<u8> {
         [&(k.len() as u32).to_le_bytes()[..], k].concat()
+    }
+
+    /// A write of more terms than one chunk holds, such as a group commit fence's, spans
+    /// several chunks that all read back, each within the chunk limit.
+    #[test]
+    fn a_large_write_spans_bounded_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.vocab");
+        let vocab = DeltaVocab::open(&path).unwrap();
+        vocab.insert(b"<urn:first>").unwrap();
+        vocab.sync().unwrap();
+        let big: Vec<Vec<u8>> = (0..5u8)
+            .map(|n| vec![b'a' + n; MAX_CHUNK / 2 + 1000])
+            .collect();
+        for k in &big {
+            vocab.insert(k).unwrap();
+        }
+        vocab.insert(b"<urn:last>").unwrap();
+        vocab.sync().unwrap();
+        drop(vocab);
+        let bytes = std::fs::read(&path).unwrap();
+        let (mut pos, mut chunks) = (HEADER, Vec::new());
+        while let Some(h) = bytes.get(pos..pos + CHUNK_HEADER) {
+            let word = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
+            if word(4) == 0 {
+                break;
+            }
+            let (n, plen) = (word(4), word(8) as usize);
+            chunks.push((n, plen));
+            pos += CHUNK_HEADER + plen;
+        }
+        // the first sync's chunk, then one per big term (two of them do not fit in one)
+        assert_eq!(chunks.len(), 1 + big.len(), "{chunks:?}");
+        assert!(
+            chunks.iter().all(|&(_, plen)| plen <= MAX_CHUNK),
+            "{chunks:?}"
+        );
+        let vocab = DeltaVocab::open(&path).unwrap();
+        assert_eq!(vocab.len(), 2 + big.len() as u64);
+        assert_eq!(vocab.get(0).unwrap(), b"<urn:first>");
+        for (i, k) in big.iter().enumerate() {
+            assert_eq!(&vocab.get(1 + i as u64).unwrap(), k);
+        }
+        assert_eq!(vocab.get(1 + big.len() as u64).unwrap(), b"<urn:last>");
     }
 
     #[test]

@@ -1342,17 +1342,37 @@ fn background_oracle_requires_a_fresh_transaction_in_one_successful_sync() {
     );
 }
 
-/// Whether files under `dir` can be opened for direct I/O, which the write-through
-/// handles need.
+/// Whether files under `dir` take direct I/O as the write-through handles do it: an
+/// aligned write and read of one 4 KiB block through `O_DIRECT` and `O_DSYNC`. A file
+/// system can accept the flags at open and refuse the I/O, and the engine then falls back
+/// to buffered writes.
 fn direct_io_available(dir: &Path) -> bool {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    const BLOCK: usize = 4096;
     let probe = dir.join("direct-probe");
-    let ok = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
-        .open(&probe)
-        .is_ok();
+    let ok = (|| {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
+            .open(&probe)
+            .ok()?;
+        let layout = std::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
+        // SAFETY: the layout has a nonzero size, and the block is freed below
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `ptr` holds BLOCK zeroed bytes that nothing else uses
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, BLOCK) };
+        buf[0] = 1;
+        let ok = f.write_at(buf, 0).ok() == Some(BLOCK) && f.read_at(buf, 0).ok() == Some(BLOCK);
+        // SAFETY: allocated above with the same layout
+        unsafe { std::alloc::dealloc(ptr, layout) };
+        ok.then_some(())
+    })()
+    .is_some();
     let _ = std::fs::remove_file(&probe);
     ok
 }
