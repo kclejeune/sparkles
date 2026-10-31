@@ -7004,6 +7004,8 @@ fn estimated_quads(sources: &[Source]) -> u64 {
         bytes += match &s.data {
             crate::io::SourceData::Bytes(b) => b.len() as u64,
             crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            // a stream's length is unknown until it is read
+            crate::io::SourceData::Reader(_) => continue,
         } * s.codec().map_or(1, |c| c.expansion());
     }
     bytes / 80

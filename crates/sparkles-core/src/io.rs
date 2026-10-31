@@ -25,6 +25,9 @@ pub enum ParseMode {
     /// Turtle. Compressed line formats use bounded parallel blocks. Other inputs
     /// buffer at most 128 MiB for Turtle/TriG or 8 MiB for other syntaxes
     /// before selecting a reader parser; sources can override this allowance.
+    /// A [`SourceData::Reader`] stream of a line-based syntax is parsed in bounded
+    /// parallel blocks whatever its compression, and other streams are probed like
+    /// compressed documents.
     #[default]
     Auto,
     /// Parse directly from a reader, one quad at a time, in every RDF syntax.
@@ -56,6 +59,74 @@ const TURTLE_AUTO_BUFFER_BYTES: usize = 128 << 20;
 pub enum SourceData {
     File(PathBuf),
     Bytes(Vec<u8>),
+    /// A stream that is read once, from start to end, such as a socket or a Python file
+    /// object. The loader reads it as it arrives and never copies it to a temporary file.
+    /// Compression detection reads its first bytes ahead, and automatic parsing of a
+    /// syntax that is not line-based reads at most the source's buffering allowance ahead.
+    /// A second read of the source fails with [`Error::Invalid`].
+    Reader(ReaderSource),
+}
+
+impl SourceData {
+    /// A source read once from `reader` (see [`SourceData::Reader`]).
+    pub fn reader(reader: impl Read + Send + 'static) -> SourceData {
+        SourceData::Reader(ReaderSource::new(reader))
+    }
+}
+
+/// The stream of a [`SourceData::Reader`], with the bytes read ahead of the parser.
+pub struct ReaderSource(Mutex<ReaderState>);
+
+struct ReaderState {
+    /// bytes read ahead to detect the compression, which come before the rest of `reader`
+    head: Vec<u8>,
+    /// `None` once the parser has taken the stream
+    reader: Option<Box<dyn Read + Send>>,
+}
+
+impl ReaderSource {
+    pub fn new(reader: impl Read + Send + 'static) -> ReaderSource {
+        ReaderSource(Mutex::new(ReaderState {
+            head: Vec::new(),
+            reader: Some(Box::new(reader)),
+        }))
+    }
+
+    /// The first `n` bytes of the stream (fewer at its end), kept to be read again.
+    fn peek(&self, n: usize) -> Result<Vec<u8>> {
+        let mut state = self.0.lock();
+        let ReaderState { head, reader } = &mut *state;
+        let Some(reader) = reader.as_mut() else {
+            return Err(Error::invalid("a reader source can be read only once"));
+        };
+        let mut block = [0u8; 64];
+        while head.len() < n {
+            let want = (n - head.len()).min(block.len());
+            match reader.read(&mut block[..want]) {
+                Ok(0) => break,
+                Ok(k) => head.extend_from_slice(&block[..k]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(crate::codec::io_error(e)),
+            }
+        }
+        Ok(head[..n.min(head.len())].to_vec())
+    }
+
+    /// The whole stream, from its first byte. A second call fails.
+    fn take(&self) -> Result<Box<dyn Read + Send>> {
+        let mut state = self.0.lock();
+        let Some(reader) = state.reader.take() else {
+            return Err(Error::invalid("a reader source can be read only once"));
+        };
+        let head = std::mem::take(&mut state.head);
+        if head.is_empty() {
+            return Ok(reader);
+        }
+        Ok(Box::new(PrefixReader {
+            prefix: Some(Cursor::new(head)),
+            reader,
+        }))
+    }
 }
 
 /// A W3C syntax or one of Jena's. Both [`RdfFormat`] and [`JenaFormat`] convert into it.
@@ -243,6 +314,18 @@ impl Source {
         }
     }
 
+    /// A source read once from `reader`, as [`SourceData::Reader`] describes.
+    pub fn from_reader(
+        reader: impl Read + Send + 'static,
+        format: impl Into<RdfSyntax>,
+        graph: Option<NamedNode>,
+    ) -> Source {
+        let mut src = Source::from_bytes(Vec::new(), format, graph);
+        src.data = SourceData::reader(reader);
+        src.name = "<reader>".into();
+        src
+    }
+
     /// The data's compression: the explicit choice (checked against the magic bytes),
     /// else the magic bytes, else the file extension. Logs a warning when the file
     /// name and the data disagree.
@@ -266,6 +349,11 @@ impl Source {
                     }
                 }
                 (n, Some(p.as_path()))
+            }
+            SourceData::Reader(r) => {
+                let head = r.peek(prefix.len())?;
+                prefix[..head.len()].copy_from_slice(&head);
+                (head.len(), None)
             }
         };
         let (codec, warning) = Codec::detect(self.compression, &prefix[..n], path)?;
@@ -409,6 +497,8 @@ fn load_bytes(src: &Source) -> Result<Loaded<'_>> {
         let requested = match &src.data {
             SourceData::Bytes(b) => b.len() as u64,
             SourceData::File(p) => std::fs::metadata(p)?.len(),
+            // the codec's reader holds a stream of unknown length to the limit
+            SourceData::Reader(_) => 0,
         };
         if requested > limit {
             return Err(Error::BudgetExceeded(crate::error::Budget {
@@ -429,6 +519,7 @@ fn load_bytes(src: &Source) -> Result<Loaded<'_>> {
     match &src.data {
         SourceData::Bytes(b) if codec == Codec::None => Ok(Loaded::Slice(b)),
         SourceData::Bytes(b) => inflate(&mut &b[..]),
+        SourceData::Reader(r) => inflate(&mut r.take()?),
         SourceData::File(p) => {
             let mut f = File::open(p)?;
             if codec != Codec::None {
@@ -480,7 +571,9 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
         sink.finish()?;
         return Ok(prefixes);
     }
-    if src.parse_mode == ParseMode::Auto && line_based && codec != Codec::None {
+    let reader = matches!(src.data, SourceData::Reader(_));
+    // a stream of line-based syntax is cut into blocks as it arrives, whatever its codec
+    if src.parse_mode == ParseMode::Auto && line_based && (codec != Codec::None || reader) {
         let block = STREAM_BLOCK.max(parallelism.max(1) * PARALLEL_MIN_CHUNK);
         parse_stream(
             src,
@@ -501,11 +594,13 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
         _ => None,
     };
     let bytes = if src.parse_mode == ParseMode::Buffered
-        || (codec == Codec::None && (splittable || matches!(src.data, SourceData::Bytes(_))))
+        || (codec == Codec::None
+            && !reader
+            && (splittable || matches!(src.data, SourceData::Bytes(_))))
         || mapped_size.is_some_and(|n| n < buffer_limit as u64)
     {
         load_bytes(src)?
-    } else if codec == Codec::None || buffer_limit == 0 {
+    } else if (codec == Codec::None && !reader) || buffer_limit == 0 {
         let mut sink = make_sink();
         let prefixes = parse_reader(src, parser, source_reader(src, codec)?, |q| sink.quad(q))?;
         sink.finish()?;
@@ -574,6 +669,7 @@ fn source_reader(src: &Source, codec: Codec) -> Result<Box<dyn Read + '_>> {
     let raw: Box<dyn Read + '_> = match &src.data {
         SourceData::File(p) => Box::new(File::open(p)?),
         SourceData::Bytes(b) => Box::new(b.as_slice()),
+        SourceData::Reader(r) => r.take()?,
     };
     // A smaller byte budget must still allow early quads to reach the sink.
     let capacity = src.max_decompressed.map_or(INPUT_BUFFER_BYTES, |limit| {
@@ -963,6 +1059,7 @@ fn read_blocks(
     let raw: Box<dyn Read + '_> = match &src.data {
         SourceData::File(p) => Box::new(File::open(p)?),
         SourceData::Bytes(b) => Box::new(&b[..]),
+        SourceData::Reader(r) => r.take()?,
     };
     let mut r = codec.reader(raw, src.max_decompressed)?;
     let mut offset = 0u64;
@@ -1299,6 +1396,144 @@ mod tests {
             );
         }
     }
+    /// A stream that hands out `data` in pieces of at most `piece` bytes, then fails with
+    /// `fail` if there is one.
+    struct Trickle {
+        data: Vec<u8>,
+        pos: usize,
+        piece: usize,
+        fail: Option<std::io::ErrorKind>,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.piece).min(self.data.len() - self.pos);
+            if n == 0
+                && !buf.is_empty()
+                && let Some(kind) = self.fail
+            {
+                return Err(std::io::Error::new(kind, "the stream broke"));
+            }
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn trickle(data: Vec<u8>) -> Trickle {
+        Trickle {
+            data,
+            pos: 0,
+            piece: 1000,
+            fail: None,
+        }
+    }
+
+    fn collect_reader(src: &Source, threads: usize) -> Result<(Vec<String>, usize)> {
+        let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+        parse_source(src, threads, || Collect(&out, Vec::new(), &finished))?;
+        let mut got = out.into_inner();
+        got.sort();
+        Ok((got, finished.into_inner()))
+    }
+
+    #[test]
+    fn reader_sources_parse_once_in_every_mode() {
+        let mut nt = String::new();
+        for i in 0..3000 {
+            nt += &format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n");
+        }
+        let mut want: Vec<String> = RdfParser::from_format(RdfFormat::NTriples)
+            .for_slice(nt.as_bytes())
+            .map(|q| q.unwrap().to_string())
+            .collect();
+        want.sort();
+        let turtle = format!("@prefix e: <http://e/> .\n{nt}");
+        for (format, data) in [
+            (RdfFormat::NTriples, nt.as_bytes().to_vec()),
+            (RdfFormat::NTriples, gzip(nt.as_bytes())),
+            (RdfFormat::NQuads, nt.as_bytes().to_vec()),
+            (RdfFormat::Turtle, turtle.as_bytes().to_vec()),
+            (RdfFormat::Turtle, gzip(turtle.as_bytes())),
+        ] {
+            for mode in [ParseMode::Auto, ParseMode::Streaming, ParseMode::Buffered] {
+                for allowance in [None, Some(0), Some(100)] {
+                    let mut src = Source::from_reader(trickle(data.clone()), format, None);
+                    src.parse_mode = mode;
+                    src.auto_buffer_bytes = allowance;
+                    let (got, _) = collect_reader(&src, 4).unwrap();
+                    assert_eq!(got, want, "{format} {mode:?} {allowance:?}");
+                    // the stream was taken: a second parse is refused
+                    let again = collect_reader(&src, 4).unwrap_err();
+                    assert!(again.to_string().contains("only once"), "{again}");
+                }
+            }
+        }
+        // the transaction path takes the stream too
+        let src = Source::from_reader(trickle(gzip(nt.as_bytes())), RdfFormat::NTriples, None);
+        let mut n = 0;
+        parse_source_into(&src, |_| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 3000);
+    }
+
+    #[test]
+    fn a_line_based_reader_source_is_parsed_in_parallel_blocks() {
+        // larger than a parallel chunk, so a block is split between sinks
+        let line = "<http://e/s> <http://e/p> \"a literal of some length to fill a block\" .\n";
+        let nt = line.repeat((2 * PARALLEL_MIN_CHUNK) / line.len() + 1000);
+        let src = Source::from_reader(trickle(nt.into_bytes()), RdfFormat::NTriples, None);
+        let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+        struct Count<'a>(&'a Mutex<Vec<String>>, usize, &'a Mutex<usize>);
+        impl QuadSink for Count<'_> {
+            fn quad(&mut self, _: Quad) -> Result<()> {
+                self.1 += 1;
+                Ok(())
+            }
+            fn finish(self) -> Result<()> {
+                *self.2.lock() += 1;
+                self.0.lock().push(self.1.to_string());
+                Ok(())
+            }
+        }
+        parse_source(&src, 4, || Count(&out, 0, &finished)).unwrap();
+        let counts: Vec<usize> = out
+            .into_inner()
+            .iter()
+            .map(|c| c.parse().unwrap())
+            .collect();
+        assert!(counts.len() > 1, "one sink took every quad: {counts:?}");
+        assert!(counts.iter().all(|&c| c > 0), "{counts:?}");
+    }
+
+    #[test]
+    fn a_reader_source_keeps_the_error_of_its_stream() {
+        let nt = b"<http://e/s> <http://e/p> <http://e/o> .\n".repeat(100);
+        for format in [RdfFormat::NTriples, RdfFormat::Turtle, RdfFormat::RdfXml] {
+            let mut stream = trickle(nt.clone());
+            stream.fail = Some(std::io::ErrorKind::ConnectionReset);
+            let src = Source::from_reader(stream, format, None);
+            match collect_reader(&src, 2) {
+                Err(Error::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{format}")
+                }
+                other => panic!("{format}: {other:?}"),
+            }
+        }
+        // an engine error inside the stream's error comes out as itself
+        struct Cancelled;
+        impl Read for Cancelled {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other(Error::Cancelled))
+            }
+        }
+        let src = Source::from_reader(Cancelled, RdfFormat::NTriples, None);
+        assert!(matches!(collect_reader(&src, 2), Err(Error::Cancelled)));
+    }
+
     fn probe_quad(i: u64) -> Quad {
         let n = |s: &str| NamedNode::new(format!("http://e/{s}")).unwrap();
         Quad::new(n(&format!("s{i}")), n("p"), n("o"), GraphName::DefaultGraph)
