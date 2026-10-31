@@ -1034,6 +1034,21 @@ keep. One is an equality filter between variables of two `UNION` branches above 
 that binds both. The other is a `BOUND` filter on a variable that `VALUES` leaves
 unbound and a path binds. An ignored test in `incr/tests.rs` records both.
 
+A later run found a second circuit error at seed 5897 (roadmap item 439). The compiler
+turned `FILTER EXISTS` and `FILTER NOT EXISTS` into a semijoin or antijoin with the
+inner pattern evaluated alone. A path that matches the empty path, such as `:p*`, `:p?`
+or `:p{0,n}`, evaluated alone binds its free end only to nodes of the active graph.
+`EXISTS` substitutes the outer row instead, and a zero-length step from a bound term
+matches the term even when the graph does not hold it. So
+`FILTER NOT EXISTS { GRAPH ?g { ?x :knows* ?y } }` kept a row whose `?x` no named
+graph held, and the default graph, a constant `GRAPH` and an outer `VALUES` showed the
+same fault. An `EXISTS` with such a path ending at a variable of the outer rows now
+compiles to a `recompute` node that the engine evaluates by substitution. The compiler
+version is now `f13-phase1-4`, so a checkpoint of an older compiler is refused and the
+view is built again. `OPTIONAL` and plain joins keep join semantics and are unchanged.
+`zero_length_paths_follow_the_oracle` checks seventeen of these queries against the
+engine after every commit and against the answers of Jena's reference engine.
+
 The recovery tests stop a child process with no cleanup at six points. These are after
 a commit and before its pass, after a pass and before its checkpoint (failpoint
 `view-pass-applied`), before a checkpoint's rename (`view-checkpoint-written`), while a

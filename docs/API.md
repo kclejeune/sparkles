@@ -3076,7 +3076,10 @@ ignored. Operators that the circuit cannot maintain run as
 `recompute` nodes, which evaluate their subtree again at each commit that touches it and
 subtract the previous output. Property paths with `*`, `+` or `?`, `LIMIT` and
 `OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, and `MINUS`, aggregates,
-`DISTINCT`, `VALUES` and subqueries under `GRAPH ?g` are recompute nodes. The plan in `GET /$/views/{ds}/{name}` marks each
+`DISTINCT`, `VALUES` and subqueries under `GRAPH ?g` are recompute nodes. A `FILTER EXISTS`
+or `FILTER NOT EXISTS` whose `*`, `?` or `{0,n}` path ends at a variable of the outer rows
+is a recompute node together with the group it filters, since the empty path matches a
+substituted term that the graph does not hold. The plan in `GET /$/views/{ds}/{name}` marks each
 operator `incremental` or `recompute`, with the reason.
 
 | Method | Path | Needs | Description |
