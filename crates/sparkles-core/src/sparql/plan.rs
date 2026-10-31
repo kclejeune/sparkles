@@ -1238,8 +1238,13 @@ impl<'a> Planner<'a> {
             }
             GP::OrderBy { inner, expression } => {
                 let child = self.plan(inner, g, Vec::new())?;
-                let bound = if self.ctx.opt.bound_order_keys {
+                // a variable that the initial bindings substitute is compiled to its
+                // constant, not to the column the BIND computes
+                let bound: Vec<_> = if self.ctx.opt.bound_order_keys {
                     bound_expressions(inner)
+                        .into_iter()
+                        .filter(|(v, _)| !self.subst.contains_key(&self.ctx.var(v.as_str())))
+                        .collect()
                 } else {
                     Vec::new()
                 };

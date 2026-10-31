@@ -2290,3 +2290,26 @@ fn order_keys_reading_a_later_binding_are_evaluated_again() {
         assert!(!has_desc(&a.plan, "(?sort)"), "{text}");
     }
 }
+
+/// An initial binding of a BIND's variable substitutes a constant for it, so the ORDER
+/// BY key keeps its expression.
+#[test]
+fn order_keys_skip_a_bind_whose_variable_is_initially_bound() {
+    let s = range_store();
+    let text = format!(
+        "{PREFIXES}SELECT ?i WHERE {{ VALUES ?i {{ 1 2 }} BIND(-?i AS ?sort) }} ORDER BY (-?i) LIMIT 1"
+    );
+    let opts = |opt| QueryOptions {
+        optimizations: Some(opt),
+        no_cache: true,
+        initial_bindings: vec![("sort".into(), oxrdf::Literal::from(0).into())],
+        ..Default::default()
+    };
+    let a = query(s.snapshot(), &text, &opts(Optimizations::ALL)).unwrap();
+    let b = query(s.snapshot(), &text, &opts(Optimizations::NONE)).unwrap();
+    let rows = |r: &QueryResult| -> Vec<String> {
+        r.rows().into_iter().map(|row| format!("{row:?}")).collect()
+    };
+    assert_eq!(rows(&a), rows(&b));
+    assert!(rows(&a)[0].contains("\"2\""), "{:?}", rows(&a));
+}
