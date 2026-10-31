@@ -1144,6 +1144,8 @@ fn invalid_directions_and_languages_are_reported() {
         ("de", true),
         ("en", false),
         ("und", false),
+        ("UND", false),
+        ("en-gb", false),
         ("en-GB", false),
     ] {
         let (_, w) = run_stats("A\nx\n", &lenient(&meta(lang), "t.csv")).unwrap();

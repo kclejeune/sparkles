@@ -685,7 +685,7 @@ struct ColumnDesc2 {
 /// Whether two language tags match: `und` matches any, and otherwise the subtags are
 /// equal up to the length of the shorter tag.
 fn languages_match(a: &str, b: &str) -> bool {
-    if a == "und" || b == "und" {
+    if a.eq_ignore_ascii_case("und") || b.eq_ignore_ascii_case("und") {
         return true;
     }
     a.split('-')
