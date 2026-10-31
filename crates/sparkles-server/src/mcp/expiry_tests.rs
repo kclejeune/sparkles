@@ -249,3 +249,35 @@ async fn the_server_sweeper_needs_mcp_update_permission() {
     ));
     assert!(!branches::spawn_server_expiry(&st));
 }
+
+/// `serve` binds its listener and opens the datasets afterwards. The first pass of the
+/// server's sweeper waits for them, since one made before finds no dataset and the next
+/// would come a minute later.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_sweeper_waits_for_the_datasets_to_open() {
+    let st = state();
+    st.set_phase(crate::obs::Phase::Starting);
+    let t = dataset_with_scratch(&st, "d", Some("1h"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = branches::spawn_expiry_with(
+        st.clone(),
+        None,
+        Cadence::Adaptive,
+        Arc::new(move || t + 2 * HOUR_MS),
+        Some(tx),
+    );
+    // nothing runs while the server is starting
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .is_err()
+    );
+    assert!(has_scratch(&st, "d"));
+    assert!(st.mark_ready());
+    let pass = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pass, ["d@scratch"]);
+    handle.abort();
+}

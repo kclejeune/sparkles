@@ -947,7 +947,8 @@ fn adaptive_wait(st: &AppState, default: Option<Duration>) -> Duration {
 /// How [`spawn_expiry_with`] schedules its passes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Cadence {
-    /// a pass at once, then at least four times per shortest TTL and at most every
+    /// a pass once the server has opened its datasets, then at least four times per
+    /// shortest TTL and at most every
     /// minute (`serve`)
     Adaptive,
     /// a pass after every interval, the first one after the first interval
@@ -962,7 +963,8 @@ pub(crate) const STDIO_EVERY: Duration = Duration::from_secs(600);
 pub(crate) type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// Run [`sweep`] in the background, at most every minute and at least four times per
-/// shortest TTL. `default` is the server's `--mcp-scratch-branch-ttl`. Each pass reads
+/// shortest TTL, starting once the server has opened its datasets. `default` is the
+/// server's `--mcp-scratch-branch-ttl`. Each pass reads
 /// the datasets' settings again, so a change takes effect at the next pass and a dataset
 /// created later is covered. The metric is exported once some dataset expires.
 pub(crate) fn spawn_expiry(st: Arc<AppState>, default: impl Into<Option<Duration>>) {
@@ -1011,6 +1013,16 @@ pub(crate) fn spawn_expiry_with(
     passes: Option<tokio::sync::mpsc::UnboundedSender<Vec<String>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if matches!(cadence, Cadence::Adaptive) {
+            // `serve` opens its datasets after the listener is bound, and a pass before
+            // they are open would find none and leave the next one a minute away
+            while st.phase() == crate::obs::Phase::Starting {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if st.phase() == crate::obs::Phase::Draining {
+                return;
+            }
+        }
         let mut wait = match cadence {
             Cadence::Every(d) => d,
             Cadence::Adaptive => Duration::ZERO,
