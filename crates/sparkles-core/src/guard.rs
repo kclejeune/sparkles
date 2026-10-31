@@ -37,7 +37,11 @@ pub trait CommitGuard: Send + Sync {
     /// and the snapshot that shows it, so a guard can keep what it knows of the head for
     /// the next open. It must not call a method of the store that takes the writer lock,
     /// and its failures are its own to log. During catalog disposal it may look up
-    /// datasets, but it must defer catalog mutations until disposal returns. Members
+    /// datasets. A catalog management call made from it on the disposing thread is
+    /// refused at once with a `catalog-disposing` conflict. It can queue the call with
+    /// `sparkles::Catalog::defer`, which runs it on the same thread after the disposing
+    /// call releases the catalog. Deferred calls live only in memory, so the guard's
+    /// work must be idempotent. Members
     /// closed during unwinding can skip this clean-close checkpoint; required
     /// resource shutdown and root exclusion still apply.
     fn close(&self, _head: &CommitInfo, _snapshot: &Snapshot) {}

@@ -28,6 +28,9 @@ pub fn publish_new(
 ) -> Result<Dataset, BackupError> {
     st.check_reservation(&reservation)
         .map_err(|e| BackupError::internal(e.to_string()))?;
+    // A refused registration must not follow a published directory.
+    st.check_manageable()
+        .map_err(|e| BackupError::new(Code::DatasetBusy, e.to_string()))?;
     let name = reservation.name().to_string();
     let _span = tracing::info_span!("restore.swap", "db.namespace" = name.as_str()).entered();
     let databases = st
@@ -47,6 +50,7 @@ pub fn publish_new(
 
 /// Replace the registered persistent dataset `name` with `restored` (see the module
 /// docs). `task` names the `.replaced-` directory; `keep_replaced` keeps it.
+#[cfg(test)]
 pub fn replace_in_place(
     st: &Catalog,
     name: &str,
@@ -96,7 +100,30 @@ fn close_hook(stage: CloseStage, attempt: u32) {
     });
 }
 
-/// [`replace_in_place`] with its drain time.
+/// Replace the registered persistent dataset of `reservation` with `restored` (see
+/// the module docs), under that restore reservation. The swap owns the reservation
+/// and releases it before the operations that close callbacks deferred run.
+pub(crate) fn replace_reserved(
+    st: &Catalog,
+    reservation: Reservation,
+    restored: &Path,
+    task: &str,
+    keep_replaced: bool,
+) -> Result<Dataset, BackupError> {
+    let name = reservation.name().to_string();
+    swap(
+        st,
+        &name,
+        restored,
+        task,
+        keep_replaced,
+        DRAIN,
+        Some(reservation),
+    )
+}
+
+/// [`replace_in_place`] with its drain time, without a reservation of its own.
+#[cfg(test)]
 pub(crate) fn replace_with(
     st: &Catalog,
     name: &str,
@@ -105,13 +132,30 @@ pub(crate) fn replace_with(
     keep_replaced: bool,
     drain: Duration,
 ) -> Result<Dataset, BackupError> {
+    swap(st, name, restored, task, keep_replaced, drain, None)
+}
+
+fn swap(
+    st: &Catalog,
+    name: &str,
+    restored: &Path,
+    task: &str,
+    keep_replaced: bool,
+    drain: Duration,
+    reservation: Option<Reservation>,
+) -> Result<Dataset, BackupError> {
     let _span = tracing::info_span!(
         "restore.swap",
         "db.namespace" = name,
         "sparkles.task" = task
     )
     .entered();
-    let _restoring = if st.restoring_by(name).as_deref() == Some(task) {
+    // Operations that close callbacks defer run once the whole swap returns, after
+    // the reservation below is released, because it is declared after the scope.
+    let _batch = st.batch_scope();
+    let _restoring = if reservation.is_some() {
+        reservation
+    } else if st.restoring_by(name).as_deref() == Some(task) {
         None
     } else {
         Some(
@@ -123,7 +167,10 @@ pub(crate) fn replace_with(
     while st.get(name).is_some_and(|d| d.in_use_without_self()) && t0.elapsed() < drain {
         std::thread::sleep(Duration::from_millis(5));
     }
-    let Some(old) = st.detach_for_swap(name) else {
+    let detached = st
+        .detach_for_swap(name)
+        .map_err(|e| BackupError::new(Code::DatasetBusy, e.to_string()))?;
+    let Some(old) = detached else {
         return Err(match st.get(name) {
             Some(_) => BackupError::new(
                 Code::NotManaged,
@@ -196,7 +243,11 @@ pub(crate) fn replace_with(
         }
         #[cfg(test)]
         close_hook(CloseStage::Proof, attempt);
-        match old.close_for_disposal(|| {}) {
+        let closed = {
+            let _disposing = st.disposal_scope();
+            old.close_for_disposal(|| {})
+        };
+        match closed {
             Ok(reasoning) => break reasoning,
             Err(refused) => {
                 old = refused.dataset;

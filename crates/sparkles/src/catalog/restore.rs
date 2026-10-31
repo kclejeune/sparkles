@@ -92,6 +92,8 @@ impl super::Catalog {
         reservation: super::Reservation,
         restored: &Path,
     ) -> crate::Result<crate::Dataset> {
+        // A close callback's refusal keeps the staged directory and its error kind.
+        self.check_manageable()?;
         super::swap::publish_new(self, reservation, restored).map_err(crate::backup::error)
     }
     #[doc(hidden)]
@@ -102,12 +104,14 @@ impl super::Catalog {
         task: &str,
         keep: bool,
     ) -> crate::Result<crate::Dataset> {
+        // A close callback's refusal comes before any drain or error translation.
+        self.check_manageable()?;
         if !std::sync::Arc::ptr_eq(&self.inner, &reservation.catalog.inner)
             || self.restoring_by(reservation.name()).as_deref() != Some(task)
         {
             return Err(crate::Error::invalid("invalid restore reservation"));
         }
-        super::swap::replace_in_place(self, reservation.name(), restored, task, keep)
+        super::swap::replace_reserved(self, reservation, restored, task, keep)
             .map_err(crate::backup::error)
     }
     #[doc(hidden)]

@@ -27,7 +27,15 @@ the original allocations and files. Release those aliases and retry. An in-place
 retries the proof itself until its drain time ends. Built-in worker and
 branch references use revocable links, so idle cached branches can close without changing
 the public StoreHandle variants. Close callbacks run after catalog lookup exclusion ends.
-Callbacks may look up datasets but must defer catalog mutations until disposal returns.
+Callbacks may look up datasets. A catalog management call from a callback on the disposing
+thread, such as create, delete or rename, fails at once with a `catalog-disposing` conflict.
+`Catalog::defer` queues the call instead, and the delete, rename or restore runs it on the
+same thread after releasing the catalog and before returning. A deferred call that panics
+is logged and later calls still run. Calls that deferred calls defer in turn run in the
+same loop. A reserved clone or restore publication refused this way leaves its files and
+staged directory in place. A deferred open or an expected attach refused this way keeps its name
+opening or expected for the startup code that owns it. Deferred calls are kept only in memory, so callbacks
+must be idempotent. Management calls from other threads wait for the disposal as before.
 Members closed during unwinding can skip checkpoints that require a clean close.
 The runtime retains root exclusion through required resource shutdown.
 

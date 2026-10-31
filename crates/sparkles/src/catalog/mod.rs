@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod gate;
 #[cfg(test)]
 mod lifecycle_tests;
 mod rename;
@@ -213,7 +214,8 @@ pub(crate) struct Inner {
     /// Names that a program will attach once its registered datasets are open
     /// ([`expect`](Catalog::expect)); nothing else may take them meanwhile.
     expected: Mutex<BTreeSet<String>>,
-    manage: Mutex<()>,
+    /// Serializes management calls (see the `gate` module).
+    manage: gate::ManageGate,
     #[cfg(feature = "backup")]
     pub(crate) repositories: Mutex<Option<crate::backup::Repositories>>,
     // Drop the lock only after the stores have closed.
@@ -310,7 +312,7 @@ impl Catalog {
                 refused: Mutex::new(BTreeMap::new()),
                 opening: Mutex::new(BTreeSet::new()),
                 expected: Mutex::new(BTreeSet::new()),
-                manage: Mutex::new(()),
+                manage: gate::ManageGate::new(),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
                 _lock: Some(lock),
@@ -361,6 +363,9 @@ impl Catalog {
     /// that fails to open, or panics while opening, stays registered and closed, and
     /// [`refusal`](Self::refusal) gives the reason. The error is returned as well.
     pub fn open_registered(&self, name: &str) -> Result<()> {
+        // A call from a close callback of this catalog is refused before anything
+        // changes, so the name stays opening for the opener that owns it.
+        self.check_manageable()?;
         if !self.inner.opening.lock().contains(name) {
             return Err(Error::Conflict(format!(
                 "dataset /{name} is not waiting to open"
@@ -390,8 +395,9 @@ impl Catalog {
         // Under the registry lock, so that a save in between sees the dataset either
         // detached or published. The dataset enters its final state (published or
         // refused) before it leaves `opening`, so a lookup always finds it in one of
-        // them.
-        let _g = self.inner.manage.lock();
+        // them. The check above makes this lock infallible, so the dataset always
+        // reaches its final state.
+        let _g = self.manage_internal();
         let result = match opened {
             Ok(ds) => {
                 let reasoning = self
@@ -455,7 +461,7 @@ impl Catalog {
     /// its registered datasets are open. Until then the name cannot be created,
     /// attached, renamed into or restored into, as for a dataset that is opening.
     pub fn expect(&self, name: &str) -> Result<()> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.available(name, false)?;
         self.inner.expected.lock().insert(name.into());
         Ok(())
@@ -466,9 +472,11 @@ impl Catalog {
     }
     /// Attach a dataset under a name that [`expect`](Self::expect) took. The name is
     /// released whether the attach succeeds or not, and only after the dataset is
-    /// registered when it does.
+    /// registered when it does. A call refused with a `catalog-disposing` conflict,
+    /// because it comes from a close callback of this catalog, leaves the name taken
+    /// for the program that expects it.
     pub fn attach_expected(&self, name: &str, source: Attach) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         if !self.inner.expected.lock().contains(name) {
             return Err(Error::Conflict(format!("dataset /{name} is not expected")));
         }
@@ -493,7 +501,7 @@ impl Catalog {
                 refused: Mutex::new(BTreeMap::new()),
                 opening: Mutex::new(BTreeSet::new()),
                 expected: Mutex::new(BTreeSet::new()),
-                manage: Mutex::new(()),
+                manage: gate::ManageGate::new(),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
                 _lock: None,
@@ -744,7 +752,7 @@ impl Catalog {
         Ok(())
     }
     pub fn create(&self, name: &str, req: &CreateDataset) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.available(name, true)?;
         let ds = self.open_dataset(name, req.kind, None)?;
         let result = (|| {
@@ -773,7 +781,7 @@ impl Catalog {
         Ok(ds)
     }
     pub fn attach(&self, name: &str, source: Attach) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.available(name, false)?;
         self.attach_locked(name, source)
     }
@@ -801,7 +809,7 @@ impl Catalog {
     /// large dataset does not hold up other catalog operations.
     pub fn delete(&self, name: &str) -> Result<bool> {
         let trash = {
-            let _g = self.inner.manage.lock();
+            let _g = self.manage()?;
             if self.is_opening(name) || self.inner.expected.lock().contains(name) {
                 return Err(Error::Conflict(format!("dataset /{name} is opening")));
             }
@@ -831,7 +839,10 @@ impl Catalog {
                 let root = entry.dataset.store().root().map(Path::to_path_buf);
                 let id = entry.dataset.dataset_id();
                 self.hold_closing_locked(name, &entry.dataset);
-                let closed = entry.dataset.close_for_disposal(|| drop(map.take()));
+                let closed = {
+                    let _disposing = self.disposal_scope();
+                    entry.dataset.close_for_disposal(|| drop(map.take()))
+                };
                 // A committed close that unwinds out of this call leaves the dataset
                 // registered and closed, never absent from what later saves write.
                 self.inner.detached.lock().remove(name);
@@ -974,7 +985,7 @@ impl Catalog {
     /// Rename an alias, retaining its UUID. Persistent datasets must have no live
     /// handles, including branch handles, so that the old store can be closed.
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.available(to, true)?;
         if self.is_opening(from) || self.inner.expected.lock().contains(from) {
             return Err(Error::Conflict(format!("dataset /{from} is opening")));
@@ -1020,7 +1031,10 @@ impl Catalog {
         let dir = self.dir().expect("persistent catalog");
         let id = entry.dataset.dataset_id();
         self.hold_closing_locked(from, &entry.dataset);
-        let closed = entry.dataset.close_for_disposal(|| drop(map.take()));
+        let closed = {
+            let _disposing = self.disposal_scope();
+            entry.dataset.close_for_disposal(|| drop(map.take()))
+        };
         // As in delete, only an unwinding committed close keeps this record.
         self.inner.detached.lock().remove(from);
         let reasoning = match closed {
@@ -1137,7 +1151,7 @@ impl Catalog {
         }
     }
     pub fn reserve(&self, name: &str, kind: ReservationKind, holder: &str) -> Result<Reservation> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         // Restore may reserve an existing managed dataset for an in-place swap.
         if kind == ReservationKind::Restore && self.get(name).is_some() {
             if self.reserved_by(name).is_some() {
@@ -1186,7 +1200,7 @@ impl Catalog {
         Ok(())
     }
     pub(crate) fn adopt(&self, reservation: Reservation) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.check_reservation(&reservation)?;
         let name = reservation.name();
         let ds = self.open_existing_dataset(name, None);
@@ -1215,7 +1229,7 @@ impl Catalog {
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         origin: serde_json::Value,
     ) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.check_reservation(&reservation)?;
         let name = reservation.name();
         let opts = DatasetOptions {
@@ -1271,6 +1285,8 @@ impl Catalog {
     ) -> Result<(Dataset, crate::store::CloneReport)> {
         ctl.check()?;
         self.check_reservation(&r)?;
+        // Refuse before the copy publishes a directory that adopt could not register.
+        self.check_manageable()?;
         let kind = req.kind.unwrap_or(if ds.store().root().is_some() {
             DatasetKind::Persistent
         } else {
@@ -1360,7 +1376,7 @@ impl Catalog {
     /// catalog saves after its own changes. Programs that change a dataset's reasoning
     /// record outside the catalog call this to persist it.
     pub fn save(&self) -> Result<()> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.save_locked()
     }
     fn save_locked(&self) -> Result<()> {
@@ -1398,16 +1414,18 @@ impl Catalog {
     /// restore. It stays registered in what [`save`](Self::save) writes until it is
     /// reinserted or reattached.
     #[cfg_attr(not(feature = "backup"), allow(dead_code))]
-    pub(crate) fn detach_for_swap(&self, name: &str) -> Option<Dataset> {
-        let _g = self.inner.manage.lock();
+    pub(crate) fn detach_for_swap(&self, name: &str) -> Result<Option<Dataset>> {
+        let _g = self.manage()?;
         let mut map = self.inner.entries.write();
         if !map
             .get(name)
             .is_some_and(|e| e.kind == DatasetKind::Persistent && !e.attached)
         {
-            return None;
+            return Ok(None);
         }
-        let ds = map.remove(name)?.dataset;
+        let Some(ds) = map.remove(name).map(|e| e.dataset) else {
+            return Ok(None);
+        };
         self.inner.detached.lock().insert(
             name.into(),
             Detached {
@@ -1415,12 +1433,14 @@ impl Catalog {
                 reasoning: ds.reasoning_record(),
             },
         );
-        Some(ds)
+        Ok(Some(ds))
     }
     /// Put back a dataset taken out by [`detach_for_swap`](Self::detach_for_swap).
+    /// Only swap recovery calls it, outside any disposal and without the lock, so it
+    /// cannot be refused.
     #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub(crate) fn reinsert(&self, name: &str, ds: Dataset) {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage_internal();
         self.inner.entries.write().insert(
             name.into(),
             Entry {
@@ -1433,13 +1453,13 @@ impl Catalog {
     }
     #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub(crate) fn reattach(&self, name: &str) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         self.reattach_locked(name, None)?;
         Ok(self.get(name).expect("reattached"))
     }
     #[cfg(feature = "backup")]
     fn reattach_expected(&self, name: &str, expected: Option<Uuid>) -> Result<Dataset> {
-        let _g = self.inner.manage.lock();
+        let _g = self.manage()?;
         if self.get(name).is_some() {
             return Err(Error::Conflict(format!("dataset '{name}' already exists")));
         }
