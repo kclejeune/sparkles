@@ -1238,11 +1238,23 @@ impl<'a> Planner<'a> {
             }
             GP::OrderBy { inner, expression } => {
                 let child = self.plan(inner, g, Vec::new())?;
+                let bound = if self.ctx.opt.bound_order_keys {
+                    bound_expressions(inner)
+                } else {
+                    Vec::new()
+                };
                 let keys = expression
                     .iter()
-                    .map(|o| match o {
-                        OrderExpression::Asc(e) => (self.compile(e, g), true),
-                        OrderExpression::Desc(e) => (self.compile(e, g), false),
+                    .map(|o| {
+                        let (e, asc) = match o {
+                            OrderExpression::Asc(e) => (e, true),
+                            OrderExpression::Desc(e) => (e, false),
+                        };
+                        let e = match bound.iter().find(|(_, x)| *x == e) {
+                            Some((v, _)) => self.compile(&Expression::Variable((*v).clone()), g),
+                            None => self.compile(e, g),
+                        };
+                        (e, asc)
                     })
                     .collect::<Vec<_>>();
                 let desc = keys
@@ -4371,6 +4383,66 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
             .ok()? as f64;
     }
     Some((rows.min(n.est), ids.len()))
+}
+
+/// The variables that the BINDs directly under an ORDER BY (a chain of `Extend`s, as
+/// SELECT expressions and BIND produce) bind to an expression whose value depends only
+/// on the row. An ORDER BY key equal to such an expression orders by its variable: the
+/// variable holds the expression's value, and is unbound where the expression is an
+/// error, which orders as the error does.
+fn bound_expressions(
+    gp: &GraphPattern,
+) -> Vec<(&spargebra::term::Variable, &spargebra::algebra::Expression)> {
+    let mut out = Vec::new();
+    let mut gp = gp;
+    while let GraphPattern::Extend {
+        inner,
+        variable,
+        expression,
+    } = gp
+    {
+        if row_determined(expression) {
+            out.push((variable, expression));
+        }
+        gp = inner;
+    }
+    out
+}
+
+/// Whether an expression's value is the same each time it is evaluated on a row: no
+/// random or fresh values, no EXISTS, and no function outside SPARQL and the XSD casts.
+fn row_determined(e: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::{Expression as E, Function as F};
+    match e {
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => true,
+        E::Exists(_) => false,
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => row_determined(a) && row_determined(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => row_determined(a),
+        E::In(a, l) => row_determined(a) && l.iter().all(row_determined),
+        E::If(a, b, c) => row_determined(a) && row_determined(b) && row_determined(c),
+        E::Coalesce(l) => l.iter().all(row_determined),
+        E::FunctionCall(f, args) => {
+            let fixed = match f {
+                F::BNode | F::Rand | F::Uuid | F::StrUuid => false,
+                F::Custom(iri) => iri
+                    .as_str()
+                    .starts_with("http://www.w3.org/2001/XMLSchema#"),
+                _ => true,
+            };
+            fixed && args.iter().all(row_determined)
+        }
+    }
 }
 
 /// Comparison of the range variable with a constant: `?v op c`.

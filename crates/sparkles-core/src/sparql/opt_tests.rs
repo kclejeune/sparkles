@@ -2245,3 +2245,33 @@ fn numeric_comparisons_on_an_unordered_column_match_the_generic_filter() {
         );
     }
 }
+
+// ------------------------------------------------------------ bound ORDER BY keys ------
+
+#[test]
+fn order_keys_equal_to_a_select_expression_order_by_its_variable() {
+    let s = range_store();
+    for text in [
+        "SELECT ?s (?v * 2 AS ?w) WHERE { ?s ex:v ?v } ORDER BY DESC(?v * 2) ?s LIMIT 7",
+        "SELECT ?s ?w WHERE { ?s ex:v ?v BIND(xsd:float(?v) / 3 AS ?w) } ORDER BY ?s DESC(xsd:float(?v) / 3) LIMIT 7",
+        "SELECT ?s (STR(?v) AS ?w) WHERE { ?s ex:v ?v } ORDER BY STR(?v) ?s OFFSET 3 LIMIT 5",
+        "SELECT ?s (?v * 2 AS ?w) WHERE { ?s ex:v ?v FILTER(?v < 10) } ORDER BY (?v * 2) ?s",
+    ] {
+        let a = run(&s, text, Optimizations::ALL);
+        let b = run(&s, text, Optimizations::NONE);
+        // ordered results: the rows must also come in the same order
+        let rows = |r: &QueryResult| -> Vec<String> {
+            r.rows().into_iter().map(|row| format!("{row:?}")).collect()
+        };
+        assert_eq!(rows(&a), rows(&b), "{text}");
+        assert!(has_desc(&a.plan, "(?w)"), "{text}: {:#?}", a.plan);
+        assert!(!has_desc(&b.plan, "(?w)"), "{text}");
+    }
+    // a random value is evaluated again
+    let r = run(
+        &s,
+        "SELECT ?s (RAND() * ?v AS ?w) WHERE { ?s ex:v ?v } ORDER BY (RAND() * ?v) LIMIT 2",
+        Optimizations::ALL,
+    );
+    assert!(!has_desc(&r.plan, "(?w)"));
+}

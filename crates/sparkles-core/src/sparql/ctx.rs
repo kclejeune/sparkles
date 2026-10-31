@@ -205,6 +205,9 @@ pub struct Optimizations {
     /// ORDER BY with LIMIT keeps the best rows in a bounded heap of offset + limit rows,
     /// evaluating the later keys only for rows whose first key can still enter
     pub topk_heap: bool,
+    /// an ORDER BY key equal to the expression of a BIND or SELECT expression directly
+    /// below it orders by that expression's variable instead of evaluating it again
+    pub bound_order_keys: bool,
     /// the vocabulary groups that hold a query's constants are requested together before
     /// the planner looks the constants up one after the other
     pub prefetch_constants: bool,
@@ -228,7 +231,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 45] = [
+    pub const NAMES: [&str; 46] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -267,6 +270,7 @@ impl Optimizations {
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
+        "bound_order_keys",
         "prefetch_constants",
         "prefetch_terms",
         "prefetch_first_scan",
@@ -316,6 +320,7 @@ impl Optimizations {
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
+        bound_order_keys: true,
         prefetch_constants: true,
         prefetch_terms: true,
         prefetch_first_scan: true,
@@ -365,6 +370,7 @@ impl Optimizations {
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
+        bound_order_keys: false,
         prefetch_constants: false,
         prefetch_terms: false,
         prefetch_first_scan: false,
@@ -414,6 +420,7 @@ impl Optimizations {
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,
+            "bound_order_keys" => &mut self.bound_order_keys,
             "prefetch_constants" => &mut self.prefetch_constants,
             "prefetch_terms" => &mut self.prefetch_terms,
             "prefetch_first_scan" => &mut self.prefetch_first_scan,
