@@ -311,10 +311,14 @@ jobs:
             echo "$((memory_kib / 1024 / 1024)) GiB of memory, so no swap file"
             exit 0
           fi
-          if ! { sudo fallocate -l 16G /swapfile-ci && sudo chmod 600 /swapfile-ci &&
-            sudo mkswap /swapfile-ci > /dev/null && sudo swapon /swapfile-ci; }; then
+          # A name of its own, so a persistent runner never touches another job's swap file
+          swapfile="/swapfile-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          if ! sudo fallocate -l 16G "$swapfile"; then
             echo '::warning::the runner refused a swap file'
-            sudo rm -f /swapfile-ci
+          elif ! { sudo chmod 600 "$swapfile" && sudo mkswap "$swapfile" > /dev/null &&
+            sudo swapon "$swapfile"; }; then
+            echo '::warning::the runner refused a swap file'
+            sudo rm -f "$swapfile" || true
           fi
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
@@ -355,6 +359,8 @@ jobs:
           rm "$RUNNER_TEMP/raw.tar.zst"
           tar -cf "$RUNNER_TEMP/archive/ui-build.tar" ui/build
           cp "$RUNNER_TEMP/archive/ui-build.tar" "$RUNNER_TEMP/heavy/"
+          echo "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/archive/build-workspace"
+          cp "$RUNNER_TEMP/archive/build-workspace" "$RUNNER_TEMP/heavy/"
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
       - name: Disk space after test archive
         if: ${{ always() }}
@@ -451,11 +457,22 @@ jobs:
       # cargo-nextest is called directly: the archive needs no Cargo, and calling cargo
       # would make rustup install the pinned toolchain first. The archive is extracted
       # into the checkout, where the build job's target directory was, because tests find
-      # the server binary and the UI by paths fixed at compile time.
+      # the server binary, the UI and their fixtures by paths fixed at compile time. When
+      # the build ran on a runner with another checkout path, as when only one of the
+      # runner variables is set, a link from that path leads to this checkout.
       - name: mbx nextest
         env:
           SHARD: ${{ matrix.shard }}
         run: |
+          build_workspace=$(cat "$RUNNER_TEMP/build-workspace")
+          if [ "$build_workspace" != "$GITHUB_WORKSPACE" ]; then
+            if [ -e "$build_workspace" ]; then
+              echo "the build's checkout path $build_workspace exists on this runner" >&2
+              exit 1
+            fi
+            sudo mkdir -p "$(dirname "$build_workspace")"
+            sudo ln -s "$GITHUB_WORKSPACE" "$build_workspace"
+          fi
           tar -xf "$RUNNER_TEMP/ui-build.tar"
           # A timing test outside TIMING_BINARIES runs in a numbered or heavy shard instead.
           timing="($TIMING_BINARIES) & ($TIMING)"
