@@ -523,6 +523,7 @@ impl PyDataset {
         );
         let flag = cancel.clone();
         let hook = signals.publish_hook();
+        let _writing = StreamWrite::begin(&ds);
         interrupt::run_stream(py, &signals, move || {
             let o = sparkles::guard::WriteOptions {
                 cancel: Some(flag),
@@ -1418,6 +1419,7 @@ impl PyDataset {
             signals
         });
         let hook = signals.as_ref().map(interrupt::StreamSignals::publish_hook);
+        let _writing = signals.as_ref().map(|_| StreamWrite::begin(&ds));
         let r = interrupt::controlled_stream(py, flag, signals, progress, timeout, move |ctl| {
             ctl.progress.report(0.0, "replacing data");
             ctl.check()?;
@@ -1570,6 +1572,42 @@ fn writer_slot(ds: &sparkles::Dataset) -> WriterSlot {
     slot
 }
 
+/// The calling thread marked as the dataset's writer while a load or replacement from a
+/// file object runs on its own thread. Its signal handlers run on this thread while the
+/// write may hold the writer lock and wait for them, so a write that a handler makes to
+/// the same dataset is refused by [`check_transaction`] instead of waiting for that lock.
+/// The mark is cleared when this is dropped, on every path.
+struct StreamWrite {
+    slot: WriterSlot,
+    marked: bool,
+}
+
+impl StreamWrite {
+    fn begin(ds: &sparkles::Dataset) -> StreamWrite {
+        let slot = writer_slot(ds);
+        let marked = {
+            let mut owner = slot.lock().unwrap_or_else(|e| e.into_inner());
+            // another thread's open transaction keeps its mark, and this write waits for it
+            let free = owner.is_none();
+            if free {
+                *owner = Some(std::thread::current().id());
+            }
+            free
+        };
+        StreamWrite { slot, marked }
+    }
+}
+
+impl Drop for StreamWrite {
+    fn drop(&mut self) {
+        let mut owner = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        // a transaction that another thread began once this write ended keeps its mark
+        if self.marked && *owner == Some(std::thread::current().id()) {
+            *owner = None;
+        }
+    }
+}
+
 /// Reject waiting for a store lock owned by this Python thread's transaction.
 /// Checking the shared state also covers aliases obtained through a catalog.
 pub(crate) fn check_transaction(py: Python<'_>, ds: &sparkles::Dataset) -> PyResult<()> {
@@ -1577,7 +1615,7 @@ pub(crate) fn check_transaction(py: Python<'_>, ds: &sparkles::Dataset) -> PyRes
         return Err(new_err(
             py,
             "ConflictError",
-            "this thread has an open transaction on the dataset: finish the transaction before this operation",
+            "this thread has an open transaction on the dataset, or a load or replacement from a file object: finish it before this operation",
         ));
     }
     Ok(())

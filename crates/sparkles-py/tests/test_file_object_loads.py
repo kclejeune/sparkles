@@ -521,21 +521,30 @@ def test_an_interrupt_in_the_last_compressed_read_commits_nothing(tmp_path: Path
     assert all(line.endswith("interrupted 1") for line in lines), lines
 
 
-def test_a_slow_stream_stops_at_the_replacement_timeout() -> None:
+@pytest.mark.parametrize("head", ["plain", "gzip-name"])
+def test_a_slow_stream_stops_at_the_replacement_timeout(head) -> None:
+    """A stream that trickles one byte every 25 ms stops at a 30 ms timeout, also inside
+    a gzip header whose file name never ends, which the decoder reads byte by byte."""
     out = run_child(
         """
-        import io, time
+        import io, sys, time
         import sparkles
+        # magic, deflate, the FNAME flag, time, flags and OS
+        start = bytes([0x1F, 0x8B, 8, 0x08, 0, 0, 0, 0, 0, 3]) if sys.argv[1] == "gzip-name" else b""
 
         class Trickle(io.RawIOBase):
             def __init__(self):
                 self.reads = 0
+                self.start = start
             def readable(self):
                 return True
             def read(self, n=-1):
                 self.reads += 1
+                if self.start:
+                    chunk, self.start = self.start[:n], self.start[n:]
+                    return chunk
                 time.sleep(0.025)
-                return b" "
+                return b"a" if start else b" "
 
         ds = sparkles.Dataset()
         ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
@@ -545,9 +554,104 @@ def test_a_slow_stream_stops_at_the_replacement_timeout() -> None:
             ds.replace(src, format="nt", timeout=0.03)
             print("replaced")
         except sparkles.QueryTimeoutError:
-            print("timeout", time.perf_counter() - t < 0.5, src.reads < 10, len(ds))
+            print("timeout", time.perf_counter() - t < 0.5, src.reads < 12, len(ds))
         """,
+        head,
         timeout=60,
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.split() == ["timeout", "True", "True", "1"]
+
+
+def brotli_nt(tmp_path: Path, n: int) -> bytes:
+    ds = Dataset()
+    ds.load(nt(n), "nt")
+    path = tmp_path / "d.nt.br"
+    ds.dump(path, format="nt")
+    return path.read_bytes()
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="no SIGUSR1")
+def test_a_handler_that_writes_the_loading_dataset_is_refused_at_once(tmp_path: Path) -> None:
+    out = run_child(
+        """
+        import io, signal, sys
+        import sparkles
+        raw = %r
+
+        class SignalAtLastData(io.RawIOBase):
+            def __init__(self):
+                self.pos = 0
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                chunk = raw[self.pos : self.pos + min(n, 1000)]
+                self.pos += len(chunk)
+                if chunk and self.pos == len(raw):
+                    signal.raise_signal(signal.SIGUSR1)
+                return chunk
+
+        other = sparkles.Dataset()
+        for kind in ["load", "replace"]:
+            ds = sparkles.Dataset()
+            ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+            seen = []
+            def handler(*_):
+                # reads and writes to another dataset work, a write to this one is refused
+                seen.append(ds.ask("ASK { ?s ?p ?o }"))
+                other.load('<http://e/o> <http://e/p> <http://e/q> .', "nt")
+                try:
+                    ds.load('<http://e/x> <http://e/y> <http://e/z> .', "nt")
+                    seen.append("wrote")
+                except sparkles.ConflictError:
+                    seen.append("refused")
+            signal.signal(signal.SIGUSR1, handler)
+            if kind == "load":
+                ds.load(SignalAtLastData(), "nt", compression="brotli")
+            else:
+                ds.replace(SignalAtLastData(), format="nt", compression="brotli")
+            # the mark is gone afterwards
+            ds.load('<http://e/after> <http://e/y> <http://e/z> .', "nt")
+            print(kind, seen, len(ds) > 1)
+        """
+        % brotli_nt(tmp_path, 3000),
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == ["load [True, 'refused'] True", "replace [True, 'refused'] True"]
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="no SIGUSR1")
+def test_a_handler_that_waits_past_the_timeout_leaves_the_data(tmp_path: Path) -> None:
+    out = run_child(
+        """
+        import io, signal, time
+        import sparkles
+        raw = %r
+
+        class SignalAtLastData(io.RawIOBase):
+            def __init__(self):
+                self.pos = 0
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                chunk = raw[self.pos : self.pos + min(n, 1000)]
+                self.pos += len(chunk)
+                if chunk and self.pos == len(raw):
+                    signal.raise_signal(signal.SIGUSR1)
+                return chunk
+
+        signal.signal(signal.SIGUSR1, lambda *_: time.sleep(0.4))
+        ds = sparkles.Dataset()
+        ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+        try:
+            ds.replace(SignalAtLastData(), format="nt", compression="brotli", timeout=0.2)
+            print("replaced", len(ds))
+        except sparkles.QueryTimeoutError:
+            print("timeout", len(ds), ds.ask("ASK { <http://e/a> <http://e/b> <http://e/c> }"))
+        """
+        % brotli_nt(tmp_path, 3000),
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["timeout", "1", "True"]
