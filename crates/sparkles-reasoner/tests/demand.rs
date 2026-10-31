@@ -1618,7 +1618,8 @@ fn equality_table_keeps_generalized_facts() {
 }
 
 /// `now` gives each session its own time, so a program that reads it does not keep
-/// the equality stages' facts: a later session derives its own time only.
+/// the equality stages' facts: a later session derives its own time only, not the
+/// time of a session before it.
 #[test]
 fn equality_table_is_not_kept_for_programs_that_read_now() {
     let profile = Profile::Rules(format!(
@@ -1633,9 +1634,15 @@ fn equality_table_is_not_kept_for_programs_that_read_now() {
     let q = "SELECT ?t { ex:a ex:out ?t }";
     let mut options = demand(&qr);
     options.no_cache = true;
+    let mut seen: Vec<String> = Vec::new();
     for i in 0..3 {
         let got = rows(&run(&s, q, &options));
         assert_eq!(got.len(), 1, "session {i}: {got:?}");
+        assert!(
+            !seen.contains(&got[0]),
+            "session {i} got an earlier session's time: {got:?} after {seen:?}"
+        );
+        seen.push(got[0].clone());
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
