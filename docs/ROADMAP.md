@@ -89,8 +89,8 @@ resources and source identity go ahead of unrelated feature expansion.
 
 Wave A holds the work that most improves the engine against objective measures.
 
-* Competitive benchmark losses come first. The remaining order is BSBM Explore `q7`
-  and `q8` and BI `q3`, as
+* Competitive benchmark losses come first. The order is a forge recheck of SP²Bench
+  `q11` after item 431, then BSBM Explore `q7` and `q8` and BI `q3`, as
   [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records them. Durable commits and
   mixed-load writes follow through items 86, 111, 112 and 171, and cold point lookups
   through item 4.
