@@ -501,10 +501,18 @@ impl KeySet {
         if let Some(right) = split {
             let left = self.root.take().expect("the root is set");
             meter.add(owned_bytes(&right));
+            // the root gets the room a copy has, so the inserts that fill it later
+            // do not grow its vectors past what the meter counted here
+            let mut lasts = Vec::with_capacity(BRANCH_CAP + 1);
+            lasts.extend([left.last(), right.last()]);
+            let mut counts = Vec::with_capacity(BRANCH_CAP + 1);
+            counts.extend([left.total(), right.total()]);
+            let mut children = Vec::with_capacity(BRANCH_CAP + 1);
+            children.extend([left, Arc::new(right)]);
             let root = Node::Branch(Branch {
-                lasts: vec![left.last(), right.last()],
-                counts: vec![left.total(), right.total()],
-                children: vec![left, Arc::new(right)],
+                lasts,
+                counts,
+                children,
             });
             meter.add(owned_bytes(&root));
             self.root = Some(Arc::new(root));
@@ -807,6 +815,24 @@ mod tests {
         }
         // a clone that writes nothing owns nothing
         assert_eq!(base.clone().unshared_bytes(|| Ok(())).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn metered_inserts_into_an_empty_set_count_every_node() {
+        // New roots and their children are written by the metered path alone, so a
+        // root that grows its vectors later must be counted too.
+        for count in [100u64, 1_000, 5_000, 40_000] {
+            let mut set = KeySet::new();
+            let mut counted = 0u64;
+            for i in 0..count {
+                assert!(set.insert_metered([i, 0, 0, 0], &mut counted));
+            }
+            let (owned, _) = set.unshared_bytes(|| Ok(())).unwrap();
+            assert!(
+                counted >= owned,
+                "{count} inserts counted {counted} of {owned}"
+            );
+        }
     }
     use super::*;
     use std::collections::BTreeSet;
