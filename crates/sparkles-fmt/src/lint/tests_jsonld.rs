@@ -527,3 +527,115 @@ fn a_query_made_from_a_key_is_not_placed_on_another_string() {
         found(&doc)
     );
 }
+
+/// A JSON-LD document of about `bytes` bytes: filler nodes, and `queries` nodes that each
+/// hold a query of their own with an undefined prefix.
+fn big_shapes(bytes: usize, queries: usize) -> String {
+    let mut doc =
+        String::from(r#"{"@context": {"sh": "http://www.w3.org/ns/shacl#"}, "@graph": ["#);
+    for i in 0..queries {
+        doc.push_str(&format!(
+            r#"{{"@id": "urn:q{i}", "sh:select": "SELECT $this {{ $this p:p{i} ?o FILTER(?o) }}"}},"#
+        ));
+    }
+    let mut i = 0;
+    while doc.len() < bytes {
+        doc.push_str(&format!(r#"{{"@id": "urn:f{i}", "http://x/p": "v{i}"}},"#));
+        i += 1;
+    }
+    doc.push_str(r#"{"@id": "urn:end"}]}"#);
+    doc
+}
+
+#[test]
+fn a_large_json_ld_document_keeps_to_a_short_deadline() {
+    let doc = big_shapes(7 << 20, 20);
+    let opts = LintOptions {
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(25)),
+        ..LintOptions::default()
+    };
+    let start = std::time::Instant::now();
+    let r = lint(&doc, Language::JsonLd, &opts);
+    assert!(matches!(r, Ok(_) | Err(LintError::Timeout)));
+    // generous slack over the 25 ms deadline
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn probes_without_a_deadline_stay_within_their_work_budget() {
+    // as in the browser: no deadline, many queries, a large document
+    let doc = big_shapes(2 << 20, 100);
+    jsonld::PROBED.with(|p| p.set(0));
+    let start = std::time::Instant::now();
+    let d = diags(&doc);
+    let took = start.elapsed();
+    let probed = jsonld::PROBED.with(std::cell::Cell::get);
+    assert!(probed <= 4 * doc.len(), "{probed} of {}", doc.len());
+    assert!(probed > 0);
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    // the queries that were probed are linted, the rest are skipped
+    let found = d.iter().filter(|d| d.rule == "undefined-prefix").count();
+    assert!(found <= 100, "{found}");
+    // a small document has room for all of its probes
+    let doc = big_shapes(0, 5);
+    let found = diags(&doc)
+        .iter()
+        .filter(|d| d.rule == "undefined-prefix")
+        .count();
+    assert_eq!(found, 5);
+}
+
+#[test]
+fn a_probe_stops_at_the_deadline_inside_the_expansion() {
+    let doc = big_shapes(7 << 20, 1);
+    let at = doc.find("SELECT").unwrap() - 1;
+    let end = at + doc[at + 1..].find('"').unwrap() + 2;
+    let s = jsonld::Str {
+        value: doc[at + 1..end - 1].to_string(),
+        start: at,
+        end,
+    };
+    // what one whole expansion of the document takes here, the measure of the slack
+    let t0 = std::time::Instant::now();
+    assert!(jsonld_quads(&doc).is_some());
+    let whole = t0.elapsed();
+    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(25));
+    let mut work = jsonld::Work::new(doc.len());
+    work.expansion_takes(whole, deadline);
+    let start = std::time::Instant::now();
+    let r = jsonld::probe(
+        &doc,
+        &s,
+        "http://www.w3.org/ns/shacl#select",
+        1,
+        (1, 0),
+        deadline,
+        &mut work,
+    );
+    assert!(matches!(r, Ok(false) | Err(LintError::Timeout)), "{r:?}");
+    // the probe stops well before it could have expanded the whole document
+    let took = start.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(25) + whole / 2,
+        "{took:?} against {whole:?} for one expansion"
+    );
+}
+
+#[test]
+fn json_ld_over_the_probe_limit_gets_no_queries_and_no_fixes() {
+    let mut doc = big_shapes(jsonld::PROBE_LIMIT + 1, 1);
+    // a fixable finding at the start
+    doc.insert_str(
+        1,
+        r#""@id": "urn:t", "http://x/p": {"@value": "a", "@language": "EN"}, "#,
+    );
+    let d = diags(&doc);
+    assert!(d.iter().all(|d| d.rule != "undefined-prefix"));
+    let tag: Vec<_> = d.iter().filter(|d| d.rule == "language-tag-case").collect();
+    assert_eq!(tag.len(), 1);
+    assert!(tag[0].fix.is_none());
+}

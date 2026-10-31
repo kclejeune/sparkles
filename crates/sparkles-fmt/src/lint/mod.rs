@@ -524,6 +524,48 @@ fn jsonld_quads(text: &str) -> Option<Vec<oxrdf::Quad>> {
         .ok()
 }
 
+/// Stream the expansion of a JSON-LD document to `each`, quad by quad, with the deadline
+/// checked every 1,024 quads and at the end. `Ok(false)` when the document cannot be
+/// expanded here.
+fn jsonld_stream(
+    text: &str,
+    deadline: Option<Instant>,
+    mut each: impl FnMut(oxrdf::Quad),
+) -> Result<bool, LintError> {
+    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    out_of_time(deadline)?;
+    let Ok(parser) = oxjsonld::JsonLdParser::new().with_base_iri(crate::check::graph::RDF_BASE)
+    else {
+        return Ok(false);
+    };
+    for (i, q) in parser.for_slice(body).enumerate() {
+        if i % 1024 == 1023 {
+            out_of_time(deadline)?;
+        }
+        match q {
+            Ok(q) => each(q),
+            Err(_) => return Ok(false),
+        }
+    }
+    out_of_time(deadline)?;
+    Ok(true)
+}
+
+/// [`jsonld_quads`] within the deadline.
+fn jsonld_quads_within(
+    text: &str,
+    deadline: Option<Instant>,
+) -> Result<Option<Vec<oxrdf::Quad>>, LintError> {
+    let mut quads = Vec::new();
+    Ok(jsonld_stream(text, deadline, |q| quads.push(q))?.then_some(quads))
+}
+
+/// Whether `a` and `b` are isomorphic, by the bounded comparison: an answer the budget
+/// cannot reach counts as a difference.
+fn same_data(a: &[oxrdf::Quad], b: &[oxrdf::Quad]) -> bool {
+    crate::check::graph::isomorphic_bounded(a, b, None) == Ok(Some(true))
+}
+
 /// Whether `a` and `b` parse to the same algebra (SPARQL) or isomorphic data. A prefix
 /// that is undeclared in either is declared for both parses, as the lint does, so a
 /// document with an `undefined-prefix` finding can still be fixed.
@@ -548,12 +590,12 @@ fn same_meaning(a: &str, b: &str, lang: Language) -> bool {
                 turtle_quads(a, trig, &undeclared),
                 turtle_quads(b, trig, &undeclared),
             ) {
-                (Ok(qa), Ok(qb)) => crate::check::graph::isomorphic(&masked(qa), &masked(qb)),
+                (Ok(qa), Ok(qb)) => same_data(&masked(qa), &masked(qb)),
                 _ => false,
             }
         }
         Language::JsonLd => match (jsonld_quads(a), jsonld_quads(b)) {
-            (Some(qa), Some(qb)) => crate::check::graph::isomorphic(&qa, &qb),
+            (Some(qa), Some(qb)) => same_data(&qa, &qb),
             _ => false,
         },
         Language::Shaclc => {
@@ -564,7 +606,7 @@ fn same_meaning(a: &str, b: &str, lang: Language) -> bool {
                 }
             }
             match (shaclc::quads(a, &undeclared), shaclc::quads(b, &undeclared)) {
-                (Ok(qa), Ok(qb)) => crate::check::graph::isomorphic(&qa, &qb),
+                (Ok(qa), Ok(qb)) => same_data(&qa, &qb),
                 _ => false,
             }
         }

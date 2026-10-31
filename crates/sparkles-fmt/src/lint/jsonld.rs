@@ -58,13 +58,19 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     scan.value(&root);
     out.deadline()?;
     // the real expansion decides which values are queries and who holds them
-    let quads = super::jsonld_quads(text);
-    out.deadline()?;
+    let started = std::time::Instant::now();
+    // a document over the limit is not expanded at all: nothing here would use it
+    let quads = match text.len() <= PROBE_LIMIT {
+        true => super::jsonld_quads_within(text, out.opts.deadline)?,
+        false => None,
+    };
+    let mut work = Work::new(text.len());
+    work.expansion_takes(started.elapsed(), out.opts.deadline);
     if let Some(quads) = &quads {
         let mut strings: HashMap<&str, Vec<&Str>> = HashMap::new();
         value_strings(&root, &mut strings);
         let facts = embedded::Facts::new(quads, out.opts.deadline)?;
-        let sites = query_sites(quads, &facts, &strings, text, out.opts.deadline)?;
+        let sites = query_sites(quads, &facts, &strings, text, out.opts.deadline, &mut work)?;
         // every site has its holder, so no count of source texts is needed
         embedded::run(sites, &scan.prefixes(), &facts, &HashMap::new(), out)?;
     }
@@ -74,7 +80,67 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
         quads.as_deref(),
         &mut out.found[before..],
         out.opts.deadline,
+        &mut work,
     )
+}
+
+/// The largest JSON-LD document whose queries are probed and whose fixes are checked.
+/// A larger one gets no query findings and no fixes.
+pub(super) const PROBE_LIMIT: usize = 8 << 20;
+
+/// The work the probes and fix checks of one document may do together. Each expands the
+/// whole document again. Together they expand at most four times the document, or 1 MiB
+/// for a small one, and never more than 64 MiB, and the budget holds with no deadline too,
+/// as in the browser. With a deadline, a probe or check is also not started when one
+/// expansion of the document, as long as the document's own took, would end past the
+/// deadline, because an expansion that must see the whole document before its first quad
+/// cannot stop early. One that does not fit is skipped, so its query gets no findings or
+/// its finding no fix.
+pub(super) struct Work {
+    left: usize,
+    /// how long one expansion of the document takes, and the deadline
+    expansion: Option<(std::time::Duration, std::time::Instant)>,
+}
+
+impl Work {
+    pub(super) fn new(len: usize) -> Work {
+        Work {
+            left: len.saturating_mul(4).clamp(1 << 20, 64 << 20),
+            expansion: None,
+        }
+    }
+
+    /// One expansion of the document takes `took`, and the work ends at `deadline`.
+    pub(super) fn expansion_takes(
+        &mut self,
+        took: std::time::Duration,
+        deadline: Option<std::time::Instant>,
+    ) {
+        self.expansion = deadline.map(|d| (took, d));
+    }
+
+    /// Take `bytes` of the budget, or `false` when they do not fit or there is no time
+    /// for one more expansion.
+    fn spend(&mut self, bytes: usize) -> bool {
+        if bytes > self.left {
+            return false;
+        }
+        if let Some((took, deadline)) = self.expansion
+            && std::time::Instant::now() + took > deadline
+        {
+            return false;
+        }
+        self.left -= bytes;
+        #[cfg(test)]
+        PROBED.with(|p| p.set(p.get() + bytes));
+        true
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes [`Work`] has let this thread expand, for the tests.
+    pub(super) static PROBED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The most fixes [`gate_fixes`] checks one by one. The fixes of a document with more
@@ -92,16 +158,20 @@ fn gate_fixes(
     quads: Option<&[oxrdf::Quad]>,
     found: &mut [super::Diagnostic],
     deadline: Option<std::time::Instant>,
+    work: &mut Work,
 ) -> Result<(), LintError> {
     let fixable = found.iter().filter(|d| d.fix.is_some()).count();
     for d in found.iter_mut().filter(|d| d.fix.is_some()) {
         let keep = match quads {
             Some(before) if fixable <= GATED_FIXES => {
-                crate::check::deadline(deadline).map_err(|_| LintError::Timeout)?;
                 let mut edits = d.fix.as_ref().expect("a fix").edits.clone();
                 edits.sort_by_key(|e| e.start);
-                let after = super::jsonld_quads(&super::apply(text, &edits));
-                match after {
+                let edited = super::apply(text, &edits);
+                if !work.spend(edited.len()) {
+                    d.fix = None;
+                    continue;
+                }
+                match super::jsonld_quads_within(&edited, deadline)? {
                     Some(after) => {
                         match crate::check::graph::isomorphic_bounded(before, &after, deadline) {
                             Ok(same) => same == Some(true),
@@ -146,7 +216,17 @@ fn query_sites(
     strings: &HashMap<&str, Vec<&Str>>,
     text: &str,
     deadline: Option<std::time::Instant>,
+    work: &mut Work,
 ) -> Result<Vec<embedded::Site>, LintError> {
+    // how many quads have each query property and text, and how many there are in all
+    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+    for q in quads {
+        if let Some(v) = embedded::query_text(&q.object)
+            .filter(|_| embedded::is_query_predicate(q.predicate.as_str()))
+        {
+            *counts.entry((q.predicate.as_str(), v)).or_default() += 1;
+        }
+    }
     let mut seen = HashSet::new();
     let mut sites = Vec::new();
     let mut probes = 0;
@@ -170,7 +250,15 @@ fn query_sites(
             break;
         }
         probes += 1;
-        if !made_by(text, quads, q, s, probes, deadline)? {
+        if !probe(
+            text,
+            s,
+            p,
+            probes,
+            (counts[&(p, v)], quads.len()),
+            deadline,
+            work,
+        )? {
             continue;
         }
         sites.push(embedded::Site {
@@ -185,45 +273,47 @@ fn query_sites(
     Ok(sites)
 }
 
-/// Whether the value string `s` is what makes quad `q`: replaced by a fresh text, the
-/// document expands to `quads` with exactly `q`'s literal replaced, within the deadline.
-fn made_by(
+/// Whether the value string `s` is what makes the quad of `predicate` with its text. The
+/// document with `s` replaced by a fresh text is expanded, streaming under the deadline
+/// and without keeping its quads, and it must have as many quads as before (`counts.1`),
+/// one fewer with `predicate` and the old text than the `counts.0` there were, and exactly
+/// one with the fresh text, under `predicate`. Only one node holds the old text, so that
+/// quad is the holder's. A probe that does not fit the `work` budget is not made, and the
+/// answer is `false`.
+pub(super) fn probe(
     text: &str,
-    quads: &[oxrdf::Quad],
-    q: &oxrdf::Quad,
     s: &Str,
+    predicate: &str,
     n: usize,
+    counts: (usize, usize),
     deadline: Option<std::time::Instant>,
+    work: &mut Work,
 ) -> Result<bool, LintError> {
     let fresh = format!("urn:x-sparkles-lint-probe:{n}");
     if text.contains(&fresh) {
         return Ok(false);
     }
-    crate::check::deadline(deadline).map_err(|_| LintError::Timeout)?;
     let probed = format!("{}\"{fresh}\"{}", &text[..s.start], &text[s.end..]);
-    let Some(after) = super::jsonld_quads(&probed) else {
+    if !work.spend(probed.len()) {
         return Ok(false);
-    };
-    let literal: oxrdf::Term = oxrdf::Literal::new_simple_literal(fresh).into();
-    let expected: Vec<oxrdf::Quad> = quads
-        .iter()
-        .map(|x| {
-            if x == q {
-                oxrdf::Quad::new(
-                    x.subject.clone(),
-                    x.predicate.clone(),
-                    literal.clone(),
-                    x.graph_name.clone(),
-                )
-            } else {
-                x.clone()
-            }
-        })
-        .collect();
-    match crate::check::graph::isomorphic_bounded(&expected, &after, deadline) {
-        Ok(same) => Ok(same == Some(true)),
-        Err(_) => Err(LintError::Timeout),
     }
+    let (mut total, mut old, mut new, mut elsewhere) = (0usize, 0usize, 0usize, false);
+    let expanded = super::jsonld_stream(&probed, deadline, |q| {
+        total += 1;
+        let Some(v) = embedded::query_text(&q.object) else {
+            return;
+        };
+        if v == fresh {
+            if q.predicate.as_str() == predicate {
+                new += 1;
+            } else {
+                elsewhere = true;
+            }
+        } else if v == s.value && q.predicate.as_str() == predicate {
+            old += 1;
+        }
+    })?;
+    Ok(expanded && !elsewhere && new == 1 && old + 1 == counts.0 && total == counts.1)
 }
 
 // ----------------------------------------------------------------------- model ------
@@ -238,10 +328,10 @@ enum Val {
 }
 
 /// A string, its decoded value, and the span of its token with the quotes.
-struct Str {
-    value: String,
-    start: usize,
-    end: usize,
+pub(super) struct Str {
+    pub(super) value: String,
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 struct Obj {
