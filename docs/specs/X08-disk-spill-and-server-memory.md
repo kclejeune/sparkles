@@ -1959,7 +1959,7 @@ equal, all of which SPARQL leaves open. The regression tests are
 `a_limit_below_an_order_free_grouping_keeps_its_input_order` and
 `integer_sums_do_not_depend_on_the_order_of_their_rows`. A join below an ORDER BY, a
 DISTINCT, a LIMIT or an order-dependent aggregate still writes its output once more,
-which [roadmap](../ROADMAP.md) item NEW-ITEM-1 takes.
+which [roadmap](../ROADMAP.md) item 496 takes.
 
 **DISTINCT over partly ordered input.** A DISTINCT over input ordered on some but not
 all of its columns kept the set of every row it had emitted, with or without spill.
@@ -1970,9 +1970,9 @@ rather than cleared for each short run after it. The rows that pass keep the inp
 order, so the operator's order claim is unchanged. The regression test is
 `distinct_over_partly_ordered_input_holds_one_run`, which failed its 256 KiB budget
 before. A DISTINCT above an ORDER BY that cannot move below the sort, or above a
-ranking, still keeps its whole set, which item NEW-ITEM-2 takes. Automatic execution
+ranking, still keeps its whole set, which item 497 takes. Automatic execution
 still runs such a DISTINCT eagerly although its cursor is now faster, which item
-NEW-ITEM-3 takes.
+498 takes.
 
 **Forge measurements.** The runs below used forge, which has a 13th Gen Intel Core
 i5-13500 with 20 logical CPUs and 15.6 GiB of memory, on kernel 7.2.9. Each ran under the
@@ -2036,7 +2036,7 @@ A DISTINCT over input ordered on its first column now holds one run of that colu
 its ledger peak fell from 479 MB to 1.2 MB for the scan and from 32 MB to 2.4 MB for
 the join. The `pdistinct-scan` query ran
 4.6 times as fast as the base cursor and 5.5 times as fast as the eager plan. Automatic
-execution still runs it eagerly, which item NEW-ITEM-3 takes.
+execution still runs it eagerly, which item 498 takes.
 
 The default was measured on the lane build 890c60ef, run once as `serve --spill off`
 and once as `serve --spill on`, so that one binary supplied both sides. A and B started fresh servers on one shared store for each of eight rounds
