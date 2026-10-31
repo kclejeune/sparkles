@@ -359,7 +359,7 @@ impl PyRdfsSetting {
         let ds = self.write(py)?;
         let source = match (schema, graph) {
             (Some(text), None) => {
-                let (src, _spool) = crate::io::source_from_py(
+                let src = crate::io::source_from_py(
                     py,
                     Some(text),
                     format,

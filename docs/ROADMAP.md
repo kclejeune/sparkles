@@ -449,6 +449,7 @@ spec sections.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
+| 445 | **First-call cost of a Python file-object load.** A one-triple load from a file object in a new process measured 6.4 ms on atlas, against 2.7 ms for the previous binding's transaction. Find where the 4 ms go, such as the start of the signal watcher and of the request's thread, and remove the fixed cost. | [Loading results](benchmarks/loading/RESULTS.md#python-file-objects) | S |
 | 1 | **Benchmark refresh.** Later X06 batches, BSBM at 100M, a rerun of the BSBM BI driver cells and the regeneration of the published tables remain. | [X06](specs/X06-benchmark-coverage.md), [F16](specs/F16-materialization-at-scale.md), [X08](specs/X08-disk-spill-and-server-memory.md#33-the-default-and-small-profiles) §3.3 | M |
 | 4 | **Cold sparse lookups.** Phase 4 adds an optional prewarm of the pages a server used before it stopped. Cold `star-join` at 10.5M is slower with index format 3 and that cost should be removed. The Oxigraph targets need measuring again, and the 1.01B dense-read gate and its window sweep are not measured. | [X07](specs/X07-cold-sparse-reads.md) | M |
 | 33 | **Per-call overhead in the bindings.** JNI calls cost 3 to 4 times Jena's in-memory store, and Node `has()` and export conversion are slower than published targets. Python value lookups trail by 0.67 µs, and some small queries by 11 to 20 µs. The scorecard in scripts/bench-bindings/scorecard.py can compare cases once the harness records the API layer, term consumption and oracle evidence and the scorecard accepts ordered and pooled fingerprints. The Python async cursor converts each row of a batch through a separate native call and reads the plan and statistics again for every batch, which is unmeasured. | [P01](specs/P01-python-bindings.md#current-source-per-call-assessment), [P04](specs/P04-jvm-bindings/OUTCOME.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M |
@@ -656,6 +657,7 @@ linked spec Outcome records how they landed.
 
 - **397.** Native Rust direct mapping controls through conversion and the final atomic load. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
 - **403.** Credential expiry for long-lived reads and fenced OIDC sign-in. [C09](specs/C09-dataset-access-control.md)
+- **438.** Python file objects load through a one-shot reader source, with no temporary copy. [Libraries and integrations](integrations/README.md#libraries-and-bindings), [Loading results](benchmarks/loading/RESULTS.md#python-file-objects)
 - **433.** A FILTER over two variables of different UNION branches keeps the rows that a later pattern of the group completes. [Querying](querying/README.md#standards-conformance)
 - **434.** A FILTER on a variable that `VALUES … { UNDEF }` leaves unbound keeps the rows that a later property path binds. [Querying](querying/README.md#standards-conformance)
 - **439.** View circuits answer `EXISTS` and `NOT EXISTS` over a zero-length path from an outer variable by substitution, as SPARQL does. [F13](specs/F13-incremental-views-and-provenance.md#outcome)

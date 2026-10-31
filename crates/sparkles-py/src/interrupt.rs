@@ -232,6 +232,174 @@ pub fn run<T: Send + 'static>(
     }
 }
 
+/// The signal controls of a request that reads a Python stream, such as a load or a
+/// replacement from a file object, which [`run_stream`] runs. The stream's reader calls
+/// [`StreamSignals::checkpoint`] before a read when a signal is pending, and the store
+/// calls it through [`StreamSignals::publish_hook`] right before it publishes the write.
+pub struct StreamSignals {
+    /// set when a signal handler raised: the request stops at its next check
+    pub cancel: Arc<AtomicBool>,
+    /// set by the signal watcher, without the GIL, when a signal arrives
+    signalled: Arc<AtomicBool>,
+    /// where a checkpoint asks the waiting main thread to run the signal handlers
+    checks: Mutex<Option<Sender<Event>>>,
+}
+
+/// What the thread of a stream request tells the main thread that waits for it.
+enum Event {
+    /// run the signal handlers, then answer
+    Check(Sender<()>),
+    Done,
+}
+
+impl StreamSignals {
+    /// Controls that cancel through `cancel`.
+    pub fn new(cancel: Arc<AtomicBool>) -> Arc<StreamSignals> {
+        Arc::new(StreamSignals {
+            cancel,
+            signalled: Arc::new(AtomicBool::new(false)),
+            checks: Mutex::new(None),
+        })
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Whether a signal waits for its handlers. The reader then makes a checkpoint
+    /// before it calls into Python again, which would otherwise keep the GIL from the
+    /// main thread in a tight loop.
+    pub fn pending(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    /// Wait, without the GIL, until the main thread has run the handlers of the signals
+    /// that have arrived, and return whether the request is cancelled. A handler that
+    /// raises cancels it. Without a waiting main thread, as on another Python thread, it
+    /// only reads the flag.
+    pub fn checkpoint(&self) -> bool {
+        let tx = self
+            .checks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tx) = tx {
+            let (done, answer) = channel();
+            if tx.send(Event::Check(done)).is_ok() {
+                let _ = answer.recv();
+            }
+        }
+        self.cancelled()
+    }
+
+    /// The store's last check before it publishes the write: a checkpoint, so that a
+    /// handler that raised for a signal during the request, whatever decoder read the
+    /// stream last, abandons the write.
+    pub fn publish_hook(self: &Arc<Self>) -> sparkles::guard::PublishHook {
+        let signals = self.clone();
+        sparkles::guard::PublishHook::new(move || {
+            if signals.checkpoint() {
+                Err(sparkles::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// Run a request that reads a Python stream, without the GIL, on a thread of its own. On
+/// Python's main thread, this thread waits for it and runs the signal handlers whenever
+/// the stream's reader makes a checkpoint (see [`StreamSignals`]), and every
+/// [`POLL`] otherwise. A signal also sets the pending flag at once through the watcher of
+/// Python's wakeup descriptor, unless the descriptor is taken, as under asyncio. When a
+/// handler raises, `cancel` is set, the request is awaited, and the handler's exception
+/// propagates. When none raises, the request goes on.
+///
+/// The request does not run on the helper thread of [`run`], because a signal handler
+/// that runs a query while the stream waits for it sends that query to the helper. The
+/// request's store write takes [`StreamSignals::publish_hook`], so an exception that a
+/// handler raises for a signal during the request abandons the write before it is
+/// published. A signal that arrives during publication itself can raise after it.
+///
+/// The watcher starts before the request's thread, since its first use imports the
+/// `signal` module, which would otherwise run while the thread could already raise a
+/// signal and lose the handler's exception.
+pub fn run_stream<T: Send + 'static>(
+    py: Python<'_>,
+    signals: &Arc<StreamSignals>,
+    f: impl FnOnce() -> sparkles::Result<T> + Send + 'static,
+) -> PyResult<T> {
+    if !on_main_thread(py)? {
+        return py.detach(f).py(py);
+    }
+    #[cfg(unix)]
+    let watch = wakeup::Watch::start(py, signals.signalled.clone());
+    let (tx, rx) = channel::<Event>();
+    *signals.checks.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
+    let slot = Arc::new(Mutex::new(None));
+    let out = slot.clone();
+    let worker = std::thread::Builder::new()
+        .name("sparkles-stream".into())
+        .spawn(move || {
+            let r = f();
+            *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            let _ = tx.send(Event::Done);
+        });
+    let worker = match worker {
+        Ok(w) => w,
+        Err(e) => {
+            *signals.checks.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            #[cfg(unix)]
+            if let Some(w) = watch {
+                w.stop(py);
+            }
+            return Err(e.into());
+        }
+    };
+    let mut raised: Option<PyErr> = None;
+    let mut rx = rx;
+    loop {
+        let (back, r) = py.detach(move || {
+            let r = rx.recv_timeout(POLL);
+            (rx, r)
+        });
+        rx = back;
+        let answer = match r {
+            Ok(Event::Done) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(Event::Check(answer)) => Some(answer),
+            // a request that panicked sends nothing
+            Err(RecvTimeoutError::Timeout) if worker.is_finished() => break,
+            Err(RecvTimeoutError::Timeout) => None,
+        };
+        if let Err(e) = py.check_signals() {
+            signals.cancel.store(true, Ordering::Relaxed);
+            raised.get_or_insert(e);
+        }
+        signals.signalled.store(false, Ordering::Release);
+        if let Some(answer) = answer {
+            let _ = answer.send(());
+        }
+    }
+    *signals.checks.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    #[cfg(unix)]
+    if let Some(w) = watch {
+        w.stop(py);
+    }
+    py.detach(move || drop(worker.join()));
+    if let Some(e) = raised {
+        return Err(e);
+    }
+    let result = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match result {
+        Some(r) => r.py(py),
+        None => Err(crate::errors::new_err(
+            py,
+            "SparklesError",
+            "the request's thread ended without an answer",
+        )),
+    }
+}
+
 /// Run a request that is safe to run again, such as a query, without the GIL. `f` gets
 /// the cancellation flag of each attempt. With a `token`, or where the signal wakeup
 /// descriptor is taken, this is [`run`] with the token's flag.
@@ -320,6 +488,31 @@ mod wakeup {
         set.bind(py).call1((fd,)).ok()?.extract().ok()
     }
 
+    /// A flag that the watcher sets on every signal with a Python handler, for as long as
+    /// the watch lasts. Only one watch or in-place request runs at a time, on the main
+    /// thread.
+    pub(super) struct Watch;
+
+    impl Watch {
+        /// Point the wakeup descriptor at the watcher with `flag` as the one to set, or
+        /// `None` when the descriptor is taken or cannot be set.
+        pub(super) fn start(py: Python<'_>, flag: Arc<AtomicBool>) -> Option<Watch> {
+            let fd = i64::from(socket()?);
+            let old = set_wakeup_fd(py, fd)?;
+            if old != -1 {
+                set_wakeup_fd(py, old);
+                return None;
+            }
+            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
+            Some(Watch)
+        }
+
+        pub(super) fn stop(self, py: Python<'_>) {
+            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            set_wakeup_fd(py, -1);
+        }
+    }
+
     /// Run `f` in place on the main thread, or `None` when the wakeup descriptor is
     /// taken (asyncio sets one) or cannot be set.
     pub(super) fn run_in_place<T: Send>(
@@ -359,9 +552,21 @@ pub fn controlled<T: Send + 'static>(
     timeout: Option<f64>,
     f: impl FnOnce(sparkles::task::Control) -> sparkles::Result<T> + Send + 'static,
 ) -> PyResult<T> {
+    controlled_stream(py, flag(token)?, None, callback, timeout, f)
+}
+
+/// [`controlled`] with the cancellation flag `cancel`, run by [`run_stream`] when the
+/// operation reads a Python stream with `signals`, whose flag must be `cancel`.
+pub fn controlled_stream<T: Send + 'static>(
+    py: Python<'_>,
+    cancel: Arc<AtomicBool>,
+    signals: Option<Arc<StreamSignals>>,
+    callback: Option<&Bound<'_, PyAny>>,
+    timeout: Option<f64>,
+    f: impl FnOnce(sparkles::task::Control) -> sparkles::Result<T> + Send + 'static,
+) -> PyResult<T> {
     use sparkles::task::{Control, Progress};
     use std::time::Instant;
-    let cancel = flag(token)?;
     let deadline =
         timeout
             .map(|s| {
@@ -420,14 +625,18 @@ pub fn controlled<T: Send + 'static>(
         deadline,
         ..Control::with_cancel(cancel.clone())
     };
-    let result = run(py, &cancel, move || {
+    let job = move || {
         ctl.check()?;
         let result = f(ctl.clone())?;
         ctl.check()?;
         ctl.progress.report(1.0, "completed");
         ctl.check()?;
         Ok(result)
-    });
+    };
+    let result = match &signals {
+        Some(signals) => run_stream(py, signals, job),
+        None => run(py, &cancel, job),
+    };
     let error = failure.lock().unwrap().take();
     match error {
         Some(e) => Err(e),

@@ -5945,11 +5945,9 @@ variable, and `row.get("name", default)` returns the default instead.
 (`RDF_THRIFT`), RDF Protobuf (`RDF_PROTOBUF`) and RDF/JSON (`RDF_JSON`). `load`, `dump`,
 `parse` and `serialize` take all of them, by name, extension or media type as well.
 An input in one of Jena's syntaxes streams through the engine's reader on a thread of
-its own. `parse` and a file object's `load` take the quads as the reader finds them.
-`load` from a path or from bytes passes them to the loader, which reads them as it reads
-the W3C syntaxes and writes no temporary copy. A file object is the exception, since
-`load` first copies it to a temporary file, as it does for every syntax. The reader of
-RDF/JSON reads its whole document first. RDF/JSON holds one
+its own. `parse` takes the quads as the reader finds them. `load` passes a path, bytes
+or a file object to the loader, which reads these syntaxes as it reads the W3C ones and
+writes no temporary copy. The reader of RDF/JSON reads its whole document first. RDF/JSON holds one
 graph, so `dump` writes the default graph, or `from_graph`.
 
 `load` reads a CSV or TSV table when the format is `"csv"` or `"tsv"`, or the path ends
@@ -5975,9 +5973,46 @@ ds.mappings.run("people", sources={"people.csv": "data/people.csv"}, replace=Tru
 
 `sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
 quads come before the input has been read to the end. A syntax error is raised by the
-iteration, after the quads that came before it. `Dataset.load` from a file object streams
-the same way into one transaction. Loads from a path or from bytes go through the
-engine's bulk loader instead.
+iteration, after the quads that came before it.
+
+`Dataset.load` and `Dataset.replace` read a file object once, as it arrives, in every
+syntax. In automatic and streaming mode they never copy it to a temporary file. Into an
+empty dataset `load` runs the bulk loader with its parallel encoders, as a load from a
+path does. A stream whose decompressed bytes end within 8 MiB, about 100,000 quads,
+goes in by a transaction instead, since a rebuild has a fixed cost of about 20 ms and parses such a
+stream on one thread. Into a dataset that holds data it inserts the quads in one transaction, since
+the size of a stream is not known before it is read. `replace` reads up to about 20 MB of
+the decompressed stream ahead, and a longer stream goes through the bounded bulk
+replacement instead of being held in memory. The bytes read ahead are parsed afterwards,
+and every read of the raw stream, including the decompressor's own, stops at the write's
+cancellation and deadline. Each read asks the file object for at most 64 KiB, or 64 Ki
+characters of a text-mode file, whose text is encoded as UTF-8. The compression is
+detected from the first bytes of the stream.
+
+N-Triples and N-Quads streams are cut into blocks that are parsed in parallel, as
+compressed files are. A block holds at least 256 MiB, or 8 MiB for each loader thread
+when that is more, and a line longer than a block extends it. At most two blocks are in
+memory, one parsed while the next is filled, so such a load holds up to about 512 MiB of
+input where a load by path maps the file instead. The memory buys a parallel parse. A
+block buffer grows as it fills, so a small stream takes a small buffer. A stream in
+another syntax is read ahead up to `auto_buffer_bytes`, and parsed in memory when it ends
+within that allowance or from the stream otherwise. `parse_mode="buffered"` reads the
+whole decoded stream into memory up to `auto_buffer_bytes`, and continues into an
+unnamed temporary file in the system's temporary directory past it, which is removed
+when the parse ends. Only a buffered stream longer than its allowance writes that file.
+
+An exception that the file object's `read` raises propagates as itself and leaves the
+dataset unchanged. Ctrl-C stops the reading at the next read and raises
+`KeyboardInterrupt`. Right before the store publishes a load or replacement from a file
+object, it waits until the main thread has run the handlers of the signals that arrived,
+so an interrupt at any point before publication changes nothing, whatever decoder read
+the stream. A signal that arrives during publication itself can raise after the commit.
+A signal handler whose function returns lets the load go on. It may read the dataset
+and write other datasets, but a write to the dataset that is loading raises
+`ConflictError` at once, as a write from inside its own transaction does, since the load
+may hold the writer lock while it waits for the handler. The store checks the timeout
+and the cancellation again after the handlers have run. `replace` from a file object also stops for its `cancel` token
+and `timeout`.
 
 ### Terms
 

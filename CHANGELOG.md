@@ -105,6 +105,29 @@ check of the SHACLC formatter and the linter no longer canonicalizes small graph
 so a few symmetric blank nodes cannot run past the deadline. The query editor no longer shows the
 findings of a lint that answered after the query changed or linting was turned off.
 
+The Python `Dataset.load` reads a file object once, as a stream, in every syntax and
+parse mode. Into an empty dataset it runs the bulk loader with its parallel encoders,
+where it used to insert the quads one at a time into a transaction, and into a dataset
+that holds data it uses one transaction. Automatic and streaming mode no longer copy the
+file object to a temporary file, and Jena's syntaxes no longer pass through an N-Quads
+pipe. Buffered mode keeps the stream in memory up to `auto_buffer_bytes` and continues
+into a temporary file past it. `Dataset.replace` from a file object replaces a long
+stream through the bounded bulk path, and it now stops for Ctrl-C, its cancel token and
+its timeout. A load of a 5M-triple N-Triples file object takes 2.2 s instead of 21 s and
+peaks at 1.2 GiB instead of 3 GiB of RSS, and a stream that ends within 8 MiB still
+goes into an empty dataset by a transaction. N-Triples and N-Quads streams are parsed in
+parallel blocks, at most two at a time, which hold more memory than a load of the same
+file by its path. A block buffer grows as it fills, which also spares small compressed
+line-based files a 256 MiB buffer. An exception that the file object's `read` raises now
+propagates as itself. Ctrl-C stops the load at the next read, and the store runs the
+main thread's signal handlers right before it publishes, so an interrupt during the load
+no longer lets it commit. A handler's write to the dataset that is loading raises
+`ConflictError` at once instead of waiting for the load's writer lock. In Rust, `SourceData::Reader` and `Source::from_reader` give
+the loader a stream that it reads once, and `WriteOptions::before_publish` takes a hook
+that the store runs right before it publishes a write. Code that matches every variant of
+`SourceData`, or builds a `WriteOptions` without `..Default::default()`, needs the new
+variant or field.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.

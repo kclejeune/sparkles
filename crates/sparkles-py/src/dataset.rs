@@ -493,39 +493,11 @@ impl PyDataset {
                 "mapping, template and key apply to CSV and TSV input",
             ));
         }
-        if let Some(i) = input.filter(|i| !i.is_none())
-            && mode != sparkles::io::ParseMode::Buffered
-            && path.is_none()
-            && crate::io::is_file_object(i)?
-        {
-            // a file object streams into one transaction as it is read
-            let mut stream = crate::io::quad_stream(
-                py,
-                Some(i),
-                format,
-                None,
-                base_iri,
-                graph,
-                compression,
-                lenient,
-            )?;
-            let ds = self.ds_for_write(py)?;
-            return py
-                .detach(|| {
-                    let n = ds.transaction(|tx| {
-                        let mut n = 0;
-                        for q in stream.by_ref() {
-                            n += tx.insert(q?.as_ref())? as u64;
-                        }
-                        Ok(n)
-                    })?;
-                    ds.store().add_prefixes(stream.prefixes())?;
-                    Ok(n)
-                })
-                .py(py);
-        }
-        // the spool of an input in one of Jena's syntaxes lives until the load ends
-        let (mut src, _spool) = source_from_py(
+        let file_object = match input.filter(|i| !i.is_none()) {
+            Some(i) if path.is_none() && crate::io::is_file_object(i)? => Some(i.clone().unbind()),
+            _ => None,
+        };
+        let mut src = source_from_py(
             py,
             input,
             format,
@@ -538,7 +510,31 @@ impl PyDataset {
         src.parse_mode = mode;
         src.auto_buffer_bytes = auto_buffer_bytes;
         let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.store().load(&[src])).py(py)
+        let Some(obj) = file_object else {
+            return py.detach(|| ds.store().load(&[src])).py(py);
+        };
+        // A file object is read once as the loader parses it. A signal handler that
+        // raises, such as Ctrl-C's, fails the next read and stops the loader at its next
+        // check, and the store waits for the handlers right before it publishes.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signals = interrupt::StreamSignals::new(cancel.clone());
+        src.data = sparkles::io::SourceData::reader(
+            crate::io::PyFileReader::new(obj).with_signals(signals.clone()),
+        );
+        let flag = cancel.clone();
+        let hook = signals.publish_hook();
+        let _writing = StreamWrite::begin(&ds);
+        interrupt::run_stream(py, &signals, move || {
+            let o = sparkles::guard::WriteOptions {
+                cancel: Some(flag),
+                before_publish: Some(hook),
+                ..Default::default()
+            };
+            let r = ds
+                .store()
+                .load_with(&[src], sparkles::commit::CommitKind::Load, &o)?;
+            Ok(if r.committed { r.commit.inserted } else { 0 })
+        })
     }
 
     /// Load many files in one commit (the parallel bulk path); returns the new quads.
@@ -566,14 +562,13 @@ impl PyDataset {
                     None,
                     false,
                 )
-                .map(|(mut source, spool)| {
+                .map(|mut source| {
                     source.parse_mode = mode;
                     source.auto_buffer_bytes = auto_buffer_bytes;
-                    (source, spool)
+                    source
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let (sources, _spools): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
         let ds = self.ds_for_write(py)?;
         py.detach(|| ds.store().load(&sources)).py(py)
     }
@@ -1400,7 +1395,11 @@ impl PyDataset {
                 _ => return Err(invalid(py, "target cannot be a blank node")),
             },
         };
-        let (src, spool) = source_from_py(
+        let file_object = match input.filter(|i| !i.is_none()) {
+            Some(i) if path.is_none() && crate::io::is_file_object(i)? => Some(i.clone().unbind()),
+            _ => None,
+        };
+        let mut src = source_from_py(
             py,
             input,
             format,
@@ -1410,11 +1409,35 @@ impl PyDataset {
             compression,
             lenient,
         )?;
-        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
-            let _spool = spool;
+        let flag = interrupt::flag(cancel)?;
+        // a file object is read by the replacement, which its signals and the token stop
+        let signals = file_object.map(|obj| {
+            let signals = interrupt::StreamSignals::new(flag.clone());
+            src.data = sparkles::io::SourceData::reader(
+                crate::io::PyFileReader::new(obj).with_signals(signals.clone()),
+            );
+            signals
+        });
+        let hook = signals.as_ref().map(interrupt::StreamSignals::publish_hook);
+        let _writing = signals.as_ref().map(|_| StreamWrite::begin(&ds));
+        let r = interrupt::controlled_stream(py, flag, signals, progress, timeout, move |ctl| {
             ctl.progress.report(0.0, "replacing data");
             ctl.check()?;
-            let r = ds.replace(target, &[src])?;
+            let o = sparkles::guard::WriteOptions {
+                cancel: Some(ctl.cancel.flag()),
+                deadline: ctl.deadline,
+                before_publish: hook,
+                ..Default::default()
+            };
+            let r = ds
+                .store()
+                .replace_with(
+                    target,
+                    &[src],
+                    sparkles::commit::CommitKind::Transaction,
+                    &o,
+                )?
+                .0;
             ctl.progress.report(1.0, "replaced data");
             Ok(r)
         })?;
@@ -1549,14 +1572,59 @@ fn writer_slot(ds: &sparkles::Dataset) -> WriterSlot {
     slot
 }
 
+/// The threads with a load or replacement from a file object in flight on each dataset,
+/// by the key of [`writer_slot`], with how many each has. Kept apart from the
+/// transaction owner, which another thread can hold while a stream write waits for it.
+type StreamCallers = std::collections::HashMap<(usize, std::thread::ThreadId), usize>;
+
+fn stream_callers() -> std::sync::MutexGuard<'static, StreamCallers> {
+    static CALLERS: std::sync::OnceLock<Mutex<StreamCallers>> = std::sync::OnceLock::new();
+    CALLERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The calling thread registered as a stream caller of the dataset while a load or
+/// replacement from a file object runs on its own thread. Its signal handlers run on this
+/// thread while the write may hold the writer lock and wait for them, so a write that a
+/// handler makes to the same dataset is refused by [`check_transaction`] instead of
+/// waiting for that lock. The registration ends when this is dropped, on every path,
+/// including an error or a panic.
+struct StreamWrite {
+    key: (usize, std::thread::ThreadId),
+}
+
+impl StreamWrite {
+    fn begin(ds: &sparkles::Dataset) -> StreamWrite {
+        let key = (ds.state() as *const _ as usize, std::thread::current().id());
+        *stream_callers().entry(key).or_insert(0) += 1;
+        StreamWrite { key }
+    }
+}
+
+impl Drop for StreamWrite {
+    fn drop(&mut self) {
+        let mut callers = stream_callers();
+        if let Some(n) = callers.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                callers.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Reject waiting for a store lock owned by this Python thread's transaction.
 /// Checking the shared state also covers aliases obtained through a catalog.
 pub(crate) fn check_transaction(py: Python<'_>, ds: &sparkles::Dataset) -> PyResult<()> {
-    if *writer_slot(ds).lock().unwrap() == Some(std::thread::current().id()) {
+    let me = std::thread::current().id();
+    let streaming = stream_callers().contains_key(&(ds.state() as *const _ as usize, me));
+    if streaming || *writer_slot(ds).lock().unwrap() == Some(me) {
         return Err(new_err(
             py,
             "ConflictError",
-            "this thread has an open transaction on the dataset: finish the transaction before this operation",
+            "this thread has an open transaction on the dataset, or a load or replacement from a file object: finish it before this operation",
         ));
     }
     Ok(())

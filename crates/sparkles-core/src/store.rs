@@ -4851,8 +4851,18 @@ impl Store {
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
         let snap = self.snapshot();
+        // A stream that ends within a few thousand quads goes into an empty store by a
+        // transaction, which costs less than the fixed cost of a rebuild. Its bytes are
+        // read ahead to tell, as only a read can.
+        let small_streams = snap.is_empty()
+            && !sources.is_empty()
+            && sources
+                .iter()
+                .all(|s| matches!(s.data, crate::io::SourceData::Reader(_)))
+            && !streams_exceed(sources, SMALL_STREAM_BYTES, o)?;
         // a write limited to some graphs checks each quad, which a rebuild does not
         if o.graphs.is_none()
+            && !small_streams
             && (snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold)
         {
             let mut w = self.lock_writer(o)?;
@@ -4970,7 +4980,9 @@ impl Store {
                 }
                 _ => {}
             }
-        } else if estimated_quads(sources) > self.opts.bulk_threshold {
+        } else if estimated_quads(sources) > self.opts.bulk_threshold
+            || streams_exceed(sources, self.opts.bulk_threshold.saturating_mul(80), o)?
+        {
             return self.replace_bulk(target, sources, kind, o);
         }
         let mut parsed = Vec::with_capacity(sources.len());
@@ -5353,6 +5365,17 @@ impl Store {
             // a walk of the directory during the build counted the candidate
             self.quota.invalidate();
             return Err(Error::DryRun(Box::new(preview?)));
+        }
+        // the last check of a bulk commit, before anything of it becomes durable
+        if bulk.is_some()
+            && let Some((_, o)) = &check
+            && let Err(e) = o.check_publish()
+        {
+            drop(gen_);
+            if self.root.is_some() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            return Err(e);
         }
         let mut annotation = crate::annotations::Annotation::default();
         if let Some(root) = &self.root {
@@ -6546,6 +6569,8 @@ impl WriteTxn<'_> {
                 }
                 other => other?,
             };
+            // the last check, after the validation, right before publication
+            self.opts.check_publish()?;
             if grouped {
                 return self.publish_grouped(validation);
             }
@@ -7004,9 +7029,41 @@ fn estimated_quads(sources: &[Source]) -> u64 {
         bytes += match &s.data {
             crate::io::SourceData::Bytes(b) => b.len() as u64,
             crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            // a stream's length is unknown until it is read
+            crate::io::SourceData::Reader(_) => continue,
         } * s.codec().map_or(1, |c| c.expansion());
     }
     bytes / 80
+}
+
+/// Decompressed bytes of streams, about 100,000 quads, below which a load into an empty store
+/// takes a transaction instead of a rebuild. A rebuild has a fixed cost of about 20 ms,
+/// and it parses a stream shorter than one parallel chunk of 8 MiB on one thread, so a
+/// transaction is faster up to about that size.
+const SMALL_STREAM_BYTES: u64 = 8 << 20;
+
+/// Whether the streams among `sources`, whose length is unknown, hold more than `limit`
+/// decompressed bytes. Each stream gets its decompressing reader (see
+/// [`ReaderSource::decode`](crate::io::ReaderSource)) and is read ahead until it ends or
+/// passes its share of `limit`, and the bytes read ahead are parsed later. `o` is checked
+/// before each read, so a slow stream stops at the write's deadline.
+fn streams_exceed(sources: &[Source], limit: u64, o: &crate::guard::WriteOptions) -> Result<bool> {
+    let mut bytes = 0u64;
+    for s in sources {
+        let crate::io::SourceData::Reader(r) = &s.data else {
+            continue;
+        };
+        // the magic bytes that tell the codec, read under the same checks
+        r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
+        r.decode(s.codec()?, s.max_decompressed, o)?;
+        let want = (limit + 1).saturating_sub(bytes);
+        let held = r.read_ahead(usize::try_from(want).unwrap_or(usize::MAX), &|| o.check())?;
+        bytes += held as u64;
+        if bytes > limit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A prefix binding as [`Store::set_prefix`] accepts it: a valid name and an absolute
@@ -7804,6 +7861,243 @@ pub(crate) fn replay_wal(
 mod tests {
     use super::*;
     use crate::io::RdfFormat;
+
+    fn collect_len(src: &Source) -> usize {
+        let mut n = 0;
+        crate::io::parse_source_into(src, |_| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        n
+    }
+
+    #[test]
+    fn the_read_ahead_of_a_slow_stream_stops_at_the_deadline() {
+        struct Slow;
+        impl std::io::Read for Slow {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                buf[0] = b' ';
+                Ok(1)
+            }
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let o = crate::guard::WriteOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)),
+            ..Default::default()
+        };
+        let t = std::time::Instant::now();
+        let src = Source::from_reader(Slow, RdfFormat::NTriples, None);
+        let e = store
+            .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
+            .unwrap_err();
+        assert!(matches!(e, Error::Timeout), "{e}");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn a_publish_hook_that_waits_past_the_deadline_publishes_nothing() {
+        let quads = |n: usize| {
+            (0..n)
+                .map(|i| format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        // the bulk path into an empty store, and a transaction into one that holds data
+        for filled in [false, true] {
+            let store = Store::in_memory(StoreOptions::default());
+            if filled {
+                store
+                    .load(&[Source::from_bytes(quads(2), RdfFormat::NTriples, None)])
+                    .unwrap();
+            }
+            let before = store.snapshot().len();
+            let o = crate::guard::WriteOptions {
+                deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(200)),
+                before_publish: Some(crate::guard::PublishHook::new(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    Ok(())
+                })),
+                ..Default::default()
+            };
+            let src = Source::from_bytes(quads(50), RdfFormat::NTriples, None);
+            let e = store.load_with(&[src], CommitKind::Load, &o).unwrap_err();
+            assert!(matches!(e, Error::Timeout), "{e}");
+            assert_eq!(store.snapshot().len(), before, "filled {filled}");
+            store
+                .load(&[Source::from_bytes(quads(1), RdfFormat::NTriples, None)])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_gzip_header_that_trickles_stops_at_the_deadline() {
+        /// A gzip header that names a file, whose name never ends.
+        struct Header(usize);
+        impl std::io::Read for Header {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                // magic, deflate, the FNAME flag, time, flags and OS
+                const START: [u8; 10] = [0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3];
+                if self.0 < START.len() {
+                    let n = buf.len().min(START.len() - self.0);
+                    buf[..n].copy_from_slice(&START[self.0..self.0 + n]);
+                    self.0 += n;
+                    return Ok(n);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                buf[0] = b'a';
+                Ok(1)
+            }
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let o = crate::guard::WriteOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)),
+            ..Default::default()
+        };
+        let t = std::time::Instant::now();
+        let src = Source::from_reader(Header(0), RdfFormat::NTriples, None);
+        let e = store
+            .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
+            .unwrap_err();
+        assert!(matches!(e, Error::Timeout), "{e}");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn a_failing_publish_hook_abandons_the_write() {
+        let quads = |n: usize| {
+            (0..n)
+                .map(|i| format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let o = crate::guard::WriteOptions {
+            before_publish: Some(crate::guard::PublishHook::new(move || {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Err(Error::Cancelled)
+            })),
+            ..Default::default()
+        };
+        // the bulk path into an empty store, and a transaction into one that holds data
+        for filled in [false, true] {
+            let store = Store::in_memory(StoreOptions::default());
+            if filled {
+                store
+                    .load(&[Source::from_bytes(quads(2), RdfFormat::NTriples, None)])
+                    .unwrap();
+            }
+            let before = store.snapshot().len();
+            let src = Source::from_bytes(quads(50), RdfFormat::NTriples, None);
+            let e = store.load_with(&[src], CommitKind::Load, &o).unwrap_err();
+            assert!(matches!(e, Error::Cancelled), "{e}");
+            assert_eq!(store.snapshot().len(), before);
+            // the store still takes writes
+            store
+                .load(&[Source::from_bytes(quads(1), RdfFormat::NTriples, None)])
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_short_stream_loads_an_empty_store_by_a_transaction() {
+        let lines = |n: usize| {
+            (0..n)
+                .map(|i| format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        for (n, transactional) in [(3usize, true), (400_000, false)] {
+            let store = Store::in_memory(StoreOptions::default());
+            let src =
+                Source::from_reader(std::io::Cursor::new(lines(n)), RdfFormat::NTriples, None);
+            assert_eq!(store.load(&[src]).unwrap(), n as u64);
+            let snap = store.snapshot();
+            assert_eq!(snap.len(), n as u64);
+            // a rebuild leaves the quads in the base, a transaction in the delta
+            assert_eq!(!snap.delta.is_empty(), transactional, "{n}");
+        }
+    }
+
+    #[test]
+    fn a_large_stream_replaces_through_the_bulk_path() {
+        let lines = |n: usize| {
+            (0..n)
+                .map(|i| format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let stream =
+            |n| Source::from_reader(std::io::Cursor::new(lines(n)), RdfFormat::NTriples, None);
+        // the read-ahead decides, and the stream still parses in full afterwards
+        let big = stream(1000);
+        let o = crate::guard::WriteOptions::default();
+        assert!(streams_exceed(std::slice::from_ref(&big), 800, &o).unwrap());
+        let small = stream(3);
+        assert!(!streams_exceed(std::slice::from_ref(&small), 800, &o).unwrap());
+        assert!(
+            !streams_exceed(
+                &[Source::from_bytes(lines(1000), RdfFormat::NTriples, None)],
+                800,
+                &o
+            )
+            .unwrap()
+        );
+        // a compressed stream is measured by its decompressed bytes, however well it packs
+        let packed = |n| {
+            let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            std::io::Write::write_all(&mut w, &lines(n)).unwrap();
+            w.finish().unwrap()
+        };
+        let gz = Source::from_reader(
+            std::io::Cursor::new(packed(300_000)),
+            RdfFormat::NTriples,
+            None,
+        );
+        assert!(streams_exceed(std::slice::from_ref(&gz), SMALL_STREAM_BYTES, &o).unwrap());
+        assert_eq!(collect_len(&gz), 300_000);
+        let gz = Source::from_reader(std::io::Cursor::new(packed(30)), RdfFormat::NTriples, None);
+        assert!(!streams_exceed(std::slice::from_ref(&gz), SMALL_STREAM_BYTES, &o).unwrap());
+        assert_eq!(collect_len(&gz), 30);
+        for (src, n) in [(big, 1000u64), (small, 3)] {
+            let store = Store::in_memory(StoreOptions {
+                bulk_threshold: 10,
+                ..StoreOptions::default()
+            });
+            store
+                .load(&[Source::from_bytes(lines(5), RdfFormat::NTriples, None)])
+                .unwrap();
+            assert_eq!(store.replace(ReplaceTarget::All, &[src]).unwrap(), n);
+            assert_eq!(store.snapshot().len(), n);
+        }
+    }
 
     #[test]
     fn poisoned_writer_refuses_transaction_admission_and_vocabulary_appends() {

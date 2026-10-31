@@ -4,9 +4,10 @@
 //! Besides oxrdfio's syntaxes, `RdfFormat` names Jena's TriX, RDF Thrift, RDF Protobuf
 //! and RDF/JSON ([`sparkles::jena_formats`]). An input in one of them is read by the
 //! engine's reader on a thread of its own as it streams, and `parse` takes the N-Quads
-//! it writes through a pipe. `Dataset.load` hands the path or the bytes to the loader,
-//! which reads these syntaxes as it reads the others. An output is written by the
-//! engine's writer.
+//! it writes through a pipe. `Dataset.load` hands the path, the bytes or the file object
+//! to the loader, which reads these syntaxes as it reads the others. A file object is a
+//! [`SourceData::Reader`] that the loader reads once as it arrives, with no temporary
+//! copy. An output is written by the engine's writer.
 
 use crate::errors::{EngineResult, invalid};
 use crate::results::PyQuadIterator;
@@ -23,6 +24,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ----------------------------------------------------------------------- formats ----
 
@@ -259,7 +261,8 @@ pub fn codec_from_py(py: Python<'_>, s: Option<&str>) -> PyResult<Option<Codec>>
 
 // ------------------------------------------------------------------------ inputs ----
 
-/// A source from `input` (str, bytes or a file object) or `path`.
+/// A source from `input` (str, bytes or a file object) or `path`. A file object is a
+/// stream the loader reads once, as it arrives.
 #[allow(clippy::too_many_arguments)]
 pub fn source_from_py(
     py: Python<'_>,
@@ -270,11 +273,11 @@ pub fn source_from_py(
     graph: Option<NamedNode>,
     compression: Option<&str>,
     lenient: bool,
-) -> PyResult<(Source, Option<Spool>)> {
-    // Jena's syntaxes load as the W3C ones do, straight from the path or the bytes
+) -> PyResult<Source> {
+    // Jena's syntaxes load as the W3C ones do, straight from the path, the bytes or the
+    // stream
     let format: Option<RdfSyntax> = format_from_py(format)?.map(Into::into);
     let input = input.filter(|i| !i.is_none());
-    let mut spool = None;
     let mut src = match (input, path) {
         (Some(_), Some(_)) => return Err(PyValueError::new_err("give input or path, not both")),
         (None, None) => return Err(PyValueError::new_err("give input or path")),
@@ -306,13 +309,8 @@ pub fn source_from_py(
                     "format is required when loading from input",
                 ));
             };
-            let (tmp, mut out) = Spool::create()?;
-            let mut reader = PyFileReader::new(i.clone().unbind());
-            py.detach(|| std::io::copy(&mut reader, &mut out))?;
-            let mut src = Source::from_bytes(Vec::new(), f, graph);
-            src.data = SourceData::File(tmp.0.clone());
+            let mut src = Source::from_reader(PyFileReader::new(i.clone().unbind()), f, graph);
             src.name = "<file object>".into();
-            spool = Some(tmp);
             src
         }
         (Some(i), None) => {
@@ -329,7 +327,7 @@ pub fn source_from_py(
     }
     src.compression = codec_from_py(py, compression)?;
     src.lenient = lenient;
-    Ok((src, spool))
+    Ok(src)
 }
 
 /// The decompressed bytes of an input in one of Jena's syntaxes, its name for errors, and
@@ -457,39 +455,6 @@ impl Read for Transcoded {
     }
 }
 
-/// A temporary file that holds a transcoded input until the load that reads it ends;
-/// it is removed when dropped.
-pub struct Spool(PathBuf);
-
-impl Spool {
-    fn create() -> std::io::Result<(Spool, std::fs::File)> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir();
-        loop {
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let p = dir.join(format!("sparkles-load-{}-{n}.nq", std::process::id()));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&p) {
-                Ok(f) => return Ok((Spool(p), f)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-
-impl Drop for Spool {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Whether `input` is a file object rather than `str` or bytes.
 pub fn is_file_object(input: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(input.cast::<PyString>().is_err()
@@ -497,12 +462,20 @@ pub fn is_file_object(input: &Bound<'_, PyAny>) -> PyResult<bool> {
         && input.hasattr("read")?)
 }
 
-/// A Python file object as a `Read`: each read takes the GIL to call `read`. A text-mode
-/// file's `str` is encoded as UTF-8.
+/// Bytes asked of a Python file object by each call of its `read`, with the GIL held.
+const PY_READ_BYTES: usize = 64 << 10;
+
+/// A Python file object as a `Read`: each read takes the GIL to call `read` for at most
+/// [`PY_READ_BYTES`] bytes, or characters of a text-mode file, whose `str` is encoded as
+/// UTF-8. An exception that `read` raises is the error of the read, so that it reaches
+/// Python as itself. With a cancellation flag, a read after the flag is set fails with
+/// [`sparkles::Error::Cancelled`], which stops the parser that reads it.
 pub struct PyFileReader {
     obj: Py<PyAny>,
+    /// encoded characters of a text-mode read that did not fit the caller's buffer
     pending: Vec<u8>,
     pos: usize,
+    signals: Option<Arc<crate::interrupt::StreamSignals>>,
 }
 
 impl PyFileReader {
@@ -511,40 +484,67 @@ impl PyFileReader {
             obj,
             pending: Vec::new(),
             pos: 0,
+            signals: None,
         }
+    }
+
+    /// The reader of a request that [`crate::interrupt::run_stream`] runs: its reads fail
+    /// once the request is cancelled, and it makes a checkpoint when a signal is pending.
+    /// The request's publication hook makes the last one (see
+    /// [`crate::interrupt::StreamSignals::publish_hook`]).
+    pub fn with_signals(mut self, signals: Arc<crate::interrupt::StreamSignals>) -> Self {
+        self.signals = Some(signals);
+        self
+    }
+
+    fn cancelled() -> std::io::Error {
+        std::io::Error::other(sparkles::Error::Cancelled)
     }
 }
 
 impl Read for PyFileReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos >= self.pending.len() {
-            let chunk = Python::attach(|py| -> PyResult<Vec<u8>> {
-                let data = self
-                    .obj
-                    .bind(py)
-                    .call_method1("read", (buf.len().max(1 << 16),))?;
-                if let Ok(s) = data.cast::<PyString>() {
-                    return Ok(s.to_str()?.as_bytes().to_vec());
-                }
-                if let Ok(b) = data.cast::<PyBytes>() {
-                    return Ok(b.as_bytes().to_vec());
-                }
-                if data.is_none() {
-                    return Ok(Vec::new());
-                }
-                data.extract::<Vec<u8>>()
-            })
-            .map_err(std::io::Error::other)?;
-            self.pending = chunk;
-            self.pos = 0;
-            if self.pending.is_empty() {
-                return Ok(0);
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pos < self.pending.len() {
+            let n = buf.len().min(self.pending.len() - self.pos);
+            buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        if let Some(signals) = &self.signals {
+            // A read in a tight loop could keep the GIL from the main thread, which must
+            // run the handlers of a pending signal.
+            if (signals.pending() && signals.checkpoint()) || signals.cancelled() {
+                return Err(Self::cancelled());
             }
         }
-        let n = buf.len().min(self.pending.len() - self.pos);
-        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
+        let want = buf.len().min(PY_READ_BYTES);
+        Python::attach(|py| -> PyResult<usize> {
+            let data = self.obj.bind(py).call_method1("read", (want,))?;
+            let mut put = |bytes: &[u8]| {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                if n < bytes.len() {
+                    self.pending.clear();
+                    self.pending.extend_from_slice(&bytes[n..]);
+                    self.pos = 0;
+                }
+                n
+            };
+            if let Ok(b) = data.cast::<PyBytes>() {
+                return Ok(put(b.as_bytes()));
+            }
+            if let Ok(s) = data.cast::<PyString>() {
+                return Ok(put(s.to_str()?.as_bytes()));
+            }
+            if data.is_none() {
+                return Ok(0);
+            }
+            Ok(put(&data.extract::<Vec<u8>>()?))
+        })
+        .map_err(std::io::Error::other)
     }
 }
 
@@ -555,16 +555,6 @@ type StreamParser = oxrdfio::ReaderQuadParser<sparkles::nesting::Guarded<Box<dyn
 pub struct QuadStream {
     parser: StreamParser,
     name: String,
-}
-
-impl QuadStream {
-    /// The prefixes the document has declared so far.
-    pub fn prefixes(&self) -> BTreeMap<String, String> {
-        self.parser
-            .prefixes()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
 }
 
 impl Iterator for QuadStream {
@@ -644,7 +634,7 @@ pub fn quad_stream(
             if let Some(j) = jena {
                 return jena_stream(py, j, input, path, base_iri, graph, compression, lenient);
             }
-            let (src, _) = source_from_py(
+            let src = source_from_py(
                 py,
                 input,
                 format,
@@ -664,6 +654,10 @@ pub fn quad_stream(
             let raw: Box<dyn Read + Send> = match src.data {
                 SourceData::File(p) => Box::new(std::fs::File::open(p)?),
                 SourceData::Bytes(b) => Box::new(std::io::Cursor::new(b)),
+                // a file object takes the branch above
+                SourceData::Reader(_) => {
+                    return Err(PyValueError::new_err("a file object is read above"));
+                }
             };
             let r = codec.reader_send(raw, None).py(py)?;
             (r, rdf, src.base, src.graph, src.name)
