@@ -14,11 +14,14 @@ use super::ctx::Ctx;
 use super::exec::{PAR_THRESHOLD, filter_mask};
 use super::expr::Expr;
 use super::exprcache::Report;
-use super::plan::{IdRange, RangeOp, compare_atom, numeric_ranges};
+use super::plan::{
+    DECIMAL_MANTISSA, IdRange, RangeOp, compare_atom, numeric_segment, numeric_segments,
+};
 use super::table::{Table, VarId};
 use super::value::Value;
 use crate::error::Result;
-use crate::id::{Id, Tag};
+use crate::id::{Id, PAYLOAD_BITS, Tag};
+use std::sync::OnceLock;
 
 /// Fewer rows are evaluated as usual: classifying them would save little.
 const MIN_ROWS: usize = 1024;
@@ -35,9 +38,15 @@ enum Class {
 }
 
 /// How the constants of the comparisons classify an id.
-enum Rule {
-    /// numeric constants: the id ranges of the numeric range scan, in id order
-    Numeric(Vec<IdRange>),
+enum Rule<'a> {
+    /// numeric constants: the id range of the numeric range scan within each segment
+    /// of [`numeric_segments`], searched for when an id of the segment first occurs,
+    /// since a table holds ids of few segments and each search decodes a hundred values
+    Numeric {
+        ctx: &'a Ctx,
+        atoms: Vec<(RangeOp, Value)>,
+        segments: [OnceLock<Option<IdRange>>; 34],
+    },
     /// date or dateTime constants: the payloads of the constants' kind of id cut into
     /// pieces in which every comparison is decided the same way, and the class of each
     /// other tag
@@ -51,26 +60,36 @@ enum Rule {
     },
 }
 
-impl Rule {
+impl Rule<'_> {
     #[inline]
     fn class(&self, id: Id) -> Class {
         match self {
-            Rule::Numeric(ranges) => {
-                match id.tag() {
-                    // computed values are not among the scan's ranges
-                    Tag::Local => return Class::Test,
-                    Tag::Int | Tag::Double | Tag::Vocab | Tag::Delta | Tag::Decimal => {}
-                    _ => return Class::Fail,
-                }
-                let i = ranges.partition_point(|r| r.hi < id.0);
-                match ranges.get(i) {
-                    Some(r) if r.lo <= id.0 => {
-                        if r.exact {
-                            Class::Pass
-                        } else {
-                            Class::Test
-                        }
+            Rule::Numeric {
+                ctx,
+                atoms,
+                segments,
+            } => {
+                let p = id.payload();
+                let i = match id.tag() {
+                    Tag::Int => (p >> (PAYLOAD_BITS - 1)) as usize,
+                    Tag::Decimal => {
+                        2 + 2 * (p >> DECIMAL_MANTISSA) as usize
+                            + ((p >> (DECIMAL_MANTISSA - 1)) & 1) as usize
                     }
+                    // doubles and stored literals do not sort by value, and computed
+                    // values are not among the scan's ranges
+                    Tag::Double | Tag::Vocab | Tag::Delta | Tag::Local => return Class::Test,
+                    _ => return Class::Fail,
+                };
+                let Some(segment) = segments.get(i) else {
+                    return Class::Test;
+                };
+                let range = segment.get_or_init(|| {
+                    let (tag, lo, hi) = numeric_segments()[i];
+                    numeric_segment(atoms, ctx, tag, lo, hi)
+                });
+                match range {
+                    Some(r) if r.lo <= id.0 && id.0 <= r.hi => Class::Pass,
                     _ => Class::Fail,
                 }
             }
@@ -170,15 +189,19 @@ fn decidable(c: &Value) -> bool {
 /// either way.
 const MARGIN_DAYS: i64 = 3;
 
-fn rule(atoms: &[(RangeOp, Value)], ctx: &Ctx) -> Option<Rule> {
+fn rule<'a>(atoms: &[(RangeOp, Value)], ctx: &'a Ctx) -> Option<Rule<'a>> {
     if atoms.iter().all(|(_, c)| c.is_numeric()) {
-        return Some(Rule::Numeric(numeric_ranges(atoms, ctx)));
+        return Some(Rule::Numeric {
+            ctx,
+            atoms: atoms.to_vec(),
+            segments: std::array::from_fn(|_| OnceLock::new()),
+        });
     }
     calendar_rule(atoms)
 }
 
 /// The rule of comparisons that all have date constants, or all dateTime constants.
-fn calendar_rule(atoms: &[(RangeOp, Value)]) -> Option<Rule> {
+fn calendar_rule(atoms: &[(RangeOp, Value)]) -> Option<Rule<'static>> {
     let mut tag = None;
     let mut bounds = Vec::with_capacity(atoms.len());
     for (op, c) in atoms {

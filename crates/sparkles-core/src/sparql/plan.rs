@@ -4569,6 +4569,54 @@ pub(super) fn compare_atom(
 
 /// Id ranges whose values satisfy every atom (see [`RangeSpec`]).
 pub(super) fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx) -> Vec<IdRange> {
+    let residual = |tag: Tag| IdRange {
+        lo: Id::new(tag, 0).0,
+        hi: Id::new(tag, crate::id::PAYLOAD_MASK).0,
+        exact: false,
+    };
+    // tags in id order: Int < Double < Vocab < Delta < Decimal
+    let segments = numeric_segments();
+    let (ints, decimals) = segments.split_at(2);
+    let segment = |&(tag, lo, hi): &(Tag, u64, u64)| numeric_segment(atoms, ctx, tag, lo, hi);
+    let out: Vec<IdRange> = ints
+        .iter()
+        .filter_map(segment)
+        .chain([Tag::Double, Tag::Vocab, Tag::Delta].map(residual))
+        .chain(decimals.iter().filter_map(segment))
+        .collect();
+    debug_assert!(out.windows(2).all(|w| w[0].hi < w[1].lo));
+    out
+}
+
+/// Bits of an inline decimal's mantissa, above which its payload holds its scale.
+pub(super) const DECIMAL_MANTISSA: u32 = 56;
+
+/// The segments of inline numeric ids in which ids sort by value, in id order, as a tag
+/// and the first and last payload: the non-negative and the negative integers, then the
+/// non-negative and the negative decimals of each scale.
+pub(super) fn numeric_segments() -> [(Tag, u64, u64); 34] {
+    let half = 1u64 << (crate::id::PAYLOAD_BITS - 1);
+    let m = 1u64 << (DECIMAL_MANTISSA - 1);
+    std::array::from_fn(|i| match i {
+        0 => (Tag::Int, 0, half - 1),
+        1 => (Tag::Int, half, 2 * half - 1),
+        _ => {
+            let (scale, upper) = (((i - 2) / 2) as u64, (i - 2) % 2 == 1);
+            let lo = (scale << DECIMAL_MANTISSA) + if upper { m } else { 0 };
+            (Tag::Decimal, lo, lo + m - 1)
+        }
+    })
+}
+
+/// The ids of one segment of [`numeric_segments`] whose values satisfy every atom,
+/// found by binary search with the ordinary comparison.
+pub(super) fn numeric_segment(
+    atoms: &[(RangeOp, super::value::Value)],
+    ctx: &Ctx,
+    tag: Tag,
+    lo: u64,
+    hi: u64,
+) -> Option<IdRange> {
     use super::value::compare;
     use std::cmp::Ordering;
     // the atoms split into lower bounds (false, then true along a segment in value order)
@@ -4607,42 +4655,14 @@ pub(super) fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx
         }
         a
     };
-    let mut out = Vec::new();
-    let segment = |tag: Tag, lo: u64, hi: u64, out: &mut Vec<IdRange>| {
-        let (lo, hi) = (Id::new(tag, lo).0, Id::new(tag, hi).0);
-        let s = first(lo, hi, &lower_ok);
-        let e = first(lo, hi, &|id| !upper_ok(id));
-        if s < e {
-            out.push(IdRange {
-                lo: s,
-                hi: e - 1,
-                exact: true,
-            });
-        }
-    };
-    let residual = |tag: Tag, out: &mut Vec<IdRange>| {
-        out.push(IdRange {
-            lo: Id::new(tag, 0).0,
-            hi: Id::new(tag, crate::id::PAYLOAD_MASK).0,
-            exact: false,
-        })
-    };
-    // tags in id order: Int < Double < Vocab < Delta < Decimal
-    let half = 1u64 << (crate::id::PAYLOAD_BITS - 1);
-    segment(Tag::Int, 0, half - 1, &mut out);
-    segment(Tag::Int, half, 2 * half - 1, &mut out);
-    residual(Tag::Double, &mut out);
-    residual(Tag::Vocab, &mut out);
-    residual(Tag::Delta, &mut out);
-    const MANTISSA: u32 = 56;
-    for scale in 0..16u64 {
-        let base = scale << MANTISSA;
-        let m = 1u64 << (MANTISSA - 1);
-        segment(Tag::Decimal, base, base + m - 1, &mut out);
-        segment(Tag::Decimal, base + m, base + 2 * m - 1, &mut out);
-    }
-    debug_assert!(out.windows(2).all(|w| w[0].hi < w[1].lo));
-    out
+    let (lo, hi) = (Id::new(tag, lo).0, Id::new(tag, hi).0);
+    let s = first(lo, hi, &lower_ok);
+    let e = first(lo, hi, &|id| !upper_ok(id));
+    (s < e).then_some(IdRange {
+        lo: s,
+        hi: e - 1,
+        exact: true,
+    })
 }
 
 /// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].
