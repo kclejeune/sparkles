@@ -116,7 +116,7 @@ buffered mode. An N-Triples stream is parsed in blocks of 256 MiB, at most two a
 so a large one holds more than a load of the same file by its path, which maps the file
 instead. The gzip path row covers the same block reader, which now holds two buffers
 instead of up to four. A one-triple load in a new process takes about 4 ms more than
-before, a fixed cost that roadmap item NEW-ITEM tracks. A
+before, a fixed cost that roadmap item 445 tracks. A
 Turtle stream larger than the 128 MiB read-ahead is parsed by one reader, so it gains less
 than N-Triples does.*
 
