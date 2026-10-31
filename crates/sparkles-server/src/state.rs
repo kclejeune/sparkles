@@ -1259,12 +1259,13 @@ impl AppState {
         name: &str,
     ) -> Result<(bool, Option<uuid::Uuid>)> {
         let leaving = self.leave(name)?;
+        let end = Instant::now() + LEAVE_DRAIN;
         let cached = self.routing.lock().remove(name);
         // Only a managed persistent dataset has files that an old handle could write.
-        if cached
+        let managed = cached
             .as_ref()
-            .is_some_and(|ds| ds.kind == DbType::Persistent && !ds.ephemeral && !drained(ds))
-        {
+            .is_none_or(|ds| ds.kind == DbType::Persistent && !ds.ephemeral);
+        if managed && cached.as_ref().is_some_and(|ds| !drained(ds, end)) {
             self.routing
                 .lock()
                 .insert(name.to_string(), cached.expect("checked"));
@@ -1281,6 +1282,11 @@ impl AppState {
             .map(|ds| ds.store.dataset_id())
             .or_else(|| self.catalog.info(name).map(|info| info.id));
         drop(cached);
+        if managed {
+            // Workers such as a starting view worker hold the dataset itself, not this
+            // server's wrapper. The catalog refuses if one still does after the wait.
+            wait_until(end, || !self.catalog.in_use(name));
+        }
         #[cfg(test)]
         tests::delete_hook(name);
         let deleted = self.catalog.delete(name);
@@ -1331,8 +1337,9 @@ impl AppState {
             .into());
         }
         let leaving = self.leave(from)?;
+        let end = Instant::now() + LEAVE_DRAIN;
         let cached = self.routing.lock().remove(from);
-        if cached.as_ref().is_some_and(|ds| !drained(ds)) {
+        if cached.as_ref().is_some_and(|ds| !drained(ds, end)) {
             self.routing
                 .lock()
                 .insert(from.to_string(), cached.expect("checked"));
@@ -1345,6 +1352,8 @@ impl AppState {
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
         drop(cached);
+        // As in delete, wait for the workers that hold the dataset itself.
+        wait_until(end, || !self.catalog.in_use(from));
         let result = self.catalog.rename(from, to);
         drop(leaving);
         match result {
@@ -1826,12 +1835,16 @@ pub fn uptime_secs(state: &AppState) -> u64 {
 /// leaving dataset, such as the first round of a new dataset's view worker.
 const LEAVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Whether `ds` is held by its caller alone, waiting up to [`LEAVE_DRAIN`] for other
-/// holders to let go. Lookups no longer find a leaving dataset, so no new holder
-/// appears meanwhile.
-fn drained<T>(ds: &Arc<T>) -> bool {
-    let end = Instant::now() + LEAVE_DRAIN;
-    while Arc::strong_count(ds) > 1 {
+/// Whether `ds` is held by its caller alone, waiting until `end` for other holders to
+/// let go. Lookups no longer find a leaving dataset, so no new holder appears
+/// meanwhile.
+fn drained<T>(ds: &Arc<T>, end: Instant) -> bool {
+    wait_until(end, || Arc::strong_count(ds) == 1)
+}
+
+/// Poll `done` until it holds or `end` passes, and return whether it held.
+fn wait_until(end: Instant, mut done: impl FnMut() -> bool) -> bool {
+    while !done() {
         if Instant::now() >= end {
             return false;
         }
@@ -2026,8 +2039,27 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let st =
             AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-        for name in ["held-briefly", "renamed-briefly"] {
+        for name in [
+            "held-briefly",
+            "renamed-briefly",
+            "worker-held",
+            "worker-renamed",
+        ] {
             drop(st.create(name, DbType::Persistent).unwrap());
+        }
+        // A worker holds the dataset itself rather than the server's wrapper.
+        for (name, rename) in [("worker-held", false), ("worker-renamed", true)] {
+            let inner = st.catalog.get(name).unwrap();
+            let holder = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(inner);
+            });
+            if rename {
+                st.rename(name, "worker-renamed-after").unwrap();
+            } else {
+                assert!(st.delete(name).unwrap());
+            }
+            holder.join().unwrap();
         }
         // Like the first round of a new dataset's view worker, a holder that lets go
         // within the drain window does not refuse the change.
