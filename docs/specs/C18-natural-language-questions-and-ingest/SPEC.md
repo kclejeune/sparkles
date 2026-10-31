@@ -316,7 +316,7 @@ its models, or in an entry of its `models`.
 | `maxOutputTokens` | 2048 | The cap on one response. |
 | `temperature` | 0 | Drafts and extraction run deterministic by default. Models that reject the parameter, such as current Claude models, never get it. |
 | `structuredOutput` | `auto` | How the server constrains output to a JSON Schema (§3.6). |
-| `pricing` | none | Prices per million input and output tokens, used only for cost estimates (§5.4, §7.9) and the evaluation (§11). |
+| `pricing` | none | Prices per million input and output tokens, used only for cost estimates (§5.4, §7.9) and the evaluation (§11). `cacheWritePerMTok`, `cacheWrite1hPerMTok` and `cacheReadPerMTok` price the prompt cache's classes and default to 1.25, 2 and 0.1 times the input price. |
 
 The three kinds differ in the protocol and in a few members of their own.
 
@@ -324,7 +324,7 @@ The three kinds differ in the protocol and in a few members of their own.
 |---|---|---|---|
 | `ollama` | Ollama's native `POST /api/chat`. | `keepAlive`, how long Ollama keeps the model loaded, and `numCtx`, passed as the context option. | A local model on the same host or network, with no key. |
 | `openai` | `POST /v1/chat/completions`. | `headers`, extra non-secret headers that some gateways need. | vLLM, llama.cpp's server, LM Studio, LocalAI, OpenAI itself, and gateways such as LiteLLM. |
-| `anthropic` | Anthropic's `POST /v1/messages`, with the `anthropic-version` header. | `version`, the API version header value. | Claude models through Anthropic's API. |
+| `anthropic` | Anthropic's `POST /v1/messages`, with the `anthropic-version` header. | `version`, the API version header value, and `promptCaching` (§3.6). | Claude models through Anthropic's API. |
 
 `GET /$/models` lists the configured providers with their kind, endpoint, the models
 that the role lists name, each model's detected capabilities and status, and the role
@@ -379,14 +379,16 @@ in different ways, and `structuredOutput` chooses one or lets the server detect 
 |---|---|---|---|
 | `ollama` | The schema in the `format` field of `/api/chat`. The default. | `"format": "json"`. | Not used. |
 | `openai` | `response_format` with `type: "json_schema"` and `strict: true`. The default where the endpoint accepts it. | `response_format` with `type: "json_object"`. | A single function with the schema, forced with `tool_choice`. Not every server honours `tool_choice`. Ollama's compatible endpoint does not. |
-| `anthropic` | `output_config.format` with `type: "json_schema"`. The default. | Not offered. | A single tool with the schema as `input_schema`, forced with `tool_choice`. |
+| `anthropic` | `output_config.format` with `type: "json_schema"`. The default. | Not offered. | A single strict tool with the schema as `input_schema` and `tool_choice: auto`. |
 
 With `auto`, `POST /$/models/{name}/test` and the first call try `json-schema`, then
 `json-object`, then plain text, and the server remembers the first that returns valid
 JSON for each provider and model pair until the configuration changes. The level is a
 property of the pair, not of the provider, because one gateway can serve models with
-different abilities. Current Claude models refuse a forced `tool_choice` with `400`, so
-the `tool` level of the `anthropic` kind applies only to older models that accept it.
+different abilities. Claude Opus 5.5, Sonnet 5.5 and Fable 5.1 refuse a forced
+`tool_choice` with `400`, so the `tool` level of the `anthropic` kind lets the model
+choose the tool, and an answer it writes as text is read and validated like the other
+levels' answers.
 
 Constrained decoding on local servers often supports only part of JSON Schema.
 llama.cpp's server, for instance, skips keywords it does not support without saying so.
@@ -412,6 +414,31 @@ question instead of the whole schema summary, two stored examples instead of fiv
 three candidates per mention. Under 8,192 it also leaves out the summary step and shows
 the rows only. The `usage` event reports the level and the trimming, and the UI shows
 "answered by a small model" with the model's name, so a person can judge the result.
+
+**Prompt caching.** Anthropic caches a prompt's prefix up to each block marked with
+`cache_control`, in the order tools, system, messages, and a later request whose bytes
+match that prefix reads it at a tenth of the input price. A write costs 1.25 times the
+input price with the 5-minute TTL and 2 times with the 1-hour TTL. A request carries at
+most four marks, and a prefix shorter than the model's minimum of 512 to 4,096 tokens is
+not cached. A model call therefore takes its prompt in parts, and a part may end a
+cached prefix. The `anthropic` kind sends the parts as text blocks that end at each
+mark, keeps the last four marks when there are more, and sends a plain string where a
+system text or message has no mark. The other kinds join the parts. `promptCaching`
+turns the marks off or sets their TTL for one provider.
+
+| Caller | Marked parts | Expected reuse |
+|---|---|---|
+| Every call | The system text. | Calls of one role within the TTL, when the system text and the schema reach the minimum. |
+| Ask draft and repair | The common prefixes, classes and predicates of the dataset, then the question with its own grounding and notes. | The first part across every question of the dataset at one context size and pair. The second across the repairs of one question on one pair, so a scoped first draft, whose schema differs from a repair's, leaves it unmarked. |
+| Ingestion extraction | The vocabulary and the instructions. | Every chunk after the first of one document. |
+
+The grounding keeps its lines and changes their order for this. The common head of each
+list, which `balanced_entries` puts first and which is the same for every question,
+comes first, and the rest of each list follows in the question's part under the same
+heading. The question follows its grounding. Global answers, summaries, explanations,
+CSV mapping and community reports mark only their system text, because their user
+messages differ in every call. A step's record keeps the cache classes apart, and token
+budgets price them as above (§5.4).
 
 ### 3.7 Model roles
 
@@ -748,6 +775,12 @@ own budgets are those of
 with `provider-unavailable` at once and the UI offers the plain editor. When only the
 current pair is unreachable and the role's list has another, the step moves to it as
 §5.5 describes.
+
+Every token budget counts a step's output and its input priced as uncached input: a
+token written to the prompt cache counts 1.25 tokens, or 2 with the 1-hour TTL, and a
+token read from it counts 0.1 token, rounded up once per step. These are Anthropic's
+standard multipliers. A model whose reads cost less, such as Claude Opus 5.5, is
+counted at the standard rate, which is the higher.
 
 ### 5.5 Routing and escalation
 
@@ -3868,7 +3901,16 @@ design remains part of its original record.
 
 ## Outcome
 
-Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 263 and 318.
+Ask, query explanations, document ingestion and agent-memory workflows are available.
+
+Anthropic providers use prompt caching by default as §3.6 describes, with the off
+switch and the 1-hour TTL of `promptCaching`. Ask's draft prompt puts the dataset's
+common grounding first and the question after its own grounding. Token budgets, the
+provider's daily budget and cost estimates price cache writes and reads apart from
+uncached input, and the `tool` level of the `anthropic` kind no longer forces its tool.
+Whether Ask's accuracy changes with the new order of the grounding is measured by the
+evaluation of §11, and the cache hit rate of real calls is checked from the
+`cacheReadInputTokens` of their records. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 263 and 318.
 
 Ask consumes recognized candidate evidence for full choice identities and conservative
 ordering of explicitly named kinds. Every ambiguous mention still requires a

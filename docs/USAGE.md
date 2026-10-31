@@ -5073,6 +5073,25 @@ before saving it. An operator can pin verification on by locking the field, as i
 option is accepted for an `http://` endpoint, and neither changes the outbound policy,
 so a private address still needs `--outbound-allow-private`.
 
+### Prompt caching
+
+An `anthropic` provider marks the stable start of each prompt for Anthropic's prompt
+cache. Each Ask on a dataset reads the system text and the dataset's common prefixes,
+classes and predicates from the cache when another Ask with the same pair ran in the
+last five minutes, and a repair reads its question's grounding too. A cache read costs a
+tenth of the input price and a write 1.25 times it. To check that the cache works, run
+two asks in a row with `--json` and compare `cacheReadInputTokens` in their `usage`.
+Turn caching off for a provider, or keep prefixes for an hour at twice the write price
+when asks on a dataset come more than five minutes apart:
+
+```sh
+sparkles settings set --global models.providers.claude.promptCaching.enabled=false
+sparkles settings set --global models.providers.claude.promptCaching.ttl=1h
+```
+
+[API.md](API.md#model-providers) lists what each caller marks and how budgets count
+the cache's tokens.
+
 ### Escalation
 
 A role's list goes from the cheapest pair to the strongest. A step moves to the next

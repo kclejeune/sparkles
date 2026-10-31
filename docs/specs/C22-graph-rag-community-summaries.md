@@ -279,8 +279,12 @@ reservation fits in what remains of `budget.tokensPerBuild` and of
 `budget.tokensPerDay`. Every attempt passes this check. That includes the client's
 retries of a `429` or `5xx` answer, the retry with validation errors of C18 §3.6, the
 move to another structured-output level, and escalation to another pair. A retry with a
-changed request is bounded again. When the provider answers with its usage, the
-reservation is replaced by the reported input and output tokens. When the attempt fails
+changed request is bounded again. A request that marks a prefix for the provider's
+prompt cache reserves its input bound at the write price of its TTL, 1.25 times for 5
+minutes and 2 times for an hour, because the provider may write every input token to
+the cache. When the provider answers with its usage, the reservation is replaced by the
+reported input and output tokens, with a cache write counted at that price and a cache
+read at 0.1 token (C18 §5.4). When the attempt fails
 in a way that leaves its usage unknown, such as a timeout or a connection lost after the
 request was sent, or when the answer reports no usage, the whole reservation stays
 counted. Concurrent builds and refreshes of a dataset share one ledger for
@@ -826,6 +830,13 @@ registry error and is not evidence of this feature's implementation.
   - rewriting every report on any change.
 
 ## Outcome
+
+A build's ledger prices the prompt cache of an `anthropic` provider. An attempt whose
+body marks a cached prefix reserves its input bound at the write price of its TTL, 1.25
+or 2 times, since the provider may write every input token, and settles with each class
+at its price, so a write of the whole prompt is no accounting anomaly. The community
+role marks only its system text, which every report of a build shares, so a build reads
+it back when the system text and the schema reach the model's minimum.
 
 The `community` model role is implemented in the server configuration, dataset role
 overrides, CLI role guidance and the model settings UI. It preserves provider/model
