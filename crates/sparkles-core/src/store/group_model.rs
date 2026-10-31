@@ -105,6 +105,12 @@ impl Fault {
     fn syncs(self) -> bool {
         matches!(self, Fault::GroupSync | Fault::VocabSync)
     }
+
+    /// whether the fault can poison the writer, which fails the searches of speculative
+    /// heads that its fence covered
+    fn poisons(self) -> bool {
+        self.syncs() || matches!(self, Fault::Panic(_))
+    }
 }
 
 fn quad(name: &str) -> Quad {
@@ -275,7 +281,7 @@ fn holds(snap: &Snapshot, name: &str) -> bool {
     snap.contains(&[s, p, o, Id::DEFAULT_GRAPH]).unwrap()
 }
 
-/// Searches of a speculative head, which the indexed runs must make.
+/// Searches of a speculative head that answered, which the indexed runs must make.
 static SPECULATIVE_SEARCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Search the full-text index of the state a transaction starts from, before it changes
@@ -284,11 +290,9 @@ static SPECULATIVE_SEARCHES: AtomicU64 = AtomicU64::new(0);
 /// their publication (X09 item 447). `Err` when the search cannot answer for a reason the
 /// transaction must report: the fence failed, so the writer is poisoned.
 #[cfg(all(feature = "text", feature = "geo"))]
-fn search_base(t: &WriteTxn<'_>, mismatch: &mut Option<String>) -> Result<()> {
+fn search_base(t: &WriteTxn<'_>, poisoning: bool, mismatch: &mut Option<String>) -> Result<()> {
     let view = Arc::new(t.view());
-    if view.commit > t.store.snapshot().commit {
-        SPECULATIVE_SEARCHES.fetch_add(1, Ordering::Relaxed);
-    }
+    let speculative = view.commit > t.store.snapshot().commit;
     let expected = subjects_of(&view, LABEL);
     let q = "PREFIX text:<http://jena.apache.org/text#> SELECT ?s { ?s text:query \"common\" }";
     match crate::sparql::query(view.clone(), q, &Default::default()) {
@@ -303,22 +307,34 @@ fn search_base(t: &WriteTxn<'_>, mismatch: &mut Option<String>) -> Result<()> {
                     "a transaction's search of its base {} found {hits:?}, the base holds {expected:?}",
                     view.commit
                 ));
+            } else if speculative {
+                SPECULATIVE_SEARCHES.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
         }
         // stale after an injected failure: the search refuses, as it does for a reader
         Err(Error::TextUnavailable(_)) => Ok(()),
-        Err(e) => Err(e),
+        // only a fault that poisons the writer may fail the search of a base whose fence
+        // was still running
+        Err(e) if poisoning => Err(e),
+        Err(e) => {
+            *mismatch = Some(format!(
+                "a transaction's search of its base {} failed in a run without a poisoning fault: {e}",
+                view.commit
+            ));
+            Err(e)
+        }
     }
 }
 
 #[cfg(not(all(feature = "text", feature = "geo")))]
-fn search_base(_: &WriteTxn<'_>, _: &mut Option<String>) -> Result<()> {
+fn search_base(_: &WriteTxn<'_>, _: bool, _: &mut Option<String>) -> Result<()> {
     unreachable!("searching runs need the text and geo features")
 }
 
 /// Run one operation, returning its outcome.
-fn run_op(s: &Store, op: &Op, indexed: bool) -> Outcome {
+/// `poisoning` says whether the run's fault can poison the writer.
+fn run_op(s: &Store, op: &Op, indexed: bool, poisoning: bool) -> Outcome {
     let mut opts = crate::guard::WriteOptions {
         message: op.message.as_deref().map(Into::into),
         ..Default::default()
@@ -351,7 +367,7 @@ fn run_op(s: &Store, op: &Op, indexed: bool) -> Outcome {
         // the fallible form, which checks the options (`write_with` takes none of them)
         let mut t = s.try_write_with(CommitKind::Update, opts)?;
         if op.kind == Kind::Search {
-            search_base(&t, &mut mismatch)?;
+            search_base(&t, poisoning, &mut mismatch)?;
         }
         for n in &op.inserts {
             for q in quads(n, indexed) {
@@ -454,7 +470,7 @@ fn worker(
             message,
             outcome: Outcome::NoCommit,
         };
-        op.outcome = run_op(s, &op, indexed);
+        op.outcome = run_op(s, &op, indexed, fault.poisons());
         match &op.outcome {
             Outcome::Acked(_) if op.kind.commits() => live.extend(op.inserts.iter().cloned()),
             Outcome::Acked(_) | Outcome::NoCommit => {}
