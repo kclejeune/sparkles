@@ -1572,38 +1572,45 @@ fn writer_slot(ds: &sparkles::Dataset) -> WriterSlot {
     slot
 }
 
-/// The calling thread marked as the dataset's writer while a load or replacement from a
-/// file object runs on its own thread. Its signal handlers run on this thread while the
-/// write may hold the writer lock and wait for them, so a write that a handler makes to
-/// the same dataset is refused by [`check_transaction`] instead of waiting for that lock.
-/// The mark is cleared when this is dropped, on every path.
+/// The threads with a load or replacement from a file object in flight on each dataset,
+/// by the key of [`writer_slot`], with how many each has. Kept apart from the
+/// transaction owner, which another thread can hold while a stream write waits for it.
+type StreamCallers = std::collections::HashMap<(usize, std::thread::ThreadId), usize>;
+
+fn stream_callers() -> std::sync::MutexGuard<'static, StreamCallers> {
+    static CALLERS: std::sync::OnceLock<Mutex<StreamCallers>> = std::sync::OnceLock::new();
+    CALLERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The calling thread registered as a stream caller of the dataset while a load or
+/// replacement from a file object runs on its own thread. Its signal handlers run on this
+/// thread while the write may hold the writer lock and wait for them, so a write that a
+/// handler makes to the same dataset is refused by [`check_transaction`] instead of
+/// waiting for that lock. The registration ends when this is dropped, on every path,
+/// including an error or a panic.
 struct StreamWrite {
-    slot: WriterSlot,
-    marked: bool,
+    key: (usize, std::thread::ThreadId),
 }
 
 impl StreamWrite {
     fn begin(ds: &sparkles::Dataset) -> StreamWrite {
-        let slot = writer_slot(ds);
-        let marked = {
-            let mut owner = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // another thread's open transaction keeps its mark, and this write waits for it
-            let free = owner.is_none();
-            if free {
-                *owner = Some(std::thread::current().id());
-            }
-            free
-        };
-        StreamWrite { slot, marked }
+        let key = (ds.state() as *const _ as usize, std::thread::current().id());
+        *stream_callers().entry(key).or_insert(0) += 1;
+        StreamWrite { key }
     }
 }
 
 impl Drop for StreamWrite {
     fn drop(&mut self) {
-        let mut owner = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-        // a transaction that another thread began once this write ended keeps its mark
-        if self.marked && *owner == Some(std::thread::current().id()) {
-            *owner = None;
+        let mut callers = stream_callers();
+        if let Some(n) = callers.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                callers.remove(&self.key);
+            }
         }
     }
 }
@@ -1611,7 +1618,9 @@ impl Drop for StreamWrite {
 /// Reject waiting for a store lock owned by this Python thread's transaction.
 /// Checking the shared state also covers aliases obtained through a catalog.
 pub(crate) fn check_transaction(py: Python<'_>, ds: &sparkles::Dataset) -> PyResult<()> {
-    if *writer_slot(ds).lock().unwrap() == Some(std::thread::current().id()) {
+    let me = std::thread::current().id();
+    let streaming = stream_callers().contains_key(&(ds.state() as *const _ as usize, me));
+    if streaming || *writer_slot(ds).lock().unwrap() == Some(me) {
         return Err(new_err(
             py,
             "ConflictError",

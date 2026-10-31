@@ -1315,9 +1315,11 @@ handlers and fails with `Cancelled` when one raised, so an interrupt during the 
 abandons the write whatever decoder read the stream last. A handler that returns lets the
 request go on, and a handler may query other datasets because the request does not
 occupy the helper thread of other calls. While the request runs, the calling thread is
-marked as the dataset's writer, as an open transaction marks it, so a handler's write to
-the same dataset raises `ConflictError` at once instead of waiting for the writer lock
-that the request holds. The store checks the cancellation and the deadline again after
+registered as a stream caller of the dataset, apart from the owner of an open
+transaction, so a handler's write to the same dataset raises `ConflictError` at once
+instead of waiting for the writer lock that the request holds. The registration holds
+while the request waits for another thread's transaction or stream write and ends on
+every path. The store checks the cancellation and the deadline again after
 the hook, and every read of the raw stream checks them beneath the decompressor. `replace` also passes its token and timeout to
 the reader, the read-ahead and the store. A signal that arrives during publication itself
 can still raise after the commit. N-Triples and N-Quads streams are parsed in blocks, of
@@ -1338,7 +1340,8 @@ of a cold process, the deadlock of a querying handler, the replacement that igno
 Ctrl-C and its deadline, the cutoffs that counted compressed bytes and the memory costs.
 A third review found the deadlock of a handler that writes the loading dataset, the
 deadline that a slow handler outlived, and the decompressor reads that skipped the
-controls.
+controls. A fourth found that the first guard lost the caller when another thread held
+the transaction slot as the request began.
 Each regression test failed on the build before its fix, and
 `tests/block_reader_memory.rs` counts the live block buffers with a global allocator. A 5M-triple N-Triples file object loads in 2.25 s instead of 21.07 s on atlas, and a
 one-triple one in a new process takes 6.4 ms instead of 2.7 ms, which roadmap item

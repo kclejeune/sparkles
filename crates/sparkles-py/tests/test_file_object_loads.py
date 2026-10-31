@@ -655,3 +655,92 @@ def test_a_handler_that_waits_past_the_timeout_leaves_the_data(tmp_path: Path) -
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.split() == ["timeout", "1", "True"]
+
+
+HANDOFF_PRELUDE = """
+import io, signal, threading, time
+import sparkles
+
+def lines(tag, n):
+    return "".join(f'<http://e/{tag}{i}> <http://e/p> "{i}" .\\n' for i in range(n)).encode()
+
+class SignalAtLastData(io.RawIOBase):
+    def __init__(self, raw, signal_at_end=True, delay=0.0):
+        self.raw, self.pos, self.signal_at_end, self.delay = raw, 0, signal_at_end, delay
+    def readable(self):
+        return True
+    def read(self, n=-1):
+        time.sleep(self.delay)
+        chunk = self.raw[self.pos : self.pos + min(n, 1000)]
+        self.pos += len(chunk)
+        if self.signal_at_end and chunk and self.pos == len(self.raw):
+            signal.raise_signal(signal.SIGUSR1)
+        return chunk
+
+ds = sparkles.Dataset()
+ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+seen = []
+def handler(*_):
+    try:
+        ds.load('<http://e/x> <http://e/y> <http://e/z> .', "nt")
+        seen.append("wrote")
+    except sparkles.ConflictError:
+        seen.append("refused")
+signal.signal(signal.SIGUSR1, handler)
+"""
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="no SIGUSR1")
+def test_a_stream_load_that_waits_for_another_threads_transaction_stays_protected() -> None:
+    """Another thread's open transaction holds the writer slot while the stream load
+    starts and waits. Once it commits, the load takes the writer lock, and its handler's
+    write must still be refused rather than wait for that lock."""
+    out = run_child(
+        HANDOFF_PRELUDE
+        + """
+holding = threading.Event()
+def other():
+    with ds.transaction() as tx:
+        tx.update('INSERT DATA { <http://e/t> <http://e/p> <http://e/q> }')
+        holding.set()
+        time.sleep(0.5)
+t = threading.Thread(target=other)
+t.start()
+holding.wait()
+ds.load(SignalAtLastData(lines("s", 500)), "nt")
+t.join()
+print(seen, len(ds))
+""",
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split("]")[0] + "]" == "['refused']"
+    assert int(out.stdout.split()[-1]) == 502
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="no SIGUSR1")
+def test_concurrent_stream_loads_keep_their_handlers_protected() -> None:
+    """A stream load on another thread holds the dataset while the main thread's stream
+    load starts and waits for it. The main thread's handler write must be refused."""
+    out = run_child(
+        HANDOFF_PRELUDE
+        + """
+started = threading.Event()
+class Started(SignalAtLastData):
+    def read(self, n=-1):
+        started.set()
+        return super().read(n)
+def other():
+    ds.load(Started(lines("t", 200), signal_at_end=False, delay=0.002), "nt")
+t = threading.Thread(target=other)
+t.start()
+started.wait()
+ds.load(SignalAtLastData(lines("s", 500)), "nt")
+t.join()
+print(seen, len(ds))
+""",
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split("]")[0] + "]" == "['refused']"
+    assert int(out.stdout.split()[-1]) == 701
