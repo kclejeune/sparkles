@@ -7290,16 +7290,12 @@ pub(crate) fn wal_point(
 }
 
 /// Make a commit durable: its WAL records, already written to `wal`, and the delta terms
-/// it added, if any. Where the terms fit in the vocabulary file's durable length on the
-/// log's ext4 or XFS device, they are written back and waited for, and the log's one
-/// `fdatasync` makes both durable with a single device cache flush
-/// ([`DeltaVocab::sync_with_log`]). Otherwise the two files are synced at the same time,
-/// on two threads, so a commit that adds terms waits for one `fdatasync` rather than two
-/// in a row (on ext4 both wait for the same journal commit). A crash can then leave the
-/// commit record durable without the terms it names: replay treats a last commit naming
-/// delta ids that `delta.vocab` lacks as a torn tail, like one whose checksum fails. The
-/// commit is acknowledged only after both are durable, so no acknowledged commit is
-/// dropped.
+/// it added, if any. The two files are synced at the same time, on two threads, so a
+/// commit that adds terms waits for one `fdatasync` rather than two in a row (on ext4
+/// both wait for the same journal commit). A crash can then leave the commit record
+/// durable without the terms it names: replay treats a last commit naming delta ids
+/// that `delta.vocab` lacks as a torn tail, like one whose checksum fails. The commit is
+/// acknowledged only after both syncs succeed, so no acknowledged commit is dropped.
 fn sync_commit_reused(
     wal: &File,
     dvocab: &DeltaVocab,
@@ -7307,9 +7303,6 @@ fn sync_commit_reused(
 ) -> Result<()> {
     if !dvocab.needs_sync() {
         return Ok(wal.sync_data()?);
-    }
-    if let Some(synced) = dvocab.sync_with_log(wal) {
-        return synced;
     }
     let pending = dvocab.sync_on(worker, false);
     let synced = wal.sync_data();

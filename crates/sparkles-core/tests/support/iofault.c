@@ -9,8 +9,7 @@
 //    file. tests/power_loss.rs replays the log to rebuild the files as a power loss at any
 //    point would leave them.
 //  * Faults. $SPARKLES_IO_FAULT is a comma-separated list of OP:SUFFIX:N or OP:SUFFIX:N+
-//    entries. OP is fdatasync, fsync, sync_file_range or pwrite (also for write). The call
-//    number N (counted
+//    entries. OP is fdatasync, fsync or pwrite (also for write). The call number N (counted
 //    from 1 over the calls on files whose path ends in SUFFIX) fails with EIO instead of
 //    reaching the kernel, and with N+ so does every later call too.
 //
@@ -20,9 +19,8 @@
 //
 // Log record, little endian:
 //   u8 kind (1 write begin, 2 write end, 3 truncate, 4 sync begin, 5 sync end, 6 rename,
-//   7 unlink, 8 create, 9 write-back begin, 10 write-back end),
-//   u8 flag (write: 1 when the descriptor is O_DSYNC; write-back begin: 1 when the call
-//   waits for the writes to complete; end records: 1 when the call failed),
+//   7 unlink, 8 create),
+//   u8 flag (write: 1 when the descriptor is O_DSYNC; end records: 1 when the call failed),
 //   u16 path length, path bytes, u64 offset, u64 length, then for a write the bytes and for
 //   a rename the new path (the path is the old one).
 // Only the shim's own bookkeeping is serialized: the real calls run concurrently. A
@@ -53,14 +51,11 @@ enum {
   K_SYNC_END = 5,
   K_RENAME = 6,
   K_UNLINK = 7,
-  K_CREATE = 8,
-  K_WRITEBACK = 9,
-  K_WRITEBACK_END = 10
+  K_CREATE = 8
 };
 
 static int (*real_fdatasync)(int);
 static int (*real_fsync)(int);
-static int (*real_sync_file_range)(int, off_t, off_t, unsigned int);
 static ssize_t (*real_pwrite)(int, const void *, size_t, off_t);
 static ssize_t (*real_write)(int, const void *, size_t);
 static int (*real_ftruncate)(int, off_t);
@@ -90,7 +85,6 @@ static void init(void) {
   if (ready) return;
   real_fdatasync = dlsym(RTLD_NEXT, "fdatasync");
   real_fsync = dlsym(RTLD_NEXT, "fsync");
-  real_sync_file_range = dlsym(RTLD_NEXT, "sync_file_range");
   real_pwrite = dlsym(RTLD_NEXT, "pwrite64");
   real_write = dlsym(RTLD_NEXT, "write");
   real_ftruncate = dlsym(RTLD_NEXT, "ftruncate64");
@@ -235,29 +229,6 @@ static int sync_call(const char *op, int fd) {
 
 int fdatasync(int fd) { return sync_call("fdatasync", fd); }
 int fsync(int fd) { return sync_call("fsync", fd); }
-
-// A write-back of a range (length 0: to the end of the file). One that waits for the
-// writes to complete (SYNC_FILE_RANGE_WAIT_AFTER) leaves them in the device's volatile
-// cache, and the next synchronization of any file, whose cache flush covers every write
-// completed before it, makes them durable. tests/power_loss.rs models it so.
-int sync_file_range(int fd, off_t off, off_t len, unsigned int flags) {
-  init();
-  char path[PATH_MAX];
-  if (!path_of(fd, path, sizeof path)) return real_sync_file_range(fd, off, len, flags);
-  int wait = (flags & SYNC_FILE_RANGE_WAIT_AFTER) != 0;
-  record(K_WRITEBACK, (uint8_t)wait, path, (uint64_t)off, (uint64_t)len, NULL);
-  int r;
-  if (should_fail("sync_file_range", path)) {
-    errno = EIO;
-    r = -1;
-  } else {
-    r = real_sync_file_range(fd, off, len, flags);
-  }
-  int saved = errno;
-  record(K_WRITEBACK_END, r != 0, path, (uint64_t)off, (uint64_t)len, NULL);
-  errno = saved;
-  return r;
-}
 
 static ssize_t write_call(int fd, const void *buf, size_t n, off_t off, int positioned) {
   init();

@@ -569,22 +569,6 @@ fn run_writer(
     Run { root, lines }
 }
 
-/// Whether `path` is on ext4 or XFS, where a fence writes the delta vocabulary back and
-/// lets the log's sync flush it.
-fn journalled_in_place(path: &Path) -> bool {
-    let Ok(out) = Command::new("stat")
-        .args(["-f", "-c", "%t"])
-        .arg(path)
-        .output()
-    else {
-        return false;
-    };
-    matches!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "ef53" | "58465342"
-    )
-}
-
 // ----------------------------------------------------------------- the I/O log
 
 enum Rec {
@@ -620,13 +604,6 @@ enum Rec {
     Create {
         path: String,
     },
-    /// a `sync_file_range` of `[off, off + len)` (`len` 0: to the end) that returned
-    /// successfully after waiting for the writes to complete
-    WrittenBack {
-        path: String,
-        off: u64,
-        len: u64,
-    },
 }
 
 /// Parse the shim's log. The writer leaves by `exit` while the store's own threads still
@@ -639,8 +616,6 @@ enum Rec {
 /// an image the model already allows, one in which the crash lost that operation.
 fn parse_log(buf: &[u8]) -> Vec<Rec> {
     let mut out = Vec::new();
-    // write-backs that began and have not returned
-    let mut waits: Vec<(String, u64, u64, bool)> = Vec::new();
     let mut p = 0;
     while p + 4 <= buf.len() {
         let (kind, flag) = (buf[p], buf[p + 1]);
@@ -693,25 +668,6 @@ fn parse_log(buf: &[u8]) -> Vec<Rec> {
             }
             7 => Rec::Unlink { path },
             8 => Rec::Create { path },
-            9 => {
-                // the begin record says whether the call waits for completion, and only
-                // the end record says that it returned
-                waits.push((path, off, len, flag == 1));
-                continue;
-            }
-            10 => {
-                let Some(i) = waits
-                    .iter()
-                    .position(|w| w.0 == path && w.1 == off && w.2 == len)
-                else {
-                    continue;
-                };
-                let (path, off, len, wait) = waits.swap_remove(i);
-                if flag == 1 || !wait {
-                    continue;
-                }
-                Rec::WrittenBack { path, off, len }
-            }
             k => panic!("unknown record kind {k}"),
         });
     }
@@ -783,8 +739,6 @@ struct Op {
     state: State,
     dsync: bool,
     returned: bool,
-    /// a write-back waited for it to complete, so a later cache flush covers it
-    completed: bool,
 }
 
 #[derive(Default)]
@@ -835,9 +789,6 @@ struct Model {
     dirs: Vec<DirOp>,
     /// per directory, the directory operations its running synchronization covers
     dir_covered: BTreeMap<String, Vec<usize>>,
-    /// per file, the completed writes of every file that the cache flush of its running
-    /// synchronization covers
-    flush_covered: BTreeMap<String, Vec<(String, usize)>>,
     events: Vec<Ev>,
 }
 
@@ -847,7 +798,6 @@ impl Model {
             files: BTreeMap::new(),
             dirs: Vec::new(),
             dir_covered: BTreeMap::new(),
-            flush_covered: BTreeMap::new(),
             events: Vec::new(),
         }
     }
@@ -883,7 +833,6 @@ impl Model {
                     state: State::Pending,
                     dsync: *dsync,
                     returned: false,
-                    completed: false,
                 },
             ),
             Rec::WriteEnd { path, off, failed } => {
@@ -909,7 +858,6 @@ impl Model {
                     state: State::Pending,
                     dsync: false,
                     returned: true,
-                    completed: false,
                 },
             ),
             Rec::Sync { path } => {
@@ -923,30 +871,10 @@ impl Model {
                     })
                     .collect();
                 self.dir_covered.insert(path.clone(), covered);
-                // A synchronization ends with a cache flush of the device, which makes
-                // every write that had completed before it durable, of any file.
-                let flushed = self
-                    .files
-                    .iter()
-                    .flat_map(|(p, f)| {
-                        f.ops
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, o)| o.completed && o.state == State::Pending)
-                            .map(move |(i, _)| (p.clone(), i))
-                    })
-                    .collect();
-                self.flush_covered.insert(path.clone(), flushed);
             }
             Rec::SyncEnd { path, failed } => {
                 let covered = self.dir_covered.remove(path).unwrap_or_default();
-                let flushed = self.flush_covered.remove(path).unwrap_or_default();
                 if !failed {
-                    for (p, i) in flushed {
-                        if let Some(f) = self.files.get_mut(&p) {
-                            f.ops[i].state = State::Durable;
-                        }
-                    }
                     let f = self.files.entry(path.clone()).or_default();
                     for i in std::mem::take(&mut f.covered) {
                         f.ops[i].state = State::Durable;
@@ -959,21 +887,6 @@ impl Model {
             Rec::Rename { path, to } => self.push_dir(DirKind::Rename(to.clone()), path),
             Rec::Unlink { path } => self.push_dir(DirKind::Unlink, path),
             Rec::Create { path } => self.push_dir(DirKind::Create, path),
-            Rec::WrittenBack { path, off, len } => {
-                let end = if *len == 0 { u64::MAX } else { off + len };
-                if let Some(f) = self.files.get_mut(path) {
-                    for o in &mut f.ops {
-                        let Some(data) = &o.data else { continue };
-                        if o.returned
-                            && o.state == State::Pending
-                            && o.off < end
-                            && o.off + data.len() as u64 > *off
-                        {
-                            o.completed = true;
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1433,16 +1346,6 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     let base = 3;
     let run = run_writer(name, cfg, base, true, "", text, background);
     let log = parse_log(&std::fs::read(run.log()).unwrap());
-    // On ext4 and XFS a fence writes the new terms back and lets the log's sync flush
-    // them (X09, roadmap item 112), so its images rely on the model of that flush.
-    let shared = log
-        .iter()
-        .filter(|r| matches!(r, Rec::WrittenBack { path, .. } if path.ends_with("delta.vocab")))
-        .count();
-    println!("{name}: {shared} write-backs of the delta vocabulary");
-    if cfg.group && journalled_in_place(&run.db()) {
-        assert!(shared > 0, "{name}: no fence shared the log's flush");
-    }
     if background {
         let count = run
             .lines
@@ -1935,16 +1838,10 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
         commits: 12,
     };
     // the first sync, one during a run of fences, the log alone, the vocabulary alone,
-    // and both at once. On ext4 and XFS the vocabulary's own `fdatasync` runs only when
-    // its file grows, and otherwise its terms are written back and flushed by the log's
-    // sync, so a failed write-back stands for a failed vocabulary sync there.
+    // and both at once
     failed_sync("g-first", grouped, "fdatasync:wal.log:1");
     failed_sync("g-later", grouped, "fdatasync:wal.log:6");
-    failed_sync("g-vocab", grouped, "fdatasync:delta.vocab:1");
-    // on ext4 and XFS a fence writes the terms back instead of syncing their file
-    if journalled_in_place(&work_root()) {
-        failed_sync("g-vocab-back", grouped, "sync_file_range:delta.vocab:2");
-    }
+    failed_sync("g-vocab", grouped, "fdatasync:delta.vocab:4");
     failed_sync(
         "g-both",
         grouped,
@@ -1953,10 +1850,7 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     failed_sync("g-wal-from", grouped, "fdatasync:wal.log:3+");
     failed_sync("o-first", ordinary, "fdatasync:wal.log:1");
     failed_sync("o-later", ordinary, "fdatasync:wal.log:7");
-    failed_sync("o-vocab", ordinary, "fdatasync:delta.vocab:1");
-    if journalled_in_place(&work_root()) {
-        failed_sync("o-vocab-back", ordinary, "sync_file_range:delta.vocab:3");
-    }
+    failed_sync("o-vocab", ordinary, "fdatasync:delta.vocab:5");
     failed_sync("d-write", direct, "pwrite:wal.log:5");
     failed_sync("d-vocab", direct, "pwrite:delta.vocab:5");
     // the annotation file alone, in a run of fences

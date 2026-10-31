@@ -333,12 +333,6 @@ pub(crate) struct DeltaFile {
     alloc: u64,
     /// the logical end known to be durable
     durable: u64,
-    /// the file length known to be durable, which a sync made durable together with the
-    /// blocks below it (0 until the first sync of this process)
-    alloc_durable: u64,
-    /// whether a cache flush of the file system that the log is on also covers this
-    /// file's completed writes (see [`sync_with_log`](Self::sync_with_log))
-    shared_flush: SharedFlush,
     /// the most the file grows ahead of its chunks at once
     prealloc: u64,
     direct: wal::Direct,
@@ -390,8 +384,6 @@ impl DeltaFile {
         self.end = bytes.len() as u64;
         self.alloc = self.end;
         self.durable = self.end;
-        self.alloc_durable = self.end;
-        self.shared_flush = SharedFlush::Untried;
         self.converted_end = self.end;
         // a handle of the replaced file must not take writes
         self.direct = wal::Direct::Untried;
@@ -434,13 +426,13 @@ impl DeltaFile {
     /// writer can mark and insert meanwhile, and a later chunk written then is not
     /// counted durable.
     fn sync_gated(file: &Arc<Mutex<Self>>) -> Result<()> {
-        let (fd, end, alloc) = {
+        let (fd, end) = {
             let mut f = file.lock();
             if !f.needs_sync() {
                 return Ok(());
             }
             f.write_pending()?;
-            (f.file.try_clone()?, f.end, f.alloc)
+            (f.file.try_clone()?, f.end)
         };
         #[cfg(test)]
         Self::test_hook(file)?;
@@ -453,8 +445,6 @@ impl DeltaFile {
         let mut f = file.lock();
         debug_assert!(f.end >= end, "rollback must serialize with prefix sync");
         f.durable = f.durable.max(end);
-        // a truncation since the capture makes the shorter length the durable bound
-        f.alloc_durable = f.alloc_durable.max(alloc).min(f.alloc);
         Ok(())
     }
 
@@ -524,100 +514,6 @@ impl DeltaFile {
         Self::sync_gated(file)
     }
 
-    /// Make the pending entries durable together with the log `log`, whose records the
-    /// caller wrote: the entries' pages are written back and the write is waited for, and
-    /// then one `fdatasync` of the log makes both files durable. `None`, before anything is
-    /// written, where that does not hold, and the caller then syncs both files as before.
-    ///
-    /// A synchronization of the log ends with a cache flush of its device, and a flush
-    /// makes every write that completed before it durable, whatever file it belongs to
-    /// (Linux's `REQ_PREFLUSH`). `sync_file_range` with `SYNC_FILE_RANGE_WAIT_AFTER`
-    /// returns once the entries' writes have completed, before the log's sync starts, so
-    /// the flush that makes the log's records durable covers the entries too. That needs
-    /// the entries to be readable without metadata: they overwrite blocks below the file
-    /// length that an earlier sync made durable, which needs no journal commit on ext4 and
-    /// XFS, so only those two file systems take this path, and only when the log is on
-    /// the same device. A copy-on-write file system would need new metadata for the same
-    /// write. An `fdatasync` of each file would flush the device twice, which on a drive
-    /// whose flush takes most of a millisecond made a group commit fence cost half as much
-    /// again as an ordinary commit (X09, roadmap item 112).
-    ///
-    /// The entries count as durable only once the log's sync has succeeded. Either
-    /// failure is the commit's failure, and a failed write-back marks the file failed, as
-    /// a failed `fdatasync` does.
-    pub(crate) fn sync_with_log(file: &Arc<Mutex<Self>>, log: &File) -> Option<Result<()>> {
-        let gate = file.lock().sync_gate.clone();
-        let _fence = gate.lock();
-        let (fd, from, end) = {
-            let mut f = file.lock();
-            if !f.needs_sync() {
-                return Some(log.sync_data().map_err(Error::from));
-            }
-            if f.failed || f.format != DeltaFormat::Framed || !f.flush_covers(log) {
-                return None;
-            }
-            if let Err(e) = f.write_pending() {
-                return Some(Err(e));
-            }
-            // Only a chunk inside the durable length: a chunk that grew the file needs
-            // the `fdatasync` of this file that makes its new length durable, which the
-            // caller's fallback runs on the bytes written here.
-            if f.alloc > f.alloc_durable {
-                return None;
-            }
-            match f.file.try_clone() {
-                Ok(fd) => (fd, f.durable, f.end),
-                Err(e) => {
-                    f.failed = true;
-                    return Some(Err(e.into()));
-                }
-            }
-        };
-        #[cfg(test)]
-        if let Err(e) = Self::test_hook(file) {
-            return Some(Err(e));
-        }
-        #[cfg(test)]
-        SHARED_FLUSH_SYNCS.with(|n| n.set(n.get() + 1));
-        // the log's pages go to the device while the entries' are written and waited for
-        write_back(log);
-        if let Err(e) = write_back_and_wait(&fd, from, end) {
-            file.lock().failed = true;
-            return Some(Err(e.into()));
-        }
-        if let Err(e) = log.sync_data() {
-            return Some(Err(e.into()));
-        }
-        let mut f = file.lock();
-        debug_assert!(f.end >= end, "rollback must serialize with prefix sync");
-        f.durable = f.durable.max(end);
-        Some(Ok(()))
-    }
-
-    /// Whether a cache flush that a sync of `log` sends also covers this file's
-    /// completed writes: both are on one device of an ext4 or XFS file system.
-    fn flush_covers(&mut self, log: &File) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if matches!(self.shared_flush, SharedFlush::Untried) {
-                self.shared_flush = match self.file.metadata() {
-                    Ok(m) if journalled_in_place(&self.file) => SharedFlush::Device(m.dev()),
-                    _ => SharedFlush::No,
-                };
-            }
-            match self.shared_flush {
-                SharedFlush::Device(dev) => log.metadata().is_ok_and(|m| m.dev() == dev),
-                _ => false,
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = log;
-            false
-        }
-    }
-
     #[cfg(test)]
     fn test_hook(file: &Arc<Mutex<Self>>) -> Result<()> {
         let (hook, failed) = {
@@ -632,83 +528,6 @@ impl DeltaFile {
         }
         Ok(())
     }
-}
-
-/// Whether a delta vocabulary's file shares the cache flush of its log's sync (see
-/// [`DeltaFile::sync_with_log`]).
-#[derive(Clone, Copy, Debug)]
-enum SharedFlush {
-    Untried,
-    /// it does, when the log is on this device
-    Device(u64),
-    No,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// syncs that took [`DeltaFile::sync_with_log`]'s shared flush, on this thread
-    pub(crate) static SHARED_FLUSH_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Whether `file` is on ext4 or XFS, whose overwrite of an allocated, written block
-/// needs no metadata to be read back.
-#[cfg(target_os = "linux")]
-fn journalled_in_place(file: &File) -> bool {
-    use std::os::fd::AsRawFd;
-    /// ext2, ext3 and ext4 share it
-    const EXT4_SUPER_MAGIC: i64 = 0xEF53;
-    const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `fstatfs` writes a `statfs` into the buffer when it returns 0.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-        return false;
-    }
-    // SAFETY: initialised by the successful call above.
-    let kind = unsafe { st.assume_init() }.f_type as i64;
-    kind == EXT4_SUPER_MAGIC || kind == XFS_SUPER_MAGIC
-}
-
-/// Start the write-back of `file`'s dirty pages, without waiting. Only an optimization:
-/// the caller's later sync of the file waits for them, and reports their errors.
-#[cfg(target_os = "linux")]
-fn write_back(file: &File) {
-    use std::os::fd::AsRawFd;
-    // SAFETY: plain system call on an open descriptor. A length of 0 means to the end.
-    unsafe {
-        libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
-    }
-}
-
-/// Write back `file`'s dirty pages in `[from, end)` and wait until those writes have
-/// completed, so that a later device cache flush covers them. Metadata is not written.
-#[cfg(target_os = "linux")]
-fn write_back_and_wait(file: &File, from: u64, end: u64) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let from = from - from % 4096;
-    // SAFETY: plain system call on an open descriptor.
-    let r = unsafe {
-        libc::sync_file_range(
-            file.as_raw_fd(),
-            from as libc::off64_t,
-            end.saturating_sub(from) as libc::off64_t,
-            libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                | libc::SYNC_FILE_RANGE_WRITE
-                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-        )
-    };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn write_back(_: &File) {}
-
-#[cfg(not(target_os = "linux"))]
-fn write_back_and_wait(_: &File, _: u64, _: u64) -> std::io::Result<()> {
-    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// Write `keys` as a framed file in a new file renamed over `path`, synced with its
@@ -935,8 +754,6 @@ impl DeltaVocab {
                 end,
                 alloc,
                 durable: end,
-                alloc_durable: 0,
-                shared_flush: SharedFlush::Untried,
                 prealloc: MAX_PREALLOC,
                 direct: wal::Direct::Untried,
                 failed: false,
@@ -1137,7 +954,6 @@ impl DeltaVocab {
         f.end = to;
         f.written = m.written;
         f.durable = to;
-        f.alloc_durable = f.alloc;
         Ok(())
     }
 
@@ -1157,15 +973,6 @@ impl DeltaVocab {
         match &self.file {
             Some(file) => DeltaFile::sync_direct(file),
             None => Ok(()),
-        }
-    }
-
-    /// [`sync`](Self::sync) together with the log `log` (see
-    /// [`DeltaFile::sync_with_log`]): `None` when the two files need a sync each.
-    pub(crate) fn sync_with_log(&self, log: &File) -> Option<Result<()>> {
-        match &self.file {
-            Some(file) => DeltaFile::sync_with_log(file, log),
-            None => Some(log.sync_data().map_err(Error::from)),
         }
     }
 
@@ -1232,7 +1039,6 @@ impl DeltaVocab {
             f.file.sync_data()?;
         }
         f.durable = f.end;
-        f.alloc_durable = f.alloc;
         Ok(())
     }
 
@@ -1244,7 +1050,6 @@ impl DeltaVocab {
         let mut f = f.lock();
         if !f.failed && f.durable == f.end && f.alloc > f.end && f.file.set_len(f.end).is_ok() {
             f.alloc = f.end;
-            f.alloc_durable = f.alloc_durable.min(f.alloc);
         }
     }
 
@@ -1431,91 +1236,6 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v.get(1).unwrap(), b"<http://x/b>");
         assert_eq!(v.format(), Some(DeltaFormat::Framed));
-    }
-
-    /// On ext4 or XFS a chunk that fits in the file's durable length is written back and
-    /// made durable by the log's sync, and a chunk that grows the file, the first one, one
-    /// after a truncation, or one whose log is on another device, takes the vocabulary's
-    /// own `fdatasync` (X09, roadmap item 112).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_chunk_inside_the_durable_length_shares_the_log_sync() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = File::create(dir.path().join("wal.log")).unwrap();
-        if !journalled_in_place(&log) {
-            eprintln!("skipped: the temporary directory is not on ext4 or XFS");
-            return;
-        }
-        let shared = || SHARED_FLUSH_SYNCS.with(std::cell::Cell::get);
-        let path = dir.path().join("delta.vocab");
-        let v = DeltaVocab::open(&path).unwrap();
-        v.set_prealloc(64 << 10);
-        // nothing pending: the log alone is synced
-        assert!(v.sync_with_log(&log).unwrap().is_ok());
-        // the first chunk writes the header and grows the file
-        v.insert(b"<urn:a>").unwrap();
-        let before = shared();
-        assert!(v.sync_with_log(&log).is_none());
-        assert_eq!(shared(), before);
-        assert!(
-            v.needs_sync(),
-            "the fallback still has to sync the written chunk"
-        );
-        v.sync().unwrap();
-        // inside the length the sync made durable
-        v.insert(b"<urn:b>").unwrap();
-        assert!(v.sync_with_log(&log).unwrap().is_ok());
-        assert_eq!(shared(), before + 1);
-        assert!(!v.needs_sync());
-        let (end, durable, alloc) = v.file_state();
-        assert_eq!(durable, end);
-        assert!(alloc > end);
-        // a truncated file grows again by its own sync
-        v.trim();
-        v.insert(b"<urn:c>").unwrap();
-        assert!(v.sync_with_log(&log).is_none());
-        v.sync().unwrap();
-        v.insert(b"<urn:d>").unwrap();
-        assert!(v.sync_with_log(&log).unwrap().is_ok());
-        assert_eq!(shared(), before + 2);
-        drop(v);
-        let v = DeltaVocab::open(&path).unwrap();
-        assert_eq!(v.len(), 4);
-        assert_eq!(v.get(3).unwrap(), b"<urn:d>");
-        // a reopened file has no length known durable until it settles
-        v.insert(b"<urn:e>").unwrap();
-        assert!(v.sync_with_log(&log).is_none());
-        drop(v);
-        // a failed write-back fails the sync and marks the file failed
-        let v = DeltaVocab::open(&path).unwrap();
-        v.set_prealloc(64 << 10);
-        v.settle().unwrap();
-        v.insert(b"<urn:f>").unwrap();
-        v.sync().unwrap();
-        v.insert(b"<urn:g>").unwrap();
-        v.fail_next_sync();
-        assert!(v.sync_with_log(&log).unwrap().is_err());
-        let (end, durable, _) = v.file_state();
-        assert!(durable < end);
-    }
-
-    /// A log on another device than the vocabulary does not share its flush.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_log_on_another_device_does_not_share_the_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("delta.vocab");
-        let v = DeltaVocab::open(&path).unwrap();
-        v.set_prealloc(64 << 10);
-        v.insert(b"<urn:a>").unwrap();
-        v.sync().unwrap();
-        v.settle().unwrap();
-        v.insert(b"<urn:b>").unwrap();
-        // /proc is never the temporary directory's device
-        let other = File::open("/proc/self/stat").unwrap();
-        assert!(v.sync_with_log(&other).is_none());
-        v.sync().unwrap();
-        assert!(!v.needs_sync());
     }
 
     /// Each sync writes one chunk after the header, and the file grows by zeros that a
