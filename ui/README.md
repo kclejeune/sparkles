@@ -150,7 +150,7 @@ the formatter changes. Delete the directory to build without it. The Nix `sparkl
 package always builds it in (`nix/fmt-wasm.nix`).
 
 `lib/fmt-wasm.ts` loads the module the first time something is formatted. The module is a
-hashed asset under `/ui/_app/immutable/`, served compressed (about 300 KB with brotli).
+hashed asset under `/ui/_app/immutable/`, served compressed (about 330 KB with brotli).
 It takes the endpoint's JSON and answers in the same shape, errors included, so the pages
 handle both paths the same way. If the module does not load, or fails while running, the
 request goes to the endpoint. The pages' Content Security Policy includes
