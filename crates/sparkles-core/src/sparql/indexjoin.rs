@@ -1805,22 +1805,35 @@ pub(super) fn probe_for(ctx: &Ctx, probe: &Node, left: &Table) -> Result<Option<
         return Ok(None);
     };
     let col = &left.cols[kc];
-    if col.iter().any(|x| x.is_undef()) {
-        return Ok(None);
-    }
     let worth = |keys: usize| {
         side.cost(keys as f64, probe.cost)
             .is_some_and(|c| c < probe.cost)
     };
     // Probing costs more with more keys. The left side's rows bound its keys, and a
-    // left side sorted on the key counts them by its runs; an unsorted one is not
-    // sorted only to find that probing does not pay.
+    // left side sorted on the key counts them by its runs, up to the most keys for
+    // which probing pays; an unsorted one is not sorted only to find that probing does
+    // not pay.
     let sorted = left.sorted.first() == Some(&side.key);
     if !worth(col.len()) {
-        let runs = 1 + col.windows(2).filter(|w| w[0] != w[1]).count();
-        if !(sorted && worth(runs)) {
+        if !sorted || !worth(1) {
             return Ok(None);
         }
+        // the most keys that pay, in [1, len)
+        let (mut most, mut over) = (1, col.len());
+        while over - most > 1 {
+            let m = most + (over - most) / 2;
+            if worth(m) { most = m } else { over = m }
+        }
+        let mut runs = 1;
+        for w in col.windows(2) {
+            runs += usize::from(w[0] != w[1]);
+            if runs > most {
+                return Ok(None);
+            }
+        }
+    }
+    if col.iter().any(|x| x.is_undef()) {
+        return Ok(None);
     }
     let held = ctx.charge(super::ctx::table_bytes(col.len(), 1))?;
     let mut keys: Vec<u64> = col.iter().map(|x| x.0).collect();
