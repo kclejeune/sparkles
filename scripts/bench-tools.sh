@@ -70,7 +70,20 @@ fluree_bin() {
 # this after resolve_tools.
 use_hyperfine() {
   local binary=${HYPERFINE:-}
-  if [ -z "$binary" ]; then binary=$(nixbin hyperfine hyperfine) || return; fi
+  if [ -z "$binary" ]; then
+    binary=$(nixbin hyperfine hyperfine) || return
+  elif [[ $binary != */* ]]; then
+    binary=$(type -P "$binary") || {
+      echo "HYPERFINE=$HYPERFINE is not on PATH" >&2
+      return 1
+    }
+  elif [[ $binary != /* ]]; then
+    binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")" || return
+  fi
+  [ -x "$binary" ] || {
+    echo "HYPERFINE=$binary is not an executable" >&2
+    return 1
+  }
   mkdir -p "$WORK/timer" || return
   ln -sfn "$binary" "$WORK/timer/hyperfine" || return
   PATH="$WORK/timer:$PATH"
