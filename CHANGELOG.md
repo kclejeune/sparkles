@@ -571,6 +571,20 @@ throughout.
 
 ### Format
 
+The dataset reader capability 6 marks protected managed graphs. Enabling a profile
+owner raises `minimumReader` to 6 durably, writes the owner's settings file such as
+`evidence.json`, and then writes `managed.json` format 1 as the commit point. That file
+holds a `revision` and, for each owner, its `profile`, `settingsDigest`, `graphs`,
+`visibility` and `merge` members. Releases that read only up to reader 5 refuse such a
+dataset. This build keeps the dataset readable and refuses every write when
+`managed.json` has an unknown format, owner or profile, a reserved `visibility` of
+`hidden` or `merge` of `exclude`, or an owner settings file whose SHA-256 digest does
+not match. An owner settings file of a `format` or `profile` this build does not read
+refuses writes the same way. A newer `managed.json` therefore does not refuse the open,
+and a backup or clone of a registry with an unknown format or owner is refused. Branches share
+the registry without copying the file, and backups, restores and clones carry both
+files.
+
 Index generations are written in index format 3. Each column of a permutation block is a
 run of independent LZ4 frames of 2,048 rows, and a new file `<perm>.seg` beside each
 permutation holds every frame's first key and compressed lengths, under the magic

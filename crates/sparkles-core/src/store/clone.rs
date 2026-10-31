@@ -145,6 +145,8 @@ struct Capture {
     files: Option<(PathBuf, LeaseGuard)>,
     /// the managed definitions current when the snapshot was taken
     definitions: Vec<super::DefinitionFile>,
+    /// the managed-graph registry's files (see [`crate::managed`]) at that time
+    managed: Vec<(&'static str, Vec<u8>)>,
 }
 
 /// A clone's generation, built or shared.
@@ -274,6 +276,13 @@ impl Store {
         // the managed definitions come along paused: the clone is a new dataset, whose
         // views run only once an operator has checked their principals and inputs
         super::definitions::write_all(dir, &cap.definitions, Some("cloned"))?;
+        // the managed graphs stay protected: the registry needs its reader first
+        if !cap.managed.is_empty() {
+            commit::require_reader(dir, crate::managed::READER)?;
+            for (name, bytes) in &cap.managed {
+                write_atomic(&dir.join(name), bytes)?;
+            }
+        }
         // the branch ordinals the copied blank nodes may carry are not given out again
         let next_ordinal = self.branching.next_ordinal.load(Ordering::Relaxed);
         if next_ordinal > 1 {
@@ -345,6 +354,7 @@ impl Store {
             id,
             Some(forked_from),
         );
+        store.install_managed_files(&cap.managed);
         report(opts, 0.95, "configuring indexes");
         self.configure_indexes(&store)?;
         report(opts, 1.0, "done");
@@ -369,7 +379,7 @@ impl Store {
     /// files may be shared.
     fn clone_capture(&self, opts: &CloneOptions) -> Result<Capture> {
         let share = opts.mode != CloneMode::Rebuild && opts.at.is_none();
-        let (snap, next_bnode, lease, definitions) = {
+        let (snap, next_bnode, lease, definitions, managed) = {
             let w = self.lock_writer(&crate::guard::WriteOptions {
                 cancel: opts.cancel.clone(),
                 deadline: opts.deadline,
@@ -381,6 +391,7 @@ impl Store {
             // not the clone's. Read before the lease is taken, so that a failure
             // leaves no lease behind.
             let definitions = self.capture_definitions()?;
+            let managed = self.managed_files()?;
             let lease = match (&self.root, &self.history) {
                 // a linked generation's base files are its upstream's: rebuilt
                 (Some(root), Some(h))
@@ -397,7 +408,7 @@ impl Store {
                 }
                 _ => None,
             };
-            (snap, w.next_bnode, lease, definitions)
+            (snap, w.next_bnode, lease, definitions, managed)
         };
         // from here on, dropping the guard releases the lease
         let files = lease.map(|(dir, no, label, id)| {
@@ -431,6 +442,7 @@ impl Store {
             prefixes: self.prefixes(),
             files,
             definitions,
+            managed,
         })
     }
 

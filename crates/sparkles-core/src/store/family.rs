@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 /// Retained last by each store and branch set, after their owned resources.
 pub(crate) struct Family {
     pub(crate) gate: Arc<FamilyGate>,
+    /// The managed-graph registry every member admits its commits against (see
+    /// [`crate::managed`]). One registry serves main and every branch, including those
+    /// created before it was enabled, so they cannot diverge.
+    pub(crate) managed: arc_swap::ArcSwapOption<crate::managed::ManagedState>,
     _owner_lock: Option<Arc<super::ProcessLock>>,
 }
 
@@ -22,6 +26,7 @@ impl Family {
     pub(crate) fn new(owner_lock: Option<Arc<super::ProcessLock>>) -> Arc<Self> {
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
+            managed: arc_swap::ArcSwapOption::empty(),
             _owner_lock: owner_lock,
         })
     }
@@ -38,12 +43,17 @@ struct State {
     writers: usize,
     admitted: bool,
     admissions: VecDeque<Arc<()>>,
+    /// The cohort a new permit joins (see [`FamilyGate::wait_for_cohorts_before`]).
+    epoch: u64,
+    /// The live permits of each cohort that still has one.
+    cohorts: std::collections::BTreeMap<u64, usize>,
 }
 
 /// Held from before branch-writer acquisition through durable publication or refusal.
 /// This is owned and Send so a pending group commit can retain it after WriteTxn ends.
 pub(crate) struct FamilyPermit {
     gate: Arc<FamilyGate>,
+    epoch: u64,
 }
 
 /// Exclusive family admission. Dropping it allows the next queued admission or writers.
@@ -87,7 +97,12 @@ impl FamilyGate {
             opts.check()?;
             if !state.admitted && state.admissions.is_empty() {
                 state.writers += 1;
-                return Ok(FamilyPermit { gate: self.clone() });
+                let epoch = state.epoch;
+                *state.cohorts.entry(epoch).or_default() += 1;
+                return Ok(FamilyPermit {
+                    gate: self.clone(),
+                    epoch,
+                });
             }
             if opts.no_wait {
                 return Err(Error::WriterBusy);
@@ -104,7 +119,9 @@ impl FamilyGate {
     /// Settle known pending group publications while waiting for family admission.
     /// This hook is for the fixed internal coordinator drainer, never a user callback.
     /// It runs outside the gate mutex, before the caller takes any branch writer.
-    /// It must be bounded and must not acquire a family permit or a branch writer.
+    /// It must be bounded and must not acquire a family permit or wait for a branch
+    /// writer. It may try a member's writer without waiting, to drive that member's
+    /// pending publications.
     #[cfg(test)]
     pub(crate) fn admit_draining(
         self: &Arc<Self>,
@@ -160,6 +177,36 @@ impl FamilyGate {
         }
     }
 
+    /// Start a new cohort and wait until every permit entered before it has dropped,
+    /// without holding back new permits. A permit is held from before its writer is
+    /// taken until its commit is published or refused, including by a pending group
+    /// commit or a writer of a detached member, so this waits for every writer that
+    /// could have seen a state the caller replaced before the call. Writers that enter
+    /// afterwards, including nested operations of those waited for, proceed.
+    /// `progress` runs outside the gate mutex between bounded waits, under the same
+    /// rules as [`admit_draining`](Self::admit_draining)'s.
+    pub(crate) fn wait_for_cohorts_before(
+        &self,
+        opts: &WriteOptions,
+        mut progress: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let mut state = self.lock(opts)?;
+        state.epoch += 1;
+        let target = state.epoch;
+        loop {
+            opts.check()?;
+            if state.cohorts.range(..target).next().is_none() {
+                return Ok(());
+            }
+            drop(state);
+            progress()?;
+            state = self.lock(opts)?;
+            if state.cohorts.range(..target).next().is_some() {
+                self.changed.wait_for(&mut state, wait_slice(opts));
+            }
+        }
+    }
+
     fn lock(&self, opts: &WriteOptions) -> Result<MutexGuard<'_, State>> {
         opts.check()?;
         if opts.no_wait {
@@ -201,8 +248,14 @@ impl Drop for FamilyPermit {
         let mut state = self.gate.state.lock();
         state.writers -= 1;
         let drained = state.writers == 0;
+        let cohort = state.cohorts.get_mut(&self.epoch).expect("a live cohort");
+        *cohort -= 1;
+        let ended = *cohort == 0;
+        if ended {
+            state.cohorts.remove(&self.epoch);
+        }
         drop(state);
-        if drained {
+        if drained || ended {
             self.gate.changed.notify_all();
         }
     }

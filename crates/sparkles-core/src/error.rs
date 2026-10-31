@@ -87,6 +87,12 @@ pub enum Error {
     /// its code and status); nothing was written.
     #[error("{0}")]
     Branch(Box<crate::branch::BranchError>),
+    /// A write refused by the managed-graph boundary (see [`crate::managed`]): it would
+    /// change a graph a profile manages, or the registry cannot be enforced. Its code is
+    /// `profile-managed-graph`, `managed-unavailable` or `unsupported-profile`; nothing
+    /// was written.
+    #[error("{0}")]
+    Managed(Box<crate::managed::ManagedError>),
     /// An error of a component outside the engine (a backup repository, the reasoner,
     /// the GraphQL adapter), with the component's own stable code. Its `source` is the
     /// component's error, which a program can downcast for the details.
@@ -336,6 +342,7 @@ impl Error {
             Error::Patch(_) => "patch",
             Error::Component(c) => &c.code,
             Error::Branch(b) => b.code,
+            Error::Managed(m) => m.code,
         }
     }
 

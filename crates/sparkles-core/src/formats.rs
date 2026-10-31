@@ -173,7 +173,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5],
+    reads: &[1, 2, 3, 4, 5, 6],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -668,6 +668,9 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphrag.json", 1),
     ds("paths.json", 1),
     ds("forms.json", 1),
+    // the managed-graph registry and its owners' settings (see `crate::managed`)
+    ds("managed.json", 1),
+    ds("evidence.json", 1),
     // a view's definition, `views/NAME/view.json`: format 2 is a paused one
     ds("view.json", 2),
     named(ds("graphrag/state.json", 2), "version"),
@@ -696,6 +699,12 @@ pub const INFORMATIONAL_SETTINGS: &[&str] = &["origin.json", "restore.json"];
 pub fn informational(name: &str) -> bool {
     INFORMATIONAL_SETTINGS.contains(&name)
 }
+
+/// Dataset settings files that a newer version does not refuse at open: the
+/// managed-graph registry and its owners' settings. A registry this build cannot
+/// enforce keeps the dataset readable and refuses every write instead (see
+/// [`crate::managed`]).
+pub const WRITE_FENCED_SETTINGS: &[&str] = &["managed.json", "evidence.json"];
 
 /// Unpublished branch scratch that existing startup recovery removes by name.
 pub(crate) fn transient_branch_directory(name: &str) -> bool {
@@ -748,10 +757,11 @@ pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
 /// gives an error that names the directory and keeps its variant.
 pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
     let mut out = Vec::new();
-    for s in SETTINGS
-        .iter()
-        .filter(|s| s.scope == Scope::Dataset && !informational(s.name))
-    {
+    for s in SETTINGS.iter().filter(|s| {
+        s.scope == Scope::Dataset
+            && !informational(s.name)
+            && !WRITE_FENCED_SETTINGS.contains(&s.name)
+    }) {
         let bytes = match std::fs::read(dir.join(s.name)) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,

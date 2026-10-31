@@ -347,3 +347,42 @@ fn an_index_meta_without_a_version_is_corrupt() {
         assert!(!plan.refused.is_empty(), "{bad}: plan refuses nothing");
     }
 }
+
+/// A managed-graph registry this build cannot enforce does not refuse the open: the
+/// dataset stays readable, and every write fails closed (spec C25 §7).
+#[test]
+fn a_newer_managed_registry_refuses_writes_not_the_open() {
+    use sparkles_core::managed::{OwnerEntry, OwnerKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let settings = br#"{"format":1,"profile":1}"#;
+    s.enable_managed(
+        OwnerKind::Evidence,
+        OwnerEntry::for_settings(1, vec!["urn:m".into()], settings),
+        settings,
+    )
+    .unwrap();
+    drop(s);
+    let v = sparkles_core::commit::read_dataset_versions(&root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.minimum_reader, 6);
+    std::fs::write(
+        root.join("managed.json"),
+        r#"{"format": 2, "revision": 9, "owners": {}}"#,
+    )
+    .unwrap();
+    assert!(sparkles_core::formats::check_dataset_dir(&root).is_ok());
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    sparkles_core::sparql::query(s.snapshot(), "ASK { ?s ?p ?o }", &QueryOptions::default())
+        .unwrap();
+    match update(
+        &s,
+        "INSERT DATA { <urn:a> <urn:p> 1 }",
+        &QueryOptions::default(),
+    ) {
+        Err(sparkles_core::error::Error::Managed(m)) => assert_eq!(m.code, "managed-unavailable"),
+        r => panic!("{r:?}"),
+    }
+}

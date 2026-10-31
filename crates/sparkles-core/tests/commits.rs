@@ -751,13 +751,13 @@ fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
     drop(s);
     // a release that reads up to reader 4 refuses the dataset now, as this one
     // refuses a dataset that requires a later reader
-    assert_eq!(sparkles_core::commit::DATASET_READER, 5);
+    assert_eq!(sparkles_core::commit::DATASET_READER, 6);
     let mut ds: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
     ds["minimumReader"] = serde_json::json!(sparkles_core::commit::DATASET_READER + 1);
     std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
-    assert!(e.to_string().contains("requires reader 6"), "{e}");
+    assert!(e.to_string().contains("requires reader 7"), "{e}");
 }
 
 #[test]

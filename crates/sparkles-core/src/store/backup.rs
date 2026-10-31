@@ -212,7 +212,9 @@ pub struct BackupCapture {
     /// every file of the backup, in a stable order: the generation's files, then
     /// `commits.bin`, then the meta files (`CURRENT`, `dataset.json`, `prefixes.json`,
     /// and when present `annotations.bin`, `text.json`, `origin.json`, `validation.json`,
-    /// `validation-shapes.ttl`, `validation-schema.shex`, `validation-schema.json`).
+    /// `validation-shapes.ttl`, `validation-schema.shex`, `validation-schema.json`, and
+    /// the dataset's managed-graph registry, `managed.json` with its owners' settings,
+    /// whose `dataset.json` then needs reader 6).
     /// `reasoning.json` is the caller's to add (the server
     /// holds the current status and applies the "not after `s`" rule).
     pub files: Vec<CapturedFile>,
@@ -468,7 +470,7 @@ impl Store {
         };
         control.check()?;
         let t0 = Instant::now();
-        let (snap, next_bnode, head, prefixes, definitions) = {
+        let (snap, next_bnode, head, prefixes, definitions, managed) = {
             let w = self.lock_writer(&control)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
@@ -479,6 +481,7 @@ impl Store {
                 w.head,
                 self.prefixes.lock().clone(),
                 self.capture_definitions()?,
+                self.managed_files()?,
             )
         };
         let lock_hold = t0.elapsed();
@@ -562,10 +565,15 @@ impl Store {
             src: FileSource::Bytes(bytes.into()),
         };
         files.push(meta_file("CURRENT", generation.as_bytes().to_vec()));
-        files.push(meta_file(
-            "dataset.json",
-            crate::commit::dataset_file_bytes(self.dataset_id, "memory", commit.timestamp_ms),
-        ));
+        let mut dataset =
+            crate::commit::dataset_file_bytes(self.dataset_id, "memory", commit.timestamp_ms);
+        if !managed.is_empty() {
+            dataset = crate::commit::with_reader(&dataset, crate::managed::READER)?;
+        }
+        files.push(meta_file("dataset.json", dataset));
+        for (name, bytes) in managed {
+            files.push(meta_file(name, bytes));
+        }
         files.push(meta_file(
             "prefixes.json",
             serde_json::to_vec_pretty(&prefixes).unwrap(),
@@ -670,6 +678,8 @@ impl Store {
         let prefixes = self.prefixes.lock().clone();
         // the definitions current at the head, before the lock lets either change
         let definitions = self.capture_definitions()?;
+        // and the managed-graph registry, which a branch shares with main
+        let managed = self.managed_files()?;
         self.failpoint("backup-capture-locked");
         let lease_id = hist.lock().lease(gen_no, label);
         drop(w);
@@ -756,7 +766,15 @@ impl Store {
                 )));
             }
         }
+        let dataset = if managed.is_empty() {
+            dataset
+        } else {
+            crate::commit::with_reader(&dataset, crate::managed::READER)?
+        };
         files.push(meta("dataset.json", dataset));
+        for (name, bytes) in managed {
+            files.push(meta(name, bytes));
+        }
         files.push(meta(
             "prefixes.json",
             serde_json::to_vec_pretty(&prefixes).unwrap(),

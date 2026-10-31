@@ -450,3 +450,10 @@ implementation status. This spec's status and Outcome describe its delivery.
 
 The design is specified and no phase is implemented. Current task records and the C21
 delivery queue remain process-local. Roadmap item 339 tracks this work.
+
+The shared managed-write boundary of §2.3 and §7 is available from C25 Phase 2. Dataset
+reader 6 marks `managed.json`, a registry of owners whose graphs ordinary writes cannot
+change, and a `ManagedWrite` capability admits an owner's typed transaction. Jobs will
+register as a second owner kind with its own settings file in the same registry and
+reader, and will use the reserved `hidden` visibility and `exclude` merge values that
+the current build refuses. No commit kind code is allocated by that boundary.
