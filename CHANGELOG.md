@@ -579,7 +579,9 @@ holds a `revision` and, for each owner, its `profile`, `settingsDigest`, `graphs
 dataset. This build keeps the dataset readable and refuses every write when
 `managed.json` has an unknown format, owner or profile, a reserved `visibility` of
 `hidden` or `merge` of `exclude`, or an owner settings file whose SHA-256 digest does
-not match. A newer `managed.json` therefore does not refuse the open. Branches share
+not match. An owner settings file of a `format` or `profile` this build does not read
+refuses writes the same way. A newer `managed.json` therefore does not refuse the open,
+and a backup or clone of a registry with an unknown format or owner is refused. Branches share
 the registry without copying the file, and backups, restores and clones carry both
 files.
 

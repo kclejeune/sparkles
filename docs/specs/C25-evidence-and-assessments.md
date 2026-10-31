@@ -573,8 +573,16 @@ owner's capability. Such a transaction starts from the durable head, is never gr
 and `WriteTxn::managed_stamp` fixes its sequence number and timestamp before publication.
 A newer `managed.json`, an unknown owner or profile, a reserved member value or a
 mismatched settings digest keeps reads and refuses every write as `managed-unavailable`.
-Enabling the owner again repairs a mismatched digest. `Store::detach_managed` returns a
-graph to ordinary writes. Backups, restores and clones carry the registry. The server
+An owner settings file whose `format` or `profile` this build does not read is
+unavailable in the same way, even when its digest matches. Enabling the owner again
+repairs a mismatched digest. A change of the registry that fails or unwinds after its
+first file is written leaves the running dataset refusing every write until the owner
+is enabled again. Enablement returns only after one exclusive family admission, which
+waits for every writer that may have been admitted against the previous registry,
+including writers of deleted branches whose handles are retained. `Store::detach_managed`
+returns a graph to ordinary writes. Backups, restores and clones carry the registry. A
+registry that names an owner this build does not know, or whose format it does not read,
+is not copied, and the backup or clone is refused. The server
 answers `profile-managed-graph` with `409` and `managed-unavailable` with `503`. In
 library mode the capability guards against mistakes, not a hostile embedder.
 
