@@ -176,18 +176,20 @@ impl Quota {
     /// The bytes that queued grouped commits and the preallocations of running fences
     /// will add to the disk, which the free-space reserve counts. A commit reserves its
     /// bytes, and a fence promises its preallocation, before checking the reserve with
-    /// this sum, so of two that race the later check sees both.
+    /// this sum, so of two that race the later check sees both. The increments and these
+    /// loads are sequentially consistent, which that argument needs on a weakly ordered
+    /// CPU: with relaxed ones, each could read the other's counter before its increment.
     pub(crate) fn unwritten(&self) -> u64 {
         self.queued
-            .load(Ordering::Relaxed)
-            .saturating_add(self.promised.load(Ordering::Relaxed))
+            .load(Ordering::SeqCst)
+            .saturating_add(self.promised.load(Ordering::SeqCst))
     }
 
     /// A group commit fence may preallocate up to `bytes` after its prefix. The
     /// free-space reserve counts them until the promise is dropped, after the fence's
     /// write, but the quota does not, since it never counts preallocated space.
     pub(crate) fn promise(self: &std::sync::Arc<Self>, bytes: u64) -> Promise {
-        self.promised.fetch_add(bytes, Ordering::Relaxed);
+        self.promised.fetch_add(bytes, Ordering::SeqCst);
         Promise {
             quota: self.clone(),
             bytes,
@@ -198,7 +200,7 @@ impl Quota {
     /// The quota counts them until the fence has written them, or until the reservation
     /// is dropped with a commit that is never written.
     pub(crate) fn reserve(self: &std::sync::Arc<Self>, bytes: u64) -> Reservation {
-        self.queued.fetch_add(bytes, Ordering::Relaxed);
+        self.queued.fetch_add(bytes, Ordering::SeqCst);
         Reservation {
             quota: self.clone(),
             bytes: AtomicU64::new(bytes),

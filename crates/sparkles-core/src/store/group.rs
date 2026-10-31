@@ -2576,6 +2576,12 @@ mod tests {
         {
             // a log longer than the step, so the step is the whole preallocation
             let s = Store::open(dir.path(), opts()).unwrap();
+            // the change log grows in the background, which no check counts
+            s.set_change_log_settings(crate::store::ChangeLogSettings {
+                enabled: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
             for i in 0..40 {
                 commit(&s, i).unwrap();
             }
@@ -2647,6 +2653,12 @@ mod tests {
         {
             // a log longer than the step, so the step is the whole preallocation
             let s = Store::open(dir.path(), opts()).unwrap();
+            // the change log grows in the background, which no check counts
+            s.set_change_log_settings(crate::store::ChangeLogSettings {
+                enabled: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
             for i in 0..40 {
                 let quads: String = (0..300)
                     .map(|j| format!("<urn:c{i}-{j}> <urn:p> <urn:o> . "))
