@@ -77,6 +77,9 @@ pub(crate) struct Quota {
     /// the records of grouped commits queued for their fence, which the leader writes to
     /// the log later: counted as if they were in it
     queued: AtomicU64,
+    /// the space that running group commit fences may preallocate, which the free-space
+    /// reserve counts with the queued commits until the fence has written
+    promised: AtomicU64,
     /// directory walks completed so far
     measures: AtomicU64,
     /// runs inside the next walk, before it reads the directory (for tests)
@@ -102,6 +105,7 @@ impl Quota {
             preallocated: AtomicU64::new(0),
             vocab_preallocated: AtomicU64::new(0),
             queued: AtomicU64::new(0),
+            promised: AtomicU64::new(0),
             measures: AtomicU64::new(0),
             #[cfg(test)]
             walking: Mutex::new(None),
@@ -163,10 +167,31 @@ impl Quota {
         *self.walking.lock() = Some(Box::new(hook));
     }
 
-    /// The bytes of records and terms that queued grouped commits will write, which the
-    /// free-space reserve also counts.
+    /// The bytes of records and terms that queued grouped commits will write.
+    #[cfg(test)]
     pub(crate) fn queued(&self) -> u64 {
         self.queued.load(Ordering::Relaxed)
+    }
+
+    /// The bytes that queued grouped commits and the preallocations of running fences
+    /// will add to the disk, which the free-space reserve counts. A commit reserves its
+    /// bytes, and a fence promises its preallocation, before checking the reserve with
+    /// this sum, so of two that race the later check sees both.
+    pub(crate) fn unwritten(&self) -> u64 {
+        self.queued
+            .load(Ordering::Relaxed)
+            .saturating_add(self.promised.load(Ordering::Relaxed))
+    }
+
+    /// A group commit fence may preallocate up to `bytes` after its prefix. The
+    /// free-space reserve counts them until the promise is dropped, after the fence's
+    /// write, but the quota does not, since it never counts preallocated space.
+    pub(crate) fn promise(self: &std::sync::Arc<Self>, bytes: u64) -> Promise {
+        self.promised.fetch_add(bytes, Ordering::Relaxed);
+        Promise {
+            quota: self.clone(),
+            bytes,
+        }
     }
 
     /// A grouped commit queued `bytes` of records and new terms for its fence to write.
@@ -402,6 +427,18 @@ pub(crate) struct Reservation {
 impl Reservation {
     fn take(&self) -> u64 {
         self.bytes.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Space a fence may preallocate (see [`Quota::promise`]).
+pub(crate) struct Promise {
+    quota: std::sync::Arc<Quota>,
+    bytes: u64,
+}
+
+impl Drop for Promise {
+    fn drop(&mut self) {
+        self.quota.promised.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 

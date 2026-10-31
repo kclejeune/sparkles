@@ -6940,9 +6940,10 @@ impl WriteTxn<'_> {
 
     fn check_storage_for(&self, inserts: bool, wal_bytes: u64) -> Result<()> {
         // grouped commits queued for their fence have not written their records and terms
-        // yet, so the free space on disk does not show them
+        // yet, nor running fences their preallocation, so the free space on disk does not
+        // show them
         self.store
-            .check_disk(wal_bytes.saturating_add(self.store.quota.queued()))?;
+            .check_disk(wal_bytes.saturating_add(self.store.quota.unwritten()))?;
         if inserts {
             self.store.quota.check_commit(wal_bytes)?;
         }

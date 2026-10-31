@@ -575,20 +575,14 @@ impl Store {
         // still queued around this prefix were counted. The log and the vocabulary each
         // preallocate after the whole prefix, so the reserve must hold that as well as
         // every queued commit's bytes (this prefix's among them), or neither preallocates.
-        let prealloc = if last.prealloc > 0
-            && self
-                .check_disk(
-                    self.quota
-                        .queued()
-                        .saturating_add(2 * last.prealloc.saturating_add(4096)),
-                )
-                .is_err()
-        {
-            0
-        } else {
-            last.prealloc
-        };
+        // The fence promises the space before it checks, and a commit queued meanwhile
+        // counts the promise, until the write below is done.
+        let promise =
+            (last.prealloc > 0).then(|| self.quota.promise(2 * last.prealloc.saturating_add(4096)));
+        let promise = promise.filter(|_| self.check_disk(self.quota.unwritten()).is_ok());
+        let prealloc = if promise.is_some() { last.prealloc } else { 0 };
         dvocab.set_prealloc(prealloc);
+        self.failpoint("group-preallocating");
         let measures = self.quota.measures();
         let (alloc_before, vocab_before) = (io.alloc, dvocab.allocated());
         let written = (|| -> Result<bool> {
@@ -619,6 +613,8 @@ impl Store {
             io.alloc - io.end,
             dvocab.preallocated(),
         );
+        // the growth is on disk now
+        drop(promise);
         // A writer that checked its quota meanwhile may have walked the directory with
         // this growth in it, which the lines above counted again.
         if self.quota.measures() != measures {
@@ -699,10 +695,13 @@ impl WriteTxn<'_> {
         let generation = self.base.generation.clone();
         let bytes = self.wal_bytes();
         // The commit's new terms stay in memory until its fence writes them with its
-        // records, so the quota counts them, with the records, from the moment the commit
-        // is queued (see `Quota::queue`).
+        // records, so the quota and the free-space reserve count them with the records
+        // until the fence has written both. The commit reserves them before it checks,
+        // so that the check of a racing fence's preallocation sees them, or this check
+        // sees its promise (see `Quota::unwritten`).
         let terms = generation.dvocab.key_bytes(self.mark.entries());
-        self.check_storage_for(self.net_ins > 0, bytes + terms)?;
+        let reserved = store.quota.reserve(bytes + terms);
+        self.check_storage_for(self.net_ins > 0, 0)?;
         let c = self.next_commit(validation.as_deref());
         let mut snapshot = Snapshot {
             cacheable: true,
@@ -813,7 +812,6 @@ impl WriteTxn<'_> {
         // number and its place in the log, and a failure poisons the writer.
         let wal_start = w.wal_len;
         w.wal_len += bytes;
-        let reserved = store.quota.reserve(bytes + terms);
         let snapshot = Arc::new(snapshot);
         // A compaction that is building carries this commit into its new generation. It
         // takes commits only after the writer lock's drain has made the queue durable, so
@@ -2629,8 +2627,88 @@ mod tests {
         // the catalog and the other small files grow by a few bytes a commit, which no
         // check counts, on the ordinary path as well
         assert!(
-            free + (64 << 10) >= RESERVE,
+            free + (32 << 10) >= RESERVE,
             "the fences left {free} bytes free, under the reserve of {RESERVE}"
+        );
+    }
+
+    /// A commit queued while a fence decides to preallocate counts the space the fence
+    /// may preallocate, so the two together stay within the free-space reserve.
+    #[test]
+    fn a_commit_queued_during_a_fence_counts_its_preallocation() {
+        const STEP: u64 = 256 << 10;
+        const HEADROOM: u64 = 600 << 10;
+        const RESERVE: u64 = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = || StoreOptions {
+            wal_prealloc_bytes: STEP,
+            ..options()
+        };
+        {
+            // a log longer than the step, so the step is the whole preallocation
+            let s = Store::open(dir.path(), opts()).unwrap();
+            for i in 0..40 {
+                let quads: String = (0..300)
+                    .map(|j| format!("<urn:c{i}-{j}> <urn:p> <urn:o> . "))
+                    .collect();
+                crate::sparql::update::update(
+                    &s,
+                    &format!("INSERT DATA {{ {quads} }}"),
+                    &Default::default(),
+                )
+                .unwrap();
+            }
+        }
+        let held = crate::store::dir_size(dir.path());
+        let _disk = crate::disk::fake::install(dir.path(), held + RESERVE + HEADROOM);
+        let s = Arc::new(
+            Store::open(
+                dir.path(),
+                StoreOptions {
+                    min_free_disk_bytes: Some(RESERVE),
+                    ..opts()
+                },
+            )
+            .unwrap(),
+        );
+        let (hit, go) = pause(&s, "group-preallocating");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "first"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        // a commit of a long literal queues while the fence has decided
+        let second = {
+            let s = s.clone();
+            thread::spawn(move || {
+                let u = format!(
+                    "INSERT DATA {{ <urn:long> <urn:p> \"{}\" }}",
+                    "x".repeat(560 << 10)
+                );
+                crate::sparql::update::update(&s, &u, &Default::default()).map(|_| ())
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while s.group.as_ref().unwrap().queued() == 0 && !second.is_finished() {
+            assert!(
+                Instant::now() < until,
+                "the second commit neither queued nor ended"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        go.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        let second = second.join().unwrap();
+        assert!(
+            matches!(&second, Ok(()) | Err(Error::StorageFull(_))),
+            "{second:?}"
+        );
+        let free = crate::disk::free_bytes(dir.path()).unwrap();
+        // the catalog and the other small files grow by a few bytes a commit, which no
+        // check counts, on the ordinary path as well
+        assert!(
+            free + (32 << 10) >= RESERVE,
+            "the fences left {free} bytes free, under the reserve of {RESERVE} ({second:?})"
         );
     }
 
