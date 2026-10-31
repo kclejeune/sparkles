@@ -296,7 +296,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   budget of four times the document, so a large document with many queries lints only
   some of them. It skips an embedded query whose holder is ambiguous, such as the
   same query text on two blank nodes, rather than risk another node's findings. Roadmap
-  item NEW-ITEM.
+  item 444.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
