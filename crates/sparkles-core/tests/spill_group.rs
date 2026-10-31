@@ -413,3 +413,43 @@ fn sorted(mut rows: Vec<String>) -> Vec<String> {
     rows.sort();
     rows
 }
+
+/// A SUM or AVG of integers is found in every row order when its result fits an
+/// `xsd:integer`, and adding a decimal to a sum past that range does not fail in one
+/// order only. A grouping that no aggregate's order matters to lets a spilled join below
+/// it emit its rows in another order than in memory (item 93), so such a sum used to be
+/// unbound in one order and 1 in another.
+#[test]
+fn integer_sums_do_not_depend_on_the_order_of_their_rows() {
+    let s = Store::in_memory(StoreOptions::default());
+    let max = i64::MAX;
+    let orders = [
+        format!("-{max} {max} 1"),
+        format!("{max} 1 -{max}"),
+        format!("1 {max} -{max}"),
+    ];
+    let mut answers = Vec::new();
+    for values in &orders {
+        for q in [
+            format!("SELECT (SUM(?x) AS ?s) (AVG(?x) AS ?a) {{ VALUES ?x {{ {values} }} }}"),
+            format!("SELECT (SUM(?x) AS ?s) {{ VALUES ?x {{ {values} {max} 1.5 }} }}"),
+            format!("SELECT (SUM(?x) AS ?s) {{ VALUES ?x {{ 1.5 {max} {values} }} }}"),
+        ] {
+            answers.push(eager(&s, &q));
+        }
+    }
+    assert!(
+        answers[0][0].starts_with("[Some(Literal(Literal(TypedLiteral { value: \"1\","),
+        "{:?}",
+        answers[0]
+    );
+    for (i, a) in answers.iter().enumerate() {
+        assert_eq!(a, &answers[i % 3], "order {}", i / 3);
+    }
+    assert_eq!(answers[1], answers[2]);
+    assert!(
+        answers[1][0].contains("9223372036854775809.5"),
+        "{:?}",
+        answers[1]
+    );
+}

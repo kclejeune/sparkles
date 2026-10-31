@@ -6699,9 +6699,11 @@ pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
     /// SUM / AVG: an exact integer sum while every value is an inline integer, then the
-    /// generic numeric sum; `None` once a value was unbound or not numeric
+    /// generic numeric sum; `None` once a value was unbound or not numeric. The integer
+    /// sum is held in an `i128`, so that a sum whose result fits an `xsd:integer` is found
+    /// whatever the order of its rows, and only the result is checked
     Sum {
-        int: i64,
+        int: i128,
         generic: Option<Value>,
         ok: bool,
         rows: u64,
@@ -6749,15 +6751,25 @@ impl AggState {
                 }
                 if generic.is_none()
                     && id.tag() == crate::id::Tag::Int
-                    && let Some(s) = int.checked_add(id.as_i64())
+                    && let Some(s) = int.checked_add(id.as_i64().into())
                 {
                     *int = s;
                     return;
                 }
-                let acc = generic
-                    .take()
-                    .unwrap_or_else(|| Value::Integer((*int).into()));
-                match (!id.is_undef()).then(|| ctx.value(id)).flatten() {
+                let value = (!id.is_undef()).then(|| ctx.value(id)).flatten();
+                // An integer too large to be inlined joins the exact sum as well.
+                if generic.is_none()
+                    && let Some(Value::Integer(i)) = &value
+                    && let Some(s) = int.checked_add(i64::from(*i).into())
+                {
+                    *int = s;
+                    return;
+                }
+                let Some(acc) = generic.take().or_else(|| super::value::exact_sum(*int)) else {
+                    *ok = false;
+                    return;
+                };
+                match value {
                     Some(v) => match arith(NumOp::Add, &acc, &v) {
                         Ok(v) => *generic = Some(v),
                         Err(_) => *ok = false,
@@ -6807,7 +6819,13 @@ impl AggState {
                 if !ok {
                     return Id::UNDEF;
                 }
-                let sum = generic.unwrap_or_else(|| Value::Integer(int.into()));
+                let sum = match generic {
+                    Some(sum) => sum,
+                    None => match i64::try_from(int) {
+                        Ok(int) => Value::Integer(int.into()),
+                        Err(_) => return Id::UNDEF,
+                    },
+                };
                 let v = if matches!(agg.func, AggregateFunction::Avg) {
                     if rows == 0 {
                         Some(Value::Integer(0.into()))
@@ -6952,28 +6970,18 @@ fn aggregate(
             .filter_map(|v| v.ok())
             .filter_map(|id| ctx.value(id))
     };
-    let fold_sum = || -> Option<Value> {
-        let mut acc = Value::Integer(0.into());
-        for v in &vals {
-            let v = ctx.value((*v).ok()?)?;
-            acc = arith(NumOp::Add, &acc, &v).ok()?;
-        }
-        Some(acc)
-    };
     let result: Option<Value> = match &agg.func {
         AggregateFunction::Count => {
             return Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64)
                 .unwrap_or(Id::UNDEF);
         }
-        AggregateFunction::Sum => fold_sum(),
-        AggregateFunction::Avg => {
-            if vals.is_empty() {
-                Some(Value::Integer(0.into()))
-            } else {
-                fold_sum().and_then(|s| {
-                    arith(NumOp::Div, &s, &Value::Integer((vals.len() as i64).into())).ok()
-                })
+        // The running sum finds an integer sum in every order of the rows.
+        AggregateFunction::Sum | AggregateFunction::Avg => {
+            let mut state = AggState::new(agg);
+            for v in &vals {
+                state.add(ctx, agg, Some(v.unwrap_or(Id::UNDEF)));
             }
+            return state.finish(ctx, agg);
         }
         AggregateFunction::Min | AggregateFunction::Max => {
             let is_min = matches!(agg.func, AggregateFunction::Min);
