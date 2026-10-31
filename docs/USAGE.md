@@ -5826,10 +5826,12 @@ longer needed.
 
 ### Library errors
 
-Every call of the library that can fail returns `sparkles::Error`. `Error::code()` gives
-a stable kebab-case name for each error, which is the same in every binding and which the
-Python and JVM exception classes are chosen from. The server answers an `Error` with the
-HTTP status in the last column. The table lists the codes of the engine's own errors.
+Every call of the Rust library that can fail returns `sparkles::Error`, and
+`Error::code()` gives a stable kebab-case name for each error. The server answers an
+`Error` with the HTTP status in the last column. The table lists the codes of the
+engine's own errors. The Python, JVM and Node.js bindings map these errors to their own
+error kinds, which can merge several codes into one kind, so a program that uses a
+binding follows that binding's error documentation instead of this table.
 
 | Code | Meaning | HTTP status |
 |---|---|---|

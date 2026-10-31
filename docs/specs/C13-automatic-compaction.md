@@ -890,10 +890,11 @@ full build, adaptive thresholds and compaction in embedded use without a server 
 later work. A bulk commit still builds the spatial index's base under the writer lock,
 because it holds the lock for its whole rebuild anyway.
 
-The vector indexes' graphs are carried over to the new generation before the switch
-(`Store::prebuild_vectors`, [F04](F04-vector-search.md)), so a search after a compaction
-uses a graph at once and is not exact for a while. This replaces the rebuild after the
-switch that §4.8 describes.
+A compaction carries a vector index's graph over to the new generation before the switch
+(`Store::prebuild_vectors`, [F04](F04-vector-search.md#outcome)) when at most 30% of its
+nodes changed and the old graph was built with the same settings, so a search after the
+compaction uses a graph at once. Otherwise the graph is built in the background after the
+switch, as §4.8 describes, and searches scan exactly until it is ready.
 
 **Current code path.** Every compaction, whether started by the scheduler or by hand,
 runs through `Store::compact_with` and `compact_inner` in `store/compaction.rs`, and
