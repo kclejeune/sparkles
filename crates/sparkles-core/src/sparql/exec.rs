@@ -1145,7 +1145,14 @@ fn run_node(
         }
         Kind::LeftJoin { expr } => {
             let l = child(0, infos)?;
-            let r = child(1, infos)?;
+            let r = match optional_probe(ctx, &l, &n.children[1])? {
+                Some((r, info)) => {
+                    infos.push(info);
+                    held.add(r.mem_bytes())?;
+                    r
+                }
+                None => child(1, infos)?,
+            };
             left_join(ctx, &l, &r, expr.as_ref(), &mut note)?
         }
         Kind::KeyedLeftJoin { expr, left, right } => {
@@ -8162,6 +8169,31 @@ fn distinct_bound(
         }
     }
     Some(out)
+}
+
+/// An OPTIONAL's right side that is a triple pattern sorted on a key that every row of
+/// the evaluated left side `l` binds, read only for the left side's distinct keys when
+/// that costs less than reading the pattern (see [`super::indexjoin::probe_for`]),
+/// with its plan entry. The filters of the pattern are applied to the rows read.
+fn optional_probe(ctx: &Ctx, l: &Table, right: &Node) -> Result<Option<(Table, PlanInfo)>> {
+    let start = Instant::now();
+    let Some((t, stats)) = super::indexjoin::probe_for(ctx, right, l)? else {
+        return Ok(None);
+    };
+    let mut info = describe(ctx, right);
+    info.description = format!(
+        "{} [probed for the left side's keys: {}]",
+        right.desc,
+        stats.note().trim_start_matches('[').trim_end_matches(']')
+    );
+    info.actual_rows = t.len() as i64;
+    info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
+    info.counters = Some(stats.counters());
+    info.children = std::mem::take(&mut info.children)
+        .into_iter()
+        .map(|c| c.skip("the OPTIONAL probed the pattern for its left side's keys"))
+        .collect();
+    Ok(Some((t, info)))
 }
 
 /// A hash join's right side that is a `text:query` call without a limit or rank, when

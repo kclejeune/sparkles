@@ -2074,3 +2074,87 @@ mod cold_reads {
         );
     }
 }
+
+// ------------------------------------------------------------ probed OPTIONAL ------
+
+/// 8,000 reviews with optional ratings, a few of them for one product.
+fn review_store() -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..8_000 {
+        ttl.push_str(&format!("ex:r{i} ex:for ex:p{} .\n", i % 2_000));
+        if i % 3 != 0 {
+            ttl.push_str(&format!("ex:r{i} ex:rating {} .\n", i % 10));
+        }
+        if i % 4 == 0 {
+            // a review with two values of one rating
+            ttl.push_str(&format!("ex:r{i} ex:rating {} .\n", i % 7 + 100));
+        }
+        ttl.push_str(&format!("ex:r{i} ex:title \"t{i}\" .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    s
+}
+
+#[test]
+fn optional_probes_the_pattern_for_a_small_left_side() {
+    let s = review_store();
+    for text in [
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?t ?x WHERE { ?r ex:for ex:p7 ; ex:title ?t OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x FILTER(?x > 3) } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } FILTER(!BOUND(?x) || ?x < 100) }",
+        "SELECT ?r ?x ?y WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } OPTIONAL { ?r ex:rating ?y } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ?p VALUES ?p { ex:p7 ex:p8 ex:p1999 } OPTIONAL { ?r ex:rating ?x } }",
+    ] {
+        same_answer(&s, text, "desc:probed for the left side's keys");
+    }
+}
+
+#[test]
+fn optional_reads_the_pattern_for_a_large_left_side() {
+    let s = review_store();
+    let r = run(
+        &s,
+        "SELECT ?r ?x WHERE { ?r ex:for ?p OPTIONAL { ?r ex:rating ?x } }",
+        Optimizations::ALL,
+    );
+    assert!(!has_desc(&r.plan, "probed for the left side's keys"));
+    same_rows(
+        &s,
+        "SELECT ?r ?x WHERE { ?r ex:for ?p OPTIONAL { ?r ex:rating ?x } }",
+    );
+}
+
+#[test]
+fn optional_probe_reads_changed_rows() {
+    let s = review_store();
+    update(
+        &s,
+        "DELETE DATA { ex:r7 ex:rating 7 } ; INSERT DATA { ex:r7 ex:rating 42 . ex:r2007 ex:rating 43 . ex:new ex:for ex:p7 . ex:new ex:rating 44 }",
+    );
+    let rows = same_answer(
+        &s,
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } }",
+        "desc:probed for the left side's keys",
+    );
+    assert!(rows.iter().any(|r| r.contains("\"42\"")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("\"43\"")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("\"44\"")), "{rows:?}");
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.starts_with("<http://ex.org/r7>") && r.contains("\"7\"")),
+        "{rows:?}"
+    );
+}
+
+/// A left side that leaves the key unbound in a row reads the whole pattern.
+#[test]
+fn optional_with_an_unbound_left_key_reads_the_pattern() {
+    let s = review_store();
+    let text = "SELECT ?r ?x WHERE { { ?r ex:for ex:p7 } UNION { BIND(1 AS ?one) } OPTIONAL { ?r ex:rating ?x } }";
+    let r = run(&s, text, Optimizations::ALL);
+    assert!(!has_desc(&r.plan, "probed for the left side's keys"));
+    same_rows(&s, text);
+}

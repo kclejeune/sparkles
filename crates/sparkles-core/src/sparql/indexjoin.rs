@@ -1782,6 +1782,70 @@ pub(super) fn run(
     Ok((out.project(vars), stats))
 }
 
+/// The rows of the pattern under `probe` (a triple pattern scan with its filters, sorted
+/// on its key) whose key takes a value of `left`, read by probing the left side's
+/// distinct keys. An OPTIONAL reads its right side so when every left row binds the
+/// key: a right row with another key value is compatible with no left row, so the
+/// OPTIONAL's result is the same. `None` when the pattern cannot be probed, a left row
+/// leaves the key unbound, or probing the keys costs more than reading the pattern.
+/// The rows come in key order, as the scan returns them.
+pub(super) fn probe_for(ctx: &Ctx, probe: &Node, left: &Table) -> Result<Option<(Table, Stats)>> {
+    if !(ctx.opt.batched_join && ctx.opt.probed_optional) {
+        return Ok(None);
+    }
+    let Some((_, scan, filter)) = probe_leaf(probe) else {
+        return Ok(None);
+    };
+    let Some(side) = probe_side(probe, ctx) else {
+        return Ok(None);
+    };
+    let Some(kc) = left.col_of(side.key) else {
+        return Ok(None);
+    };
+    let col = &left.cols[kc];
+    if col.iter().any(|x| x.is_undef()) {
+        return Ok(None);
+    }
+    let held = ctx.charge(super::ctx::table_bytes(col.len(), 1))?;
+    let mut keys: Vec<u64> = col.iter().map(|x| x.0).collect();
+    if left.sorted.first() != Some(&side.key) {
+        keys.sort_unstable();
+    }
+    keys.dedup();
+    // the exact number of keys, against reading the whole pattern
+    if !side
+        .cost(keys.len() as f64, probe.cost)
+        .is_some_and(|c| c < probe.cost)
+    {
+        return Ok(None);
+    }
+    let spec = IndexJoinSpec {
+        key: side.key,
+        probes: vec![Probe {
+            scan: scan.clone(),
+            filter,
+            star: None,
+        }],
+    };
+    let mut stats = Stats {
+        keys: keys.len(),
+        ..Stats::default()
+    };
+    let mut t = if keys.is_empty() {
+        Table::new(scan.cols.iter().map(|c| c.1).collect())
+    } else {
+        read_probes(ctx, &spec, &keys, false, &mut stats)?
+            .pop()
+            .expect("one probe")
+    };
+    drop(held);
+    // the probe table's first column is the key, read in key order
+    if t.cols[0].is_sorted() {
+        t.sorted = vec![side.key];
+    }
+    Ok(Some((t.project(&probe.vars), stats)))
+}
+
 /// Whether the second column is ordered within every primary-key span. Check the
 /// actual table so alternate readers and filtered scans retain their fallback.
 fn ordered_secondary(ctx: &Ctx, table: &Table) -> Result<bool> {

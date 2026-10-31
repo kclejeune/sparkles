@@ -163,6 +163,10 @@ pub struct Optimizations {
     /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
     /// runs as a merge in the left side's order
     pub merge_left_join: bool,
+    /// OPTIONAL whose right side is a triple pattern sorted on a variable that every row
+    /// of the evaluated left side binds reads the pattern only for the left side's
+    /// distinct values, when probing them costs less than reading the pattern
+    pub probed_optional: bool,
     /// an OPTIONAL whose sides share no variable and whose condition equates a variable
     /// of each side pairs the rows by that equality instead of forming their product
     pub keyed_left_join: bool,
@@ -224,7 +228,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 44] = [
+    pub const NAMES: [&str; 45] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -250,6 +254,7 @@ impl Optimizations {
         "flat_hash_join",
         "gallop_index_join",
         "merge_left_join",
+        "probed_optional",
         "keyed_left_join",
         "keyed_join",
         "point_patterns",
@@ -298,6 +303,7 @@ impl Optimizations {
         flat_hash_join: true,
         gallop_index_join: true,
         merge_left_join: true,
+        probed_optional: true,
         keyed_left_join: true,
         keyed_join: true,
         point_patterns: true,
@@ -346,6 +352,7 @@ impl Optimizations {
         flat_hash_join: false,
         gallop_index_join: false,
         merge_left_join: false,
+        probed_optional: false,
         keyed_left_join: false,
         keyed_join: false,
         point_patterns: false,
@@ -394,6 +401,7 @@ impl Optimizations {
             "flat_hash_join" => &mut self.flat_hash_join,
             "gallop_index_join" => &mut self.gallop_index_join,
             "merge_left_join" => &mut self.merge_left_join,
+            "probed_optional" => &mut self.probed_optional,
             "keyed_left_join" => &mut self.keyed_left_join,
             "keyed_join" => &mut self.keyed_join,
             "point_patterns" => &mut self.point_patterns,
