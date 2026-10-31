@@ -38,7 +38,7 @@ longer term, so a fence with more than 4 GiB of new terms stays readable. On `fo
 1.00 to 1.14, and four writers on the spatial dataset at 1.05M committed 2.05 times as many
 transactions/s with the drive in its slow state. In the drive's fast state, flushing
 fences were faster than write-through ones in three of ten pairs, which roadmap item
-NEW-ITEM-2 measures.
+502 measures.
 
 Change feeds, live queries and long polls end with `access-changed` when the session
 or token they were opened with expires, including a session's idle timeout. OIDC

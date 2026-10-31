@@ -326,13 +326,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   item 448.
 * A fence whose commits carry a commit message or a change digest still synchronizes
   `annotations.bin` with an `fdatasync`, which costs a device cache flush, while its log
-  records and terms go through the write-through handles. Roadmap item NEW-ITEM-1.
+  records and terms go through the write-through handles. Roadmap item 501.
 * Write-through fences remove the device cache flush, which doubles the throughput of four
   writers when the drive of the benchmark hosts is in its slow state. In its fast state a
   fence that writes and flushes measured faster, and write-through fences gain little on
   the full-text dataset
   ([results](../benchmarks/writes/RESULTS.md#write-through-fences)). Roadmap item
-  NEW-ITEM-2.
+  502.
 * Automatic execution streams eligible large scans, groupings and ASK joins. Other
   plans remain eager, including an EXISTS evaluated once per outer key when its cursor
   is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays
@@ -396,7 +396,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md).
+The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item 501](../ROADMAP.md), [item 502](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

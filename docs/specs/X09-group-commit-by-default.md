@@ -1887,7 +1887,7 @@ to 2,681 transactions/s with fences of 0.58 to 0.64 ms, against 1,157 to 1,287 a
 of 1.48 to 1.67 ms for the flushing processes that ran with the drive in its slow state, a
 paired ratio of 2.053. Four flushing processes ran in the drive's fast state with fences
 of 0.44 to 0.67 ms and committed up to 3,754 transactions/s, which no write-through
-process reached, and item NEW-ITEM-2 measures fences in each state. On the full-text
+process reached, and item 502 measures fences in each state. On the full-text
 dataset the paired ratio was 1.020, because the write-through fences of eight processes
 still took 1.10 to 1.48 ms. With the drive in its slow state, grouped commits of
 `3da475a9` committed 2.135 and 1.927 times as many transactions/s as ordinary ones on the

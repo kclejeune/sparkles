@@ -339,7 +339,7 @@ fence and committed 1,157 to 1,287 transactions/s, and every write-through proce
 took 0.44 to 0.67 ms a fence and committed 2,566 to 3,754 transactions/s. Three of them
 outran every write-through process, and their pairs have ratios of 0.69 to 0.73. No
 write-through process ran with fences that short, because each fence's write-through
-writes took about 0.47 ms under this load. [Roadmap](../../ROADMAP.md) item NEW-ITEM-2
+writes took about 0.47 ms under this load. [Roadmap](../../ROADMAP.md) item 502
 measures write-through fences with the drive held in each state. In the full-text cell
 the write-through fences of eight processes took 1.10 to 1.48 ms, with device writes of
 0.76 to 1.20 ms each, and the paired gain is 1.020. Serial commits take the ordinary path
