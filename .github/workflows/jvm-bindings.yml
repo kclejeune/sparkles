@@ -3,6 +3,9 @@
 # `jvm-v*` tag with publishing switched on, the release to Maven Central
 # (docs/DEVELOPMENT.md, "Releases"). The jobs run on standard GitHub-hosted runners
 # with Cargo and Gradle dependencies cached in GitHub Actions.
+# Branch builds of the Linux x86_64 native use the runner that SPARKLES_RUNNER_LARGE
+# names and the other Linux x86_64 jobs the one SPARKLES_RUNNER names, when they are set.
+# Tags, publishing and fork pull requests always use GitHub's runners.
 name: JVM bindings
 
 # Pushes to main and pull requests run when the JVM bindings or a crate the native library
@@ -36,6 +39,11 @@ on:
   pull_request:
     paths: *paths
   workflow_dispatch:
+    inputs:
+      github-hosted:
+        description: Use GitHub's runners even when the runner variables are set
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -71,7 +79,9 @@ jobs:
         exclude:
           - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'linux-aarch64' || 'none' }}
           - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'macos-aarch64' || 'none' }}
-    runs-on: ${{ matrix.platform == 'macos-aarch64' && 'macos-15' || matrix.platform == 'linux-aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    # Linux x86_64 uses SPARKLES_RUNNER_LARGE for same-repository branch events. Tags
+    # (releases) and fork pull requests use GitHub's runners.
+    runs-on: ${{ matrix.platform == 'macos-aarch64' && 'macos-15' || matrix.platform == 'linux-aarch64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -136,7 +146,9 @@ jobs:
     timeout-minutes: 30
     needs: natives
     if: github.event_name != 'push' || github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
+    # SPARKLES_RUNNER for same-repository branch events. Tags (releases) and fork pull
+    # requests use GitHub's runner.
+    runs-on: ${{ !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 2 }
@@ -178,7 +190,9 @@ jobs:
     timeout-minutes: 30
     needs: natives
     if: github.event_name != 'push' || github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
+    # SPARKLES_RUNNER for same-repository branch events. Tags (releases) and fork pull
+    # requests use GitHub's runner.
+    runs-on: ${{ !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:

@@ -777,7 +777,11 @@ esac
         workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
         branches = re.search(r"^    branches: \[([^\]]+)\]$", workflow, re.M).group(1)
         self.assertEqual([value.strip() for value in branches.split(",")], ["main"])
-        self.assertIn("options: --cpus 4 --memory 14g --memory-swap 14g --pids-limit 2048", workflow)
+        # GitHub's runner keeps the exact limits; SPARKLES_RUNNER_LARGE lifts CPU and memory.
+        options = re.search(r"^      options: (.+)$", workflow, re.M).group(1)
+        self.assertIn("|| '--cpus 4 --memory 14g --memory-swap 14g --pids-limit 2048' }}", options)
+        self.assertIn("vars.SPARKLES_RUNNER_LARGE && '--pids-limit 2048'", options)
+        self.assertIn("vars.SPARKLES_RUNNER_LARGE && 'default' || '2' }}", workflow)
         self.assertEqual(re.findall(r"timeout-minutes: (\d+)", workflow), ["90", "10"])
         self.assertLess(workflow.index("# BEGIN SERVER ARTIFACT PREFLIGHT"),
                         workflow.index("actions-rust-lang/setup-rust-toolchain"))
