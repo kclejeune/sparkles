@@ -3868,7 +3868,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 263, 318 and 436.
+Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 263 and 318.
 
 Ask consumes recognized candidate evidence for full choice identities and conservative
 ordering of explicitly named kinds. Every ambiguous mention still requires a

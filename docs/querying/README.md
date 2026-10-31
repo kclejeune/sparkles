@@ -302,9 +302,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A template lookup that binds a blank node of the dataset writes a new node, and a JSON
   number with a fraction or an exponent loses its source form. Roadmap items 238 and 239.
 * Tables and databases are imported, not queried in place. Roadmap item 43.
-* The planner tests a group's FILTER on the rows of a VALUES table before the join fills
-  the table's UNDEF cells, so the solutions that an UNDEF row joins can be lost.
-  Roadmap item 436.
 
 * Incremental views are `table` views on `main`, maintained after the commit. There are
   no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node

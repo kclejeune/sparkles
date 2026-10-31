@@ -1458,8 +1458,8 @@ graph, so the copied-rows bound counts one copy of the table per graph. The revi
 UNDEF case found that the planner tests a group's FILTER on the rows of a VALUES table
 before the join fills the table's UNDEF cells, so
 `{ { VALUES ?o { 1 2 UNDEF } ?s <urn:p> ?o } FILTER(?o > 1) }` loses the solutions of
-the UNDEF row. That is older than this item and is roadmap item 436. Until it is fixed,
-a table with an UNDEF cell in a variable that a FILTER reads stays outside that FILTER.
+the UNDEF row. That fault is older than this item and is fixed under item 433. A table
+with an UNDEF cell in a variable that a FILTER reads still stays outside that FILTER.
 
 Tests compare the rewritten pattern with the expected one for each shape, check that the
 negative shapes keep the table outside, and run 18 more queries with the rewrite on and
