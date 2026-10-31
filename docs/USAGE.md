@@ -1690,16 +1690,22 @@ rules to SPARQL. The term rules (`iri-space`, the language tag and datatype rule
 `deprecated-syntax`) apply to every language. In JSON-LD they read value objects, terms
 with a datatype coercion, and the IRIs of `@id`, `@type` and `@context`. `unmapped-key`
 stays silent for a document without a context, beside a context given by URL, and under
-`@vocab`, because any of them may define the key. The values of a JSON literal and of a
-map container are data, and a term's own scoped context applies to its value. A JSON-LD
-fix is applied only after expanding the input and the fixed text and finding the same
+`@vocab`, because any of them may define the key. Names expand as JSON-LD expands them,
+through the `@vocab` IRI, keyword aliases such as a term for `@value`, and the default
+language. The values of a JSON literal and of a map container are data, so nothing inside
+a JSON literal counts as a context or a term, and a term's own scoped context applies to
+its value. A JSON-LD fix is applied only after expanding the input and the fixed text and finding the same
 dataset, so a document that names a context by URL keeps its text.
 
 In a Turtle, TriG or JSON-LD document, the plain string objects of `sh:select`, `sh:ask`,
 `sh:construct` and `sh:update` are linted as SPARQL, with every rule above, and a finding
 is placed inside the literal, whatever escapes or line breaks come before it. The query
 sees the prefixes of `sh:prefixes` and `sh:declare`, with the `owl:imports` closure, and
-those of the document itself. SHACL binds `$this`, `$shapesGraph`, `$currentShape`,
+those of the document itself. Each query sees the declarations and parameters of the node
+that holds it, in its graph, even when another node holds the same text. A document prefix
+that a query uses counts as used, so `--fix` keeps it. In JSON-LD, a value is a query only
+when it expands to a plain string, so a default language or an `@id` coercion makes it
+something else. SHACL binds `$this`, `$shapesGraph`, `$currentShape`,
 `$value` and `$PATH` before it runs a query, and the validators of a constraint component
 also see its parameters, so the variable rules count them as bound. A fix is offered only
 in a long string (`"""` or `'''`) without escapes, and only when the edited query means

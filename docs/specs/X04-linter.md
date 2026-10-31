@@ -357,16 +357,28 @@ the scoped contexts of terms and of `@type` values, and it skips the keys of map
 containers, the values of JSON literals and value objects. It stays silent for a document
 without a context, beside a context given by URL or `@import`, and under `@vocab`, because
 any of them can define the key. A term defined as `null` is dropped on purpose and is not
-reported. The fix of any JSON-LD rule is accepted only when oxjsonld expands the input and
-the fixed text to isomorphic datasets. A document that cannot be expanded here, because it
+reported. The walk expands names as JSON-LD does. The `@vocab` IRI expands keys, types and
+datatypes, a term that aliases a keyword such as `@value` or `@language` stands for the
+keyword, and a term's `@language` or the context's default language applies to its
+strings. A JSON literal, the value of a term typed `@json` or of a value object whose type
+is `@json`, is data. Nothing in it is read as a context, a term definition or a use of a
+term. The fix of any JSON-LD rule is accepted only when oxjsonld expands the input and the
+fixed text to isomorphic datasets, compared whole. A document that cannot be expanded here, because it
 names a context by URL, gets no `unused-context-term` fix and keeps its text under `fix`.
 oxjsonld became a dependency of `sparkles-fmt`, and the crate still builds for
 `wasm32-unknown-unknown`.
 
 **SPARQL in SHACL.** In Turtle, TriG and JSON-LD, the plain string objects of `sh:select`,
 `sh:ask`, `sh:construct` and `sh:update` are linted as SPARQL. A string with a language tag
-or a datatype other than `xsd:string` is not a query. The document is read a second time as
-RDF, only when it has such a literal, to find the prefixes and parameters of each query.
+or a datatype other than `xsd:string` is not a query. In JSON-LD that is decided from the
+literal the value expands to, so an explicit `xsd:string` value object is a query, and a
+string under a default language or an `@id`, `@vocab` or other datatype coercion is not.
+The document is read a second time as RDF, only when it has such a literal, to find the
+prefixes and parameters of each query. Each literal is matched to the quad it makes, in
+document order, so a query sees the prefixes and parameters of the node that holds it, in
+its own graph, even when another node holds the same text. When the literals and the quads
+do not match one to one, which only a construct the linter does not read as a query could
+cause, a query sees those of every node that holds its text.
 
 * *Prefixes.* A query sees the document's own prefixes first and then the `sh:declare`
   pairs of the nodes that `sh:prefixes` names on the node that holds the query and on the
@@ -374,7 +386,9 @@ RDF, only when it has such a literal, to find the prefixes and parameters of eac
   of the query as `PREFIX` lines, and a finding in front of the query is dropped, so an
   injected prefix is never reported as unused. The engine of `sparkles-shacl` resolves
   only the `sh:declare` prefixes, so a query that works through the document's prefixes
-  lints clean and fails at validation. That leniency follows the design above.
+  lints clean and fails at validation. That leniency follows the design above. A document
+  prefix that a query writes counts as used, so `unused-prefix` does not report it and
+  `fix` does not remove it.
 * *Pre-bound variables.* `$this`, `$shapesGraph`, `$currentShape`, `$value` and `$PATH`
   are bound, and so are the parameters of a constraint component, by the local name of each
   `sh:path`, when the query is one of its validators. The variable rules do not report them
@@ -390,18 +404,22 @@ RDF, only when it has such a literal, to find the prefixes and parameters of eac
 * *Fixes.* A finding has a fix only in a long string (`"""` or `'''`) without escapes,
   where the query text is the source text and an edit lands exactly. The edited query must
   parse to the same algebra, the string must not gain its own delimiter, and the edit may
-  not insert a quote or a backslash. `fix` compares the document before and after as RDF
-  with the text of the query literals blanked, because the embedded linter has already
-  checked that each query means what it meant. JSON strings are never long, so JSON-LD
-  queries have findings and no fixes.
+  not insert a quote or a backslash. `fix` compares a Turtle or TriG document before and
+  after as RDF with the text of its `xsd:string` query literals blanked, because the
+  embedded linter has already checked that each query means what it meant. JSON strings
+  are never long, so JSON-LD queries have findings and no fixes, and a JSON-LD document is
+  compared with nothing blanked.
 
 **Surfaces.** `sparkles lint` walks `.nt`, `.nq`, `.jsonld`, `.shaclc` and `.shc` files
 too, and `--list-rules` shows each rule's languages. `sparkles lsp`, `POST /$/lint` and the
 browser module take the new languages without a change of their own. The MCP `lint` tool
 takes `text`, `language`, `options` with the rule names in camelCase, `fix` and
 `timeoutSeconds`, as `format` takes its options. It returns each finding with its rule,
-severity, message and range, the counts, and with `fix` the fixed text. A result over
-`--mcp-max-bytes` lists the findings that fit and sets `truncated`. The shapes editor on a
+severity, message and range, the counts, and with `fix` the fixed text. The result is
+measured as its structured content serializes, escapes included. A fixed text that does not
+fit is refused with `too-large`, and a result with more findings than fit lists the ones
+that do and sets `truncated`. `POST /$/lint` answers `415` with `unsupported-language` for
+RDF/XML, named or detected, and `400` for a language name it does not know. The shapes editor on a
 dataset's page lints 400 ms after the text stops changing, in the browser module when it
 is there and through the endpoint otherwise, in Turtle and in SHACLC, with a count next to
 the Format button.
@@ -415,9 +433,23 @@ the Format button.
 * The MCP option names are camelCase rule names, `unusedPrefix` for `unused-prefix`, and
   the kebab-case names are accepted too. The HTTP endpoint keeps its `rules` object.
 * The line formats are read whole, so the CLI's `--max-bytes` applies to them. Linting a
-  document larger than memory in bounded memory is left open.
+  document larger than memory in bounded memory is left open. The reference parse streams
+  without keeping the quads, and it and the term rules check the deadline every few steps.
+  The lines and columns of all findings are set in one pass over the text, and so are the
+  UTF-16 offsets of the HTTP endpoint and the MCP tool and the positions of the language
+  server, so a document with many findings costs one scan rather than one per finding.
 * N-Triples and N-Quads are not read for SHACL query literals. The three languages that
   can carry shapes in practice are covered.
+
+**Review fixes.** An independent review of the extension found that a JSON literal's
+payload could get a context-term fix, that the line-format pass ignored its deadline and
+placed each finding by rescanning the text before it, that a prefix used only by a query
+was removed by `fix`, that queries with the same text shared their holders' prefixes and
+parameters, that JSON-LD queries were chosen without expanding types, languages, `@vocab`
+and keyword aliases, that the MCP tool measured the fixed text before JSON escaping, that
+the shapes editor could show the findings of text it no longer held, and that the API
+promised a `415` for RDF/XML that the endpoint did not give. Each has a regression test,
+and the behaviour above is the fixed one.
 
 **Tests.** `crates/sparkles-fmt/src/lint` has unit tests for N-Triples, N-Quads, SHACLC,
 JSON-LD and the embedded queries. They cover the pre-bound variables, the prefix sources,
@@ -426,4 +458,6 @@ escapes, multi-line and non-ASCII literals, long strings and the fix conditions.
 and the JSON-LD files of the Jena and Oxigraph checkouts: no `syntax` finding on a valid
 document, an error on every invalid one, and `fix` accepted by the equivalence checks. The
 MCP tool has tests in `mcp/lint_tests.rs`, and the tool-list test lists it. The shapes
-editor has a unit test of its lint request and a mock-backend test of the marks.
+editor has a unit test of its lint request and a mock-backend test of the marks, and
+`ui/src/lib/lint-runner.test.ts` tests that both editors drop the answer of a lint whose
+text has changed, been cleared or been closed.

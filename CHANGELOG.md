@@ -95,7 +95,10 @@ type. `sparkles lint` walks `.nt`, `.nq`, `.jsonld`, `.shaclc` and `.shc` files,
 `--list-rules` shows the languages of each rule. A `--fix` on a Turtle or SHACLC document
 with an undefined prefix used to fail with `unsafe-fix` and now applies its fixes. The MCP
 tool takes rule levels as camelCase `options`. JSON-LD documents are expanded with
-`oxjsonld` to check that a fix keeps their dataset.
+`oxjsonld` to check that a fix keeps their dataset. `POST /$/lint` now answers `415` with
+`unsupported-language` for RDF/XML instead of `400`. A document with many findings is
+placed in one pass, so the lint keeps to its timeout. The query editor no longer shows the
+findings of a lint that answered after the query changed or linting was turned off.
 
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
