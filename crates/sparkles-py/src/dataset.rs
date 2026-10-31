@@ -493,39 +493,11 @@ impl PyDataset {
                 "mapping, template and key apply to CSV and TSV input",
             ));
         }
-        if let Some(i) = input.filter(|i| !i.is_none())
-            && mode != sparkles::io::ParseMode::Buffered
-            && path.is_none()
-            && crate::io::is_file_object(i)?
-        {
-            // a file object streams into one transaction as it is read
-            let mut stream = crate::io::quad_stream(
-                py,
-                Some(i),
-                format,
-                None,
-                base_iri,
-                graph,
-                compression,
-                lenient,
-            )?;
-            let ds = self.ds_for_write(py)?;
-            return py
-                .detach(|| {
-                    let n = ds.transaction(|tx| {
-                        let mut n = 0;
-                        for q in stream.by_ref() {
-                            n += tx.insert(q?.as_ref())? as u64;
-                        }
-                        Ok(n)
-                    })?;
-                    ds.store().add_prefixes(stream.prefixes())?;
-                    Ok(n)
-                })
-                .py(py);
-        }
-        // the spool of an input in one of Jena's syntaxes lives until the load ends
-        let (mut src, _spool) = source_from_py(
+        let file_object = match input.filter(|i| !i.is_none()) {
+            Some(i) if path.is_none() && crate::io::is_file_object(i)? => Some(i.clone().unbind()),
+            _ => None,
+        };
+        let mut src = source_from_py(
             py,
             input,
             format,
@@ -538,7 +510,27 @@ impl PyDataset {
         src.parse_mode = mode;
         src.auto_buffer_bytes = auto_buffer_bytes;
         let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.store().load(&[src])).py(py)
+        let Some(obj) = file_object else {
+            return py.detach(|| ds.store().load(&[src])).py(py);
+        };
+        // A file object is read once as the loader parses it. Ctrl-C sets the flag, which
+        // fails the next read and stops the loader at its next check.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        src.data = sparkles::io::SourceData::reader(
+            crate::io::PyFileReader::new(obj).cancelled_by(cancel.clone(), signalled.clone()),
+        );
+        let flag = cancel.clone();
+        interrupt::run_reading(py, &cancel, &signalled, move || {
+            let o = sparkles::guard::WriteOptions {
+                cancel: Some(flag),
+                ..Default::default()
+            };
+            let r = ds
+                .store()
+                .load_with(&[src], sparkles::commit::CommitKind::Load, &o)?;
+            Ok(if r.committed { r.commit.inserted } else { 0 })
+        })
     }
 
     /// Load many files in one commit (the parallel bulk path); returns the new quads.
@@ -566,14 +558,13 @@ impl PyDataset {
                     None,
                     false,
                 )
-                .map(|(mut source, spool)| {
+                .map(|mut source| {
                     source.parse_mode = mode;
                     source.auto_buffer_bytes = auto_buffer_bytes;
-                    (source, spool)
+                    source
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let (sources, _spools): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
         let ds = self.ds_for_write(py)?;
         py.detach(|| ds.store().load(&sources)).py(py)
     }
@@ -1400,7 +1391,7 @@ impl PyDataset {
                 _ => return Err(invalid(py, "target cannot be a blank node")),
             },
         };
-        let (src, spool) = source_from_py(
+        let src = source_from_py(
             py,
             input,
             format,
@@ -1411,7 +1402,6 @@ impl PyDataset {
             lenient,
         )?;
         let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
-            let _spool = spool;
             ctl.progress.report(0.0, "replacing data");
             ctl.check()?;
             let r = ds.replace(target, &[src])?;

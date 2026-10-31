@@ -232,6 +232,66 @@ pub fn run<T: Send + 'static>(
     }
 }
 
+/// Run a request that reads a Python stream, such as a load from a file object, without
+/// the GIL. It runs as [`run`] does, and in addition a signal sets `signalled` at once,
+/// without waiting for the GIL, through the watcher of Python's signal wakeup descriptor.
+/// The stream's reader should stop calling into Python while `signalled` is set. The
+/// main thread then takes the GIL at its next wakeup, even when the reader calls `read`
+/// in a tight loop, and runs the handlers. When one raises, `cancel` is set and the
+/// exception propagates once the request has stopped. When none raises, `signalled` is
+/// cleared and the request goes on. Where the wakeup descriptor is taken, as under
+/// asyncio, this is [`run`].
+pub fn run_reading<T: Send + 'static>(
+    py: Python<'_>,
+    cancel: &Arc<AtomicBool>,
+    signalled: &Arc<AtomicBool>,
+    f: impl FnOnce() -> sparkles::Result<T> + Send + 'static,
+) -> PyResult<T> {
+    if !on_main_thread(py)? {
+        return py.detach(f).py(py);
+    }
+    #[cfg(unix)]
+    let watch = wakeup::Watch::start(py, signalled.clone());
+    let (tx, rx) = channel();
+    submit(Box::new(move || {
+        let _ = tx.send(f());
+    }))?;
+    let mut rx = rx;
+    let result = loop {
+        let (back, r) = py.detach(move || {
+            let r = rx.recv_timeout(POLL);
+            (rx, r)
+        });
+        rx = back;
+        match r {
+            Ok(v) => break Ok(Some(v)),
+            Err(RecvTimeoutError::Disconnected) => break Ok(None),
+            Err(RecvTimeoutError::Timeout) => {
+                if let Err(e) = py.check_signals() {
+                    cancel.store(true, Ordering::Relaxed);
+                    signalled.store(false, Ordering::Release);
+                    py.detach(move || drop(rx.recv()));
+                    break Err(e);
+                }
+                // the handlers ran and none raised: the reader goes on
+                signalled.store(false, Ordering::Release);
+            }
+        }
+    };
+    #[cfg(unix)]
+    if let Some(w) = watch {
+        w.stop(py);
+    }
+    match result? {
+        Some(r) => r.py(py),
+        None => Err(crate::errors::new_err(
+            py,
+            "SparklesError",
+            "the request's thread ended without an answer",
+        )),
+    }
+}
+
 /// Run a request that is safe to run again, such as a query, without the GIL. `f` gets
 /// the cancellation flag of each attempt. With a `token`, or where the signal wakeup
 /// descriptor is taken, this is [`run`] with the token's flag.
@@ -318,6 +378,31 @@ mod wakeup {
             })
             .ok()?;
         set.bind(py).call1((fd,)).ok()?.extract().ok()
+    }
+
+    /// A flag that the watcher sets on every signal with a Python handler, for as long as
+    /// the watch lasts. Only one watch or in-place request runs at a time, on the main
+    /// thread.
+    pub(super) struct Watch;
+
+    impl Watch {
+        /// Point the wakeup descriptor at the watcher with `flag` as the one to set, or
+        /// `None` when the descriptor is taken or cannot be set.
+        pub(super) fn start(py: Python<'_>, flag: Arc<AtomicBool>) -> Option<Watch> {
+            let fd = i64::from(socket()?);
+            let old = set_wakeup_fd(py, fd)?;
+            if old != -1 {
+                set_wakeup_fd(py, old);
+                return None;
+            }
+            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
+            Some(Watch)
+        }
+
+        pub(super) fn stop(self, py: Python<'_>) {
+            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            set_wakeup_fd(py, -1);
+        }
     }
 
     /// Run `f` in place on the main thread, or `None` when the wakeup descriptor is
