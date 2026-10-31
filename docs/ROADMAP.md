@@ -106,9 +106,9 @@ Wave A holds the work that most improves the engine against objective measures.
   building, rank fusion and the commit publish tail.
 * The reasoning quick fixes of item 456 are items 485 to 487. They add closure operators,
   the missing OWL 2 RL rules and cost-based rule-body planning.
-* The remaining Stage A lanes of item 17 are items 414 to 417. They deliver internal
+* The remaining Stage A parts of item 17 are items 414 to 417. They deliver internal
   circuits, the provenance algebra, reasoner witnesses and the fixed-point operator.
-* Small lanes that finish a capability run in free capacity. These are items 277 and
+* Small items that finish a capability run in free capacity. These are items 277 and
   77.
 
 ### Wave A2: engine rewrites
@@ -123,7 +123,7 @@ query under 0.3 ms may be slower on an Intel host.
 ### Wave B: memory and entities
 
 Wave B starts with item 81 Phase 3, then items 341, 396 and 435 and the remaining C18
-work. Item 18 Phase 3 and item 12 follow once the item 17 lanes they need have landed.
+work. Item 18 Phase 3 and item 12 follow once the item 17 parts they need have landed.
 Item 12 needs item 414, and item 18 Phase 3 needs items 415 and 416. The cheap agent
 tools of item 462 also belong to Wave B. They are the `ask` MCP tool in item 488, MCP tool
 profiles in item 489 and a hybrid search tool that embeds query text in item 490.
@@ -170,7 +170,7 @@ jobs, and the Bolt protocol of item 465 waits for item 20.
 
 ### Sequencing
 
-Write-path competitive work goes before the commit-time maintenance lane of item 17,
+Write-path competitive work goes before the commit-time maintenance part of item 17,
 which is item 421, because both change the commit path. Item 421 then measures its cost
 against the improved baseline.
 
@@ -241,7 +241,7 @@ not to every extension in a spec or to phases that have already shipped.
 | **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, starting with items 474 to 484. Item 454 follows the executor merge, and 455 follows 446, 447, 4 and 14. | X14, X15, X16, X17, X05 |
 | **Ontology and data platform** | 71 is the root of the ontology workbench 457. Items 458 to 461 add the resource catalog, checks and protected merges, git sync and linked-data publishing once the policy plumbing of 480 to 483 has landed. | F21, F24, U12, C30, X18, C31, F25, C32 |
 | **Agent platform** | 462 adds tool profiles, review queues, handoff and framework adapters, starting with 488 to 490. Its data-change triggers wait for 339. | C33, C11, C17, C18 |
-| **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses the lanes of item 17. | C25, C26, A01, F22, C27, C22b |
+| **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses the parts of item 17. | C25, C26, A01, F22, C27, C22b |
 
 The workstreams depend on each other and on existing items as follows.
 
@@ -311,8 +311,8 @@ flowchart LR
 
 Item 226 goes with item 414, because the change ring is copied for every commit once an
 internal circuit consumes it. Item 223 comes before item 427, and item 222 comes before
-items 424 and 426. The other item 17 lanes in Stage B and Stage C are listed in the
-[lane table](#lanes-of-item-17).
+items 424 and 426. The other item 17 parts in Stage B and Stage C are listed in the
+[table of its parts](#parts-of-item-17).
 
 Item 19 Phase 2 does not wait for F13 Phase 3. Its `auto` mode must account for the
 materialization states available when it lands. Item 100 Phase 1's report configurations
@@ -431,7 +431,7 @@ continues within its caller-visible evidence and measured-latency scope.
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 17 | **Incremental computation core.** This umbrella item is split into one item per lane, items 413 to 429, so that each lane has its own size and dependencies. Item 17 is complete when all of its lanes are. Item 413 is complete, and the [lane table](#lanes-of-item-17) lists the others. GraphQL subscriptions are deferred under item 37 until a workload asks for them. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
+| 17 | **Incremental computation core.** This umbrella item is split into items 413 to 429, so that each part has its own size and dependencies. Item 17 is complete when all of its parts are. Item 413 is complete, and the [table of its parts](#parts-of-item-17) lists the others. GraphQL subscriptions are deferred under item 37 until a workload asks for them. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
 | 18 | **Explanations.** Provenance-aware protections with `reviewedOnly` over derived facts. Demand derivation trees, bounded why-not searches, entailment diffs and minimal justifications are available. Phase 3 needs the provenance algebra and reasoner witnesses of items 415 and 416. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
 | 23 | **Full-text parity.** Online enabling and reconfiguring, search after uncommitted writes, and historical search remain. The analyzers that follow Lucene's and the dictionary analyzers are built. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
 | 24 | **GeoSPARQL completion.** Add per-row nearest-neighbour joins that run at least 50 times faster than the generic plan, QLever's `spatialSearch:` syntax, metric-property rewrites and polygon approximations in a versioned index format. Add exact Helmert datum shifts and geographic CRSs on datums other than WGS 84, opt-in grid-based shifts from operator-supplied grid files that still refuse when a needed grid is missing, and curved GML segments read by densifying arcs into line segments within a stated tolerance. Exact arithmetic on curves, GML solids, 3D constructions and splitting lines at crossings are not adopted. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | L | Medium |
@@ -450,19 +450,21 @@ continues within its caller-visible evidence and measured-latency scope.
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 113 | **Small changes and undos over a kept closure.** Changes of 100 triples at 16 threads and undos at 1 thread remain slower than before the F16 follow-up, and a profile of the full run should find or rule out a cost of about 5%. The options are an opt-in in-memory index of the input facts, charged to the memory budget, and per-thread counters in the block cache. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
 
-### Lanes of item 17
+<a id="lanes-of-item-17"></a>
+
+### Parts of item 17
 
 Stage A makes the incremental core safe and supplies what items 12, 18 and 19 need.
 Items 12, 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 12 needs
 item 414, item 18 Phase 3 needs items 415 and 416, and item 19 Phase 3 needs
 items 415 and 417. Stage B delivers the rest of Phase 2. Stage C delivers view
-provenance. The F13 spec records the design decisions that the lanes follow. Items that
+provenance. The F13 spec records the design decisions that the parts follow. Items that
 affect the write path measure with the `--views none|async:N|commit:Q|graph:N` option of
 `scripts/nsc-writes.sh` that item 414 adds.
 
 | # | Item | Spec | Size | Depends on |
 |---|---|---|---|---|
-| 414 | **Internal circuits.** Let the server attach circuits that no user defined, with an accumulator sink and a server-only `InternalAccess`. The accumulator keeps each changed fact's identity to the sink, which sums the absolute weight per key and fact and then per key, so an addition followed by a removal counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the existing feed-based counter does. Item 12 counts per-community changes with one. Tests cover churn across commits, a same-commit replacement and deletion-only workloads against that counter. Item 226 goes with this lane, and the lane adds the `--views none\|async:N\|commit:Q\|graph:N` option to `scripts/nsc-writes.sh` so that write-path gates can measure views. | [F13](specs/F13-incremental-views-and-provenance.md#36-internal-circuits), [C22](specs/C22-graph-rag-community-summaries.md#5-refresh) | S–M | None |
+| 414 | **Internal circuits.** Let the server attach circuits that no user defined, with an accumulator sink and a server-only `InternalAccess`. The accumulator keeps each changed fact's identity to the sink, which sums the absolute weight per key and fact and then per key, so an addition followed by a removal counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the existing feed-based counter does. Item 12 counts per-community changes with one. Tests cover churn across commits, a same-commit replacement and deletion-only workloads against that counter. Item 226 goes with this item, and this item adds the `--views none\|async:N\|commit:Q\|graph:N` option to `scripts/nsc-writes.sh` so that write-path gates can measure views. | [F13](specs/F13-incremental-views-and-provenance.md#36-internal-circuits), [C22](specs/C22-graph-rag-community-summaries.md#5-refresh) | S–M | None |
 | 415 | **Provenance algebra.** Add the `count`, `lineage` and `why` annotations with a 128-bit `FactKey` over vocabulary keys and bounded witness sets. | [F13](specs/F13-incremental-views-and-provenance.md#5-provenance) | S–M | None |
 | 416 | **Reasoner witnesses.** Record witnesses in the reasoner with F13's algebra, off unless a protection needs supported visibility, and define how witness sets converge under truncation. | [F18](specs/F18-explanations-and-entailment-diffs.md#71-protections) | M | 415 |
 | 417 | **Fixed-point operator.** Host one fixed-point interface in F13 with a reasoner plug-in, maintain property paths with `+` and `*` through backward and forward rederivation, and add `VIEW_STATE` format 2 for its state. | [F13](specs/F13-incremental-views-and-provenance.md#43-added-in-phase-3), [F17](specs/F17-query-time-reasoning.md#63-kept-current-phase-3) | M | 415 |
@@ -519,13 +521,14 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 
 ## Tier 3: big bets
 
-These remaining reasoning and integration phases follow the foundation and shared
-capability work above. Each phase keeps its declared prerequisites and acceptance. The ontology and data platform workstreams follow them, rooted in item 71.
+These remaining reasoning, integration and live-profiling phases follow the foundation
+and shared capability work above. Each phase keeps its declared prerequisites and acceptance. The ontology and data platform workstreams follow them, rooted in item 71.
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
 | 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 after items 415 and 417, and adds `why` provenance on tables for F18. Items 190, 192 and 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
 | 25 | **Query extension completion.** Dynamic dispatch, foreign callbacks, batching, additional aggregate arities and measurements remain, including native Java dispatch beside ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 27 | **Live query profiling and verified rewrites.** The static plan overlay is available. The running-query registry, live operator progress and hotspot views remain planned, followed by C18 Phase 6's result-equivalent rewrite suggestions and their integration in the live plan. | [U04](specs/U04-live-query-profiling.md), [C18](specs/C18-natural-language-questions-and-ingest/README.md) Phase 6 | M | Medium |
 | 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. Its Phase 1 axiom model, mappings, profile checks and `/$/ontology/{ds}` are the root of the ontology workbench, item 457. | [F21](specs/F21-ontology-api.md) | L | High |
 | 457 | **Ontology workbench.** Sparkles reads and checks ontologies but cannot edit, classify or explain them as ontology tools do. Item 71's axiom model comes first, then OWL syntaxes, refactoring, diffs, module extraction and OWL and SHACL translation in F21, an EL classifier and DL bridge in F24, and the editor in U12. Classification stays separate from the reasoner core of item 456. | [F21](specs/F21-ontology-api.md#ontology-workbench-workstream) | XL | High |
 | 458 | **Resource catalog.** Loading a public dataset is manual and unrecorded, vocabularies have no lifecycle and licences are not tracked. A server-level catalog of versioned sources, vocabularies and datasets adds a content-addressed source store, recipes, load manifests, pinned imports, mirrors, IRI minting and licence records. Fragment composition in X18 follows item 455, and the catalog starts once items 480 to 483 have landed. | [C30](specs/C30-resource-catalog/README.md) | L–XL | High |
@@ -563,7 +566,6 @@ numbered item when it is ready to start.
 | # | Item | Spec | Size |
 |---|---|---|---|
 | 6 | **Ask evaluation on public benchmarks.** Runs of local and OpenAI-compatible models and an evaluation with independent roles remain, and LC-QuAD 2.0 waits for a Wikidata load from the full dump. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 27 | **Live query profiling and verified rewrites.** The static plan overlay is available. The running-query registry, live operator progress and hotspot views remain planned, followed by C18 Phase 6's result-equivalent rewrite suggestions and their integration in the live plan. | [U04](specs/U04-live-query-profiling.md), [C18](specs/C18-natural-language-questions-and-ingest/README.md) Phase 6 | M |
 | 28 | **Query by example** and Bloom-style search phrases. | [U03](specs/U03-query-by-example.md) | M |
 | 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance. This item belongs to the additional query languages capability and is outside the completion path of paths and graph algorithms. | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL |
 | 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes. | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L |
