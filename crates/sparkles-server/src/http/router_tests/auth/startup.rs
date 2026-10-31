@@ -161,7 +161,7 @@ async fn startup_states_follow_the_callers_access() {
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
     let r = get_as(&app, "/$/server", Some(&rb)).await;
     let srv = r.json();
-    assert_eq!(srv["openingDatasets"], json!(["slow"]), "{srv}");
+    assert_eq!(srv["openingDatasets"], serde_json::json!(["slow"]), "{srv}");
     assert_eq!(srv["refusedDatasets"][0]["name"], "bad", "{srv}");
     assert_eq!(
         srv["refusedDatasets"][0]["reason"],
