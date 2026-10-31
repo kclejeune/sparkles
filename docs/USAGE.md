@@ -1707,7 +1707,10 @@ the source names, or else the only node that holds the query when no other strin
 document repeats its text. An ambiguous literal, such as the same query on two blank
 nodes, is skipped rather than given another node's findings. In JSON-LD the expansion
 decides which values are queries and who holds them, so a document that names a context
-by URL gets no query findings. A document prefix that a query uses counts as used, so
+by URL, or one over 8 MiB, gets no query findings. Each query is confirmed by expanding the
+document again, within a budget of four times its size (at least 1 MiB, at most 64 MiB)
+for all queries and fixes together, so a large document with many queries lints only
+some of them. A document prefix that a query uses counts as used, so
 `--fix` keeps it. SHACL binds `$this`, `$shapesGraph`, `$currentShape`,
 `$value` and `$PATH` before it runs a query, and the validators of a constraint component
 also see its parameters, so the variable rules count them as bound. A fix is offered only

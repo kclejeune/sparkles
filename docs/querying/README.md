@@ -291,7 +291,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Fuseki integration.
 * The linter reads a document whole, so a file over `--max-bytes` is refused even in a line
   format. It does not lint SHACL query literals in N-Triples and N-Quads or JSON-LD queries
-  under `@index` maps. It skips an embedded query whose holder is ambiguous, such as the
+  under `@index` maps, and a JSON-LD document over 8 MiB gets no query findings and no
+  fixes. Each JSON-LD query and fix is checked by expanding the document again, within a
+  budget of four times the document, so a large document with many queries lints only
+  some of them. It skips an embedded query whose holder is ambiguous, such as the
   same query text on two blank nodes, rather than risk another node's findings. Roadmap
   item NEW-ITEM.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.

@@ -389,9 +389,18 @@ graph, and a literal is linted only when that holder is certain.
   exactly one value string of the document has its text, exactly one node holds it, and a
   probe shows that the string makes the quad: the document with that string replaced by a
   fresh text expands to the same dataset with only that quad's literal replaced. A query
-  made from something else, such as the key of an `@index` map, fails the probe. At most
-  256 strings are probed, and a document that cannot be expanded here gets no query
+  made from something else, such as the key of an `@index` map, fails the probe. The probe
+  streams the expansion under the deadline and counts quads instead of keeping them. At
+  most 256 strings are probed, and a document that cannot be expanded here gets no query
   findings.
+* *Work.* Each probe and each fix check expands the whole document again. Together they
+  expand at most four times the document, or 1 MiB for a small one, and never more than
+  64 MiB, with or without a deadline, so linting in the browser stays bounded too. With a
+  deadline, one is not started when an expansion as long as the document's own would end
+  past it, because an expansion that must read the whole document before its first quad
+  cannot stop early. A probe or check that does not fit is skipped, so its query gets no
+  findings or its finding no fix. A JSON-LD document over 8 MiB is not expanded at all,
+  so it gets no query findings and no fixes.
 * *Ambiguity.* Any other literal is skipped. The same query text on two anonymous nodes,
   or a text that another string of the document repeats, costs the findings of that query
   and never gives one node the findings of another.
