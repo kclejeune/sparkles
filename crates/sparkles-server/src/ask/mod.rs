@@ -1514,7 +1514,7 @@ impl Asking<'_, '_> {
             "draftPair": draft_pos,
             "tryHarder": self.o.query.is_none() && draft_pos + 1 < self.list(Role::Draft).len(),
         });
-        crate::models::cache_json(&mut u, &crate::models::usage_total(&self.steps));
+        crate::models::steps_json(&mut u, &self.steps);
         if let Some(id) = &self.o.id {
             u["askId"] = id.clone().into();
         }

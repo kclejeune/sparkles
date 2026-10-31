@@ -214,7 +214,7 @@ impl Usage {
             "elapsedMs": started.elapsed().as_millis() as u64,
             "steps": self.steps.iter().map(StepRecord::json).collect::<Vec<_>>(),
         });
-        crate::models::cache_json(&mut j, &crate::models::usage_total(&self.steps));
+        crate::models::steps_json(&mut j, &self.steps);
         let costs: Vec<f64> = self.steps.iter().filter_map(|s| s.estimated_cost).collect();
         if !costs.is_empty() {
             j["estimatedCost"] = json!((costs.iter().sum::<f64>() * 1e6).round() / 1e6);

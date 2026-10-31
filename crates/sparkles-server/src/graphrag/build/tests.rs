@@ -969,6 +969,70 @@ async fn the_estimate_uses_the_pairs_output_limit() {
     .unwrap();
 }
 
+/// With prompt caching, every attempt reserves its input at the write price of the
+/// provider's TTL, so the estimate counts the input at that price too, and an estimate
+/// under the cap is never refused at its first reservation.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_estimate_counts_the_cache_write_price() {
+    let f = fixture_with(
+        3,
+        |r, _| (200, mock::openai(&answer(r))),
+        json!({ "provider": "p", "model": "m" }),
+    );
+    f.allow_rows().await;
+    let url = f.mock.url();
+    tokio::task::spawn_blocking(move || {
+        let ds = f.ds();
+        let s = settings(json!({}));
+        store_settings(&f.st, &ds, &s);
+        let r = Run {
+            st: &f.st,
+            ds,
+            settings: s,
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: "e".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let estimate = |caching: Value| {
+            let cfg = json!({
+                "providers": { "p": { "kind": "anthropic", "endpoint": url,
+                    "allowedModels": ["m"], "structuredOutput": "json-schema",
+                    "promptCaching": caching } },
+                "roles": { "community": [{ "provider": "p", "model": "m" }] }
+            });
+            f.st.set_models(Some(Arc::new(Models::new(
+                ModelsConfig::parse(&cfg.to_string()).unwrap(),
+                Default::default(),
+                sparkles::outbound::OutboundPolicy {
+                    allow_private: true,
+                    ..Default::default()
+                },
+            ))));
+            let (models, pairs, p) = r.admit().unwrap();
+            let prep = r.prepare(&p, &BuildState::default()).unwrap();
+            let plans = r.plan(&prep, &BuildState::default());
+            r.estimate(&models, &pairs, &prep, &plans)
+        };
+        let plain = estimate(json!({ "enabled": false }));
+        let hour = estimate(json!({ "ttl": "1h" }));
+        let n = |v: &Value, k: &str| v[k].as_u64().unwrap();
+        let out = n(&plain, "outputLimit") * n(&plain, "requests");
+        assert!(n(&plain, "requests") > 0, "{plain}");
+        assert_eq!(
+            n(&hour, "tokens"),
+            2 * (n(&plain, "tokens") - out) + out,
+            "{hour} {plain}"
+        );
+        let five = estimate(json!({}));
+        assert!(n(&five, "tokens") > n(&plain, "tokens"), "{five}");
+        assert!(n(&five, "tokens") < n(&hour, "tokens"), "{five}");
+    })
+    .await
+    .unwrap();
+}
+
 /// An accounting anomaly stops the run: the remaining communities stay pending rather
 /// than failed, and a dataset without a directory keeps the anomaly (round 6, findings
 /// 15 and 17).

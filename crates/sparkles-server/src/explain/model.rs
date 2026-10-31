@@ -348,7 +348,7 @@ impl Written {
             "failedCalls": self.steps.iter().filter(|s| s.outcome != "ok").count(),
             "steps": self.steps.iter().map(StepRecord::json).collect::<Vec<_>>(),
         });
-        crate::models::cache_json(&mut j, &crate::models::usage_total(&self.steps));
+        crate::models::steps_json(&mut j, &self.steps);
         j
     }
 }

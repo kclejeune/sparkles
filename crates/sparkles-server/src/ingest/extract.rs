@@ -238,7 +238,10 @@ fn from_text(t: &str) -> Option<Value> {
 }
 
 /// An estimate of an extraction's tokens and cost (§7.9): each chunk's prompt with the
-/// vocabulary and its context, and an answer of half the chunk's size.
+/// vocabulary and its context, and an answer of half the chunk's size. When the first
+/// pair's provider caches prompts, the first chunk writes the system text, the schema
+/// and the vocabulary to the cache and the later chunks read them, and `tokens` and the
+/// cost price each class as the budgets do (§3.6).
 pub fn estimate(
     models: &Models,
     pairs: &[Pair],
@@ -249,8 +252,13 @@ pub fn estimate(
     let fixed = (SYSTEM.len()
         + user_prompt(&v.prompt(), "", "").len()
         + v.schema().to_string().len()) as u64;
-    let mut input = 0u64;
-    let mut output = 0u64;
+    let shared =
+        (SYSTEM.len() + vocabulary_prompt(&v.prompt()).len() + v.schema().to_string().len()) as u64;
+    let ttl = pairs
+        .first()
+        .and_then(|p| models.provider(&p.provider))
+        .and_then(|p| p.cache_ttl());
+    let mut usage = crate::models::admission::Usage::default();
     let mut prev_end = 0usize;
     for (i, (a, b)) in chunks.iter().enumerate() {
         let chunk_bytes = slice_len(text, *a, *b) as u64;
@@ -264,20 +272,31 @@ pub fn estimate(
             ) as u64
         };
         prev_end = *b;
-        input += (fixed + chunk_bytes + ctx).div_ceil(4);
-        output += (chunk_bytes / 2).div_ceil(4) + 50;
+        match ttl {
+            None => usage.input += (fixed + chunk_bytes + ctx).div_ceil(4),
+            Some(t) => {
+                usage.input += (fixed - shared + chunk_bytes + ctx).div_ceil(4);
+                let cached = shared.div_ceil(4);
+                match (i, t) {
+                    (0, crate::models::CacheTtl::FiveMinutes) => usage.cache_write_5m += cached,
+                    (0, crate::models::CacheTtl::OneHour) => usage.cache_write_1h += cached,
+                    _ => usage.cache_read += cached,
+                }
+            }
+        }
+        usage.output += (chunk_bytes / 2).div_ceil(4) + 50;
     }
     let mut j = json!({
         "chunks": chunks.len(),
-        "inputTokens": input,
-        "outputTokens": output,
-        "tokens": input + output,
+        "inputTokens": usage.input,
+        "outputTokens": usage.output,
+        "tokens": usage.budget(),
     });
+    crate::models::cache_json(&mut j, &usage, usage.budget());
     if let Some(p) = pairs.first() {
         j["pair"] = json!({ "provider": p.provider, "model": p.model });
         if let Some(price) = models.resolved(p).and_then(|r| r.pricing) {
-            let cost = input as f64 * price.input_per_m_tok / 1e6
-                + output as f64 * price.output_per_m_tok / 1e6;
+            let cost = usage.cost(&price);
             j["estimatedCost"] = json!((cost * 1e6).round() / 1e6);
         }
     }
@@ -1150,5 +1169,64 @@ mod tests {
             "\"2026-10-14\"^^<http://www.w3.org/2001/XMLSchema#date>"
         );
         assert_eq!(l("x", None, Some("en")), "\"x\"@en");
+    }
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+    use crate::models::ModelsConfig;
+
+    fn models(caching: Value) -> Models {
+        let cfg = json!({ "providers": { "p": { "kind": "anthropic", "endpoint": "http://h",
+            "promptCaching": caching,
+            "pricing": { "inputPerMTok": 1.0, "outputPerMTok": 5.0 } } } });
+        Models::new(
+            ModelsConfig::parse(&cfg.to_string()).unwrap(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    /// A cold cache writes the shared prefix at the TTL's price on the first chunk and
+    /// reads it on the others, so the estimate's tokens and cost count each class at its
+    /// price, as the budgets will.
+    #[test]
+    fn the_estimate_prices_the_cache_classes() {
+        let v = Vocabulary {
+            classes: vec![("ex:Person".into(), Some("Person".into()))],
+            predicates: Vec::new(),
+            language: None,
+            class_enum: vec!["ex:Person".into()],
+            predicate_enum: Vec::new(),
+        };
+        let text = "x".repeat(4000);
+        let chunks = [(0, 2000), (2000, 4000)];
+        let pairs = [Pair::new("p", "m")];
+        let off = estimate(
+            &models(json!({ "enabled": false })),
+            &pairs,
+            &v,
+            &text,
+            &chunks,
+        );
+        let hour = estimate(&models(json!({ "ttl": "1h" })), &pairs, &v, &text, &chunks);
+        let n = |j: &Value, k: &str| j[k].as_u64().unwrap_or(0);
+        let shared = n(&hour, "cacheWriteInputTokens");
+        assert!(shared > 0, "{hour}");
+        assert_eq!(n(&hour, "cacheWrite1hInputTokens"), shared);
+        assert_eq!(n(&hour, "cacheReadInputTokens"), shared);
+        // the first chunk's write at 2 tokens and the second's read at 0.1
+        let expected =
+            n(&hour, "inputTokens") + n(&hour, "outputTokens") + (21 * shared).div_ceil(10);
+        assert_eq!(n(&hour, "tokens"), expected, "{hour}");
+        assert!(n(&hour, "tokens") > n(&off, "tokens"), "{hour} {off}");
+        let cost = |j: &Value| j["estimatedCost"].as_f64().unwrap();
+        assert!(cost(&hour) > cost(&off), "{hour} {off}");
+        assert!(off.get("cacheWriteInputTokens").is_none());
+        assert_eq!(
+            n(&off, "tokens"),
+            n(&off, "inputTokens") + n(&off, "outputTokens")
+        );
     }
 }

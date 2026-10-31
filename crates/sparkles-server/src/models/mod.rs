@@ -35,8 +35,8 @@ mod structured;
 pub use client::body_bytes;
 pub use client::{CallError, ChatRequest, Message, Part};
 pub use config::{
-    DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair, ProviderConfig,
-    Role, Routing, TLS_MEMBERS, check_secret_name, invalid_field,
+    CacheTtl, DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair,
+    ProviderConfig, Role, Routing, TLS_MEMBERS, check_secret_name, invalid_field,
 };
 #[cfg(test)]
 pub use structured::validate;
@@ -167,7 +167,7 @@ impl StepRecord {
             "latencyMs": self.latency.as_millis() as u64,
             "outcome": self.outcome,
         });
-        cache_json(&mut j, &self.usage());
+        cache_json(&mut j, &self.usage(), self.budget_tokens());
         if let Some(r) = self.role {
             j["role"] = r.as_str().into();
         }
@@ -187,9 +187,10 @@ impl StepRecord {
 /// Add the cache members of `u` to a usage object `j` that has `inputTokens` and
 /// `outputTokens`, when the provider used its cache: `cacheWriteInputTokens` (of which
 /// `cacheWrite1hInputTokens` at the 1-hour TTL), `cacheReadInputTokens`, and
-/// `budgetTokens`, the tokens the usage counts against a token budget. A usage
-/// without them used no cache, and its budget tokens are its input and output tokens.
-pub fn cache_json(j: &mut Value, u: &admission::Usage) {
+/// `budgetTokens`, the tokens the usage counts against a token budget, which is
+/// `budget`. A usage without them used no cache, and its budget tokens are its input
+/// and output tokens.
+pub fn cache_json(j: &mut Value, u: &admission::Usage, budget: u64) {
     let written = u.cache_write_5m.saturating_add(u.cache_write_1h);
     if written == 0 && u.cache_read == 0 {
         return;
@@ -199,7 +200,27 @@ pub fn cache_json(j: &mut Value, u: &admission::Usage) {
         j["cacheWrite1hInputTokens"] = u.cache_write_1h.into();
     }
     j["cacheReadInputTokens"] = u.cache_read.into();
-    j["budgetTokens"] = u.budget().into();
+    j["budgetTokens"] = budget.into();
+}
+
+/// [`cache_json`] for the usage of `steps` together. Its budget tokens are the sum of
+/// the steps' own, since each step's cache classes are rounded up on their own.
+pub fn steps_json<'a>(j: &mut Value, steps: impl IntoIterator<Item = &'a StepRecord> + Clone) {
+    let budget = steps
+        .clone()
+        .into_iter()
+        .map(StepRecord::budget_tokens)
+        .sum();
+    cache_json(j, &usage_total(steps), budget);
+}
+
+/// The tokens a usage object or a step record in JSON counts against a token budget:
+/// its `budgetTokens`, or its input and output tokens when it used no cache.
+pub fn budget_of(j: &Value) -> u64 {
+    j["budgetTokens"].as_u64().unwrap_or_else(|| {
+        let n = |k: &str| j[k].as_u64().unwrap_or(0);
+        n("inputTokens").saturating_add(n("outputTokens"))
+    })
 }
 
 /// The usage of a usage object or a step record in JSON, as [`cache_json`] writes it.
@@ -951,7 +972,7 @@ impl Models {
                 f.record.usage(),
             ),
         };
-        cache_json(&mut j, &usage);
+        cache_json(&mut j, &usage, usage.budget());
         Ok(j)
     }
 

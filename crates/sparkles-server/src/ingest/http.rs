@@ -397,7 +397,7 @@ fn spawn(
             request_id,
         };
         let (out, usage) = pipeline::run(&ctx, &req);
-        let tokens = crate::models::usage_json(&usage).budget();
+        let tokens = crate::models::budget_of(&usage);
         if tokens > 0 {
             st.asks.add_tokens(&req.dataset, &p.id(), tokens);
         }

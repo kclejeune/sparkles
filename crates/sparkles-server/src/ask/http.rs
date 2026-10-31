@@ -279,7 +279,7 @@ async fn ask_route(
         let id = id.clone();
         let me = me.clone();
         move |out: &Value| {
-            let tokens = crate::models::usage_json(&out["usage"]).budget();
+            let tokens = crate::models::budget_of(&out["usage"]);
             st.asks.add_tokens(&ds.name, &me, tokens);
             st.asks
                 .record(&id, assistant::recent_of(&ds.name, &me, out), &out["usage"]);

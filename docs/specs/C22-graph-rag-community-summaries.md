@@ -284,7 +284,9 @@ prompt cache reserves its input bound at the write price of its TTL, 1.25 times 
 minutes and 2 times for an hour, because the provider may write every input token to
 the cache. When the provider answers with its usage, the reservation is replaced by the
 reported input and output tokens, with a cache write counted at that price and a cache
-read at 0.1 token (C18 §5.4). When the attempt fails
+read at 0.1 token (C18 §5.4). The estimate counts each request's input at the same
+write price, so a build whose estimate fits its cap is not refused at its first
+reservation. When the attempt fails
 in a way that leaves its usage unknown, such as a timeout or a connection lost after the
 request was sent, or when the answer reports no usage, the whole reservation stays
 counted. Concurrent builds and refreshes of a dataset share one ledger for

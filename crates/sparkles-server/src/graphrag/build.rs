@@ -874,6 +874,9 @@ impl Run<'_> {
             .or_else(|| models.resolved(pair).map(|r| r.max_output_tokens))
             .map_or(0, u64::from);
         let bb = self.settings.budget.byte_bound_of(kind);
+        // the community role marks its system text for the provider's cache, so each
+        // attempt reserves its input at the write price of the provider's TTL (§3.5)
+        let ttl = models.provider(&pair.provider).and_then(|p| p.cache_ttl());
         let fixed = system.len() + schema.schema.to_string().len() + ENVELOPE_BYTES;
         let mut tokens = 0u64;
         let mut requests = 0usize;
@@ -893,10 +896,11 @@ impl Run<'_> {
                 // each child report at its output limit is counted in tokens below
                 report::render_parent(&[], &n.facts, &prep.info).text.len() + n.children.len() * 128
             };
-            let mut t = byte_bound(&bb, &vec![0u8; fixed + bytes], 2).saturating_add(out);
+            let mut input = byte_bound(&bb, &vec![0u8; fixed + bytes], 2);
             if !n.leaf() {
-                t = t.saturating_add(out.saturating_mul(n.children.len() as u64));
+                input = input.saturating_add(out.saturating_mul(n.children.len() as u64));
             }
+            let t = crate::models::admission::input_budget_bound(input, ttl).saturating_add(out);
             tokens = tokens.saturating_add(t);
         }
         json!({

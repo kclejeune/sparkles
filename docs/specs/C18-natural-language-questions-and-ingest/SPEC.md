@@ -778,7 +778,9 @@ current pair is unreachable and the role's list has another, the step moves to i
 
 Every token budget counts a step's output and its input priced as uncached input: a
 token written to the prompt cache counts 1.25 tokens, or 2 with the 1-hour TTL, and a
-token read from it counts 0.1 token, rounded up once per step. These are Anthropic's
+token read from it counts 0.1 token, rounded up once per step, and the budget of
+several steps is the sum of theirs. An ingestion estimate (§7.9) counts the first
+chunk's shared prefix as a write and the later chunks' as reads. These are Anthropic's
 standard multipliers. A model whose reads cost less, such as Claude Opus 5.5, is
 counted at the standard rate, which is the higher.
 

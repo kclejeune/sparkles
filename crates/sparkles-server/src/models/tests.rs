@@ -408,6 +408,30 @@ fn cache_tokens_are_charged_at_their_prices() {
     );
 }
 
+/// The budget of several steps is the sum of each step's own, as the ask's budget
+/// counts it, not the budget of their summed usage: two reads of 513 tokens count 52
+/// each, 104 together, where their sum would count 103.
+#[test]
+fn step_budgets_are_rounded_per_step() {
+    let step = StepRecord {
+        cache_read_tokens: 513,
+        ..Default::default()
+    };
+    assert_eq!(step.budget_tokens(), 52);
+    let steps = [step.clone(), step];
+    let mut j = json!({ "inputTokens": 0, "outputTokens": 0 });
+    steps_json(&mut j, &steps);
+    assert_eq!(j["budgetTokens"], 104);
+    assert_eq!(j["cacheReadInputTokens"], 1026);
+    assert_eq!(budget_of(&j), 104);
+    assert_eq!(usage_total(&steps).budget(), 103);
+    // a usage without cache members counts its input and output
+    assert_eq!(
+        budget_of(&json!({ "inputTokens": 7, "outputTokens": 3 })),
+        10
+    );
+}
+
 #[test]
 fn a_reload_shares_the_token_count_with_requests_on_the_old_config() {
     let mock = MockModel::start(|_, _| (200, mock::ollama(r#"{"query":"ASK {}"}"#)));

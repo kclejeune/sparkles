@@ -400,10 +400,7 @@ impl Runtime {
     /// in the usage counts under `role`. It is not counted as an ask.
     pub fn charge(&self, dataset: &str, principal: &str, role: &str, usage: &Value) {
         let steps = usage["steps"].as_array().cloned().unwrap_or_default();
-        let tokens: u64 = steps
-            .iter()
-            .map(|s| crate::models::usage_json(s).budget())
-            .sum();
+        let tokens: u64 = steps.iter().map(crate::models::budget_of).sum();
         self.add_tokens(dataset, principal, tokens);
         tracing::info!(
             target: "sparkles::models",
@@ -713,7 +710,7 @@ fn counts_json(c: &Counts) -> Value {
         "outcomes": c.outcomes.iter().map(|((b, o), n)| json!({"bucket": b, "outcome": o, "count": n})).collect::<Vec<_>>(),
         "tokens": c.tokens.iter().map(|((p, m), (u, cost))| {
             let mut j = json!({"provider": p, "model": m, "inputTokens": u.input, "outputTokens": u.output, "estimatedCost": cost});
-            crate::models::cache_json(&mut j, u);
+            crate::models::cache_json(&mut j, u, u.budget());
             j
         }).collect::<Vec<_>>(),
     })
@@ -848,7 +845,16 @@ pub fn record_of(id: &str, principal: &str, out: &Value) -> AskRecord {
         "outputTokens": u["outputTokens"],
         "estimatedCost": u["estimatedCost"],
     });
-    crate::models::cache_json(&mut routing, &crate::models::usage_json(u));
+    for k in [
+        "cacheWriteInputTokens",
+        "cacheWrite1hInputTokens",
+        "cacheReadInputTokens",
+        "budgetTokens",
+    ] {
+        if !u[k].is_null() {
+            routing[k] = u[k].clone();
+        }
+    }
     AskRecord {
         id: id.to_string(),
         principal: principal.to_string(),
