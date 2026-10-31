@@ -186,6 +186,9 @@ pub struct Mask {
     pub key: String,
     /// the hidden quads as SPO keys, sorted
     pub hidden: Vec<Key>,
+    /// the bytes of delta nodes the masked snapshot alone owns: those that hiding the
+    /// quads copied or created
+    pub(crate) retained: u64,
 }
 
 impl Mask {
@@ -224,22 +227,30 @@ pub fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
     let spo = Perm::Spo.index();
     let (from_ins, from_base): (Vec<Key>, Vec<Key>) =
         hidden.iter().partition(|k| snap.delta.ins[spo].contains(k));
+    // the writes count the nodes they copy or create: what the mask alone owns
     let dels: Vec<_> = Perm::ALL
         .par_iter()
         .map(|&p| {
             let mut del = snap.delta.del[p.index()].clone();
+            let mut allocated = 0u64;
             for k in &from_base {
-                del.insert(p.to_key(&Perm::Spo.to_quad(k)));
+                del.insert_metered(p.to_key(&Perm::Spo.to_quad(k)), &mut allocated);
             }
-            del
+            (del, allocated)
         })
         .collect();
     let mut delta = snap.delta.clone();
-    for (i, del) in dels.into_iter().enumerate() {
+    let mut retained = 0u64;
+    for (i, (del, allocated)) in dels.into_iter().enumerate() {
         delta.del[i] = del;
+        retained = retained.saturating_add(allocated);
     }
     let from_ins: Vec<[Id; 4]> = from_ins.iter().map(|k| Perm::Spo.to_quad(k)).collect();
-    delta.remove_inserted_all(&from_ins);
+    if !from_ins.is_empty() {
+        retained = retained
+            .saturating_add(delta.remove_inserted_all_metered(&from_ins))
+            .saturating_add(delta.predicate_bytes_bound());
+    }
     Snapshot {
         delta,
         counts: Default::default(),
@@ -247,6 +258,7 @@ pub fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
             id: MASK_IDS.fetch_add(1, Ordering::Relaxed),
             key,
             hidden,
+            retained,
         })),
         ..snap.clone()
     }

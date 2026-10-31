@@ -50,6 +50,68 @@ fn split_with_room<T>(v: &mut Vec<T>, at: usize, cap: usize) -> Vec<T> {
     right
 }
 
+/// Counts the bytes a write allocates for nodes. `()` counts nothing and compiles away,
+/// so the ordinary write paths are unchanged.
+pub(crate) trait Meter {
+    /// Whether the meter counts at all. The checks it needs are skipped when not.
+    const COUNTS: bool;
+    fn add(&mut self, bytes: u64);
+}
+
+impl Meter for () {
+    const COUNTS: bool = false;
+    #[inline(always)]
+    fn add(&mut self, _: u64) {}
+}
+
+impl Meter for u64 {
+    const COUNTS: bool = true;
+    #[inline]
+    fn add(&mut self, bytes: u64) {
+        *self = self.saturating_add(bytes);
+    }
+}
+
+/// `Arc::make_mut`, counting the copy it makes of a shared node. Nodes are never
+/// held weakly, so a node is copied exactly when another set holds it too.
+#[inline]
+fn make_mut<'a, M: Meter>(node: &'a mut Arc<Node>, meter: &mut M) -> &'a mut Node {
+    if M::COUNTS && Arc::strong_count(node) != 1 {
+        meter.add(copy_bytes(node));
+    }
+    Arc::make_mut(node)
+}
+
+/// The allocations of a copy of `node` for a write (see [`Node::clone`]).
+fn copy_bytes(node: &Node) -> u64 {
+    let vectors = match node {
+        Node::Leaf(_) => (LEAF_CAP + 1) * std::mem::size_of::<Key>(),
+        Node::Branch(_) => {
+            (BRANCH_CAP + 1)
+                * (std::mem::size_of::<Arc<Node>>()
+                    + std::mem::size_of::<Key>()
+                    + std::mem::size_of::<usize>())
+        }
+    };
+    (NODE_HEADER + vectors) as u64
+}
+
+/// The allocations of a node that is not yet shared.
+fn owned_bytes(node: &Node) -> u64 {
+    let vectors = match node {
+        Node::Leaf(v) => v.capacity() * std::mem::size_of::<Key>(),
+        Node::Branch(b) => {
+            b.children.capacity() * std::mem::size_of::<Arc<Node>>()
+                + b.lasts.capacity() * std::mem::size_of::<Key>()
+                + b.counts.capacity() * std::mem::size_of::<usize>()
+        }
+    };
+    (NODE_HEADER + vectors) as u64
+}
+
+/// The shared allocation that holds a node, with its reference counts.
+const NODE_HEADER: usize = 2 * std::mem::size_of::<usize>() + std::mem::size_of::<Node>();
+
 impl Clone for Node {
     /// A copy of a node for a write, with room for the write's insert.
     fn clone(&self) -> Node {
@@ -155,7 +217,13 @@ impl Node {
     /// node when it splits. `shares` is set to whether another key of the tree has the
     /// first `n` columns of `k`, when the keys next to it in its leaf tell (it is left
     /// `None` when `k` lands at an end of its leaf and the other neighbour differs).
-    fn insert(&mut self, k: Key, n: usize, shares: &mut Option<bool>) -> Option<Option<Node>> {
+    fn insert<M: Meter>(
+        &mut self,
+        k: Key,
+        n: usize,
+        shares: &mut Option<bool>,
+        meter: &mut M,
+    ) -> Option<Option<Node>> {
         match self {
             Node::Leaf(v) => {
                 let at = v.binary_search(&k).err()?;
@@ -178,7 +246,7 @@ impl Node {
             }
             Node::Branch(b) => {
                 let i = b.route(&k);
-                let split = Arc::make_mut(&mut b.children[i]).insert(k, n, shares)?;
+                let split = make_mut(&mut b.children[i], meter).insert(k, n, shares, meter)?;
                 match split {
                     None => {
                         b.counts[i] += 1;
@@ -192,6 +260,7 @@ impl Node {
                         b.lasts[i] = left.last();
                         b.counts.insert(i + 1, right.total());
                         b.lasts.insert(i + 1, right.last());
+                        meter.add(owned_bytes(&right));
                         b.children.insert(i + 1, Arc::new(right));
                     }
                 }
@@ -203,7 +272,7 @@ impl Node {
     /// Remove `k`, which is in the tree. A child left with fewer than a quarter of its
     /// capacity is merged with a neighbour, or the two share their entries evenly when
     /// together they are more than one node holds.
-    fn remove(&mut self, k: &Key) {
+    fn remove<M: Meter>(&mut self, k: &Key, meter: &mut M) {
         match self {
             Node::Leaf(v) => {
                 let at = v.binary_search(k).expect("the key is in the tree");
@@ -211,8 +280,8 @@ impl Node {
             }
             Node::Branch(b) => {
                 let i = b.route(k);
-                let child = Arc::make_mut(&mut b.children[i]);
-                child.remove(k);
+                let child = make_mut(&mut b.children[i], meter);
+                child.remove(k, meter);
                 b.counts[i] -= 1;
                 let width = child.width();
                 if width == 0 {
@@ -228,7 +297,7 @@ impl Node {
                 };
                 if width < cap / 4 && b.children.len() > 1 {
                     let j = if i + 1 < b.children.len() { i } else { i - 1 };
-                    rebalance(b, j, cap);
+                    rebalance(b, j, cap, meter);
                 }
             }
         }
@@ -237,12 +306,16 @@ impl Node {
 
 /// Merge children `j` and `j + 1` of `b`, or share their entries evenly when together
 /// they are more than `cap`.
-fn rebalance(b: &mut Branch, j: usize, cap: usize) {
+fn rebalance<M: Meter>(b: &mut Branch, j: usize, cap: usize, meter: &mut M) {
     let right = b.children.remove(j + 1);
     b.lasts.remove(j + 1);
     b.counts.remove(j + 1);
+    if M::COUNTS && Arc::strong_count(&right) != 1 {
+        meter.add(copy_bytes(&right));
+    }
     let right = Arc::unwrap_or_clone(right);
-    let left = Arc::make_mut(&mut b.children[j]);
+    let left = make_mut(&mut b.children[j], meter);
+    let before = if M::COUNTS { owned_bytes(left) } else { 0 };
     let split = match (left, right) {
         (Node::Leaf(l), Node::Leaf(r)) => {
             l.extend(r);
@@ -257,15 +330,36 @@ fn rebalance(b: &mut Branch, j: usize, cap: usize) {
         }
         _ => unreachable!("siblings are at the same level"),
     };
+    // a vector that grows moves to a new allocation
+    if M::COUNTS {
+        let after = owned_bytes(&b.children[j]);
+        if after > before {
+            meter.add(after);
+        }
+    }
     let left = &b.children[j];
     b.counts[j] = left.total();
     b.lasts[j] = left.last();
     if let Some(r) = split {
         b.counts.insert(j + 1, r.total());
         b.lasts.insert(j + 1, r.last());
+        meter.add(owned_bytes(&r));
         b.children.insert(j + 1, Arc::new(r));
     }
 }
+
+/// The most bytes one node allocates. A merge can extend a node's vectors to twice
+/// the room a copy gives before it splits again.
+const NODE_BOUND: u64 = {
+    let header = NODE_HEADER;
+    let leaf = 2 * (LEAF_CAP + 1) * std::mem::size_of::<Key>();
+    let branch = 2
+        * (BRANCH_CAP + 1)
+        * (std::mem::size_of::<Arc<Node>>()
+            + std::mem::size_of::<Key>()
+            + std::mem::size_of::<usize>());
+    (header + if leaf > branch { leaf } else { branch }) as u64
+};
 
 /// A persistent sorted set of keys with range counts (see the module docs).
 #[derive(Clone, Default)]
@@ -289,6 +383,69 @@ impl KeySet {
         self.len == 0
     }
 
+    /// The levels from the root to a leaf (0 for an empty set).
+    pub(crate) fn depth(&self) -> usize {
+        let mut depth = 0;
+        let mut node = self.root.as_deref();
+        while let Some(n) = node {
+            depth += 1;
+            node = match n {
+                Node::Leaf(_) => None,
+                Node::Branch(b) => b.children.first().map(|c| &**c),
+            };
+        }
+        depth
+    }
+
+    /// An upper bound on the bytes one insert or remove allocates in this set.
+    pub(crate) fn mutation_bound(&self) -> u64 {
+        let levels = self.depth() as u64 + 1;
+        // per level: a path copy, a copied sibling, a merged node's growth and a split;
+        // then a new root and its new child
+        levels
+            .saturating_mul(4)
+            .saturating_add(2)
+            .saturating_mul(NODE_BOUND)
+    }
+
+    /// The bound [`mutation_bound`](Self::mutation_bound) adds for each level.
+    pub(crate) fn level_bound() -> u64 {
+        4 * NODE_BOUND
+    }
+
+    /// The allocated bytes of the nodes this set alone owns: the nodes a write copied or
+    /// created since the set was cloned. Nodes shared with another set are not counted,
+    /// and neither is anything below them. `check` runs every 1024 nodes.
+    #[cfg(test)]
+    pub(crate) fn unshared_bytes(
+        &self,
+        mut check: impl FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<(u64, u64)> {
+        let Some(root) = &self.root else {
+            return Ok((0, 0));
+        };
+        let mut stack: Vec<&Arc<Node>> = Vec::new();
+        if Arc::strong_count(root) == 1 && Arc::weak_count(root) == 0 {
+            stack.push(root);
+        }
+        let (mut bytes, mut nodes) = (0u64, 0u64);
+        while let Some(node) = stack.pop() {
+            nodes += 1;
+            if nodes.is_multiple_of(1024) {
+                check()?;
+            }
+            bytes = bytes.saturating_add(owned_bytes(node));
+            if let Node::Branch(b) = &**node {
+                for child in &b.children {
+                    if Arc::strong_count(child) == 1 && Arc::weak_count(child) == 0 {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        Ok((bytes, nodes))
+    }
+
     /// Whether `other` is this set or an unchanged clone of it: both are empty, or both
     /// share one root and hold as many keys. A set changed after a clone has a copied
     /// root, so this is false for it even when it holds the same keys.
@@ -309,7 +466,7 @@ impl KeySet {
     /// on its path that a clone shares even when the key is already there: the delta's
     /// writer inserts keys that are mostly new.
     pub fn insert(&mut self, k: Key) -> bool {
-        self.insert_at(k, 0, &mut None).is_some()
+        self.insert_at(k, 0, &mut None, &mut ()).is_some()
     }
 
     /// Insert `k`: `None` if it was in the set, else whether another key of the set
@@ -317,41 +474,68 @@ impl KeySet {
     /// to `k` in its leaf, so it seldom costs more than the insert.
     pub fn insert_sharing(&mut self, k: Key, n: usize) -> Option<bool> {
         let mut shares = None;
-        self.insert_at(k, n, &mut shares)?;
+        self.insert_at(k, n, &mut shares, &mut ())?;
         Some(shares.unwrap_or_else(|| {
             let prefix = &k[..n];
             self.count_between(&pad(prefix, 0), &pad(prefix, u64::MAX)) > 1
         }))
     }
 
-    fn insert_at(&mut self, k: Key, n: usize, shares: &mut Option<bool>) -> Option<()> {
+    fn insert_at<M: Meter>(
+        &mut self,
+        k: Key,
+        n: usize,
+        shares: &mut Option<bool>,
+        meter: &mut M,
+    ) -> Option<()> {
         let Some(root) = self.root.as_mut() else {
-            self.root = Some(Arc::new(Node::Leaf(with_room(&[k], LEAF_CAP))));
+            let leaf = Node::Leaf(with_room(&[k], LEAF_CAP));
+            meter.add(owned_bytes(&leaf));
+            self.root = Some(Arc::new(leaf));
             self.len = 1;
             *shares = Some(false);
             return Some(());
         };
-        let split = Arc::make_mut(root).insert(k, n, shares)?;
+        let split = make_mut(root, meter).insert(k, n, shares, meter)?;
         self.len += 1;
         if let Some(right) = split {
             let left = self.root.take().expect("the root is set");
-            self.root = Some(Arc::new(Node::Branch(Branch {
+            meter.add(owned_bytes(&right));
+            let root = Node::Branch(Branch {
                 lasts: vec![left.last(), right.last()],
                 counts: vec![left.total(), right.total()],
                 children: vec![left, Arc::new(right)],
-            })));
+            });
+            meter.add(owned_bytes(&root));
+            self.root = Some(Arc::new(root));
         }
         Some(())
     }
 
+    /// [`insert`](Self::insert), adding to `meter` the bytes of every node it copies or
+    /// creates.
+    pub(crate) fn insert_metered(&mut self, k: Key, meter: &mut u64) -> bool {
+        self.insert_at(k, 0, &mut None, meter).is_some()
+    }
+
+    /// [`remove`](Self::remove), adding to `meter` the bytes of every node it copies or
+    /// grows.
+    pub(crate) fn remove_metered(&mut self, k: &Key, meter: &mut u64) -> bool {
+        self.remove_with(k, meter)
+    }
+
     /// Remove `k`; true if it was in the set. An absent key copies no node.
     pub fn remove(&mut self, k: &Key) -> bool {
+        self.remove_with(k, &mut ())
+    }
+
+    fn remove_with<M: Meter>(&mut self, k: &Key, meter: &mut M) -> bool {
         if !self.contains(k) {
             return false;
         }
         self.len -= 1;
         let root = self.root.as_mut().expect("a set holding a key has a root");
-        Arc::make_mut(root).remove(k);
+        make_mut(root, meter).remove(k, meter);
         // a branch left with one child gives way to it
         loop {
             match self.root.as_deref() {
@@ -591,6 +775,39 @@ impl<'a> Iterator for Iter<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn metered_writes_count_every_node_a_clone_comes_to_own() {
+        let key = |i: u64| [i / 7, i % 7, i, 0];
+        let base: KeySet = (0..20_000).map(key).collect();
+        for step in [1u64, 3, 10, 97] {
+            let mut set = base.clone();
+            let mut inserted = 0u64;
+            for i in (20_000..24_000).step_by(step as usize) {
+                let bound = set.mutation_bound();
+                let mut one = 0u64;
+                assert!(set.insert_metered(key(i), &mut one));
+                assert!(one <= bound);
+                inserted += one;
+            }
+            let (owned, _) = set.unshared_bytes(|| Ok(())).unwrap();
+            assert!(inserted >= owned, "inserts counted {inserted} of {owned}");
+            let mut set = base.clone();
+            let mut removed = 0u64;
+            for i in (0..20_000).step_by(step as usize) {
+                let bound = set.mutation_bound();
+                let mut one = 0u64;
+                assert!(set.remove_metered(&key(i), &mut one));
+                assert!(one <= bound);
+                removed += one;
+            }
+            let (owned, _) = set.unshared_bytes(|| Ok(())).unwrap();
+            assert!(removed >= owned, "removals counted {removed} of {owned}");
+            assert!(set.iter().all(|k| (k[2] % step) != 0));
+        }
+        // a clone that writes nothing owns nothing
+        assert_eq!(base.clone().unshared_bytes(|| Ok(())).unwrap(), (0, 0));
+    }
     use super::*;
     use std::collections::BTreeSet;
 

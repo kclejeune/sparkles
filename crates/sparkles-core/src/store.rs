@@ -354,6 +354,38 @@ impl Delta {
         }
     }
 
+    /// The bytes of key-set nodes this delta alone owns, and their number: what writes
+    /// to a clone of another delta copied or created (see [`KeySet::unshared_bytes`]).
+    #[cfg(test)]
+    pub(crate) fn unshared_bytes(
+        &self,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<(u64, u64)> {
+        let (mut bytes, mut nodes) = (0u64, 0u64);
+        for set in self.ins.iter().chain(&self.del) {
+            let (b, n) = set.unshared_bytes(&mut check)?;
+            bytes = bytes.saturating_add(b);
+            nodes = nodes.saturating_add(n);
+        }
+        Ok((bytes, nodes))
+    }
+
+    /// An upper bound on the bytes of every node of the predicate statistics: each
+    /// node holds at least one entry, and a node takes at most 8 KiB.
+    pub(crate) fn predicate_bytes_bound(&self) -> u64 {
+        (self.predicates.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(2)
+            .saturating_mul(8 << 10)
+    }
+
+    /// Lower the statistics of predicate `p` by `n` inserted quads taken out of every
+    /// permutation, as [`remove_inserted_all`](Self::remove_inserted_all) does for the
+    /// quads of one predicate: `subjects` and `objects` are their distinct values.
+    pub(crate) fn forget_removed(&mut self, p: u64, n: u64, subjects: &[u64], objects: &[u64]) {
+        self.forget(p, n, subjects, objects);
+    }
+
     /// Take `q`, which is not in the base, out of the inserted quads.
     pub(crate) fn remove_inserted(&mut self, q: &[Id; 4]) {
         let mut removed = false;
@@ -390,20 +422,24 @@ impl Delta {
 
     /// Take the inserted quads `qs` out of the delta at once (a triple-level access
     /// view's hidden quads). Every one of them is an inserted quad.
-    pub(crate) fn remove_inserted_all(&mut self, qs: &[[Id; 4]]) {
+    /// Returns the bytes of the key-set nodes the removals copied or grew.
+    pub(crate) fn remove_inserted_all_metered(&mut self, qs: &[[Id; 4]]) -> u64 {
         use rayon::prelude::*;
-        let sets: Vec<KeySet> = Perm::ALL
+        let sets: Vec<(KeySet, u64)> = Perm::ALL
             .par_iter()
             .map(|&perm| {
                 let mut set = self.ins[perm.index()].clone();
+                let mut allocated = 0u64;
                 for q in qs {
-                    set.remove(&perm.to_key(q));
+                    set.remove_metered(&perm.to_key(q), &mut allocated);
                 }
-                set
+                (set, allocated)
             })
             .collect();
-        for (i, set) in sets.into_iter().enumerate() {
+        let mut allocated = 0u64;
+        for (i, (set, bytes)) in sets.into_iter().enumerate() {
             self.ins[i] = set;
+            allocated = allocated.saturating_add(bytes);
         }
         // by predicate: the quads removed, and the distinct subjects and objects
         let mut by_p: BTreeMap<u64, (u64, Vec<u64>, Vec<u64>)> = BTreeMap::new();
@@ -420,6 +456,7 @@ impl Delta {
             os.dedup();
             self.forget(p, n, &ss, &os);
         }
+        allocated
     }
 
     /// The statistics of the inserted quads with predicate `p`.

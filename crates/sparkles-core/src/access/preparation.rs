@@ -48,6 +48,19 @@ impl Preparation {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn inner_used(&self) -> u64 {
+        self.inner.used.load(Ordering::Relaxed)
+    }
+
+    /// The allowance not yet reserved. Other clones may reserve it at any moment, so
+    /// this only sizes work; storage still needs a [`reserve`](Self::reserve).
+    pub(crate) fn room(&self) -> u64 {
+        self.inner
+            .limit
+            .saturating_sub(self.inner.used.load(Ordering::Relaxed))
+    }
+
     /// Refuse a preparation lock that is already held instead of waiting for it.
     pub fn with_no_wait(mut self, no_wait: bool) -> Self {
         self.no_wait = no_wait;
@@ -695,6 +708,73 @@ fn copy_str(out: &mut String, text: &str, preparation: &Preparation) -> Result<(
     preparation.check()
 }
 
+/// Sort keys in pieces that the standard sort orders in well under a millisecond,
+/// then merge the pieces through an admitted buffer, polling between pieces and every
+/// 1024 merged keys. This is several times faster than [`sort_by`]'s heapsort and
+/// keeps the same bounded time between checks.
+pub(crate) fn sort_keys(values: &mut [crate::index::Key], preparation: &Preparation) -> Result<()> {
+    const PIECE: usize = 1 << 14;
+    preparation.check()?;
+    if values.len() <= PIECE {
+        values.sort_unstable();
+        return preparation.check();
+    }
+    for piece in values.chunks_mut(PIECE) {
+        preparation.check()?;
+        piece.sort_unstable();
+    }
+    let _held = preparation.reserve(
+        (values.len() as u64).saturating_mul(std::mem::size_of::<crate::index::Key>() as u64),
+    )?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(values.len())
+        .map_err(|_| preparation.exhausted())?;
+    for piece in values.chunks(PIECE) {
+        preparation.check()?;
+        buffer.extend_from_slice(piece);
+    }
+    // `buffer` holds the sorted pieces; each pass merges pairs into the other side
+    let mut in_buffer = true;
+    let mut width = PIECE;
+    while width < values.len() {
+        let (from, to): (&[crate::index::Key], &mut [crate::index::Key]) = if in_buffer {
+            (&buffer, &mut *values)
+        } else {
+            (&*values, &mut buffer)
+        };
+        let mut start = 0;
+        while start < from.len() {
+            let middle = (start + width).min(from.len());
+            let end = (start + 2 * width).min(from.len());
+            let (mut a, mut b, mut out) = (start, middle, start);
+            while out < end {
+                if out.is_multiple_of(1024) {
+                    preparation.check()?;
+                }
+                if b >= end || (a < middle && from[a] <= from[b]) {
+                    to[out] = from[a];
+                    a += 1;
+                } else {
+                    to[out] = from[b];
+                    b += 1;
+                }
+                out += 1;
+            }
+            start = end;
+        }
+        in_buffer = !in_buffer;
+        width *= 2;
+    }
+    if in_buffer {
+        for (to, from) in values.chunks_mut(PIECE).zip(buffer.chunks(PIECE)) {
+            preparation.check()?;
+            to.copy_from_slice(from);
+        }
+    }
+    preparation.check()
+}
+
 /// In-place heapsort can propagate a refusal during ordering, without unwinding or
 /// leaving an uninterruptible library sort running after cancellation.
 pub(crate) fn sort_by<T>(
@@ -777,6 +857,21 @@ impl Reservation {
         }
         Ok(())
     }
+    /// Release the allowance above `bytes` once the owner retains no more than that.
+    pub(crate) fn release_to(&mut self, bytes: u64) {
+        if bytes < self.bytes {
+            self.preparation
+                .inner
+                .used
+                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+            self.bytes = bytes;
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub(crate) fn merge(&mut self, mut other: Self) {
         assert!(Arc::ptr_eq(
             &self.preparation.inner,
@@ -1076,6 +1171,19 @@ mod tests {
             lossy(&bytes, &preparation).unwrap(),
             String::from_utf8_lossy(&bytes)
         );
+        for len in [0usize, 1, 5, (1 << 14) + 3, 3 << 14, (5 << 14) + 17] {
+            let mut keys: Vec<crate::index::Key> = (0..len as u64)
+                .map(|i| {
+                    let x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    [x % 97, x >> 7, i % 5, 0]
+                })
+                .collect();
+            let mut expected = keys.clone();
+            expected.sort_unstable();
+            let roomy = Preparation::new(Control::none(), 64 << 20).unwrap();
+            sort_keys(&mut keys, &roomy).unwrap();
+            assert_eq!(keys, expected, "{len} keys");
+        }
         let mut values = vec![9, 1, 8, 0, 1, 4, 7];
         let mut expected = values.clone();
         expected.sort_unstable();
