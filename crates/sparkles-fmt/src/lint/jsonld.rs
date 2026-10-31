@@ -221,15 +221,7 @@ fn query_sites(
     deadline: Option<std::time::Instant>,
     work: &mut Work,
 ) -> Result<Vec<embedded::Site>, LintError> {
-    // how many quads have each query property and text, and how many there are in all
-    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
-    for q in quads {
-        if let Some(v) = embedded::query_text(&q.object)
-            .filter(|_| embedded::is_query_predicate(q.predicate.as_str()))
-        {
-            *counts.entry((q.predicate.as_str(), v)).or_default() += 1;
-        }
-    }
+    let mut base = None;
     let mut seen = HashSet::new();
     let mut sites = Vec::new();
     let mut probes = 0;
@@ -253,15 +245,13 @@ fn query_sites(
             break;
         }
         probes += 1;
-        if !probe(
-            text,
-            s,
-            p,
-            probes,
-            (counts[&(p, v)], quads.len()),
-            deadline,
-            work,
-        )? {
+        if base.is_none() {
+            base = Some(Baseline::new(quads));
+        }
+        let Some(Some(base)) = base.as_mut() else {
+            break;
+        };
+        if !probe(text, s, q, base, probes, deadline, work)? {
             continue;
         }
         sites.push(embedded::Site {
@@ -276,47 +266,214 @@ fn query_sites(
     Ok(sites)
 }
 
-/// Whether the value string `s` is what makes the quad of `predicate` with its text. The
-/// document with `s` replaced by a fresh text is expanded, streaming under the deadline
-/// and without keeping its quads, and it must have as many quads as before (`counts.1`),
-/// one fewer with `predicate` and the old text than the `counts.0` there were, and exactly
-/// one with the fresh text, under `predicate`. Only one node holds the old text, so that
-/// quad is the holder's. A probe that does not fit the `work` budget is not made, and the
-/// answer is `false`.
+/// Whether the value string `s` is what makes the quad `target`. The document with `s`
+/// replaced by a fresh text is expanded, streaming under the deadline and without keeping
+/// its quads. Its dataset, with the one quad of the fresh text given back the old text,
+/// must be the document's own, as told by `base`, and that one quad must be `target`. Only
+/// one node holds the text of `target`, so the quad is the holder's. A probe that does not
+/// fit the `work` budget is not made, and the answer is `false`.
 pub(super) fn probe(
     text: &str,
     s: &Str,
-    predicate: &str,
+    target: &oxrdf::Quad,
+    base: &mut Baseline,
     n: usize,
-    counts: (usize, usize),
     deadline: Option<std::time::Instant>,
     work: &mut Work,
 ) -> Result<bool, LintError> {
-    let fresh = format!("urn:x-sparkles-lint-probe:{n}");
-    if text.contains(&fresh) {
-        return Ok(false);
-    }
+    let fresh = format!("{}{n}", base.marker);
     let probed = format!("{}\"{fresh}\"{}", &text[..s.start], &text[s.end..]);
     if !work.spend(probed.len()) {
         return Ok(false);
     }
-    let (mut total, mut old, mut new, mut elsewhere) = (0usize, 0usize, 0usize, false);
+    let want = base.hash(target);
+    let mut probe = Digest::new(&base.keys);
+    let mut new = 0usize;
+    let mut stray = false;
     let expanded = super::jsonld_stream(&probed, deadline, |q| {
-        total += 1;
-        let Some(v) = embedded::query_text(&q.object) else {
-            return;
-        };
-        if v == fresh {
-            if q.predicate.as_str() == predicate {
+        let q = match &q.object {
+            oxrdf::Term::Literal(l) if l.value() == fresh => {
                 new += 1;
-            } else {
-                elsewhere = true;
+                let put_back = oxrdf::Quad::new(
+                    q.subject.clone(),
+                    q.predicate.clone(),
+                    oxrdf::Literal::new_simple_literal(s.value.as_str()),
+                    q.graph_name.clone(),
+                );
+                if l.datatype() != oxrdf::vocab::xsd::STRING || probe.peek(&put_back) != want {
+                    stray = true;
+                }
+                put_back
             }
-        } else if v == s.value && q.predicate.as_str() == predicate {
-            old += 1;
-        }
+            _ => q,
+        };
+        probe.add(&q);
     })?;
-    Ok(expanded && !elsewhere && new == 1 && old + 1 == counts.0 && total == counts.1)
+    Ok(expanded
+        && !stray
+        && new == 1
+        && probe.count == base.digest.count
+        && probe.sum == base.digest.sum)
+}
+
+/// The document's own expansion as the probes compare against it: a text no term of it
+/// contains, from which each probe's fresh text is made, and the digest of its quads.
+pub(super) struct Baseline {
+    marker: String,
+    keys: [std::hash::RandomState; 2],
+    digest: Digest,
+}
+
+impl Baseline {
+    /// The baseline of `quads`, or `None` when no marker is found that none of its terms
+    /// contains.
+    pub(super) fn new(quads: &[oxrdf::Quad]) -> Option<Baseline> {
+        let marker = (0..16u32)
+            .map(|nonce| format!("urn:x-sparkles-lint-probe-{nonce:x}-"))
+            .find(|m| !quads.iter().any(|q| quad_contains(q, m)))?;
+        let keys = [std::hash::RandomState::new(), std::hash::RandomState::new()];
+        let mut digest = Digest::new(&keys);
+        quads.iter().for_each(|q| digest.add(q));
+        Some(Baseline {
+            marker,
+            keys,
+            digest,
+        })
+    }
+
+    /// The hash of a quad of the document, with its blank nodes named as in the digest.
+    fn hash(&mut self, q: &oxrdf::Quad) -> u128 {
+        self.digest.peek(q)
+    }
+}
+
+/// An order-independent digest of a multiset of quads: their count and the wrapping sum of
+/// their 128-bit keyed hashes. Blank nodes are hashed by the order in which they first
+/// appear, so two expansions of documents that differ in one string literal, which emit
+/// their quads in the same order, name them alike whatever labels the parser gave them.
+/// When the order differs, the digests differ and the probe proves nothing.
+struct Digest {
+    keys: [std::hash::RandomState; 2],
+    blanks: HashMap<String, u64>,
+    count: usize,
+    sum: u128,
+}
+
+impl Digest {
+    fn new(keys: &[std::hash::RandomState; 2]) -> Digest {
+        Digest {
+            keys: keys.clone(),
+            blanks: HashMap::new(),
+            count: 0,
+            sum: 0,
+        }
+    }
+
+    fn add(&mut self, q: &oxrdf::Quad) {
+        let h = self.peek(q);
+        self.count += 1;
+        self.sum = self.sum.wrapping_add(h);
+    }
+
+    /// The hash of `q`, naming the blank nodes it brings in for the first time.
+    fn peek(&mut self, q: &oxrdf::Quad) -> u128 {
+        use std::hash::{BuildHasher, Hasher};
+        let [a, b] = &self.keys;
+        let (mut ha, mut hb) = (a.build_hasher(), b.build_hasher());
+        let mut feed = |bytes: &[u8]| {
+            ha.write(bytes);
+            hb.write(bytes);
+        };
+        let blanks = &mut self.blanks;
+        let mut blank = |id: &str| {
+            let next = blanks.len() as u64;
+            *blanks.entry(id.to_string()).or_insert(next)
+        };
+        subject_bytes(&q.subject, &mut feed, &mut blank);
+        named_bytes(q.predicate.as_str(), &mut feed);
+        term_bytes(&q.object, &mut feed, &mut blank);
+        match &q.graph_name {
+            oxrdf::GraphName::NamedNode(g) => named_bytes(g.as_str(), &mut feed),
+            oxrdf::GraphName::BlankNode(g) => blank_bytes(blank(g.as_str()), &mut feed),
+            oxrdf::GraphName::DefaultGraph => feed(&[3]),
+        }
+        (u128::from(ha.finish()) << 64) | u128::from(hb.finish())
+    }
+}
+
+fn named_bytes(iri: &str, feed: &mut impl FnMut(&[u8])) {
+    feed(&[0]);
+    feed(&(iri.len() as u64).to_le_bytes());
+    feed(iri.as_bytes());
+}
+
+fn blank_bytes(n: u64, feed: &mut impl FnMut(&[u8])) {
+    feed(&[1]);
+    feed(&n.to_le_bytes());
+}
+
+fn subject_bytes(
+    s: &oxrdf::NamedOrBlankNode,
+    feed: &mut impl FnMut(&[u8]),
+    blank: &mut impl FnMut(&str) -> u64,
+) {
+    match s {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => named_bytes(n.as_str(), feed),
+        oxrdf::NamedOrBlankNode::BlankNode(b) => blank_bytes(blank(b.as_str()), feed),
+    }
+}
+
+fn term_bytes(t: &oxrdf::Term, feed: &mut impl FnMut(&[u8]), blank: &mut impl FnMut(&str) -> u64) {
+    match t {
+        oxrdf::Term::NamedNode(n) => named_bytes(n.as_str(), feed),
+        oxrdf::Term::BlankNode(b) => blank_bytes(blank(b.as_str()), feed),
+        oxrdf::Term::Literal(l) => {
+            // the literal's N-Triples form spells out its value, datatype, language and
+            // direction without ambiguity
+            let l = l.to_string();
+            feed(&[2]);
+            feed(&(l.len() as u64).to_le_bytes());
+            feed(l.as_bytes());
+        }
+        oxrdf::Term::Triple(tr) => {
+            feed(&[4]);
+            subject_bytes(&tr.subject, feed, blank);
+            named_bytes(tr.predicate.as_str(), feed);
+            term_bytes(&tr.object, feed, blank);
+        }
+    }
+}
+
+/// Whether any term of `q` has a text that contains `m`.
+fn quad_contains(q: &oxrdf::Quad, m: &str) -> bool {
+    fn subject(s: &oxrdf::NamedOrBlankNode, m: &str) -> bool {
+        match s {
+            oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().contains(m),
+            oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().contains(m),
+        }
+    }
+    fn term(t: &oxrdf::Term, m: &str) -> bool {
+        match t {
+            oxrdf::Term::NamedNode(n) => n.as_str().contains(m),
+            oxrdf::Term::BlankNode(b) => b.as_str().contains(m),
+            oxrdf::Term::Literal(l) => {
+                l.value().contains(m)
+                    || l.datatype().as_str().contains(m)
+                    || l.language().is_some_and(|g| g.contains(m))
+            }
+            oxrdf::Term::Triple(tr) => {
+                subject(&tr.subject, m) || tr.predicate.as_str().contains(m) || term(&tr.object, m)
+            }
+        }
+    }
+    subject(&q.subject, m)
+        || q.predicate.as_str().contains(m)
+        || term(&q.object, m)
+        || match &q.graph_name {
+            oxrdf::GraphName::NamedNode(g) => g.as_str().contains(m),
+            oxrdf::GraphName::BlankNode(g) => g.as_str().contains(m),
+            oxrdf::GraphName::DefaultGraph => false,
+        }
 }
 
 // ----------------------------------------------------------------------- model ------

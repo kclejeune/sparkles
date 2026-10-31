@@ -389,8 +389,15 @@ graph, and a literal is linted only when that holder is certain.
   exactly one value string of the document has its text, exactly one node holds it, and a
   probe shows that the string makes the quad: the document with that string replaced by a
   fresh text expands to the same dataset with only that quad's literal replaced. A query
-  made from something else, such as the key of an `@index` map, fails the probe. The probe
-  streams the expansion under the deadline and counts quads instead of keeping them. At
+  made from something else, such as the key of an `@index` map, fails the probe. The fresh
+  text is a marker that no IRI, literal, datatype or language of the document's expansion
+  contains. The probe streams the expansion under the deadline without keeping its quads.
+  Exactly one quad must carry the fresh text, and it must be the query quad with the new
+  text. With the old text put back in it, the probe's quads must match the document's by
+  count and by the wrapping sum of their keyed 128-bit hashes. The parser names anonymous
+  nodes afresh in each expansion, so blank nodes are hashed by the order in which they
+  first appear. A probe whose expansion meets them in another order fails, and its query
+  is skipped. At
   most 256 strings are probed, and a document that cannot be expanded here gets no query
   findings.
 * *Work.* Each probe and each fix check expands the whole document again. Together they
@@ -500,7 +507,12 @@ placed on an unrelated string with its text, that every Turtle string got a posi
 table, and that the language server renewed its deadline for positions. The search
 replaced the exact canonicalization, holders are hash sets built under the deadline, each
 JSON-LD query's source is proved by a probe, only query literals get tables, and the
-language server keeps one deadline per request. Each case has a regression test.
+language server keeps one deadline per request. A fourth review found that timing the
+JSON-LD expansion read the clock in the browser, where the WebAssembly build has none, and
+that a probe could accept a string whose replacement moved the query to another predicate
+while an escaped literal that looked like the marker supplied the fresh text. The clock is
+now read only under a deadline, and the probe compares the whole dataset by digest with a
+marker chosen against the decoded terms. Each case has a regression test.
 
 **Tests.** `crates/sparkles-fmt/src/lint` has unit tests for N-Triples, N-Quads, SHACLC,
 JSON-LD and the embedded queries. They cover the pre-bound variables, the prefix sources,

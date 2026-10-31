@@ -601,21 +601,20 @@ fn a_probe_stops_at_the_deadline_inside_the_expansion() {
     };
     // what one whole expansion of the document takes here, the measure of the slack
     let t0 = std::time::Instant::now();
-    assert!(jsonld_quads(&doc).is_some());
+    let quads = jsonld_quads(&doc).unwrap();
     let whole = t0.elapsed();
-    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(25));
+    let target = quads
+        .iter()
+        .find(|q| q.predicate.as_str() == "http://www.w3.org/ns/shacl#select")
+        .unwrap()
+        .clone();
+    let mut base = jsonld::Baseline::new(&quads).unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(25);
+    let deadline = Some(end);
     let mut work = jsonld::Work::new(doc.len());
-    work.expansion_takes(whole, deadline.unwrap());
+    work.expansion_takes(whole, end);
     let start = std::time::Instant::now();
-    let r = jsonld::probe(
-        &doc,
-        &s,
-        "http://www.w3.org/ns/shacl#select",
-        1,
-        (1, 0),
-        deadline,
-        &mut work,
-    );
+    let r = jsonld::probe(&doc, &s, &target, &mut base, 1, deadline, &mut work);
     assert!(matches!(r, Ok(false) | Err(LintError::Timeout)), "{r:?}");
     // the probe stops well before it could have expanded the whole document
     let took = start.elapsed();
@@ -638,4 +637,44 @@ fn json_ld_over_the_probe_limit_gets_no_queries_and_no_fixes() {
     let tag: Vec<_> = d.iter().filter(|d| d.rule == "language-tag-case").collect();
     assert_eq!(tag.len(), 1);
     assert!(tag[0].fix.is_none());
+}
+
+#[test]
+fn a_probe_that_changes_another_quad_proves_nothing() {
+    // the reviewer's case: the only value string with the indexed query's text is the
+    // context's mapping of `q`, and probing it moves the indexed quad to another predicate,
+    // while a literal that looks like a probe marker is already there
+    let doc = r#"{"@context": {"q": "http://www.w3.org/ns/shacl#select", "m": {"@id": "http://x/m", "@container": "@index", "@index": "q"}}, "@id": "urn:s", "m": {"http://www.w3.org/ns/shacl#select": {"@id": "urn:inner"}}, "http://www.w3.org/ns/shacl#select": "urn:x-sparkles-lint-probe:\u0031"}"#;
+    let at = doc
+        .find(r#""http://www.w3.org/ns/shacl#select", "m""#)
+        .unwrap();
+    let mapping = at..at + r#""http://www.w3.org/ns/shacl#select""#.len();
+    let inside: Vec<_> = diags(doc)
+        .into_iter()
+        .filter(|d| mapping.contains(&d.start))
+        .collect();
+    assert!(inside.is_empty(), "{inside:?}");
+    // a marker written into the document is never the probe's
+    let doc = r#"{"@id": "urn:s", "http://www.w3.org/ns/shacl#select": "SELECT $this { $this p:p ?o FILTER(?o) }", "http://x/c": "urn:x-sparkles-lint-probe-0-1"}"#;
+    assert_eq!(
+        diags(doc)
+            .iter()
+            .filter(|d| d.rule == "undefined-prefix")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn queries_of_anonymous_nodes_are_probed() {
+    // the parser names anonymous nodes afresh in each expansion, and the probe still
+    // proves the query's string
+    let doc = r#"{"@id": "urn:s", "http://www.w3.org/ns/shacl#sparql": [{"http://www.w3.org/ns/shacl#select": "SELECT $this { $this p:p ?o }"}, {"http://www.w3.org/ns/shacl#select": "SELECT $this { $this q:q ?o }", "http://x/l": {"@list": [1, {"@id": "_:b"}]}}]}"#;
+    assert_eq!(
+        diags(doc)
+            .iter()
+            .filter(|d| d.rule == "undefined-prefix")
+            .count(),
+        2
+    );
 }
