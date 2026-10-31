@@ -1,0 +1,11 @@
+campaign g3-writers-1m
+100000 geo writers (10/10 processes) peak_rss=ok throughput=ok
+    amended gate throughput: ok paired 2.253, required 1.500 at 1.26 ms
+    tps: off 723.394 [647.876-888.062], on 1653.848 [995.742-2368.151], ratio 2.286, paired 2.253 [1.277-3.269]
+    peak_rss_mib: off 193.803 [190.254-196.879], on 193.287 [188.543-195.527], ratio 0.997, paired 0.991 [0.958-1.023]
+    sync_ms: off 1.262 [1.008-1.419], on 1.066 [0.573-1.848], ratio 0.845, paired 0.810 [0.472-1.660]
+100000 text writers (10/10 processes) peak_rss=ok throughput=ok
+    amended gate throughput: ok paired 1.805, required 1.500 at 1.32 ms
+    tps: off 682.914 [630.760-907.649], on 1248.782 [1082.031-2276.325], ratio 1.829, paired 1.805 [1.205-3.359]
+    peak_rss_mib: off 232.740 [230.996-240.965], on 241.322 [232.332-249.383], ratio 1.037, paired 1.031 [0.999-1.079]
+    sync_ms: off 1.319 [0.965-1.436], on 1.396 [0.597-1.733], ratio 1.058, paired 1.084 [0.449-1.771]

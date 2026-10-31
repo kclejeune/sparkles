@@ -1,0 +1,56 @@
+{
+  "gates": [
+    {
+      "people": 1000000,
+      "index": "geo",
+      "scenario": "serial-delete",
+      "processes_per_variant": 10,
+      "checks": {
+        "p50_ms": {
+          "ratio": 1.0318626045422343,
+          "passed": true
+        },
+        "p90_ms": {
+          "ratio": 1.0127348069460502,
+          "passed": true
+        }
+      },
+      "passed": true
+    },
+    {
+      "people": 1000000,
+      "index": "geo",
+      "scenario": "serial-iri",
+      "processes_per_variant": 10,
+      "checks": {
+        "p50_ms": {
+          "ratio": 0.9966868578953828,
+          "passed": true
+        },
+        "p90_ms": {
+          "ratio": 1.0009140761031523,
+          "passed": true
+        }
+      },
+      "passed": true
+    },
+    {
+      "people": 1000000,
+      "index": "geo",
+      "scenario": "serial-literal",
+      "processes_per_variant": 10,
+      "checks": {
+        "p50_ms": {
+          "ratio": 0.9873952832147042,
+          "passed": true
+        },
+        "p90_ms": {
+          "ratio": 0.9815637492713603,
+          "passed": true
+        }
+      },
+      "passed": true
+    }
+  ],
+  "passed": true
+}

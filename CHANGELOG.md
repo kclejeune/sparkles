@@ -299,9 +299,13 @@ Group commit now covers datasets with a full-text, spatial or embedding index, w
 to take the ordinary path. On a Namespace instance whose synchronizations were slowed to
 4 ms each, four writers on such a dataset committed about twice as fast and sixteen
 writers about eight times as fast. On the instance's own synchronization of about 0.1 ms,
-four writers gained nothing and sixteen writers about 1.6 times. These are approximate
-screens, and the gates on `forge` have not run. A commit falls back only while a
-full-text index recovers or rebuilds or while a spatial index builds or after its build
+four writers gained nothing and sixteen writers about 1.6 times. On `forge` and `atlas`,
+whose drives synchronize in 0.25 to 1.7 ms, four writers committed 1.5 to 2.4 times as fast,
+single commits stayed within 5% of the ordinary path's latency, and readers of a full-text
+or spatial index kept theirs under a paced load, which meets every gate of spec X09
+section 17.9. A fence costs more than an ordinary commit when the drive is slow, because it
+ends with two device cache flushes where an ordinary commit writes through. A commit falls
+back only while a full-text index recovers or rebuilds or while a spatial index builds or after its build
 failed, and `sparkles_group_commit_fallbacks_total` reports these as `text-recovering`,
 `text-rebuilding` and `geo-unavailable` in place of the old `text`, `geo` and `embed`
 reasons. A full-text search on a transaction that started from a commit still in flight

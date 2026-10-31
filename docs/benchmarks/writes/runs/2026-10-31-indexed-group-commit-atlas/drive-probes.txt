@@ -1,0 +1,63 @@
+# tools/syncprobe2.py on atlas, 2026-10-31, in ~/lanes/gc-86 on the store's ext4 file system
+# (dm-crypt over the SK hynix HFS512GEJ9X102N), under the host's heavy lock, nothing else
+# running. 4 KiB writes into two preallocated 64 MiB files.
+# buf1  pwrite + fdatasync of one file
+# buf2  pwrite of both files, then fdatasync of each on two threads
+# dir1  O_DIRECT|O_DSYNC pwrite of one file
+# dir2  O_DIRECT|O_DSYNC pwrite of both files on two threads
+# sfr2  pwrite of both, sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER) of each on two threads, then fdatasync of the first
+# sfr2s pwrite of both, sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER) of the second, fdatasync of the first
+# The first listing came from an earlier version of the script without the sfr modes.
+# flushes/op and flushms/op come from /proc/diskstats of nvme0n1 (fields 19 and 20).
+
+## python3 syncprobe2.py ~/lanes/gc-86 300 nvme0n1 6 (the drive in its slow state, then fast)
+buf1: p50=1.147 p90=1.629 mean=0.999 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.880
+buf2: p50=1.554 p90=3.270 mean=1.474 ms writes/op=4.00 flushes/op=2.00 flushms/op=1.870
+dir1: p50=0.906 p90=1.521 mean=0.887 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=1.248 p90=1.840 mean=1.130 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+buf1: p50=0.999 p90=1.617 mean=0.965 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.877
+buf2: p50=1.410 p90=1.923 mean=1.311 ms writes/op=4.00 flushes/op=2.00 flushms/op=1.830
+dir1: p50=0.921 p90=1.523 mean=0.888 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=1.291 p90=1.767 mean=1.118 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+buf1: p50=1.107 p90=1.608 mean=0.967 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.873
+buf2: p50=1.464 p90=2.064 mean=1.362 ms writes/op=4.00 flushes/op=2.00 flushms/op=1.877
+dir1: p50=0.955 p90=1.530 mean=0.900 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=1.293 p90=1.792 mean=1.125 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+buf1: p50=0.981 p90=1.607 mean=0.963 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.873
+buf2: p50=1.455 p90=3.229 mean=1.387 ms writes/op=4.00 flushes/op=2.00 flushms/op=1.933
+dir1: p50=0.991 p90=1.525 mean=0.898 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=1.320 p90=1.803 mean=1.149 ms writes/op=2.02 flushes/op=0.00 flushms/op=0.007
+buf1: p50=0.995 p90=1.607 mean=0.965 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.873
+buf2: p50=1.431 p90=3.213 mean=1.373 ms writes/op=4.00 flushes/op=2.00 flushms/op=1.887
+dir1: p50=0.931 p90=1.526 mean=0.892 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=0.494 p90=1.845 mean=0.988 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+buf1: p50=0.300 p90=0.303 mean=0.302 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.230
+buf2: p50=0.518 p90=0.688 mean=0.557 ms writes/op=4.00 flushes/op=2.00 flushms/op=0.473
+dir1: p50=0.248 p90=0.251 mean=0.271 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=0.416 p90=0.480 mean=0.434 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+
+## python3 syncprobe2.py ~/lanes/gc-86 300 nvme0n1 4 (fast state)
+buf1: p50=0.326 p90=0.328 mean=0.319 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.233
+buf2: p50=0.556 p90=0.703 mean=0.588 ms writes/op=4.00 flushes/op=2.00 flushms/op=0.450
+dir1: p50=0.239 p90=0.243 mean=0.240 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=0.426 p90=0.530 mean=0.453 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+sfr2: p50=0.522 p90=0.617 mean=0.543 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.243
+sfr2s: p50=0.397 p90=0.421 mean=0.395 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.233
+buf1: p50=0.300 p90=0.325 mean=0.311 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.233
+buf2: p50=0.522 p90=0.678 mean=0.550 ms writes/op=4.00 flushes/op=2.00 flushms/op=0.483
+dir1: p50=0.261 p90=0.270 mean=0.260 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=0.430 p90=0.593 mean=0.468 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+sfr2: p50=0.533 p90=0.619 mean=0.555 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.243
+sfr2s: p50=0.374 p90=0.399 mean=0.384 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.233
+buf1: p50=0.302 p90=0.325 mean=0.312 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.233
+buf2: p50=0.507 p90=0.664 mean=0.538 ms writes/op=4.00 flushes/op=2.00 flushms/op=0.480
+dir1: p50=0.243 p90=0.246 mean=0.244 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=0.419 p90=0.507 mean=0.445 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+sfr2: p50=0.544 p90=0.595 mean=0.547 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.237
+sfr2s: p50=0.374 p90=0.375 mean=0.375 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.237
+buf1: p50=0.300 p90=0.301 mean=0.301 ms writes/op=2.00 flushes/op=1.00 flushms/op=0.233
+buf2: p50=0.503 p90=0.605 mean=0.537 ms writes/op=4.00 flushes/op=2.00 flushms/op=0.477
+dir1: p50=0.271 p90=0.277 mean=0.273 ms writes/op=1.00 flushes/op=0.00 flushms/op=0.000
+dir2: p50=0.425 p90=0.595 mean=0.487 ms writes/op=2.00 flushes/op=0.00 flushms/op=0.000
+sfr2: p50=0.519 p90=0.570 mean=0.522 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.237
+sfr2s: p50=0.374 p90=0.375 mean=0.375 ms writes/op=3.00 flushes/op=1.00 flushms/op=0.240

@@ -127,14 +127,17 @@ scenario has ten processes per setting. Every process started from a fresh copy 
 seed store, checked every acknowledgement and the index answers, and reopened cold to
 check them again.
 
-Under the gates, 35 of 36 serial checks, all six throughput gates and all ten memory gates
-are met. The p90 of spatial literal inserts at 10.5M is the one serial miss. The reader
-gates are met for the full-text cells at both sizes and the spatial cell at 10.5M. The
-spatial reader gate at 1.05M is not established, because its ordinary writer did not keep
-the offered schedule ([roadmap](../../ROADMAP.md) item 171).
+Every gate is met. On `forge`, 35 of 36 serial checks, all six throughput gates, all ten
+memory gates and three of the four reader gates are met. The p90 of spatial literal inserts
+at 10.5M missed there, and the spatial reader gate at 1.05M was not established, because
+its ordinary writer did not keep the offered schedule. The [rerun on atlas](#rerun-on-atlas),
+a host with the same CPU and drive model, met the serial gates of that spatial cell, the
+spatial reader gate at 1.05M with a rate calibrated for the drive's slow state, and the
+throughput and memory gates of the full-text and spatial cells at 1.05M.
 
 *The serial, writer and memory cells were measured on forge on 2026-10-23 at commit
-5b40d0ec, and the mixed cells on 2026-10-24 with the bounded full-text checkpoint.*
+5b40d0ec, the mixed cells on forge on 2026-10-24 with the bounded full-text checkpoint, and
+the rerun on atlas on 2026-10-31 at commit a202e8f2.*
 
 #### Serial commits
 
@@ -173,7 +176,8 @@ processes, 32 of 180 ordinary and 27 of 180 grouped ones had a mean synchronizat
 have p50 medians of 0.464 and 1.053 ms and a paired ratio of 1.001. The engine overhead,
 the mean request latency less the mean synchronization, differs by at most 3.6% between the
 settings in 8 of 10 cells where it can be computed. It is 12.7% higher with grouping for
-spatial literals at 10.5M, 0.240 against 0.213 ms, the cell that misses. Of the 36 paired
+spatial literals at 10.5M, 0.240 against 0.213 ms, the cell that misses, and the rerun on
+atlas met both of its gates. Of the 36 paired
 medians, 19 are above 1.0, with a median of 1.001 and a sign test p value of 0.43, so the
 single-writer path shows no general cost.
 
@@ -222,7 +226,8 @@ ordinary, and the gate asks for at most 1.10 with a schedule lag of at most 50 m
 No text process stalled. The ordinary spatial processes at 1.05M had no slow request, but
 in 36 to 56 of their 86 seconds four queued commit synchronizations took about 7 ms, so
 they sustained about 570 transactions/s against the offered 583. The unpaced calibration
-averaged the drive's fast and slow states, and [roadmap](../../ROADMAP.md) item 171 corrects it.
+averaged the drive's fast and slow states, and the rerun on atlas calibrated the rate for
+the slow state instead.
 The text readers' paired ratios of 1.001 and 1.008 are within the gate and the spread of
 the runs, and [roadmap](../../ROADMAP.md) item 170 measures them with more rounds.
 
@@ -232,6 +237,48 @@ Every cell stayed under the 64 MiB limit. The certified peak resident memory
 difference was between −3.4 and 19.6 MiB for the writer scenarios and between 0.3 and
 5.6 MiB for the mixed scenarios, where both settings run for the same time. The
 certificate subtracts the lower sampled bound of the ordinary process, so it errs upward.
+
+#### Rerun on atlas
+
+These campaigns ran on `atlas`, an Intel Core i5-13500 with the SK hynix drive of `forge`
+under the same LUKS, LVM and ext4 stack, with a release build of commit `a202e8f2`. Each
+cell had five blocks in the order ordinary, grouped, grouped, ordinary, and every process
+probed the drive before it started. The [run record](runs/2026-10-31-indexed-group-commit-atlas/README.md)
+holds the results, the gate summaries and the per-process device counters.
+
+| Cell | Measurement | Ordinary | Grouped | Paired ratio | Gate |
+|---|---|---:|---:|---:|---|
+| Spatial at 10.5M, serial literal | p50 and p90 (ms) | 0.568, 0.641 | 0.561, 0.629 | 0.984, 0.973 | Met. |
+| Spatial at 10.5M, serial IRI | p50 and p90 (ms) | 0.648, 2.018 | 0.646, 2.020 | 0.999, 1.000 | Met. |
+| Spatial at 10.5M, serial delete | p50 and p90 (ms) | 0.541, 0.612 | 0.558, 0.619 | 1.016, 1.019 | Met. |
+| Spatial at 1.05M, four writers | tx/s | 723 (648–888) | 1,654 (996–2,368) | 2.253 | Met, with 1.5 required. |
+| Full-text at 1.05M, four writers | tx/s | 683 (631–908) | 1,249 (1,082–2,276) | 1.805 | Met, with 1.5 required. |
+| Spatial at 1.05M, readers at 466 tx/s | Reader p50 and p99 (ms) | 1.654, 2.204 | 1.653, 2.187 | 0.999, 1.005 | Met. |
+
+The certified peak resident memory differences were −1.4 MiB and 8.4 MiB for the
+spatial and full-text writers and −2.2 MiB for the readers. The ordinary writers ran
+with the drive in its slow state, with mean commit synchronizations of 1.26 and 1.32 ms.
+Grouped processes whose fences took 0.6 to 0.74 ms committed 2,060 to 2,370
+transactions/s, and those whose fences took 1.27 to 1.90 ms committed 1,000 to 1,370, a
+median gain of 1.40 over their ordinary neighbours. A fence carried 1.70 to 1.99 commits.
+
+The reader cell offered 80% of the rate that the slowest ordinary calibration process
+would sustain with every synchronization at 1.6 ms, which is 466 transactions/s. Every
+process kept its schedule within 11.1 to 21.0 ms. A first campaign at the same rate met
+the lag in four blocks, and in its fifth every process of both settings saw device writes
+of 7 to 12 ms and fell behind by up to 2.5 s. The stall hit both settings alike, which
+points to I/O from outside the campaign, and the run record keeps it.
+
+The fence's synchronization explains the smaller gain in the slow state. A fence writes
+with buffered writes and an `fdatasync` of the log and of the vocabulary, which is two
+device cache flushes, while an ordinary commit writes both files through `O_DIRECT` and
+`O_DSYNC` with no flush. Idle, the drive takes 0.30 ms for a write and its flush and 0.24 ms for a
+write-through write. In its slow state these take about 1.0 and 0.9 ms, and the fence's
+two flushes in parallel take 1.3 to 1.5 ms. A fence that let the log's flush cover the
+vocabulary measured no faster, as [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#writes)
+records. Serial commits take the ordinary path in both settings, and `perf stat` counted
+0.1% more user instructions per serial IRI insert with grouping and 0.3% more per geometry
+insert, the admission checks of the group.
 
 #### Limits of these runs
 

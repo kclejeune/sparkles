@@ -308,12 +308,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   cold `star-lookup` at 10.5M, and that comparison has not been repeated on index format
   3. Index format 3 makes cold `star-join` at 10.5M 6% to 8% slower. Dense reads on the
   1.01B dataset are unmeasured. Roadmap item 4.
-* Group commit on datasets with a full-text, spatial or embedding index has measured
-  costs ([X09](../specs/X09-group-commit-by-default.md#179-performance-gates)). The p90 of
-  single spatial inserts at 10.5M is 1.077 times the ordinary path's, which is roadmap
-  item 111. A fence synchronizes in 1.4 to 1.5 ms against about 1.0 ms for one ordinary
-  commit, which is item 112. Reader latency on a spatial dataset at 1.05M under mixed load
-  is not established, item 171.
+* Group commit on datasets with a full-text, spatial or embedding index meets its gates,
+  but a fence costs more than it needs to when the drive is slow
+  ([X09](../specs/X09-group-commit-by-default.md#phase-4)). It ends with an `fdatasync` of
+  the log and of the vocabulary, two device cache flushes, while an ordinary commit writes
+  through with none. On the SK hynix drives of the benchmark hosts in their slow state a
+  fence then synchronizes in 1.3 to 1.5 ms against about 1.0 ms for one ordinary commit,
+  which is roadmap item NEW-ITEM-1. Staged full-text documents do not count toward the
+  queue's byte limit, and the leader applies text changes while its fence is still active,
+  which is item NEW-ITEM-2.
 * Automatic execution streams eligible large scans, groupings and ASK joins. Other
   plans remain eager, including an EXISTS evaluated once per outer key when its cursor
   is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays
@@ -377,7 +380,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 111](../ROADMAP.md), [item 112](../ROADMAP.md), [item 160](../ROADMAP.md), [item 171](../ROADMAP.md), [item 343](../ROADMAP.md).
+The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md), [item 343](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
