@@ -1,0 +1,339 @@
+2026-10-31 08:13:47.888 - INFO: [1mQLever server 0.0.0-unknown, compiled on Mon Sep  7 06:00:51 UTC 2026 using git hash QLever [22m
+2026-10-31 08:13:47.888 - INFO: Initializing server ...
+2026-10-31 08:13:47.888 - INFO: The git hash used to build this index was "QLever "
+2026-10-31 08:13:47.888 - INFO: Reading vocabulary from file dbpedia.vocabulary.words ...
+2026-10-31 08:13:47.889 - INFO: Done, number of words: 15,884,869
+2026-10-31 08:13:47.889 - INFO: Number of words in internal vocabulary (these are also part of the external vocabulary): 29,678
+2026-10-31 08:13:47.889 - INFO: Registered PSO permutation: #relations = 13,745, #blocks = 352, #triples = 10,957,432
+2026-10-31 08:13:47.890 - INFO: Registered PSO permutation: #relations = 25,733, #blocks = 1,367, #triples = 41,127,700
+2026-10-31 08:13:47.890 - INFO: Registered POS permutation: #relations = 13,745, #blocks = 352, #triples = 10,957,432
+2026-10-31 08:13:47.890 - INFO: Registered POS permutation: #relations = 25,733, #blocks = 1,367, #triples = 41,127,700
+2026-10-31 08:13:47.890 - INFO: Registered OPS permutation: #relations = 14,805,264, #blocks = 988, #triples = 41,127,700
+2026-10-31 08:13:47.890 - INFO: Registered OSP permutation: #relations = 14,805,264, #blocks = 988, #triples = 41,127,700
+2026-10-31 08:13:47.891 - INFO: Registered SPO permutation: #relations = 3,222,514, #blocks = 881, #triples = 41,127,700
+2026-10-31 08:13:47.891 - INFO: Registered SOP permutation: #relations = 3,222,514, #blocks = 881, #triples = 41,127,700
+2026-10-31 08:13:47.891 - INFO: Reading patterns from file dbpedia.index.patterns ...
+2026-10-31 08:13:48.010 - INFO: Sorting random result tables to estimate the sorting performance of this machine ...
+2026-10-31 08:13:48.056 - INFO: Access token for restricted API calls is "bench"
+2026-10-31 08:13:48.056 - INFO: The server is ready, listening for requests on port 37575 ...
+2026-10-31 08:13:48.388 - INFO: 
+2026-10-31 08:13:48.388 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.388 - INFO: Processing command "stats": get index statistics
+2026-10-31 08:13:48.406 - INFO: 
+2026-10-31 08:13:48.406 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.414 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.414 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.414 - INFO: Query planning done in 7 ms
+2026-10-31 08:13:48.433 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.434 - INFO: Done processing query and sending result, total time was 27 ms
+2026-10-31 08:13:48.455 - INFO: 
+2026-10-31 08:13:48.455 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.456 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.456 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.456 - INFO: Query planning done in 1 ms
+2026-10-31 08:13:48.474 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.475 - INFO: Done processing query and sending result, total time was 19 ms
+2026-10-31 08:13:48.495 - INFO: 
+2026-10-31 08:13:48.495 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.495 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.499 - INFO: 
+2026-10-31 08:13:48.499 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.499 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.499 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.500 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.509 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.510 - INFO: Done processing query and sending result, total time was 10 ms
+2026-10-31 08:13:48.517 - INFO: 
+2026-10-31 08:13:48.517 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.517 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.521 - INFO: 
+2026-10-31 08:13:48.521 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.522 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.522 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.522 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.531 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.531 - INFO: Done processing query and sending result, total time was 9 ms
+2026-10-31 08:13:48.538 - INFO: 
+2026-10-31 08:13:48.538 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.538 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.556 - INFO: 
+2026-10-31 08:13:48.556 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.557 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.557 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.557 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.570 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.571 - INFO: Done processing query and sending result, total time was 14 ms
+2026-10-31 08:13:48.580 - INFO: 
+2026-10-31 08:13:48.580 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.580 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.585 - INFO: 
+2026-10-31 08:13:48.585 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.585 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.585 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.585 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.596 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.596 - INFO: Done processing query and sending result, total time was 11 ms
+2026-10-31 08:13:48.605 - INFO: 
+2026-10-31 08:13:48.605 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.605 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.609 - INFO: 
+2026-10-31 08:13:48.609 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.609 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.609 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.609 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.617 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.617 - INFO: Done processing query and sending result, total time was 8 ms
+2026-10-31 08:13:48.624 - INFO: 
+2026-10-31 08:13:48.624 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.624 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.628 - INFO: 
+2026-10-31 08:13:48.628 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.628 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.629 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.629 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.639 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.639 - INFO: Done processing query and sending result, total time was 10 ms
+2026-10-31 08:13:48.646 - INFO: 
+2026-10-31 08:13:48.646 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.646 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.650 - INFO: 
+2026-10-31 08:13:48.650 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.650 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.650 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.651 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.659 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.659 - INFO: Done processing query and sending result, total time was 9 ms
+2026-10-31 08:13:48.666 - INFO: 
+2026-10-31 08:13:48.666 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.666 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.670 - INFO: 
+2026-10-31 08:13:48.670 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.670 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.670 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.670 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.680 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.680 - INFO: Done processing query and sending result, total time was 10 ms
+2026-10-31 08:13:48.687 - INFO: 
+2026-10-31 08:13:48.687 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.687 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.691 - INFO: 
+2026-10-31 08:13:48.691 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.691 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.691 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.692 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.699 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.699 - INFO: Done processing query and sending result, total time was 8 ms
+2026-10-31 08:13:48.706 - INFO: 
+2026-10-31 08:13:48.706 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.706 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.709 - INFO: 
+2026-10-31 08:13:48.709 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.710 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.710 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.710 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.719 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.720 - INFO: Done processing query and sending result, total time was 10 ms
+2026-10-31 08:13:48.726 - INFO: 
+2026-10-31 08:13:48.726 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.726 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.730 - INFO: 
+2026-10-31 08:13:48.730 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.730 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.730 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.731 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.739 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.740 - INFO: Done processing query and sending result, total time was 9 ms
+2026-10-31 08:13:48.746 - INFO: 
+2026-10-31 08:13:48.746 - INFO: Request received via GET, no content type specified
+2026-10-31 08:13:48.746 - INFO: Processing command "clear-cache": clear the cache (unpinned elements only)
+2026-10-31 08:13:48.750 - INFO: 
+2026-10-31 08:13:48.750 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.750 - INFO: Processing the following SPARQL query:
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p a dbo:Person ; dbo:birthDate ?d BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade
+
+2026-10-31 08:13:48.750 - INFO: Requested media types of the result are: "text/tab-separated-values"
+2026-10-31 08:13:48.751 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.759 - INFO: Result has size 80 x 2
+2026-10-31 08:13:48.759 - INFO: Done processing query and sending result, total time was 9 ms
+2026-10-31 08:13:48.765 - INFO: 
+2026-10-31 08:13:48.765 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.765 - INFO: Processing the following SPARQL query:
+SELECT * WHERE { ?s ?p ?o } LIMIT 1
+2026-10-31 08:13:48.765 - INFO: Requested media types of the result are: "application/sparql-results+json"
+2026-10-31 08:13:48.766 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.766 - INFO: Result has unknown size (not computed yet)
+2026-10-31 08:13:48.769 - INFO: Done processing query and sending result, total time was 4 ms
+2026-10-31 08:13:48.803 - INFO: 
+2026-10-31 08:13:48.803 - INFO: Request received via POST, content type "application/x-www-form-urlencoded"
+2026-10-31 08:13:48.803 - INFO: Processing the following SPARQL query:
+SELECT * WHERE { ?s ?p ?o } LIMIT 1
+2026-10-31 08:13:48.803 - INFO: Requested media types of the result are: "application/sparql-results+json"
+2026-10-31 08:13:48.803 - INFO: Query planning done in 0 ms
+2026-10-31 08:13:48.803 - INFO: Result has unknown size (not computed yet)
+2026-10-31 08:13:48.804 - INFO: Done processing query and sending result, total time was 1 ms

@@ -1,0 +1,487 @@
+{
+ "record": 3,
+ "suite": "dbpedia",
+ "scale": "50m",
+ "manifest": {
+  "suite": "dbpedia",
+  "started": "2026-10-31T11:28:10Z",
+  "ended": "2026-10-31T12:20:36Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15620,
+   "disk_model": "",
+   "kernel": "7.2.9",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/forge-checks-440-432-20261031/bin/1acdc38a",
+   "version": "sparkles 0.1.0",
+   "sha256": "512c5e61fe8eee94fb17dc4f03f2236f619bcb58c0bea9a300cd51135b76d10c",
+   "scripts_commit": "1acdc38a (git archive, no .git)",
+   "binary_commit": "1acdc38a"
+  },
+  "engines": {
+   "qlever": {
+    "license": "Apache-2.0",
+    "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+    "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+    "version": "0.5.48",
+    "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+    "package": "qlever-0.5.48",
+    "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+   }
+  },
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "anchor-text_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "9ff8cf0b7a42eff97a58ec31b188730d308b8fe22057089fa32264de2c5f1356",
+    "bytes": 116002282
+   },
+   "article-templates_lang=en_nested.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "ec2eebd1a600109ba804f616cd6ce9c244f9eb727c676998082a04c95b63407f",
+    "bytes": 4005320
+   },
+   "article-templates_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "8399adb921f48dbf8d597868b36209254058da712f161c5d2715137c0c617f41",
+    "bytes": 18842408
+   },
+   "categories_lang=en_articles.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "ee827c0d447dc1d930363c626da2c6e4e2695d9210093b8a955aaec7732aa97b",
+    "bytes": 17146234
+   },
+   "categories_lang=en_labels.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "55ca0ea9fe7304025e8a2c23d82cd9d02f6c49c986f68337b5ef98b11c433391",
+    "bytes": 1409430
+   },
+   "categories_lang=en_skos.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "1f67b3c6a00f9fe73d47e01da2873b2629e8ca55f771c098218fc7bebae77ace",
+    "bytes": 4158731
+   },
+   "citations_lang=en_data.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "faade129b8d533012447454d25a68f5aad44ab0842e70dbeed85b49048e26703",
+    "bytes": 87820418
+   },
+   "citations_lang=en_links.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "069abd1c38e32570c9a7b80e0b5f7f07238274e352d9373995102655e95f808c",
+    "bytes": 33279021
+   },
+   "commons-sameas-links_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "598f12aa8e8da28ee2cf88a18db2f069b0db571da32912d14665169e772f53bb",
+    "bytes": 39227
+   },
+   "disambiguations_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "3bb457be8bd6d63a2373cc476e263535d9aa0aa08371ef19fde147a17045ecc6",
+    "bytes": 871676
+   },
+   "external-links_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "80b1f4ba432347eefaae39f8014c21a689c9fa9259f96f3d2d90418a2c06dd9c",
+    "bytes": 10171072
+   },
+   "geo-coordinates_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "546202cfccad6c22b274df37b2f8b67d5316d2eece7bb7c6ee08cfbba6732999",
+    "bytes": 2456642
+   },
+   "geo-coordinates-mappingbased_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "43452de2efb52e4c6a8b6c8aef49367697df3cc37c78257dc348dc405aefe203",
+    "bytes": 1288389
+   },
+   "homepages_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "f9f5357a680a00869daea096ccdd032b838671fa13a1eefc19488891357db5cb",
+    "bytes": 711826
+   },
+   "images_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "582ac3d810fd4b43ff811495b3f96e21dd4c881080c25b663e6297b72c673609",
+    "bytes": 35523141
+   },
+   "infobox-properties_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "ed67d764fa45852f2941a100439cf3fcf0d2c325f9a45b5b2c17de242929d774",
+    "bytes": 55197269
+   },
+   "infobox-property-definitions_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "be9154a2ec6194fee6558e5e25668b49d8cc658e4b5e1976233a5373f55e5897",
+    "bytes": 38968
+   },
+   "instance-types_lang=en_specific.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "21c84bb0b8de7122f5daec25b112c4d55eda2753e90e5eb6b95442309b23d752",
+    "bytes": 3860972
+   },
+   "instance-types_lang=en_transitive.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "12dfbaa7c666209a0acbffdd2a7db239c8fbe0f0d778bed2cfc23fcd1c8047b2",
+    "bytes": 11921014
+   },
+   "interlanguage-links_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "b2a7f144c6b9560a948ad6e88fea86ffff2630b0d35fcba57b95a146c12cd071",
+    "bytes": 52521
+   },
+   "labels_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "6f64b04a3a531554da2b0d387525d629687b1858a6572dd239b37743f10d0ee2",
+    "bytes": 10814310
+   },
+   "long-abstracts_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "93e0df04546eaa42550d9eca96255f270f2d86bf7cc406f68962d8f5b481c9c0",
+    "bytes": 48961460
+   },
+   "mappingbased-literals_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "6a15624fda765e7e10b74c1bac42a535f6c6de61fac5029d3c9d51cf9e64782e",
+    "bytes": 10837959
+   },
+   "mappingbased-objects_lang=en_disjointDomain.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "b1af6a61c8add9d8f294c36736ea54072fd23529cb974b26e1ed25c66a4c3658",
+    "bytes": 31960
+   },
+   "mappingbased-objects_lang=en_disjointRange.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "c0be4bec90e987620e4539f191e52cfbb14cfcca69642a5722851e84969b0efd",
+    "bytes": 53955
+   },
+   "mappingbased-objects_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "047f2c9352df1f721cd64be7549068f8aac93ebc060c4377a8beb778c619bbd9",
+    "bytes": 12283893
+   },
+   "ontology--DEV_type=parsed.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "b1b56ea8b21e6ef8ff9dbbe9e4f4f0d64706a8f4b9ef0b853d8089fb0f28bc2d",
+    "bytes": 22075
+   },
+   "page_lang=en_ids.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "e9e2d84daed0177d34dc39b230df1f4772316d777eec008d56f919a42e5f746d",
+    "bytes": 13761704
+   },
+   "page_lang=en_length.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "23ee7f5a22cca6acca6b8036e33481b62ae0cd36d871a8a28e6979adbdee2307",
+    "bytes": 8917541
+   },
+   "persondata_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c",
+    "bytes": 13
+   },
+   "redirects_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "a4f27a9790050c1f9f470c512fc0ed968ab87016f24e9c75936346052a88314f",
+    "bytes": 7690844
+   },
+   "redirects_lang=en_transitive.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "de91e029a921dd6ad04b59f2a41c180fa871d553810ee714923e3b6ffac5f4cc",
+    "bytes": 7690605
+   },
+   "revisions_lang=en_ids.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "b98f12904683c6d056e4714931aca4b1cd0bf21a1d9b38d12c498d9e68a44728",
+    "bytes": 14381478
+   },
+   "revisions_lang=en_uris.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "d792ee0f99467feeb077a0cca2678df415d7f42faf7e91a52f006a36699f42cb",
+    "bytes": 17879750
+   },
+   "short-abstracts_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "8399f170ed54ac7e8440e12da039494d3f4effa1e6d3f8fb4159c1ded11ad3e6",
+    "bytes": 34689153
+   },
+   "specific-mappingbased-properties_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "4355656b7eb870c696b69dfec9b039e4e1c61080f0f25fe84705baa7cb0e0a17",
+    "bytes": 647950
+   },
+   "wikilinks_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "d7e26b8a478dbd7a6d7f99dae66c222b38c9df34ddf379e1f309030d06608704",
+    "bytes": 114648607
+   },
+   "wikipedia-links_lang=en.nt.zst": {
+    "license": "CC BY-SA 3.0 and GFDL",
+    "params": "DBpedia 2022.12.01 subject slice 50m",
+    "sha256": "60881dfb99f87da9fb06995e9d24f8f5c48f758ae441222efd24912280471fb4",
+    "bytes": 24997726
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": []
+  },
+  "hyperfine": "hyperfine 2.0.0"
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false,
+  "passes": 5,
+  "note": "five passes of one cold request and ten timed requests after two warm-ups; the warm result joins the 50 timed requests"
+ },
+ "results": [
+  {
+   "engine": "sparkles",
+   "query": "births-by-decade",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    21.163,
+    14.001,
+    8.259,
+    7.274,
+    7.156,
+    6.374,
+    6.181,
+    6.969,
+    6.056,
+    5.958,
+    13.284,
+    7.855,
+    6.599,
+    6.448,
+    6.432,
+    6.305,
+    5.862,
+    6.126,
+    6.129,
+    5.803,
+    27.448,
+    25.602,
+    25.815,
+    19.922,
+    24.18,
+    18.986,
+    23.841,
+    24.374,
+    19.165,
+    24.01,
+    18.662,
+    14.319,
+    7.27,
+    7.699,
+    7.345,
+    6.367,
+    6.314,
+    6.714,
+    6.588,
+    6.24,
+    11.067,
+    7.525,
+    7.167,
+    6.579,
+    6.382,
+    5.956,
+    6.144,
+    5.848,
+    5.838,
+    5.905
+   ],
+   "median_ms": 7.063,
+   "p95_ms": 25.602,
+   "answer": {
+    "rows": 80,
+    "hash": "ca64446e6253f769/4f370c7a44c46271",
+    "agrees": true,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "births-by-decade",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    20.357,
+    16.039,
+    12.394,
+    15.135,
+    13.646,
+    14.547,
+    12.203,
+    14.283,
+    13.524,
+    13.258,
+    19.674,
+    15.807,
+    17.816,
+    14.568,
+    19.715,
+    14.495,
+    11.528,
+    12.24,
+    11.381,
+    12.724,
+    23.751,
+    16.097,
+    14.053,
+    16.115,
+    12.646,
+    11.785,
+    17.822,
+    15.104,
+    15.618,
+    13.874,
+    18.817,
+    13.125,
+    11.621,
+    10.897,
+    12.342,
+    12.56,
+    11.213,
+    11.179,
+    12.852,
+    11.095,
+    23.637,
+    16.368,
+    17.043,
+    12.984,
+    13.463,
+    12.152,
+    11.297,
+    11.301,
+    11.054,
+    11.335
+   ],
+   "median_ms": 13.494,
+   "p95_ms": 20.357,
+   "answer": {
+    "rows": 80,
+    "hash": "ca64446e6253f769/4f370c7a44c46271",
+    "agrees": true,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "sparkles",
+   "query": "births-by-decade",
+   "mode": "cold",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    37.821,
+    35.824,
+    29.462,
+    38.958,
+    38.283
+   ],
+   "median_ms": 37.821,
+   "p95_ms": 38.958,
+   "answer": {
+    "rows": 80,
+    "hash": "ca64446e6253f769/4f370c7a44c46271",
+    "agrees": true,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "qlever",
+   "query": "births-by-decade",
+   "mode": "cold",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    42.4,
+    43.093,
+    50.386,
+    43.765,
+    44.493
+   ],
+   "median_ms": 43.765,
+   "p95_ms": 50.386,
+   "answer": {
+    "rows": 80,
+    "hash": "ca64446e6253f769/4f370c7a44c46271",
+    "agrees": true,
+    "algorithm": "canonical-sha256-v1"
+   },
+   "status": "ok"
+  }
+ ],
+ "load": {
+  "sparkles": {
+   "seconds": 27.4612,
+   "max_rss_kib": 3181212,
+   "index_bytes": 1577462281
+  },
+  "qlever": {
+   "seconds": 50.4639,
+   "max_rss_kib": 7273776,
+   "index_bytes": 1689992738
+  }
+ },
+ "memory": {
+  "sparkles": {
+   "rss_after_mib": "133"
+  },
+  "qlever": {
+   "rss_after_mib": "163"
+  }
+ }
+}

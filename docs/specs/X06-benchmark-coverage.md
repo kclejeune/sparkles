@@ -1650,8 +1650,35 @@ flagged `count-all`, `distinct-obj`, `predicate-subjects`, `values-star` and `mi
 all under 0.3 ms with spreads between server processes of 44% to 220%. Eight rounds
 of 100 requests brought every one of them within 6.5% of the base in server time and
 within 2.8% in client time. Item 328 keeps the quiet Intel checks of these small
-queries. The same-host QLever run is internal evidence. The published ranking and the loss
-list change only after the paired forge comparison that item 432 holds.
+queries. The same-host QLever run is internal evidence. The paired forge comparison under
+[births-by-decade after decimal arithmetic on forge](#births-by-decade-after-decimal-arithmetic-on-forge)
+changes the published ranking and the loss list.
+
+### `births-by-decade` after decimal arithmetic on forge
+
+Item 432 paired `1acdc38a` with QLever 0.5.48 on forge over freshly loaded stores of the 50M
+slice, with both host locks held and each engine alone. The complete-HTTP timer of the
+cursor assessment ran 20 rounds, each with three cold restarts after file-cache eviction and
+one warm process of 20 timed requests per engine. Sparkles took 3.9 ms warm and 27.5 ms cold
+against 17.2 and 29.3 ms for QLever, where the same contract gave 50.2 and 68.1 ms before the
+change. Warm, Sparkles is 4.5 times faster. Cold, it leads by 6%, inside the ten-percent tie
+band. The hyperfine and curl timer of the comparative tables gives 7.1 and 37.8 ms against
+13.5 and 43.8 ms, with five passes of ten warm requests and five cold restarts. Both
+engines return the same 80 groups and one value fingerprint in every request.
+
+The DBpedia tables and the loss list now show Sparkles ahead of QLever on this query. The
+`births-by-decade` row of the 50M tables mixes this run for Sparkles and QLever with the
+earlier run for the other three engines, and its footnote says so. The 1.24-billion-triple
+guards stay internal A/B comparisons.
+
+The run also shows that a Sparkles server process sometimes runs this query three to four
+times slower for its whole life. One of 20 timer rounds took 15.4 ms for the process and one
+of five hyperfine passes about 24 ms per request, against the usual 3 to 5 ms and 6 to
+7 ms. The medians include these processes. A follow-up item records the investigation, since
+the cause could be thread placement on the hybrid cores of the host, the frequency
+governor or the parallel evaluation of the BIND. The
+[run record](../benchmarks/dbpedia/runs/2026-10-31-births-by-decade-forge/README.md)
+keeps both timers' samples and the failed attempts that preceded the run.
 
 ### Preparation-batch short-query control
 

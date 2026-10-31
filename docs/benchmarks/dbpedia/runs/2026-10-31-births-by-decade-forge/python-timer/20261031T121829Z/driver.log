@@ -1,0 +1,26 @@
+locks held 2026-10-31T12:17:29Z
+start 12:18:29 load 0.23 0.39 0.72
+1 S cold [28.9, 23.3, 26.4] warm median 4.72
+1 Q cold [34.9, 29.1, 41.9] warm median 17.65
+2 Q cold [23.8, 23.4, 51.2] warm median 17.98
+2 S cold [28.0, 31.0, 39.5] warm median 3.58
+3 S cold [23.3, 23.6, 30.8] warm median 12.97
+3 Q cold [19.8, 46.6, 53.1] warm median 15.25
+4 Q cold [24.5, 32.3, 48.9] warm median 17.15
+4 S cold [27.2, 31.0, 23.8] warm median 3.74
+{
+ "S": {
+  "warm_median_ms": 4.721427452750504,
+  "cold_median_ms": 27.615480474196374,
+  "n_warm": 80,
+  "n_cold": 12
+ },
+ "Q": {
+  "warm_median_ms": 17.28704251581803,
+  "cold_median_ms": 33.611605467740446,
+  "n_warm": 80,
+  "n_cold": 12
+ }
+}
+COMPLETE /home/kclejeune/lanes/forge-checks-440-432-20261031/births-http-20261031T121829Z
+all done 12:18:39

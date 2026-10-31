@@ -1,0 +1,18 @@
+{
+ "births-by-decade": {
+  "sparkles": {
+   "rows": 80,
+   "order": "4f370c7a44c46271",
+   "exact": "aca66a5880c4f705",
+   "value": "ca64446e6253f769",
+   "query_sha256": "5bb3573d778339e7412587bbf7196877edaa53a7ac34f0643dbce85946e42f9e"
+  },
+  "qlever": {
+   "rows": 80,
+   "order": "4f370c7a44c46271",
+   "exact": "081221480802e105",
+   "value": "ca64446e6253f769",
+   "query_sha256": "5bb3573d778339e7412587bbf7196877edaa53a7ac34f0643dbce85946e42f9e"
+  }
+ }
+}

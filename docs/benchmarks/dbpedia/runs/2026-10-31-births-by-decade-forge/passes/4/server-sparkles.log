@@ -1,0 +1,4 @@
+[2m2026-10-31T12:14:12.013777Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m memory profile default: block cache 1024 MiB, result cache 0 MiB, SERVICE cache 64 MiB, history cache 512 MiB, query budget 12288 MiB, query pool 5344 MiB
+[2m2026-10-31T12:14:12.026892Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m Sparkles 0.1.0 listening on http://127.0.0.1:58185/ (UI at /ui/), opening 0 datasets
+[2m2026-10-31T12:14:12.051973Z[0m [32m INFO[0m [2msparkles::startup[0m[2m:[0m datasets opened in 24.8ms: status ready, ready true
+[2m2026-10-31T12:14:14.882851Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m shutting down: finishing requests in flight (up to 20s)

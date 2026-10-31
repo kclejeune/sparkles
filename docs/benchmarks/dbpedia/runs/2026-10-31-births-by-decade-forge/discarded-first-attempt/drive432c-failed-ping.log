@@ -1,0 +1,10 @@
+locks held 2026-10-31T12:16:19Z
+start 12:17:19 load 0.07 0.40 0.75
+Traceback (most recent call last):
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/births_http.py", line 122, in <module>
+    ms, body = request(label)
+               ~~~~~~~^^^^^^^
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/births_http.py", line 49, in request
+    assert r.status == 200, (r.status, body[:300])
+           ^^^^^^^^^^^^^^^
+AssertionError: (503, b'{"code":"dataset-opening","error":"dataset /bench is opening; retry later","requestId":"3a49d8ec-000000000002"}')
