@@ -231,7 +231,8 @@ impl<'c, 'a, 's> Level<'c, 'a, 's> {
     /// `unused-variable` and `unbound-variable`.
     fn variables(&self, out: &mut Out<'_>) {
         let c = self.c;
-        let bound = self.bound();
+        let mut bound = self.bound();
+        bound.extend(out.prebound.iter().cloned());
         if out.on("unbound-variable") {
             for t in self.uses() {
                 let n = name(c, t);
@@ -283,7 +284,8 @@ impl<'c, 'a, 's> Level<'c, 'a, 's> {
         }
         for (n, t) in binding {
             let Some(t) = t else { continue };
-            if n.starts_with('_') || count.get(&n).copied() != Some(1) {
+            if n.starts_with('_') || count.get(&n).copied() != Some(1) || out.prebound.contains(&n)
+            {
                 continue;
             }
             let (s, e) = c.span(t);

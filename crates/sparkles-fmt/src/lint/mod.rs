@@ -10,6 +10,7 @@
 //! and keeps the result only when it parses to the same SPARQL algebra, or to an
 //! isomorphic graph or dataset, as the input.
 
+mod embedded;
 mod jsonld;
 mod lines;
 mod prefixes;
@@ -384,6 +385,7 @@ pub fn lint(text: &str, lang: Language, opts: &LintOptions) -> Result<Linted, Li
         text,
         opts,
         found: Vec::new(),
+        prebound: Vec::new(),
     };
     match lang {
         Language::Sparql => lint_sparql(text, &mut out)?,
@@ -399,6 +401,26 @@ pub fn lint(text: &str, lang: Language, opts: &LintOptions) -> Result<Linted, Li
         language: lang,
         diagnostics,
     })
+}
+
+/// Lint the SPARQL of a SHACL query, `text` with its prefixes written in front of it, with
+/// the variables `prebound` counted as bound.
+fn lint_embedded(
+    text: &str,
+    opts: &LintOptions,
+    prebound: Vec<String>,
+) -> Result<Vec<Diagnostic>, LintError> {
+    let mut out = Out {
+        text,
+        opts,
+        found: Vec::new(),
+        prebound,
+    };
+    lint_sparql(text, &mut out)?;
+    let mut found = out.found;
+    found.sort_by(|a, b| (a.start, a.end, a.rule).cmp(&(b.start, b.end, b.rule)));
+    found.dedup_by(|a, b| a.rule == b.rule && a.start == b.start && a.end == b.end);
+    Ok(found)
 }
 
 /// Apply the safe fixes of the enabled rules, again until none is left (at most a few
@@ -479,6 +501,21 @@ pub fn apply(text: &str, edits: &[Edit]) -> String {
     out
 }
 
+/// `quads` with the text of every SHACL query blanked. A fix inside a query changes the
+/// string and nothing else, and the embedded linter has checked that the query still
+/// means the same.
+fn masked(mut quads: Vec<oxrdf::Quad>) -> Vec<oxrdf::Quad> {
+    for q in &mut quads {
+        if embedded::is_query_predicate(q.predicate.as_str())
+            && let oxrdf::Term::Literal(l) = &q.object
+            && l.language().is_none()
+        {
+            q.object = oxrdf::Literal::new_simple_literal("").into();
+        }
+    }
+    quads
+}
+
 /// The dataset of a JSON-LD document, expanded without fetching anything (relative IRIs
 /// resolve against a synthetic base); `None` when it cannot be, for example because a
 /// context is given by URL.
@@ -516,12 +553,12 @@ fn same_meaning(a: &str, b: &str, lang: Language) -> bool {
                 turtle_quads(a, trig, &undeclared),
                 turtle_quads(b, trig, &undeclared),
             ) {
-                (Ok(qa), Ok(qb)) => crate::check::graph::isomorphic(&qa, &qb),
+                (Ok(qa), Ok(qb)) => crate::check::graph::isomorphic(&masked(qa), &masked(qb)),
                 _ => false,
             }
         }
         Language::JsonLd => match (jsonld_quads(a), jsonld_quads(b)) {
-            (Some(qa), Some(qb)) => crate::check::graph::isomorphic(&qa, &qb),
+            (Some(qa), Some(qb)) => crate::check::graph::isomorphic(&masked(qa), &masked(qb)),
             _ => false,
         },
         Language::Shaclc => {
@@ -550,6 +587,8 @@ pub(crate) struct Out<'a> {
     pub text: &'a str,
     pub opts: &'a LintOptions,
     pub found: Vec<Diagnostic>,
+    /// the names of variables bound before the query runs (SHACL's `this`, `value`, …)
+    pub prebound: Vec<String>,
 }
 
 impl Out<'_> {
@@ -691,6 +730,7 @@ fn lint_turtle(text: &str, trig: bool, out: &mut Out<'_>) -> Result<(), LintErro
             let c = Cst::new(&tree);
             prefixes::run(&c, out);
             terms::run(&c, out);
+            embedded::turtle(&c, text, trig, &undeclared, out)?;
         }
         Err(e) => out.syntax(&e),
     }
@@ -993,6 +1033,8 @@ pub(crate) fn unescape_iri(s: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_embedded;
 #[cfg(test)]
 mod tests_formats;
 #[cfg(test)]

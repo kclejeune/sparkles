@@ -13,7 +13,7 @@
 //! context. `@vocab` maps every key. The values of a term with a map container, of a
 //! term typed `@json` and of a value object are data, not properties.
 
-use super::{Cst, Edit, Fix, LintError, Out, terms};
+use super::{Cst, Edit, Fix, LintError, Out, embedded, terms};
 use crate::lex::TokenKind;
 use crate::syntax::NodeKind;
 use crate::tree::NodeId;
@@ -36,9 +36,17 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     };
     let c = Cst::new(&tree);
     let root = build(&c, c.tree.root());
-    Walk { out }.value(&root, &Ctx::default());
+    let mut scan = Scan::default();
+    scan.value(&root);
+    let mut walk = Walk {
+        out,
+        sites: Vec::new(),
+    };
+    walk.value(&root, &Ctx::default());
+    let sites = std::mem::take(&mut walk.sites);
     out.deadline()?;
-    context_rules(&root, out);
+    embedded::run(sites, &scan.prefixes(), || super::jsonld_quads(text), out)?;
+    context_rules(&scan, out);
     Ok(())
 }
 
@@ -371,6 +379,8 @@ impl Ctx<'_> {
 
 struct Walk<'o, 'c> {
     out: &'o mut Out<'c>,
+    /// the strings that hold SHACL queries
+    sites: Vec<embedded::Site>,
 }
 
 impl<'a> Walk<'_, '_> {
@@ -427,7 +437,44 @@ impl<'a> Walk<'_, '_> {
                     ),
                 );
             }
+            let iri = term.and_then(|t| t.iri.clone()).or_else(|| keys.expand(k));
+            if let Some(iri) = iri.filter(|i| embedded::is_query_predicate(i)) {
+                self.queries(&iri, &m.value);
+            }
             self.property(term, &m.value, &here);
+        }
+    }
+
+    /// The plain strings among `v` (a string, a value object or an array of them) are
+    /// queries.
+    fn queries(&mut self, predicate: &str, v: &Val) {
+        let string = match v {
+            Val::Str(s) => Some(s),
+            Val::Obj(o) if o.get("@language").is_none() => {
+                match (o.get("@value"), o.get("@type")) {
+                    (
+                        Some(Member {
+                            value: Val::Str(s), ..
+                        }),
+                        None,
+                    ) => Some(s),
+                    _ => None,
+                }
+            }
+            Val::Arr(items) => {
+                items.iter().for_each(|i| self.queries(predicate, i));
+                None
+            }
+            _ => None,
+        };
+        if let Some(s) = string {
+            let text = embedded::decode_json(&self.out.text[s.start..s.end], s.start);
+            self.sites.push(embedded::Site {
+                predicate: predicate.to_string(),
+                text,
+                long: false,
+                quote: '"',
+            });
         }
     }
 
@@ -558,9 +605,7 @@ fn strings(v: &Val) -> Vec<&str> {
 // ------------------------------------------------------------ the context rules ------
 
 /// `unused-context-term`, and the IRIs the contexts define.
-fn context_rules(root: &Val, out: &mut Out<'_>) {
-    let mut scan = Scan::default();
-    scan.value(root);
+fn context_rules(scan: &Scan<'_>, out: &mut Out<'_>) {
     for (o, i) in &scan.defs {
         let m = &o.members[*i];
         if scan.used.contains(&m.key.value) {
@@ -614,6 +659,48 @@ impl<'a> Scan<'a> {
             self.used.insert(prefix.to_string());
         }
         self.used.insert(s.to_string());
+        // a string with spaces is text, such as a SHACL query, whose `label:name` words
+        // use prefixes
+        if s.contains(char::is_whitespace) {
+            for (i, _) in s.match_indices(':') {
+                let label: String = s[..i]
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                self.used.insert(label);
+            }
+        }
+    }
+
+    /// The prefixes the contexts declare: a term for an absolute IRI that ends in `/`, `#`
+    /// or `:`, the first time a label is defined.
+    fn prefixes(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (o, i) in &self.defs {
+            let m = &o.members[*i];
+            let iri = match &m.value {
+                Val::Str(s) => Some(s.value.as_str()),
+                Val::Obj(d) => match d.get("@id") {
+                    Some(Member {
+                        value: Val::Str(s), ..
+                    }) => Some(s.value.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(iri) = iri
+                && iri.contains(':')
+                && iri.ends_with(['/', '#', ':'])
+                && !out.iter().any(|(l, _)| *l == m.key.value)
+            {
+                out.push((m.key.value.clone(), iri.to_string()));
+            }
+        }
+        out
     }
 
     fn object(&mut self, o: &'a Obj, is_context: bool) {
