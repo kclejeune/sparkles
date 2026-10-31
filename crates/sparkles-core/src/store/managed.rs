@@ -106,7 +106,11 @@ impl Store {
     /// until the owner is enabled again. An in-memory store keeps the registry in memory.
     ///
     /// Returns the installed registry. When this returns, every commit of the dataset
-    /// that has not yet published is admitted against it.
+    /// that has not yet published is admitted against it: it waits for every writer of
+    /// the dataset and its branches to finish, so a thread that holds one of their
+    /// write transactions must not call it. A change that fails or unwinds after its
+    /// first file is written leaves every write refused until the owner is enabled
+    /// again.
     pub fn enable_managed(
         &self,
         owner: OwnerKind,
