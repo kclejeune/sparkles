@@ -24,6 +24,11 @@ on:
   pull_request:
     paths: *paths
   workflow_dispatch:
+    inputs:
+      github-hosted:
+        description: Use GitHub's runner even when SPARKLES_RUNNER_LARGE is set
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,20 +44,23 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # SPARKLES_RUNNER_LARGE for same-repository events, GitHub's runner otherwise
+    runs-on: ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     timeout-minutes: 90
     permissions:
       contents: read
       id-token: write
-    # UI, Wasm and Rust use one workspace and one managed target in this container.
+    # UI, Wasm and Rust use one workspace and one managed target in this container. On
+    # GitHub's runner the container is held to 4 CPUs and 14 GB with two compiler jobs.
+    # A larger runner lends the container all of its CPUs and memory.
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
-      options: --cpus 4 --memory 14g --memory-swap 14g --pids-limit 2048
+      options: ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE && '--pids-limit 2048' || '--cpus 4 --memory 14g --memory-swap 14g --pids-limit 2048' }}
     defaults:
       run:
         shell: bash
     env:
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE && 'default' || '2' }}
       SPARKLES_ARTIFACT_BUILDER_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3
     steps:
       - uses: actions/checkout@v5

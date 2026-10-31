@@ -1,7 +1,10 @@
 # The main checks on every push to main and every pull request (docs/DEVELOPMENT.md,
-# "Continuous integration"). The jobs run in parallel on standard GitHub-hosted runners,
-# so a push waits for the longest chain, which is the test build followed by one test
-# shard:
+# "Continuous integration"). The jobs run in parallel, so a push waits for the longest
+# chain, which is the test build followed by one test shard. They run on standard
+# GitHub-hosted runners unless the repository variables SPARKLES_RUNNER_LARGE (the
+# compile-heavy jobs) and SPARKLES_RUNNER (the test shards, the doctests and the checks)
+# name another runner label. Fork pull requests always use GitHub's runners.
+#
 #
 #   checks       formatting of Rust, UI, JavaScript and shell, shellcheck, cited doc
 #                paths, the benchmark scripts' tests, the UI's type check, unit tests and
@@ -9,10 +12,11 @@
 #                Rust build
 #   clippy       Clippy with warnings as errors on the workspace, the formatter's
 #                WebAssembly build and the three binding crates
-#   build        the workspace's tests built once into a nextest archive, and the doctests
-#   test         the archive's tests in four shards, with the W3C SPARQL and RDF, SHACL,
+#   build        the workspace's tests built once into nextest archives
+#   doctests     the workspace's doctests, which nextest does not run
+#   test         the archive's tests in shards, with the W3C SPARQL and RDF, SHACL,
 #                ShEx and JSON-LD suites fetched at pinned commits
-#   jena-clients Apache Jena's own HTTP clients against the server binary from the archive
+#   jena-clients Apache Jena's own HTTP clients against the debug server binary
 #   features     an opt-in manual compatibility matrix with the server defaults off
 #                and one optional feature set on, built apart from the archive
 #
@@ -51,6 +55,10 @@ on:
         description: Also run Clippy and the tests on Linux arm64 and macOS arm64
         type: boolean
         default: false
+      github-hosted:
+        description: Use GitHub's runners even when the runner variables are set
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -69,6 +77,15 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   NEXTEST_VERSION: "0.9.146"
+  # The test binaries with the slowest tests, which run in two shards of their own, and the
+  # `timing` group of .config/nextest.toml, which runs alone. These three shards use a small
+  # archive of HEAVY_1, HEAVY_2 and TIMING_BINARIES. The other tests are split by count
+  # over the remaining shards. Each regular expression must match a binary, or nextest
+  # refuses the filter. A new test in the timing group needs its binary in TIMING_BINARIES.
+  HEAVY_1: binary_id(/^(sparkles-core::(spill_join|power_loss|w3c|geo_join)|sparkles-fmt::w3c_turtle)$/)
+  HEAVY_2: binary_id(/^(sparkles-core::query_cursor|sparkles-reasoner::(explain_demand|demand)|sparkles-fmt::turtle_stream)$/)
+  TIMING: test(planning_at_the_limit_stops_at_the_timeout) | test(a_large_json_ld_document_keeps_to_a_short_deadline)
+  TIMING_BINARIES: binary_id(/^(sparkles::nesting|sparkles-fmt)$/)
 
 jobs:
   # Whether the change can affect the Rust jobs. Changes only to the UI, the JavaScript
@@ -82,7 +99,22 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.rust == 'true' }}
+      shards: ${{ steps.shards.outputs.shards }}
     steps:
+      # The two heavy shards, the timing shard and SPARKLES_TEST_SLICES shards (default
+      # four) that split the other tests by count.
+      - name: Test shards
+        id: shards
+        env:
+          SLICES: ${{ vars.SPARKLES_TEST_SLICES || '4' }}
+        run: |
+          case "$SLICES" in
+            [1-9] | 1[0-6]) ;;
+            *) echo "SPARKLES_TEST_SLICES must be a number from 1 to 16, not '$SLICES'" >&2; exit 1 ;;
+          esac
+          shards='"heavy-1","heavy-2","timing"'
+          for i in $(seq 1 "$SLICES"); do shards="$shards,\"$i/$SLICES\""; done
+          echo "shards=[$shards]" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
@@ -102,7 +134,8 @@ jobs:
   checks:
     name: Checks
     timeout-minutes: 20
-    runs-on: ubuntu-24.04
+    # SPARKLES_RUNNER for same-repository events, GitHub's runner otherwise
+    runs-on: &runner ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER || 'ubuntu-24.04' }}
     steps:
       # The fixed bootstrap source and trusted base need complete ancestry proof.
       - uses: actions/checkout@v5
@@ -190,7 +223,8 @@ jobs:
       fail-fast: false
       matrix:
         platform: ${{ fromJSON(inputs.all-platforms && '["linux-amd64", "linux-arm64", "macos-arm64"]' || '["linux-amd64"]') }}
-    runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    # Linux amd64 uses SPARKLES_RUNNER_LARGE for same-repository events.
+    runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     env:
       # Workspace and binding checks exceed the shared 10 GiB download allowance.
       MBX_GC_MAX_SIZE: 30GiB
@@ -243,8 +277,10 @@ jobs:
         if: ${{ always() }}
         run: df -h "$GITHUB_WORKSPACE"
 
-  # The tests are built once and archived, and the shards run the archive. nextest does
-  # not run doctests, so they run here.
+  # The tests are built once and archived, and the shards run the archives. The heavy and
+  # timing shards get a second, small archive with only their binaries, so they skip most
+  # of the download and extraction. The doctests run in a job of their own, so the shards
+  # do not wait for them.
   build:
     permissions:
       contents: read
@@ -253,7 +289,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     timeout-minutes: 45
-    runs-on: ubuntu-24.04
+    # SPARKLES_RUNNER_LARGE for same-repository events, GitHub's runner otherwise
+    runs-on: ${{ !inputs.github-hosted && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     env:
       # Keep the archive build's remote download allowance above the shared 10 GiB.
       MBX_GC_MAX_SIZE: 30GiB
@@ -263,15 +300,28 @@ jobs:
         with: { fetch-depth: 2 }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      # The test build can exceed the runner's physical memory.
+      # The test build can exceed the physical memory of a 16 GB runner. A larger runner
+      # needs no swap file, and a runner whose file system refuses one warns instead.
       - name: Add swap
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          sudo fallocate -l 16G /swapfile-ci
-          sudo chmod 600 /swapfile-ci
-          sudo mkswap /swapfile-ci > /dev/null
-          sudo swapon /swapfile-ci
+        run: &add-swap |
+          memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+          if [ "$memory_kib" -ge $((24 * 1024 * 1024)) ]; then
+            echo "$((memory_kib / 1024 / 1024)) GiB of memory, so no swap file"
+            exit 0
+          fi
+          # A name of its own, so a persistent runner never touches another job's swap file
+          swapfile="/swapfile-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          if ! sudo fallocate -l 16G "$swapfile"; then
+            echo '::warning::the runner refused a swap file'
+          elif ! { sudo chmod 600 "$swapfile" && sudo mkswap "$swapfile" > /dev/null &&
+            sudo swapon "$swapfile"; }; then
+            echo '::warning::the runner refused a swap file'
+            sudo rm -f "$swapfile" || true
+          else
+            echo "CI_SWAPFILE=$swapfile" >> "$GITHUB_ENV"
+          fi
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           # Fork pull requests use GitHub cache because they cannot request an OIDC token.
@@ -285,51 +335,123 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # The 188 test binaries share most of their code, which zstd finds with a long
-      # window: the archive shrinks from 2.2 GB to about 1.4 GB, which the five test jobs
-      # download. nextest reads windows up to 128 MB (--long=27). The server's build script
-      # writes a placeholder ui/build, which debug builds read from disk at run time, so the
-      # shards get it next to the archive.
+      # The test binaries are about 18 GB and share most of their code, which zstd finds
+      # with a long window. nextest 0.9.146 cannot write one, so it writes its fastest level
+      # and a second pass recompresses at level 1 with a 128 MB window (--long=27, the
+      # largest nextest reads). That pass takes about a quarter of the time of level 6 and
+      # gives a 2.7 GB archive instead of 2.3 GB. The server's build script writes a
+      # placeholder ui/build, which debug builds read from disk at run time, so the shards
+      # get it next to the archive. The Jena clients job gets the server binary alone.
       - name: Disk space before test archive
         run: df -h "$GITHUB_WORKSPACE"
-      - name: Build the test archive
+      # One managed-target lease (scripts/cargo-sparkles-task) covers both archive commands
+      # and the copy of the server binary. Without it Boxington collects the target after
+      # the first command, and the second rebuilds the workspace.
+      - name: Build the test archives
         run: |
-          mkdir -p "$RUNNER_TEMP/archive"
-          mbx nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
-          zstd -q -d -c "$RUNNER_TEMP/raw.tar.zst" | zstd -q -6 -T0 --long=27 -o "$RUNNER_TEMP/archive/tests.tar.zst"
+          mkdir -p "$RUNNER_TEMP/archive" "$RUNNER_TEMP/heavy" "$RUNNER_TEMP/server"
+          # shellcheck disable=SC2016 # the inner shell expands the variables
+          PATH="$PWD/scripts:$PATH" mbx sparkles-task -- bash -euo pipefail -c '
+            mbx nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
+            mbx nextest archive --locked --workspace -E "$HEAVY_1 | $HEAVY_2 | $TIMING_BINARIES" --zstd-level 3 \
+              --archive-file "$RUNNER_TEMP/heavy/tests.tar.zst"
+            tar --zstd -cf "$RUNNER_TEMP/server/sparkles.tar.zst" target/debug/sparkles
+          '
+          zstd -q -d -c "$RUNNER_TEMP/raw.tar.zst" | zstd -q -1 -T0 --long=27 -o "$RUNNER_TEMP/archive/tests.tar.zst"
           rm "$RUNNER_TEMP/raw.tar.zst"
-          ls -l "$RUNNER_TEMP/archive/tests.tar.zst"
           tar -cf "$RUNNER_TEMP/archive/ui-build.tar" ui/build
+          cp "$RUNNER_TEMP/archive/ui-build.tar" "$RUNNER_TEMP/heavy/"
+          echo "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/archive/build-workspace"
+          cp "$RUNNER_TEMP/archive/build-workspace" "$RUNNER_TEMP/heavy/"
+          ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
       - name: Disk space after test archive
         if: ${{ always() }}
         run: df -h "$GITHUB_WORKSPACE"
+      # A persistent runner keeps the machine, so the job removes its own swap file.
+      - name: Remove swap
+        if: ${{ always() && env.CI_SWAPFILE != '' }}
+        run: &remove-swap |
+          sudo swapoff "$CI_SWAPFILE" || true
+          sudo rm -f "$CI_SWAPFILE" || true
+      # The archives are zstd already.
       - uses: actions/upload-artifact@v4
         with:
           name: nextest-archive
           path: ${{ runner.temp }}/archive
           retention-days: 1
-          # the archive is zstd already
           compression-level: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive-heavy
+          path: ${{ runner.temp }}/heavy
+          retention-days: 1
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-debug
+          path: ${{ runner.temp }}/server
+          retention-days: 1
+          compression-level: 0
+
+  # nextest does not run doctests. They build the workspace's libraries again, from the
+  # same remote cache, in parallel with the test build.
+  doctests:
+    permissions:
+      contents: read
+      id-token: write
+    name: Doctests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    timeout-minutes: 45
+    runs-on: *runner
+    env:
+      MBX_GC_MAX_SIZE: 30GiB
+      MBX_GC_MIN_FREE_SIZE: 5GiB
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
+      - name: Add swap
+        if: runner.os == 'Linux'
+        shell: bash
+        run: *add-swap
+      - uses: jdx/mr-boxington-action@v1.7.3
+        with:
+          # Fork pull requests use GitHub cache because they cannot request an OIDC token.
+          backend: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'remote' || 'github' }}
+          remote-url: https://mbx.kclj.dev
+          namespace: kclejeune/sparkles
+          oidc-audience: https://mbx.kclj.dev
+          version: 1.28.0
+          cache-generation: sparkles-doctests-v1
+          save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - name: Doctests
         run: mbx test --locked --workspace --doc
+      - name: Remove swap
+        if: ${{ always() && env.CI_SWAPFILE != '' }}
+        run: *remove-swap
 
-  # Each shard runs a quarter of the tests from the archive. The settings come from
-  # .config/nextest.toml: every failure reported at the end, and a test that runs past
-  # ten minutes stopped. The suite includes openapi::tests::checked_in_copy_is_current,
-  # which fails when docs/openapi.json is out of date.
+  # Each shard runs a part of the tests from an archive. The settings come from
+  # .config/nextest.toml: every failure reported at the end, the slowest tests started
+  # first, and a test that runs past ten minutes stopped. The suite includes
+  # openapi::tests::checked_in_copy_is_current, which fails when docs/openapi.json is out
+  # of date.
   #
-  # The tests of the `timing` group in .config/nextest.toml need the machine to
-  # themselves, and one of them runs for about four minutes on a runner, which would
-  # stall the shard it fell into. They run in a job of their own instead.
+  # heavy-1 and heavy-2 run the binaries in HEAVY_1 and HEAVY_2. The numbered shards split
+  # every other test by count. The tests of the `timing` group need the machine to
+  # themselves, and one of them runs for about two minutes on a runner, which would stall
+  # the shard it fell into, so they run in the timing shard. The filters together select
+  # every test exactly once, as long as HEAVY_1 and HEAVY_2 share no binary.
   test:
     name: Test (${{ matrix.shard }})
-    needs: build
+    needs: [changes, build]
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1/4, 2/4, 3/4, 4/4, timing]
-    runs-on: ubuntu-24.04
+        shard: ${{ fromJSON(needs.changes.outputs.shards) }}
+    runs-on: *runner
     steps:
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@v2
@@ -337,7 +459,7 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - uses: actions/download-artifact@v4
         with:
-          name: nextest-archive
+          name: ${{ (startsWith(matrix.shard, 'heavy-') || matrix.shard == 'timing') && 'nextest-archive-heavy' || 'nextest-archive' }}
           path: ${{ runner.temp }}
       # shallow sparse checkouts of Apache Jena's and Oxigraph's test directories, about
       # 35 MB, which take a few seconds
@@ -346,18 +468,33 @@ jobs:
       # cargo-nextest is called directly: the archive needs no Cargo, and calling cargo
       # would make rustup install the pinned toolchain first. The archive is extracted
       # into the checkout, where the build job's target directory was, because tests find
-      # the server binary and the UI by paths fixed at compile time.
+      # the server binary, the UI and their fixtures by paths fixed at compile time. When
+      # the build ran on a runner with another checkout path, as when only one of the
+      # runner variables is set, a link from that path leads to this checkout.
       - name: mbx nextest
         env:
           SHARD: ${{ matrix.shard }}
         run: |
-          tar -xf "$RUNNER_TEMP/ui-build.tar"
-          timing='test(planning_at_the_limit_stops_at_the_timeout) | test(a_large_json_ld_document_keeps_to_a_short_deadline)'
-          if [ "$SHARD" = timing ]; then
-            select=(-E "$timing")
-          else
-            select=(-E "not ($timing)" --partition "slice:$SHARD")
+          # The link assumes one job at a time on the machine, as on ephemeral runners.
+          build_workspace=$(cat "$RUNNER_TEMP/build-workspace")
+          if [ "$build_workspace" != "$GITHUB_WORKSPACE" ]; then
+            if [ -e "$build_workspace" ] && [ ! -L "$build_workspace" ]; then
+              echo "the build's checkout path $build_workspace exists on this runner" >&2
+              exit 1
+            fi
+            sudo mkdir -p "$(dirname "$build_workspace")"
+            sudo ln -sfn "$GITHUB_WORKSPACE" "$build_workspace"
+            echo "CI_WORKSPACE_LINK=$build_workspace" >> "$GITHUB_ENV"
           fi
+          tar -xf "$RUNNER_TEMP/ui-build.tar"
+          # A timing test outside TIMING_BINARIES runs in a numbered or heavy shard instead.
+          timing="($TIMING_BINARIES) & ($TIMING)"
+          case "$SHARD" in
+            timing) select=(-E "$timing") ;;
+            heavy-1) select=(-E "($HEAVY_1) & not ($timing)") ;;
+            heavy-2) select=(-E "($HEAVY_2) & not ($timing)") ;;
+            *) select=(-E "not ($timing) & not ($HEAVY_1) & not ($HEAVY_2)" --partition "slice:$SHARD") ;;
+          esac
           cargo-nextest nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" \
             --workspace-remap . --extract-to . --profile ci "${select[@]}"
       - if: ${{ !cancelled() }}
@@ -367,6 +504,9 @@ jobs:
           path: target/nextest/ci/junit.xml
           retention-days: 7
           if-no-files-found: ignore
+      - name: Remove the checkout link
+        if: ${{ always() && env.CI_WORKSPACE_LINK != '' }}
+        run: sudo rm -f "$CI_WORKSPACE_LINK" || true
 
   # The server's unit and integration tests with the default features off and one feature
   # set on (scripts/test-features.sh, mise run test:features). The archive above builds
@@ -423,8 +563,9 @@ jobs:
         run: scripts/test-features.sh "${{ matrix.set }}"
 
   # Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP,
-  # QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against the server binary that
-  # the test archive carries (mise run test:jena-clients).
+  # QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against the debug server binary
+  # that the build job uploads (mise run test:jena-clients). The job is short, so it stays
+  # on GitHub's runner.
   jena-clients:
     name: Jena clients
     needs: build
@@ -436,7 +577,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
-          name: nextest-archive
+          name: server-debug
           path: ${{ runner.temp }}
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "21" }
@@ -450,7 +591,7 @@ jobs:
         run: curl -fsSL "https://archive.apache.org/dist/jena/binaries/apache-jena-$JENA_VERSION.tar.gz" | tar -xz -C "$RUNNER_TEMP"
       - name: Run Jena's clients against the server
         run: |
-          tar -xf "$RUNNER_TEMP/tests.tar.zst" -C "$RUNNER_TEMP" --zstd target/debug/sparkles
+          tar -xf "$RUNNER_TEMP/sparkles.tar.zst" -C "$RUNNER_TEMP" --zstd target/debug/sparkles
           SPARKLES_BIN="$RUNNER_TEMP/target/debug/sparkles" \
           JENA_HOME="$RUNNER_TEMP/apache-jena-$JENA_VERSION" \
           JAVA="$(command -v java)" \

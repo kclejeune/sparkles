@@ -9,6 +9,9 @@
 # Wheels are built for Linux on x86_64 and arm64 (manylinux and musllinux) and for macOS
 # on Apple silicon. The jobs run on standard GitHub-hosted runners with build
 # dependencies cached in GitHub Actions.
+# Branch builds of the Linux x86_64 native use the runner that SPARKLES_RUNNER_LARGE
+# names and the other Linux x86_64 jobs the one SPARKLES_RUNNER names, when they are set.
+# Tags, publishing and fork pull requests always use GitHub's runners.
 name: Python wheels
 
 # Pushes to main and pull requests run when the Python bindings or a crate they build on
@@ -45,6 +48,11 @@ on:
   pull_request:
     paths: *paths
   workflow_dispatch:
+    inputs:
+      github-hosted:
+        description: Use GitHub's runners even when the runner variables are set
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -89,7 +97,9 @@ jobs:
       CARGO_HOME: ${{ github.workspace }}/.cache/cargo
       MBX_CACHE_DIR: ${{ github.workspace }}/.cache/mbx
       COMPAT: ${{ matrix.libc == 'manylinux' && '2_28' || 'musllinux_1_2' }}
-    runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    # Linux x86_64 uses SPARKLES_RUNNER_LARGE for same-repository branch events. Tags
+    # (releases) and fork pull requests use GitHub's runners.
+    runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
         with: { fetch-depth: 2 }
@@ -221,7 +231,9 @@ jobs:
     name: Source distribution
     # tags and manual runs only
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    # SPARKLES_RUNNER for same-repository branch events. Tags (releases) and fork pull
+    # requests use GitHub's runner.
+    runs-on: ${{ !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER || 'ubuntu-24.04' }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:

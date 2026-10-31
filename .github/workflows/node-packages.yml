@@ -3,6 +3,9 @@
 # Addons are built for Linux on x64 and arm64 (glibc and musl) and for macOS on Apple
 # silicon. The jobs run on standard GitHub-hosted runners with Cargo and pnpm
 # dependencies cached in GitHub Actions or the remote mbx server.
+# Branch builds of the Linux x86_64 native use the runner that SPARKLES_RUNNER_LARGE
+# names and the other Linux x86_64 jobs the one SPARKLES_RUNNER names, when they are set.
+# Tags, publishing and fork pull requests always use GitHub's runners.
 name: Node packages
 # Pushes to main and pull requests run when the Node packages or a crate the addon builds
 # on changes, or when the server used by the remote client tests changes. Tests, benches
@@ -45,6 +48,11 @@ on:
   pull_request:
     paths: *paths
   workflow_dispatch:
+    inputs:
+      github-hosted:
+        description: Use GitHub's runners even when the runner variables are set
+        type: boolean
+        default: false
 permissions:
   contents: read
 # Main runs have distinct groups so neither running nor pending checks are superseded.
@@ -76,7 +84,9 @@ jobs:
         exclude:
           - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'linux-arm64' || 'none' }}
           - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'darwin-arm64' || 'none' }}
-    runs-on: ${{ matrix.platform == 'darwin-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    # Linux x64 uses SPARKLES_RUNNER_LARGE for same-repository branch events. Tags
+    # (releases) and fork pull requests use GitHub's runners.
+    runs-on: ${{ matrix.platform == 'darwin-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
@@ -174,7 +184,9 @@ jobs:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
-    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    # amd64 uses SPARKLES_RUNNER_LARGE for same-repository branch events. Tags
+    # (releases) and fork pull requests use GitHub's runners.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || !inputs.github-hosted && github.ref_type != 'tag' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SPARKLES_RUNNER_LARGE || 'ubuntu-24.04' }}
     env:
       MBX_CACHE_DIR: ${{ github.workspace }}/.cache/mbx
     steps:

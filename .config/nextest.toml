@@ -32,7 +32,7 @@ path = "junit.xml"
 # soon after its timeout. They run one at a time and alone, with no other test on the
 # machine, since other work stretches the time a stop takes. CI runs them in a job of
 # their own and leaves them out of the test shards (.github/workflows/ci.yml), so a new
-# test here needs the same filter there.
+# test here needs the same filter there, in TIMING, and its binary in TIMING_BINARIES.
 [test-groups.timing]
 max-threads = 1
 
@@ -62,3 +62,37 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = "test(controlled_waits_do_not_count_against_the_deadline)"
 threads-required = "num-test-threads"
+
+# The slowest tests start first, so a shard does not end with one of them running alone
+# after the short tests have finished. The list comes from CI's JUnit timings and only
+# changes the order, so a renamed test merely loses its head start.
+[[profile.default.overrides]]
+filter = """test(/^(\
+crash_images_during_background_full_text_checkpoints|\
+sparql::join_tests::galloping_index_joins_match_scans_per_cluster_across_blocks|\
+a_heavy_key_joins_as_a_block_nested_loop|\
+every_inferred_triple_has_a_sound_demand_tree|\
+spilled_hash_joins_match_eager_at_every_batch_size|\
+spilled_optional_and_minus_handle_unbound_keys|\
+sparql::cursor::joinspill::tests::spilled_distinct_of_colliding_rows_is_not_amplified|\
+comment_sweeps|\
+sparql::cursor::joinspill::tests::spilled_join_modes_match_eager_execution|\
+crash_images_of_a_dataset_with_full_text_search|\
+random_joins_and_nearest_neighbours_agree|\
+demand_answers_like_materialization|\
+sparql_query_cursors|\
+sparql::opt_tests::the_numeric_column_answers_as_decoding_does|\
+morsel_filters_and_ordered_top_k_agree_with_eager_on_mixed_terms|\
+memory_stays_bounded|\
+ordered_top_k_dedups_union_graph_rows_across_morsels|\
+sparql::join_tests::flat_hash_joins_give_the_rows_of_per_key_lists_in_the_same_order|\
+every_syntax_and_codec_agree_in_all_parse_modes|\
+exists_evaluated_per_key_stays_eager_and_matches|\
+f16_keeping_after_commit_stays_within_limit|\
+sparql::opt_tests::range_filters_read_only_matching_id_ranges|\
+schema_heavy_demand_answers_like_materialization|\
+incremental::tests::owl_rl_matches_full|\
+ask_over_a_large_keyed_join_reads_both_sides_alternately|\
+http::pool_tests::dropping_a_default_streamed_body_releases_its_query_grant\
+)$/)"""
+priority = 50
