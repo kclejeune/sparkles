@@ -1694,18 +1694,21 @@ stays silent for a document without a context, beside a context given by URL, an
 through the `@vocab` IRI, keyword aliases such as a term for `@value`, and the default
 language. The values of a JSON literal and of a map container are data, so nothing inside
 a JSON literal counts as a context or a term, and a term's own scoped context applies to
-its value. A JSON-LD fix is applied only after expanding the input and the fixed text and finding the same
-dataset, so a document that names a context by URL keeps its text.
+its value. A JSON-LD fix is offered only when the document with that edit expands to the same dataset, so a
+document that names a context by URL gets no fixes and keeps its text.
 
 In a Turtle, TriG or JSON-LD document, the plain string objects of `sh:select`, `sh:ask`,
 `sh:construct` and `sh:update` are linted as SPARQL, with every rule above, and a finding
 is placed inside the literal, whatever escapes or line breaks come before it. The query
 sees the prefixes of `sh:prefixes` and `sh:declare`, with the `owl:imports` closure, and
 those of the document itself. Each query sees the declarations and parameters of the node
-that holds it, in its graph, even when another node holds the same text. A document prefix
-that a query uses counts as used, so `--fix` keeps it. In JSON-LD, a value is a query only
-when it expands to a plain string, so a default language or an `@id` coercion makes it
-something else. SHACL binds `$this`, `$shapesGraph`, `$currentShape`,
+that holds it, in its graph. A literal is linted only when that node is certain: a subject
+the source names, or else the only node that holds the query when no other string of the
+document repeats its text. An ambiguous literal, such as the same query on two blank
+nodes, is skipped rather than given another node's findings. In JSON-LD the expansion
+decides which values are queries and who holds them, so a document that names a context
+by URL gets no query findings. A document prefix that a query uses counts as used, so
+`--fix` keeps it. SHACL binds `$this`, `$shapesGraph`, `$currentShape`,
 `$value` and `$PATH` before it runs a query, and the validators of a constraint component
 also see its parameters, so the variable rules count them as bound. A fix is offered only
 in a long string (`"""` or `'''`) without escapes, and only when the edited query means

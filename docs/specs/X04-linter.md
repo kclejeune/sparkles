@@ -357,28 +357,40 @@ the scoped contexts of terms and of `@type` values, and it skips the keys of map
 containers, the values of JSON literals and value objects. It stays silent for a document
 without a context, beside a context given by URL or `@import`, and under `@vocab`, because
 any of them can define the key. A term defined as `null` is dropped on purpose and is not
-reported. The walk expands names as JSON-LD does. The `@vocab` IRI expands keys, types and
-datatypes, a term that aliases a keyword such as `@value` or `@language` stands for the
-keyword, and a term's `@language` or the context's default language applies to its
-strings. A JSON literal, the value of a term typed `@json` or of a value object whose type
-is `@json`, is data. Nothing in it is read as a context, a term definition or a use of a
-term. The fix of any JSON-LD rule is accepted only when oxjsonld expands the input and the
-fixed text to isomorphic datasets, compared whole. A document that cannot be expanded here, because it
-names a context by URL, gets no `unused-context-term` fix and keeps its text under `fix`.
+reported. These rules read the document through a model of its contexts that follows
+`@vocab`, keyword aliases and the scoped contexts of terms, types and aliases of `@nest`.
+A JSON literal, the value of a term typed `@json` or of a value object whose type is
+`@json`, is data, and nothing in it is read as a context, a term definition or a use of a
+term. The model only guides the rules. Each fix of a JSON-LD finding is offered, in `fix`
+and as an editor's quick fix alike, only when oxjsonld expands the document with that one
+edit applied to a dataset isomorphic to the document's own, within the deadline. A
+document with more than 256 fixable findings gets the findings without fixes, so the check
+stays bounded. A document that cannot be expanded here, because it names a context by URL,
+gets no fixes and keeps its text under `fix`.
 oxjsonld became a dependency of `sparkles-fmt`, and the crate still builds for
 `wasm32-unknown-unknown`.
 
 **SPARQL in SHACL.** In Turtle, TriG and JSON-LD, the plain string objects of `sh:select`,
 `sh:ask`, `sh:construct` and `sh:update` are linted as SPARQL. A string with a language tag
-or a datatype other than `xsd:string` is not a query. In JSON-LD that is decided from the
-literal the value expands to, so an explicit `xsd:string` value object is a query, and a
-string under a default language or an `@id`, `@vocab` or other datatype coercion is not.
-The document is read a second time as RDF, only when it has such a literal, to find the
-prefixes and parameters of each query. Each literal is matched to the quad it makes, in
-document order, so a query sees the prefixes and parameters of the node that holds it, in
-its own graph, even when another node holds the same text. When the literals and the quads
-do not match one to one, which only a construct the linter does not read as a query could
-cause, a query sees those of every node that holds its text.
+or a datatype other than `xsd:string` is not a query. The document is read a second time
+as RDF, only when it has such a literal, to find the holder of each query and the
+prefixes and parameters it sees. A query sees those of the node that holds it, in its own
+graph, and a literal is linted only when that holder is certain.
+
+* *Turtle and TriG.* When the statement's subject is an absolute IRI, a prefixed name or a
+  blank node label, in the default graph or in a graph block with such a label, the
+  holder is that node in that graph, confirmed by a quad of the parse. A literal in a blank
+  node property list, a reified triple or an annotation has no holder in the source. It is
+  linted when exactly one node holds its property and text and exactly one string literal
+  of the document has that text.
+* *JSON-LD.* Which values are queries comes from oxjsonld's expansion of the document, so
+  `@vocab`, keyword aliases, default and scoped languages, coercions and redefined terms
+  are decided as JSON-LD decides them. A query quad is mapped back to the source when
+  exactly one value string of the document has its text and exactly one node holds it. A
+  document that cannot be expanded here gets no query findings.
+* *Ambiguity.* Any other literal is skipped. The same query text on two anonymous nodes,
+  or a text that another string of the document repeats, costs the findings of that query
+  and never gives one node the findings of another.
 
 * *Prefixes.* A query sees the document's own prefixes first and then the `sh:declare`
   pairs of the nodes that `sh:prefixes` names on the node that holds the query and on the
@@ -438,6 +450,8 @@ the Format button.
   The lines and columns of all findings are set in one pass over the text, and so are the
   UTF-16 offsets of the HTTP endpoint and the MCP tool and the positions of the language
   server, so a document with many findings costs one scan rather than one per finding.
+  Each of those passes checks the deadline as it goes, and the lint never returns findings
+  once the deadline has passed.
 * N-Triples and N-Quads are not read for SHACL query literals. The three languages that
   can carry shapes in practice are covered.
 
@@ -448,8 +462,15 @@ was removed by `fix`, that queries with the same text shared their holders' pref
 parameters, that JSON-LD queries were chosen without expanding types, languages, `@vocab`
 and keyword aliases, that the MCP tool measured the fixed text before JSON escaping, that
 the shapes editor could show the findings of text it no longer held, and that the API
-promised a `415` for RDF/XML that the endpoint did not give. Each has a regression test,
-and the behaviour above is the fixed one.
+promised a `415` for RDF/XML that the endpoint did not give. A second review found that
+the hand-written model of JSON-LD contexts still let a fix reach a JSON literal through a
+context scoped on an `@nest` alias and still misread scoped languages and redefined terms,
+that matching literals to quads by their order swapped holders, and that error paths and
+the final placing of findings ran past the deadline. Queries and fixes in JSON-LD now rest
+on the real expansion, holders on identity or an unambiguous match, and the lint checks the
+deadline before every parse, on every error path, while placing findings and before it
+returns. The HTTP endpoint's and the MCP tool's UTF-16 offsets and the language server's
+positions are counted under the same deadline. Each case has a regression test.
 
 **Tests.** `crates/sparkles-fmt/src/lint` has unit tests for N-Triples, N-Quads, SHACLC,
 JSON-LD and the embedded queries. They cover the pre-bound variables, the prefix sources,

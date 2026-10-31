@@ -97,7 +97,10 @@ with an undefined prefix used to fail with `unsafe-fix` and now applies its fixe
 tool takes rule levels as camelCase `options`. JSON-LD documents are expanded with
 `oxjsonld` to check that a fix keeps their dataset. `POST /$/lint` now answers `415` with
 `unsupported-language` for RDF/XML instead of `400`. A document with many findings is
-placed in one pass, so the lint keeps to its timeout. The query editor no longer shows the
+placed in one pass, and the lint checks its deadline on every path, so it keeps to its
+timeout. JSON-LD queries come from the document's expansion, every JSON-LD fix is checked
+against the expansion before it is offered, and an embedded query whose holder is
+ambiguous is skipped. The query editor no longer shows the
 findings of a lint that answered after the query changed or linting was turned off.
 
 Signing in, minting a token and expiry pruning no longer move the shared authority

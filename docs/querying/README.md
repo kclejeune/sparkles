@@ -290,8 +290,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   code point instead of by locale. Roadmap item 69, a lower-priority extension outside the completion of Server and
   Fuseki integration.
 * The linter reads a document whole, so a file over `--max-bytes` is refused even in a line
-  format, and it does not lint SHACL query literals in N-Triples and N-Quads. Roadmap item
-  NEW-ITEM.
+  format. It does not lint SHACL query literals in N-Triples and N-Quads or JSON-LD queries
+  under `@index` maps. It skips an embedded query whose holder is ambiguous, such as the
+  same query text on two blank nodes, rather than risk another node's findings. Roadmap
+  item NEW-ITEM.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
