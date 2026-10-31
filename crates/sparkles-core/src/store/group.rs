@@ -50,6 +50,9 @@ pub(super) struct Pending {
     /// what the commit counts against the queue's limit: its records and the documents
     /// it staged for the full-text index
     pub bytes: u64,
+    /// what the quota counts for the commit until its fence writes it: its records and
+    /// its new terms
+    pub queued: u64,
     pub ticket: Arc<Ticket>,
     /// what the write guard found, told to the guard once the commit is published
     pub validation: Option<Arc<crate::guard::ValidationSummary>>,
@@ -155,6 +158,12 @@ impl Coordinator {
                 return !s.busy() && (s.failed || s.queue.is_empty());
             }
         }
+    }
+
+    /// Commits waiting in the queue, not yet sealed (for tests).
+    #[cfg(test)]
+    pub fn queued(&self) -> usize {
+        self.state.lock().queue.len()
     }
 
     pub fn full(&self, bytes: u64) -> bool {
@@ -302,8 +311,13 @@ impl Coordinator {
                     return Err(Error::WriterBusy);
                 }
             }
-            if self.drive(store, None)? {
-                continue;
+            match self.drive(store, None) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                // The fence this caller led failed. A prefix before it may still be
+                // publishing, and the caller, which may go on to install a view, must not
+                // return before it has: the failed state above waits for it.
+                Err(_) => continue,
             }
             let mut s = self.state.lock();
             if s.busy() {
@@ -381,9 +395,7 @@ impl Coordinator {
             write()
         };
         // the records are in the log, or will never be: the quota counts them there
-        store
-            .quota
-            .dequeue(batch.iter().map(|p| p.data.len() as u64).sum());
+        store.quota.dequeue(batch.iter().map(|p| p.queued).sum());
         store
             .commit_stats
             .synced(SyncPath::Group, started.elapsed());
@@ -559,6 +571,7 @@ impl Store {
             .filter(|_| self.opts.wal_direct_writes)
             .map(|d| d.join("wal.log"));
         dvocab.set_prealloc(last.prealloc);
+        let measures = self.quota.measures();
         let (alloc_before, vocab_before) = (io.alloc, dvocab.allocated());
         let written = (|| -> Result<bool> {
             if wal::DirectLog::fits(at, data.len(), io.alloc)
@@ -580,12 +593,18 @@ impl Store {
         })();
         tail.release(&io);
         let direct = written?;
+        self.failpoint("group-written");
         io.end = last.wal_end;
         self.quota.add(io.alloc - alloc_before);
         self.quota
             .add(dvocab.allocated().saturating_sub(vocab_before));
         self.quota.set_preallocated(io.alloc - io.end);
         self.quota.set_vocab_preallocated(dvocab.preallocated());
+        // A writer that checked its quota meanwhile may have walked the directory with
+        // this growth in it, which the lines above counted again.
+        if self.quota.measures() != measures {
+            self.quota.remeasure();
+        }
         Ok(direct)
     }
 
@@ -658,20 +677,73 @@ impl WriteTxn<'_> {
             Some(m) => crate::annotations::validate_message(m)?,
             None => None,
         };
+        let generation = self.base.generation.clone();
+        let bytes = self.wal_bytes();
+        // The commit's new terms stay in memory until its fence writes them with its
+        // records, so the quota counts them, with the records, from the moment the commit
+        // is queued (see `Quota::queue`).
+        let terms = generation.dvocab.key_bytes(self.mark.entries());
+        self.check_storage_for(self.net_ins > 0, bytes + terms)?;
+        let c = self.next_commit(validation.as_deref());
+        let mut snapshot = Snapshot {
+            cacheable: true,
+            dataset_id: self.base.dataset_id,
+            generation: generation.clone(),
+            delta: std::mem::take(&mut self.delta),
+            version: self.base.version + 1,
+            cache: self.base.cache.clone(),
+            results: self.base.results.clone(),
+            dvocab_len: generation.dvocab.len(),
+            commit: c.seq,
+            text: self.base.text.clone(),
+            geo: self.base.geo.clone(),
+            union_default_graph: self.base.union_default_graph,
+            geo_op_vertices: self.base.geo_op_vertices,
+            counts: Default::default(),
+            mask: None,
+            historical: false,
+            change_log: self.base.change_log.clone(),
+        };
+        // The index state of the speculative snapshot (X09 section 17.4, step 1). The
+        // spatial view is a value computed from the base's, which a failed fence drops
+        // with the snapshot. The full-text changes are only staged here, and nothing of
+        // either reaches the disk. They are computed before the commit is admitted to the
+        // queue, so that the staged documents count in its limit.
+        store.maintain_geo(&mut snapshot, &self.base, &self.log);
+        // A panic while staging poisons the writer, as a failed write does, so that the
+        // index's state after it is never built on.
+        #[cfg(feature = "text")]
+        let text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.stage_text(&mut snapshot, &self.log)
+        })) {
+            Ok(text) => text,
+            Err(_) => {
+                tracing::error!(
+                    target: "sparkles::store",
+                    seq = c.seq,
+                    "staging a grouped commit's full-text changes panicked; writes are refused until the store is reopened"
+                );
+                self.guard.poisoned = true;
+                group.fail();
+                return Err(Error::Poisoned);
+            }
+        };
+        // Staged documents hold their whole literals, so they count against the queue's
+        // limit with the records (X09 item 447). A commit larger than the limit on its
+        // own drains the queue and is queued alone.
+        #[cfg(feature = "text")]
+        let staged = text.as_ref().map_or(0, crate::text::Staged::bytes);
+        #[cfg(not(feature = "text"))]
+        let staged = 0;
         // The commit record counts the commits before it that may not be durable yet
         // in one byte, which a full queue keeps far below its limit.
-        if group.full(self.wal_bytes()) || self.unfenced(store) >= MAX_UNFENCED {
+        if group.full(bytes + staged) || self.unfenced(store) >= MAX_UNFENCED {
             store.drain_group(&mut self.guard, Some(&self.opts))?;
         }
         // Publication only lowers the count, so reading it early stays conservative.
         let unfenced = u8::try_from(self.unfenced(store)).expect("drained above");
-        self.check_storage()?;
-        let generation = self.base.generation.clone();
-        let c = self.next_commit(validation.as_deref());
-        let bytes = self.wal_bytes();
         let prealloc = self.wal_prealloc();
-        // The descriptor clone fails before any byte of this transaction is written. The
-        // commit's terms stay in memory until its fence writes them with its records.
+        // The descriptor clone fails before any byte of this transaction is written.
         let owned_wal = self
             .guard
             .wal
@@ -722,52 +794,7 @@ impl WriteTxn<'_> {
         // number and its place in the log, and a failure poisons the writer.
         let wal_start = w.wal_len;
         w.wal_len += bytes;
-        store.quota.queue(bytes);
-        let mut snapshot = Snapshot {
-            cacheable: true,
-            dataset_id: self.base.dataset_id,
-            generation: generation.clone(),
-            delta: std::mem::take(&mut self.delta),
-            version: self.base.version + 1,
-            cache: self.base.cache.clone(),
-            results: self.base.results.clone(),
-            dvocab_len: generation.dvocab.len(),
-            commit: c.seq,
-            text: self.base.text.clone(),
-            geo: self.base.geo.clone(),
-            union_default_graph: self.base.union_default_graph,
-            geo_op_vertices: self.base.geo_op_vertices,
-            counts: Default::default(),
-            mask: None,
-            historical: false,
-            change_log: self.base.change_log.clone(),
-        };
-        // The index state of the speculative snapshot (X09 section 17.4, step 1). The
-        // spatial view is a value computed from the base's, which a failed fence drops
-        // with the snapshot. The full-text changes are only staged here, and nothing of
-        // either reaches the disk.
-        store.maintain_geo(&mut snapshot, &self.base, &self.log);
-        // The commit holds its number, its place in the log and its annotation record,
-        // so a panic while staging must not unwind past the queue: the next commit would
-        // reuse its number and leave a gap where its records were to go. The writer is
-        // poisoned instead, as after a failed write.
-        #[cfg(feature = "text")]
-        let text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            store.stage_text(&mut snapshot, &self.log)
-        })) {
-            Ok(text) => text,
-            Err(_) => {
-                tracing::error!(
-                    target: "sparkles::store",
-                    seq = c.seq,
-                    "staging a grouped commit's full-text changes panicked; writes are refused until the store is reopened"
-                );
-                w.poisoned = true;
-                store.quota.dequeue(bytes);
-                group.fail();
-                return Err(Error::Poisoned);
-            }
-        };
+        store.quota.queue(bytes + terms);
         let snapshot = Arc::new(snapshot);
         // A compaction that is building carries this commit into its new generation. It
         // takes commits only after the writer lock's drain has made the queue durable, so
@@ -785,12 +812,6 @@ impl WriteTxn<'_> {
             }
         }
         let ticket = Arc::new(Ticket::default());
-        // Staged documents hold their whole literals, so they count against the queue's
-        // limit with the records (X09 item 447).
-        #[cfg(feature = "text")]
-        let staged = text.as_ref().map_or(0, crate::text::Staged::bytes);
-        #[cfg(not(feature = "text"))]
-        let staged = 0;
         let pending = Pending {
             info: c,
             snapshot: snapshot.clone(),
@@ -803,6 +824,7 @@ impl WriteTxn<'_> {
             tail: w.tail.clone(),
             prealloc,
             bytes: bytes + staged,
+            queued: bytes + terms,
             ticket: ticket.clone(),
             validation: validation.clone(),
             annotation: annotation.clone(),
@@ -815,7 +837,7 @@ impl WriteTxn<'_> {
         w.staged = Some(snapshot);
         if let Err(e) = group.enqueue(pending) {
             w.poisoned = true;
-            store.quota.dequeue(bytes);
+            store.quota.dequeue(bytes + terms);
             return Err(e);
         }
         store.failpoint("group-enqueued-writer-held");
@@ -2266,6 +2288,164 @@ mod tests {
         assert_eq!(a1.join().unwrap().unwrap().commit.seq, 2);
         assert_eq!(a2.join().unwrap().unwrap().commit.seq, 3);
         assert_eq!(s.snapshot().commit, 3);
+    }
+
+    /// A caller that drains the group and leads a fence that fails returns only once the
+    /// prefix before it has published, so that an installer that drains never installs a
+    /// view that the earlier prefix's publication then replaces.
+    #[test]
+    fn a_failed_drain_waits_for_the_prefix_still_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit, go) = pause(&s, "group-published");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        // a queued commit whose thread leaves the fence to the draining caller
+        let y_go = Arc::new(AtomicBool::new(false));
+        {
+            let y_go = y_go.clone();
+            s.set_failpoint(
+                "group-wait-observed",
+                Some(Arc::new(move |_| {
+                    let until = Instant::now() + Duration::from_secs(10);
+                    if thread::current().name() == Some("y") {
+                        while !y_go.load(Ordering::SeqCst) && Instant::now() < until {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                })),
+            );
+        }
+        let y = {
+            let s = s.clone();
+            thread::Builder::new()
+                .name("y".into())
+                .spawn(move || insert(&s, "two"))
+                .unwrap()
+        };
+        queued(&s, 1);
+        s.fail_next_group_sync();
+        let (done, finished) = mpsc::channel();
+        let drainer = {
+            let s = s.clone();
+            thread::spawn(move || {
+                let mut w = s.writer.lock();
+                let r = s.drain_group(&mut w, None);
+                done.send(()).unwrap();
+                r
+            })
+        };
+        // the drainer led the failed fence, and the first prefix still publishes
+        let until = Instant::now() + Duration::from_secs(5);
+        while s.group.as_ref().unwrap().fences.load(Ordering::Relaxed) < 2 {
+            assert!(Instant::now() < until, "the drainer did not lead the fence");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            finished.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the drain returned while the first prefix was publishing"
+        );
+        go.send(()).unwrap();
+        assert!(matches!(drainer.join().unwrap(), Err(Error::Poisoned)));
+        assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+        y_go.store(true, Ordering::SeqCst);
+        assert!(matches!(y.join().unwrap(), Err(Error::Poisoned)));
+        assert_eq!(s.snapshot().commit, 1);
+    }
+
+    /// The quota counts a queued commit's new terms as well as its records, though its
+    /// fence writes both later. Commits of long new literals queued behind a running fence
+    /// reach the quota while the fence still runs.
+    #[test]
+    fn queued_terms_count_against_the_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        insert(&s, "seed").unwrap();
+        s.set_quota(Some(s.disk_usage() + (1 << 20))).unwrap();
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut waiting = Vec::new();
+        let mut refused = None;
+        for i in 0..8 {
+            let (done, finished) = mpsc::channel();
+            let t = {
+                let s = s.clone();
+                thread::spawn(move || {
+                    let u = format!(
+                        "INSERT DATA {{ <urn:long{i}> <urn:p> \"{}{i}\" }}",
+                        "x".repeat(300 << 10)
+                    );
+                    let r = crate::sparql::update::update(&s, &u, &Default::default());
+                    let _ = done.send(());
+                    r.map(|_| ())
+                })
+            };
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                if s.group.as_ref().unwrap().queued() > waiting.len() {
+                    waiting.push(t);
+                    break;
+                }
+                if finished.try_recv().is_ok() {
+                    refused = Some(t.join().unwrap());
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "commit {i} neither queued nor finished"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            if refused.is_some() {
+                break;
+            }
+        }
+        let refused = refused.expect("the quota never refused a queued commit's terms");
+        assert!(
+            matches!(&refused, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::DatasetBytes),
+            "{refused:?}"
+        );
+        assert!(
+            waiting.len() < 4,
+            "{} commits of 300 KiB fit in 1 MiB",
+            waiting.len()
+        );
+        go.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        for t in waiting {
+            t.join().unwrap().unwrap();
+        }
+    }
+
+    /// A directory walk for the quota during a fence sees the files the fence grew, and the
+    /// fence then adds the same growth. The fence makes the next use of the quota walk the
+    /// directory again, so the count is not left inflated.
+    #[test]
+    fn a_quota_walk_during_a_fence_is_not_counted_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        s.set_quota(Some(1 << 40)).unwrap();
+        s.set_failpoint(
+            "group-written",
+            Some(Arc::new(|st: &Store| {
+                st.quota.remeasure();
+                st.quota.used();
+            })),
+        );
+        // the first fence preallocates, so it grows the log by a step
+        insert(&s, "one").unwrap();
+        s.set_failpoint("group-written", None);
+        let counted = s.quota.used();
+        s.quota.remeasure();
+        let measured = s.quota.used();
+        assert_eq!(counted, measured, "the fence's growth was counted twice");
     }
 
     /// A publisher that panics fails the prefix synchronized behind it: those commits are

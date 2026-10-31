@@ -302,6 +302,13 @@ pub struct VocabMark {
     legacy: bool,
 }
 
+impl VocabMark {
+    /// The vocabulary's entries when the mark was taken.
+    pub(crate) fn entries(&self) -> u64 {
+        self.entries
+    }
+}
+
 /// The persisted, append-only delta vocabulary (terms introduced by updates).
 ///
 /// Readers and the single writer share it through an `RwLock`; ids only ever grow, so a
@@ -933,6 +940,16 @@ impl DeltaVocab {
     /// [`sync`](Self::sync) or [`flush`](Self::flush) writes them.
     pub fn insert(&self, key: &[u8]) -> Result<u64> {
         Ok(self.inner.write().insert(key).0)
+    }
+
+    /// The bytes that entries `from` onwards take in a chunk of the file, without the
+    /// chunk's header: what a group commit's quota counts for its terms before its fence
+    /// writes them.
+    pub(crate) fn key_bytes(&self, from: u64) -> u64 {
+        let v = self.inner.read();
+        v.keys
+            .get(from as usize..)
+            .map_or(0, |k| k.iter().map(|k| 4 + k.len() as u64).sum())
     }
 
     /// Where the vocabulary ends now, for a later [`rollback`](Self::rollback).

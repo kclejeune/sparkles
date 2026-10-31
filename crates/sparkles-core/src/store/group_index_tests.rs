@@ -214,9 +214,10 @@ fn a_search_from_a_speculative_head_waits_for_its_publication() {
 }
 
 /// A commit's staged documents count against the queue's 4 MiB limit with its records
-/// (X09 item 447). One label of 5 MiB has a few records but stages a document that holds
-/// the whole literal, so the queue is full behind it and the next commit drains first,
-/// leading a fence of its own.
+/// (X09 item 447), at admission as well. A label of 1.5 MiB has a few records but stages a
+/// document that holds the literal in a buffer of 2 MiB. With one such commit queued behind a running fence, a second one does not
+/// fit, so it drains the queue before it joins, and waits for the fence instead of
+/// queueing.
 #[cfg(feature = "text")]
 #[test]
 fn staged_documents_count_against_the_queue_limit() {
@@ -230,29 +231,39 @@ fn staged_documents_count_against_the_queue_limit() {
         thread::spawn(move || label(&s, "b", "bravo"))
     };
     observed.recv_timeout(Duration::from_secs(10)).unwrap();
-    let long = format!("charlie {}", "x".repeat(5 << 20));
+    let long = |word: &str| format!("{word} {}", "x".repeat(1536 << 10));
+    let queued_len = || s.group.as_ref().unwrap().queued();
     let second = {
-        let s = s.clone();
-        thread::spawn(move || label(&s, "c", &long))
+        let (s, text) = (s.clone(), long("charlie"));
+        thread::spawn(move || label(&s, "c", &text))
     };
-    let g = s.group.as_ref().unwrap();
     let until = Instant::now() + Duration::from_secs(10);
-    while !g.full(0) {
-        assert!(
-            Instant::now() < until,
-            "the long label did not fill the queue"
-        );
+    while queued_len() < 1 {
+        assert!(Instant::now() < until, "the first long label did not queue");
         thread::sleep(Duration::from_millis(1));
     }
+    let (done, finished) = mpsc::channel();
+    let third = {
+        let (s, text) = (s.clone(), long("delta"));
+        thread::spawn(move || {
+            let r = label(&s, "d", &text);
+            done.send(()).unwrap();
+            r
+        })
+    };
+    // the third commit drains instead of joining the queue, and the fence is paused
+    assert!(finished.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(queued_len(), 1, "a second long label joined a full queue");
     resume.send(()).unwrap();
     first.join().unwrap().unwrap();
     second.join().unwrap().unwrap();
-    assert_eq!(s.snapshot().commit, 3);
+    third.join().unwrap().unwrap();
+    assert_eq!(s.snapshot().commit, 4);
     assert_eq!(
         text_hits(s.snapshot(), "bravo").unwrap(),
         BTreeSet::from(["urn:b".to_string()])
     );
-    assert!(g.idle());
+    assert!(s.group.as_ref().unwrap().idle());
 }
 
 #[cfg(feature = "text")]

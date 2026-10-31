@@ -77,6 +77,8 @@ pub(crate) struct Quota {
     /// the records of grouped commits queued for their fence, which the leader writes to
     /// the log later: counted as if they were in it
     queued: AtomicU64,
+    /// directory walks so far
+    measures: AtomicU64,
 }
 
 impl Quota {
@@ -97,6 +99,7 @@ impl Quota {
             preallocated: AtomicU64::new(0),
             vocab_preallocated: AtomicU64::new(0),
             queued: AtomicU64::new(0),
+            measures: AtomicU64::new(0),
         })
     }
 
@@ -115,6 +118,7 @@ impl Quota {
         let Some(root) = &self.root else { return 0 };
         let mut m = self.measured.lock();
         if m.is_none_or(|t| t.elapsed() >= MAX_AGE) {
+            self.measures.fetch_add(1, Ordering::Relaxed);
             let building = self.excluded.lock().as_deref().map_or(0, dir_size);
             self.used
                 .store(dir_size(root).saturating_sub(building), Ordering::Relaxed);
@@ -126,6 +130,18 @@ impl Quota {
             self.preallocated.load(Ordering::Relaxed)
                 + self.vocab_preallocated.load(Ordering::Relaxed),
         )
+    }
+
+    /// How many times the directory was walked, so that a group commit fence can tell
+    /// whether a walk saw part of its growth.
+    pub(crate) fn measures(&self) -> u64 {
+        self.measures.load(Ordering::Relaxed)
+    }
+
+    /// Measure the directory again on the next use: a walk during a fence may have seen
+    /// the fence's growth, which the fence then counted again.
+    pub(crate) fn remeasure(&self) {
+        *self.measured.lock() = None;
     }
 
     /// A grouped commit queued `bytes` of records for its fence to write.
