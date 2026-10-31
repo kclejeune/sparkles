@@ -69,8 +69,8 @@ Twelve threads make `q3` 34% faster and `q5` 24% faster, and `q8` 12% slower. Th
 other templates move by 6% or less, and Explore `q7` and `q8` stay between 3.68 and
 3.91 ms. On atlas, a host with the same processor, the slower side of the `q3` plan's
 hash join changes from one server process to another, and each side then takes twice
-its usual time. This fits a sequential part of an operator that runs on an efficiency
-core. The default pool size stays at the number of logical CPUs, because no single
+its usual time. Work that lands on an efficiency core would explain this, but the
+servers were not pinned, so the run does not establish placement. The default pool size stays at the number of logical CPUs, because no single
 size is faster on every template.
 
 These two passes ran Sparkles alone in the results directory of the earlier passes. Their

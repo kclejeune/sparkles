@@ -1761,12 +1761,14 @@ where `d65eaf40` took 41.40 ms. Every instance returns the same answers from bot
 engines. The Explore rows leave the loss list, and the BI `q3` row now gives QLever
 1.09 and 1.12 times.
 
-The same run timed every BI template with twelve and twenty query threads. Twelve
-threads, one per logical CPU of the performance cores, make `q3` take 22.65 ms instead
-of 34.37 ms and `q5` 23.17 ms instead of 30.68 ms, but make `q8` 12% slower. Item 449
-records this as the likely cause of its slow server processes, together with the
-observation on atlas that the slower side of the `q3` hash join changes between server
-processes. The default pool keeps one thread per logical CPU.
+The same run timed every BI template with twelve and twenty query threads, without
+pinning the server to particular CPUs. Twelve is the number of logical CPUs of the
+performance cores. Twelve threads make `q3` take 22.65 ms instead of 34.37 ms and `q5`
+23.17 ms instead of 30.68 ms, but make `q8` 12% slower. On atlas, a host with the same
+processor, the slower side of the `q3` hash join changes between server processes.
+Work that lands on an efficiency core would explain both observations, but the run did
+not control placement. Item 449 records the thread-count effect as a possible cause of
+its slow server processes. The default pool keeps one thread per logical CPU.
 
 The Namespace screen of the first version flagged `optional-chain` at +10.6%, which
 sorted the left side's keys before the probe's cost check. It also flagged

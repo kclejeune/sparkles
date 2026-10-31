@@ -258,7 +258,7 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   expression of a BIND or SELECT expression directly below it orders by that
   expression's variable, so `SELECT (?a / ?b AS ?r) … ORDER BY DESC(?a / ?b)` evaluates
   the division once per row. The variable is unbound where the expression is an error,
-  and both order first. Expressions with `RAND`, `UUID`, `STRUUID`, `BNODE`, `EXISTS` or
+  and an unbound value takes the same place in the order as an error. Expressions with `RAND`, `UUID`, `STRUUID`, `BNODE`, `EXISTS` or
   a function outside SPARQL and the XSD casts are evaluated again.
 * **Ordered-scan top-k.** `ORDER BY ?v LIMIT k` (with or without OFFSET) over one triple
   pattern and its FILTERs reads the pattern in `?v` order and stops once the first k rows

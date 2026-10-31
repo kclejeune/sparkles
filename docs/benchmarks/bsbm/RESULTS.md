@@ -60,9 +60,7 @@ Sparkles has the lower pooled q5 median in both paired passes. The closest insta
 takes a mean of 4.58 ms against Fluree's 4.76 ms, within 4%. Sparkles also has the
 lower pooled q7 and q8 medians in both paired passes against Oxigraph. The second pass
 gives 3.83 and 3.63 ms against 4.03 and 3.93 ms, and all six instances return the same
-answers from both engines. Before the probed OPTIONAL and the comparisons decided on
-ids, the same forge pairing gave Sparkles `d65eaf40` 5.21 and 5.79 ms against 4.11 and
-3.91 ms.
+answers from both engines.
 
 The driver ran fifty warm-up mixes and five hundred measured mixes with each
 client count. The standard mix includes DESCRIBE and CONSTRUCT, which the driver
@@ -160,8 +158,7 @@ Fluree's q3 and q8 answers and two QLever q8 answers remain unresolved fingerpri
 disagreements. The q3 and q8 exclusions have no independent data oracle. Sparkles has
 the lowest median on q1, q2 and q4 to q8. Its q4 lead over Fluree is within 10%.
 QLever remains 1.09 times faster on q3, where its answers agree with Sparkles'. The
-second paired pass gives 33.03 ms against 29.46 ms, 1.12 times, and Sparkles `d65eaf40`
-took 41.40 ms against 31.09 ms. Sparkles leads on the first and third instances and
+second paired pass gives 33.03 ms against 29.46 ms, 1.12 times. Sparkles leads on the first and third instances and
 trails on the second. Its q3 time depends on the size of the query thread pool on the
 hybrid cores of forge, where twelve threads give 22.65 ms and the default of twenty
 gives 34.37 ms, as the [Wave A run](runs/2026-10-31-wave-a-forge/README.md#thread-pool-size)
