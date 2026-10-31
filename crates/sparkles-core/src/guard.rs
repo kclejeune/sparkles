@@ -225,14 +225,16 @@ impl WriteOptions {
         Ok(())
     }
 
-    /// [`check`](Self::check), then the [`before_publish`](Self::before_publish) hook:
+    /// [`check`](Self::check), then the [`before_publish`](Self::before_publish) hook,
+    /// then `check` again, since the hook may wait past the deadline or a cancellation:
     /// the last check of a write before it is published.
     pub fn check_publish(&self) -> Result<()> {
         self.check()?;
-        match &self.before_publish {
-            Some(hook) => (hook.0)(),
-            None => Ok(()),
+        if let Some(hook) = &self.before_publish {
+            (hook.0)()?;
+            self.check()?;
         }
+        Ok(())
     }
 }
 

@@ -7055,7 +7055,7 @@ fn streams_exceed(sources: &[Source], limit: u64, o: &crate::guard::WriteOptions
         };
         // the magic bytes that tell the codec, read under the same checks
         r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
-        r.decode(s.codec()?, s.max_decompressed)?;
+        r.decode(s.codec()?, s.max_decompressed, o)?;
         let want = (limit + 1).saturating_sub(bytes);
         let held = r.read_ahead(usize::try_from(want).unwrap_or(usize::MAX), &|| o.check())?;
         bytes += held as u64;
@@ -7896,6 +7896,86 @@ mod tests {
         };
         let t = std::time::Instant::now();
         let src = Source::from_reader(Slow, RdfFormat::NTriples, None);
+        let e = store
+            .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
+            .unwrap_err();
+        assert!(matches!(e, Error::Timeout), "{e}");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn a_publish_hook_that_waits_past_the_deadline_publishes_nothing() {
+        let quads = |n: usize| {
+            (0..n)
+                .map(|i| format!("<http://e/s{i}> <http://e/p> \"{i}\" .\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        // the bulk path into an empty store, and a transaction into one that holds data
+        for filled in [false, true] {
+            let store = Store::in_memory(StoreOptions::default());
+            if filled {
+                store
+                    .load(&[Source::from_bytes(quads(2), RdfFormat::NTriples, None)])
+                    .unwrap();
+            }
+            let before = store.snapshot().len();
+            let o = crate::guard::WriteOptions {
+                deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(200)),
+                before_publish: Some(crate::guard::PublishHook::new(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    Ok(())
+                })),
+                ..Default::default()
+            };
+            let src = Source::from_bytes(quads(50), RdfFormat::NTriples, None);
+            let e = store.load_with(&[src], CommitKind::Load, &o).unwrap_err();
+            assert!(matches!(e, Error::Timeout), "{e}");
+            assert_eq!(store.snapshot().len(), before, "filled {filled}");
+            store
+                .load(&[Source::from_bytes(quads(1), RdfFormat::NTriples, None)])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_gzip_header_that_trickles_stops_at_the_deadline() {
+        /// A gzip header that names a file, whose name never ends.
+        struct Header(usize);
+        impl std::io::Read for Header {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                // magic, deflate, the FNAME flag, time, flags and OS
+                const START: [u8; 10] = [0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3];
+                if self.0 < START.len() {
+                    let n = buf.len().min(START.len() - self.0);
+                    buf[..n].copy_from_slice(&START[self.0..self.0 + n]);
+                    self.0 += n;
+                    return Ok(n);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                buf[0] = b'a';
+                Ok(1)
+            }
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let o = crate::guard::WriteOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)),
+            ..Default::default()
+        };
+        let t = std::time::Instant::now();
+        let src = Source::from_reader(Header(0), RdfFormat::NTriples, None);
         let e = store
             .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
             .unwrap_err();

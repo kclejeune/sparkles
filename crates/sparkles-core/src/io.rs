@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Minimum bytes per chunk before splitting a document for parallel parsing.
 const PARALLEL_MIN_CHUNK: usize = 8 << 20;
@@ -84,6 +85,27 @@ struct ReaderState {
     reader: Option<Box<dyn Read + Send>>,
     /// `reader` and `head` hold the decompressed stream (see [`ReaderSource::decode`])
     decoded: bool,
+    /// the write controls that every read of the raw stream checks once it is decoded
+    controls: Controls,
+}
+
+/// The write controls of a [`ReaderSource`], shared with its [`Controlled`] stream.
+type Controls = Arc<Mutex<Option<crate::guard::WriteOptions>>>;
+
+/// A raw stream that checks the write controls before every read, beneath the decoder,
+/// which can make many reads of its own, such as through a long gzip header.
+struct Controlled {
+    inner: Box<dyn Read + Send>,
+    controls: Controls,
+}
+
+impl Read for Controlled {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(o) = self.controls.lock().as_ref() {
+            o.check().map_err(std::io::Error::other)?;
+        }
+        self.inner.read(buf)
+    }
 }
 
 impl ReaderState {
@@ -120,6 +142,7 @@ impl ReaderSource {
             head: Vec::new(),
             reader: Some(Box::new(reader)),
             decoded: false,
+            controls: Arc::default(),
         }))
     }
 
@@ -139,23 +162,37 @@ impl ReaderSource {
 
     /// Put the decompressing reader of `codec` in front of the stream, with the bytes
     /// read ahead replayed into it, so that later reads ahead count decoded bytes. The
-    /// source's compression is then [`Codec::None`]. A second call does nothing.
-    pub(crate) fn decode(&self, codec: Codec, max_decompressed: Option<u64>) -> Result<()> {
+    /// source's compression is then [`Codec::None`]. Every later read of the raw stream,
+    /// including the decoder's own, first checks `controls`. A second call only replaces
+    /// the controls.
+    pub(crate) fn decode(
+        &self,
+        codec: Codec,
+        max_decompressed: Option<u64>,
+        controls: &crate::guard::WriteOptions,
+    ) -> Result<()> {
         let mut state = self.0.lock();
+        *state.controls.lock() = Some(controls.clone());
         if state.decoded {
             return Ok(());
         }
-        if codec != Codec::None {
-            let Some(reader) = state.reader.take() else {
-                return Err(Error::invalid("a reader source can be read only once"));
-            };
-            let head = std::mem::take(&mut state.head);
-            let raw = PrefixReader {
-                prefix: Some(Cursor::new(head)),
-                reader,
-            };
-            state.reader = Some(codec.reader_send(raw, max_decompressed)?);
-        }
+        let Some(reader) = state.reader.take() else {
+            return Err(Error::invalid("a reader source can be read only once"));
+        };
+        let raw = Controlled {
+            inner: reader,
+            controls: state.controls.clone(),
+        };
+        let head = std::mem::take(&mut state.head);
+        let replayed = PrefixReader {
+            prefix: Some(Cursor::new(head)),
+            reader: raw,
+        };
+        state.reader = Some(if codec == Codec::None {
+            Box::new(replayed)
+        } else {
+            codec.reader_send(replayed, max_decompressed)?
+        });
         state.decoded = true;
         Ok(())
     }
