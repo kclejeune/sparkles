@@ -1000,3 +1000,45 @@ changed, so `build` refuses a projection name that is not a valid catalog name a
 `metric` other than `jaccard` and `overlap`, with a test for each. Integer parameters
 keep their exact value. An integer literal is read as an integer, and a decimal or
 double is accepted for an integer parameter only when it is whole and at most 2^53.
+
+### Roadmap follow-ups
+
+#### Analytics library workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 463, the analytics library workstream. Each phase gets its own numbered item when it is ready to start.
+
+**DAG toolkit.** Add topological sort, cycle witness, longest or critical path and transitive reduction as algo: services. Dependency graphs and protocols are DAGs, and build order, depth tiers and cycle reports are core questions. SCC finds cycles only indirectly. It depends on item 8.
+
+**Centrality pack.** Add closeness, harmonic, weighted directional degree, eigenvector, HITS and ArticleRank. Standard GDS and Neptune algorithms are absent from the 15-algorithm registry, which shows in head-to-head comparisons. They are cheap on the existing CSR and pool. It depends on item 8.
+
+**Structural criticality.** Add articulation points, bridges, biconnected components and a Lengauer-Tarjan dominator tree from a root. They find single points of failure, and a dominator tree answers what depends only on X. It depends on item 8.
+
+**Random walk with restart and batched personalized PageRank.** Return top-k per source with one vector per source in a batch, Pixie-style visit counts and an exposed `algo:randomWalk`. Personalized PageRank returns one full vector for one source set, and random walks are internal to node2vec. It depends on item 8.
+
+**Branch and commit diff of algorithm results.** Run an algorithm on two commits or branches and return a joined, ranked delta. Branches give what-if sandboxes, but comparing results needs hand-written joins. It depends on item 340.
+
+**Similarity metric breadth.** Add cosine over neighbourhoods or properties, weighted Jaccard, and filtered source and target sets to nodeSimilarity. `algo:metric` accepts only jaccard and overlap. It depends on item 8.
+
+**Topological link prediction scores.** Add Adamic-Adar, common neighbours, preferential attachment, resource allocation, total neighbours and same community. They are cheap candidate-generation features for recommendation and entity resolution. It depends on item 8.
+
+**kNN graph from a vector index.** Expose HNSW neighbour lists as an algo: projection or as edges. It enables community detection and label propagation over embeddings, and the embedding map already draws these lists. It depends on item 142.
+
+**Minimum spanning tree, Steiner tree, max-flow and min-cut.** Add MST, Steiner tree, max-flow, min-cut and min-cost flow. Min-cut answers how many suppliers must fail, and Steiner trees give minimal explanation subgraphs. It depends on item 8.
+
+**A* and delta-stepping SSSP.** Add A* with a geo or embedding heuristic and parallel delta-stepping for SSSP at scale. Graphalytics SSSP and GeoSPARQL routing both benefit. It depends on items 8 and 24.
+
+**HashGNN and property-aware FastRP.** Use node properties in embeddings without training infrastructure. FastRP ignores properties today. It depends on item 8.
+
+**Ontology semantic similarity.** Add Resnik, Lin, Jiang-Conrath and simGIC similarity using information content over the class hierarchy. Gene and phenotype similarity over HPO and GO and disease matching need it.
+
+**Data-quality scores and numeric outlier detection.** Compute completeness, consistency and freshness scores per class or source and flag numeric outliers. Dashboards need scalars and trends. It depends on item 31.
+
+**Incremental WCC, PageRank and label propagation.** Maintain these results as F13 views after each commit. F14 §13 mentions it as later work, and none of items 413 to 429 does it. It depends on items 413, 414 and 417.
+
+**Small-graph summaries and partition scoring.** Add APSP for small graphs, eccentricity, diameter, radius, global clustering, k-truss, and modularity and conductance of a supplied partition. They give network summary statistics and community quality checks, such as on GraphRAG communities. It depends on item 8.
+
+**DFS order output.** Expose DFS discovery and finish order. `path:search` lists paths but not DFS order. It depends on item 8.
+
+**Seeded label propagation.** Accept seed labels for semi-supervised label propagation. The CDLP tie rule ships, but seeded or semi-supervised labels are missing. It depends on item 8.
+
+**Motif and graphlet counting and frequent subgraph mining.** Count graphlets and mine frequent subgraphs. Fraud detection and recurring dependency patterns use them. It depends on item 8.

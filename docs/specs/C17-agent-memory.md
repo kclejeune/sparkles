@@ -1575,3 +1575,27 @@ The richer evidence is information for contextual ranking and for deciding when 
 lookup is needed. It does not change `exact` or `ambiguous` advice, suppress clarification
 or authorize merging entities. Item 263 keeps contextual resolution and end-to-end
 accuracy and latency evaluation open.
+
+### Roadmap follow-ups
+
+#### Agent platform workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 462, the agent platform workstream, whose primary spec is [C33](C33-agent-platform-controls/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Synchronous remember(text) tool.** Extract, link and assert from text in one call and hold the result for review. Server ingestion is asynchronous and document-only. It depends on item 77.
+
+**Automatic contradiction invalidation.** Close the validity of a conflicting old fact when a new one arrives, under policy and with the record kept. Item 341 adds valid time but no automatic invalidation. It depends on items 81 and 341.
+
+**Entity history tool.** Return one resource's changes and superseded values across commits or valid time. It answers what was believed and when without composing `list_changes`. It depends on item 341.
+
+**Stored-query proposals under review.** Let agents propose stored queries to a review queue that a person accepts. The stored-query library then grows from agent work.
+
+**Per-row provenance in query results.** Add graph, source and reifier columns to `sparql_query` and `describe_resource` on request. Citations exist only in recall and community findings. It depends on item 81.
+
+**Bounded subgraph extraction.** Add `extract_subgraph` with more than two hops, per-predicate fan-out caps and a byte target. recall stops at two hops.
+
+**Ontology-change proposals.** Add `propose_terms`, which writes new classes or predicates to a review branch. It gives agents a path forward without inventing terms. It depends on item 81.
+
+**Mem0-style memory facade.** Offer add, search, `get_all` and delete over `assert_facts` and recall on HTTP and in SDKs. It eases migration from popular memory layers. C17 §12 rejects a single MCP memory tool with an action argument, so the facade stays outside MCP.
+
+**Memory decay that changes stored state.** Add per-dataset retention that moves expired facts out of the current state while history keeps them. The default stays ranking-only decay. Recall uses a recency half-life for ranking only. It depends on item 81. It ships only as an option, and the default stays ranking-only decay.

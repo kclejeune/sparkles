@@ -897,3 +897,29 @@ bootstrap source, full file digest, JSON pointer and expected schema digest in t
 compatibility inventory. Current descriptions must use the valid media-type layout.
 Changed old bytes, another malformed location or extra old schema annotations do not
 qualify for the rule. The historical baseline itself remains byte-preserved.
+
+### Roadmap follow-ups
+
+#### Security and audit workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 466, the security and audit workstream, whose primary spec is [C34](C34-audit-and-erasure/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Release SBOM and vulnerability report.** Attach an SPDX or CycloneDX SBOM and dependency scan to each release. Supply-chain consumers expect one with each release. It depends on item 59.
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Kubernetes operator and multi-replica chart.** Add CRDs for datasets, backups and replicas and a multi-replica chart. The Helm chart is a single-replica StatefulSet. It depends on items 59, 66 and 280.
+
+**Terraform provider.** Manage datasets, grants, backups and settings as code. No provider exists. It depends on items 47 and 60.
+
+**Package size budget.** Set size budgets for the wheel, JVM library and Node addon, with optional components. The wheel grew 40.7% to 19.5 MB compressed. It depends on item 58.
+
+**Managed-service shape.** Build a multi-tenant control plane with metering and per-tenant isolation. No managed shape exists. It depends on item 66.
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**crates.io publication.** Publish the library and client crates and settle the crate name. Rust embedders need git dependencies today, and item 58 covers PyPI, Maven and npm only. It depends on items 59 and 60.

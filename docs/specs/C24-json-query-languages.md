@@ -528,3 +528,11 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 72.
+
+### Roadmap follow-ups
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**SQL surface over shape-derived tables with pgwire.** Derive tables from SHACL shapes or characteristic sets and serve SQL over the Postgres wire protocol for BI tools. No SQL surface exists. It depends on item 72.

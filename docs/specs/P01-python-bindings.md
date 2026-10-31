@@ -1347,3 +1347,11 @@ Each regression test failed on the build before its fix, and
 one-triple one in a new process takes 6.4 ms instead of 2.7 ms, which roadmap item
 445 tracks. The [loading results](../benchmarks/loading/RESULTS.md#python-file-objects)
 record the measurements.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Python client for a remote server.** Give the Python package a client for a remote Sparkles server with the same API as the embedded store. Python users of a shared server currently need a generic SPARQL client.

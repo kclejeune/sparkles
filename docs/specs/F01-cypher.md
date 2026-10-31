@@ -1288,3 +1288,13 @@ Nothing is built.
   compile time and the run time beside the SPARQL query's, so the cost of the frontend
   is measured. Queries outside the subset are listed with the feature that excludes
   them.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Bolt protocol.** Speak Bolt so Neo4j drivers, Browser and cypher-shell connect. Neo4j tooling cannot use the openCypher endpoint. It depends on item 20.
+
+**ISO GQL frontend.** Add a GQL frontend sharing item 20's property-graph lowering. F01 and F07 borrow only GQL path modes. It depends on item 20.
+
+**SQL/PGQ.** Add SQL/PGQ graph queries on top of *SQL surface over shape-derived tables with pgwire*'s SQL surface. Only F07's sources cite it. It depends on item 20.

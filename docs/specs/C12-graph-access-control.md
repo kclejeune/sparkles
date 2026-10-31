@@ -843,3 +843,13 @@ evidence and the parts that entry leaves out.
   for `ex:email` on every person, and the answer says `scope: "view"`; a restricted
   writer's rejected write lists its own failing focus node and counts the others as
   hidden.
+
+#### Security and audit workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 466, the security and audit workstream, whose primary spec is [C34](C34-audit-and-erasure/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Value masking at query time.** Mask literal values by role with hashes, partial or generalized values. C12b hides whole triples only. Item 77 redacts ingested documents only. It depends on item 75.
+
+**ABAC over request and environment attributes.** Let protection conditions test token claims, the client IP and the request time inside the existing protection model, without a separate policy language. Protections bind only name, roles and groups. It depends on item 395.
+
+**Deny rules and per-graph exceptions.** Add deny rules and exceptions for single graphs to protections, with a fixed precedence between allow and deny. Administrators expect to carve exceptions out of broad grants.

@@ -301,3 +301,11 @@ The mode is part of the index files' identity where it changes what is indexed (
 CRSs). It never changes a dataset without the setting. Acceptance: with the mode on,
 each of the benchmark's misses that the Conformance paragraph attributes to these
 choices passes, and the score with the mode is reported beside the default's.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Geometry validity and strict geometry writes.** Add `isValid`, `makeValid` and `simplify` and an opt-in rejection of ill-typed geometry literals. Invalid geometries give wrong topology. It depends on item 24.
+
+**GIS file import.** Load Shapefile, GeoPackage, GeoParquet and FlatGeobuf into geometry literals. Open geodata rarely arrives as RDF. It depends on items 24 and 237.

@@ -1883,3 +1883,17 @@ administration surface in Python, JVM and Node. Deferred helper and policy/utili
 entries have been implemented. The newer explicit Rust branch-relink operation has
 a separate binding follow-up entry. The corresponding binding specs describe
 their supported controls, lifetime rules and deferred APIs.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Branch-aware point-in-time reads in the library.** Move `snapshot_for` into `Dataset` and let validation read a past state. Embedders cannot reproduce the server's `at` on a branch.
+
+**Binding parity for planned entries.** Close the 35 `planned` entries in `crates/sparkles/bindings.toml`, which are 22 JVM and 13 Node.js. It depends on items 32, 33 and 58.
+
+**MCP tools in the parity test.** Map every MCP tool to a library call and fail on gaps. MCP is a third surface that grows quickly.
+
+**Runtime handle for the backup handle.** Let embedders pass their Tokio runtime to `BackupRuntime`. P06 allows it and the build does not.

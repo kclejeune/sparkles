@@ -1138,3 +1138,23 @@ Acceptance extends the existing work, memory and rebuild test to compare all thr
 representations after queries, updates, successful compact/bulk publications and
 failed or abandoned builds. Test histogram sums/counts, unseen datasets, reopen/reset
 behavior and the exporter-disabled build. No new counters belong on inner executor loops.
+
+### Roadmap follow-ups
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Query text or hash in the access log and a slow-query log.** Log a normalized query hash and optionally text, add a slow-query threshold and a separate log target. The access log has timings and memory but not the query (`API.md`:213-240). It depends on item 342.
+
+**Per-statement statistics endpoint.** Aggregate calls, total and mean time, rows and peak memory per normalized statement, with read and reset endpoints. Prometheus has only aggregate histograms. It depends on items 27, 32 and 342.
+
+**Per-principal budgets and quota reporting.** Bound query-seconds, CPU, result bytes and tool calls per principal and window, and report usage. Rate limits are per client and class, and item 224 limits only live queries. It depends on items 42 and 224.
+
+**Cancellable embedding executor.** Give `embed_until_idle` cancellation and progress and expose them in the bindings. Embedding is the longest unattended call for agent memory. It depends on item 14.
+
+**Priority classes in admission.** Add interactive, batch and background classes and CPU or slot weighting to the FIFO memory pool. Admission is FIFO by bytes only. It depends on item 27.
+
+**Generations set aside after a crash.** Add a command that lists, restores or deletes `gen-N.set-aside-*` directories with their quota effect. They count toward the byte quota and need a manual rename.
+
+**Serve under a URL path prefix.** Add `--base-path` and convert `fuseki:contextPath`. The converter reports it unsupported, which blocks shared-host migrations.

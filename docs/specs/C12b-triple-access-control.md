@@ -683,3 +683,11 @@ preparation. Existing hidden-quad, pattern-row and shared-cache limits retain th
 scope. The extension covers temporary buffers, cached results and exact inherited
 origins before a bounded caller receives its view. No bounded preparation phase has
 shipped.
+
+### Roadmap follow-ups
+
+#### Security and audit workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 466, the security and audit workstream, whose primary spec is [C34](C34-audit-and-erasure/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Incremental protection masks.** Update a protection mask from each commit's changes and rebuild it only when rule inputs change. The first read after each commit costs 0.16–0.6 s. It depends on items 75, 395 and 428.

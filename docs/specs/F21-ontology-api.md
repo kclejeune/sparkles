@@ -557,3 +557,33 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 71.
+
+### Roadmap follow-ups
+
+#### Ontology workbench workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 457, the ontology workbench workstream. Each phase gets its own numbered item when it is ready to start.
+
+**OWL and SHACL translation.** Generate SHACL from domains, ranges, restrictions and cardinalities under a closed-world reading, summarize shapes as OWL, translate ShEx schemas to SHACL where the constructs correspond, and install the result as a guard like drafted shapes. It bridges the ontology and the shapes and forms stack that already exists. It depends on item 71.
+
+**Ontology refactoring operations.** Rename or change IRIs everywhere including RDF 1.2 triple terms, merge entities, move axioms between ontologies, deprecate with replacement and delete with usage check, each as a previewed commit. These are daily ontology maintenance tasks. Rename can ship first over SPARQL. It depends on item 71.
+
+**The F21 axiom model as the workbench base.** Item 71 builds the F21 Phase 1 axiom model, the reverse and forward mappings, the profile checks and `/$/ontology/{ds}` as a new `sparkles-owl` crate. Almost every ontology editing, refactoring, diff, documentation and classification phase depends on it, so it is the root of this workstream.
+
+**Functional, Manchester, OWL/XML, OBO and OBO Graphs JSON syntaxes.** Add readers and writers for OFN, Manchester, OWL/XML, OBO 1.4 and OBO Graphs JSON in sparkles-owl, registered with the loader, formatter, linter and LSP, with a Manchester class-expression editor mode. Ontologies are distributed in these formats and Protégé users write Manchester. Manchester is only rendered today (`schema/expressions.rs`). It depends on item 71.
+
+**SSSOM mapping sets.** Import and export SSSOM TSV as RDF and review mapping sets in the UI. Crosswalks between vocabularies have no support.
+
+**Axiom-level and hierarchy-level diffs.** Diff axioms between commits or branches rendered in Manchester or OFN with labels, and classify changes as effectual or ineffectual from entailment diffs. Ontology review needs semantic diffs, not triple diffs. It depends on item 71.
+
+**Module extraction and import refresh.** Extract syntactic locality modules (top, bot, star) and MIREOT term lists into import graphs and refresh them against a new source version. It is the standard OBO way to manage imports. It depends on item 71.
+
+**Ontology release pipeline.** Run checks, reason, produce ODK base, full and simple artifacts in chosen syntaxes, bump the version IRI, take a named snapshot and publish files as a durable job from a branch head. It follows ODK and OBO practice and makes Sparkles the ontology build system. It depends on item 339.
+
+**ROBOT templates and DOS-DP patterns.** Read ROBOT template strings and DOS-DP YAML patterns over CSV or TSV to generate axioms, using the Manchester parser. CSVW, Tarql and RML produce triples, not axioms. It depends on item 71.
+
+**Ontology matcher and mapping review.** Combine lexical matching over labels and synonyms, embedding similarity and structural propagation, output SSSOM, and repair incoherent mappings with the classifier. Matches are exchanged as SSSOM and enter the ontology through merge review. Alignment is a common task with no store-integrated tool. It depends on items 71 and 396.
+
+**LinkML import and export.** Read LinkML YAML into OWL and SHACL graphs and export classes and shapes as LinkML. It bridges to the LinkML ecosystem and its generators.
+
+**Annotator endpoint.** Return text spans and term IRIs from labels and synonyms of selected ontologies at POST `/$/annotate/{ds}`. It matches the BioPortal Annotator over the existing entity linking.

@@ -1732,3 +1732,65 @@ rechecked `optional-count` and `order-by-full`. Large timing spreads prevent a p
 cost claim from these Namespace results. Item 328 retains matched quiet Intel checks
 of these queries, including the small accepted `order-by-full` increase. Further
 optimization remains reserved for a material persistent cost or a simple broad fix.
+
+### Roadmap follow-ups
+
+#### Benchmark gates and competitive coverage workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 452, the benchmark gates and competitive coverage workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Performance gates before the engine rewrites.** Add a forge-pinned eager-against-cursor matrix of the 33 synthetic queries at 1.05M and 10.5M with 12 threads and one, the W3C suites under execution=streaming, `incr_bench.rs` as a mise task, a demand and RDFS-on-read latency benchmark, and an instruction-count screen for vocabulary scans and WAL replay. Several areas the unification touches have no performance gate. This is stage 0 of the architecture sequence. It depends on items 1 and 190. Roadmap items 469, 470, 471, 472 and 473 hold this phase.
+
+**Reasoning benchmark suite against RDFox, Nemo, VLog, GraphDB, ELK and Konclude.** Add LUBM-1000 and 8000 under OWL RL with UBA data, UOBM, Claros and Claros-LE, Reactome, ChEMBL, UniProt, DBpedia with its ontology, OWL2Bench at 5 to 200, ORE, SNOMED, GO, the RDFox incremental methodology including sameAs deletes, ChaseBench and a query-time reasoning comparison. None of UOBM, Claros, Reactome, ChEMBL, SNOMED or ORE appears in the docs or X06. Query-time reasoning has no peer comparison. It depends on item 1.
+
+**Remaining recorded competitive losses.** Profile and close WatDiv `L1-1` (Fluree 1.11×), the cold small scans at 1.05M where Fluree leads by 1.17–3.0× and DBpedia cold `outlink-classes-2` (QLever 1.25×). It depends on item 4.
+
+**BSBM Explore multi-client throughput gap.** Find why Fluree's driver throughput is two to three times Sparkles' at 1, 4 and 16 clients, separating its answer differences from real per-mix cost. The cell is unranked because Fluree's q8, q11 and q12 answers differ, so the losses table omits a large concurrency signal. It depends on item 1.
+
+**BSBM BI driver completion.** Make the BI driver finish. Fix the generated `q6` that needs 200,003,584 intermediate rows and the `q4` and `q2` pool pressure, and do it before item 1 reruns the cells. Sparkles fails all three BI cells and reaches the wall limit after 218 of 500 mixes, and item 1 only reruns them. It depends on items 1, 7 and 93.
+
+**Long write and compaction comparison across engines.** Run the built `bench-longwrite` harness for an hour per engine and four hours for Sparkles, with durability classes and post-SIGKILL checks. Only one-minute smoke runs exist, and item 14's adaptive policy depends on these measurements. It depends on items 1 and 290.
+
+**Virtuoso Open Source and GraphDB Free comparisons.** Add Virtuoso Open Source and GraphDB Free to the benchmark peers, with Blazegraph at low priority. These are the engines users most often compare against.
+
+**Billion-scale benchmarks.** Build Wikidata truthy and full, UniProt and PubChem through the dataset manager's recipes and record build memory and time, vocabulary at 10B+ terms, cold queries and update cost. The largest measured dataset is 1.24B triples. X06 Phase 3 already specifies a Wikidata query-log replay above 1.24B under item 1, and catalog recipes make the loads repeatable. It depends on items 1, 4 and 6.
+
+**Independent answer oracles for open disagreements.** Add data-derived oracles for BSBM BI q3 and q8 and DBpedia `births-by-decade`, and check LUBM against published reference counts. Majority agreement is the only check on these cells. It depends on item 1.
+
+**Memory-estimate accuracy audit.** Compare `meta.memory.peakBytes` with sampled RSS and allocator counters per operator class, then correct the estimates or add an overhead factor, and decide whether update peaks are observed. Budgets, the server pool and admission rest on the estimate, and C01's trigger for allocator accounting has never been tested. It depends on item 88.
+
+**Backup and restore measurements at scale.** Measure backup and restore on S3 and MinIO, cold, larger than memory, after compaction and with 10,000 backups. Also measure update throughput during a backup against F05's 90% target. The only numbers are local, warm and 10.5M quads. It depends on item 61.
+
+**Spatial peer comparison.** Run the GeoSPARQL Compliance Benchmark and `gen-geo.py` queries against Jena GeoSPARQL Fuseki and QLever, and add an OSM extract with large spatial self-joins. `BENCHMARKS.md` marks spatial work unmeasured against peers, and G01 expects to lose huge self-joins without evidence. It depends on items 1 and 24.
+
+**Vector recall-throughput comparison.** Add an ANN-Benchmarks-style lane with recall@10 against ground truth and QPS at 1 and 16 clients against USearch, Qdrant and pgvector. Vector search is central to agent memory and only Sparkles-only numbers exist. It depends on items 1, 34 and 82.
+
+**Remaining standard-suite workloads.** Add the BSBM Explore-and-Update mix, SP²Bench at 100M and WatDiv stress testing. Peers publish these workloads, and the reference README lists them as not covered. It depends on item 1.
+
+**Hardware matrix on aarch64 and network block storage.** Publish standard-suite tables on an aarch64 server and cold-mode tables on network block storage. Embedded and edge users run on ARM, and cloud disks change cold-read behaviour. It depends on item 1.
+
+**Benchmark harness CI smoke and scheduled refresh.** Run the `ANSWERS_ONLY` smoke at the smallest scale in CI and automate the standard and full refreshes with `bench-regressions.py compare` as the gate. Harness breakage is found only by hand at refresh time. It depends on items 1 and 399.
+
+**Encryption overhead measurements and gates.** Run F11 §10's encrypted suite, backup and restart measurements on forge and publish the cost beside the OS-encryption advice. The 10% and 30% gates of F11 §10 have no measurement behind them. It depends on items 1 and 65.
+
+**Embedding pipeline and local-model evidence.** Measure backfill throughput, lag, WAL and history growth and write-latency effects with a hosted and a local provider. Compare the Candle runtime with TEI or fastembed and tune its CPU path. F08 was never measured against a real provider, and F12's numbers were taken under load. It depends on items 26 and 41.
+
+**Explore overview and facets at scale.** Measure the class overview, group opening and the facets route at 100M and billion scale and near the facets' 1M cap. Share the repeated query-set run between counts. U06 promises any size but was measured at 10.5M, and the facets route was never measured near its cap. It depends on items 1, 4 and 29.
+
+**Continuous per-PR benchmarking and a hosted dashboard.** Run a fixed benchmark screen on each pull request and publish the history on a dashboard. Regressions are found per change instead of per batch.
+
+**RDFox and Stardog comparisons after a licence check.** Check the RDFox and Stardog licences for benchmark-publication clauses, then compare against them, and keep the measurement private if publishing is forbidden. Both are leading commercial reasoning and graph engines.
+
+**LDBC SNB workload in SPARQL against property-graph peers.** Write SPARQL versions of SNB Interactive and BI at SF1 and SF10 and compare with Neo4j CE, Memgraph and Kùzu where licences allow. It depends on items 1 and 20.
+
+**Quiet-host baselines for small surfaces.** Record release-build measurements for `sparkles convert`, the SERVICE enhancer and its bulk VALUES form, `sparkles-client`, and the JVM `update-modify` and eager `NOW()` paths. These surfaces have only debug-build, loaded-host or no measurements.
+
+**Formatter and linter benchmark record.** Run `sparkles-fmt` benches against X02 §8's targets and the linter's sub-millisecond claim and publish them. The X02 and X04 targets have no recorded measurement.
+
+**Node event-loop and concurrency acceptance.** Publish P05 §11.1's T1, T4, T5 and T7 rows, covering event-loop delay under eight queries and concurrent loops against the server. The package claims to keep the event loop free with no published evidence. It depends on items 33 and 329.
+
+**Forge confirmation of time-slider costs.** Rerun U01 A15 time-lapse frame time and the grouped-diff cost on forge. The numbers behind item 104 still await a forge confirmation.
+
+**Loader format coverage for peers.** Measure RDF Thrift, RDF Protobuf, TriX and RDF/JSON loads for Jena and Oxigraph where they support them. The loading table leaves these peer cells unmeasured. It depends on item 1.
+
+**ShEx validation performance gap.** Profile and close the full-validation cost of 3.4 times SHACL in parallel and 2.3 times sequentially, and re-measure persisted-typing restarts. It depends on item 54.

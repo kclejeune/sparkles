@@ -1890,3 +1890,13 @@ Acceptance: a clone of `dev` at `commit:57` from server A to server B through `r
 and through an archive file, gives a dataset whose quads, blank-node labels, prefixes
 and configuration equal A's at that commit, with `forkedFrom` naming A's dataset,
 branch and seq.
+
+#### Git sync and remotes workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 460, the git sync and remotes workstream, whose primary spec is [F25](F25-git-sync-and-remotes/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**Large merges beyond the rows budget.** Stream and spill merge toggle sets and use the bulk path for large merges, as F09 §4.5 states. Measure a million-quad merge. Merges fail with 507 beyond `--max-rows`. It depends on item 93.
+
+**Branch-aware backups.** Back up and restore all branches with the branch table, with a policy choice of main only or all branches. Scheduled backups capture `main` only. It depends on item 61.
+
+**Schema-aware and blank-node-isomorphic merge.** Report conflicts for functional properties and `sh:maxCount` 1 values changed on both sides, and treat blank-node structures that are isomorphic on both sides as the same during merge. Both are common sources of false or missed merge conflicts in RDF.

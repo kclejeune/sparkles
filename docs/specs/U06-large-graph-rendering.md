@@ -477,3 +477,13 @@ checks here draws with WebGL in software, which shows the views but measures no 
 rate. Groups by named graph and on-demand community detection are not built, for the
 reasons in §11. A picture of up to 30 nodes draws every label, and its fit makes room
 for the labels on screen.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Layered DAG layouts and tier, Sankey and flow views.** Add Sugiyama-style layered layouts with expand and collapse, a subClassOf hierarchy graph with inferred arcs dashed and unsatisfiable classes marked, and tier, Sankey and flow views. Dependency tiers read poorly in force layouts. U07 rejected a layered layout library for the small schema diagram only. It depends on item 29.
+
+**GPU layout for more than a million nodes.** Lay out and render very large graphs on the GPU. Rendering tops out at 100k nodes. It depends on item 29.

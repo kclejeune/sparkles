@@ -361,3 +361,9 @@ compaction. It differs from the design above in where and when it writes.
   import policy from them. The local default stays `allow_private: true`, so existing
   invocations keep working, and `--outbound-block-private` refuses imports from
   private addresses.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Remaining ShEx conformance cases.** Resolve lexical blank-node labels in shape maps, infinities, relative labels, `includeWithCardinality` and the coherence rule, or list each as a boundary. The 99.9% figure hides 42 skipped tests. It depends on item 54.

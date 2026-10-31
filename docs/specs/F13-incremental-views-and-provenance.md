@@ -1145,3 +1145,13 @@ all 776 tests. Twenty repetitions of all six HTTP group commit tests pass, inclu
 the persistent reopen assertion that exposed the directory lock race. The worker
 callback case that reopens through a retained state and the thread-local destruction
 case each pass 100 repetitions.
+
+### Roadmap follow-ups
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**RSP-QL windows and CEP.** Add tumbling and sliding windows over event time and CEP patterns. Live queries exist without windows. It depends on items 341 and 419.
+
+**Time-series values and downsampling.** Store compact time-series values or a per-predicate column store with downsampling and retention aggregates. No time-series support exists. It depends on item 341.

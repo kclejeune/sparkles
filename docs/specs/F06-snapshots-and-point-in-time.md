@@ -1929,3 +1929,19 @@ preparation. Existing hidden-quad, pattern-row and shared-cache limits retain th
 scope. The extension covers temporary buffers, cached results and exact inherited
 origins before a bounded caller receives its view. No bounded preparation phase has
 shipped.
+
+### Roadmap follow-ups
+
+#### Git sync and remotes workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 460, the git sync and remotes workstream, whose primary spec is [F25](F25-git-sync-and-remotes/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**SPARQL view of the commit catalog.** Add a SERVICE `hist:commits` that returns commits with authors, messages, kinds and branches. COMPARISON.md notes that `hist:changes` is not a general SPARQL view of the commit catalog. It depends on item 52.
+
+**Bulk-commit change-log durability and memory accounting.** Write `changes.bin` before `CURRENT` switches, charge collected keys to the build budget and count the net change. Three parts of completed item 5 did not land, so a crash can leave a bulk commit out of history.
+
+**Tag objects and blame tooling.** Add immutable tags on the commit catalog, a sparkles blame command for a resource and a UI panel. Named snapshots double as tags, and blame is only a query recipe. It depends on item 52.
+
+**Relative commit selectors.** Add `head~N` and `snapshot:v1~N` to the `at` grammar and the CLI. It answers open question 8 of F06.
+
+**Spatial index on historical snapshots.** Build or load spatial bases for retained generations so `?at=` keeps index plans. Past-state spatial queries scan today. It depends on items 23 and 24.

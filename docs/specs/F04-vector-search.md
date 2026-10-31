@@ -1416,3 +1416,15 @@ The review of item 10 left four questions that need measurements rather than cod
   dimension, rows, nodes, overlay and pending counts, bytes and state, from the data
   that route already returns, so `GET /$/stats/{ds}` reports it with the rest of the
   dataset's counts.
+
+#### Search depth workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 464, the search depth workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Tunable hybrid ranking.** Add linear and score-normalized fusion, MMR diversity and a graph-proximity boost to `spk:hybridSearch`. Only RRF exists.
+
+**GraphQL search root fields.** Generate text, vector and hybrid search root fields over F03, F04 and `spk:hybridSearch`. GraphQL users cannot reach the search stack. It depends on item 37.
+
+**PQ and binary quantization with an SSD-resident index.** Add product and binary quantization and a DiskANN-style on-disk graph for 10M+ vectors under RAM limits. Item 34 targets f16 and i8 only. It depends on items 4 and 34.
+
+**Sparse and multi-vector retrieval.** Add SPLADE sparse vectors and ColBERT late-interaction scoring. Sparse retrieval comes first, and multi-vector scoring follows later. They improve retrieval quality for retrieval-augmented answers. It depends on items 26 and 34.

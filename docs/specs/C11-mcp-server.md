@@ -1824,3 +1824,33 @@ gets the protocol's error for an unsupported method.
 [its section of the Outcome](#oauth-for-the-mcp-endpoint-item-67-2026-10-24) records
 how. The scope challenge for operations inside a tool that need admin remains as item
 270 of the [ROADMAP](../ROADMAP.md).
+
+#### Agent platform workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 462, the agent platform workstream, whose primary spec is [C33](C33-agent-platform-controls/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**A hybrid search tool that embeds query text.** Add `search_semantic`, which embeds query text and runs hybrid search. `similar_entities` needs a vector and `search_text` is BM25 only, so agents hand-write `spk:hybridSearch`. It depends on items 34 and 82. Roadmap item 490 holds this phase.
+
+**Instance sampling and value-distribution tool.** Sample N instances of a class and return value histograms per predicate. Agents otherwise write SPARQL for grounding.
+
+**Token-budget result shaping.** Accept maxTokens and per-host size profiles instead of fixed bytes. It settles C11 open question 2.
+
+**Expected result size in explain_query.** Report rows times width as bytes and tokens before running. Agents could choose to page or aggregate.
+
+**resource_link results for large outputs.** Return resource links so hosts fetch big results on demand. No `resource_link` exists.
+
+**Memory brief as an MCP tool or resource.** Expose sparkles://{ds}/memory/brief. MCP-only hosts lack session-start context, which needs hooks or HTTP today.
+
+**Function-manifest export.** Add sparkles mcp export-tools for OpenAI, Anthropic and Gemini function formats. Frameworks without MCP could reuse the schemas. It depends on item 55.
+
+**llms.txt and a docs resource.** Publish llms.txt and llms-full.txt and a docs MCP resource or search tool. Agents learn the API without scraping.
+
+**Elicitation for merges, ambiguous links and destructive confirmations.** Ask the person in-band for merge conflicts, ambiguous `link_entities` results and destructive confirmations. Elicitation is used only for `assert_facts` duplicates. It depends on item 435.
+
+**Prompt-injection markers on suspicious literals.** Mark suspicious literals in tool output. It is cheap defence in depth over C11 §4.10.
+
+**Server logging notifications.** Send notifications/message for warnings such as budget cut-offs. It surfaces warnings in host logs. It depends on item 42.
+
+**Subgraph rendering for hosts.** Render recall or path results as Mermaid or DOT. Hosts that draw diagrams could show what the agent found.
+
+**Effective prefixes on every surface.** Make the schema summary, MCP prefixes, assistant and shape drafts read the declared, runtime and locked prefix layers. Agents see different prefix names from query results.

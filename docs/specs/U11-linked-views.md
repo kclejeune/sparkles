@@ -807,3 +807,17 @@ each point is computed when the point is added rather than in every redraw.
 served to callers with partial access, which are open questions 1 and 2 and item 142. The
 library call is bound in Python as `Dataset.indexes.vector.projection`, and `bindings.toml`
 marks the Node.js and JVM bindings as planned.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Explore branch selector.** Let the graph, path finder, lenses, Why? panel, map and facets read a chosen branch. U09, U10 and U11 all record that Explore reads only `main`. It depends on item 140.
+
+**Relationship facets by value class.** Facet IRI-valued properties by the class of the value, with a budget per facet. Entity browsing needs relationship facets.
+
+**Facet and Apply-to-query correctness.** Make `IN` brushes agree with bar-list counts and support queries with `LIMIT`, `OFFSET`, `GROUP BY` and `HAVING`. U11 records two such mismatches.
+
+**Arc layout in a worker and a UMAP projection.** Move arc clustering off the main thread and add UMAP beside PCA. Arc layout stalls 100–220 ms per zoom. It depends on items 29 and 141.

@@ -214,3 +214,19 @@ Subscriptions are deferred under item 37 until a workload asks for them, and the
 F13 as live queries. Mutations remain a separately approved design, as §12 and the follow-up
 above state. Neither conditional extension can be treated as delivered merely because
 Phase 2 completes, and declining one must be recorded explicitly.
+
+### Roadmap follow-ups
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**GraphQL response assembly overhead.** Replace per-object executor calls with a direct tree builder so responses stay within C03's 10% target, after re-measuring on a quiet host. It depends on item 37.
+
+**GraphQL keyset cursors.** Seek on the ordered key for deep pages instead of sorting and skipping. A cold deep page currently costs as much as every earlier item. It depends on item 37.
+
+**GraphQL aggregate fields.** Add count, sum, avg, min, max and group-by fields compiled to grouped SPARQL, plus min or max choice for multi-valued ordering. Dashboards need more than `totalCount`. It depends on item 37.
+
+**GraphQL mutations generated from the mapping.** Generate GraphQL mutations from the GraphQL mapping and run them as SPARQL updates under the same access rules. Applications that adopt GraphQL expect writes.
+
+**GraphQL edge annotations.** Expose RDF 1.2 annotations of an edge's triple as connection fields. Property-graph users expect edge properties. It depends on item 37.

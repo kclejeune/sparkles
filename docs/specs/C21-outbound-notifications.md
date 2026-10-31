@@ -592,3 +592,15 @@ dataset applications. It reuses applicable C21 signing, outbound policy and retr
 transport but commits delivery intent with the dataset update. C21's current operator
 notifications retain their in-process queue and existing event scope. The planned
 outbox does not retroactively provide restart durability to that queue.
+
+### Roadmap follow-ups
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Further operator notification events.** Add events for failed maintenance tasks and embeddings, replication lag, quota pressure, certificate expiry and validation spikes, plus a `--secret` flag. Only three event types exist. It depends on items 46 and 74.
+
+**CDC broker sinks.** Deliver the change feed to Kafka, NATS, Kinesis and Pub/Sub with a Debezium-style envelope and server-side consumer offsets. The change feed supports long-poll and SSE only, and item 339's outbox is about job delivery. It depends on items 52 and 339.
+
+**External index connectors.** Push changes into Elasticsearch or OpenSearch indexes. No connector exists. It depends on item 36.

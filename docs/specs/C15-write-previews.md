@@ -809,3 +809,11 @@ renumbering, so schema edits are checked in both previews and actual bulk commit
   can skip building the index permutations that only queries need: it builds the
   candidate's vocabulary and the SPO order, runs the guard over that, and discards
   them.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Interactive multi-request transactions over HTTP.** Let a client open a transaction, run several queries and updates against its snapshot and then commit or abort it, in the style of the RDF4J transaction protocol, with timeouts and limits on open transactions. RDF4J, GraphDB, Stardog and Neo4j offer them, and agents that read and then write need more than If-Match.
+
+**Blank-node-aware graph sync.** Match payload blank nodes by isomorphism on `PUT` so unchanged data is no change. Reloading unchanged Turtle with blank nodes churns commits and feeds.

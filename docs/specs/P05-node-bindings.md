@@ -1622,3 +1622,11 @@ acceptance. UI transport migration is also an optional scope decision, rather th
 missing prerequisite for the delivered native and remote clients. Any decision to
 remove an accepted requirement must be approved by the maintainer and recorded in
 this Outcome before declaring that scope complete.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Long-held transaction warning in Node.** Emit `process.emitWarning` past 30 s, as P05's open question decided. A forgotten `await` blocks every writer silently.

@@ -614,3 +614,10 @@ variables first. A selection made on the second of two join badges fell back to 
 once the focus left the canvas, and moving between the Plan and Pattern tabs cleared the
 selected operator although the plan was the same.
 
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Pattern numbers in the plan overlay.** Carry source ranges from the parser so patterns after UNION, GRAPH or subquery blocks get their own numbers. U04 ships a known wrong-number case. It depends on item 101.

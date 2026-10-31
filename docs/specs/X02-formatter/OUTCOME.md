@@ -180,3 +180,23 @@ shared document model.
   a generator test formats 6,000 random documents. Golden files under
   `tests/golden/shaclc` cover layout, wrapping at three widths, alignment, pruning,
   nested bodies, paths, strings and the ignore pragma.
+
+### Roadmap follow-ups
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**RDF/XML formatting.** Add RDF/XML to the formatter's languages. RDF/XML remains common in ontology files.
+
+#### Operations and streaming workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 467, the operations and streaming workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Bounded-memory formatting above `--max-bytes`.** Format sorted Turtle and TriG, SPARQL and JSON-LD above the limit in bounded memory, or document the limit as final. The formatter refuses with advice to convert, while item 444 covers only line-format linting.
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Editor extension packages.** Publish a VS Code extension and thin Zed and JetBrains wrappers for `sparkles lsp` and `fmt`. `docs/editors.md` says there is no extension. It depends on item 58.

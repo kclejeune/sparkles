@@ -590,3 +590,13 @@ SPARQL `LOAD`, and Jena's syntaxes loaded without a temporary N-Quads copy.**
   parallel sinks made the difference. The full table and the method are in the
   [loading results](../benchmarks/loading/RESULTS.md#jenas-syntaxes). These are not forge
   numbers.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Archive inputs with member selection.** Treat ZIP and TAR (gz or zst) as containers, select members by glob, assign graphs per member and stream without full extraction. GeoNames, YAGO, Wikipathways and many dumps ship as archives.
+
+**HDT import, export and read-only HDT datasets.** Read HDT (header, dictionary, bitmap triples) as a load input and dump format, serve an HDT file as a read-only dataset, and optionally map HDT's sorted dictionary directly into a base vocabulary. No HDT support exists. LOD Laundromat, DNB and Bio2RDF publish HDT, and its sorted dictionary is close to Sparkles' base vocabulary.
+
+**Configurable `--check` severity.** Set severity per IRI and language-tag rule and keep tag case through the parser. G05 lists both as not built.

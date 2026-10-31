@@ -375,3 +375,13 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 30.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Jupyter kernel.** Provide a Jupyter kernel that runs SPARQL against an embedded or remote store and renders results. Importing foreign notebooks stays out of scope. Data scientists work in Jupyter.
+
+**Dashboards of stored queries.** Pin stored queries as chart panels with refresh. Notebooks with chart cells in U05 Phase 2 are the nearest. It depends on items 30 and 424.

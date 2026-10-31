@@ -820,3 +820,13 @@ a different inferred intermediate and readable schema facts.
 Depth-cut refs retain the materialized component's read context inside mixed trees. The
 panel requests the same source and checks the returned commit and fallback marker before
 grafting an expansion, including generalized premises from historical materializations.
+
+### Roadmap follow-ups
+
+#### Developer ecosystem and UI workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 468, the developer ecosystem and UI workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Why? at past states.** Explain an inferred edge at a past commit. Audit and memory review need to know why the store believed a fact on a date. It depends on items 18 and 52.
+
+**Shareable canvas state in the URL.** Put lenses, path ends, filters, brushes and selection in Explore's URL. It answers U10 open question 3.

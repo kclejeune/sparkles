@@ -449,3 +449,9 @@ sketch below states how it answers that objection.
   `sparkles_service_request_seconds` per endpoint host, bounded by
   `--metrics-max-datasets` and a cap of 100 hosts with the rest under `$other`.
   OpenTelemetry follows the same names.
+
+#### Interop and query surfaces workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
+
+**Cross-dataset SERVICE on one server.** Let `SERVICE` name another local dataset and read it in process, under the caller's permissions on the target. G10 calls it a separate roadmap item, but none exists. This is local, not cross-server federation. It depends on item 38.

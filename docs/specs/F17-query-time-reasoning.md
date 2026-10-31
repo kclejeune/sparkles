@@ -976,3 +976,14 @@ runs of `every_inferred_triple_has_a_sound_demand_tree`, the test took 214 s and
 before these changes and 107 s and 167 s after, with the host's one-minute load between
 16 and 47.
 
+### Roadmap follow-ups
+
+#### Reasoning engine workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 456, the reasoning engine workstream, whose primary spec is [F23](F23-reasoner-core/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**RDFS-on-read path ranges beyond 8 steps.** Count each entailed link once in `p{n,m}` and unbounded ranges, or refuse the combination with a warning. Answers diverge from the entailed semantics today.
+
+**Tree-witness or Presto OWL 2 QL rewriting.** Prefer tree-witness or Presto-style rewriting over plain PerfectRef to avoid union blowup. Item 19 plans PerfectRef only. It depends on item 19.
+
+**Cost-based reasoning strategy selector.** Choose among the demand strategies (plain magic sets, schema pass with specialization, compact closure, linear rewriting) from cheap estimates before any transform is built, and extend the same selector to materialize cheap high-fan-in predicates while answering rare ones on demand. `query.rs` `ensure_program` stacks strategies without a selector and builds the full schema transform only to learn its size. Item 19's auto mode chooses per query, not per predicate. It depends on items 19, 190 and 192.

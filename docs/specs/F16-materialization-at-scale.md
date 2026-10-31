@@ -1506,3 +1506,11 @@ derived rows read first without a bound, at 80,003 scans of the input graphs, an
 the bound. The reviews found an uncharged table of predicate-object answers, the unbounded
 order of rows-first, a pair list whose capacity passed its charge and memos kept until a
 round ended, and each is fixed.
+
+#### Reasoning engine workstream
+
+These phases belong to [ROADMAP](../ROADMAP.md) item 456, the reasoning engine workstream, whose primary spec is [F23](F23-reasoner-core/README.md). Each phase gets its own numbered item when it is ready to start.
+
+**FBF maintenance and a cost-based maintenance chooser.** Add Forward/Backward/Forward maintenance and choose among B/F, FBF, DRed and full recomputation from the estimated delete fan-out, replacing the fixed one-in-twenty threshold. LARGE_DELETION = 20 forces a full run above 5% of at least 10k facts. F16 §7.3 asks for a cost estimate without naming an algorithm. It depends on item 9.
+
+**Barrier-free evaluation on skewed workloads.** Retest the barrier-free gate on OWL2Bench, Claros and transitive-heavy data after *specialized closure operators for transitive, symmetric and equivalence relations*. The rejection was measured on LUBM(100) and RDFS runs only. It depends on item 9.
