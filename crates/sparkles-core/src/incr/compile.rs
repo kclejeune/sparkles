@@ -439,8 +439,9 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             };
             let before = (fp.entries.len(), fp.all);
             footprint_of(inner, &s, fp);
-            // a group that reads no triple still depends on which graphs exist
-            if (fp.entries.len(), fp.all) == before {
+            // a group that reads no triple still depends on which graphs exist, and so
+            // does a group whose triples a GRAPH inside it reads from other graphs
+            if (fp.entries.len(), fp.all) == before || nested_graph(inner) {
                 any_quad(&s, fp);
             }
             // the special graphs of ARQ read other graphs
@@ -761,6 +762,38 @@ fn conjuncts(e: &Expression, out: &mut Vec<Expression>) {
     }
 }
 
+/// Whether a subtree may hold a `GRAPH` of its own, which sets the active graph of its
+/// group again: the outer `GRAPH ?g` still ranges over every named graph, and a
+/// constant outer graph still has to exist. Expressions with `EXISTS` and patterns
+/// not listed count as holding one.
+fn nested_graph(gp: &GP) -> bool {
+    match gp {
+        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => false,
+        GP::Graph { .. } => true,
+        GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } => {
+            nested_graph(left) || nested_graph(right)
+        }
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            nested_graph(left) || nested_graph(right) || expression.as_ref().is_some_and(has_exists)
+        }
+        GP::Filter { expr, inner } => has_exists(expr) || nested_graph(inner),
+        GP::Extend {
+            inner, expression, ..
+        } => has_exists(expression) || nested_graph(inner),
+        GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Project { inner, .. }
+        | GP::Slice { inner, .. }
+        | GP::OrderBy { inner, .. }
+        | GP::Group { inner, .. } => nested_graph(inner),
+        _ => true,
+    }
+}
+
 /// Whether a subtree under `GRAPH ?g` binds `?g` in every row by its own patterns, so
 /// that the incremental operators evaluate it graph by graph.
 fn graph_var_ok(gp: &GP) -> bool {
@@ -907,6 +940,8 @@ impl C {
             GP::Join { left, right } => {
                 self.factors(left, scope, out) && self.factors(right, scope, out)
             }
+            // a GRAPH inside GRAPH: the outer graph still constrains the rows
+            GP::Graph { .. } if !matches!(scope, Scope::Default) => false,
             GP::Graph {
                 name: NamedNodePattern::NamedNode(n),
                 inner,
@@ -1146,6 +1181,9 @@ impl C {
                 self.union(l, r)
             }
             GP::Graph { name, inner } => match name {
+                _ if !matches!(scope, Scope::Default) => {
+                    self.recompute(gp, scope, "GRAPH inside GRAPH", None)
+                }
                 NamedNodePattern::NamedNode(n) if !n.as_str().starts_with("urn:x-arq:") => {
                     self.compile(inner, &Scope::Graph(n.clone()))
                 }

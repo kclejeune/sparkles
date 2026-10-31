@@ -914,8 +914,9 @@ capabilities and remaining work are described by the spec status and Outcome.
   footprint. These are paths with `*`, `+` or `?` (paths without them are expanded into
   joins and unions of at most 16 alternatives), `LIMIT` and `OFFSET`, a dataset clause,
   the aggregates other than `COUNT`, `SUM` and `AVG`, correlated `EXISTS`, `LATERAL` and
-  ARQ's other extensions, triple terms, property functions, and `MINUS`, aggregates,
-  `DISTINCT`, `VALUES` and subqueries under `GRAPH ?g`. `ORDER BY` without `LIMIT` does not change a view's rows and is ignored.
+  ARQ's other extensions, triple terms, property functions, a `GRAPH` inside another
+  `GRAPH`, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and subqueries under
+  `GRAPH ?g`. `ORDER BY` without `LIMIT` does not change a view's rows and is ignored.
 - `SUM` and `AVG` keep an exact integer sum, and value counts for decimals, floats and
   doubles. Decimals are summed exactly in 256 bits, and a sum outside the decimal range
   is unbound. A one-off evaluation adds the rows in order and can overflow on the way to
@@ -1006,6 +1007,42 @@ capabilities and remaining work are described by the spec status and Outcome.
   data. In-memory clones carry no views, which item 401 tracks.
 - PUT starts a `view-build` task that waits for the first evaluation on the worker,
   rather than running the evaluation in the task.
+
+**Load-time checks.** `Runtime::open` and every attach check a definition as `PUT`
+does. A `view.json` of format 1 that holds an option a later phase adds, such as
+`mode: graph`, `maintenance: commit`, other branches, `keepCommits` or provenance, is
+listed as failed with `unsupported-option` and never runs. Such a file can come from a
+hand edit or from a release that supports the option at the same format. The other
+views of the dataset attach and run, and defining the view again replaces the file.
+
+**Differential and recovery tests.** The differential tests of §11 draw queries from a
+grammar-driven generator in `incr/gen.rs`. It covers the fragment of §4.1 and the
+operators that compile to `recompute` nodes. It leaves out `SAMPLE`, `GROUP_CONCAT` and
+orders with ties under a `LIMIT`, since the engine may answer them in more than one
+way. The histories hold small and bulk transactions, transactions that add and remove
+one quad, deletes by pattern and compactions. Each generated case runs over every quad,
+and a second set runs as a random reader whose graph grants and protections by
+predicate or by subject class mask the oracle's snapshot. A failing case is shrunk to a
+short history. The runs are seeded, with 160 and 120 cases by default, and
+`SPARKLES_INCR_GEN_CASES` and `SPARKLES_INCR_GEN_SEED` select longer runs.
+
+A run of 4,000 cases of each kind found one circuit error. A `GRAPH` inside `GRAPH ?g`
+compiled to the inner pattern alone and left `?g` unbound. Such a group is now a
+`recompute` node whose footprint covers the outer graph. The run also found two queries
+where the engine, the oracle, drops rows that the SPARQL semantics give and the circuits
+keep. One is an equality filter between variables of two `UNION` branches above a join
+that binds both. The other is a `BOUND` filter on a variable that `VALUES` leaves
+unbound and a path binds. An ignored test in `incr/tests.rs` records both.
+
+The recovery tests stop a child process with no cleanup at six points. These are after
+a commit and before its pass, after a pass and before its checkpoint (failpoint
+`view-pass-applied`), before a checkpoint's rename (`view-checkpoint-written`), while a
+compaction builds its generation, before it switches `CURRENT`, and during the first
+pass after the switch. After an open, every view loads its checkpoint, applies the
+commits since and matches the oracle. A checkpoint interrupted before its rename used to
+leave its temporary file behind, and the next checkpoint now removes it. A further test
+fingerprints the variants of the operator enum and fails when they change while
+`COMPILER`, which checkpoint fingerprints include, keeps its name.
 
 **Measurements.** See [BENCHMARKS](../benchmarks/writes/RESULTS.md#incremental-views). Three pinned forge
 runs at 200,000 and 1,000,000 people put touching rounds near one query evaluation, with

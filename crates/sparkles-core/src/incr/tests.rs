@@ -3,6 +3,8 @@
 
 use super::circuit::{Advance, Circuit, DeltaSet};
 use super::compile::{Kind, compile};
+use super::r#gen::{self as generator, QueryGen, Step};
+use crate::access::GraphAccess;
 use crate::io::RdfFormat;
 use crate::sparql::{self, QueryOptions};
 use crate::store::{Store, StoreOptions};
@@ -10,6 +12,7 @@ use crate::task::Control;
 use oxrdf::Term;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use std::sync::Arc;
 
 const PREFIX: &str = "PREFIX : <http://ex/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
 
@@ -23,10 +26,25 @@ fn canon(t: &Option<Term>) -> String {
 
 /// The query's result at the store's head as sorted rows of the circuit's columns.
 fn oracle(store: &Store, q: &str, cols: &[String], kind: Kind) -> Vec<String> {
+    oracle_as(store, q, cols, kind, None)
+}
+
+/// [`oracle`] for a reader with `access`, over its masked snapshot.
+fn oracle_as(
+    store: &Store,
+    q: &str,
+    cols: &[String],
+    kind: Kind,
+    access: Option<&Arc<GraphAccess>>,
+) -> Vec<String> {
     let r = sparql::query(
         store.snapshot(),
         &format!("{PREFIX}{q}"),
-        &QueryOptions::default(),
+        &QueryOptions {
+            graphs: access.cloned(),
+            no_cache: true,
+            ..Default::default()
+        },
     )
     .expect("oracle query");
     let mut out: Vec<String> = match kind {
@@ -334,6 +352,205 @@ fn random_histories_follow_the_oracle() {
             check(&s, &c, q, &format!("seed {seed} at the end"));
         }
     }
+    generated(generator::cases(160), false);
+}
+
+/// The generated cases of [`random_histories_follow_the_oracle`] read by random readers
+/// over their masked snapshots: graphs left out, and protections by predicate and by
+/// the data.
+#[test]
+fn random_histories_follow_the_masked_oracle() {
+    generated(generator::cases(120), true);
+}
+
+/// A generated case: its query, starting data, reader and history.
+struct Case {
+    seed: u64,
+    query: String,
+    data: String,
+    access: Option<(Arc<GraphAccess>, String)>,
+    steps: Vec<Step>,
+}
+
+impl Case {
+    /// The case of `seed`; masked cases draw from seeds of their own.
+    fn new(seed: u64, masked: bool) -> Case {
+        let mut rng = StdRng::seed_from_u64(if masked { seed | 1 << 32 } else { seed });
+        let query = QueryGen::new(&mut rng).query();
+        let data = generator::data(&mut rng);
+        let access = masked.then(|| generator::access(&mut rng));
+        let n = rng.random_range(4..12);
+        let steps = generator::history(&mut rng, n);
+        Case {
+            seed,
+            query,
+            data,
+            access,
+            steps,
+        }
+    }
+
+    fn describe(&self, steps: &[Step], why: &str) -> String {
+        let mut out = format!(
+            "seed {} (SPARKLES_INCR_GEN_SEED={} SPARKLES_INCR_GEN_CASES=1)\nquery: {}\ndata: {}\n",
+            self.seed, self.seed, self.query, self.data
+        );
+        if let Some((_, d)) = &self.access {
+            out.push_str(&format!("reader: {d}\n"));
+        }
+        for s in steps {
+            out.push_str(&format!("  {s:?}\n"));
+        }
+        out.push_str(why);
+        out
+    }
+}
+
+/// What running a case found.
+enum Ran {
+    /// the circuit followed the oracle; `true` when it was reset at some commit
+    Followed(bool),
+    /// the compiler refused the query, with the reason
+    Refused(String),
+}
+
+/// Rows of a circuit's result, or the reason they are not a result.
+fn try_result(c: &Circuit) -> Result<Vec<String>, String> {
+    if let Some((_, w)) = c.rows().iter().find(|(_, w)| *w <= 0) {
+        return Err(format!("a weight {w} in the result"));
+    }
+    Ok(result(c))
+}
+
+/// Run `case`'s query through `steps`, comparing the circuit with the oracle at every
+/// check. A panic counts as a failure, so that a failing case can be shrunk.
+fn run_case(case: &Case, steps: &[Step]) -> Result<Ran, String> {
+    let access = case.access.as_ref().map(|(a, _)| a.clone());
+    let run = || -> Result<Ran, String> {
+        let s = Store::in_memory(StoreOptions::default());
+        upd(&s, &format!("{PREFIX}{}", case.data)).map_err(|e| format!("data: {e}"))?;
+        let parsed = sparql::parse_query(&format!("{PREFIX}{}", case.query), None, &[])
+            .map_err(|e| format!("the generator wrote a query that does not parse: {e}"))?;
+        let whole = super::runtime::whole_reason(access.as_ref());
+        let compiled = match compile(&parsed, whole) {
+            Ok(c) => c,
+            Err(e) => return Ok(Ran::Refused(e.to_string())),
+        };
+        let mut c = Circuit::new(compiled, access.clone());
+        c.build(s.snapshot(), &Control::none())
+            .map_err(|e| format!("build: {e}"))?;
+        let compare = |c: &Circuit, at: &str| -> Result<(), String> {
+            let mut want = oracle_as(&s, &case.query, &c.columns(), c.kind, access.as_ref());
+            let mut got = try_result(c)?;
+            // REDUCED may drop some duplicates or none, and the circuit drops all; the
+            // generator writes it only on the outer query, so the sets compare
+            if case.query.contains("REDUCED") {
+                want.dedup();
+                got.dedup();
+            }
+            if got != want {
+                return Err(format!(
+                    "{at}: the circuit has\n    {got:?}\nthe oracle has\n    {want:?}\nplan: {:#?}",
+                    c.plan()
+                ));
+            }
+            Ok(())
+        };
+        compare(&c, "after the build")?;
+        let mut reset = false;
+        for (i, step) in steps.iter().enumerate() {
+            match step {
+                Step::Update(u) => {
+                    upd(&s, &format!("{PREFIX}{u}")).map_err(|e| format!("update {u}: {e}"))?;
+                }
+                Step::Compact => {
+                    s.compact().map_err(|e| format!("compact: {e}"))?;
+                }
+                Step::Check => {
+                    let d = DeltaSet::read(&s, c.applied, &Control::none());
+                    match c.advance(&d, &Control::none()) {
+                        Ok(Advance::Reset(_)) => reset = true,
+                        Ok(_) => {}
+                        Err(e) => return Err(format!("step {i}: advance: {e}")),
+                    }
+                    compare(&c, &format!("step {i}"))?;
+                }
+            }
+        }
+        Ok(Ran::Followed(reset))
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(r) => r,
+        Err(p) => Err(format!(
+            "panicked: {}",
+            p.downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| p.downcast_ref::<&str>().copied())
+                .unwrap_or("?")
+        )),
+    }
+}
+
+/// The shortest history found by removing one step at a time that still fails, with
+/// its failure. The final check stays.
+fn shrink(case: &Case, mut steps: Vec<Step>, mut why: String) -> (Vec<Step>, String) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        while i + 1 < steps.len() {
+            let mut fewer = steps.clone();
+            fewer.remove(i);
+            match run_case(case, &fewer) {
+                Err(e) => {
+                    steps = fewer;
+                    why = e;
+                    changed = true;
+                }
+                Ok(_) => i += 1,
+            }
+        }
+    }
+    (steps, why)
+}
+
+/// Run `n` generated cases, read by every graph or (`masked`) by random readers, and
+/// fail with every divergence, each shrunk to a short history.
+fn generated(n: usize, masked: bool) {
+    let first = generator::first_seed();
+    let (mut followed, mut resets, mut refused) = (0usize, 0usize, Vec::new());
+    let mut failures = Vec::new();
+    for seed in first..first + n as u64 {
+        let case = Case::new(seed, masked);
+        match run_case(&case, &case.steps) {
+            Ok(Ran::Followed(reset)) => {
+                followed += 1;
+                resets += reset as usize;
+            }
+            Ok(Ran::Refused(why)) => refused.push(why),
+            Err(why) => {
+                let (steps, why) = shrink(&case, case.steps.clone(), why);
+                failures.push(case.describe(&steps, &why));
+            }
+        }
+    }
+    eprintln!(
+        "generated cases{}: {followed} followed the oracle ({resets} with a reset), {} refused, {} diverged",
+        if masked { " (masked)" } else { "" },
+        refused.len(),
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {n} generated cases diverged:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+    // the generator stays inside the fragment: most of its queries compile
+    assert!(
+        followed * 4 >= n * 3,
+        "only {followed} of {n} generated queries compiled; refused: {refused:#?}"
+    );
 }
 
 /// Queries whose circuits once missed changes or disagreed with the engine: each runs
@@ -404,6 +621,35 @@ fn edge_cases_follow_the_oracle() {
                 "DELETE DATA { GRAPH :g { :a :p 1 } }",
             ],
         ),
+        // a GRAPH inside GRAPH ?g: ?g ranges over every named graph, whatever the
+        // inner GRAPH reads, so a graph the inner pattern never reads changes it
+        (
+            "SELECT ?g ?h ?o WHERE { GRAPH ?g { GRAPH ?h { ?s :p ?o } } }",
+            &[
+                "INSERT DATA { GRAPH :h { :a :p 1 } }",
+                "INSERT DATA { GRAPH :x { :a :other 1 } }",
+                "INSERT DATA { GRAPH :x { :b :p 2 } }",
+                "DELETE DATA { GRAPH :x { :a :other 1 . :b :p 2 } }",
+            ],
+        ),
+        (
+            "SELECT ?g ?s WHERE { GRAPH ?g { ?s :q ?o GRAPH :h { ?s :p ?x } } }",
+            &[
+                "INSERT DATA { GRAPH :h { :a :p 1 } }",
+                "INSERT DATA { GRAPH :x { :a :q 1 } }",
+                "INSERT DATA { :a :q 2 }",
+                "DELETE DATA { GRAPH :x { :a :q 1 } }",
+            ],
+        ),
+        // a GRAPH inside a constant GRAPH reads only while the outer graph exists
+        (
+            "SELECT ?h ?o WHERE { GRAPH :x { GRAPH ?h { ?s :p ?o } } }",
+            &[
+                "INSERT DATA { GRAPH :h { :a :p 1 } }",
+                "INSERT DATA { GRAPH :x { :b :q 1 } }",
+                "DELETE DATA { GRAPH :x { :b :q 1 } }",
+            ],
+        ),
         // a template's blank node is one node per occurrence of a solution
         (
             "CONSTRUCT { [] :p ?o } WHERE { ?s :v ?o }",
@@ -452,5 +698,36 @@ fn a_rebuild_clears_the_operators_state() {
         upd(&s, &format!("{PREFIX}DELETE DATA {{ :a :p 1 }}")).unwrap();
         step(&s, &mut c);
         check(&s, &c, q, "after a delete");
+    }
+}
+
+/// Divergences the generator found where the engine, the oracle, drops rows that the
+/// SPARQL semantics give and the circuits keep, shrunk to a few quads. With
+/// `SPARKLES_INCR_GEN_CASES` above 2451 the generated cases reach the first (seed
+/// 2451), and the masked ones above 389 reach the second (seed 389).
+#[test]
+#[ignore = "the engine drops these rows; the circuits answer them correctly"]
+fn generator_found_engine_divergences() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        // an equality between a variable of each UNION branch, over a join that binds
+        // both in one row
+        (
+            "INSERT DATA { :a :p 1 . :a :q 1 . :c :r :a }",
+            "SELECT ?x ?y ?z WHERE { { ?x :p 1 } UNION { ?y :q 1 } ?z :r ?x FILTER(sameTerm(?x, ?y)) }",
+            &["<http://ex/a> <http://ex/a> <http://ex/c>"],
+        ),
+        // a filter on a variable that VALUES leaves unbound and a path binds
+        (
+            "INSERT DATA { :c :knows :e }",
+            "SELECT ?x ?y WHERE { VALUES ?x { UNDEF } ?x :knows+ ?y FILTER(BOUND(?x)) }",
+            &["<http://ex/c> <http://ex/e>"],
+        ),
+    ];
+    for (data, q, want) in cases {
+        let s = Store::in_memory(StoreOptions::default());
+        upd(&s, &format!("{PREFIX}{data}")).unwrap();
+        let c = circuit(&s, q);
+        assert_eq!(result(&c), *want, "the circuit: {q}");
+        check(&s, &c, q, "the engine");
     }
 }

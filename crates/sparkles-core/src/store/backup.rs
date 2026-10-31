@@ -800,7 +800,11 @@ impl Store {
     /// `backup-capture-locked` (writer lock held: the hook must not write) or
     /// `backup-capture-unlocked` (right after the lock is released, before `CURRENT`
     /// is read), or `clone-captured` (a clone took its snapshot and released the lock,
-    /// and has not copied anything yet).
+    /// and has not copied anything yet). The views run `view-pass-applied` after a
+    /// pass changed a circuit in memory, before any checkpoint, and
+    /// `view-checkpoint-written` once a checkpoint is synced under its temporary name,
+    /// before the rename. Both run with the view's state locked, so their hooks must
+    /// not call the views.
     #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn set_failpoint(&self, name: &'static str, hook: Option<Failpoint>) {
@@ -824,7 +828,7 @@ impl Store {
     }
 
     #[inline]
-    pub(super) fn failpoint(&self, name: &'static str) {
+    pub(crate) fn failpoint(&self, name: &'static str) {
         #[cfg(any(test, feature = "failpoints"))]
         {
             let hook = self.failpoints.lock().get(name).cloned();

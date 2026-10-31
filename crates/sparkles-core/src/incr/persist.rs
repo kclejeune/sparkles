@@ -334,9 +334,28 @@ pub fn list(dir: &Path) -> Vec<(u64, PathBuf)> {
 
 /// Write a checkpoint atomically, then remove the older ones this release can read.
 pub fn write(dir: &Path, h: &Header, body: &[u8]) -> Result<()> {
+    write_with(dir, h, body, || {})
+}
+
+/// [`write`], calling `before_rename` once the file is written and synced under its
+/// temporary name and before it is renamed into place. A crash there leaves the
+/// temporary file, which [`list`] does not read and the next checkpoint removes.
+pub fn write_with(dir: &Path, h: &Header, body: &[u8], before_rename: impl FnOnce()) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name(h.commit));
-    crate::store::write_atomic(&path, &encode(h, body))?;
+    let tmp = path.with_extension("tmp");
+    crate::store::write_synced(&tmp, &encode(h, body))?;
+    before_rename();
+    std::fs::rename(&tmp, &path)?;
+    crate::store::sync_dir(dir)?;
+    // the temporary files of checkpoints a crash interrupted
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("state-") && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     for (c, p) in list(dir) {
         if c == h.commit {
             continue;

@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-const COMPILER: &str = "f13-phase1-2";
+const COMPILER: &str = "f13-phase1-3";
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
 /// The most rows a circuit's diff history keeps for resumed live queries.
@@ -638,6 +638,16 @@ fn key_of(q: &Query, text: &str, access: Option<&Arc<GraphAccess>>, whole: Optio
     u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
 }
 
+/// Why definition `def` does not run in this release, as `{code}: {message}`: an
+/// option a later phase adds, such as a graph view or maintenance at commit
+/// (`unsupported-option`), or a definition that is not valid (`invalid-view`). `put`
+/// refuses such a definition, and a `view.json` on disk that holds one, written by
+/// hand or by another release at the same format, is marked failed instead of running
+/// as a table view.
+fn unsupported(def: &ViewDef) -> Option<String> {
+    def.check().err().map(|e| format!("{}: {e}", e.code()))
+}
+
 fn failure(e: &Error) -> (String, String) {
     let code = match e {
         Error::Timeout | Error::Cancelled => "pass-timeout",
@@ -658,6 +668,13 @@ impl Runtime {
                     for (name, def, paused) in defs {
                         // a restored or cloned view waits until it is resumed
                         let suspended = paused.as_ref().map(paused_reason);
+                        let error = unsupported(&def);
+                        if let Some(e) = &error {
+                            tracing::warn!(
+                                target: "sparkles::incr::runtime",
+                                "view {name}: {e}; it does not run until it is defined again"
+                            );
+                        }
                         reg.views.insert(
                             name,
                             ViewEntry {
@@ -665,7 +682,7 @@ impl Runtime {
                                 cell: None,
                                 access: None,
                                 suspended,
-                                error: None,
+                                error,
                                 checkpointed: 0,
                                 paused: paused.is_some(),
                             },
@@ -851,6 +868,13 @@ impl Runtime {
             return Ok(());
         };
         if entry.cell.is_some() || entry.suspended.is_some() {
+            return Ok(());
+        }
+        // checked again on every attach, since a change of the host's epoch or a
+        // rebuild clears the error
+        if let Some(e) = unsupported(&entry.def) {
+            let entry = reg.views.get_mut(name).expect("checked above");
+            entry.error = Some(e);
             return Ok(());
         }
         let def = entry.def.clone();
@@ -1212,6 +1236,9 @@ impl Runtime {
                 return true;
             }
         }
+        // the pass is applied in memory and not yet checkpointed (a test hook; it must
+        // not call the runtime, whose locks the pass holds)
+        store.failpoint("view-pass-applied");
         if d.complete && st.circuit.applied > from + 1 && from > 0 && st.views > 0 {
             tracing::debug!(
                 target: "sparkles::incr::runtime",
@@ -1372,7 +1399,6 @@ impl Runtime {
             .iter()
             .filter_map(|(n, e)| Some((n.clone(), e.cell.clone()?, e.checkpointed)))
             .collect();
-        let _ = store;
         for (name, cell, done) in todo {
             // under the state lock, which a switch of the inference takes to replace the
             // circuit
@@ -1388,7 +1414,7 @@ impl Runtime {
                 continue;
             };
             let r = st.circuit.encode(&snap).and_then(|body| {
-                persist::write(
+                persist::write_with(
                     &views::dir(&root, &name).join(BRANCH),
                     &persist::Header {
                         dataset: self.dataset,
@@ -1396,6 +1422,7 @@ impl Runtime {
                         fingerprint: st.fingerprint(cell.key),
                     },
                     &body,
+                    || store.failpoint("view-checkpoint-written"),
                 )
             });
             drop(st);
@@ -2327,5 +2354,75 @@ mod switch_tests {
         let mut reg = rt.reg.lock();
         rt.sync_inference(&mut reg, host.as_ref());
         assert_eq!(rt.switched.load(Ordering::Acquire), 7);
+    }
+}
+
+#[cfg(test)]
+mod compiler_tests {
+    use super::COMPILER;
+    use sha2::{Digest, Sha256};
+
+    /// Each compiler version with the fingerprint of the operator variant list it
+    /// compiles to, oldest first. A change to `ops::Op` changes what a circuit's state
+    /// holds, so it needs a new `COMPILER` and a new row here: a state checkpointed by
+    /// the old compiler is then refused by its fingerprint and the view is built
+    /// again, instead of being decoded into the wrong operators.
+    const VERSIONS: &[(&str, &str)] = &[
+        ("f13-phase1-2", "650d426b8dbb3bb3"),
+        // a GRAPH inside GRAPH compiles to a recompute node
+        ("f13-phase1-3", "650d426b8dbb3bb3"),
+    ];
+
+    /// The variants of `ops::Op` as the source declares them, without comments or
+    /// whitespace.
+    fn op_variants() -> String {
+        let src = include_str!("ops/mod.rs");
+        let start = src
+            .find("pub enum Op {")
+            .expect("ops::Op is declared in ops/mod.rs");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("the end of ops::Op");
+        body[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .flat_map(|l| l.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn fingerprint() -> String {
+        let h = Sha256::digest(op_variants().as_bytes());
+        h[..8].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The operator variants and `COMPILER` change together.
+    #[test]
+    fn compiler_version_follows_the_operators() {
+        let got = fingerprint();
+        let (version, pinned) = VERSIONS.last().expect("a version");
+        assert_eq!(
+            (*version, *pinned),
+            (COMPILER, got.as_str()),
+            "ops::Op changed ({}): bump COMPILER in incr/runtime.rs and add \
+             (\"<new COMPILER>\", \"{got}\") to VERSIONS",
+            op_variants()
+        );
+        // a version names one variant list; a bump for another reason, such as a
+        // change of an operator's state encoding, may keep the list
+        for (i, (v, _)) in VERSIONS.iter().enumerate() {
+            for (w, _) in &VERSIONS[i + 1..] {
+                assert_ne!(v, w, "COMPILER {v:?} is listed twice");
+            }
+        }
+    }
+
+    /// The fingerprint covers the variants and nothing around them.
+    #[test]
+    fn the_fingerprint_reads_the_variant_list() {
+        let v = op_variants();
+        assert!(v.starts_with("pub enum Op {"), "{v}");
+        assert!(v.contains("Bgp(Box<bgp::Bgp>),"), "{v}");
+        assert!(v.contains("Template(Box<template::Template>),"), "{v}");
+        assert!(!v.contains("impl"), "{v}");
     }
 }

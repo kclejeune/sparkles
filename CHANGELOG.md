@@ -29,6 +29,17 @@ or token they were opened with expires, including a session's idle timeout. OIDC
 sign-ins decide admission and the session lifetime under the policy current after the
 provider exchange and create the session only if no reload completed meanwhile.
 
+A view whose stored `view.json` asks for an option that only a later phase supports,
+such as a `graph` view, maintenance at commit, other branches, `keepCommits` or
+provenance, no longer runs as a `table` view on `main`. The views are checked when they
+load and on every attach, and such a view is listed as failed with `unsupported-option`
+until it is defined again. The other views of the dataset open and run as before.
+
+A view or live query with a `GRAPH` inside another `GRAPH` now evaluates that group
+again at each commit that touches it. The outer graph variable was unbound in every row
+before, and a constant outer graph was not required to exist. View checkpoints of the
+older compiler are built again from the data.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.
