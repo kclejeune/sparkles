@@ -1846,6 +1846,12 @@ impl Ctx {
                 Some(id) => id,
                 None => self.intern_term(&v.to_term()),
             },
+            // The canonical form of a decimal value parses back to the same value, so
+            // its inline id needs neither the text nor the parse of `intern_term`.
+            Value::Decimal(d) => match id::pack_decimal(*d) {
+                Some(p) => Id::new(Tag::Decimal, p),
+                None => self.intern_term(&v.to_term()),
+            },
             _ => self.intern_term(&v.to_term()),
         }
     }
@@ -2509,6 +2515,43 @@ pub enum TermKind {
 mod charge_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    /// A decimal value gets the id of its canonical literal, inline or query-local.
+    #[test]
+    fn decimal_values_intern_as_their_canonical_literal() {
+        use oxsdatatypes::Decimal;
+        let store = Store::in_memory(StoreOptions::default());
+        let context = Ctx::new(store.snapshot());
+        let mut bits: Vec<i128> = vec![
+            0,
+            1,
+            -1,
+            1_950_000_000_000_000_000_000,
+            -5_000_000_000_000_000_000,
+            123_456_789,
+            i128::MAX,
+            i128::MIN,
+            1 << 100,
+        ];
+        for scale in 0..=38 {
+            let p = 10i128.pow(scale);
+            bits.extend([p, -p, 7 * (p / 10)]);
+            bits.extend(
+                [1i128 << 55, (1 << 55) - 1, -(1 << 55), -(1 << 55) - 1]
+                    .iter()
+                    .filter_map(|m| m.checked_mul(p / 10)),
+            );
+        }
+        let mut inline = 0;
+        for v in bits {
+            let value = Value::Decimal(Decimal::from_be_bytes(v.to_be_bytes()));
+            let id = context.intern_value(&value);
+            assert_eq!(id, context.intern_term(&value.to_term()), "{value:?}");
+            inline += usize::from(id.tag() == Tag::Decimal);
+            assert_eq!(context.term(id), Some(value.to_term()));
+        }
+        assert!(inline > 20, "most of the values are inline: {inline}");
+    }
 
     #[test]
     fn retained_cursor_charges_release_and_do_not_keep_context_alive() {

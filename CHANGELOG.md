@@ -149,6 +149,14 @@ The full-text integrity check retries segment replacements made by merges even w
 commit stamp stays the same. If the index keeps changing throughout its three attempts,
 it requests another check instead of reporting missing files from superseded metadata.
 
+The product of a decimal and a nonzero integer and the quotient of two integers are now
+computed in one 128-bit operation, with the same results and overflow errors as before.
+Decimal results take their inline ids without being written as text and parsed again,
+and YEAR, MONTH, DAY, HOURS and MINUTES read the fields of an inline date or dateTime.
+DBpedia's `births-by-decade` at the 50M slice takes 4.7 ms warm and 29.8 ms cold on
+atlas instead of 48.9 and 64.5 ms, and on the full 1.24-billion-triple store it takes
+58.9 ms warm on forge instead of 161.7 ms.
+
 Eager results are now serialized into an 8 KiB buffer of the engine's own and written to
 the response in pieces of that size, where the serializers used to write a few bytes at a
 time through the response writer's checks. On forge the 300,191 rows of `optional-chain`

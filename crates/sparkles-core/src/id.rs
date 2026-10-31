@@ -301,6 +301,18 @@ fn pack_date_time(
     )
 }
 
+/// The year, month, day, hour and minute of a packed dateTime (or date). An inline id
+/// holds only canonical forms, so these are the components of its value.
+pub fn date_time_fields(p: u64) -> (i64, u8, u8, u8, u8) {
+    (
+        ((p >> 43) & 0x3FFF) as i64 - 8192,
+        ((p >> 39) & 0xF) as u8,
+        ((p >> 34) & 0x1F) as u8,
+        ((p >> 29) & 0x1F) as u8,
+        ((p >> 23) & 0x3F) as u8,
+    )
+}
+
 /// Canonical lexical form of a packed dateTime (or date).
 pub fn unpack_date_time(p: u64, date_only: bool) -> String {
     let year = ((p >> 43) & 0x3FFF) as i64 - 8192;

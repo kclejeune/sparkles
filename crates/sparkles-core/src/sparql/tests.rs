@@ -420,6 +420,151 @@ fn arithmetic_is_left_associative() {
     assert_eq!(strs(&r), ["7"]);
 }
 
+/// YEAR, MONTH, DAY, HOURS and MINUTES of an inline date or dateTime read its packed
+/// components. They agree with the same functions over the parsed literal, which a
+/// nested argument takes, for every kind of temporal and non-temporal input.
+#[test]
+fn temporal_components_of_inline_terms_match_parsed_literals() {
+    use rand::{RngExt, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+    let mut values = vec![
+        r#""1999-12-31T24:00:00"^^xsd:dateTime"#.to_string(),
+        r#""2000-01-01T00:00:00.123+05:07"^^xsd:dateTime"#.to_string(),
+        r#""20000-01-01"^^xsd:date"#.to_string(),
+        r#""-0044-03-15"^^xsd:date"#.to_string(),
+        r#""0000-01-01Z"^^xsd:date"#.to_string(),
+        r#""1950"^^xsd:gYear"#.to_string(),
+        r#""10:30:00"^^xsd:time"#.to_string(),
+        r#""bad"^^xsd:date"#.to_string(),
+        r#""1950-01-01""#.to_string(),
+        "1950".to_string(),
+    ];
+    for _ in 0..400 {
+        let year = rng.random_range(-9000i64..9000);
+        let sign = if year < 0 { "-" } else { "" };
+        let date = format!(
+            "{sign}{:04}-{:02}-{:02}",
+            year.abs(),
+            rng.random_range(1..13),
+            rng.random_range(1..29)
+        );
+        let tz = match rng.random_range(0..4) {
+            0 => String::new(),
+            1 => "Z".to_string(),
+            2 => format!(
+                "+{:02}:{:02}",
+                rng.random_range(0..14),
+                15 * rng.random_range(0..4)
+            ),
+            _ => format!(
+                "-{:02}:{:02}",
+                rng.random_range(0..14),
+                15 * rng.random_range(0..4)
+            ),
+        };
+        values.push(format!(r#""{date}{tz}"^^xsd:date"#));
+        values.push(format!(
+            r#""{date}T{:02}:{:02}:{:02}{tz}"^^xsd:dateTime"#,
+            rng.random_range(0..24),
+            rng.random_range(0..60),
+            rng.random_range(0..60)
+        ));
+    }
+    let s = store();
+    let inline = values
+        .iter()
+        .filter(|v| {
+            let r = q(&s, &format!("SELECT ?d {{ VALUES ?d {{ {v} }} }}"));
+            r.rows().into_iter().flatten().flatten().any(|t| {
+                matches!(&t, Term::Literal(l) if crate::id::inline_literal(l.value(), l.datatype().as_str()).is_some())
+            })
+        })
+        .count();
+    assert!(inline > 700, "most inputs are inline ids: {inline}");
+    let functions = ["YEAR", "MONTH", "DAY", "HOURS", "MINUTES"];
+    let fast: Vec<String> = functions
+        .iter()
+        .map(|f| format!("({f}(?d) AS ?{f})"))
+        .collect();
+    let slow: Vec<String> = functions
+        .iter()
+        .map(|f| format!("({f}(STRDT(STR(?d), DATATYPE(?d))) AS ?{f})"))
+        .collect();
+    let body = format!(
+        "{{ VALUES ?d {{ {} }} }} ORDER BY STR(?d)",
+        values.join(" ")
+    );
+    let fast = q(&s, &format!("SELECT ?d {} {body}", fast.join(" ")));
+    let slow = q(&s, &format!("SELECT ?d {} {body}", slow.join(" ")));
+    assert_eq!(fast.rows(), slow.rows());
+    assert_eq!(fast.rows().len(), values.len());
+}
+
+/// Decades of birth dates grouped and counted, the shape of DBpedia's
+/// `births-by-decade`, over dates and dateTimes with and without timezones, years
+/// before zero, a normalized midnight and inputs whose YEAR is an error.
+#[test]
+fn decades_of_mixed_temporal_values_group_exactly() {
+    let data = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+ex:a ex:born "1950-01-01"^^xsd:date .
+ex:b ex:born "1959-12-31+14:00"^^xsd:date .
+ex:c ex:born "1960-01-01T00:00:00Z"^^xsd:dateTime .
+ex:d ex:born "1999-12-31T24:00:00"^^xsd:dateTime .
+ex:e ex:born "-0044-03-15"^^xsd:date .
+ex:f ex:born "0005-06-01-05:00"^^xsd:date .
+ex:g ex:born "1950"^^xsd:gYear .
+ex:h ex:born "bad"^^xsd:date .
+ex:i ex:born "1950-01-01" .
+ex:j ex:born "1955-05-05T12:00:00.5+05:07"^^xsd:dateTime .
+ex:k ex:born "12345-01-01"^^xsd:date .
+"#;
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        data.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let mut extra = String::new();
+    for i in 0..3000 {
+        let year = 1900 + i % 120;
+        extra.push_str(&format!(
+            "<http://ex.org/p{i}> <http://ex.org/born> \"{year}-{:02}-{:02}\"^^<http://www.w3.org/2001/XMLSchema#date> .\n",
+            1 + i % 12,
+            1 + i % 28
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        extra.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let text = "SELECT ?decade (COUNT(?p) AS ?n) WHERE { ?p ex:born ?d \
+                BIND(FLOOR(YEAR(?d) / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade";
+    let mut want: std::collections::BTreeMap<i64, usize> = Default::default();
+    for i in 0..3000 {
+        *want.entry((1900 + i % 120) / 10 * 10).or_default() += 1;
+    }
+    for year in [1950, 1959, 1960, 2000, 1955, 12345] {
+        *want.entry(year / 10 * 10).or_default() += 1;
+    }
+    *want.entry(-50).or_default() += 1;
+    *want.entry(0).or_default() += 1;
+    let mut want: Vec<String> = want.iter().map(|(d, n)| format!("{d} {n}")).collect();
+    want.push("UNDEF 3".to_string());
+    want.sort();
+    assert_eq!(strs(&q(&s, text)), want);
+    let r = q(&s, text);
+    for row in r.rows() {
+        if let Some(Term::Literal(l)) = &row[0] {
+            assert_eq!(l.datatype(), oxrdf::vocab::xsd::DECIMAL, "{l}");
+        }
+    }
+}
+
 /// Whether the query is rejected (with the test prefixes, so only its syntax is at fault).
 fn rejected(s: &Store, text: &str) -> bool {
     let prefixes = vec![

@@ -38,7 +38,7 @@ DBpedia 50M queries are within 10%. SP²Bench `q12b` is also within 8% of Oxigra
 | Writes during mixed load | Oxigraph 3.4× at 1.05M in the suite and 2.1–3.0× at 10.5M in the focused assessment | At 10.5M in the focused assessment, Oxigraph completes no reads in the thirty-second window, while Sparkles completes 232–245 reads/s. Durability and completed reader work differ. |
 | Cold point lookups | Oxigraph 1.5–3.0× at 1.05M and 1.3–2.9× at 10.5M | Listed under [Cold starts](benchmarks/synthetic/RESULTS.md#cold-starts). |
 | Cold small scans at 1.05M | Fluree 1.17–3.0× on `count-all`, `contains`, `distinct-obj` and `employee-docs` | Fluree is not ahead on any cold query at 10.5M. |
-| DBpedia 50M slice `births-by-decade` | QLever 3.0× warm and 2.5× cold in the complete-HTTP assessment | Sparkles takes 50.2 ms warm and 68.1 ms cold, against 16.6 and 27.6 ms. The comparative TSV tables use another timer contract, and the full-data internal guard establishes no current peer ranking. |
+| DBpedia 50M slice `births-by-decade` | QLever 3.0× warm and 2.5× cold in the complete-HTTP assessment | Sparkles takes 50.2 ms warm and 68.1 ms cold, against 16.6 and 27.6 ms. The [decimal arithmetic change](benchmarks/dbpedia/RESULTS.md#decimal-arithmetic-and-inline-dates) is faster in an internal comparison, and item 432 holds the paired forge recheck. |
 | DBpedia cold `outlink-classes-2` | QLever 1.25× | Sparkles wins 29 of 31 cold queries. |
 | Server RSS after the run, 1.05M | QLever 1.32× | Without its block cache, Sparkles holds 345 MiB. Sparkles has the lowest RSS after the run at 10.5M. |
 | Peak RSS under 16 readers | QLever 1.67× at 1.05M and 1.43× at 10.5M | Sparkles peaks at 567 and 1,339 MiB, against 339 and 939 MiB. |

@@ -373,6 +373,9 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
                 };
                 return r.map(Value::Integer).ok_or(TypeError);
             }
+            if let Some(r) = exact_decimal(&op, a, b) {
+                return r.map(Value::Decimal).ok_or(TypeError);
+            }
             let x = a.to_decimal().ok_or(TypeError)?;
             let y = b.to_decimal().ok_or(TypeError)?;
             let r = match op {
@@ -407,6 +410,38 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
             })
         }
     })
+}
+
+/// The scale of oxsdatatypes' decimals, which hold `value × 10^-18` in an `i128`.
+const DECIMAL_SCALE: i128 = 1_000_000_000_000_000_000;
+
+/// The decimal product or quotient of `a` and `b` in one `i128` operation, for the
+/// operands whose oxsdatatypes result it is known to equal, or `None` to use
+/// oxsdatatypes. Its `checked_mul` and `checked_div` strip and count trailing zeros
+/// with one 128-bit division per digit, about twenty for an integer operand.
+///
+/// A product with a nonzero integer `j` is the other operand's value times `j`.
+/// oxsdatatypes then shifts by at least zero digits, computes the exact product and
+/// overflows exactly when the product does. A zero integer can fail there on a
+/// fractional operand, so it keeps the general path. The quotient of two integers
+/// `i / j` with `j` nonzero is `i × 10^18 / j` truncated toward zero. oxsdatatypes
+/// truncates twice, which gives the same result, and its shifts stay below 10^39 for
+/// 64-bit integers, so it never fails there.
+fn exact_decimal(op: &NumOp, a: Num, b: Num) -> Option<Option<Decimal>> {
+    let raw = |d: Decimal| i128::from_be_bytes(d.to_be_bytes());
+    let decimal = |v: i128| Decimal::from_be_bytes(v.to_be_bytes());
+    match (op, a, b) {
+        (NumOp::Mul, Num::Decimal(d), Num::Integer(j))
+        | (NumOp::Mul, Num::Integer(j), Num::Decimal(d))
+            if i64::from(j) != 0 =>
+        {
+            Some(raw(d).checked_mul(i128::from(i64::from(j))).map(decimal))
+        }
+        (NumOp::Div, Num::Integer(i), Num::Integer(j)) if i64::from(j) != 0 => Some(Some(decimal(
+            i128::from(i64::from(i)) * DECIMAL_SCALE / i128::from(i64::from(j)),
+        ))),
+        _ => None,
+    }
 }
 
 /// A numeric constant prepared for many comparisons: its value in each type that
@@ -734,6 +769,93 @@ mod tests {
             };
             same(Decimal::from_be_bytes(bits.to_be_bytes()));
         }
+    }
+
+    /// The one-operation decimal products and quotients give oxsdatatypes' results,
+    /// errors and overflows included.
+    #[test]
+    fn exact_decimal_arithmetic_matches_oxsdatatypes() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let reference = |op: &NumOp, a: Num, b: Num| -> Option<Decimal> {
+            let (x, y) = (a.to_decimal()?, b.to_decimal()?);
+            match op {
+                NumOp::Mul => x.checked_mul(y),
+                NumOp::Div if y == Decimal::from(0) => None,
+                NumOp::Div => x.checked_div(y),
+                _ => unreachable!(),
+            }
+        };
+        let decimal = |v: i128| Decimal::from_be_bytes(v.to_be_bytes());
+        let integers = |rng: &mut rand::rngs::StdRng| -> i64 {
+            match rng.random_range(0..5) {
+                0 => rng.random_range(-20i64..20),
+                1 => rng.random_range(-3000i64..3000),
+                2 => rng.random::<i64>(),
+                3 => rng.random::<i64>() >> rng.random_range(0..63),
+                _ => [0, 1, -1, 10, i64::MAX, i64::MIN, 1_000_000_000_000_000_000]
+                    [rng.random_range(0..7)],
+            }
+        };
+        let decimals = |rng: &mut rand::rngs::StdRng| -> i128 {
+            match rng.random_range(0..5) {
+                0 => rng.random_range(-1_000_000i128..1_000_000),
+                1 => i128::from(rng.random::<i32>())
+                    .saturating_mul(10i128.pow(rng.random_range(0..30))),
+                2 => rng.random::<i128>() >> rng.random_range(0..127),
+                3 => rng.random::<i128>(),
+                _ => [
+                    0,
+                    1,
+                    -1,
+                    i128::MAX,
+                    i128::MIN,
+                    DECIMAL_SCALE,
+                    -DECIMAL_SCALE,
+                ][rng.random_range(0..7)],
+            }
+        };
+        let mut checked = 0;
+        for _ in 0..200_000 {
+            let i = Num::Integer(integers(&mut rng).into());
+            let j = Num::Integer(integers(&mut rng).into());
+            let d = Num::Decimal(decimal(decimals(&mut rng)));
+            for (op, a, b) in [
+                (NumOp::Mul, d, j),
+                (NumOp::Mul, j, d),
+                (NumOp::Div, i, j),
+                (NumOp::Div, d, j),
+                (NumOp::Mul, d, Num::Decimal(decimal(decimals(&mut rng)))),
+            ] {
+                if let Some(fast) = exact_decimal(&op, a, b) {
+                    checked += 1;
+                    assert_eq!(fast, reference(&op, a, b), "{a:?} {b:?}");
+                }
+                let want = reference(&op, a, b);
+                let got = match arith(op, &a.into_value(), &b.into_value()) {
+                    Ok(Value::Decimal(d)) => Some(d),
+                    Err(_) => None,
+                    Ok(other) => panic!("{other:?}"),
+                };
+                assert_eq!(got, want, "{a:?} {b:?}");
+            }
+        }
+        assert!(checked > 500_000, "the fast paths are exercised: {checked}");
+        // oxsdatatypes fails on a zero integer times a fractional decimal, and on some
+        // quotients of a fractional decimal, so these keep its general path.
+        let tiny = Num::Decimal(decimal(1));
+        assert!(exact_decimal(&NumOp::Mul, tiny, Num::Integer(0.into())).is_none());
+        assert!(arith(NumOp::Mul, &tiny.into_value(), &Value::Integer(0.into())).is_err());
+        assert!(exact_decimal(&NumOp::Div, tiny, Num::Integer(10.into())).is_none());
+        assert!(arith(NumOp::Div, &tiny.into_value(), &Value::Integer(10.into())).is_err());
+        assert!(
+            arith(
+                NumOp::Div,
+                &Value::Integer(7.into()),
+                &Value::Integer(0.into())
+            )
+            .is_err()
+        );
     }
 
     #[test]

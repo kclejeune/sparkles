@@ -1606,6 +1606,53 @@ checks, and expose the different completed reader work in mixed throughput compa
 Direct synchronization and small absolute serial differences support deferring further
 work under290. No change to durability or crash-recovery behavior is inferred.
 
+### Decimal arithmetic and inline date components
+
+Item 432 profiled `births-by-decade` on the 50M slice with `perf` on atlas. About 47 of
+its 50 ms went to the BIND of `FLOOR(YEAR(?d) / 10) * 10` over 40,790 joined rows,
+about 1.1 µs per row, while the scans and the merge join took about 3 ms. Reusing the
+expression per distinct input could not remove much of this, because 27,436 of the
+40,790 dates are distinct. Grouping by distinct dates before evaluating the key, the
+candidate named before profiling, would have saved at most a third of the evaluations,
+so it was not built.
+
+Most of the cost per row was decimal arithmetic. The `checked_div` and `checked_mul`
+of oxsdatatypes count the trailing zeros of each operand with one 128-bit division per
+digit, about twenty for an integer operand. Every decimal result was also written as
+text and parsed back to find its inline id, and every inline date was written as text
+and parsed again before YEAR read it.
+
+A product of a decimal and a nonzero integer, and a quotient of two integers, now take
+one 128-bit operation. Both return the oxsdatatypes result, including its overflow
+errors, and a differential test compares them over 200,000 random operand sets. A zero
+factor and other quotients keep the general path, because oxsdatatypes fails on some of
+them where an exact result exists. Decimal values pack into their inline ids without
+text, and YEAR, MONTH, DAY, HOURS and MINUTES read the fields of an inline date or
+dateTime. A test checks these functions against the parsed literal for 810 dates and
+dateTimes, and another groups decades over dates with timezones, negative years, a
+normalized midnight, non-inline years and inputs whose YEAR is an error.
+
+Paired measurements on atlas ran main `4196fb84`, the change `249f5f35` and QLever
+0.5.48 alone over the same 50M slice indexes, with the complete-HTTP JSON timer of the
+cursor assessment and result caches off. Four rounds gave each engine 80 warm requests
+and 12 cold restarts after file-cache eviction. Warm medians were 48.9 ms for main,
+4.7 ms for the change and 15.0 ms for QLever. Cold medians were 64.5, 29.8 and
+33.6 ms. All three returned the same 80 groups and counts. On forge, the full
+1.24-billion-triple store took 161.7 ms warm and 229.0 ms cold with main, against
+58.9 and 109.5 ms with the change, over 20 warm requests and four cold restarts each,
+and kept all 171 groups. The change shortens the work of each row and adds no state,
+so inputs with many distinct dates pay no new cost and query memory is unchanged.
+
+A Namespace screen of the same two binaries over the 30 synthetic queries at 1.05M
+triples returned matching answers, with geometric means of 0.993 for server time and
+1.000 for client time. `expr-bind-group` took 15% less server time. Its first pass
+flagged `count-all`, `distinct-obj`, `predicate-subjects`, `values-star` and `minus`,
+all under 0.3 ms with spreads between server processes of 44% to 220%. Eight rounds
+of 100 requests brought every one of them within 6.5% of the base in server time and
+within 2.8% in client time. Item 328 keeps the quiet Intel checks of these small
+queries. The same-host QLever run is internal evidence. The published ranking and the loss
+list change only after the paired forge comparison that item 432 holds.
+
 ### Preparation-batch short-query control
 
 An initial optional-count client-wall flag did not recur with a larger interleaved
