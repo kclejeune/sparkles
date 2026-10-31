@@ -582,10 +582,11 @@ SPARQL `LOAD`, and Jena's syntaxes loaded without a temporary N-Quads copy.**
   `crates/sparkles-server/tests/cli_jena_load.rs` does the same for `sparkles load`. The
   JVM, Node.js and Python suites cover the bindings.
 * **Measurements.** On a shared 16-core laptop, the command `sparkles load` takes 11 to
-  22 percent less wall time on 1.05M-triple files and 26 to 28 percent less on 5.26M-triple
-  files, and it writes no temporary file where it wrote 105 MiB and 533 MiB. Peak RSS
-  falls from about 1.17 GiB to 0.9 GiB on the larger files. The first build, in which the
+  22 percent less wall time on 1.05M-triple files. On the quiet host atlas, with the final
+  loader, it takes 16 percent less on a 5.26M-triple RDF Thrift file and 22 percent less
+  on an RDF Protobuf file. It writes no temporary file where it wrote 105 MiB and 533 MiB.
+  Peak RSS falls from about 1.28 GiB to 1.0 GiB on the larger files. The first build, in which the
   decoder also encoded the quads, measured level with the old loader, and the batches to
   parallel sinks made the difference. The full table and the method are in the
-  [loading results](../benchmarks/loading/RESULTS.md#jenas-syntaxes). These are local
-  numbers and not forge numbers.
+  [loading results](../benchmarks/loading/RESULTS.md#jenas-syntaxes). These are not forge
+  numbers.

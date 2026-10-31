@@ -80,7 +80,7 @@ malformed RDF Thrift or RDF Protobuf body now reports how many statements were r
 before the fault. The decompressed-size cap of the server still bounds a Thrift, Protobuf,
 RDF/JSON or TriX body by the size of its quads as N-Quads, as the rewrite did, and it
 also counts the bytes read. A body that expands through a prefix is refused with `413`.
-Loading a file in one of these syntaxes takes 11 to 28 percent less time and no longer
+Loading a file in one of these syntaxes takes 11 to 22 percent less time and no longer
 needs the disk room of the copy.
 
 Signing in, minting a token and expiry pruning no longer move the shared authority
