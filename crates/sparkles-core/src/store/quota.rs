@@ -163,8 +163,8 @@ impl Quota {
         *self.walking.lock() = Some(Box::new(hook));
     }
 
-    /// The bytes reserved for queued commits (for tests).
-    #[cfg(test)]
+    /// The bytes of records and terms that queued grouped commits will write, which the
+    /// free-space reserve also counts.
     pub(crate) fn queued(&self) -> u64 {
         self.queued.load(Ordering::Relaxed)
     }

@@ -2449,6 +2449,82 @@ mod tests {
         assert_eq!(counted, measured, "the fence's growth was counted twice");
     }
 
+    /// Commits queued behind a fence count against the free-space reserve, since their
+    /// records and terms are not on disk yet.
+    #[test]
+    fn queued_commits_count_against_the_free_space_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = crate::disk::free_bytes(dir.path()).unwrap();
+        let s = Arc::new(
+            Store::open(
+                dir.path(),
+                StoreOptions {
+                    min_free_disk_bytes: Some(free.saturating_sub(8 << 20)),
+                    ..options()
+                },
+            )
+            .unwrap(),
+        );
+        insert(&s, "seed").unwrap();
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut waiting = Vec::new();
+        let mut refused = None;
+        for i in 0..16 {
+            let (done, finished) = mpsc::channel();
+            let t = {
+                let s = s.clone();
+                thread::spawn(move || {
+                    let u = format!(
+                        "INSERT DATA {{ <urn:long{i}> <urn:p> \"{}{i}\" }}",
+                        "x".repeat(1 << 20)
+                    );
+                    let r = crate::sparql::update::update(&s, &u, &Default::default());
+                    let _ = done.send(());
+                    r.map(|_| ())
+                })
+            };
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                if s.group.as_ref().unwrap().queued() > waiting.len() {
+                    waiting.push(t);
+                    break;
+                }
+                if finished.try_recv().is_ok() {
+                    refused = Some(t.join().unwrap());
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "commit {i} neither queued nor finished"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            if refused.is_some() {
+                break;
+            }
+        }
+        let refused = refused.expect("the free-space reserve never refused a queued commit");
+        assert!(
+            matches!(&refused, Err(Error::StorageFull(_))),
+            "{refused:?}"
+        );
+        assert!(
+            waiting.len() < 9,
+            "{} commits of 1 MiB fit in 8 MiB",
+            waiting.len()
+        );
+        go.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        for t in waiting {
+            t.join().unwrap().unwrap();
+        }
+    }
+
     /// A walk that began before a fence read the walk count, and read the directory
     /// after the fence grew it, also makes the fence measure again.
     #[test]
