@@ -217,6 +217,16 @@ jobs:
       - name: Formatter for wasm32 (mise run fmt:wasm)
         if: ${{ !cancelled() && matrix.platform == 'linux-amd64' }}
         run: mbx clippy --locked -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings
+      # node and the wasm-bindgen test runner at the versions mise.toml pins
+      - uses: jdx/mise-action@v5
+        if: ${{ !cancelled() && matrix.platform == 'linux-amd64' }}
+        with:
+          install_args: node github:wasm-bindgen/wasm-bindgen@0.2.129
+      - name: Formatter entry points in node (mise run fmt:wasm)
+        if: ${{ !cancelled() && matrix.platform == 'linux-amd64' }}
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: mbx test --locked -p sparkles-fmt-wasm --target wasm32-unknown-unknown --test wasm_runtime
       - name: Bindings (mise run py:lint jvm:lint node:lint)
         if: ${{ !cancelled() && matrix.platform == 'linux-amd64' }}
         run: |
