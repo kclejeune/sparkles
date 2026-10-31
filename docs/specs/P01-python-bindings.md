@@ -1345,5 +1345,5 @@ the transaction slot as the request began.
 Each regression test failed on the build before its fix, and
 `tests/block_reader_memory.rs` counts the live block buffers with a global allocator. A 5M-triple N-Triples file object loads in 2.25 s instead of 21.07 s on atlas, and a
 one-triple one in a new process takes 6.4 ms instead of 2.7 ms, which roadmap item
-NEW-ITEM tracks. The [loading results](../benchmarks/loading/RESULTS.md#python-file-objects)
+445 tracks. The [loading results](../benchmarks/loading/RESULTS.md#python-file-objects)
 record the measurements.
