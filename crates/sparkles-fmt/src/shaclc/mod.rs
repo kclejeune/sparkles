@@ -113,16 +113,9 @@ impl LangImpl for Shaclc {
         let out = parse_reference(output).map_err(|_| unsafe_.clone())?;
         match isomorphic_bounded(&r.quads, &out, deadline)? {
             Some(true) => Ok(()),
-            Some(false) => Err(unsafe_),
-            // never accept what was not verified
-            None => Err(FormatError::Unsupported {
-                message: "could not verify the formatted output: comparing its shapes graph \
-                          with the input's takes more work than the budget allows; input \
-                          left unchanged"
-                    .to_string(),
-                line: 1,
-                column: 1,
-            }),
+            // a difference, or a budget that ran out: never accept what was not verified,
+            // and report both as a refusal of the graph check
+            Some(false) | None => Err(unsafe_),
         }
     }
 }
