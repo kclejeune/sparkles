@@ -1587,3 +1587,55 @@ fn equality_table_respects_graph_visibility_and_commits() {
     }
     assert_eq!(rows(&query(pinned, q, &demand(&qr)).unwrap()), all);
 }
+
+/// Rules with a schema vocabulary, so that demand specializes them, whose equality runs
+/// through a generalized fact: `"1" owl:sameAs ex:a` has a literal subject.
+fn generalized_equality_profile() -> Profile {
+    Profile::Rules(format!(
+        "{PREFIXES}
+        [domain: (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+        [same: (?x ex:val ?v) -> (?v owl:sameAs ?x)]
+        [out: (?v owl:sameAs ?x) -> (?x ex:out ?v)]"
+    ))
+}
+
+/// A session that reads the equality stages' table keeps the generalized facts those
+/// stages derived, so warm answers equal cold ones.
+#[test]
+fn equality_table_keeps_generalized_facts() {
+    let s = store("ex:a ex:val \"1\" .");
+    let qr = reasoner(&generalized_equality_profile());
+    let q = "SELECT ?v { ex:a ex:out ?v }";
+    for no_cache in [true, true, false] {
+        let mut options = demand(&qr);
+        options.no_cache = no_cache;
+        assert_eq!(
+            rows(&run(&s, q, &options)),
+            vec!["\"1\""],
+            "no_cache {no_cache}"
+        );
+    }
+}
+
+/// `now` gives each session its own time, so a program that reads it does not keep
+/// the equality stages' facts: a later session derives its own time only.
+#[test]
+fn equality_table_is_not_kept_for_programs_that_read_now() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [domain: (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+        [stamp: (?x ex:val ?v), now(?t) -> (?x ex:stamp ?t)]
+        [same: (?x ex:stamp ?t) -> (?t owl:sameAs ?x)]
+        [out: (?t owl:sameAs ?x), (?x ex:stamp ?t) -> (?x ex:out ?t)]"
+    ));
+    let s = store("ex:a ex:val 1 .");
+    let qr = reasoner(&profile);
+    let q = "SELECT ?t { ex:a ex:out ?t }";
+    let mut options = demand(&qr);
+    options.no_cache = true;
+    for i in 0..3 {
+        let got = rows(&run(&s, q, &options));
+        assert_eq!(got.len(), 1, "session {i}: {got:?}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

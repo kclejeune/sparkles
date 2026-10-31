@@ -1314,3 +1314,28 @@ fn explanations_from_cached_equality_facts_are_sound() {
         }
     }
 }
+
+/// An explanation over the equality stages' table finds the generalized premises the
+/// stages derived, as the first explanation did.
+#[test]
+fn explanations_from_cached_equality_keep_generalized_premises() {
+    let p = Profile::Rules(format!(
+        "{PREFIXES}
+        [domain: (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+        [same: (?x ex:val ?v) -> (?v owl:sameAs ?x)]
+        [out: (?v owl:sameAs ?x) -> (?x ex:out ?v)]"
+    ));
+    let s = store("ex:a ex:val \"1\" .");
+    let t = [
+        ex("a"),
+        ex("out"),
+        Term::Literal(oxrdf::Literal::new_simple_literal("1")),
+    ];
+    for _ in 0..3 {
+        let (ts, _) = trees(demand(&s, &p, t.clone(), &ExplainOptions::default()));
+        assert!(!ts.is_empty());
+        for d in &ts {
+            sound(&s, d, &mut Vec::new());
+        }
+    }
+}

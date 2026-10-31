@@ -10,7 +10,7 @@
 //! calls build on what earlier calls derived. Each derivation runs under the query's
 //! deadline, cancellation and memory budget and a limit of derived facts.
 
-use crate::budget::{Budget, MemoryExceeded};
+use crate::budget::{Budget, Held, MemoryExceeded};
 use crate::demand::{self, Key, KeyP, Pass, Program, TransformError, Vocab};
 use crate::engine::{self, Atom, CHead, CRule, Slot};
 use crate::facts::Base;
@@ -573,10 +573,29 @@ impl Session {
         if let Some((_, key)) = &equality
             && let Some(t) = tables::get(key)
         {
-            let facts = self.remap(&t)?;
+            // the table's local terms get this session's ids, and its facts go to the
+            // graph, which charges them, as they are read
+            let _map_held = Held::try_new(
+                &self.budget,
+                t.keys
+                    .len()
+                    .saturating_mul(2 * std::mem::size_of::<(u64, u64)>()),
+            )
+            .map_err(|e| memory_error(e, "the equality stages"))?;
+            let mut map: FxHashMap<u64, u64> = FxHashMap::default();
+            for (old, key) in &t.keys {
+                let new = self
+                    .terms
+                    .try_id_for_key(key)
+                    .map_err(|e| memory_error(e, "the equality stages"))?;
+                map.insert(*old, new);
+            }
             let g = self.graph.as_mut().expect("graph made");
-            g.try_add_batch(facts)
-                .map_err(|e| memory_error(e, "the equality stages"))?;
+            g.try_add_batch(
+                t.facts()
+                    .map(|f| f.map(|x| map.get(&x).copied().unwrap_or(x))),
+            )
+            .map_err(|e| memory_error(e, "the equality stages"))?;
             self.cached_equality = true;
         }
         for si in (1..stages).rev() {
@@ -610,7 +629,13 @@ impl Session {
     /// recursion as the rules state it, derive other intermediate facts and keep a key
     /// of their own.
     fn equality_key(&self) -> Option<tables::Key> {
-        if !self.equality_cacheable || self.added_facts {
+        // `now` is read once per session, so its facts are the session's own
+        let now = self.rules.iter().any(|r| {
+            r.builtins
+                .iter()
+                .any(|b| b.kind == crate::builtins::BuiltinKind::Now)
+        });
+        if !self.equality_cacheable || self.added_facts || now {
             return None;
         }
         Some(tables::Key {
@@ -623,21 +648,42 @@ impl Session {
 
     /// Keep every derived fact of the session's graph in the table cache, after its
     /// lower stages: they include the premises of each fact the equality stages derived,
-    /// so that an explanation in a session that reads the table still finds them. Magic
-    /// facts are left out, and nothing is kept when a rule made a blank node.
+    /// so that an explanation in a session that reads the table still finds them. Facts
+    /// RDF cannot state are kept too, since the stages' consequences can follow from
+    /// them. Magic facts are left out, and nothing is kept when a rule made a blank
+    /// node, when the table would pass the cache's capacity, or when the workspace that
+    /// builds it does not fit the session's memory budget.
     fn cache_equality(&self, key: tables::Key) {
         let g = self.graph.as_ref().expect("graph made");
-        let mut facts: Vec<[u64; 3]> = Vec::new();
+        let rows = g
+            .derived()
+            .iter()
+            .filter(|t| !self.hidden.contains(&t[1]))
+            .count();
+        let bytes = rows.saturating_mul(std::mem::size_of::<[u64; 3]>());
+        if bytes as u64 > tables::capacity() {
+            return;
+        }
+        let Ok(mut held) = Held::try_new(&self.budget, bytes) else {
+            return;
+        };
+        let mut facts: Vec<[u64; 3]> = Vec::with_capacity(rows);
         let mut keys: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for t in g.derived() {
-            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+            if self.hidden.contains(&t[1]) {
                 continue;
             }
             for &x in t {
                 if Id(x).tag() == Tag::Local && seen.insert(x) {
                     match self.terms.local(x) {
-                        Some(LocalTerm::Key(k)) => keys.push((x, k.clone())),
+                        Some(LocalTerm::Key(k)) => {
+                            // the key's copy, its entry and the seen set's slot
+                            if held.try_grow(k.len() + 64).is_err() {
+                                return;
+                            }
+                            keys.push((x, k.clone()))
+                        }
                         _ => return,
                     }
                 }
@@ -2085,5 +2131,61 @@ mod equality_cache_tests {
         next.derive_all(&[types_of_c()]).unwrap();
         assert!(next.cached_equality);
         assert!(!holds(&next, "http://ex.org/z"));
+    }
+}
+
+#[cfg(test)]
+mod equality_workspace_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    /// The workspace that builds the equality table is charged to the session's budget,
+    /// and the table, which is optional, is not kept when the workspace does not fit.
+    #[test]
+    fn equality_table_workspace_is_charged() {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                "@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . ex:a owl:sameAs ex:b . ex:b a ex:C ."
+                    .as_bytes()
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let reasoner =
+            QueryReasoner::new(Profile::OwlRl, &Extras::default(), Inputs::default()).unwrap();
+        let mut session = Session::new(
+            reasoner.shared.clone(),
+            SessionRequest {
+                snap: store.snapshot(),
+                readable: None,
+                stop: Arc::new(|| Ok(())),
+                max_memory: Some(1 << 30),
+                no_cache: true,
+            },
+        )
+        .unwrap();
+        session.make_graph().unwrap();
+        let id = |t: &str| {
+            session
+                .terms
+                .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(t)))
+        };
+        let fact = [
+            id("http://ex.org/a"),
+            id("http://ex.org/p"),
+            id("http://ex.org/b"),
+        ];
+        session.graph_mut().unwrap().add_batch([fact]);
+        session.equality_cacheable = true;
+        let key = session.equality_key().expect("cacheable");
+        let _rest = Held::try_new(&session.budget, session.budget.available()).unwrap();
+        session.cache_equality(key.clone());
+        assert!(tables::get(&key).is_none());
+        drop(_rest);
+        session.cache_equality(key.clone());
+        assert!(tables::get(&key).is_some());
     }
 }

@@ -904,13 +904,19 @@ stages finish in the derived-table cache. Later sessions over the same view add 
 facts and skip the equality stages. The key is the view, the rules' digest and whether the
 program rewrites linear recursion. Explanation sessions keep the rules' linear recursion
 and so keep a table of their own. The kept facts include the premises of every fact the
-equality stages derived, so an explanation over cached facts still finds well-founded
-trees. A session whose graph holds facts from outside the view, such as why-not hypotheses
+equality stages derived, including generalized facts that RDF cannot state, such as an
+`owl:sameAs` fact whose subject is a literal. An explanation over cached facts therefore
+still finds well-founded trees, and a warm query derives what a cold one does. A program
+that reads `now` neither reads nor fills the table, since each session reads its own
+time. A session whose graph holds facts from outside the view, such as why-not hypotheses
 or GeoSPARQL default geometries, neither reads nor fills the table. Like the schema table,
 the equality table is a property of the view, and `no_cache` does not bypass it.
 
 The table is charged to the derived-table cache's capacity, and the facts a session adds
-from it are charged to the session's memory budget. This trades memory for time. A view's
+from it are charged to the session's memory budget as they are read. The workspace that
+builds the table is charged to the session's budget first. A table larger than the
+cache's capacity, or one whose workspace does not fit the budget, is not kept, and the
+session's answers do not change. This trades memory for time. A view's
 table holds every fact the first session had derived when its lower stages finished,
 which can be many more facts than a selective query derives. Tables whose facts hold a
 blank node a rule made are not kept.
@@ -924,7 +930,8 @@ variable predicate or a builtin that reads facts outside its atoms. The predicat
 new rows come from the graph's predicate index rather than from the rows themselves. A demand program
 guards nearly every rule with a magic predicate of its own, so most rules have no new
 facts in a given iteration, and a full scan of the program dominated planning. The
-planned tasks are the same as without the index. A property test compares them on random
+index and each iteration's list of rules are charged to the run's memory budget while
+they are held. The planned tasks are the same as without the index. A property test compares them on random
 programs, graphs and row ranges. An iteration whose new rows include the base tier still
 plans every rule, since the base tier's predicates are not listed, and so does a graph
 with more predicates than the program has atoms, where a scan of the rules is cheaper.
