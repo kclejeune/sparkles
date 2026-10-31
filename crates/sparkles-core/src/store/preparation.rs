@@ -68,8 +68,4 @@ impl Snapshot {
         }
         preparation.check()
     }
-
-    pub(crate) fn retained_preparation_bytes(&self) -> u64 {
-        history_limited::preparation_delta_bytes(&self.delta)
-    }
 }

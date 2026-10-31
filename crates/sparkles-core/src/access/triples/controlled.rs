@@ -2,6 +2,7 @@
 use super::*;
 use crate::access::preparation::{Buffer, Map, Text, compare_text, sort_by};
 use crate::access::{Exemptions, GraphGuard, GraphRule, Preparation, PreparedView, Reservation};
+use crate::store::{Delta, KeySet};
 mod key;
 
 pub(crate) fn prepare(
@@ -10,11 +11,9 @@ pub(crate) fn prepare(
     preparation: &Preparation,
 ) -> Result<PreparedView> {
     preparation.stage("preparing permission view")?;
-    let mut held = preparation.reserve(
-        snap.retained_preparation_bytes()
-            .saturating_add(mask_storage(snap))
-            .saturating_add(1024),
-    )?;
+    // The input snapshot and its persistent delta belong to the caller. The returned
+    // view is charged only for storage this preparation creates or keeps alive alone.
+    let mut held = preparation.reserve(1024)?;
     // Shared policy definitions are retained too. Inspect their sizes with controls
     // before taking the returned owner's Arc references.
     if let Some(rules) = &original.triples {
@@ -86,13 +85,8 @@ pub(crate) fn prepare(
     if let Some(slot) = &existing {
         let slot = preparation.lock(slot)?;
         if let Some(cached) = &*slot {
-            held.merge(
-                preparation.reserve(
-                    cached
-                        .retained_preparation_bytes()
-                        .saturating_add(mask_storage(cached)),
-                )?,
-            );
+            // The view may outlive the cache entry, so it owns the mask's own storage.
+            held.merge(preparation.reserve(mask_storage(cached))?);
             preparation.check()?;
             return Ok(PreparedView::new(access, cached.clone(), held));
         }
@@ -123,14 +117,20 @@ fn already_masked() -> Error {
     )
 }
 
+/// The storage a masked snapshot owns apart from the snapshot it was made from: its
+/// copied delta nodes, hidden keys, key text and the snapshot and mask headers.
 fn mask_storage(snap: &Snapshot) -> u64 {
     snap.mask.as_ref().map_or(0, |mask| {
         (mask.hidden.capacity() as u64)
             .saturating_mul(32)
             .saturating_add(mask.key.capacity() as u64)
-            .saturating_add(2048)
+            .saturating_add(mask.retained)
+            .saturating_add(SNAPSHOT_HEADERS)
     })
 }
+
+/// The allocations of a masked snapshot, its mask and their shared counters.
+const SNAPSHOT_HEADERS: u64 = 4096;
 
 fn strings_bytes(values: &Vec<String>, preparation: &Preparation) -> Result<u64> {
     let mut bytes = 64u64.saturating_add(
@@ -515,7 +515,7 @@ fn hidden(
         }
     }
     preparation.stage("ordering permission mask")?;
-    sort_by(&mut hidden, preparation, |a, b| Ok(a.cmp(b)))?;
+    crate::access::preparation::sort_keys(&mut hidden, preparation)?;
     let mut kept = 0;
     for index in 0..hidden.len() {
         preparation.check()?;
@@ -528,6 +528,115 @@ fn hidden(
     Ok(hidden)
 }
 
+/// Lower the predicate statistics for the hidden quads the delta had inserted, by
+/// predicate with their distinct subjects and objects, as the legacy path does.
+fn forget_removed(
+    delta: &mut Delta,
+    hidden: &[Key],
+    inserted: &[bool],
+    preparation: &Preparation,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut by_subject = Buffer::new(preparation)?;
+    let mut by_object = Buffer::new(preparation)?;
+    for (at, (key, &was_inserted)) in hidden.iter().zip(inserted).enumerate() {
+        if at.is_multiple_of(1024) {
+            check()?;
+        }
+        if was_inserted {
+            let [s, p, o, _] = *key;
+            by_subject.push([p, s, o, 0])?;
+            by_object.push([p, o, s, 0])?;
+        }
+    }
+    crate::access::preparation::sort_keys(&mut by_subject, preparation)?;
+    crate::access::preparation::sort_keys(&mut by_object, preparation)?;
+    let mut subjects = Buffer::new(preparation)?;
+    let mut objects = Buffer::new(preparation)?;
+    let (mut a, mut b) = (0, 0);
+    while a < by_subject.len() {
+        check()?;
+        let p = by_subject[a][0];
+        let start = a;
+        subjects.truncate(0);
+        while a < by_subject.len() && by_subject[a][0] == p {
+            if a.is_multiple_of(1024) {
+                check()?;
+            }
+            if subjects.last() != Some(&by_subject[a][1]) {
+                subjects.push(by_subject[a][1])?;
+            }
+            a += 1;
+        }
+        objects.truncate(0);
+        while b < by_object.len() && by_object[b][0] == p {
+            if b.is_multiple_of(1024) {
+                check()?;
+            }
+            if objects.last() != Some(&by_object[b][1]) {
+                objects.push(by_object[b][1])?;
+            }
+            b += 1;
+        }
+        delta.forget_removed(p, (a - start) as u64, &subjects, &objects, check)?;
+    }
+    check()
+}
+
+/// Hide `hidden` in one permutation: remove the keys the delta inserted and add the
+/// others to its deletions. Returns the admission of the nodes the writes allocated.
+fn write_permutation(
+    perm: Perm,
+    ins: &mut KeySet,
+    del: &mut KeySet,
+    hidden: &[Key],
+    inserted: &[bool],
+    preparation: &Preparation,
+    owned: &mut Reservation,
+) -> Result<()> {
+    // `owned` belongs to the caller, which keeps it until the sets these writes change
+    // are dropped. A refused or interrupted batch keeps its whole admission there too,
+    // so no other writer can reuse the allowance of nodes that are still alive.
+    let mut at = 0;
+    while at < hidden.len() {
+        // One more level than either set has now covers a root split in the batch.
+        let bound = ins
+            .mutation_bound()
+            .max(del.mutation_bound())
+            .saturating_add(KeySet::level_bound());
+        // A batch admits at most a quarter of what the writes already own, or an eighth
+        // of the room the cap leaves each of the seven writers, so headroom stays small
+        // next to the charge and the cap while admissions stay few.
+        let share = (owned.bytes() / 4).max(preparation.room() / 8 / Perm::ALL.len() as u64);
+        let batch = usize::try_from(share / bound.max(1))
+            .unwrap_or(usize::MAX)
+            .clamp(1, 4096)
+            .min(hidden.len() - at);
+        let mut headroom = preparation.reserve(bound.saturating_mul(batch as u64))?;
+        let mut allocated = 0u64;
+        let written = (at..at + batch).try_for_each(|index| {
+            if index.is_multiple_of(64) {
+                preparation.check()?;
+            }
+            let key = perm.to_key(&Perm::Spo.to_quad(&hidden[index]));
+            if inserted[index] {
+                ins.remove_metered(&key, &mut allocated);
+            } else {
+                del.insert_metered(key, &mut allocated);
+            }
+            Ok(())
+        });
+        let grown = written.and_then(|()| headroom.grow_to(allocated));
+        if grown.is_ok() {
+            headroom.release_to(allocated);
+        }
+        owned.merge(headroom);
+        grown?;
+        at += batch;
+    }
+    preparation.check()
+}
+
 fn apply_controlled(
     snap: &Snapshot,
     hidden: Buffer<Key>,
@@ -535,27 +644,51 @@ fn apply_controlled(
     preparation: &Preparation,
 ) -> Result<(Arc<Snapshot>, Reservation)> {
     preparation.stage("applying permission mask")?;
-    let quads = (snap.delta.inserts() as u64)
-        .saturating_add(snap.delta.deletes() as u64)
-        .saturating_add(hidden.len() as u64);
-    let mut held = preparation.reserve(quads.saturating_mul(2048).saturating_add(128 << 10))?;
-    let paths = (u64::from(quads.saturating_add(1).ilog2()) / 3 + 2)
-        .saturating_mul(64 << 10)
-        .saturating_add(2048);
-    let _temporary = preparation.reserve(paths)?;
-    let mut delta = snap.delta.clone();
+    let mut held = preparation.reserve(SNAPSHOT_HEADERS)?;
+    // The clone shares every node of the input delta, and hiding quads copies the
+    // nodes on their paths. The seven permutations are written in parallel, as the
+    // legacy path writes them. Each batch of key-set writes is admitted at an upper
+    // bound before it runs and then keeps only the bytes it allocated, so the view is
+    // charged for the nodes it owns and the cap holds at the peak of every batch.
+    let mut inserted = Buffer::new(preparation)?;
     for key in hidden.iter() {
-        preparation.check()?;
-        let quad = Perm::Spo.to_quad(key);
-        if delta.ins[Perm::Spo.index()].contains(key) {
-            delta.remove_inserted(&quad);
-        } else {
-            for perm in Perm::ALL {
-                preparation.check()?;
-                delta.del[perm.index()].insert(perm.to_key(&quad));
-            }
-        }
+        inserted.push(snap.delta.ins[Perm::Spo.index()].contains(key))?;
     }
+    let mut predicates = preparation.reserve(0)?;
+    if inserted.iter().any(|&i| i) {
+        // the statistics map is persistent too, and cannot copy more than its nodes
+        predicates.merge(preparation.reserve(snap.delta.predicate_bytes_bound())?);
+    }
+    let mut copies = Perm::ALL
+        .iter()
+        .map(|_| preparation.reserve(0))
+        .collect::<Result<Vec<_>>>()?;
+    // Declared after the reservations, so an early return drops the copied nodes
+    // before it releases their admission.
+    let mut delta = snap.delta.clone();
+    let sets: Vec<(Perm, &mut KeySet, &mut KeySet)> = Perm::ALL
+        .into_iter()
+        .zip(delta.ins.iter_mut().zip(delta.del.iter_mut()))
+        .map(|(perm, (ins, del))| (perm, ins, del))
+        .collect();
+    {
+        use rayon::prelude::*;
+        sets.into_par_iter()
+            .zip(copies.par_iter_mut())
+            .map(|((perm, ins, del), owned)| {
+                write_permutation(perm, ins, del, &hidden, &inserted, preparation, owned)
+            })
+            .collect::<Result<()>>()?
+    };
+    forget_removed(&mut delta, &hidden, &inserted, preparation, &mut || {
+        preparation.check()
+    })?;
+    drop(inserted);
+    for copy in copies {
+        held.merge(copy);
+    }
+    held.merge(predicates);
+    let retained = held.bytes().saturating_sub(SNAPSHOT_HEADERS);
     let mut text = Text::new(preparation)?;
     text.push_str(key)?;
     let (key, charge) = text.finish()?;
@@ -570,6 +703,7 @@ fn apply_controlled(
             id: MASK_IDS.fetch_add(1, Ordering::Relaxed),
             key,
             hidden,
+            retained,
         })),
         ..snap.clone()
     });
@@ -673,6 +807,185 @@ mod tests {
                     matches!(result, Err(Error::Invalid(ref message)) if message.contains("no_wait"))
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn the_view_reserves_at_least_every_delta_node_its_mask_owns() {
+        let store = crate::store::Store::in_memory(Default::default());
+        for chunk in 0..3 {
+            let rows: String = (chunk * 4000..(chunk + 1) * 4000)
+                .map(|i| {
+                    let p = if i % 7 == 0 { "urn:p" } else { "urn:q" };
+                    format!("<urn:s{i}> <{p}> <urn:o{i}> . ")
+                })
+                .collect();
+            crate::sparql::update::update(
+                &store,
+                &format!("INSERT DATA {{ {rows} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+        }
+        // half of the hidden quads come from the delta and half from the base
+        store.compact().unwrap();
+        let rows: String = (12_000..16_000)
+            .map(|i| {
+                let p = if i % 7 == 0 { "urn:p" } else { "urn:q" };
+                format!("<urn:s{i}> <{p}> <urn:o{i}> . ")
+            })
+            .collect();
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {rows} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        let legacy = view().masked(&snap).unwrap();
+        let prep = Preparation::new(Control::none(), 64 << 20).unwrap();
+        let before = prep.inner_used();
+        let prepared = view().masked_controlled(&snap, &prep).unwrap();
+        let owned = prepared
+            .snapshot()
+            .delta
+            .unshared_bytes(|| Ok(()))
+            .unwrap()
+            .0;
+        let mask = prepared.snapshot().mask.as_ref().unwrap();
+        assert!(owned > 0);
+        assert!(mask.retained >= owned);
+        assert!(prep.inner_used() - before >= mask_storage(prepared.snapshot()));
+        assert_eq!(prepared.snapshot().len(), legacy.len());
+        let legacy_mask = legacy.mask.as_ref().unwrap();
+        assert!(legacy_mask.retained >= legacy.delta.unshared_bytes(|| Ok(())).unwrap().0);
+        drop(prepared);
+        assert_eq!(prep.inner_used(), before);
+    }
+
+    #[test]
+    fn a_writer_refused_mid_mask_keeps_the_charge_for_the_nodes_it_wrote() {
+        // A refused batch must not release the admission of nodes that stay alive in
+        // the caller's delta, or other writers could reuse it while they exist.
+        let key = |i: u64| [i, 1, i, 0];
+        let base: KeySet = (0..20_000).map(|i| key(i * 2)).collect();
+        let hidden: Vec<Key> = (0..20_000).map(|i| key(i * 2 + 1)).collect();
+        let inserted = vec![false; hidden.len()];
+        let prep = Preparation::new(Control::none(), 512 << 10).unwrap();
+        let mut ins = KeySet::new();
+        let mut del = base.clone();
+        let mut copies = prep.reserve(0).unwrap();
+        let result = write_permutation(
+            Perm::Spo,
+            &mut ins,
+            &mut del,
+            &hidden,
+            &inserted,
+            &prep,
+            &mut copies,
+        );
+        assert!(
+            matches!(result, Err(Error::BudgetExceeded(_))),
+            "{result:?}"
+        );
+        let (owned, _) = del.unshared_bytes(|| Ok(())).unwrap();
+        assert!(owned > 0);
+        assert!(
+            prep.inner_used() >= owned,
+            "charged {} for {owned} live bytes",
+            prep.inner_used()
+        );
+        drop((ins, del));
+        drop(copies);
+    }
+
+    #[test]
+    fn statistics_of_one_large_predicate_poll_the_controls() {
+        // One predicate with many distinct subjects and objects is one statistics
+        // update, which must still poll its controls as it goes.
+        let store = crate::store::Store::in_memory(Default::default());
+        let rows: String = (0..20_000)
+            .map(|i| format!("<urn:s{i}> <urn:p> <urn:o{i}> . "))
+            .collect();
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {rows} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let mut delta = store.snapshot().delta.clone();
+        let hidden: Vec<Key> = delta.ins[Perm::Spo.index()].iter().copied().collect();
+        assert_eq!(hidden.len(), 20_000);
+        let inserted = vec![true; hidden.len()];
+        let prep = Preparation::new(Control::none(), 64 << 20).unwrap();
+        let mut checks = 0usize;
+        forget_removed(&mut delta, &hidden, &inserted, &prep, &mut || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        // two lists of 20,000 values, polled at least every 1024 steps
+        assert!(checks >= 2 * 20_000 / 1024, "{checks} checks");
+        let mut refused = 0usize;
+        let cancelled = forget_removed(&mut delta.clone(), &hidden, &inserted, &prep, &mut || {
+            refused += 1;
+            if refused > 20 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(cancelled, Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn a_statistics_update_refused_while_probing_changes_nothing() {
+        // The delta's own update polls while it probes subjects and then objects, and
+        // a refusal there leaves the predicate's statistics as they were.
+        let store = crate::store::Store::in_memory(Default::default());
+        let rows: String = (0..20_000)
+            .map(|i| format!("<urn:s{i}> <urn:p> <urn:o{i}> . "))
+            .collect();
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {rows} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let delta = store.snapshot().delta.clone();
+        let keys: Vec<Key> = delta.ins[Perm::Pso.index()].iter().copied().collect();
+        let p = keys[0][0];
+        let mut subjects: Vec<u64> = keys.iter().map(|k| k[1]).collect();
+        let mut objects: Vec<u64> = keys.iter().map(|k| k[2]).collect();
+        subjects.dedup();
+        objects.sort_unstable();
+        objects.dedup();
+        assert_eq!((subjects.len(), objects.len()), (20_000, 20_000));
+        let n = keys.len() as u64;
+        let before = *delta.predicate(p).unwrap();
+        // unchecked, the update lowers the count
+        let mut changed = delta.clone();
+        changed
+            .forget_removed(p, n / 2, &subjects, &objects, &mut || Ok(()))
+            .unwrap();
+        assert_ne!(*changed.predicate(p).unwrap(), before);
+        // 20 polls cover the subjects and 20 more the objects
+        for refuse_at in [3usize, 23] {
+            let mut target = delta.clone();
+            let mut calls = 0usize;
+            let result = target.forget_removed(p, n / 2, &subjects, &objects, &mut || {
+                calls += 1;
+                if calls == refuse_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(result, Err(Error::Cancelled)),
+                "refusal at poll {refuse_at}: {result:?} after {calls} polls"
+            );
+            assert_eq!(*target.predicate(p).unwrap(), before);
         }
     }
 

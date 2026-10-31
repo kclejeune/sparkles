@@ -597,6 +597,51 @@ fn controlled_disclosure_row_temporaries_release_before_the_next_row() {
 }
 
 #[test]
+fn controlled_disclosure_rows_repeating_across_many_graphs_match_the_real_guard() {
+    use sparkles::access::Preparation;
+    use sparkles::task::Control;
+    let c = caller("reports", &[]);
+    let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    let r = reader(&[A, REPORTS]);
+    for broken in [false, true] {
+        // Every subject links from the reports graph and from 600 other guarded
+        // graphs, so repeated graph and object pairs interleave with many others.
+        let mut data = with_footprint(&fp);
+        for row in 0..40 {
+            for other in 0..600 {
+                data.push_str(&format!(
+                    "<urn:x-sparkles:graphrag:other{other}> {{ <urn:report:{row}> <{}> <{}> . }}\n",
+                    gr("disclosure"),
+                    fp.iri()
+                ));
+            }
+            let target = if broken && row == 39 {
+                "urn:missing:footprint".to_string()
+            } else {
+                fp.iri()
+            };
+            data.push_str(&format!(
+                "<{REPORTS}> {{ <urn:report:{row}> <{}> <{target}> . }}\n",
+                gr("disclosure"),
+            ));
+        }
+        let s = store(&data);
+        let snapshot = s.snapshot();
+        let mut expected = Guard::new().index(&snapshot).proven(&r);
+        expected.sort();
+        assert_eq!(expected.is_empty(), broken);
+        let actual = controlled_exemptions(
+            &Arc::new(Guard::new()),
+            &snapshot,
+            &r,
+            &Preparation::new(Control::none(), 64 << 20).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, expected, "broken={broken}");
+    }
+}
+
+#[test]
 #[ignore = "local controlled provider latency diagnostic"]
 fn controlled_provider_preparation_cost_diagnostic() {
     use sparkles::access::Preparation;
@@ -604,17 +649,37 @@ fn controlled_provider_preparation_cost_diagnostic() {
     use std::time::Instant;
     let c = caller("reports", &[]);
     let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
-    for rows in [100, 2000] {
+    // `distinct` writes each row in its own guarded graph, so no row repeats
+    // another's graph and object.
+    for (rows, compact, distinct) in [
+        (100, true, false),
+        (2000, true, false),
+        (2000, false, false),
+        (20000, false, false),
+        (20000, false, true),
+    ] {
         let mut data = with_footprint(&fp);
         for row in 0..rows {
+            let graph = if distinct {
+                format!("urn:x-sparkles:graphrag:g{row}")
+            } else {
+                REPORTS.to_string()
+            };
             data.push_str(&format!(
-                "<{REPORTS}> {{ <urn:r{row}> <{}> <{}> . }}\n",
+                "<{graph}> {{ <urn:r{row}> <{}> <{}> . }}\n",
                 gr("disclosure"),
                 fp.iri()
             ));
         }
+        let compact = if distinct {
+            format!("{compact}_distinct")
+        } else {
+            compact.to_string()
+        };
         let s = store(&data);
-        s.compact().unwrap();
+        if compact.starts_with("true") {
+            s.compact().unwrap();
+        }
         let snapshot = s.snapshot();
         let access = reader(&[A, REPORTS]);
         for warm in [false, true] {
@@ -629,13 +694,13 @@ fn controlled_provider_preparation_cost_diagnostic() {
                 let mut expected = old.index(&snapshot).proven(&access);
                 let old_ns = start.elapsed().as_nanos();
                 expected.sort();
-                let p = Preparation::new(Control::none(), 16 << 20).unwrap();
+                let p = Preparation::new(Control::none(), 256 << 20).unwrap();
                 let start = Instant::now();
                 let actual = controlled_exemptions(&controlled, &snapshot, &access, &p).unwrap();
                 let controlled_ns = start.elapsed().as_nanos();
                 assert_eq!(actual, expected);
                 eprintln!(
-                    "provider cost rows={rows} warm={warm} round={round} legacy_ns={old_ns} controlled_ns={controlled_ns}"
+                    "provider cost rows={rows} compact={compact} warm={warm} round={round} legacy_ns={old_ns} controlled_ns={controlled_ns}"
                 );
             }
         }

@@ -861,3 +861,61 @@ fn a_snapshot_masked_by_another_policy_is_refused() {
         .unwrap();
     assert_eq!(fresh.snapshot().len(), 1);
 }
+
+/// A store whose 20,000 quads and their terms stay in the uncompacted delta.
+fn uncompacted() -> Store {
+    let store = Store::in_memory(StoreOptions::default());
+    for chunk in 0..4 {
+        let rows = (chunk * 5000..(chunk + 1) * 5000)
+            .map(|row| {
+                let p = if row % 10 == 0 {
+                    "urn:secret"
+                } else {
+                    "urn:visible"
+                };
+                format!("<urn:s{row}> <{p}> \"value {row}\" .\n")
+            })
+            .collect::<String>();
+        sparkles_core::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {rows} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+    }
+    assert_eq!(store.snapshot().delta.inserts(), 20_000);
+    store
+}
+
+#[test]
+fn the_shared_input_delta_is_not_charged_to_the_view() {
+    let store = uncompacted();
+    let snap = store.snapshot();
+    // A graph-only policy keeps the input snapshot and owns almost nothing.
+    let graphs = GraphAccess::graphs(Graphs::All, Graphs::none());
+    let small = Preparation::new(Control::none(), 64 << 10).unwrap();
+    let view = graphs.masked_controlled(&snap, &small).unwrap();
+    assert!(std::ptr::eq(view.snapshot(), &*snap));
+    drop(view);
+    // A mask charges the nodes it copies, not the 20,000 shared quads at 2 KiB each.
+    let masked = access(vec![(protection(), Graphs::none())], Graphs::All);
+    let cap = 16 << 20;
+    let preparation = Preparation::new(Control::none(), cap).unwrap();
+    let view = masked.masked_controlled(&snap, &preparation).unwrap();
+    assert_eq!(view.snapshot().len(), 18_000);
+    let legacy = masked.masked(&snap).unwrap();
+    assert_eq!(quads(view.snapshot()), quads(&legacy));
+    // the planner statistics of the hidden inserted quads leave as the legacy path's do
+    assert!(view.snapshot().delta.predicates_consistent());
+    let stats = |s: &Snapshot| {
+        s.delta
+            .predicate_stats()
+            .map(|(p, d)| (p, *d))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stats(view.snapshot()), stats(&legacy));
+    drop(view);
+    // A cache hit is charged for the cached mask's own storage only.
+    let view = masked.masked_controlled(&snap, &preparation).unwrap();
+    assert_eq!(view.snapshot().len(), 18_000);
+}

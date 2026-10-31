@@ -88,6 +88,15 @@ Controlled permission preparation refuses a snapshot that another policy already
 masked, unless the mask is the requested policy's own. A policy that hides no
 triples keeps the existing stricter mask.
 
+Controlled permission preparation now charges a view only for the policy and mask
+storage it retains, not for the input snapshot or the delta it shares. Delta
+vocabulary lookup probes the index instead of scanning entries, and a cold mask
+writes its permutations in parallel. On a 100,000-quad uncompacted delta the smallest
+admitting cap fell from 431 MB to 41 MB in a release diagnostic. A cached GraphRAG
+disclosure index is no longer charged to each request, and a cold one skips
+disclosure rows that repeat a recent graph and footprint, which took a 20,000-row
+index from 24 ms to 0.18 ms.
+
 Catalog disposal now refuses raw shared state, Store and BranchSet aliases and preserves
 exact owners on refusal. Resident source leases retain real catalog openings without
 changing StoreHandle variants or granting managed-write authority. Built-in close links,
