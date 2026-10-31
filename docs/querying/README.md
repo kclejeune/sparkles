@@ -304,8 +304,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * There is no openCypher frontend and no JSON query language. Roadmap items 20 and 72.
 * Mappings read no PostgreSQL or DuckDB database and no Parquet file in an object store.
   Roadmap items 230 and 237.
-* RML join conditions written as expression maps are not read, and function maps call 20
-  of SPARQL's functions. Roadmap items 232 and 236.
+* Function maps call 20 of SPARQL's functions. Roadmap item 236.
 * Stored mapping runs are not tasks, and the web UI has no Mappings page.
   Roadmap items 233 and 234.
 * The W3C CSVW test suite does not run. Roadmap item 235.
@@ -348,7 +347,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 232](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 235](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
+The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 235](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

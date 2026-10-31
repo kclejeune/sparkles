@@ -165,8 +165,12 @@ Tests and conformance:
   language tags against the subtag registry, and R2RMLTC0018a expects `CHAR` padding.
 * The RML-Core test cases with JSON and CSV sources run from `testsuite/mapping/rml-core`,
   vendored from `kg-construct/rml-core` at commit 82ab28d46803 (2026-04-20) under
-  CC-BY-4.0. 70 of 76 pass. RMLTC0027b expects IRIs that oxrdf refuses, and RMLTC0030b to
-  RMLTC0030f use join conditions written as expression maps, which roadmap item 232 adds.
+  CC-BY-4.0. 75 of 76 pass. RMLTC0027b expects IRIs with spaces, which oxrdf refuses and the
+  expected N-Quads cannot even express. Join conditions accept RML-Core expression maps
+  (`rml:childMap` and `rml:parentMap` with a reference, constant, template or function),
+  which compare as strings, and RMLTC0030b to RMLTC0030f pass. A join with an expression
+  map runs in memory, and the `rml:UnsafeIRI` term type inserts template values as they
+  are and refuses a result that is not a valid IRI.
 * `crates/sparkles-core/src/mapping/tests.rs` covers A1 to A6 on SQLite, CSV, JSON and
   Parquet, conversion round trips, refusals, functions and a 200,000-row run that
   streams. `tabular/tests.rs` covers A7 to A9. `tests/cli_map.rs` runs the command line,

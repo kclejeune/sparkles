@@ -6,7 +6,7 @@
 
 use super::CONNECTION_PREFIX;
 use super::model::*;
-use super::template::Template;
+use super::template::{Encoding, Template};
 use crate::error::{Error, Result};
 use crate::tabular::csvw::DialectDesc;
 use oxrdf::vocab::rdf;
@@ -382,14 +382,25 @@ impl Reader {
             let Some(jc) = subject_of(jc) else {
                 return self.bad(om, "a join condition is a literal");
             };
-            let side = |name: &str, map: &str| -> Result<String> {
+            let side = |name: &str, map: &str| -> Result<JoinKey> {
                 if let Some(s) = self.g.string(&jc, name)? {
-                    return Ok(s);
+                    return Ok(JoinKey::Reference(s));
                 }
-                if let Some(m) = self.g.one(&jc, map)?.and_then(subject_of)
-                    && let Some(r) = self.g.string(&m, "reference")?
-                {
-                    return Ok(r);
+                if let Some(m) = self.g.one(&jc, map)?.and_then(subject_of) {
+                    let mut tm = self.term_map(&m, Role::Value)?;
+                    if tm.datatype.is_some() || tm.language.is_some() {
+                        return self.bad(
+                            &m,
+                            format!("the {map} of a join condition is an expression map, and takes no datatype or language"),
+                        );
+                    }
+                    return Ok(match tm.value {
+                        Value::Reference(r) => JoinKey::Reference(r),
+                        _ => {
+                            tm.term_type = TermType::Literal;
+                            JoinKey::Map(Box::new(tm))
+                        }
+                    });
                 }
                 self.bad(&jc, format!("a join condition needs a {name}"))
             };
@@ -443,7 +454,7 @@ impl Reader {
         if count > 1 {
             return self.bad(n, "a term map has more than one of constant, column or reference, template and function");
         }
-        let mut uri = false;
+        let mut encoding = Encoding::Iri;
         let term_type = match self.g.one(n, "termType")? {
             None => None,
             Some(Term::NamedNode(t)) => {
@@ -452,9 +463,13 @@ impl Reader {
                     .strip_prefix(RR)
                     .or_else(|| t.as_str().strip_prefix(RML));
                 Some(match local {
-                    Some("IRI") | Some("UnsafeIRI") => TermType::Iri,
+                    Some("IRI") => TermType::Iri,
+                    Some("UnsafeIRI") => {
+                        encoding = Encoding::Unsafe;
+                        TermType::Iri
+                    }
                     Some("URI") => {
-                        uri = true;
+                        encoding = Encoding::Uri;
                         TermType::Iri
                     }
                     Some("BlankNode") => TermType::BlankNode,
@@ -514,7 +529,7 @@ impl Reader {
         } else if let Some(t) = template {
             Value::Template(
                 Template::parse(&t)
-                    .map(|t| if uri { t.with_uri_safe() } else { t })
+                    .map(|t| t.with_encoding(encoding))
                     .map_err(|e| Error::invalid(format!("{}: {e}", show(n))))?,
             )
         } else if let Some(f) = function {
@@ -1275,11 +1290,36 @@ pub fn to_turtle(m: &Mapping, r2rml: bool) -> Result<String> {
                             map_node(&m.maps[*parent].id)
                         ));
                         for (c, pa) in conditions {
-                            out.push_str(&format!(
-                                "            {p}:joinCondition [ {p}:child {} ; {p}:parent {} ] ;\n",
-                                turtle_string(c),
-                                turtle_string(pa)
-                            ));
+                            out.push_str(&format!("            {p}:joinCondition [ "));
+                            for (i, (key, name, map)) in
+                                [(c, "child", "childMap"), (pa, "parent", "parentMap")]
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                if i > 0 {
+                                    out.push_str(" ; ");
+                                }
+                                match key {
+                                    JoinKey::Reference(r) => {
+                                        out.push_str(&format!("{p}:{name} {}", turtle_string(r)))
+                                    }
+                                    JoinKey::Map(t) => {
+                                        if pr.r2rml {
+                                            return Err(Error::invalid(
+                                                "R2RML join conditions compare columns; convert to RML instead",
+                                            ));
+                                        }
+                                        out.push_str(&format!("{p}:{map} "));
+                                        pr.term_map(
+                                            t,
+                                            TermType::Literal,
+                                            &mut out,
+                                            "            ",
+                                        )?;
+                                    }
+                                }
+                            }
+                            out.push_str(" ] ;\n");
                         }
                         out.push_str("        ] ;\n");
                     }

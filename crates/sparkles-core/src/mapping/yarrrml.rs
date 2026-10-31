@@ -507,7 +507,12 @@ pub fn parse(text: &str, _base: Option<&str>) -> Result<Mapping> {
                 for k in 0..pending[ti].maps.len() {
                     m.predicate_objects[*jpo].objects.push(ObjectMap::Join {
                         parent: offsets[ti] + k,
-                        conditions: conds.clone(),
+                        conditions: conds
+                            .iter()
+                            .map(|(c, p)| {
+                                (JoinKey::Reference(c.clone()), JoinKey::Reference(p.clone()))
+                            })
+                            .collect(),
                     });
                 }
             }

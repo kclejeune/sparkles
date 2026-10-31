@@ -548,6 +548,14 @@ the first policy. `scripts/eval-ask-rescore` scores a run's saved answers again 
 current policy without calling a model, and the paid wrapper records every request and
 reply, key redacted, in `replies.jsonl`.
 
+RML-Core join conditions can be written as expression maps. The `rml:childMap` and
+`rml:parentMap` of a join condition take a reference, a constant, a template or a
+function, and the join compares the strings they make. A join with an expression map runs
+in memory, and one with plain references still runs in SQL when both tables are in one
+SQLite database. The `rml:UnsafeIRI` term type now inserts template values without
+percent-encoding and fails the run when the result is not a valid IRI. All RML-Core test
+cases except RMLTC0027b pass, whose expected output holds IRIs with spaces.
+
 ### Fixed
 
 A delete or rename of a dataset waits up to two seconds for the requests and workers

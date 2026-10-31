@@ -1544,6 +1544,13 @@ sparkles map draft --connection shop=sqlite:shop.sqlite --base http://ex.org/sho
 sparkles load --loc db --mapping shop.ttl --connection shop=sqlite:shop.sqlite
 ```
 
+A join condition compares the values of two references. An RML-Core mapping can also write
+either side as an expression map with `rml:childMap` and `rml:parentMap`, which take a
+reference, a constant, a template or a function. The join compares the strings the two
+maps make, and such a join runs in memory. The `rml:UnsafeIRI` term type inserts a
+template's values as they are, where the other IRI term types encode them, and the run
+fails when the result is not a valid IRI.
+
 Function maps call the GREL and IDLab functions of RML's function descriptions and
 Sparkles' own `urn:x-sparkles:fn:` functions, which `sparkles map check --functions`
 lists. A function the list lacks fails, and a CONSTRUCT template can then do the job with

@@ -9,9 +9,9 @@
 //! it.
 
 use super::functions;
-use super::model::{Dt, Lang, Mapping, ObjectMap, SourceKind, TermMap, TermType, Value};
+use super::model::{Dt, JoinKey, Lang, Mapping, ObjectMap, SourceKind, TermMap, TermType, Value};
 use super::source::{self, Cell, Dt as Nat, Row};
-use super::template::{Part, iri_safe, uri_safe};
+use super::template::{Encoding, Part, iri_safe, uri_safe};
 use super::{DEFAULT_GRAPH_RML, DEFAULT_GRAPH_RR, Inputs, RunOptions};
 use crate::error::{Error, Result};
 use oxrdf::vocab::rdf;
@@ -95,6 +95,13 @@ pub fn validate(m: &Mapping) -> Result<()> {
                                 p.id
                             ));
                         }
+                        for (c, pa) in conditions {
+                            for k in [c, pa] {
+                                if let JoinKey::Map(t) = k {
+                                    check_term_map(t, &tm.id)?;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -167,7 +174,7 @@ enum CValue {
     Const(Term),
     Ref(usize),
     /// the parts, and whether values are URI-safe rather than IRI-safe encoded
-    Tpl(Vec<CPart>, bool),
+    Tpl(Vec<CPart>, Encoding),
     Fn(String, Vec<(usize, CTerm)>),
     /// a blank node per row, labelled by the generating site and the row number, so that
     /// a parent's subject read again for a join is the same node
@@ -218,7 +225,7 @@ fn compile(t: &TermMap, refs: &mut Refs, side: u8, site: usize) -> CTerm {
                     Part::Ref(r) => CPart::Ref(refs.get(side, r)),
                 })
                 .collect(),
-            tpl.uri_safe(),
+            tpl.encoding(),
         ),
         Value::Function(f) => {
             let def = functions::lookup(f.function.as_str());
@@ -263,7 +270,7 @@ enum CObj {
     /// a probe of hash table `table` with the child's join values
     Probe {
         table: usize,
-        keys: Vec<usize>,
+        keys: Vec<CTerm>,
     },
     /// the parent's subject, from the parent's columns of a pushed-down join scan
     Joined(CTerm, Option<Rc<str>>),
@@ -291,7 +298,9 @@ struct CMap {
 /// A parent table of an in-memory join.
 struct Table {
     parent: usize,
-    keys: Vec<String>,
+    keys: Vec<JoinKey>,
+    /// the keys as written, which tell apart the tables of one parent
+    key_id: String,
     rows: FxHashMap<Vec<String>, Vec<Term>>,
     desc: String,
 }
@@ -312,6 +321,15 @@ enum ScanKind {
         child_refs: usize,
         conditions: Vec<(String, String)>,
     },
+}
+
+/// The conditions of a join as column names, when every key is a plain reference. Only
+/// those joins can run in SQL.
+fn plain_conditions(conditions: &[(JoinKey, JoinKey)]) -> Option<Vec<(String, String)>> {
+    conditions
+        .iter()
+        .map(|(a, b)| Some((a.reference()?.to_string(), b.reference()?.to_string())))
+        .collect()
 }
 
 fn is_sql(m: &Mapping, s: usize) -> Option<&str> {
@@ -378,7 +396,8 @@ fn plan(m: &Mapping) -> Plan {
                                     compile(&p.subject, &mut refs, 0, *parent),
                                     base_of(&p.base),
                                 )
-                            } else if let (Some(a), Some(b)) = (is_sql(m, s), is_sql(m, p.source))
+                            } else if let (Some(a), Some(b), Some(plain)) =
+                                (is_sql(m, s), is_sql(m, p.source), plain_conditions(conditions))
                                 && a == b
                                 // a blank node per row is labelled by the row of its own
                                 // source, which a joined statement does not keep
@@ -390,22 +409,24 @@ fn plan(m: &Mapping) -> Plan {
                                     tm.id,
                                     p.id,
                                     if a.is_empty() { "default" } else { a },
-                                    join_sketch(m, s, p.source, conditions)
+                                    join_sketch(m, s, p.source, &plain)
                                 ));
-                                scans.push(join_scan(m, mi, pi, *parent, conditions));
+                                scans.push(join_scan(m, mi, pi, *parent, &plain));
                                 CObj::Skip
                             } else {
-                                let keys: Vec<String> =
+                                let keys: Vec<JoinKey> =
                                     conditions.iter().map(|(_, b)| b.clone()).collect();
+                                let key_id = format!("{keys:?}");
                                 let t = match tables
                                     .iter()
-                                    .position(|t| t.parent == *parent && t.keys == keys)
+                                    .position(|t| t.parent == *parent && t.key_id == key_id)
                                 {
                                     Some(t) => t,
                                     None => {
                                         tables.push(Table {
                                             parent: *parent,
                                             keys: keys.clone(),
+                                            key_id,
                                             rows: FxHashMap::default(),
                                             desc: format!("the join of {} with {}", tm.id, p.id),
                                         });
@@ -417,11 +438,17 @@ fn plan(m: &Mapping) -> Plan {
                                     tm.id,
                                     p.id,
                                     p.id,
-                                    keys.join(", ")
+                                    keys.iter()
+                                        .map(JoinKey::describe)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
                                 ));
                                 CObj::Probe {
                                     table: t,
-                                    keys: conditions.iter().map(|(a, _)| refs.get(0, a)).collect(),
+                                    keys: conditions
+                                        .iter()
+                                        .map(|(a, _)| compile(&a.term_map(), &mut refs, 0, NO_SITE))
+                                        .collect(),
                                 }
                             }
                         }
@@ -461,7 +488,7 @@ fn plan(m: &Mapping) -> Plan {
             .expect("the parent's own scan");
         compile(&p.subject, &mut scan.refs, 0, t.parent);
         for k in &t.keys {
-            scan.refs.get(0, k);
+            compile(&k.term_map(), &mut scan.refs, 0, NO_SITE);
         }
     }
     Plan {
@@ -620,7 +647,7 @@ impl Gen<'_> {
                     out.push((c.lex.into_owned(), c.dt));
                 }
             }
-            CValue::Tpl(parts, uri) => {
+            CValue::Tpl(parts, enc) => {
                 let iri = t.tt == TermType::Iri;
                 // every reference first: a NULL anywhere generates nothing, before the
                 // size of the product is checked
@@ -665,12 +692,10 @@ impl Gen<'_> {
                             for a in &acc {
                                 for c in &cells {
                                     let mut s = a.clone();
-                                    if iri && *uri {
-                                        uri_safe(&c.lex, &mut s);
-                                    } else if iri {
-                                        iri_safe(&c.lex, &mut s);
-                                    } else {
-                                        s.push_str(&c.lex);
+                                    match (iri, enc) {
+                                        (true, Encoding::Uri) => uri_safe(&c.lex, &mut s),
+                                        (true, Encoding::Iri) => iri_safe(&c.lex, &mut s),
+                                        _ => s.push_str(&c.lex),
                                     }
                                     next.push(s);
                                 }
@@ -940,8 +965,8 @@ impl Gen<'_> {
                         keyvals.clear();
                         for k in keys {
                             let mut v = Vec::new();
-                            row.get(*k, &mut v)?;
-                            keyvals.push(v.into_iter().map(|c| c.lex.into_owned()).collect());
+                            self.values(k, row, &cm.id, &mut v)?;
+                            keyvals.push(v.into_iter().map(|(s, _)| s).collect());
                         }
                         if keyvals.iter().any(Vec::is_empty) {
                             continue;
@@ -1060,7 +1085,11 @@ pub fn run(
         }
         let subject = compile(&pm.subject, &mut refs, 0, parent);
         g.map_base = base_of(&pm.base);
-        let keys: Vec<usize> = p.tables[ti].keys.iter().map(|k| refs.get(0, k)).collect();
+        let keys: Vec<CTerm> = p.tables[ti]
+            .keys
+            .iter()
+            .map(|k| compile(&k.term_map(), &mut refs, 0, NO_SITE))
+            .collect();
         let mut src = source::open(&m.sources[pm.source], &refs.list, inputs, opts)?;
         let mut rows: FxHashMap<Vec<String>, Vec<Term>> = FxHashMap::default();
         let mut n = 0u64;
@@ -1079,12 +1108,12 @@ pub fn run(
             keyvals.clear();
             for k in &keys {
                 let mut v = Vec::new();
-                row.get(*k, &mut v)?;
+                g.values(k, row, &pm.id, &mut v)?;
                 // NULL never joins
                 if v.is_empty() {
                     return Ok(());
                 }
-                keyvals.push(v.into_iter().map(|c| c.lex.into_owned()).collect());
+                keyvals.push(v.into_iter().map(|(s, _)| s).collect());
             }
             // a multi-valued key indexes every combination of its values
             let combos =

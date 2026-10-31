@@ -7,9 +7,20 @@
 pub struct Template {
     text: String,
     pub parts: Vec<Part>,
+    encoding: Encoding,
+}
+
+/// How an IRI template inserts the values of its references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    /// R2RML's IRI-safe form.
+    Iri,
     /// RML-Core's `rml:URI` term type: values are percent-encoded to URI-safe form,
-    /// non-ASCII characters included, instead of R2RML's IRI-safe form.
-    uri_safe: bool,
+    /// non-ASCII characters included.
+    Uri,
+    /// RML-Core's `rml:UnsafeIRI` term type: values are inserted as they are, and the
+    /// result must be a valid IRI.
+    Unsafe,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,18 +73,18 @@ impl Template {
         Ok(Template {
             text: text.to_string(),
             parts,
-            uri_safe: false,
+            encoding: Encoding::Iri,
         })
     }
 
-    /// The template with URI-safe encoding of its values (`rml:URI`).
-    pub fn with_uri_safe(mut self) -> Template {
-        self.uri_safe = true;
+    /// The template with another encoding of its values (`rml:URI`, `rml:UnsafeIRI`).
+    pub fn with_encoding(mut self, encoding: Encoding) -> Template {
+        self.encoding = encoding;
         self
     }
 
-    pub fn uri_safe(&self) -> bool {
-        self.uri_safe
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
     }
 
     pub fn as_str(&self) -> &str {

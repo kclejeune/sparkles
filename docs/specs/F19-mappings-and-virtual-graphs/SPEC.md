@@ -948,7 +948,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230, 232 to 239 and 404. Native Rust `Dataset::run_mapping_with` carries complete structured write options through direct mapping conversion and final load while preserving the existing `run_mapping` and `RunOptions` APIs, and stored runs apply the same controls to conversion. Python mapping runs have no cancellation or timeout, which is item 404. Virtual graphs remain under item 43.
+Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230 and 233 to 239 and 404. Native Rust `Dataset::run_mapping_with` carries complete structured write options through direct mapping conversion and final load while preserving the existing `run_mapping` and `RunOptions` APIs, and stored runs apply the same controls to conversion. Python mapping runs have no cancellation or timeout, which is item 404. Virtual graphs remain under item 43.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

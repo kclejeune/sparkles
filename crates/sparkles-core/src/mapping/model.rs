@@ -152,11 +152,60 @@ pub struct PredicateObject {
 pub enum ObjectMap {
     Term(TermMap),
     /// A referencing object map: the parent triples map's subject, joined on the
-    /// conditions (child reference, parent reference).
+    /// conditions (child key, parent key).
     Join {
         parent: usize,
-        conditions: Vec<(String, String)>,
+        conditions: Vec<(JoinKey, JoinKey)>,
     },
+}
+
+/// One side of a join condition: a reference, or an RML-Core expression map (a
+/// constant, a template or a function) whose values are compared as strings.
+#[derive(Clone, Debug)]
+pub enum JoinKey {
+    Reference(String),
+    /// An expression map. Its term type is the literal one, so a template inserts
+    /// its references as they are.
+    Map(Box<TermMap>),
+}
+
+impl JoinKey {
+    /// The column or JSONPath of a key that is a plain reference.
+    pub fn reference(&self) -> Option<&str> {
+        match self {
+            JoinKey::Reference(r) => Some(r),
+            JoinKey::Map(_) => None,
+        }
+    }
+
+    /// The key as a term map.
+    pub fn term_map(&self) -> TermMap {
+        match self {
+            JoinKey::Reference(r) => TermMap {
+                value: Value::Reference(r.clone()),
+                term_type: TermType::Literal,
+                datatype: None,
+                language: None,
+            },
+            JoinKey::Map(m) => (**m).clone(),
+        }
+    }
+
+    /// The references the key reads.
+    pub fn references(&self, out: &mut Vec<String>) {
+        match self {
+            JoinKey::Reference(r) => out.push(r.clone()),
+            JoinKey::Map(m) => m.references(out),
+        }
+    }
+
+    /// The key as written, for messages.
+    pub fn describe(&self) -> String {
+        match self {
+            JoinKey::Reference(r) => r.clone(),
+            JoinKey::Map(m) => m.describe(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

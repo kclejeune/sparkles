@@ -90,7 +90,8 @@ These read paths are tuned for queries over data that is not yet in memory
   within the memory budget. Function maps call GREL, IDLab and SPARQL functions.
   `sparkles map` also checks a mapping, converts YARRRML to RML-Core Turtle and drafts an
   R2RML mapping from a SQLite database. The W3C R2RML test cases pass on SQLite apart
-  from three, and the RML-Core cases with CSV and JSON sources apart from six.
+  from three, and the RML-Core cases with CSV and JSON sources apart from one. A join
+  condition compares references or RML-Core expression maps.
 * Mappings of every kind can be stored per dataset with versions and run again
   ([API.md](../API.md#stored-mappings)). A run in replace mode commits only the net change.
   The Graph Store protocol takes CSV bodies with a stored or default mapping, and the
