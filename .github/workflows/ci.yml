@@ -352,7 +352,7 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           tar -xf "$RUNNER_TEMP/ui-build.tar"
-          timing='test(planning_at_the_limit_stops_at_the_timeout)'
+          timing='test(planning_at_the_limit_stops_at_the_timeout) | test(a_large_json_ld_document_keeps_to_a_short_deadline)'
           if [ "$SHARD" = timing ]; then
             select=(-E "$timing")
           else

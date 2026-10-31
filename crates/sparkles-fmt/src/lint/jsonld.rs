@@ -42,14 +42,17 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
             return Ok(());
         }
     };
+    out.deadline()?;
     let c = Cst::new(&tree);
     let root = build(&c, c.tree.root());
+    out.deadline()?;
     let before = out.found.len();
     let mut walk = Walk {
         out,
         json: HashSet::new(),
     };
     walk.value(&root, &Ctx::default());
+    walk.out.deadline()?;
     // the values of JSON literals are data: no term is defined or used in them
     let mut scan = Scan {
         json: std::mem::take(&mut walk.json),

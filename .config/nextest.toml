@@ -42,6 +42,13 @@ test-group = "timing"
 threads-required = "num-cpus"
 slow-timeout = { period = "300s", terminate-after = 4 }
 
+# The JSON-LD lint must stop soon after a 25 ms deadline on a 7 MiB document. On a
+# loaded runner the passes between two deadline checks take longer than the slack.
+[[profile.default.overrides]]
+filter = "test(a_large_json_ld_document_keeps_to_a_short_deadline)"
+test-group = "timing"
+threads-required = "num-cpus"
+
 # This functional test imports a 5 MiB transcript through real HTTP requests. Give
 # it the runner's test slots so concurrent heavy tests do not consume its server's
 # query deadline. Keep the production timeout and all assertions unchanged.
