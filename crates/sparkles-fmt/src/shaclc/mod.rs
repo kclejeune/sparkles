@@ -15,6 +15,7 @@ use crate::tree::Tree;
 use crate::trivia::{CommentRules, Comments};
 use crate::{Check, FormatError, Language, Options, Warning};
 use oxrdf::{GraphName, Quad};
+use std::time::Instant;
 
 /// Whether SHACLC formats.
 pub const IMPLEMENTED: bool = true;
@@ -97,16 +98,30 @@ impl LangImpl for Shaclc {
     }
 
     fn equivalent(&self, r: &ShaclcReference, output: &str) -> Result<(), FormatError> {
+        self.equivalent_by(r, output, None)
+    }
+
+    fn equivalent_by(
+        &self,
+        r: &ShaclcReference,
+        output: &str,
+        deadline: Option<Instant>,
+    ) -> Result<(), FormatError> {
         let unsafe_ = FormatError::Unsafe {
             check: Check::Graph,
         };
         let out = parse_reference(output).map_err(|_| unsafe_.clone())?;
-        match isomorphic_bounded(&r.quads, &out) {
+        match isomorphic_bounded(&r.quads, &out, deadline)? {
             Some(true) => Ok(()),
             Some(false) => Err(unsafe_),
             // never accept what was not verified
-            None => Err(FormatError::Unsafe {
-                check: Check::Unverified,
+            None => Err(FormatError::Unsupported {
+                message: "could not verify the formatted output: comparing its shapes graph \
+                          with the input's takes more work than the budget allows; input \
+                          left unchanged"
+                    .to_string(),
+                line: 1,
+                column: 1,
             }),
         }
     }
@@ -170,5 +185,42 @@ mod tests {
             Shaclc.equivalent(&reference(&identical(10)), &identical(10)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_large_comparison_watches_the_deadline() {
+        // two `in` lists that share 120 copies of an 8 KiB literal, with exchanged tails
+        let big = "x".repeat(8192);
+        let doc = |ends: [&str; 2]| {
+            let shared = format!("\"{big}\" ").repeat(120);
+            format!(
+                "shape <s> {{ <p0> in=[{shared}<{}>] . <p1> in=[{shared}<{}>] . }}",
+                ends[0], ends[1]
+            )
+        };
+        let input = reference(&doc(["x", "y"]));
+        let output = doc(["y", "x"]);
+        // an expired deadline is a timeout, which is not a refusal of the output
+        let past = Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            Shaclc.equivalent_by(&input, &output, Some(past)),
+            Err(FormatError::Timeout)
+        );
+        // within a deadline, the comparison ends in a verdict well before it
+        let start = Instant::now();
+        let err = Shaclc
+            .equivalent_by(
+                &input,
+                &output,
+                Some(start + std::time::Duration::from_secs(10)),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::Unsafe {
+                check: Check::Graph
+            }
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }

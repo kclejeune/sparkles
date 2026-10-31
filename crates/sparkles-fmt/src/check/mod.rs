@@ -55,6 +55,17 @@ pub trait LangImpl {
 
     /// `Ok` when `output` means the same as the input ([`FormatError::Unsafe`] if not).
     fn equivalent(&self, r: &Self::Reference, output: &str) -> Result<(), FormatError>;
+
+    /// Like [`equivalent`](Self::equivalent), for a check that can run long and so
+    /// watches `deadline` ([`FormatError::Timeout`] when it passes).
+    fn equivalent_by(
+        &self,
+        r: &Self::Reference,
+        output: &str,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<(), FormatError> {
+        self.equivalent(r, output)
+    }
 }
 
 /// Format `text` with `lang`, checking the result.
@@ -89,7 +100,7 @@ pub fn run<L: LangImpl>(lang: &L, text: &str, opts: &Options) -> Result<Formatte
     let changed = printed.text != text;
     if changed {
         deadline(opts.deadline)?;
-        lang.equivalent(&r, &printed.text)?;
+        lang.equivalent_by(&r, &printed.text, opts.deadline)?;
         comments::same(text, &printed.text, mode)?;
         deadline(opts.deadline)?;
         // the output formats to itself

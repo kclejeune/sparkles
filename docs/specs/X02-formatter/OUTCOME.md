@@ -128,9 +128,14 @@ shared document model.
   differs, a graph of at most eight blank nodes is canonicalized exactly. A larger one is
   compared by colour refinement, which can only reject, and then by a backtracking search
   for a blank node mapping that checks every quad under the mapping. The search has a
-  budget of 20 million steps, each a candidate try or a quad lookup. If the budget runs
-  out, the formatter refuses the output with the check `could not verify the formatted
-  output` and leaves the input unchanged. It never accepts a graph it did not verify.
+  budget of 20 million steps, each a candidate try or a quad lookup. The terms are
+  numbered once before the comparison, so a step never hashes or copies a term, and
+  refinement and the search look at the request deadline every 1,024 steps. A passed
+  deadline gives the normal timeout error. If the budget runs out, the formatter refuses
+  the output with an unsupported-syntax error that reads `could not verify the formatted
+  output` and leaves the input unchanged. It never accepts a graph it did not verify. A
+  new error variant or check would break exhaustive matches on the public enums, so the
+  refusal uses an existing variant.
   Canonicalizing many symmetric blank nodes is factorial and does not look at the
   deadline, which made a 211-byte input of two property shapes with nine identical
   constraints each take 33 seconds. An earlier version accepted a graph whenever

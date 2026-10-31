@@ -5,9 +5,12 @@
 
 use crate::{Check, FormatError, Language};
 use oxrdf::dataset::CanonicalizationAlgorithm;
-use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedOrBlankNode, Quad, Term, Triple};
+use oxrdf::{
+    BlankNode, Dataset, GraphName, Literal, NamedOrBlankNode, Quad, Term, TermRef, Triple,
+};
 use oxttl::{NQuadsParser, NTriplesParser, TriGParser, TurtleParser};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 /// The base IRI of both parses, so relative IRIs resolve (a `BASE` in the text wins).
 pub const RDF_BASE: &str = super::SPARQL_BASE;
@@ -106,52 +109,88 @@ pub fn isomorphic(a: &[Quad], b: &[Quad]) -> bool {
 pub const EXACT_BLANK_NODES: usize = 8;
 
 /// The work [`isomorphic_bounded`] spends searching for a blank node mapping, counted in
-/// quad lookups and candidate tries. Typical shapes graphs need a few hundred per blank
+/// candidate tries and quad lookups. Typical shapes graphs need a few hundred per blank
 /// node, and ten thousand identical property shapes still fit.
 pub const SEARCH_BUDGET: usize = 20_000_000;
 
 /// Like [`isomorphic`], with the work bounded, and never wrong in the accepting direction.
-/// `Some(true)` means a blank node mapping was found and checked quad by quad, and
-/// `Some(false)` means the graphs differ. `None` means the budget ran out before either
-/// was shown, and the caller must refuse. The fast path is the same as [`isomorphic`]'s.
-/// When it misses, a graph with at most [`EXACT_BLANK_NODES`] blank nodes on each side is
-/// canonicalized as before. A larger one is first compared by colour refinement, which
-/// can only reject, and then a backtracking search guided by the colours looks for a
-/// mapping. Canonicalizing many symmetric blank nodes takes factorial time and does not
-/// check the formatter's deadline, so input from the network must not reach it.
-pub fn isomorphic_bounded(a: &[Quad], b: &[Quad]) -> Option<bool> {
-    isomorphic_within(a, b, SEARCH_BUDGET)
+/// `Ok(Some(true))` means a blank node mapping was found and checked quad by quad, and
+/// `Ok(Some(false))` means the graphs differ. `Ok(None)` means the budget ran out before
+/// either was shown, and the caller must refuse. `Err(Timeout)` means `deadline` passed.
+/// The fast path is the same as [`isomorphic`]'s. When it misses, a graph with at most
+/// [`EXACT_BLANK_NODES`] blank nodes on each side is canonicalized as before. A larger
+/// one is first compared by colour refinement, which can only reject, and then a
+/// backtracking search guided by the colours looks for a mapping. The terms are interned
+/// to small numbers once, so no step hashes or copies a term. Canonicalizing many
+/// symmetric blank nodes takes factorial time and does not check the deadline, so input
+/// from the network must not reach it.
+pub fn isomorphic_bounded(
+    a: &[Quad],
+    b: &[Quad],
+    deadline: Option<Instant>,
+) -> Result<Option<bool>, FormatError> {
+    isomorphic_within(a, b, SEARCH_BUDGET, deadline)
 }
 
-fn isomorphic_within(a: &[Quad], b: &[Quad], budget: usize) -> Option<bool> {
+fn isomorphic_within(
+    a: &[Quad],
+    b: &[Quad],
+    budget: usize,
+    deadline: Option<Instant>,
+) -> Result<Option<bool>, FormatError> {
     if relabeled(a) == relabeled(b) {
-        return Some(true);
+        return Ok(Some(true));
     }
+    deadline_check(deadline)?;
     if blank_nodes(a) <= EXACT_BLANK_NODES && blank_nodes(b) <= EXACT_BLANK_NODES {
-        return Some(isomorphic(a, b));
+        return Ok(Some(isomorphic(a, b)));
     }
-    // duplicates do not count
-    let a: Vec<Quad> = a
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let b: Vec<Quad> = b
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    if a.len() != b.len() {
-        return Some(false);
+    let Some(mut g) = Interned::new(a, b) else {
+        return Ok(None);
+    };
+    g.a.quads.sort_unstable();
+    g.a.quads.dedup();
+    g.b.quads.sort_unstable();
+    g.b.quads.dedup();
+    if g.a.quads.len() != g.b.quads.len() {
+        return Ok(Some(false));
     }
-    let (ca, ha) = refined(&a);
-    let (cb, hb) = refined(&b);
-    if ha != hb {
-        return Some(false);
+    let ca = g.a.refined(deadline)?;
+    let cb = g.b.refined(deadline)?;
+    if ca.1 != cb.1 {
+        return Ok(Some(false));
     }
-    search(&a, &ca, &b, &cb, budget)
+    search(&g.a, &ca.0, &g.b, &cb.0, budget, deadline)
+}
+
+fn deadline_check(d: Option<Instant>) -> Result<(), FormatError> {
+    super::deadline(d)
+}
+
+/// A countdown that looks at the clock every so many steps.
+struct Ticker {
+    deadline: Option<Instant>,
+    left: u32,
+}
+
+impl Ticker {
+    const EVERY: u32 = 1024;
+
+    fn new(deadline: Option<Instant>) -> Ticker {
+        Ticker {
+            deadline,
+            left: Self::EVERY,
+        }
+    }
+
+    fn tick(&mut self) -> Result<(), FormatError> {
+        self.left -= 1;
+        if self.left == 0 {
+            self.left = Self::EVERY;
+            deadline_check(self.deadline)?;
+        }
+        Ok(())
+    }
 }
 
 fn blank_nodes(quads: &[Quad]) -> usize {
@@ -167,253 +206,232 @@ fn blank_nodes(quads: &[Quad]) -> usize {
     names.len()
 }
 
-/// The blank nodes of a term, subject or graph name, in order of occurrence.
-fn blanks_of<'q>(q: &'q Quad, out: &mut Vec<&'q str>) {
-    fn term<'q>(t: &'q Term, out: &mut Vec<&'q str>) {
+/// A term of an interned quad: a constant's number, or a blank node's number with
+/// [`BLANK`] set.
+type Code = u32;
+const BLANK: Code = 1 << 31;
+
+/// One side of a comparison: quads of `[subject, predicate, object, graph]` codes.
+struct Side {
+    quads: Vec<[Code; 4]>,
+    /// how many blank nodes, numbered in order of first occurrence
+    blanks: usize,
+}
+
+/// Both sides, with the constants numbered together so equal terms have equal codes.
+struct Interned {
+    a: Side,
+    b: Side,
+}
+
+fn has_blank(t: &Triple) -> bool {
+    fn term(t: &Term) -> bool {
         match t {
-            Term::BlankNode(b) => out.push(b.as_str()),
-            Term::Triple(t) => {
-                if let NamedOrBlankNode::BlankNode(b) = &t.subject {
-                    out.push(b.as_str());
-                }
-                term(&t.object, out);
-            }
-            _ => {}
+            Term::BlankNode(_) => true,
+            Term::Triple(t) => has_blank(t),
+            _ => false,
         }
     }
-    if let NamedOrBlankNode::BlankNode(b) = &q.subject {
-        out.push(b.as_str());
-    }
-    term(&q.object, out);
-    if let GraphName::BlankNode(b) = &q.graph_name {
-        out.push(b.as_str());
+    matches!(t.subject, NamedOrBlankNode::BlankNode(_)) || term(&t.object)
+}
+
+impl Interned {
+    /// `None` when a quad has a blank node inside a triple term, which the search does
+    /// not map.
+    fn new(a: &[Quad], b: &[Quad]) -> Option<Interned> {
+        // the key borrows from the quads
+        fn side<'q>(quads: &'q [Quad], constants: &mut HashMap<TermRef<'q>, Code>) -> Option<Side> {
+            let mut blanks: HashMap<&'q str, Code> = HashMap::new();
+            let mut code = |t: TermRef<'q>| -> Option<Code> {
+                Some(match t {
+                    TermRef::BlankNode(b) => {
+                        let n = blanks.len() as Code;
+                        BLANK | *blanks.entry(b.as_str()).or_insert(n)
+                    }
+                    TermRef::Triple(t) if has_blank(t) => return None,
+                    t => {
+                        // 0 is the default graph
+                        let n = constants.len() as Code + 1;
+                        *constants.entry(t).or_insert(n)
+                    }
+                })
+            };
+            let mut out = Vec::with_capacity(quads.len());
+            for q in quads {
+                let graph = match &q.graph_name {
+                    GraphName::DefaultGraph => 0,
+                    GraphName::NamedNode(n) => code(TermRef::NamedNode(n.as_ref()))?,
+                    GraphName::BlankNode(b) => code(TermRef::BlankNode(b.as_ref()))?,
+                };
+                out.push([
+                    code(q.subject.as_ref().into())?,
+                    code(TermRef::NamedNode(q.predicate.as_ref()))?,
+                    code(q.object.as_ref())?,
+                    graph,
+                ]);
+            }
+            let blanks = blanks.len();
+            Some(Side { quads: out, blanks })
+        }
+        let mut constants = HashMap::new();
+        let a = side(a, &mut constants)?;
+        let b = side(b, &mut constants)?;
+        Some(Interned { a, b })
     }
 }
 
-/// `q` with its blank nodes renamed through `map` (all of them must be in it).
-fn mapped(q: &Quad, map: &HashMap<&str, &str>) -> Quad {
-    fn blank(b: &BlankNode, map: &HashMap<&str, &str>) -> BlankNode {
-        BlankNode::new_unchecked(map[b.as_str()])
-    }
-    fn subject(s: &NamedOrBlankNode, map: &HashMap<&str, &str>) -> NamedOrBlankNode {
-        match s {
-            NamedOrBlankNode::BlankNode(b) => blank(b, map).into(),
-            other => other.clone(),
+fn mix<T: std::hash::Hash>(t: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut s = std::hash::DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
+
+impl Side {
+    /// The colour of each blank node after refinement, and the sorted hashes of the
+    /// quads under those colours. Each round colours a blank node by its old colour and
+    /// the sorted descriptions of the quads it occurs in, with other blank nodes standing
+    /// for their colours. The rounds are fixed, so both sides of a comparison are
+    /// refined alike.
+    fn refined(&self, deadline: Option<Instant>) -> Result<(Vec<u64>, Vec<u64>), FormatError> {
+        let mut tick = Ticker::new(deadline);
+        let mut colour = vec![0u64; self.blanks];
+        let of = |c: Code, colour: &[u64]| -> u64 {
+            if c & BLANK != 0 {
+                mix(&(1u8, colour[(c & !BLANK) as usize]))
+            } else {
+                mix(&(2u8, c))
+            }
+        };
+        for _ in 0..12 {
+            let mut seen: Vec<Vec<u64>> = vec![Vec::new(); self.blanks];
+            for q in &self.quads {
+                tick.tick()?;
+                let [s, p, o, g] = *q;
+                let (hs, ho, hg) = (of(s, &colour), of(o, &colour), of(g, &colour));
+                if s & BLANK != 0 {
+                    seen[(s & !BLANK) as usize].push(mix(&(0u8, p, ho, hg)));
+                }
+                if o & BLANK != 0 {
+                    seen[(o & !BLANK) as usize].push(mix(&(1u8, p, hs, hg)));
+                }
+                if g & BLANK != 0 {
+                    seen[(g & !BLANK) as usize].push(mix(&(2u8, p, hs, ho)));
+                }
+            }
+            for (c, mut v) in colour.iter_mut().zip(seen) {
+                tick.tick()?;
+                v.sort_unstable();
+                *c = mix(&(*c, v));
+            }
         }
+        let mut hashes: Vec<u64> = self
+            .quads
+            .iter()
+            .map(|&[s, p, o, g]| mix(&(of(s, &colour), p, of(o, &colour), of(g, &colour))))
+            .collect();
+        hashes.sort_unstable();
+        Ok((colour, hashes))
     }
-    fn term(t: &Term, map: &HashMap<&str, &str>) -> Term {
-        match t {
-            Term::BlankNode(b) => blank(b, map).into(),
-            Term::Triple(t) => Triple::new(
-                subject(&t.subject, map),
-                t.predicate.clone(),
-                term(&t.object, map),
-            )
-            .into(),
-            other => other.clone(),
-        }
-    }
-    Quad::new(
-        subject(&q.subject, map),
-        q.predicate.clone(),
-        term(&q.object, map),
-        match &q.graph_name {
-            GraphName::BlankNode(b) => GraphName::BlankNode(blank(b, map)),
-            other => other.clone(),
-        },
-    )
 }
 
 /// A backtracking search for a bijection of the blank nodes of `a` onto those of `b`
 /// that maps every quad of `a` onto a quad of `b`. A blank node may only take a partner
 /// of its own colour, and a quad is checked as soon as its blank nodes are all mapped.
-/// `None` when `budget` steps were not enough.
+/// `Ok(None)` when `budget` steps were not enough.
 fn search(
-    a: &[Quad],
-    ca: &HashMap<String, u64>,
-    b: &[Quad],
-    cb: &HashMap<String, u64>,
+    a: &Side,
+    ca: &[u64],
+    b: &Side,
+    cb: &[u64],
     budget: usize,
-) -> Option<bool> {
-    let b_set: HashSet<&Quad> = b.iter().collect();
-    // the blank nodes of `a` in order of first occurrence, and the quads each is in
-    let mut order: Vec<&str> = Vec::new();
-    let mut index: HashMap<&str, usize> = HashMap::new();
-    let mut quad_blanks: Vec<Vec<&str>> = Vec::with_capacity(a.len());
-    for q in a {
-        let mut v = Vec::new();
-        blanks_of(q, &mut v);
-        for x in &v {
-            index.entry(*x).or_insert_with(|| {
-                order.push(*x);
-                order.len() - 1
-            });
-        }
-        quad_blanks.push(v);
+    deadline: Option<Instant>,
+) -> Result<Option<bool>, FormatError> {
+    let mut tick = Ticker::new(deadline);
+    let b_set: HashSet<[Code; 4]> = b.quads.iter().copied().collect();
+    let (mut sa, mut sb) = (ca.to_vec(), cb.to_vec());
+    sa.sort_unstable();
+    sb.sort_unstable();
+    if a.blanks != b.blanks || sa != sb {
+        return Ok(Some(false));
     }
-    // a quad is checked when its last blank node (in `order`) is mapped
-    let mut due: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
-    for (qi, v) in quad_blanks.iter().enumerate() {
-        if let Some(last) = v.iter().map(|x| index[*x]).max() {
-            due[last].push(qi);
-        }
-    }
-    // a quad without blank nodes must be there as it is
-    for (qi, v) in quad_blanks.iter().enumerate() {
-        if v.is_empty() && !b_set.contains(&a[qi]) {
-            return Some(false);
+    // a quad is checked when its last blank node is mapped, and one without blank nodes
+    // must be there as it is
+    let mut due: Vec<Vec<usize>> = vec![Vec::new(); a.blanks];
+    for (qi, q) in a.quads.iter().enumerate() {
+        match [q[0], q[2], q[3]]
+            .iter()
+            .filter(|c| **c & BLANK != 0)
+            .map(|c| (*c & !BLANK) as usize)
+            .max()
+        {
+            Some(last) => due[last].push(qi),
+            None if !b_set.contains(q) => return Ok(Some(false)),
+            None => {}
         }
     }
-    let mut candidates: HashMap<u64, Vec<&str>> = HashMap::new();
-    for k in cb.keys() {
-        candidates.entry(cb[k]).or_default().push(k.as_str());
+    let mut candidates: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (y, c) in cb.iter().enumerate() {
+        candidates.entry(*c).or_default().push(y);
     }
-    for v in candidates.values_mut() {
-        v.sort_unstable();
-    }
-    if order.len() != cb.len() {
-        return Some(false);
-    }
-    let mut map: HashMap<&str, &str> = HashMap::new();
-    let mut used: HashSet<&str> = HashSet::new();
-    // the next candidate to try for each depth
-    let mut next: Vec<usize> = vec![0; order.len() + 1];
+    let mut map = vec![0 as Code; a.blanks];
+    let mut used = vec![false; b.blanks];
+    let mut next = vec![0usize; a.blanks + 1];
     let mut spent = 0usize;
     let mut depth = 0usize;
-    loop {
-        if depth == order.len() {
-            return Some(true);
+    let image = |c: Code, map: &[Code]| {
+        if c & BLANK != 0 {
+            BLANK | map[(c & !BLANK) as usize]
+        } else {
+            c
         }
-        let x = order[depth];
-        let Some(cands) = candidates.get(&ca[x]) else {
-            return Some(false);
+    };
+    loop {
+        if depth == a.blanks {
+            return Ok(Some(true));
+        }
+        let Some(cands) = candidates.get(&ca[depth]) else {
+            return Ok(Some(false));
         };
         let mut placed = false;
         while next[depth] < cands.len() {
+            tick.tick()?;
             let y = cands[next[depth]];
             next[depth] += 1;
             spent += 1;
-            if used.contains(y) {
+            if used[y] {
                 continue;
             }
-            map.insert(x, y);
+            map[depth] = y as Code;
             let mut ok = true;
             for &qi in &due[depth] {
+                tick.tick()?;
                 spent += 1;
-                if !b_set.contains(&mapped(&a[qi], &map)) {
+                let [s, p, o, g] = a.quads[qi];
+                if !b_set.contains(&[image(s, &map), p, image(o, &map), image(g, &map)]) {
                     ok = false;
                     break;
                 }
             }
             if spent > budget {
-                return None;
+                return Ok(None);
             }
             if ok {
-                used.insert(y);
+                used[y] = true;
                 placed = true;
                 break;
             }
-            map.remove(x);
         }
         if placed {
             depth += 1;
             next[depth] = 0;
         } else if depth == 0 {
-            return Some(false);
+            return Ok(Some(false));
         } else {
             depth -= 1;
-            let x = order[depth];
-            let y = map.remove(x).expect("mapped");
-            used.remove(y);
+            used[map[depth] as usize] = false;
         }
     }
-}
-
-/// The colour of each blank node after refinement, and the sorted hashes of the quads
-/// under those colours. Each round colours a blank node by its old colour and the sorted
-/// descriptions of the quads it occurs in, with other blank nodes standing for their
-/// colours. The rounds are fixed, so both sides of a comparison are refined alike.
-fn refined(quads: &[Quad]) -> (HashMap<String, u64>, Vec<u64>) {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    fn h<T: Hash>(t: &T) -> u64 {
-        let mut s = DefaultHasher::new();
-        t.hash(&mut s);
-        s.finish()
-    }
-    // a term as a number: a blank node by its colour, anything else by its text
-    fn term(t: &Term, colour: &HashMap<String, u64>) -> u64 {
-        match t {
-            Term::BlankNode(b) => h(&(1u8, colour[b.as_str()])),
-            other => h(&(2u8, other.to_string())),
-        }
-    }
-    fn subject(s: &NamedOrBlankNode, colour: &HashMap<String, u64>) -> u64 {
-        match s {
-            NamedOrBlankNode::BlankNode(b) => h(&(1u8, colour[b.as_str()])),
-            other => h(&(2u8, other.to_string())),
-        }
-    }
-    fn graph(g: &GraphName, colour: &HashMap<String, u64>) -> u64 {
-        match g {
-            GraphName::BlankNode(b) => h(&(1u8, colour[b.as_str()])),
-            other => h(&(2u8, other.to_string())),
-        }
-    }
-    let mut colour: HashMap<String, u64> = HashMap::new();
-    for q in quads {
-        let mut v = Vec::new();
-        blanks_of(q, &mut v);
-        for b in v {
-            colour.insert(b.to_string(), 0);
-        }
-    }
-    for _ in 0..12 {
-        let mut seen: HashMap<String, Vec<u64>> = HashMap::new();
-        for q in quads {
-            let (s, o, g) = (
-                subject(&q.subject, &colour),
-                term(&q.object, &colour),
-                graph(&q.graph_name, &colour),
-            );
-            let p = h(&q.predicate.as_str());
-            if let NamedOrBlankNode::BlankNode(b) = &q.subject {
-                seen.entry(b.as_str().to_string())
-                    .or_default()
-                    .push(h(&(0u8, p, o, g)));
-            }
-            if let Term::BlankNode(b) = &q.object {
-                seen.entry(b.as_str().to_string())
-                    .or_default()
-                    .push(h(&(1u8, p, s, g)));
-            }
-            if let GraphName::BlankNode(b) = &q.graph_name {
-                seen.entry(b.as_str().to_string())
-                    .or_default()
-                    .push(h(&(2u8, p, s, o)));
-            }
-        }
-        colour = colour
-            .iter()
-            .map(|(k, c)| {
-                let mut v = seen.remove(k).unwrap_or_default();
-                v.sort_unstable();
-                (k.clone(), h(&(*c, v)))
-            })
-            .collect();
-    }
-    let mut out: Vec<u64> = quads
-        .iter()
-        .map(|q| {
-            h(&(
-                subject(&q.subject, &colour),
-                q.predicate.as_str(),
-                term(&q.object, &colour),
-                graph(&q.graph_name, &colour),
-            ))
-        })
-        .collect();
-    out.sort_unstable();
-    (colour, out)
 }
 
 /// A term with its blank node numbered by first occurrence, borrowing the rest: the fast
@@ -503,6 +521,14 @@ mod tests {
         assert!(!isomorphic(&d, &quads("_:a <http://e/p> 1 .", t)));
     }
 
+    fn bounded(a: &[Quad], b: &[Quad]) -> Option<bool> {
+        isomorphic_bounded(a, b, None).unwrap()
+    }
+
+    fn within(a: &[Quad], b: &[Quad], budget: usize) -> Option<bool> {
+        isomorphic_within(a, b, budget, None).unwrap()
+    }
+
     /// Two nodes with `n` identical blank children each, listed in the given order.
     fn children(order: &[usize], n: usize) -> Vec<Quad> {
         let mut s = String::new();
@@ -522,12 +548,12 @@ mod tests {
         let rev: Vec<usize> = (0..22).step_by(2).chain((1..22).step_by(2)).collect();
         let start = std::time::Instant::now();
         assert_eq!(
-            isomorphic_bounded(&children(&fwd, 11), &children(&rev, 11)),
+            bounded(&children(&fwd, 11), &children(&rev, 11)),
             Some(true)
         );
         // one child fewer on one side
         assert_eq!(
-            isomorphic_bounded(&children(&fwd, 11), &children(&fwd[1..], 11)),
+            bounded(&children(&fwd, 11), &children(&fwd[1..], 11)),
             Some(false)
         );
         // the same shape with a different value on one child
@@ -539,7 +565,7 @@ mod tests {
             Literal::from(2),
             GraphName::DefaultGraph,
         ));
-        assert_eq!(isomorphic_bounded(&children(&fwd, 11), &other), Some(false));
+        assert_eq!(bounded(&children(&fwd, 11), &other), Some(false));
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
@@ -569,16 +595,16 @@ mod tests {
         // tails gives another graph that refinement alone cannot tell from the first
         let a = lists(30, ["x", "y"]);
         let shuffled: Vec<Quad> = a.iter().rev().cloned().collect();
-        assert_eq!(isomorphic_bounded(&a, &shuffled), Some(true));
-        assert_eq!(isomorphic_bounded(&a, &lists(30, ["y", "x"])), Some(false));
+        assert_eq!(bounded(&a, &shuffled), Some(true));
+        assert_eq!(bounded(&a, &lists(30, ["y", "x"])), Some(false));
         // ten identical blank nodes are not nine
         let ten = children(&(0..10).collect::<Vec<_>>(), 10);
         let nine = children(&(0..9).collect::<Vec<_>>(), 9);
-        assert_eq!(isomorphic_bounded(&ten, &nine), Some(false));
+        assert_eq!(bounded(&ten, &nine), Some(false));
         // and duplicates of one quad do not make a difference
         let mut dup = ten.clone();
         dup.extend(ten.clone());
-        assert_eq!(isomorphic_bounded(&ten, &dup), Some(true));
+        assert_eq!(bounded(&ten, &dup), Some(true));
     }
 
     #[test]
@@ -587,8 +613,8 @@ mod tests {
         // not a mirror image, which numbers the blank nodes alike
         let rev: Vec<usize> = (0..22).step_by(2).chain((1..22).step_by(2)).collect();
         let (a, b) = (children(&fwd, 11), children(&rev, 11));
-        assert_eq!(isomorphic_within(&a, &b, 5), None);
-        assert_eq!(isomorphic_within(&a, &b, SEARCH_BUDGET), Some(true));
+        assert_eq!(within(&a, &b, 5), None);
+        assert_eq!(within(&a, &b, SEARCH_BUDGET), Some(true));
     }
 
     #[test]
@@ -617,5 +643,41 @@ mod tests {
             })
         );
         assert!(rdf_equivalent(&r, "<a> <b> .").is_err());
+    }
+
+    #[test]
+    fn the_deadline_stops_a_comparison_with_large_terms() {
+        // two lists sharing 120 copies of a long literal, with exchanged tails, which
+        // the fast path cannot settle
+        let big = "x".repeat(8192);
+        let list = |k: usize, end: &str| -> String {
+            let mut s = format!("<http://e/s> <http://e/p{k}> _:l{k}_0 .\n");
+            for i in 0..120 {
+                s.push_str(&format!(
+                    "_:l{k}_{i} <http://e/first> \"{big}\" . _:l{k}_{i} <http://e/rest> _:l{k}_{} .\n",
+                    i + 1
+                ));
+            }
+            s.push_str(&format!(
+                "_:l{k}_120 <http://e/first> <http://e/{end}> . _:l{k}_120 <http://e/rest> <http://e/nil> .\n"
+            ));
+            s
+        };
+        let a = quads(&(list(0, "x") + &list(1, "y")), Language::Turtle);
+        let b = quads(&(list(0, "y") + &list(1, "x")), Language::Turtle);
+        let start = std::time::Instant::now();
+        // an expired deadline is a timeout, not an answer
+        let past = Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            isomorphic_bounded(&a, &b, Some(past)),
+            Err(FormatError::Timeout)
+        );
+        // without one the comparison is quick, because terms are interned once
+        assert_eq!(bounded(&a, &b), Some(false));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }

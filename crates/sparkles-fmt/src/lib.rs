@@ -440,20 +440,16 @@ pub enum Check {
     Comments,
     /// formatting the output changes it again
     Idempotence,
-    /// the work budget ran out before the output's graph was shown to match the input's
-    Unverified,
 }
 
 impl Check {
-    /// `algebra differs`, `graph differs`, `comment lost`, `not idempotent` or
-    /// `could not verify the formatted output`
+    /// `algebra differs`, `graph differs`, `comment lost`, `not idempotent`
     pub fn message(self) -> &'static str {
         match self {
             Check::Algebra => "algebra differs",
             Check::Graph => "graph differs",
             Check::Comments => "comment lost",
             Check::Idempotence => "not idempotent",
-            Check::Unverified => "could not verify the formatted output",
         }
     }
 }
