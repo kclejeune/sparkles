@@ -939,6 +939,57 @@ mod tests {
     }
 
     #[test]
+    fn a_statistics_update_refused_while_probing_changes_nothing() {
+        // The delta's own update polls while it probes subjects and then objects, and
+        // a refusal there leaves the predicate's statistics as they were.
+        let store = crate::store::Store::in_memory(Default::default());
+        let rows: String = (0..20_000)
+            .map(|i| format!("<urn:s{i}> <urn:p> <urn:o{i}> . "))
+            .collect();
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {rows} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let delta = store.snapshot().delta.clone();
+        let keys: Vec<Key> = delta.ins[Perm::Pso.index()].iter().copied().collect();
+        let p = keys[0][0];
+        let mut subjects: Vec<u64> = keys.iter().map(|k| k[1]).collect();
+        let mut objects: Vec<u64> = keys.iter().map(|k| k[2]).collect();
+        subjects.dedup();
+        objects.sort_unstable();
+        objects.dedup();
+        assert_eq!((subjects.len(), objects.len()), (20_000, 20_000));
+        let n = keys.len() as u64;
+        let before = *delta.predicate(p).unwrap();
+        // unchecked, the update lowers the count
+        let mut changed = delta.clone();
+        changed
+            .forget_removed(p, n / 2, &subjects, &objects, &mut || Ok(()))
+            .unwrap();
+        assert_ne!(*changed.predicate(p).unwrap(), before);
+        // 20 polls cover the subjects and 20 more the objects
+        for refuse_at in [3usize, 23] {
+            let mut target = delta.clone();
+            let mut calls = 0usize;
+            let result = target.forget_removed(p, n / 2, &subjects, &objects, &mut || {
+                calls += 1;
+                if calls == refuse_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(result, Err(Error::Cancelled)),
+                "refusal at poll {refuse_at}: {result:?} after {calls} polls"
+            );
+            assert_eq!(*target.predicate(p).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn returned_view_owns_its_allowance_and_releases_it_on_drop() {
         let store = crate::store::Store::in_memory(Default::default());
         crate::sparql::update::update(
