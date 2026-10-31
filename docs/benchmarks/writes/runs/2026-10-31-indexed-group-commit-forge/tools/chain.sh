@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -e
 cd ~/lanes/gc-86
 B="--binary bin/sparkles-main-a202e8f2 --write-bench bin/write-bench --source-commit a202e8f2 --blocks 5 --port 41800 --provider-port 41801"
 ./runlocked.sh runs/f1.log $B --out runs/f1-geo10m-serial --people 1000000 --indexes geo --scenarios serial-literal serial-iri serial-delete
