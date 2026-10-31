@@ -59,6 +59,15 @@ fields of the HTTP and MCP formatters. Directory walks now format `.shc` files, 
 they skipped before. The SHACLC lexer, reader and writer moved to the new
 `sparkles-shaclc` crate, which `sparkles-shacl` re-exports as `compact`.
 
+`ORDER BY ?v LIMIT k` over one triple pattern reads the IRIs of the base vocabulary in
+value order, and in ascending order reads plain strings from the low end of the
+vocabulary. A literal's vocabulary key ends its lexical form with a 0xFF byte, so a form
+sorts after the longer forms it begins. The reader looks up the prefixes of the last
+string it read, which are the only unread strings that can still rank ahead. SP²Bench
+`q11` at 10M reads 120 rows instead of ranking 603,577 decoded strings, and took 0.13 ms
+against 127 to 141 ms in a local server A/B. The planner keeps the plain sort for literal
+columns whose first rows are not plain strings, such as language-tagged labels.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.

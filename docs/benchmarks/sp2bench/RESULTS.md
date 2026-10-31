@@ -13,7 +13,7 @@ The Forge benchmark answers `q4` in 30.626 s and `q6` in 978.4 ms with Sparkles 
 `6b7f32ce`. Both complete answers match independent reconstruction from the source data.
 The benchmark gives Sparkles a 4 GiB response allowance; the production default remains
 1 GiB. Sparkles is the only engine with a completed `q5a` measurement under the published
-600 s request budget. QLever is faster on the checked `q11` comparison. Fluree's native response encoding is
+600 s request budget. QLever is faster on the recorded `q11` comparison, whose Sparkles build predates the ordered read of plain strings described below. Fluree's native response encoding is
 qualified below.
 
 ## SP²Bench on Forge
@@ -103,7 +103,10 @@ timeouts remain missing comparisons. Fluree and Oxigraph `q6`, and Jena and Oxig
 `q7`, also retain their bounded timeout statuses rather than partial answers.
 
 QLever's checked `q11` mean is 43.5 ms and Fluree's is 52.2 ms, against Sparkles's
-103.1 ms. These complete answers and their ordering match retained references. Remaining errors, unsupported formats, wrong answers and bounded timeouts stay
+103.1 ms. The recorded Sparkles build decodes and ranks all 603,577 `rdfs:seeAlso` values,
+which are plain strings. The current planner reads them from the low end of the
+vocabulary instead and reads 120 rows for this query, so this row describes the recorded
+build until the Forge run is repeated. These complete answers and their ordering match retained references. Remaining errors, unsupported formats, wrong answers and bounded timeouts stay
 explicit rather than receiving inferred timings.
 
 ## Separate Wally memory profile

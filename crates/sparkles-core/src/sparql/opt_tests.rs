@@ -1133,13 +1133,357 @@ fn ordered_top_k_is_chosen_when_it_reads_less() {
         let read = topk_rows_read(&fast.plan);
         assert!(read.is_some_and(|n| n < 60_000), "{q}: {:#?}", fast.plan);
     }
-    // ordering by a column of IRIs reads every row: the plain sort stays
-    let r = run(
-        &s,
+    // the IRIs of the base vocabulary are in value order too, so ordering by the
+    // subjects reads only the best end of their piece
+    for q in [
         "SELECT ?p ?s WHERE { ?p ex:salary ?s } ORDER BY DESC(?p) LIMIT 10",
-        Optimizations::ALL,
+        "SELECT ?p ?s WHERE { ?p ex:salary ?s } ORDER BY ?p LIMIT 10 OFFSET 50",
+    ] {
+        let fast = run(&s, q, Optimizations::ALL);
+        let slow = run(&s, q, without_ordered_topk());
+        assert_eq!(fast.rows(), slow.rows(), "{q}");
+        let read = topk_rows_read(&fast.plan);
+        assert!(read.is_some_and(|n| n < 60_000), "{q}: {:#?}", fast.plan);
+    }
+}
+
+/// Literals read in ascending order from the low end of the base vocabulary, where a
+/// lexical form sorts after the forms it is a proper prefix of: the empty string, chains
+/// of prefixes, multi-byte characters, and plain strings mixed with language-tagged
+/// strings, other datatypes, numbers, IRIs and blank nodes, before and after updates
+/// that add strings with delta ids. Every answer is the full sort's, and a column of
+/// plain strings is read from its low end, not whole.
+#[test]
+fn ordered_top_k_reads_strings_from_the_low_end() {
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let stems = [
+        "", "a", "ab", "abc", "abd", "ab c", "b", "ba", "é", "e\u{301}", "日", "日本", "~",
+        "a\u{7f}",
+    ];
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
     );
-    assert!(!has_op(&r.plan, "IndexTopK"));
+    for i in 0..4000u64 {
+        let r = next();
+        let stem = stems[(r % stems.len() as u64) as usize];
+        let lex = if (r >> 8) & 3 == 0 {
+            stem.to_string()
+        } else {
+            format!("{stem}{}", (r >> 10) % 50)
+        };
+        let o = match (r >> 20) % 9 {
+            0 => format!("\"{lex}\"@en"),
+            1 => format!("\"{lex}\"^^ex:dt"),
+            2 => format!("\"0{}\"^^xsd:integer", (r >> 30) % 20),
+            3 => format!("{}", (r >> 30) % 20),
+            4 => format!("<http://ex.org/{}>", (r >> 30) % 30),
+            5 => format!("_:b{}", (r >> 30) % 5),
+            _ => format!("\"{lex}\""),
+        };
+        let tag = ["en", "de"][(r >> 40) as usize % 2];
+        ttl.push_str(&format!(
+            "ex:s{i} ex:str \"{lex}\" ; ex:mix {o} ; ex:lang \"{lex}\"@{tag} .\n"
+        ));
+        // ex:big holds enough plain strings for the planner to prefer the ordered scan,
+        // and ex:labels as many language-tagged strings
+        for j in 0..5 {
+            let tail = if j == 0 { String::new() } else { j.to_string() };
+            ttl.push_str(&format!(
+                "ex:s{i} ex:big \"{lex}{tail}\" ; ex:labels \"{lex}{tail}\"@{tag} .\n"
+            ));
+        }
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    let plain = |s: &Store| -> Vec<String> {
+        let r = run(s, "SELECT ?v WHERE { ?s ex:str ?v }", Optimizations::NONE);
+        let mut v: Vec<String> = r
+            .rows()
+            .into_iter()
+            .map(|row| match &row[0] {
+                Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for round in 0..2 {
+        let strings = plain(&s);
+        for p in ["str", "mix", "lang"] {
+            for (dir, limit, offset) in [
+                ("", 10, 0),
+                ("", 10, 50),
+                ("", 1, 0),
+                ("", 37, 300),
+                ("", 60, 2000),
+                ("DESC", 10, 5),
+                ("", 500, 3600),
+            ] {
+                let q = format!(
+                    "SELECT ?v ?s WHERE {{ ?s ex:{p} ?v }} ORDER BY {dir}(?v) LIMIT {limit} OFFSET {offset}"
+                );
+                let r = topk_check(&s, &q);
+                assert!(has_op(&r.plan, "IndexTopK"), "{q}");
+                if p == "str" && dir.is_empty() {
+                    let got: Vec<String> = r
+                        .rows()
+                        .into_iter()
+                        .map(|row| match &row[0] {
+                            Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
+                            other => panic!("{other:?}"),
+                        })
+                        .collect();
+                    let end = (offset + limit).min(strings.len());
+                    assert_eq!(got, strings[offset.min(end)..end], "round {round}: {q}");
+                }
+            }
+        }
+        // the planner picks the ordered scan for a column of plain strings on its own,
+        // and it reads the low end and the prefixes of the last string read
+        for (limit, offset) in [(10, 50), (1, 0), (20, 100)] {
+            let q = format!(
+                "SELECT ?v WHERE {{ ?s ex:big ?v }} ORDER BY ?v LIMIT {limit} OFFSET {offset}"
+            );
+            let fast = run(&s, &q, Optimizations::ALL);
+            let slow = run(&s, &q, without_ordered_topk());
+            assert_eq!(fast.rows(), slow.rows(), "{q}");
+            let read = topk_rows_read(&fast.plan);
+            assert!(read.is_some_and(|n| n < 1500), "{q}: {read:?}");
+            // labels do not start with plain strings: the plain sort stays
+            let q = q.replace("ex:big", "ex:labels");
+            let r = run(&s, &q, Optimizations::ALL);
+            assert!(!has_op(&r.plan, "IndexTopK"), "{q}");
+            assert_eq!(r.rows(), run(&s, &q, without_ordered_topk()).rows(), "{q}");
+        }
+        // plain strings with delta ids, among them prefixes of base strings and the
+        // smallest string of all
+        update(
+            &s,
+            "INSERT DATA { ex:n1 ex:str \"\" , \"a\" , \"ab1\" , \"!\" , \"zz\" . \
+             ex:n2 ex:mix \"!\" , \"!\"@en , \"\" . ex:n3 ex:lang \"!\"@en } ; \
+             DELETE WHERE { ?s ex:str \"a1\" }",
+        );
+    }
+}
+
+/// Load `body` (Turtle without prefixes) and compare `q` with the generic plan, with the
+/// planner's own choice and with the ordered read forced.
+fn lexical_case(body: &str, q: &str) -> QueryResult {
+    let s = Store::in_memory(StoreOptions::default());
+    let ttl = format!(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n{body}"
+    );
+    load(&s, &ttl, RdfFormat::Turtle);
+    let slow = run(&s, q, without_ordered_topk());
+    let fast = run(&s, q, Optimizations::ALL);
+    assert_eq!(fast.rows(), slow.rows(), "{q}");
+    topk_check(&s, q);
+    fast
+}
+
+/// Equal values with different ids (non-canonical integers) at the cut: the generic
+/// plan breaks their tie by its own row order, which the ordered read must keep.
+#[test]
+fn ordered_top_k_lexical_reads_keep_the_generic_tie_order() {
+    let mut ttl = String::new();
+    for i in 0..32 {
+        ttl.push_str(&format!("ex:drop{i} ex:p \"!{i}\" .\n"));
+    }
+    for i in 0..128 {
+        ttl.push_str(&format!("ex:keep_x{i} ex:p \"0001\"^^xsd:int .\n"));
+    }
+    ttl.push_str("ex:keep_m ex:p \"001\"^^xsd:int .\nex:keep_a ex:p \"01\"^^xsd:int .\n");
+    for i in 0..10_000 {
+        ttl.push_str(&format!("ex:keep_u{i} ex:p \"u{i}\"^^ex:unknown .\n"));
+    }
+    let r = lexical_case(
+        &ttl,
+        "SELECT ?s WHERE { ?s ex:p ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY ?v LIMIT 1",
+    );
+    assert_eq!(solutions(&r), ["<http://ex.org/keep_a>"]);
+}
+
+/// Plain strings that a FILTER drops start the column, so the ordered read is planned,
+/// and its steps then read dateTimes with and without a timezone, which are only
+/// partially ordered. The generic plan must decide.
+#[test]
+fn ordered_top_k_lexical_steps_fall_back_on_partially_ordered_values() {
+    let mut ttl = String::new();
+    for i in 0..32 {
+        ttl.push_str(&format!("ex:drop{i} ex:p \"!{i}\" .\n"));
+    }
+    // four fractional digits keep them out of the inline dateTimes, in the vocabulary
+    for (i, d) in [
+        "2024-01-01T01:00:00.0001+10:00",
+        "2024-01-01T00:00:00.0001Z",
+        "2024-01-01T00:30:00.0001",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ttl.push_str(&format!("ex:keep_d{i} ex:p \"{d}\"^^xsd:dateTime .\n"));
+    }
+    for i in 0..10_000 {
+        ttl.push_str(&format!("ex:keep_u{i} ex:p \"u{i}\"^^ex:unknown .\n"));
+    }
+    let r = lexical_case(
+        &ttl,
+        "SELECT ?s ?v WHERE { ?s ex:p ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY ?v LIMIT 10",
+    );
+    assert!(has_desc(&r.plan, "ran the generic plan"), "{:#?}", r.plan);
+}
+
+/// A long plain string at the low end ties with the k-th candidate, so each of its
+/// prefixes could still win. Looking them all up is quadratic in its length, so the
+/// ordered read gives the query to the generic plan instead.
+#[test]
+fn ordered_top_k_bounds_the_prefix_lookups_of_long_strings() {
+    let long = "a".repeat(4096);
+    let mut ttl = String::new();
+    for i in 0..32 {
+        ttl.push_str(&format!("ex:l{i} ex:p \"{long}\" .\n"));
+    }
+    for i in 0..20_000 {
+        ttl.push_str(&format!("ex:s{i} ex:p \"b{i}\" .\n"));
+    }
+    let r = lexical_case(
+        &ttl,
+        "SELECT ?s ?v WHERE { ?s ex:p ?v } ORDER BY ?v LIMIT 10",
+    );
+    assert!(has_desc(&r.plan, "ran the generic plan"), "{:#?}", r.plan);
+}
+
+/// IRIs whose order differs from the order of their keys' bytes under other encodings
+/// (a prefix of another IRI, `/`, `#` and `-` against `>`, case, multi-byte characters),
+/// mixed with blank nodes, literals and numbers, and IRIs that updates add with delta ids
+/// before, between and after the base vocabulary's. Every ORDER BY on them, ascending
+/// and descending with offsets, gives the rows of the full sort, which orders IRIs by
+/// their code points after blank nodes and before literals.
+#[test]
+fn ordered_top_k_reads_iris_in_value_order() {
+    let names = [
+        "a", "a/", "a#", "a-b", "a/b", "ab", "A", "Z", "_", "~", "é", "e\u{301}", "日本", "a%20",
+        "0", "9z", "zz", "a.b",
+    ];
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..4000 {
+        let o = match i % 23 {
+            0 => format!("_:b{}", i % 5),
+            1 => format!("\"lit{}\"", i % 9),
+            2 => format!("{}", i % 11),
+            _ => format!("<http://ex.org/{}{}>", names[i % names.len()], i % 37),
+        };
+        ttl.push_str(&format!("ex:s{i} ex:see {o} .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    let queries = |s: &Store| {
+        let mut out = Vec::new();
+        for (dir, limit, offset) in [
+            ("", 10, 200),
+            ("DESC", 10, 400),
+            ("", 1, 0),
+            ("DESC", 3, 0),
+            ("", 40, 3900),
+            ("DESC", 200, 7),
+            ("", 15, 1000),
+            ("DESC", 15, 2000),
+        ] {
+            let q = format!(
+                "SELECT ?e ?s WHERE {{ ?s ex:see ?e }} ORDER BY {dir}(?e) LIMIT {limit} OFFSET {offset}"
+            );
+            let r = topk_check(s, &q);
+            assert!(has_op(&r.plan, "IndexTopK"), "{q}");
+            if limit + offset <= 1100 {
+                // the IRIs are read from their best end, in steps of twice the rows
+                // wanted and more, and the about 520 other rows whole
+                let bound = 2 * (limit + offset) as u64 + 600;
+                let read = topk_rows_read(&r.plan);
+                assert!(read.is_some_and(|n| n <= bound), "{q}: {read:?}");
+            }
+            out.push((dir, limit, offset, r));
+        }
+        out
+    };
+    let expect = |s: &Store| {
+        // the IRIs in code point order, after the blank nodes and before the literals
+        let r = run(
+            s,
+            "SELECT ?e ?s WHERE { ?s ex:see ?e }",
+            Optimizations::NONE,
+        );
+        let mut rows = r.rows();
+        let rank = |t: &Option<oxrdf::Term>| match t {
+            Some(oxrdf::Term::BlankNode(_)) => 0,
+            Some(oxrdf::Term::NamedNode(_)) => 1,
+            _ => 2,
+        };
+        rows.retain(|row| rank(&row[0]) == 1);
+        let mut iris: Vec<String> = rows
+            .into_iter()
+            .map(|row| match &row[0] {
+                Some(oxrdf::Term::NamedNode(n)) => n.as_str().to_string(),
+                _ => unreachable!(),
+            })
+            .collect();
+        iris.sort();
+        iris
+    };
+    let count = |s: &Store, filter: &str| -> usize {
+        let r = run(
+            s,
+            &format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s ex:see ?e FILTER({filter}(?e)) }}"),
+            Optimizations::NONE,
+        );
+        match &r.rows()[0][0] {
+            Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
+            other => panic!("{other:?}"),
+        }
+    };
+    for round in 0..2 {
+        let iris = expect(&s);
+        let (blanks, literals) = (count(&s, "isBlank"), count(&s, "isLiteral"));
+        let mut checked = 0;
+        for (dir, limit, offset, r) in queries(&s) {
+            let got: Vec<String> = r
+                .rows()
+                .into_iter()
+                .filter_map(|row| match &row[0] {
+                    Some(oxrdf::Term::NamedNode(n)) => Some(n.as_str().to_string()),
+                    _ => None,
+                })
+                .collect();
+            // ascending, the blank nodes come first, and descending, the literals
+            let (before, mut want) = if dir.is_empty() {
+                (blanks, iris.clone())
+            } else {
+                (literals, iris.iter().rev().cloned().collect())
+            };
+            if offset >= before {
+                let at = (offset - before).min(want.len());
+                want = want[at..(at + limit).min(want.len())].to_vec();
+                assert_eq!(got, want, "round {round}: {dir} {limit} {offset}");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 4, "round {round}: {checked}");
+        // IRIs with delta ids at both ends and in the middle of the base IRIs, and
+        // deletes of base rows at the best ends
+        update(
+            &s,
+            "INSERT DATA { ex:n1 ex:see <http://ex.org/> . ex:n2 ex:see <http://ex.org/ÿ> . \
+             ex:n3 ex:see <http://ex.org/a/0x> . ex:n4 ex:see <http://a> . ex:n5 ex:see <zzz:z> . \
+             ex:n6 ex:see <http://ex.org/a0> . ex:n7 ex:see _:fresh . ex:n8 ex:see \"new\" } ; \
+             DELETE WHERE { ?s ex:see <http://ex.org/00> } ; DELETE WHERE { ?s ex:see <http://ex.org/~36> }",
+        );
+    }
 }
 
 // ---------------------------------------------------------- batched frontiers ------
