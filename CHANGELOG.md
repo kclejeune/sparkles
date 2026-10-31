@@ -494,6 +494,16 @@ reply, key redacted, in `replies.jsonl`.
 
 ### Fixed
 
+A view or live query whose `FILTER EXISTS` or `FILTER NOT EXISTS` holds a path that
+matches the empty path, such as `:p*` or `:p?`, from a variable of the outer rows now
+gives the query's answer (roadmap item 439). The circuit joined the outer rows with
+the path evaluated alone, which binds the variable only to nodes of the active graph,
+while `EXISTS` substitutes the outer value and the zero-length step matches it whether
+or not the graph holds it. `FILTER NOT EXISTS { GRAPH ?g { ?x :knows* ?y } }` kept a row
+for an `?x` that no named graph held. Such an `EXISTS` is now evaluated again by the
+engine at each pass that touches its footprint. The compiler version changes, so view
+checkpoints of an older release are refused and their views are built again.
+
 A FILTER of a group no longer runs before the group's other patterns can bind its
 variables. The planner placed a FILTER on part of the join as soon as that part could
 bind every variable of it, even when a UNION branch, an OPTIONAL, a failed BIND or an

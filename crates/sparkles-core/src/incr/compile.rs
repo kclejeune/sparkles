@@ -315,6 +315,128 @@ fn refused_gp(gp: &GP, found: &mut Option<String>) {
     }
 }
 
+/// Whether a path matches the empty path, which joins every node of the graph to
+/// itself and a bound end term to itself whether or not it is a node of the graph.
+fn nullable(p: &PPE) -> bool {
+    match p {
+        PPE::ZeroOrMore(_) | PPE::ZeroOrOne(_) => true,
+        PPE::Range { min, path, .. } => *min == 0 || nullable(path),
+        PPE::Reverse(a) | PPE::Distinct(a) | PPE::Multi(a) | PPE::Shortest(a) => nullable(a),
+        PPE::OneOrMore(a) => nullable(a),
+        PPE::Sequence(a, b) => nullable(a) && nullable(b),
+        PPE::Alternative(a, b) => nullable(a) || nullable(b),
+        PPE::NamedNode(_) | PPE::NegatedPropertySet(_) => false,
+    }
+}
+
+/// The variables at the ends of the paths in a subtree, and in its `EXISTS`
+/// expressions, that match the empty path.
+///
+/// Substituting a term for such a variable matches the term to itself even when it
+/// is no node of the active graph, while the path evaluated alone binds the variable
+/// only to nodes of the graph. A join with the outer rows therefore differs from the
+/// substitution that `EXISTS` makes.
+fn nullable_ends(gp: &GP, out: &mut Vec<String>) {
+    fn expr(e: &Expression, out: &mut Vec<String>) {
+        use Expression as E;
+        match e {
+            E::Exists(p) => nullable_ends(p, out),
+            E::Or(a, b)
+            | E::And(a, b)
+            | E::Equal(a, b)
+            | E::SameTerm(a, b)
+            | E::Greater(a, b)
+            | E::GreaterOrEqual(a, b)
+            | E::Less(a, b)
+            | E::LessOrEqual(a, b)
+            | E::Add(a, b)
+            | E::Subtract(a, b)
+            | E::Multiply(a, b)
+            | E::Divide(a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr(a, out),
+            E::In(a, l) => {
+                expr(a, out);
+                l.iter().for_each(|x| expr(x, out));
+            }
+            E::If(a, b, c) => {
+                expr(a, out);
+                expr(b, out);
+                expr(c, out);
+            }
+            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| expr(x, out)),
+            _ => {}
+        }
+    }
+    match gp {
+        GP::Path {
+            subject,
+            path,
+            object,
+        } => {
+            if nullable(path) {
+                for t in [subject, object] {
+                    if let TermPattern::Variable(v) = t {
+                        out.push(v.as_str().to_string());
+                    }
+                }
+            }
+        }
+        GP::Filter { expr: e, inner } => {
+            expr(e, out);
+            nullable_ends(inner, out);
+        }
+        GP::Extend {
+            inner, expression, ..
+        } => {
+            expr(expression, out);
+            nullable_ends(inner, out);
+        }
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            if let Some(e) = expression {
+                expr(e, out);
+            }
+            nullable_ends(left, out);
+            nullable_ends(right, out);
+        }
+        GP::Join { left, right }
+        | GP::Union { left, right }
+        | GP::Minus { left, right }
+        | GP::Lateral { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right } => {
+            nullable_ends(left, out);
+            nullable_ends(right, out);
+        }
+        GP::Group {
+            inner, aggregates, ..
+        } => {
+            for (_, a) in aggregates {
+                if let AggregateExpression::FunctionCall { expr: e, .. } = a {
+                    expr(e, out);
+                }
+            }
+            nullable_ends(inner, out);
+        }
+        GP::OrderBy { inner, .. }
+        | GP::Graph { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Slice { inner, .. }
+        | GP::Assign { inner, .. }
+        | GP::Unfold { inner, .. }
+        | GP::Service { inner, .. } => nullable_ends(inner, out),
+        _ => {}
+    }
+}
+
 /// The footprint entries of a subtree read in `scope`.
 fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
     fn term(t: &TermPattern) -> Option<Term> {
@@ -322,19 +444,6 @@ fn footprint_of(gp: &GP, scope: &Scope, fp: &mut Footprint) {
             TermPattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
             TermPattern::Literal(l) => Some(Term::Literal(l.clone())),
             _ => None,
-        }
-    }
-    /// Whether a path matches the empty path, which joins every node of the graph
-    /// to itself.
-    fn nullable(p: &PPE) -> bool {
-        match p {
-            PPE::ZeroOrMore(_) | PPE::ZeroOrOne(_) => true,
-            PPE::Range { min, path, .. } => *min == 0 || nullable(path),
-            PPE::Reverse(a) | PPE::Distinct(a) | PPE::Multi(a) | PPE::Shortest(a) => nullable(a),
-            PPE::OneOrMore(a) => nullable(a),
-            PPE::Sequence(a, b) => nullable(a) && nullable(b),
-            PPE::Alternative(a, b) => nullable(a) || nullable(b),
-            PPE::NamedNode(_) | PPE::NegatedPropertySet(_) => false,
         }
     }
     fn any_quad(scope: &Scope, fp: &mut Footprint) {
@@ -1381,7 +1490,8 @@ impl C {
         }
         for (p, mode) in exists {
             // join semantics equal substitution only when the pattern shares nothing but
-            // variables both sides always bind, and its expressions read only its own
+            // variables both sides always bind, its expressions read only its own, and
+            // no path of it that matches the empty path ends at an outer variable
             let outer: Vec<String> = node
                 .schema
                 .iter()
@@ -1392,6 +1502,16 @@ impl C {
             let mut all = Vec::new();
             mentioned(&p, &mut all);
             let free_outer = all.iter().any(|v| !own.contains(v) && outer.contains(v));
+            let mut ends = Vec::new();
+            nullable_ends(&p, &mut ends);
+            if ends.iter().any(|v| outer.contains(v)) {
+                return self.recompute(
+                    gp,
+                    scope,
+                    "an EXISTS whose empty path starts at an outer variable",
+                    None,
+                );
+            }
             let right = self.compile(&p, scope);
             let shared_ok = right.schema.iter().all(|v| {
                 !node.schema.contains(v) || (node.certain.contains(v) && right.certain.contains(v))

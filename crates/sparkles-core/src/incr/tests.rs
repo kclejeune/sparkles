@@ -678,6 +678,122 @@ fn edge_cases_follow_the_oracle() {
     assert_eq!(result(&c).len(), 2);
 }
 
+/// A zero-length path from a term an outer pattern binds matches that term, even when
+/// it is no node of the active graph. `EXISTS` substitutes the outer row, so its
+/// answer differs from a join of the pattern evaluated alone. `OPTIONAL` joins, so a
+/// term that is no node of the graph finds no match. The expected rows come from
+/// `arq --engine=ref` (Jena 6.2) over the data after the third update, and the
+/// generator found the first case at seed 5897.
+#[test]
+fn zero_length_paths_follow_the_oracle() {
+    let updates = [
+        "INSERT DATA { GRAPH :g2 { :a :knows :d } . :a :left false . :d :left true . :d rdfs:label \"y\" . :d rdfs:label 1 . GRAPH :g2 { :d :knows :b } }",
+        "INSERT DATA { :d rdfs:label \"x\"@en }",
+        "INSERT DATA { :a :knows :e } ; INSERT DATA { :a rdfs:label 1 }",
+        "DELETE DATA { GRAPH :g2 { :a :knows :d . :d :knows :b } }",
+        "INSERT DATA { GRAPH :g3 { :e :other 1 } }",
+    ];
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "CONSTRUCT { ?v1 :out ?v1 } WHERE { ?v0 :knows? ?v1 . ?v2 rdfs:label \"x\"@en . FILTER NOT EXISTS { GRAPH ?v3 { ?v1 :knows* ?v4 } } }",
+            &[],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER NOT EXISTS { GRAPH ?g { ?x :knows* ?y } } }",
+            &[],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER NOT EXISTS { GRAPH ?g { ?x :knows? ?y } } }",
+            &[],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER EXISTS { GRAPH ?g { ?x :knows* ?y } } }",
+            &["<http://ex/e>"],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER EXISTS { GRAPH ?g { ?x :knows? ?y } } }",
+            &["<http://ex/e>"],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER NOT EXISTS { GRAPH :g2 { ?x :knows* ?y } } }",
+            &[],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER NOT EXISTS { GRAPH :nope { ?x :knows* ?y } } }",
+            &["<http://ex/e>"],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER EXISTS { GRAPH :nope { ?x :knows? ?y } } }",
+            &[],
+        ),
+        (
+            "SELECT ?x WHERE { GRAPH :g2 { ?a :knows ?x } FILTER NOT EXISTS { ?x :knows* ?y } }",
+            &[],
+        ),
+        (
+            "SELECT ?x WHERE { GRAPH :g2 { ?a :knows ?x } FILTER EXISTS { ?x :knows? ?y } }",
+            &["<http://ex/b>", "<http://ex/d>"],
+        ),
+        (
+            "SELECT ?x WHERE { VALUES ?x { :zz } FILTER NOT EXISTS { ?x :knows? ?y } }",
+            &[],
+        ),
+        (
+            "SELECT ?x WHERE { ?a :knows ?x FILTER NOT EXISTS { GRAPH ?g { ?y :knows* ?x } } }",
+            &[],
+        ),
+        (
+            "SELECT ?x ?g ?y WHERE { ?a :knows ?x OPTIONAL { GRAPH ?g { ?x :knows* ?y } } }",
+            &["<http://ex/e> UNDEF UNDEF"],
+        ),
+        (
+            "SELECT ?x ?y WHERE { GRAPH :g2 { ?a :knows ?x } OPTIONAL { ?x :knows? ?y } }",
+            &["<http://ex/b> UNDEF", "<http://ex/d> <http://ex/d>"],
+        ),
+        (
+            "SELECT ?g ?y WHERE { GRAPH ?g { :e :knows* ?y } }",
+            &["<http://ex/g2> <http://ex/e>"],
+        ),
+        ("SELECT ?y WHERE { GRAPH :nope { :e :knows* ?y } }", &[]),
+        (
+            "SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s :knows? ?o } }",
+            &[
+                "<http://ex/g2> <http://ex/a> <http://ex/a>",
+                "<http://ex/g2> <http://ex/a> <http://ex/d>",
+                "<http://ex/g2> <http://ex/b> <http://ex/b>",
+                "<http://ex/g2> <http://ex/d> <http://ex/b>",
+                "<http://ex/g2> <http://ex/d> <http://ex/d>",
+            ],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (q, want) in cases {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut c = circuit(&s, q);
+        let mut what = vec!["after the build"];
+        what.extend(updates);
+        for (i, u) in what.iter().enumerate() {
+            if i > 0 {
+                upd(&s, &format!("{PREFIX}{u}")).expect("update");
+                step(&s, &mut c);
+            }
+            let got = result(&c);
+            let oracle = oracle(&s, q, &c.columns(), c.kind);
+            if got != oracle {
+                wrong.push(format!(
+                    "{q}\n  {u}: the circuit has {got:?}, the engine {oracle:?}"
+                ));
+            }
+            if i == 3 && oracle != *want {
+                wrong.push(format!(
+                    "{q}\n  the engine has {oracle:?}, the reference {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rebuild starts the operators' state from nothing.
 #[test]
 fn a_rebuild_clears_the_operators_state() {

@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-const COMPILER: &str = "f13-phase1-3";
+const COMPILER: &str = "f13-phase1-4";
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
 /// The most rows a circuit's diff history keeps for resumed live queries.
@@ -2371,6 +2371,9 @@ mod compiler_tests {
         ("f13-phase1-2", "650d426b8dbb3bb3"),
         // a GRAPH inside GRAPH compiles to a recompute node
         ("f13-phase1-3", "650d426b8dbb3bb3"),
+        // an EXISTS whose empty path starts at an outer variable compiles to a
+        // recompute node
+        ("f13-phase1-4", "650d426b8dbb3bb3"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or
