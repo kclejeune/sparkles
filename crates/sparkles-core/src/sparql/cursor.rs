@@ -2595,7 +2595,9 @@ impl Operator {
         // reads its build input into a hash table and keeps only the probe input's
         // order. A filter keeps its input's order without using it. A grouping in a hash
         // table claims no order, and when no aggregate depends on the order of its rows
-        // it relies on none (item 93). Other operators may use their inputs' order.
+        // it relies on none (item 93). A LIMIT or OFFSET chooses its rows by their
+        // order, so it relies on it whatever its parent needs. Other operators may use
+        // their inputs' order.
         let hashes = joins && ctx.spill.is_some() && !merge::eligible(&node);
         let order_free_group = incremental_group
             && match &node.kind {
@@ -2604,6 +2606,7 @@ impl Operator {
             };
         let needs: Vec<bool> = (0..node.children.len())
             .map(|i| match node.kind {
+                Kind::Slice { offset, limit } if offset > 0 || limit.is_some() => true,
                 Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } | Kind::Filter(_) => {
                     needed
                 }

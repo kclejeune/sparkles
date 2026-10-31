@@ -620,3 +620,32 @@ fn a_grouping_above_finished_joins_has_their_room_for_its_passes() {
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
 }
+
+/// A LIMIT chooses its rows by their order even when nothing above it relies on the
+/// order of its output. The spilled OPTIONAL below this one keeps its left input's value
+/// order, so the LIMIT picks the rows with the largest values as it does in memory.
+#[test]
+fn a_limit_below_an_order_free_grouping_keeps_its_input_order() {
+    let s = store(60_000, false);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT (SUM(?v) AS ?vs) (COUNT(DISTINCT ?a) AS ?n) { SELECT ?a ?v { \
+             { SELECT ?a ?k ?v { ?a <urn:v> ?v . ?a <urn:p> ?k } ORDER BY DESC(?v) ?a } \
+             OPTIONAL { ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l } } LIMIT 3000 }";
+    let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
+    let spilled = run(&s, q, 4 << 20, Some(spill.clone()), 4096).unwrap();
+    assert!(
+        counter(&spilled.plan, "spilledBytes").is_some_and(|b| b > 0),
+        "{}",
+        spilled.plan
+    );
+    assert_eq!(spilled.rows, memory.rows, "{}", spilled.plan);
+    assert!(
+        memory.rows[0].contains("\"36000\""),
+        "{:?} {}",
+        memory.rows,
+        memory.plan
+    );
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
