@@ -138,6 +138,11 @@ A completed phase does not imply every later extension or compatibility goal is 
 | [C27](C27-valid-time-profiles.md) | Validity intervals, uncertain temporal bounds, observation availability, temporal query helpers and an event-time control | implemented in part; Phase 1 A4 remains open |
 | [C28](C28-chatgpt-model-access.md) | Personal ChatGPT-plan model connections, local sign-in, protected credentials, Responses streaming and explicitly delegated background access | specified |
 | [C29](C29-bounded-view-preparation/README.md) | Request-scoped memory, cancellation and deadlines for historical replay, permission preparation and bounded caller adoption | Implemented in part. Bounded history and supported controlled masks with the built-in disclosure guard are available. Pattern support, nested-provider accounting and guarded adoption remain. |
+| [C30](C30-resource-catalog/README.md) | A server-level catalog of versioned sources, vocabularies and datasets with a content-addressed source store, recipes and harvesters, load manifests, pinned imports, mirrors, IRI minting and licence records | planned |
+| [C31](C31-checks-and-protected-merges/README.md) | Gate suites of SHACL, ShEx, lint, reasoning and quality checks defined in RDF, required checks on protected branches, breaking-change analysis, change-request workflows and comments | planned |
+| [C32](C32-linked-data-publishing/README.md) | Content negotiation for hosted namespaces, term and ontology pages with generated documentation, catalog-wide term search and an OLS API subset | planned |
+| [C33](C33-agent-platform-controls/README.md) | MCP tool profiles, shape templates, an approval queue for agent updates, data-change resources, composite tools, branch handoff, framework adapters, in-process memory APIs and A2A skills | planned |
+| [C34](C34-audit-and-erasure/README.md) | A tamper-evident audit stream of data access and agent activity, personal-data erasure across history and backups, field-level encryption with crypto-shredding, PII detection, comparable digests and verifiable credentials | planned |
 | [F01](F01-cypher.md) | A read-only openCypher subset compiled to the SPARQL algebra over a property-graph view of RDF, with relationship identity and properties through RDF 1.2 reifiers, `/{ds}/cypher` and `sparkles cypher` | specified |
 | [F03](F03-full-text-search/README.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query`, with Lucene's query syntax, highlighting and stemming per language | implemented in part (Phases 1 and 2, most of Phase 3) |
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions, `spk:vectorSearch`, HNSW vector indexes per predicate, and hybrid ranking with full-text search | implemented in part (Phases 1, 1b and 2, most of Phase 3) |
@@ -158,6 +163,12 @@ A completed phase does not imply every later extension or compatibility goal is 
 | [F20](F20-local-first-engine.md) | The engine compiled to WebAssembly over a storage layer without mapped files, replicas of a dataset or some of its graphs in the browser's Origin Private File System, offline commits on a local branch synced through RDF Patch with `H prev` and F09 merges with conflict reports, the UI's local mode, and a variant for Node.js, Deno and edge runtimes | specified |
 | [F21](F21-ontology-api.md) | An OWL 2 ontology API over the triples of a dataset: entities, class and property expressions, axioms and annotations read and written through the OWL 2 mapping to RDF graphs, OWL 2 EL, QL and RL profile checks, Rust, Python, Node.js and JVM (through Jena's `jena-ontapi`) surfaces, and its relation to materialized and query-time reasoning | specified |
 | [F22](F22-analysis-lifecycle.md) | Reproducible analysis runs, read dependencies, alternative evidence supports, freshness, guarded publication and maintained assessments | specified |
+| [F23](F23-reasoner-core/README.md) | Specialized closure operators, complete OWL 2 RL rules, cost-based rule planning, a columnar derived tier, compact provenance, a native n-ary Datalog core, rule frontends and one incremental-maintenance core shared with views | planned |
+| [F24](F24-owl-classification/README.md) | An OWL 2 EL classifier and a bridge to external DL reasoners over the F21 axiom model, with inferred-axiom export, justifications for any entailed axiom and repair suggestions | planned |
+| [F25](F25-git-sync-and-remotes/README.md) | A canonical git serialization, export of branches to git, import and sync from git refs, and remotes with fetch, push and pull between Sparkles servers | planned |
+| [F26](F26-temporal-paths/README.md) | Time-respecting paths and temporal projections over valid time, custody-chain checks and algorithm results across time slices with change-point detection | planned |
+| [F27](F27-impact-and-identity-primitives/README.md) | Generic entity-resolution primitives, tier and concentration metrics, decaying weighted reachability, recommendation explanations and survivorship rules | planned |
+| [F28](F28-ml-and-probabilistic-integration/README.md) | Integration with ML pipelines, model registries and probabilistic engines through Croissant, Parquet, MLflow, Hugging Face Hub, ONNX, KServe, Triton, Feast, OpenLineage, PSL and ProbLog | planned |
 | [G01](G01-geosparql/README.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2, part of Phase 3) |
 | [G02](G02-shex/README.md) | ShEx validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx, with schemas in ShExR graphs of the dataset | implemented in part (Phases 1–2 and most of Phase 3, including the supported ShEx 2.2 subset) |
 | [G03](G03-shaclc.md) | The SHACL Compact Syntax (`text/shaclc`) read and written wherever shapes go in or come out, and the SHACL 1.2 list constraints | implemented in part (Phase 1 and two of the later items) |
@@ -184,6 +195,11 @@ A completed phase does not imply every later extension or compatibility goal is 
 | [X11](X11-index-compression-and-predicate-patterns.md) | QLever-style predicate patterns per subject with `spk:hasPredicate` and pattern counts in the planner, FSST-compressed vocabulary suffixes, IRIs with numeric suffixes encoded in the id, frame-of-reference and zstd index blocks with dictionaries, and versioned per-generation features | implemented in part (Phase 1 and optional Phase 2a) |
 | [X12](X12-release-engineering.md) | One release workflow and version for the server, crates and bindings, server binaries and multi-arch images with checksums and provenance attestations, Windows, Intel macOS, musl JVM, PyPy and free-threaded wheels, on-disk format versions with a compatibility window, older-format fixtures and `sparkles migrate`, an API compatibility policy with checks, and install smoke tests | partially implemented (Phase 3) |
 | [X13](X13-per-crate-nix-builds.md) | An investigation of per-crate Nix builds with crate2nix, measured against Crane under matched settings and checked for packaging, feature and platform parity before a migration decision | investigation planned |
+| [X14](X14-unified-executor/README.md) | One morsel-driven pull executor in which eager execution is a consumption policy, with one memory-accounting model, one kernel per join and grouping algorithm, and one execution-policy function for every entry point | planned |
+| [X15](X15-join-algorithms-and-estimation/README.md) | Correlation-aware cardinality estimation, worst-case-optimal joins, scalable join enumeration, adaptive re-optimization, OPTIONAL reordering, a reachability index and factorized intermediate results | planned |
+| [X16](X16-storage-consolidation/README.md) | A first-release format cutoff, budgeted readers through one Control trait, a shared commit publish tail, one load plan, partitioned vocabularies with per-range generations, and the remaining replica, clone and format-policy work | planned |
+| [X17](X17-tiered-segments/README.md) | Immutable generations uploaded to S3-compatible storage after compaction, fetched as whole segments into a local disk cache and memory-mapped from there, with lazy dataset open and idle unload | planned |
+| [X18](X18-fragment-composition/README.md) | Each source version indexed once into an immutable fragment generation, and datasets composed by a k-way merge of fragment vocabularies and sorted permutations | planned |
 | [U01](U01-time-slider.md) | A time slider over query results, the Explore graph, an entity's properties and memory, and the schema tab, built on the existing `at` field and history views: commits, snapshots and branches on one track, compare mode with added and removed rows, nodes and edges marked, play with animation, a bucketed commit timeline, a term filter on diffs and result diffs on the server, then a time-lapse from each commit's changes, a commit's diff drawn as a graph and the overview through time | implemented (Phases 1–4) |
 | [U02](U02-shape-driven-forms/README.md) | Editing forms generated from a dataset's SHACL shapes and DASH editor hints, with a form model built on the server, checks in the browser and against the shapes on the server, C15 previews, saves with field-level conflict checks to `main` or an edit branch, and review through the merge page | implemented in part. Bounded affected-target checks are available. Nested forms, list and choice editors and remaining producer admission stay under item 21. |
 | [U03](U03-query-by-example.md) | Queries built from nodes and edges selected in Explore's graph, with constants turned into variables, classes, parameters or filters, a match count, saving as a stored query with typed parameters, Bloom-style search phrases on stored queries matched without a model, and Cypher output once F01 exists | specified |
@@ -195,6 +211,38 @@ A completed phase does not imply every later extension or compatibility goal is 
 | [U09](U09-path-finder.md) | Shortest, all shortest and k shortest paths between two entities, drawn and animated in Explore and on the query page's graphs, weighted by reifier properties, with excluded predicates and a hub degree limit added to F07's path search | implemented |
 | [U10](U10-canvas-lenses.md) | Size, colour, badge and edge-style lenses on the graph views, inferred edges drawn dashed, PageRank, centrality and community lenses from view-only F14 runs cached on the server, and the derivation tree of an inferred edge from a search over the materialized closure | implemented (Phases 1, 2 and 3) |
 | [U11](U11-linked-views.md) | Arcs between located entities on the map, facet histograms computed on the server whose brushes filter the canvas and add filters to the query, and an embedding map of a vector index whose lasso becomes a `VALUES` block, all sharing one selection | implemented in part (Phases 1, 2 and 3 with recorded omissions) |
+| [U12](U12-ontology-workbench/README.md) | An ontology editor in the web UI with class, property and individual trees, entity frames, a SKOS thesaurus editor, a DL Query tab and an editable schema diagram | planned |
+
+### Interop and query surfaces
+
+Roadmap item 465 groups the remaining interoperability and query-surface work. It has no
+spec of its own, because each part extends the spec that owns its surface. Each spec lists
+its parts in the Roadmap follow-ups of its Outcome.
+
+| Surface | Spec |
+|---|---|
+| GraphQL aggregates, edge annotations, mutations, response assembly and keyset cursors | [C03](C03-graphql/OUTCOME.md#interop-and-query-surfaces-workstream) |
+| Interactive multi-request transactions and blank-node-aware graph sync | [C15](C15-write-previews.md#interop-and-query-surfaces-workstream) |
+| A SQL surface over shape-derived tables | [C24](C24-json-query-languages.md#interop-and-query-surfaces-workstream) |
+| GQL, SQL/PGQ and the Bolt protocol | [F01](F01-cypher.md#interop-and-query-surfaces-workstream) |
+| Arrow and Parquet results, DuckDB, CSV in virtual graphs, ontology rewriting and reconciliation | [F19](F19-mappings-and-virtual-graphs/OUTCOME.md#interop-and-query-surfaces-workstream) |
+| Geometry validity and GIS file import | [G01](G01-geosparql/OUTCOME.md#interop-and-query-surfaces-workstream) |
+| The remaining ShEx conformance cases | [G02](G02-shex/OUTCOME.md#interop-and-query-surfaces-workstream) |
+| SHACL 1.2 Core and its Working Group suite | [G03](G03-shaclc.md#interop-and-query-surfaces-workstream) |
+| Archive inputs, HDT and `--check` severities | [G05](G05-command-line-tools.md#interop-and-query-surfaces-workstream) |
+| Fuseki status codes and Linked Data Fragments endpoints | [G08](G08-fuseki-configuration.md#interop-and-query-surfaces-workstream) |
+| `SERVICE` over another local dataset | [G10](G10-service-enhancer.md#interop-and-query-surfaces-workstream) |
+| RDF/XML formatting | [X02](X02-formatter/OUTCOME.md#interop-and-query-surfaces-workstream) |
+| The SHACL query prefix contract | [X04](X04-linter.md#interop-and-query-surfaces-workstream) |
+
+Two surfaces stay out of scope.
+
+**LDP containers and the Solid Protocol.** Sparkles does not serve LDP containers, the
+Solid Protocol, WebID or WAC and ACP documents. The Graph Store protocol and the access
+model of C09 and C12 cover the same data without a second resource model.
+
+**Gremlin server and traversal API.** Sparkles does not serve Gremlin traversals. openCypher
+through item 20, and GQL after it, are the property-graph query languages it adopts.
 
 ### How the graph-interaction features are grouped
 

@@ -1,0 +1,181 @@
+# X14: Unified executor
+
+> **Status:** planned.
+>
+> **Roadmap:** [item 453](../../ROADMAP.md) holds this work. Each candidate phase below gets
+> its own numbered roadmap item when it is ready to start, and the items already numbered
+> are named in their phase.
+
+One morsel-driven pull executor in which eager execution is a consumption policy, with one memory-accounting model, one kernel per join and grouping algorithm, and one execution-policy function for every entry point.
+
+## Problem and goal
+
+Sparkles runs queries through two complete executors. The eager columnar executor
+evaluates whole inputs with parallelism inside operators, and the pull-cursor executor of
+[X05](../X05-streaming-query-execution.md) serves demand batch by batch with operator
+state charged to the query budget. An admission layer of about 840 lines decides which
+one runs, with a fallback state and an eager memory retry. Most of the `cursor_*` twins
+exist because the two executors account memory differently, so every kernel change is
+made and tested twice and the copies have already diverged on OPTIONAL counting. The
+HTTP server, CLI, MCP server, GraphQL adapter and each binding also encode their own
+execution policy.
+
+The goal is one engine. Every operator serves demand over column batches, `collect()`
+asks for unbounded demand with whole-input morsels and Rayon across them, and exchange
+operators, partitioned hash builds and parallel merge joins supply pipeline parallelism.
+Eager execution survives only as the way a consumer asks for its answer.
+
+## Scope
+
+The work runs in stages, and each stage removes a reason for later duplication
+before the duplication itself goes. A stage lands only when the gates below pass.
+
+1. Cheap deletions with no change in behaviour, items 474 to 478.
+2. The first-release format cutoff, item 479, which [X16](../X16-storage-consolidation/README.md)
+   designs. It shrinks the reader code that the storage stages must unify.
+3. Policy and plumbing consolidation, items 480 to 483 and the short-term half of item
+   484, so that every later engine change lands in one place per surface.
+4. One accounting model, followed by the link to the reasoner and view budgets. This
+   stage is the keystone of the merge, and it is measured on an Intel host.
+5. Shared kernels under both executors, each landing with the eager-against-cursor
+   differential tests as its oracle.
+6. The morsel-parallel cursor and the executor merge. ASK and unordered LIMIT go through
+   pull demand, the remaining fallback kinds get native leaf cursors, `collect()` becomes
+   the only eager API, and the admission layer, the eager memory retry and the server's
+   mode routing go. The in-place quick runner stays as a scheduling choice.
+
+Phases that touch a single area, such as the CLI's remote mode and the Python
+transaction worker, are scheduled when other work changes that area.
+
+The merge keeps the fast paths that are genuinely different algorithms. These are
+index-order top-k with its runtime fallback, the bounded top-k heap, the numeric top-k
+prefilter and the first-key screen, range pushdown and filter-on-runs, the count plans,
+keyed joins and keyed OPTIONAL, merge OPTIONAL, ripple joins for ASK, index joins with
+galloping and star fusion, batched joins, decorrelated EXISTS key sets, point and
+predicate patterns, the seek-or-sweep frontier with its dense-block switch, spatial
+pushdown and joins, vector top-k, the text subject pushdown, Grace hash-join spill, the
+external sort and spilled DISTINCT and grouping, the in-place quick runner, self-service
+SERVICE and per-distinct-value expression evaluation. `crate::spill` remains the one
+spill format.
+
+## Candidate phases
+
+### Stage 1: cheap deletions
+
+**Dead compaction arm and one generation switch.** Make `rebuild_locked` take a plain BulkCommit and delete the unreachable branches, split `build_generation` from a shared `switch_generation`, and replace the thread-per-call `sync_commit` with the LazySync worker. All three callers pass Some(bulk), and one CURRENT-switch bug needed two edits. Roadmap item 474 holds this phase.
+
+**One join-order planner.** Keep `joinorder.rs` only, lift its 128-join-variable fallback with the existing Bits set or route it to its own greedy, and delete `Planner::dp`, `apply_dp_filters`, `Planner::greedy` and the `pruned_join_order` toggle. `Planner::dp` and `Planner::greedy` survive in `plan.rs` as a narrow fallback and toggle-off path. Item 84 should land on the unified planner. Roadmap item 475 holds this phase.
+
+**Delete the off paths of replacement-style optimization toggles.** Remove the superseded implementations behind about 15 replacement toggles and the toggles themselves, keep the algorithm toggles for diagnosis, and move generic reference evaluation into a test-only spec-literal evaluator. Optimizations has 44 boolean fields, and every kernel change must keep each off path correct. Roadmap item 476 holds this phase.
+
+**Shared format registry and small helpers.** Add one syntax registry for format names, extensions and media types, one INFERRED_GRAPH constant, one `parse_duration` and one durable atomic-write helper, and fix the Turtle string escaping that differs between `mapping/rdf.rs` and `mapping/draft.rs`. About ten format tables, nine INFERRED_GRAPH constants and ten atomic-write helpers exist. The unescaped draft writer could produce invalid Turtle. Roadmap item 477 holds this phase.
+
+**Implementation-selecting switches made test-only.** Make the EnvSwitch statics, implementation-only StoreOptions booleans and measurement switches test-only or remove them after X07 closes. No measured difference has been recorded for I/O hints on bulk loads. It depends on item 4. Roadmap item 478 holds this phase.
+
+### Stage 3: policy and plumbing
+
+The short-term half of the shared commit publish tail belongs to this stage as item 484, and [X16](../X16-storage-consolidation/SPEC.md#candidate-phases) holds its design.
+
+**One execution-policy function for every entry point.** Move the execution choice into one core function keyed by consumer properties (exact total, plan, inside transaction, format), so HTTP, CLI, MCP, GraphQL and the bindings state what they consume. HTTP, CLI, FFI, Node, Python, MCP and GraphQL each encode their own policy. It depends on items 7 and 240. Roadmap item 480 holds this phase.
+
+**Typed reasoning mode and one inference view.** Add ReasoningMode { Off, Materialized, Demand(profile), Auto } and one InferenceView on Dataset that produces QueryOptions, the incremental inference input and the explanation source. Inferred-data selection is decided in about eight places with repeated string matching. It is the natural home of item 19's auto. Roadmap item 481 holds this phase.
+
+**Library QueryRequest builder and server CallerContext.** Replace about 16 copies of the per-caller QueryOptions recipe and the binding copies with a library QueryRequest builder with Budgets and `with_reasoning`, plus a server `CallerContext::for_caller`. The GraphRAG builder builds options from the dataset defaults plus restrict and carries only the cancel flag, so server timeouts and limits plausibly do not apply to it. That would be a correctness gap. Roadmap item 482 holds this phase.
+
+**Shared RRF fusion and text hits in the library.** Add a library `fuse_rrf(lists, k, weights)` and `TextIndexes::hits()`, used by `spk:hybridSearch`, MCP search and the memory layer. `text:query` SPARQL is generated three times and reciprocal rank fusion is implemented five times in the MCP memory layer. Roadmap item 483 holds this phase.
+
+### Stage 4: one accounting model
+
+**One memory-accounting model for all query state.** Charge every retained structure, keep the eager fast account's speed with chunked reservations, make the value cache query-scoped and charged, and pick one regex engine per measured case. `Ctx::is_cursor()` is tested at 47 non-test sites and about 1,300 lines of `cursor_*` twins exist only because the regimes differ. Uncharged eager state is a budget hole. It is the keystone of the executor merge. It depends on items 7, 40 and 88.
+
+**Hierarchical budget across reasoner, views and queries.** Link the reasoner Budget, the incr per-view memory and the query pool into one hierarchical budget. A reasoning run, a view and a query can each stay within their limits and overshoot together. It depends on item 192.
+
+### Stage 5: shared kernels
+
+**One join-kernel library over column batches.** Keep merge, hash, keyed, index and ripple joins as distinct algorithms with one implementation each, where an eager join is one probe of the whole input and spill partitioning wraps the same kernel. About 1,000 eager and 4,000 cursor lines implement the same join families, and the copies have diverged on OPTIONAL counting. It depends on items 7 and 93.
+
+**One grouping operator with an accumulator trait.** Use one hash and sorted-streaming grouping operator with spill over an accumulator trait (init, `add_batch`, merge, finish) shared by FOLD, registered aggregates and incremental views with a retraction method. Grouping exists four times (`exec.rs`, `cursor/group.rs`, `incr/ops/group.rs` and the count plans). It also delivers item 418's retraction semantics. It depends on items 7, 93 and 418.
+
+**One frontier-expansion kernel for paths and path search.** Share one expand(frontier, direction, lanes, graph filter, exclusions, dedup) kernel with the seek-or-sweep and dense-block policies across property paths, ARQ path ranges and path search. The sweep ratio is defined in both the SPARQL executor and path search, and only the executor applies the X07 cold-read rule. The fixed-point operator of item 417 would add a third copy. It depends on items 8, 51 and 417.
+
+**One query-scoped expression memo.** Replace exprcache, cursor BIND reuse and the EXISTS memo with one charged memo keyed by expression and input value with one admission policy fed by observed repetition. Three memos each have their own admission and charging. It depends on item 293.
+
+**One columnar writer per format over batch sources.** Write each result format once over a batch source, with an eager QueryResult as a one-batch source, vectorized term decoding, per-column writes into prebuilt buffers, and the Thrift writer moved into core. Two serializer stacks exist, Thrift forces eager execution, cursor writers write a few bytes at a time (item 240), and large answers such as SP2Bench q4 at 1.96 GB need a raised limit. It depends on items 91, 240 and 243.
+
+### Stage 6: the executor merge
+
+**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 93, 240, 243 and 293.
+
+**Eager LIMIT and ASK through pull demand.** Route every ASK and unordered LIMIT through the cursor's pull demand, move UNION branch ordering for ASK into the planner's cost model, and delete `run_limited`'s geometric prefix replay and the unionpush first-work estimator. Eager LIMIT replays growing prefixes and unionpush keeps a duplicate cost model. `ask_streaming` exists, so this can land before the executor merge. It depends on item 7.
+
+**Plans independent of execution mode.** Fix the plan before consumption is known and turn demand-dependent choices into runtime operator decisions, keeping the OrderedTopK and vector order fallbacks. The planner reads ctx.is_cursor() and `cursor.rs` rewrites plans, which makes EXPLAIN mode-dependent.
+
+**Demand seeding inside the planner and one algebra visitor.** Make demand a planner-integrated operator that takes its seeds from the real plan, share one GraphPattern visitor and fold, and have explain call `prepare_query`. Demand has about 350 lines of its own join ordering and runs earlier patterns twice when seeding, and GraphPattern visitors are copied in six places. It depends on item 190.
+
+### Phases scheduled with their area
+
+**CLI remote mode on sparkles-client.** Move the CLI's remote commands onto `sparkles_client::blocking` and serve local mode through the in-process router. A 1,000-line reqwest client predates sparkles-client and was never replaced. It depends on item 47.
+
+**Python transactions on TxnWorker.** Port the Python bindings' private transaction worker to `sparkles::embed::TxnWorker`. The module header states that Python keeps its own worker until it next changes. It depends on item 33.
+
+**Serializable library wire structs.** Give NamedSnapshot, HistoryStatus and branch information Serialize wire structs shared with the generated client types. Hand-built JSON in four places already disagrees on keys (created against createdMs). It depends on item 60.
+
+**Settings in one system.** Move the library's per-kind settings files, prefixes and compaction settings into the C19 layered registry, and give the remaining dataset configuration declarative layers there: the guard, text index, compaction, reasoning, quota, grants, protections and stored queries. Two settings systems plus two more paths exist, and C19 was built for more kinds.
+
+### Execution additions
+
+**Partitioned aggregation with a per-group overflow path.** Grace-partition grouping so that a single group can exceed the budget, as part of making spill the default. Spill is opt-in, a single group can outgrow the budget, and a spilled ordered join was 8.9 times slower. It depends on items 7 and 93.
+
+**SIMD kernels and a vectorized expression evaluator.** Add explicit SIMD kernels for filters, hashing, joins and decoding, and evaluate expressions over column batches. Execution relies on autovectorization of u64 blocks only. Item 7 covers batching and spill, not kernels. It depends on item 7.
+
+**Savepoints and statement-level atomicity in write transactions.** Roll back only a failed SPARQL update inside a longer write transaction instead of aborting the transaction. Embedded agents and Jena-style code retry one failed statement, and all three bindings document the abort.
+
+**Parallel partial aggregation for registered aggregates.** Add an optional associative merge to registered accumulators so grouped queries can aggregate in parallel. P03 leaves a future merge capability that item 25 does not list. It depends on item 25.
+
+## Dependencies
+
+* The gates of items 469 to 473 exist before any stage that rewrites an executor path.
+* Items 7 and 93 land before the executor merge, because they settle the spill default and
+  the remaining eager fallbacks that the merge must absorb.
+* Items 240, 243 and 293 settle the cursor writers, row accounting and BIND reuse that
+  stage 6 relies on.
+* The join-algorithm work of [X15](../X15-join-algorithms-and-estimation/README.md),
+  [item 454](../../ROADMAP.md), follows the merge so that new algorithms land in one executor.
+
+## Acceptance gates
+
+* No query is 5% or more slower on forge at 12 threads, and no query that runs under
+  0.3 ms is slower on an Intel host. This is the decision gate of the executor merge, and
+  every stage that changes an executor path meets it.
+* The eager-against-cursor differential tests pass before either copy of a kernel is
+  deleted, and the forge-pinned matrix of item 469 shows no regression for the 33
+  synthetic queries at 1.05M and 10.5M triples with 12 threads and with one.
+* The W3C suites pass with `execution=streaming` as well as with the default, which item
+  470 makes part of the gate.
+* The guards are `scripts/bench.sh` and `mise run bench:nsc` for queries, with forge runs
+  of BSBM Explore and BI, SP²Bench `q4`, `q6` and `q12b`, WatDiv, LUBM and DBpedia at 50M,
+  the memory benchmarks in `docs/benchmarks/memory`, `query_cursor.rs`,
+  `plan_fidelity_tests.rs` and the W3C suites. Bindings use `bench:bindings`.
+* Stage 4 is measured on an Intel host, since its effects on short queries are small.
+* Query budgets, cancellation on disconnect and the results of every query stay as they
+  are. A measured slowdown that a gate accepts gets its own roadmap item.
+
+## Non-goals
+
+* Removing a fast path listed under Scope because the merged executor could express it.
+* Changes to SPARQL semantics or result formats.
+* New query features. The executor merge changes how queries run, not what they answer.
+
+## Design constraints
+
+Streaming, non-materialized execution is the default, and eager whole-input work
+remains only where a measurement shows it is faster. Higher memory use is acceptable when
+it buys speed, and each stage states such a tradeoff in its Outcome.
+
+## Provenance
+
+This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: DuckDB external aggregation (Kuiper et al. 2024), DuckDB, Velox, DuckDB buffer manager, Leis et al. SIGMOD 2014 (HyPer morsels), Umbra, DuckDB aggregation, QLever result export and Sideways information passing. No code from another project is copied.
+
+## Outcome
+
+Nothing is built. [Item 453](../../ROADMAP.md) tracks the work.
