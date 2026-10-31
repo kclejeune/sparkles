@@ -1555,8 +1555,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Lint SPARQL, Turtle or TriG
-         * @description Lints a SPARQL query or update, or a Turtle or TriG document, with the rules of `sparkles lint`. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.
+         * Lint SPARQL or RDF
+         * @description Lints a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACLC document, with the rules of `sparkles lint`. The SPARQL in `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals is linted too. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.
          */
         post: operations["lint"];
         delete?: never;
