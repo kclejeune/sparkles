@@ -2375,6 +2375,9 @@ pub struct AppendVocab {
     key_bytes: usize,
 }
 
+/// The longest key a controlled delta-vocabulary lookup hashes in one probe.
+pub(crate) const PREPARED_PROBE_BYTES: usize = 1 << 20;
+
 fn compare_prepared_bytes(
     left: &[u8],
     right: &[u8],
@@ -2411,15 +2414,22 @@ impl AppendVocab {
         }
         self.map.get(key).copied()
     }
-    /// Controlled lookup avoids hashing an arbitrarily long live or cold key.
-    /// This opt-in scan trades lookup latency for cooperative polling without
-    /// allocating another persistent index or changing the ordinary hash path.
+    /// Controlled lookup of a key among the first `limit` entries. A key of up to
+    /// [`PREPARED_PROBE_BYTES`] is one probe of the index, whose hashing and comparison
+    /// take no more than a fraction of a millisecond. A longer key is compared with
+    /// each entry in polled pieces instead, since hashing it could not be interrupted.
     pub(crate) fn find_prepared(
         &self,
         key: &[u8],
         limit: u64,
         mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
     ) -> crate::error::Result<Option<u64>> {
+        checkpoint("searching delta vocabulary")?;
+        if key.len() <= PREPARED_PROBE_BYTES {
+            let found = self.find(key).filter(|&id| id < limit);
+            checkpoint("completed delta vocabulary search")?;
+            return Ok(found);
+        }
         for (id, candidate) in self
             .keys
             .iter()
@@ -3694,6 +3704,49 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn controlled_delta_lookup_probes_the_index_instead_of_scanning() {
+        let mut vocab = AppendVocab::default();
+        for i in 0..10_000 {
+            vocab.insert(format!("<urn:entry:{i}").as_bytes());
+        }
+        let mut checks = 0;
+        let mut count = |_: &'static str| {
+            checks += 1;
+            Ok(())
+        };
+        let found = vocab
+            .find_prepared(b"<urn:entry:9999", 10_000, &mut count)
+            .unwrap();
+        assert_eq!(found, Some(9999));
+        assert!(checks <= 2, "the lookup visited {checks} entries");
+        // the snapshot's limit hides later entries, and absent keys stay absent
+        assert_eq!(
+            vocab
+                .find_prepared(b"<urn:entry:9999", 9999, |_| Ok(()))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            vocab
+                .find_prepared(b"<urn:absent", 10_000, |_| Ok(()))
+                .unwrap(),
+            None
+        );
+        // a key too long to hash in one probe is still found, with polling
+        let long = [b"<".as_slice(), &vec![b'x'; PREPARED_PROBE_BYTES + 1]].concat();
+        vocab.insert(&long);
+        let mut polls = 0;
+        let found = vocab
+            .find_prepared(&long, 10_001, |_| {
+                polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(found, Some(10_000));
+        assert!(polls > 10_000);
     }
 
     #[test]
