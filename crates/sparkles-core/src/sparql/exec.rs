@@ -5663,6 +5663,14 @@ pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<E
         return Ok(report);
     }
     let sorted = t.sorted.clone();
+    if let Some((keep, rest)) = super::rangemask::mask(ctx, t, exprs, &mut report)? {
+        t.filter_rows(&keep);
+        t.sorted = sorted;
+        if !rest.is_empty() {
+            report.extend(apply_filter(ctx, t, &rest)?);
+        }
+        return Ok(report);
+    }
     match super::exprcache::filter(ctx, t, exprs, &mut report)? {
         Some((keep, rest)) => {
             t.filter_rows(&keep);

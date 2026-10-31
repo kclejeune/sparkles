@@ -4373,8 +4373,8 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
     Some((rows.min(n.est), ids.len()))
 }
 
-/// Comparison of the range variable with a numeric constant: `?v op c`.
-#[derive(Clone, Copy, PartialEq)]
+/// Comparison of the range variable with a constant: `?v op c`.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum RangeOp {
     Lt,
     Le,
@@ -4385,6 +4385,17 @@ pub(super) enum RangeOp {
 
 /// `?v op c` for a filter conjunct comparing variable `v` with a numeric literal.
 pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, super::value::Value)> {
+    compare_atom(e, v, ctx, super::value::Value::is_numeric)
+}
+
+/// `?v op c` for a filter conjunct comparing variable `v` with a constant `c` that
+/// `accept` admits. Arithmetic in the constant is folded only over numbers.
+pub(super) fn compare_atom(
+    e: &Expr,
+    v: VarId,
+    ctx: &Ctx,
+    accept: fn(&super::value::Value) -> bool,
+) -> Option<(RangeOp, super::value::Value)> {
     use super::expr::CmpOp;
     let (a, b, op) = match e {
         Expr::Cmp(a, b, op) => (a, b, Some(*op)),
@@ -4421,7 +4432,7 @@ pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, supe
         (c, Expr::Var(x)) if *x == v => (constant(c)?, true),
         _ => return None,
     };
-    if !c.is_numeric() {
+    if !accept(&c) {
         return None;
     }
     let op = match (op, flip) {
@@ -4435,7 +4446,7 @@ pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, supe
 }
 
 /// Id ranges whose values satisfy every atom (see [`RangeSpec`]).
-fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx) -> Vec<IdRange> {
+pub(super) fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx) -> Vec<IdRange> {
     use super::value::compare;
     use std::cmp::Ordering;
     // the atoms split into lower bounds (false, then true along a segment in value order)

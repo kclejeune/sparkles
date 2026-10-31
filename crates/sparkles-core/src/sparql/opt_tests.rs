@@ -2158,3 +2158,90 @@ fn optional_with_an_unbound_left_key_reads_the_pattern() {
     assert!(!has_desc(&r.plan, "probed for the left side's keys"));
     same_rows(&s, text);
 }
+
+// ---------------------------------------------------- comparisons decided on ids ------
+
+/// Dates and dateTimes with and without timezones, non-canonical and invalid forms, and
+/// other kinds of value, in an object column that the filters do not scan in order.
+#[test]
+fn calendar_comparisons_match_the_generic_filter() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    let tzs = ["", "Z", "+14:00", "-14:00", "+05:30", "-09:00"];
+    for i in 0..6_000i64 {
+        let day = i % 120;
+        let (m, d) = (1 + day / 28, 1 + day % 28);
+        let tz = tzs[(i % 6) as usize];
+        let v = match i % 9 {
+            0..=3 => format!("\"2008-{m:02}-{d:02}{tz}\"^^xsd:date"),
+            4 | 5 => format!(
+                "\"2008-{m:02}-{d:02}T{:02}:30:00{tz}\"^^xsd:dateTime",
+                i % 24
+            ),
+            6 => format!("\"2008-{m}-{d}\"^^xsd:date"),
+            7 => format!("{}", 20080000 + day),
+            _ => format!("\"2008-{m:02}-{d:02}\""),
+        };
+        ttl.push_str(&format!("ex:s{i} ex:d {v} .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    for (lo, hi) in [
+        ("\"2008-02-29\"^^xsd:date", "\"2008-03-28\"^^xsd:date"),
+        (
+            "\"2008-02-01Z\"^^xsd:date",
+            "\"2008-02-03+14:00\"^^xsd:date",
+        ),
+        (
+            "\"2008-01-10T00:00:00\"^^xsd:dateTime",
+            "\"2008-04-01T12:00:00-05:00\"^^xsd:dateTime",
+        ),
+    ] {
+        for text in [
+            format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e >= {lo} && ?e < {hi}) }}"
+            ),
+            format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e > {lo}) FILTER(?e <= {hi}) }}"
+            ),
+            format!("SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER({lo} < ?e) }}"),
+            format!("SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e = {lo}) }}"),
+            format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e < {hi} && STRLEN(STR(?e)) > 10) }}"
+            ),
+        ] {
+            same_answer(&s, &text, "desc:decided on ids");
+        }
+        // a date and a number: no rule decides both
+        same_rows(
+            &s,
+            &format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e >= {lo} && ?e < 20080050) }}"
+            ),
+        );
+    }
+    let r = run(
+        &s,
+        "SELECT ?s WHERE { ?s ex:d ?d FILTER(?d >= \"2008-02-29\"^^xsd:date) }",
+        Optimizations::ALL,
+    );
+    assert!(!r.rows().is_empty());
+}
+
+#[test]
+fn numeric_comparisons_on_an_unordered_column_match_the_generic_filter() {
+    let s = range_store();
+    for t in THRESHOLDS {
+        same_rows(
+            &s,
+            &format!(
+                "SELECT ?s ?v WHERE {{ ?s ex:v ?v FILTER(STRSTARTS(STR(?s), \"http\") && ?v >= {t} && ?v != 3) }} ORDER BY ?s"
+            ),
+        );
+        same_rows(
+            &s,
+            &format!("SELECT ?s ?w WHERE {{ ?s ex:v ?v BIND(?v * 2 AS ?w) FILTER(?w < {t}) }}"),
+        );
+    }
+}
