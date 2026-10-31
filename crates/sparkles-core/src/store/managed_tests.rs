@@ -636,3 +636,39 @@ fn backups_and_clones_keep_the_protection() {
     let r = Store::open(&from_memory, StoreOptions::default()).unwrap();
     assert_eq!(managed_code(upd(&r, &insert)), "profile-managed-graph");
 }
+
+/// An enablement whose files may have changed but whose registry was not installed,
+/// as when a directory sync fails after a rename, fences the running dataset instead
+/// of leaving it writable under the previous registry.
+#[test]
+fn an_uncertain_enablement_fences_the_running_dataset() {
+    let insert_t = format!("INSERT DATA {{ GRAPH <{T}> {{ <urn:x> <urn:p> 1 }} }}");
+    for failpoint in ["managed-settings-written", "managed-published"] {
+        for already in [false, true] {
+            let (_dir, s) = setup();
+            let dev = s.branch("dev").unwrap();
+            if already {
+                enable(&s, &[M]);
+            }
+            s.set_failpoint(failpoint, Some(Arc::new(|_| panic!("uncertain"))));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                s.enable_managed(OwnerKind::Evidence, entry(&[M, T], SETTINGS), SETTINGS)
+            }));
+            assert!(r.is_err());
+            s.set_failpoint(failpoint, None);
+            let what = format!("{failpoint}, registry before: {already}");
+            for store in [&s, &*dev] {
+                assert_eq!(
+                    managed_code(upd(store, &insert_t)),
+                    "managed-unavailable",
+                    "{what}"
+                );
+            }
+            // reads continue, and enabling again settles the registry
+            assert_eq!(count(&s, M), 1);
+            enable(&s, &[M, T]);
+            assert_eq!(managed_code(upd(&s, &insert_t)), "profile-managed-graph");
+            upd(&s, "INSERT DATA { GRAPH <urn:free> { <urn:x> <urn:p> 1 } }").unwrap();
+        }
+    }
+}

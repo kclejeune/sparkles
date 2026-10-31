@@ -241,10 +241,19 @@ impl Store {
                 ));
             }
         }
+        // From the first registry file written until the new registry is installed,
+        // the files may no longer match the installed registry. An error or unwind
+        // in between leaves the family refusing every write, so that no ordinary
+        // write lands under a registry that may already be the old one on disk.
+        let mut fence = UncertainRegistry {
+            family: &self.family,
+            armed: false,
+        };
         if let Some(root) = &self.root {
             // 1. the reader that enforces the registry, before anything relies on it
             crate::commit::require_reader(root, crate::managed::READER)?;
             self.failpoint("managed-reader-raised");
+            fence.armed = true;
             // 2. the owner's settings, which the registry's digest names
             if let Some(owner) = written {
                 let bytes = &next.settings[&owner];
@@ -262,6 +271,7 @@ impl Store {
         self.family
             .managed
             .store(Some(Arc::new(ManagedState::Installed(next))));
+        fence.armed = false;
         drop(w);
         self.managed_barrier()?;
         Ok(graphs)
@@ -399,6 +409,28 @@ impl Store {
                 .map(|(_, b)| b.clone()))
         });
         self.family.managed.store(Some(Arc::new(state)));
+    }
+}
+
+/// Fences a family whose registry files changed without the new registry being
+/// installed: every write is refused until the owner is enabled again.
+struct UncertainRegistry<'a> {
+    family: &'a super::family::Family,
+    armed: bool,
+}
+
+impl Drop for UncertainRegistry<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::error!(target: "sparkles::store", "a managed-graph registry change did not complete; writes are refused until it is made again");
+            self.family
+                .managed
+                .store(Some(Arc::new(ManagedState::Unavailable {
+                    reason: "a change of the registry did not complete; enable the owner again"
+                        .into(),
+                    repairable: true,
+                })));
+        }
     }
 }
 
