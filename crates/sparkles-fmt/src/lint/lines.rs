@@ -1,6 +1,7 @@
 //! Linting N-Triples and N-Quads: the term rules of spec X04 §3.4 over each term of the
 //! document. Prefix and variable rules do not apply, because the line formats have
-//! neither. The reference parser is oxttl, which also decides what a syntax error is.
+//! neither. The reference parser is oxttl, which also decides what a syntax error is. The
+//! parse streams, and both it and the rules look at the deadline every few steps.
 //!
 //! The Turtle lexer reads the line formats' terms, so the rules run on a flat tree that
 //! holds every significant token under one root, with a [`NodeKind::Literal`] around each
@@ -8,24 +9,68 @@
 //! Turtle, so they run unchanged.
 
 use super::{Cst, LintError, Out, terms};
-use crate::Language;
 use crate::lex::{LexMode, Token, TokenKind, lex};
 use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeData, NodeId, TokenId, Tree};
+use crate::{FormatError, Language};
 
 pub(super) fn run(text: &str, lang: Language, out: &mut Out<'_>) -> Result<(), LintError> {
-    let reference = crate::check::graph::parse(text, lang);
-    out.deadline()?;
-    if let Err(e) = reference {
+    if let Err(e) = reference(text, lang, out)? {
         if !terms::iri_space_in_error(text, &e, out) {
             out.syntax(&e);
         }
         return Ok(());
     }
-    let tree = flat_tree(text, lex(text, LexMode::Turtle));
+    terms_pass(text, out)
+}
+
+/// oxttl's parse of the document, streamed without keeping the quads, with the deadline
+/// checked as it goes. The outer error is the deadline, the inner one a syntax error.
+fn reference(
+    text: &str,
+    lang: Language,
+    out: &mut Out<'_>,
+) -> Result<Result<(), FormatError>, LintError> {
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let body = &text[bom..];
+    let positioned = |e: oxttl::TurtleSyntaxError| {
+        let offset = bom + e.location().start.offset as usize;
+        let (line, column) = crate::line_col(text, offset);
+        FormatError::Syntax {
+            message: e.message().to_string(),
+            line,
+            column,
+            offset,
+        }
+    };
+    if lang == Language::NQuads {
+        for q in oxttl::NQuadsParser::new().for_slice(body) {
+            out.tick()?;
+            if let Err(e) = q {
+                return Ok(Err(positioned(e)));
+            }
+        }
+    } else {
+        for t in oxttl::NTriplesParser::new().for_slice(body) {
+            out.tick()?;
+            if let Err(e) = t {
+                return Ok(Err(positioned(e)));
+            }
+        }
+    }
+    out.deadline()?;
+    Ok(Ok(()))
+}
+
+/// The term rules over a document that parses, with the deadline checked between the
+/// stages and every few steps of the rules.
+pub(super) fn terms_pass(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
+    let tokens = lex(text, LexMode::Turtle);
+    out.deadline()?;
+    let tree = flat_tree(text, tokens);
+    out.deadline()?;
     let c = Cst::new(&tree);
-    terms::run(&c, out);
-    Ok(())
+    terms::run(&c, out)
 }
 
 /// A tree of one root over all the significant tokens of `src`, with a `Literal` node

@@ -34,7 +34,7 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
         Ok(tree) => {
             let c = Cst::new(&tree);
             prefixes::run(&c, out);
-            terms::run(&c, out);
+            terms::run(&c, out)?;
         }
         Err(e) => out.syntax(&e),
     }

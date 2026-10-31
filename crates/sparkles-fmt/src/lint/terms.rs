@@ -2,7 +2,7 @@
 //! `deprecated-language-tag`, `suspicious-datatype`, `redundant-datatype`, `iri-space`
 //! and `deprecated-syntax`.
 
-use super::{Cst, Edit, Fix, Out, unescape_iri};
+use super::{Cst, Edit, Fix, LintError, Out, unescape_iri};
 use crate::FormatError;
 use crate::lex::TokenKind;
 use crate::sparql::keywords::Kw;
@@ -13,8 +13,9 @@ pub(super) const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 pub(super) const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub(super) const OWL_DATA_RANGE: &str = "http://www.w3.org/2002/07/owl#DataRange";
 
-pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
+pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) -> Result<(), LintError> {
     for n in c.nodes() {
+        out.tick()?;
         match c.kind(n) {
             NodeKind::Literal | NodeKind::ShaclcLiteral => literal(c, n, out),
             NodeKind::Call => call(c, n, out),
@@ -22,6 +23,7 @@ pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
         }
     }
     for i in 0..c.tree.tokens.len() {
+        out.tick()?;
         let t = TokenId(i as u32);
         match c.token_kind(t) {
             TokenKind::IriRef => iri_ref(c, t, out),
@@ -32,6 +34,7 @@ pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
             _ => {}
         }
     }
+    Ok(())
 }
 
 fn data_range_message() -> String {

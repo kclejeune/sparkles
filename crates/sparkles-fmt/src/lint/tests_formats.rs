@@ -218,3 +218,44 @@ fn fixing_a_document_with_an_undefined_prefix() {
     let f = fix(doc, Language::Shaclc, &LintOptions::default()).unwrap();
     assert_eq!(f.text, "shape nope:S { <http://x/p> in=[\"a\"@en] . }\n");
 }
+
+#[test]
+fn many_findings_are_placed_in_linear_time() {
+    // one finding per line: the positions come from one pass over the text, not a scan
+    // of everything before each finding
+    let n = 20_000;
+    let text = "<urn:s> <urn:p> \"a\"@EN .\n".repeat(n);
+    let t0 = std::time::Instant::now();
+    let d = diags(&text, Language::NTriples);
+    let took = t0.elapsed();
+    assert_eq!(d.len(), n);
+    let last = d.last().unwrap();
+    assert_eq!((last.line, last.column), (n as u32, 20));
+    assert_eq!((last.end_line, last.end_column), (n as u32, 23));
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    // a BOM is not a column, and a character counts once whatever its UTF-8 length
+    let text = "\u{feff}<urn:é> <urn:p> \"a\"@EN .\n";
+    let d = diags(text, Language::NTriples);
+    assert_eq!((d[0].line, d[0].column), (1, 20));
+    assert_eq!((d[0].line, d[0].column), crate::line_col(text, d[0].start));
+    assert_eq!(
+        (d[0].end_line, d[0].end_column),
+        crate::line_col(text, d[0].end)
+    );
+}
+
+#[test]
+fn the_term_pass_checks_the_deadline() {
+    let text = "<urn:s> <urn:p> \"a\"@EN .\n".repeat(5_000);
+    let opts = LintOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..LintOptions::default()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut out = Out::new(&text, &opts, Vec::new());
+    assert_eq!(lines::terms_pass(&text, &mut out), Err(LintError::Timeout));
+    // and the whole lint gives up, for both line formats
+    for lang in [Language::NTriples, Language::NQuads] {
+        assert_eq!(lint(&text, lang, &opts), Err(LintError::Timeout));
+    }
+}

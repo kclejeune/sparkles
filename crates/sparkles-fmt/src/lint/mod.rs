@@ -381,12 +381,7 @@ pub fn lint(text: &str, lang: Language, opts: &LintOptions) -> Result<Linted, Li
     if text.len() > u32::MAX as usize {
         return Err(LintError::TooLarge);
     }
-    let mut out = Out {
-        text,
-        opts,
-        found: Vec::new(),
-        prebound: Vec::new(),
-    };
+    let mut out = Out::new(text, opts, Vec::new());
     match lang {
         Language::Sparql => lint_sparql(text, &mut out)?,
         Language::Turtle | Language::TriG => lint_turtle(text, lang == Language::TriG, &mut out)?,
@@ -397,6 +392,7 @@ pub fn lint(text: &str, lang: Language, opts: &LintOptions) -> Result<Linted, Li
     let mut diagnostics = out.found;
     diagnostics.sort_by(|a, b| (a.start, a.end, a.rule).cmp(&(b.start, b.end, b.rule)));
     diagnostics.dedup_by(|a, b| a.rule == b.rule && a.start == b.start && a.end == b.end);
+    locate(text, &mut diagnostics);
     Ok(Linted {
         language: lang,
         diagnostics,
@@ -410,12 +406,7 @@ fn lint_embedded(
     opts: &LintOptions,
     prebound: Vec<String>,
 ) -> Result<Vec<Diagnostic>, LintError> {
-    let mut out = Out {
-        text,
-        opts,
-        found: Vec::new(),
-        prebound,
-    };
+    let mut out = Out::new(text, opts, prebound);
     lint_sparql(text, &mut out)?;
     let mut found = out.found;
     found.sort_by(|a, b| (a.start, a.end, a.rule).cmp(&(b.start, b.end, b.rule)));
@@ -589,9 +580,64 @@ pub(crate) struct Out<'a> {
     pub found: Vec<Diagnostic>,
     /// the names of variables bound before the query runs (SHACL's `this`, `value`, …)
     pub prebound: Vec<String>,
+    /// steps left before [`Out::tick`] looks at the clock
+    ticks: u32,
 }
 
-impl Out<'_> {
+/// How many steps of a rule pass go between two looks at the clock.
+const TICKS: u32 = 256;
+
+/// Set the lines and columns of `diagnostics` from their byte offsets in one pass over
+/// `text`, so many findings cost no more than one scan. The positions are those of
+/// [`crate::line_col`]: a leading BOM is not counted, and columns are Unicode scalar
+/// values.
+fn locate(text: &str, diagnostics: &mut [Diagnostic]) {
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let clamp = |o: usize| {
+        let mut o = o.max(bom).min(text.len());
+        while !text.is_char_boundary(o) {
+            o -= 1;
+        }
+        o
+    };
+    // every start and end, in order of offset
+    let mut at: Vec<(usize, usize)> = Vec::with_capacity(diagnostics.len() * 2);
+    for (i, d) in diagnostics.iter().enumerate() {
+        at.push((clamp(d.start), 2 * i));
+        at.push((clamp(d.end), 2 * i + 1));
+    }
+    at.sort_unstable();
+    let (mut pos, mut line, mut column) = (bom, 1u32, 1u32);
+    for (offset, slot) in at {
+        for ch in text[pos..offset].chars() {
+            if ch == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        pos = offset;
+        let d = &mut diagnostics[slot / 2];
+        if slot % 2 == 0 {
+            (d.line, d.column) = (line, column);
+        } else {
+            (d.end_line, d.end_column) = (line, column);
+        }
+    }
+}
+
+impl<'a> Out<'a> {
+    pub fn new(text: &'a str, opts: &'a LintOptions, prebound: Vec<String>) -> Out<'a> {
+        Out {
+            text,
+            opts,
+            found: Vec::new(),
+            prebound,
+            ticks: TICKS,
+        }
+    }
+
     /// Whether rule `id` runs.
     pub fn on(&self, id: &str) -> bool {
         self.opts.level(id).is_some()
@@ -615,24 +661,33 @@ impl Out<'_> {
         };
         let end = end.max(start).min(self.text.len());
         let start = start.min(end);
-        let (line, column) = crate::line_col(self.text, start);
-        let (end_line, end_column) = crate::line_col(self.text, end);
+        // the lines and columns are set once at the end, by `locate`
         self.found.push(Diagnostic {
             rule: id,
             severity,
             message,
             start,
             end,
-            line,
-            column,
-            end_line,
-            end_column,
+            line: 0,
+            column: 0,
+            end_line: 0,
+            end_column: 0,
             fix,
         });
     }
 
     pub fn deadline(&self) -> Result<(), LintError> {
         crate::check::deadline(self.opts.deadline).map_err(|_| LintError::Timeout)
+    }
+
+    /// One step of a pass over the document: every [`TICKS`] steps, the deadline.
+    pub fn tick(&mut self) -> Result<(), LintError> {
+        self.ticks -= 1;
+        if self.ticks == 0 {
+            self.ticks = TICKS;
+            self.deadline()?;
+        }
+        Ok(())
     }
 
     /// The reference parser's error as a `syntax` diagnostic on the character there.
@@ -686,7 +741,7 @@ fn lint_sparql(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
             let c = Cst::new(&tree);
             prefixes::run(&c, out);
             sparql::run(&c, out)?;
-            terms::run(&c, out);
+            terms::run(&c, out)?;
         }
         (Ok(_), Err(e)) => out.syntax(&e),
         // the tree's parser takes what fails only on variable scoping: the scope rules
@@ -729,7 +784,7 @@ fn lint_turtle(text: &str, trig: bool, out: &mut Out<'_>) -> Result<(), LintErro
         Ok(tree) => {
             let c = Cst::new(&tree);
             prefixes::run(&c, out);
-            terms::run(&c, out);
+            terms::run(&c, out)?;
             embedded::turtle(&c, text, trig, &undeclared, out)?;
         }
         Err(e) => out.syntax(&e),
