@@ -234,8 +234,8 @@ pub fn run<T: Send + 'static>(
 
 /// The signal controls of a request that reads a Python stream, such as a load or a
 /// replacement from a file object, which [`run_stream`] runs. The stream's reader calls
-/// [`StreamSignals::checkpoint`] before a read when a signal is pending, and at the end of
-/// the stream.
+/// [`StreamSignals::checkpoint`] before a read when a signal is pending, and the store
+/// calls it through [`StreamSignals::publish_hook`] right before it publishes the write.
 pub struct StreamSignals {
     /// set when a signal handler raised: the request stops at its next check
     pub cancel: Arc<AtomicBool>,
@@ -291,6 +291,20 @@ impl StreamSignals {
         }
         self.cancelled()
     }
+
+    /// The store's last check before it publishes the write: a checkpoint, so that a
+    /// handler that raised for a signal during the request, whatever decoder read the
+    /// stream last, abandons the write.
+    pub fn publish_hook(self: &Arc<Self>) -> sparkles::guard::PublishHook {
+        let signals = self.clone();
+        sparkles::guard::PublishHook::new(move || {
+            if signals.checkpoint() {
+                Err(sparkles::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+    }
 }
 
 /// Run a request that reads a Python stream, without the GIL, on a thread of its own. On
@@ -302,9 +316,14 @@ impl StreamSignals {
 /// propagates. When none raises, the request goes on.
 ///
 /// The request does not run on the helper thread of [`run`], because a signal handler
-/// that runs a query while the stream waits for it sends that query to the helper.
-/// Since the reader makes a checkpoint at the end of the stream, an exception that a
-/// handler raises for a signal during a read stops the request before it can commit.
+/// that runs a query while the stream waits for it sends that query to the helper. The
+/// request's store write takes [`StreamSignals::publish_hook`], so an exception that a
+/// handler raises for a signal during the request abandons the write before it is
+/// published. A signal that arrives during publication itself can raise after it.
+///
+/// The watcher starts before the request's thread, since its first use imports the
+/// `signal` module, which would otherwise run while the thread could already raise a
+/// signal and lose the handler's exception.
 pub fn run_stream<T: Send + 'static>(
     py: Python<'_>,
     signals: &Arc<StreamSignals>,
@@ -313,6 +332,8 @@ pub fn run_stream<T: Send + 'static>(
     if !on_main_thread(py)? {
         return py.detach(f).py(py);
     }
+    #[cfg(unix)]
+    let watch = wakeup::Watch::start(py, signals.signalled.clone());
     let (tx, rx) = channel::<Event>();
     *signals.checks.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
     let slot = Arc::new(Mutex::new(None));
@@ -328,11 +349,13 @@ pub fn run_stream<T: Send + 'static>(
         Ok(w) => w,
         Err(e) => {
             *signals.checks.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            #[cfg(unix)]
+            if let Some(w) = watch {
+                w.stop(py);
+            }
             return Err(e.into());
         }
     };
-    #[cfg(unix)]
-    let watch = wakeup::Watch::start(py, signals.signalled.clone());
     let mut raised: Option<PyErr> = None;
     let mut rx = rx;
     loop {

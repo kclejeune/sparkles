@@ -515,16 +515,18 @@ impl PyDataset {
         };
         // A file object is read once as the loader parses it. A signal handler that
         // raises, such as Ctrl-C's, fails the next read and stops the loader at its next
-        // check, and the end of the stream waits for the handlers.
+        // check, and the store waits for the handlers right before it publishes.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let signals = interrupt::StreamSignals::new(cancel.clone());
         src.data = sparkles::io::SourceData::reader(
             crate::io::PyFileReader::new(obj).with_signals(signals.clone()),
         );
         let flag = cancel.clone();
+        let hook = signals.publish_hook();
         interrupt::run_stream(py, &signals, move || {
             let o = sparkles::guard::WriteOptions {
                 cancel: Some(flag),
+                before_publish: Some(hook),
                 ..Default::default()
             };
             let r = ds
@@ -1415,12 +1417,14 @@ impl PyDataset {
             );
             signals
         });
+        let hook = signals.as_ref().map(interrupt::StreamSignals::publish_hook);
         let r = interrupt::controlled_stream(py, flag, signals, progress, timeout, move |ctl| {
             ctl.progress.report(0.0, "replacing data");
             ctl.check()?;
             let o = sparkles::guard::WriteOptions {
                 cancel: Some(ctl.cancel.flag()),
                 deadline: ctl.deadline,
+                before_publish: hook,
                 ..Default::default()
             };
             let r = ds

@@ -430,3 +430,124 @@ def test_a_large_buffered_stream_spills_beyond_its_allowance(tmp_path: Path) -> 
     assert out.returncode == 0, out.stderr
     assert out.stdout.split() == ["5000"]
     assert list(spool.iterdir()) == []
+
+
+def test_an_interrupt_in_the_first_read_of_a_cold_process_commits_nothing() -> None:
+    """The first file-object load of a process starts the signal watcher, which imports
+    `signal`. An interrupt from the reader's first read must not be lost to that."""
+    out = run_child(
+        """
+        import _thread, io
+        import sparkles
+
+        class First(io.RawIOBase):
+            def __init__(self, data):
+                self.data, self.pos, self.reads = data, 0, 0
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                self.reads += 1
+                if self.reads == 1:
+                    _thread.interrupt_main()
+                chunk = self.data[self.pos : self.pos + n]
+                self.pos += len(chunk)
+                return chunk
+
+        ds = sparkles.Dataset()
+        ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+        try:
+            ds.load(First(b'<http://e/x> <http://e/y> <http://e/z> .\\n'), "nt")
+            print("committed", len(ds))
+        except KeyboardInterrupt:
+            print("interrupted", len(ds))
+        """,
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["interrupted", "1"]
+
+
+def test_an_interrupt_in_the_last_compressed_read_commits_nothing(tmp_path: Path) -> None:
+    """A decoder that ends without a further raw read gives the reader no end-of-stream
+    read, so the store's check before publication must run the handlers."""
+    data = nt(2000)
+    ds = Dataset()
+    ds.load(data, "nt")
+    packed = {}
+    for codec, ext in [("gzip", "gz"), ("brotli", "br"), ("zstd", "zst")]:
+        path = tmp_path / f"d.nt.{ext}"
+        ds.dump(path, format="nt")
+        packed[codec] = path.read_bytes()
+    out = run_child(
+        """
+        import _thread, io, sys
+        import sparkles
+        packed = %s
+
+        class InterruptAtLastData(io.RawIOBase):
+            def __init__(self, data):
+                self.data, self.pos = data, 0
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                chunk = self.data[self.pos : self.pos + min(n, 1000)]
+                self.pos += len(chunk)
+                if chunk and self.pos == len(self.data):
+                    _thread.interrupt_main()
+                return chunk
+
+        for codec, raw in packed.items():
+            for mode in ["auto", "streaming", "buffered"]:
+                for kind in ["load", "replace"]:
+                    ds = sparkles.Dataset()
+                    ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+                    try:
+                        src = InterruptAtLastData(raw)
+                        # Brotli has no magic bytes to sniff
+                        if kind == "load":
+                            ds.load(src, "nt", parse_mode=mode, compression=codec)
+                        else:
+                            ds.replace(src, format="nt", compression=codec)
+                        print(codec, mode, kind, "committed", len(ds))
+                    except KeyboardInterrupt:
+                        print(codec, mode, kind, "interrupted", len(ds))
+        """
+        % repr(packed),
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    lines = out.stdout.splitlines()
+    assert len(lines) == 18, lines
+    assert all(line.endswith("interrupted 1") for line in lines), lines
+
+
+def test_a_slow_stream_stops_at_the_replacement_timeout() -> None:
+    out = run_child(
+        """
+        import io, time
+        import sparkles
+
+        class Trickle(io.RawIOBase):
+            def __init__(self):
+                self.reads = 0
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                self.reads += 1
+                time.sleep(0.025)
+                return b" "
+
+        ds = sparkles.Dataset()
+        ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+        src = Trickle()
+        t = time.perf_counter()
+        try:
+            ds.replace(src, format="nt", timeout=0.03)
+            print("replaced")
+        except sparkles.QueryTimeoutError:
+            print("timeout", time.perf_counter() - t < 0.5, src.reads < 10, len(ds))
+        """,
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["timeout", "True", "True", "1"]

@@ -489,8 +489,9 @@ impl PyFileReader {
     }
 
     /// The reader of a request that [`crate::interrupt::run_stream`] runs: its reads fail
-    /// once the request is cancelled, and it makes a checkpoint when a signal is pending
-    /// and at the end of the stream.
+    /// once the request is cancelled, and it makes a checkpoint when a signal is pending.
+    /// The request's publication hook makes the last one (see
+    /// [`crate::interrupt::StreamSignals::publish_hook`]).
     pub fn with_signals(mut self, signals: Arc<crate::interrupt::StreamSignals>) -> Self {
         self.signals = Some(signals);
         self
@@ -520,7 +521,7 @@ impl Read for PyFileReader {
             }
         }
         let want = buf.len().min(PY_READ_BYTES);
-        let n = Python::attach(|py| -> PyResult<usize> {
+        Python::attach(|py| -> PyResult<usize> {
             let data = self.obj.bind(py).call_method1("read", (want,))?;
             let mut put = |bytes: &[u8]| {
                 let n = bytes.len().min(buf.len());
@@ -543,16 +544,7 @@ impl Read for PyFileReader {
             }
             Ok(put(&data.extract::<Vec<u8>>()?))
         })
-        .map_err(std::io::Error::other)?;
-        // The end of the stream waits for the handlers of a signal that arrived during
-        // the reads, so that a raising handler stops the request before it commits.
-        if n == 0
-            && let Some(signals) = &self.signals
-            && signals.checkpoint()
-        {
-            return Err(Self::cancelled());
-        }
-        Ok(n)
+        .map_err(std::io::Error::other)
     }
 }
 
