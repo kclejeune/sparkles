@@ -129,7 +129,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | GET    | `/$/openapi.json`, `/$/openapi.yaml` | The OpenAPI 3.1 description of the API. See [OpenAPI description](#openapi-description). |
 | POST   | `/$/format`   | Formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads or JSON-LD document. See [Formatting](#formatting). |
-| POST   | `/$/lint`     | Lints a SPARQL query or update, or a Turtle or TriG document. See [Linting](#linting). |
+| POST   | `/$/lint`     | Lints a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACLC document. See [Linting](#linting). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
 ```ts
@@ -9114,17 +9114,22 @@ count the route in the `query` class.
 
 The design and its rationale are in [X04 Linter](specs/X04-linter.md).
 
-`POST /$/lint` lints a SPARQL query or update, or a Turtle or TriG document, with the
-rules of `sparkles lint` (see [USAGE.md](USAGE.md#linting)). It reads no dataset and no
+`POST /$/lint` lints a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads,
+JSON-LD or SHACLC document, with the rules of `sparkles lint` (see
+[USAGE.md](USAGE.md#linting)). In Turtle, TriG and JSON-LD it also lints the SPARQL in
+the `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals of a shapes graph, and
+a finding inside such a literal has its range in the document. It reads no dataset and no
 config file. The rule levels come with the request. A syntax error is one of the
 findings, so a document that does not parse still gets `200`. The UI's WebAssembly module
 answers the same request in the page, and the UI calls the endpoint only when the module
-is missing or fails.
+is missing or fails. The query editor and the shapes editor both lint through it.
+
+The MCP server offers the same linter as its `lint` tool (see [MCP server](#mcp-server)).
 
 ```ts
 type LintRequest = {
   text: string;
-  language?: "sparql" | "turtle" | "trig";   // default: detected
+  language?: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld" | "shaclc";  // default: detected
   rules?: Record<string, "error" | "warning" | "info" | "hint" | "off">;
   fix?: boolean;                              // apply the safe fixes
 };
@@ -9152,7 +9157,7 @@ A `fix` is present only for the rules whose fixes are safe. With `fix: true`, th
 text must parse to the same SPARQL algebra, or to an isomorphic graph or dataset, as the
 input, or the request fails with `422` and `code: "unsafe-fix"`. Other errors are `400`
 with `code: "bad-request"` for a bad body, rule or level, `415` with
-`code: "unsupported-language"` for a language the linter does not take, and `415` for a
+`code: "unsupported-language"` for RDF/XML, which the linter does not take, and `415` for a
 body that is not JSON. The endpoint follows `--format-endpoint`, `--format-max-mb` and
 `--format-timeout` as `POST /$/format` does, with `401`, `404`, `408` and `413` in the
 same cases, and it shares the formatter's slots. With authentication, it needs no dataset permission, and rate limits
@@ -10590,7 +10595,8 @@ open-world when SERVICE is allowed. The common arguments are:
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
-| `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
+| `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`\|`shaclc`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
+| `lint` | `text` (required, ≤ 1 MiB), `language` (as for `format`; detected when left out), `options` (rule levels with camelCase rule names, such as `{"unusedPrefix": "off", "singleUseVariable": "error"}`, each `error`, `warning`, `info`, `hint` or `off`), `fix` (false), `timeoutSeconds` (30). It takes no `dataset`. | `{language, diagnostics: [{rule, severity, message, line, column, endLine, endColumn, from, to, fix?}], total, counts: {error, warning, info, hint}, truncated?, fixed?, applied?}`: the findings of `sparkles lint` and `POST /$/lint`, in the same shape. A syntax error is a finding, not an error. With `fix` true the safe fixes are applied, `fixed` is the new text, `applied` the number of fixes, and the findings are those of the fixed text. A result over `--mcp-max-bytes` lists as many findings as fit and sets `truncated`, and a `fixed` text over it is `too-large`. RDF/XML is `unsupported-language`. Only in builds with the `fmt` feature. |
 | `graphql_query` | `query` (a GraphQL document, ≤ 65536 characters; leave it out for the API schema), `variables`, `operationName`, `maxBytes` (65536), `timeoutSeconds` (30) | One text block: the [GraphQL](#graphql) response as JSON with the dataset and commit added, `{dataset, commit, data?, errors?, extensions?}`, or the API schema (SDL) without `query`. Mutations are refused. Listed only while a dataset the caller may query through GraphQL has a schema installed. Only in builds with the `graphql` feature. |
 | `sparql_update` | `update` or `patch` (one of them, ≤ 1 Mi characters), `message` (the commit message), `ifHead` (a commit), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, patch?, message?, validation?, elapsedMs}`: the receipt of the write. A patch adds `patch: {rows, aborted, prevChecked, prefixesSet, prefixesRemoved}`. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |
 | `assert_facts` | `graph` or `source: {iri, title?}` (one is required), `entities` (≤ 200 of `{key, label, types, altLabels?, distinctFrom?}`), `facts` (≤ 500 of `{s, p, o, mode?, confidence?, quote?, span?, derivedFrom?}`), `retract` (≤ 500 reifier IRIs or `{s, p, o, graph}`), `replaceScope` (`graph`\|`writable`), `message`, `idempotencyKey` (≤ 128 characters), `agent: {name, model?}`, `iriBase`, `allowUnknownIris` (false), `dryRun`, `changes` (0–100, with `dryRun`), `ifHead`, `retractStale` (a rendition IRI), `timeoutSeconds` (30) | `{dataset, branch?, graph, committed, commit?, head, alreadyApplied?, activity, minted, inserted, deleted, superseded, retracted, conflicts, warnings, validation?, dryRun?, notice?, elapsedMs, prefixes}`: facts written with their provenance as one commit, described [below](#memory-writes). `span`, `derivedFrom` and `retractStale` are described in [Ingest profiles](#ingest-profiles). Listed like `sparql_update`. |

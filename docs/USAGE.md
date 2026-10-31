@@ -1643,9 +1643,12 @@ The UI formats in the page when it is built with the formatter's WebAssembly mod
 ## Linting
 
 `sparkles lint` finds mistakes and doubtful constructs in SPARQL queries and updates
-(`.rq`, `.ru`, `.sparql`) and in Turtle (`.ttl`) and TriG (`.trig`) documents. It walks
-directories and reads ignore files and config files as `sparkles fmt` does. The design is
-in [spec X04](specs/X04-linter.md).
+(`.rq`, `.ru`, `.sparql`) and in Turtle (`.ttl`), TriG (`.trig`), N-Triples (`.nt`),
+N-Quads (`.nq`), JSON-LD (`.jsonld`) and SHACL Compact Syntax (`.shaclc`, `.shc`)
+documents. It walks directories and reads ignore files and config files as `sparkles fmt`
+does. The design is in [spec X04](specs/X04-linter.md). RDF/XML is not linted. The
+line formats get the term rules only, and a file over `--max-bytes` is refused, because the
+linter reads a document whole.
 
 ```sh
 sparkles lint queries/ shapes/            # path:line:column: severity [rule] message
@@ -1679,6 +1682,30 @@ stdin, the fixed text goes to stdout and the remaining findings go to stderr.
 | `suspicious-datatype` | warning | An invalid lexical form, an unknown XML Schema datatype, a misspelled XML Schema namespace, or `rdf:langString` as a datatype. |
 | `redundant-datatype` | info | `"…"^^xsd:string`, which is the plain string. `--fix` drops the datatype. |
 | `deprecated-syntax` | warning | Jena's old `jena.hpl.hp.com` function namespaces, or `owl:DataRange`. |
+| `unused-context-term` | hint | A term of a JSON-LD `@context` that no key, value or other definition uses. `--fix` removes it. |
+| `unmapped-key` | warning | A JSON-LD key that no context in effect maps, which JSON-LD drops without a word. |
+
+The prefix rules apply to SPARQL, Turtle, TriG and SHACLC, and the variable and scope
+rules to SPARQL. The term rules (`iri-space`, the language tag and datatype rules, and
+`deprecated-syntax`) apply to every language. In JSON-LD they read value objects, terms
+with a datatype coercion, and the IRIs of `@id`, `@type` and `@context`. `unmapped-key`
+stays silent for a document without a context, beside a context given by URL, and under
+`@vocab`, because any of them may define the key. The values of a JSON literal and of a
+map container are data, and a term's own scoped context applies to its value. A JSON-LD
+fix is applied only after expanding the input and the fixed text and finding the same
+dataset, so a document that names a context by URL keeps its text.
+
+In a Turtle, TriG or JSON-LD document, the plain string objects of `sh:select`, `sh:ask`,
+`sh:construct` and `sh:update` are linted as SPARQL, with every rule above, and a finding
+is placed inside the literal, whatever escapes or line breaks come before it. The query
+sees the prefixes of `sh:prefixes` and `sh:declare`, with the `owl:imports` closure, and
+those of the document itself. SHACL binds `$this`, `$shapesGraph`, `$currentShape`,
+`$value` and `$PATH` before it runs a query, and the validators of a constraint component
+also see its parameters, so the variable rules count them as bound. A fix is offered only
+in a long string (`"""` or `'''`) without escapes, and only when the edited query means
+what it meant. The SHACL-SPARQL engine resolves only the `sh:declare` prefixes of a query,
+so a query that works only through the document's own prefixes lints clean here and
+fails when validation runs it. SHACLC has no syntax for these properties.
 
 The SPARQL rules look at variables in their scope. A subquery's variables are its own,
 and `MINUS` and `EXISTS` patterns bind nothing outside themselves. A variable whose name
@@ -1699,8 +1726,10 @@ single-use-variable = "off"
 fixes ([editors.md](editors.md)). The same file's `[prefixes]` and `[lsp]` tables give
 `sparkles lsp` the prefixes it completes and declares, and the formatter and the lint only
 check them ([editors.md](editors.md#prefixes)). The UI's query editor lints while you type, and its
-Format menu fixes the safe findings. `POST /$/lint` is the HTTP form
-([API.md](API.md#linting)).
+Format menu fixes the safe findings. The shapes editor on a dataset's page lints Turtle and
+SHACLC shapes the same way, and marks the findings in the queries of
+`sh:select` and the like. `POST /$/lint` is the HTTP form ([API.md](API.md#linting)), and
+the MCP server has a `lint` tool.
 
 ## Automatic compaction
 

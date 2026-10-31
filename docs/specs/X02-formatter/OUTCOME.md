@@ -169,8 +169,8 @@ shared document model.
   `language: "shaclc"` or the media type `text/shaclc`, the MCP `format` tool, `sparkles lsp` with the
   language id `shaclc`, `sparkles-fmt-wasm`, and the shapes editor, whose Format button
   picks the language from the syntax switch. The OpenAPI document and the TypeScript
-  client list the new language. The linter does not support SHACLC, which stays with
-  the linter part of item 48.
+  client list the new language. The linter checks SHACLC too, which
+  [X04](../X04-linter.md#linter-extensions-item-48-part-b) records.
 * **Checks.** `crates/sparkles-fmt/tests/shaclc.rs` runs the corpus under 32 option sets.
   Each output parses, gives a shapes graph isomorphic to the input's, keeps every
   comment and formats to itself. The corpus is Jena's `shaclc-valid` pairs and syntax

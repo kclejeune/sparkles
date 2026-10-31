@@ -254,15 +254,20 @@ the UI and editors.
 * SHACL Compact Syntax keeps directives as written, separates shapes with one blank line,
   and puts one property on each line. A property's constraints wrap at `line-width`.
   `prune-prefixes` and `align-values` apply, and the sort keys do not. The shapes editor
-  in the UI formats SHACLC as well. The linter does not check SHACLC.
-* `sparkles lint` checks SPARQL, Turtle and TriG with seventeen rules
-  ([X04](../specs/X04-linter.md), [USAGE.md](../USAGE.md#linting)). They cover undefined and
-  unused prefixes, unused, single-use and unbound variables, cartesian products,
-  `SELECT *` with grouping, ungrouped variables, FILTER scope and equality, IRIs with
-  spaces, language tags, suspicious and redundant datatypes, and deprecated names.
-  Severities are set in `.sparklesfmt.toml` or with `--rule`, and `--fix` applies safe
-  fixes after checking that the meaning is unchanged. The linter also runs as
-  `POST /$/lint` and in the query editor.
+  in the UI formats and lints SHACLC as well.
+* `sparkles lint` checks SPARQL, Turtle, TriG, N-Triples, N-Quads, JSON-LD and SHACL
+  Compact Syntax with nineteen rules ([X04](../specs/X04-linter.md),
+  [USAGE.md](../USAGE.md#linting)). They cover undefined and unused prefixes, unused,
+  single-use and unbound variables, cartesian products, `SELECT *` with grouping,
+  ungrouped variables, FILTER scope and equality, IRIs with spaces, language tags,
+  suspicious and redundant datatypes, and deprecated names. The term rules apply to every
+  language, and JSON-LD adds two rules for context terms that nothing uses and keys that no
+  context maps. In Turtle, TriG and JSON-LD shapes, the SPARQL of `sh:select`, `sh:ask`,
+  `sh:construct` and `sh:update` literals is linted with the prefixes of `sh:declare` and
+  the pre-bound variables of SHACL, and findings are placed inside the literal. Severities
+  are set in `.sparklesfmt.toml` or with `--rule`, and `--fix` applies safe fixes after
+  checking that the meaning is unchanged. The linter also runs as `POST /$/lint`, as the
+  MCP `lint` tool, in the query editor and in the shapes editor.
 * `sparkles lsp` is a language server for every language the formatter handles. It
   formats documents and ranges, reports syntax errors and lint findings, and offers safe
   fixes as quick fixes. [editors.md](../editors.md) has setups for Neovim, Helix, Emacs and
@@ -284,6 +289,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   argument. `afn:print` and `afn:execTime` print nothing, and `afn:collation` orders by
   code point instead of by locale. Roadmap item 69, a lower-priority extension outside the completion of Server and
   Fuseki integration.
+* The linter reads a document whole, so a file over `--max-bytes` is refused even in a line
+  format, and it does not lint SHACL query literals in N-Triples and N-Quads. Roadmap item
+  NEW-ITEM.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`

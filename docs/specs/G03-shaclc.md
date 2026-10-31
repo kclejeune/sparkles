@@ -661,6 +661,24 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
   expressions.
 
 
+### Linter extensions (item 48, part b)
+
+SHACLC is linted. `sparkles lint`, `sparkles lsp`, `POST /$/lint`, the MCP `lint` tool,
+the WebAssembly module and the shapes editor take `shaclc` as a language, and the record
+is in [X04](X04-linter.md#linter-extensions-item-48-part-b).
+
+* *Rules.* The reader of `sparkles-shaclc` is the reference parser. `undefined-prefix`
+  and `unused-prefix` read the `PREFIX` directives, the prefixed names and the `@ex:Shape`
+  references, and the four standard prefixes are declared from the start. An unused prefix
+  has a fix that removes its line. The term rules read the literals of a parameter, such as
+  `in=["a"@en-us]`, and the IRIs.
+* *Embedded queries.* SHACLC has no syntax for `sh:select`, `sh:ask`, `sh:construct`,
+  `sh:update` or `sh:prefixes`, so a SHACLC document carries no SPARQL literal to lint. A
+  shapes graph with SPARQL constraints is Turtle, as the Jena reader and writer have it,
+  and the Turtle linter reads those literals.
+* *The shapes editor.* It lints Turtle shapes with the Turtle rules and the queries inside
+  them, and SHACLC shapes with the SHACLC rules, through the same call as the query editor.
+
 ### Completion path
 
 Completed item 13 covers the adopted list and node-expression contracts. The draft

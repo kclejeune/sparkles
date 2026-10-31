@@ -98,8 +98,8 @@ Wave A holds the work that most improves the engine against objective measures.
 * The Stage A lanes of item 17 are items 413 to 417. They deliver the safety net,
   internal circuits, the provenance algebra, reasoner witnesses and the fixed-point
   operator.
-* Small lanes that finish a capability run in free capacity. These are item 48, items
-  277 and 77, and the CSVW and RML conformance gaps in items 235 and 232.
+* Small lanes that finish a capability run in free capacity. These are items 277 and
+  77, and the CSVW and RML conformance gaps in items 235 and 232.
 
 ### Wave B: memory and entities
 
@@ -266,7 +266,6 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | 43, 230, 232, 233, 234, 235, 236, 237, 238, 239, 404 | Finish the named source, UI/task, conformance, function and term-identity gaps before claiming Phase 1 complete. Phase 2 virtual graphs must match materialized SPARQL answers with pushdown, access, cancellation and source-failure behavior tested. |
 | [G01](specs/G01-geosparql/SPEC.md#outcome) | 24 | Complete per-row nearest-neighbour joins, QLever's spatial syntax, metric-property rewrites, polygon approximations, datum shifts and curved GML segments as item 24 lists them. Keep intentional default divergences explicit, since item 70's Jena-compatible mode is not adopted. |
 | [G02](specs/G02-shex/SPEC.md#outcome) | 54 | Complete combined guards, graph-plus-file schemas and CLI outbound controls with the adopted ShEx conformance and incremental/full equivalence tests. Unsupported reference syntax remains a stated language boundary rather than a claim of universal ShEx parity. |
-| [G03](specs/G03-shaclc.md#outcome) | 48 | The SHACLC formatter is done. The linter part remains and is tracked by the X04 row. The separately listed SHACL 1.2 draft constraints are outside the adopted node-expression phase. |
 | [P01](specs/P01-python-bindings.md#outcome) | 32, 33, 40, 58 | Complete release/platform and further async administration and bulk coverage, reusable plans and the remaining bounded per-call and footprint assessment. Validate package installation and the Python API suite on the claimed runtimes while preserving cancellation, term identity and snapshots. |
 | [P03](specs/P03-query-extensions.md#outcome) | 25 | Complete dynamic registered dispatch, foreign callbacks, batching and the adopted aggregate arities. Verify captured-view access, duplicate invocation, error, cancellation and transaction behavior, and measure callback costs. |
 | [P04](specs/P04-jvm-bindings/SPEC.md#outcome) | 25, 32, 33, 58, 76, 405 | Complete the named callback, plan, integration-harness, metrics and release gaps with the accepted Jena contract tests. Keep fallback BGP batching and optional module/allocator/transaction choices explicit, and substantiate performance claims with matched bridge measurements. |
@@ -290,8 +289,8 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 
 These decisions fix what completes four capabilities in the [capability matrix](FEATURES.md#capability-status).
 
-* Formatting, linting and command-line tools complete with item 48 alone. Item 55 is a
-  follow-up outside that capability.
+* Formatting, linting and command-line tools are complete. Item 55 is a follow-up
+  outside that capability.
 * Paths and graph algorithms complete with items 8, 275, 276 and 277. OpenCypher
   procedures belong to item 20 under additional query languages, and the C23 writer belongs
   to item 36 under batched updates and triggers. The weighted-betweenness extensions in
@@ -526,7 +525,7 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 45 | **Branches and cross-server cloning.** Remote branch relinking from the CLI and cross-server clone and archive transfer remain. Verify chosen-commit contents, blank identities, prefixes, configuration and lineage, with no destination published on a failed transfer. | [F09](specs/F09-branches-and-merges.md#roadmap-follow-ups-2026-10-12), [C06](specs/C06-clone-to-sandbox.md#completion-path) | M |
 | 46 | **Notifications.** An email channel, an administration UI, broader backup-failure coverage, and delivery that a slow channel cannot delay. | [C21](specs/C21-outbound-notifications.md#roadmap-follow-ups-2026-10-12) | M |
 | 47 | **Rust client.** Typed schema reports, statistics, stored queries, backup listings, snapshot and branch metadata and mutations, and bounded JSON diffs are available. Typed change feeds, clones, merges, search, reasoning, validation and settings remain, along with proactive rate-limit pacing and environment and saved-credential integration tests. | [P02](specs/P02-rust-client.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 48 | **Formatter and linter.** The SHACLC formatter is done across CLI, HTTP, MCP, language server, WebAssembly and the shapes editor. Linting remains and needs SHACLC, N-Triples, N-Quads, JSON-LD, embedded SHACL queries, the shapes editor and an MCP tool. | [G03](specs/G03-shaclc.md#completion-path), [X02](specs/X02-formatter/OUTCOME.md#roadmap-follow-ups-2026-10-12), [X04](specs/X04-linter.md#roadmap-follow-ups-2026-10-12) | M |
+| NEW-ITEM | **Linter reach.** Lint N-Triples and N-Quads documents larger than memory in bounded memory, as the formatter streams them, lint SHACL query literals in the line formats, and decide whether a query that resolves only through the document's own prefixes, which validation rejects, gets a finding of its own. | [X04](specs/X04-linter.md#linter-extensions-item-48-part-b) | S |
 | 49 | **Write previews.** Local dry-run flags, UI previews beyond the CSV import panel and merge page, `If-Match` on `/{ds}/update`, and handling of read-only servers and costly bulk previews. | [C15](specs/C15-write-previews.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 401 | **Views in in-memory clones.** A persistent clone carries the source's view definitions paused, but an in-memory clone carries none, as it carries no stored queries. Seed the clone's view runtime with the captured definitions, paused with the reason `cloned`, through every binding that adopts an in-memory clone. | [F05](specs/F05-snapshot-repositories/OUTCOME.md#recovery-of-managed-definitions), [C06](specs/C06-clone-to-sandbox.md#completion-path) | S |
 | 50 | **Restricted views.** Token scopes limited to graphs, validation and statistics for restricted views, and text scoring local to what a caller can see. | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12) | M |
@@ -611,6 +610,7 @@ linked spec Outcome records how they landed.
 - **16.** Index compression after predicate patterns. [X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)
 - **22.** RML, R2RML and YARRRML loading. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) Phase 1
 - **231.** JVM and Node.js stored mappings and direct mapping runs. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
+- **48.** Formatter and linter. [G03](specs/G03-shaclc.md#linter-extensions-item-48-part-b), [X02](specs/X02-formatter/OUTCOME.md#roadmap-follow-ups-2026-10-12), [X04](specs/X04-linter.md#linter-extensions-item-48-part-b)
 - **64.** Bind-before-open startup with opening, failed and degraded states. [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12)
 - **62.** Dataset and branch administration audit events. [C09](specs/C09-dataset-access-control.md#dataset-administration-audit)
 - **67.** MCP OAuth. [C11](specs/C11-mcp-server.md#oauth-for-the-mcp-endpoint-item-67-2026-10-24)
