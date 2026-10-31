@@ -13,8 +13,8 @@ The Forge benchmark answers `q4` in 30.626 s and `q6` in 978.4 ms with Sparkles 
 `6b7f32ce`. Both complete answers match independent reconstruction from the source data.
 The benchmark gives Sparkles a 4 GiB response allowance; the production default remains
 1 GiB. Sparkles is the only engine with a completed `q5a` measurement under the published
-600 s request budget. QLever is faster on the recorded `q11` comparison, whose Sparkles build predates the ordered read of plain strings described below. Fluree's native response encoding is
-qualified below.
+600 s request budget. A paired run of `d65eaf40` answers `q11` in 3.5 ms against QLever's
+43.6 ms. Fluree's native response encoding is qualified below.
 
 ## SP²Bench on Forge
 
@@ -50,7 +50,7 @@ full-suite settings. `mise run bench:sp2b 10m` runs the suite with the repaired 
 | q8 | **8.3 ± 1.0** | 35.2 ± 2.9 | error | 187.5 ± 5.4 | 1911.6 ± 52.6 |
 | q9 | **158.5 ± 33.5** | 4227.3 ± 15.1 | 284.0 ± 6.8 | 6436.7 ± 23.0 | 5202.0 ± 22.1 |
 | q10 | **3.8 ± 0.2** | 7.3 ± 0.5 | 7.1 ± 0.7 | 4.2 ± 0.2 | 7.6 ± 0.9 |
-| q11 | 103.1 ± 9.0 | 375.8 ± 21.4 | **43.5 ± 3.3** | 52.2 ± 1.6 | 31619.1 ± 97.9 |
+| q11 | **3.5 ± 0.2** | 375.8 ± 21.4 | 43.6 ± 4.6 | 52.2 ± 1.6 | 31619.1 ± 97.9 |
 | q12a | **3.8 ± 0.1** | 9.0 ± 1.1 | 248.7 ± 7.4 | 1694.3 ± 22.0 | 6794.7 ± 61.5 |
 | q12b | 4.0 ± 0.1 | 9.7 ± 1.3 | error | 186.7 ± 5.8 | **3.7 ± 0.1** |
 | q12c | **3.6 ± 0.1** | 6.7 ± 0.2 | 5.2 ± 1.5 | 3.8 ± 0.1 | 3.7 ± 0.1 |
@@ -74,7 +74,10 @@ Sparkles and Oxigraph `q12b` come from the
 `b26ce6a9`. Their 7.8% mean difference is inside the ten-percent tie band. The paired
 `q12a` cells and Jena's `q12b` come from the
 [paired record](../2026-10-25-competitive-query-pairs-forge.json), with Sparkles at
-`2ec8a266`. Other retained Sparkles cells use `6699f27d`. The
+`2ec8a266`. The Sparkles and QLever `q11` cells pool the two runs of the
+[`q11` recheck](runs/2026-10-31-q11-recheck-forge/README.md), with Sparkles at `d65eaf40`,
+ten warm-ups and thirty timed requests per run. Other retained Sparkles cells use
+`6699f27d`. The
 [full-suite record](../2026-10-23-sp2b-10m-forge.json) supplies the retained peer cells
 and their original failure statuses. Its original answer check kept all servers up,
 which killed QLever and Fluree during `q4`; fresh isolated checks replace that missing
@@ -102,12 +105,12 @@ Sparkles's 385,208 `q5a` rows match an independent data oracle. Other engines' `
 timeouts remain missing comparisons. Fluree and Oxigraph `q6`, and Jena and Oxigraph
 `q7`, also retain their bounded timeout statuses rather than partial answers.
 
-QLever's checked `q11` mean is 43.5 ms and Fluree's is 52.2 ms, against Sparkles's
-103.1 ms. The recorded Sparkles build decodes and ranks all 603,577 `rdfs:seeAlso` values,
-which are plain strings. The current planner reads them from the low end of the
-vocabulary instead and reads 120 rows for this query, so this row describes the recorded
-build until the Forge run is repeated. These complete answers and their ordering match retained references. Remaining errors, unsupported formats, wrong answers and bounded timeouts stay
-explicit rather than receiving inferred timings.
+Sparkles answers `q11` in 3.5 ms, against 43.6 ms for QLever in the same paired run and
+52.2 ms for Fluree's retained cell. The planner reads the 603,577 `rdfs:seeAlso` values,
+which are plain strings, from the low end of the vocabulary and stops after 120 rows,
+instead of decoding and ranking every value. Both engines return the ten rows and the
+ordering of the retained references. Remaining errors, unsupported formats, wrong answers
+and bounded timeouts stay explicit rather than receiving inferred timings.
 
 ## Separate Wally memory profile
 

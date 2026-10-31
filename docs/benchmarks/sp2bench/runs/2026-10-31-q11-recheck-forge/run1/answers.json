@@ -1,0 +1,20 @@
+{
+ "q11": {
+  "sparkles": {
+   "rows": 10,
+   "order": "f0c0253753657af0",
+   "boundary_rows": 0,
+   "exact": "fba9c0ebb1734be4",
+   "value": "fba9c0ebb1734be4",
+   "query_sha256": "87da887e5a431588dc20c8989bd6f6ce6581b28c05cc3e1cffe53f2873bd729b"
+  },
+  "qlever": {
+   "rows": 10,
+   "order": "f0c0253753657af0",
+   "boundary_rows": 0,
+   "exact": "fba9c0ebb1734be4",
+   "value": "fba9c0ebb1734be4",
+   "query_sha256": "87da887e5a431588dc20c8989bd6f6ce6581b28c05cc3e1cffe53f2873bd729b"
+  }
+ }
+}
