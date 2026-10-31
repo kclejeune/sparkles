@@ -604,7 +604,7 @@ fn controlled_provider_preparation_cost_diagnostic() {
     use std::time::Instant;
     let c = caller("reports", &[]);
     let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
-    for rows in [100, 2000] {
+    for (rows, compact) in [(100, true), (2000, true), (2000, false), (20000, false)] {
         let mut data = with_footprint(&fp);
         for row in 0..rows {
             data.push_str(&format!(
@@ -614,7 +614,9 @@ fn controlled_provider_preparation_cost_diagnostic() {
             ));
         }
         let s = store(&data);
-        s.compact().unwrap();
+        if compact {
+            s.compact().unwrap();
+        }
         let snapshot = s.snapshot();
         let access = reader(&[A, REPORTS]);
         for warm in [false, true] {
@@ -635,7 +637,7 @@ fn controlled_provider_preparation_cost_diagnostic() {
                 let controlled_ns = start.elapsed().as_nanos();
                 assert_eq!(actual, expected);
                 eprintln!(
-                    "provider cost rows={rows} warm={warm} round={round} legacy_ns={old_ns} controlled_ns={controlled_ns}"
+                    "provider cost rows={rows} compact={compact} warm={warm} round={round} legacy_ns={old_ns} controlled_ns={controlled_ns}"
                 );
             }
         }

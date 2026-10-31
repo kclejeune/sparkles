@@ -125,11 +125,12 @@ pub(super) fn exempt(
                 .map(|(_, index)| index.clone())
         };
         if let Some(index) = cached {
-            let mut cached = CachedIndex {
+            // The shared index belongs to the guard's cache, and this call only reads
+            // it. The exemptions it returns are copies that the request admits.
+            let cached = CachedIndex {
                 value: index,
                 _held: preparation.reserve(4096)?,
             };
-            retained_index(&cached.value, &mut cached._held, preparation)?;
             let mut output = Exemptions::new(preparation)?;
             for (name, state) in &cached.value.graphs {
                 if proven(name, state, view, preparation)? {
@@ -745,26 +746,6 @@ fn retained_footprint(
                         .saturating_add(value.capacity() as u64)
                         .saturating_add(256),
                 )?;
-            }
-        }
-    }
-    preparation.check()
-}
-
-fn retained_index(index: &Index, held: &mut Reservation, preparation: &Preparation) -> Result<()> {
-    held.grow_by(
-        (index.graphs.capacity() as u64)
-            .saturating_add(1)
-            .saturating_mul(256),
-    )?;
-    for (name, state) in &index.graphs {
-        preparation.check()?;
-        held.grow_by(name.capacity() as u64)?;
-        held.grow_by((state.footprints.capacity() as u64).saturating_mul(16))?;
-        for fp in &state.footprints {
-            preparation.check()?;
-            if let Some(fp) = fp {
-                retained_footprint(fp, held, preparation)?;
             }
         }
     }
