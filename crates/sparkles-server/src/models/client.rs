@@ -404,34 +404,47 @@ fn read_usage(kind: Kind, v: &Value, ttl: Option<CacheTtl>) -> (Usage, bool) {
     };
     if kind == Kind::Anthropic {
         let r = &v["usage"];
-        // a cache member that is present but not a count leaves the usage unknown, so
-        // that a settlement keeps its reservation
-        let split = &r["cache_creation"];
-        let members = [
-            &r["cache_creation_input_tokens"],
-            &r["cache_read_input_tokens"],
-            &split["ephemeral_5m_input_tokens"],
-            &split["ephemeral_1h_input_tokens"],
-        ];
-        if members.iter().any(|m| !m.is_null() && m.as_u64().is_none())
-            || !(split.is_null() || split.is_object())
-        {
-            complete = false;
-        }
-        let written = r["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-        let (five, hour) = (
-            split["ephemeral_5m_input_tokens"].as_u64(),
-            split["ephemeral_1h_input_tokens"].as_u64(),
-        );
-        (u.cache_write_5m, u.cache_write_1h) = match (five, hour) {
-            (None, None) if ttl == Some(CacheTtl::FiveMinutes) => (written, 0),
-            (None, None) => (0, written),
-            (a, b) if a.unwrap_or(0) + b.unwrap_or(0) == written => {
-                (a.unwrap_or(0), b.unwrap_or(0))
+        // a cache member that is present, even as null, but not a count, a split that is
+        // not an object, and a split whose sum overflows leave the usage unknown, so that
+        // a settlement keeps its reservation
+        let count = |o: &Value, k: &str| -> Result<Option<u64>, ()> {
+            match o.get(k) {
+                None => Ok(None),
+                Some(x) => x.as_u64().map(Some).ok_or(()),
             }
-            (a, b) => (0, written.max(a.unwrap_or(0) + b.unwrap_or(0))),
         };
-        u.cache_read = r["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        let split = r.get("cache_creation");
+        let read = (|| {
+            let written = count(r, "cache_creation_input_tokens")?.unwrap_or(0);
+            let (five, hour) = match split {
+                None => (None, None),
+                Some(o) if o.is_object() => (
+                    count(o, "ephemeral_5m_input_tokens")?,
+                    count(o, "ephemeral_1h_input_tokens")?,
+                ),
+                Some(_) => return Err(()),
+            };
+            let classes = match (five, hour) {
+                (None, None) if ttl == Some(CacheTtl::FiveMinutes) => (written, 0),
+                (None, None) => (0, written),
+                (a, b) => {
+                    let (a, b) = (a.unwrap_or(0), b.unwrap_or(0));
+                    let sum = a.checked_add(b).ok_or(())?;
+                    if sum == written {
+                        (a, b)
+                    } else {
+                        (0, written.max(sum))
+                    }
+                }
+            };
+            Ok::<_, ()>((classes, count(r, "cache_read_input_tokens")?.unwrap_or(0)))
+        })();
+        match read {
+            Ok(((five, hour), read)) => {
+                (u.cache_write_5m, u.cache_write_1h, u.cache_read) = (five, hour, read);
+            }
+            Err(()) => complete = false,
+        }
     }
     (u, complete)
 }
@@ -1393,6 +1406,10 @@ mod tests {
             json!({ "cache_creation_input_tokens": -1 }),
             json!({ "cache_creation_input_tokens": 5, "cache_creation": { "ephemeral_1h_input_tokens": 5.5 } }),
             json!({ "cache_creation": [5] }),
+            json!({ "cache_read_input_tokens": null }),
+            json!({ "cache_creation": { "ephemeral_5m_input_tokens": null } }),
+            json!({ "cache_creation_input_tokens": 1,
+                "cache_creation": { "ephemeral_5m_input_tokens": u64::MAX, "ephemeral_1h_input_tokens": 1 } }),
         ] {
             let mut u = json!({ "input_tokens": 1, "output_tokens": 1 });
             u.as_object_mut()

@@ -341,7 +341,9 @@ struct Counts {
     /// (bucket, outcome) → answers
     outcomes: BTreeMap<(String, String), u64>,
     /// (provider, model) → (input tokens, output tokens, estimated cost)
-    tokens: BTreeMap<(String, String), (crate::models::admission::Usage, f64)>,
+    /// (provider, model) → (tokens, estimated cost, budget tokens, each step's rounded
+    /// on its own)
+    tokens: BTreeMap<(String, String), (crate::models::admission::Usage, f64, u64)>,
     asks: u64,
 }
 
@@ -430,6 +432,7 @@ impl Runtime {
                 let t = c.tokens.entry(pair).or_default();
                 t.0 = t.0.plus(crate::models::usage_json(s));
                 t.1 += s["estimatedCost"].as_f64().unwrap_or(0.0);
+                t.2 += crate::models::budget_of(s);
             }
         };
         {
@@ -482,6 +485,7 @@ impl Runtime {
                     .or_default();
                 t.0 = t.0.plus(crate::models::usage_json(s));
                 t.1 += s["estimatedCost"].as_f64().unwrap_or(0.0);
+                t.2 += crate::models::budget_of(s);
             }
         };
         {
@@ -578,6 +582,7 @@ impl Runtime {
                 let e = t.tokens.entry(k.clone()).or_default();
                 e.0 = e.0.plus(v.0);
                 e.1 += v.1;
+                e.2 += v.2;
             }
         }
         let datasets: Vec<Value> = by
@@ -662,7 +667,7 @@ pub fn metrics(st: &AppState, o: &mut String) {
         "Model tokens of asks by dataset, provider, model and direction: uncached input, output, and input written to or read from the provider's prompt cache.",
     );
     for (ds, c) in &totals {
-        for ((p, m), (u, _)) in &c.tokens {
+        for ((p, m), (u, _, _)) in &c.tokens {
             let written = u.cache_write_5m + u.cache_write_1h;
             for (dir, n) in [
                 ("input", u.input),
@@ -690,7 +695,7 @@ pub fn metrics(st: &AppState, o: &mut String) {
         "Estimated cost of asks at the pairs' pricing, by dataset, provider and model.",
     );
     for (ds, c) in &totals {
-        for ((p, m), (_, cost)) in &c.tokens {
+        for ((p, m), (_, cost, _)) in &c.tokens {
             let _ = writeln!(
                 o,
                 "sparkles_ask_estimated_cost_total{{dataset=\"{}\",provider=\"{}\",model=\"{}\"}} {cost}",
@@ -708,9 +713,9 @@ fn counts_json(c: &Counts) -> Value {
         "answers": c.answers.iter().map(|((r, p, m, o), n)| json!({"role": r, "provider": p, "model": m, "outcome": o, "count": n})).collect::<Vec<_>>(),
         "escalations": c.escalations.iter().map(|((r, s), n)| json!({"role": r, "signal": s, "count": n})).collect::<Vec<_>>(),
         "outcomes": c.outcomes.iter().map(|((b, o), n)| json!({"bucket": b, "outcome": o, "count": n})).collect::<Vec<_>>(),
-        "tokens": c.tokens.iter().map(|((p, m), (u, cost))| {
+        "tokens": c.tokens.iter().map(|((p, m), (u, cost, budget))| {
             let mut j = json!({"provider": p, "model": m, "inputTokens": u.input, "outputTokens": u.output, "estimatedCost": cost});
-            crate::models::cache_json(&mut j, u, u.budget());
+            crate::models::cache_json(&mut j, u, *budget);
             j
         }).collect::<Vec<_>>(),
     })
@@ -1148,4 +1153,30 @@ async fn usage(State(st): St, Query(q): Query<UsageParams>) -> ApiResult<Json<Va
         ));
     }
     Ok(Json(st.asks.usage_json(days)))
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    /// The usage counters add each step's own budget tokens, as the charges do, so two
+    /// steps that each read 513 cached tokens count 52 + 52 for the pair, over two
+    /// requests too, and never the 103 of their summed reads.
+    #[test]
+    fn usage_counters_keep_each_steps_budget() {
+        let rt = Runtime::default();
+        let step = json!({ "provider": "p", "model": "m", "outcome": "ok", "inputTokens": 0,
+            "outputTokens": 0, "cacheWriteInputTokens": 0, "cacheReadInputTokens": 513,
+            "budgetTokens": 52 });
+        let usage = json!({ "steps": [step.clone(), step.clone()] });
+        rt.charge("ds", "ana", "explain", &usage);
+        let t = &rt.usage_json(1)["datasets"][0]["tokens"][0];
+        assert_eq!(t["budgetTokens"], 104, "{t}");
+        assert_eq!(t["cacheReadInputTokens"], 1026);
+        rt.charge("ds", "ana", "explain", &json!({ "steps": [step] }));
+        assert_eq!(
+            rt.usage_json(1)["datasets"][0]["tokens"][0]["budgetTokens"],
+            156
+        );
+    }
 }
