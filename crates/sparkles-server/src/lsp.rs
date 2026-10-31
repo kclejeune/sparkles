@@ -547,7 +547,12 @@ impl Doc {
                 .collect();
             // every position in one pass over the text
             let offsets: Vec<usize> = found.iter().flat_map(|d| [d.start, d.end]).collect();
-            let at = text::positions(&self.text, &offsets, enc);
+            // within the lint's own time; past it, the findings are not shown
+            let Some(at) =
+                text::positions(&self.text, &offsets, enc, Some(Instant::now() + DEADLINE))
+            else {
+                return out;
+            };
             let pos = |b: usize| {
                 let (line, character) = at[&b];
                 Position { line, character }

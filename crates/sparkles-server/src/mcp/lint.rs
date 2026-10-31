@@ -123,7 +123,8 @@ impl Tools<'_> {
         // the findings fit what is left, each with the comma before it
         let mut room = max - frame;
         let mut shown: Vec<Value> = Vec::new();
-        let utf16 = crate::http::lint::Utf16::new(text, &diagnostics);
+        let utf16 = crate::http::lint::Utf16::new(text, &diagnostics, opts.deadline)
+            .map_err(|e| self.error(&e, timeout))?;
         for d in &diagnostics {
             let j = crate::http::lint::diagnostic(&utf16, d);
             let size = serialized_len(&j) + usize::from(!shown.is_empty());

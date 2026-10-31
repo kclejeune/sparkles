@@ -97,12 +97,18 @@ pub fn position(text: &str, offset: usize, enc: Encoding) -> (u32, u32) {
 }
 
 /// The [`position`] of each of `offsets`, found in one pass over `text`, so that many
-/// offsets cost one scan rather than one each.
+/// offsets cost one scan rather than one each. `None` once `deadline` passes.
 pub fn positions(
     text: &str,
     offsets: &[usize],
     enc: Encoding,
-) -> std::collections::HashMap<usize, (u32, u32)> {
+    deadline: Option<std::time::Instant>,
+) -> Option<std::collections::HashMap<usize, (u32, u32)>> {
+    let late = || deadline.is_some_and(|d| std::time::Instant::now() > d);
+    if late() {
+        return None;
+    }
+    let mut since = 0usize;
     let mut sorted = offsets.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -132,10 +138,17 @@ pub fn positions(
                 c => units += enc.width(c),
             }
             i += c.len_utf8();
+            since += c.len_utf8();
+            if since >= 1 << 16 {
+                since = 0;
+                if late() {
+                    return None;
+                }
+            }
         }
         out.insert(o, (line, units as u32));
     }
-    out
+    Some(out)
 }
 
 /// One replacement: bytes `start..end` of the old text become `insert`.
@@ -187,11 +200,21 @@ pub fn minimal_edit(old: &str, new: &str) -> Option<Edit> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn positions_keep_to_the_deadline() {
+        let text = "a".repeat(1 << 20);
+        let past = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert_eq!(
+            super::positions(&text, &[text.len()], Encoding::Utf16, past),
+            None
+        );
+    }
+
+    #[test]
     fn positions_match_position() {
         let text = "a\r\nbé\u{1F600}c\rd\n\ne\u{1F600}";
         let offsets: Vec<usize> = (0..=text.len() + 2).rev().collect();
         for enc in [Encoding::Utf8, Encoding::Utf16] {
-            let all = super::positions(text, &offsets, enc);
+            let all = super::positions(text, &offsets, enc, None).unwrap();
             for &o in &offsets {
                 assert_eq!(all[&o], super::position(text, o, enc), "{o} {enc:?}");
             }

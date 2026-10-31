@@ -15,7 +15,10 @@ use crate::tree::{Element, NodeData, NodeId, TokenId, Tree};
 use crate::{FormatError, Language};
 
 pub(super) fn run(text: &str, lang: Language, out: &mut Out<'_>) -> Result<(), LintError> {
+    out.deadline()?;
     if let Err(e) = reference(text, lang, out)? {
+        // a syntax error is reported only within the deadline
+        out.deadline()?;
         if !terms::iri_space_in_error(text, &e, out) {
             out.syntax(&e);
         }

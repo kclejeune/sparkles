@@ -108,21 +108,22 @@ pub(super) async fn lint_handler(
     opts.deadline = Some(deadline);
     let answer = blocking(move || {
         let _permit = permit;
+        let within = Some(deadline);
         Ok(if fix {
-            lint::fix(&text, language, &opts).map(|f| {
-                json!({
+            lint::fix(&text, language, &opts).and_then(|f| {
+                Ok(json!({
                     "language": language.name(),
+                    "diagnostics": diagnostics(&f.text, &f.diagnostics, within)?,
                     "text": f.text,
                     "applied": f.applied,
-                    "diagnostics": diagnostics(&f.text, &f.diagnostics),
-                })
+                }))
             })
         } else {
-            lint::lint(&text, language, &opts).map(|l| {
-                json!({
+            lint::lint(&text, language, &opts).and_then(|l| {
+                Ok(json!({
                     "language": language.name(),
-                    "diagnostics": diagnostics(&text, &l.diagnostics),
-                })
+                    "diagnostics": diagnostics(&text, &l.diagnostics, within)?,
+                }))
             })
         })
     })
@@ -143,20 +144,37 @@ fn timed_out() -> ApiError {
     )
 }
 
-/// The findings as JSON, their UTF-16 offsets counted in one pass over the text.
-fn diagnostics(text: &str, found: &[lint::Diagnostic]) -> Vec<J> {
-    let u16 = Utf16::new(text, found);
-    found.iter().map(|d| diagnostic(&u16, d)).collect()
+/// The findings as JSON, their UTF-16 offsets counted in one pass over the text within
+/// the deadline.
+fn diagnostics(
+    text: &str,
+    found: &[lint::Diagnostic],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<J>, LintError> {
+    let u16 = Utf16::new(text, found, deadline)?;
+    Ok(found.iter().map(|d| diagnostic(&u16, d)).collect())
 }
 
+/// How many bytes [`Utf16::new`] reads between two looks at the clock.
+const UTF16_CHUNK: usize = 1 << 16;
+
 /// The UTF-16 offsets of the byte offsets of some findings and their fixes, counted in
-/// one pass over the text rather than from its start for each offset.
+/// one pass over the text rather than from its start for each offset, with the deadline
+/// checked as it goes.
 pub(crate) struct Utf16 {
     at: std::collections::HashMap<usize, usize>,
 }
 
 impl Utf16 {
-    pub(crate) fn new(text: &str, found: &[lint::Diagnostic]) -> Utf16 {
+    pub(crate) fn new(
+        text: &str,
+        found: &[lint::Diagnostic],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Utf16, LintError> {
+        let late = || deadline.is_some_and(|d| std::time::Instant::now() > d);
+        if late() {
+            return Err(LintError::Timeout);
+        }
         let mut offsets: Vec<usize> = Vec::with_capacity(found.len() * 2);
         for d in found {
             offsets.extend([d.start, d.end]);
@@ -173,13 +191,23 @@ impl Utf16 {
             while !text.is_char_boundary(b) {
                 b -= 1;
             }
-            if b > byte {
-                units += text[byte..b].encode_utf16().count();
-                byte = b;
+            while byte < b {
+                let mut end = b.min(byte + UTF16_CHUNK);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end <= byte {
+                    end = b;
+                }
+                units += text[byte..end].encode_utf16().count();
+                byte = end;
+                if late() {
+                    return Err(LintError::Timeout);
+                }
             }
             at.insert(o, units);
         }
-        Utf16 { at }
+        Ok(Utf16 { at })
     }
 
     fn get(&self, text_offset: usize) -> usize {
@@ -227,4 +255,46 @@ fn lint_error(e: &LintError) -> ApiError {
         LintError::UnsafeFix => StatusCode::UNPROCESSABLE_ENTITY,
     };
     ApiError(status, json!({ "error": e.to_string(), "code": e.code() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(start: usize, end: usize) -> lint::Diagnostic {
+        lint::Diagnostic {
+            rule: "language-tag-case",
+            severity: lint::Severity::Warning,
+            message: String::new(),
+            start,
+            end,
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 1,
+            fix: None,
+        }
+    }
+
+    #[test]
+    fn utf16_offsets_keep_to_the_deadline() {
+        // a long text with a finding at its end, as POST /$/lint and the MCP tool convert
+        let text = format!("{}\u{1F600}x", "é".repeat(8 << 20));
+        let found = [finding(text.len() - 1, text.len())];
+        let past = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert!(matches!(
+            Utf16::new(&text, &found, past),
+            Err(LintError::Timeout)
+        ));
+        assert!(matches!(
+            diagnostics(&text, &found, past),
+            Err(LintError::Timeout)
+        ));
+        let u = Utf16::new(&text, &found, None).unwrap();
+        assert_eq!(
+            u.get(text.len() - 1),
+            text[..text.len() - 1].encode_utf16().count()
+        );
+        assert_eq!(u.get(text.len()), text.encode_utf16().count());
+    }
 }

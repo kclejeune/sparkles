@@ -382,6 +382,7 @@ pub fn lint(text: &str, lang: Language, opts: &LintOptions) -> Result<Linted, Li
         return Err(LintError::TooLarge);
     }
     let mut out = Out::new(text, opts, Vec::new());
+    out.deadline()?;
     match lang {
         Language::Sparql => lint_sparql(text, &mut out)?,
         Language::Turtle | Language::TriG => lint_turtle(text, lang == Language::TriG, &mut out)?,
@@ -392,7 +393,9 @@ pub fn lint(text: &str, lang: Language, opts: &LintOptions) -> Result<Linted, Li
     let mut diagnostics = out.found;
     diagnostics.sort_by(|a, b| (a.start, a.end, a.rule).cmp(&(b.start, b.end, b.rule)));
     diagnostics.dedup_by(|a, b| a.rule == b.rule && a.start == b.start && a.end == b.end);
-    locate(text, &mut diagnostics);
+    locate(text, &mut diagnostics, opts.deadline)?;
+    // whatever path the pass took, nothing is returned once the deadline has passed
+    out_of_time(opts.deadline)?;
     Ok(Linted {
         language: lang,
         diagnostics,
@@ -588,19 +591,25 @@ pub(crate) struct Out<'a> {
 /// How many steps of a rule pass go between two looks at the clock.
 const TICKS: u32 = 256;
 
+/// `Err(Timeout)` once `deadline` has passed.
+fn out_of_time(deadline: Option<Instant>) -> Result<(), LintError> {
+    crate::check::deadline(deadline).map_err(|_| LintError::Timeout)
+}
+
+/// How many bytes [`locate`] reads between two looks at the clock.
+const LOCATE_CHUNK: usize = 1 << 16;
+
 /// Set the lines and columns of `diagnostics` from their byte offsets in one pass over
-/// `text`, so many findings cost no more than one scan. The positions are those of
-/// [`crate::line_col`]: a leading BOM is not counted, and columns are Unicode scalar
-/// values.
-fn locate(text: &str, diagnostics: &mut [Diagnostic]) {
+/// `text`, so many findings cost no more than one scan, with the deadline checked every
+/// [`LOCATE_CHUNK`] bytes. The positions are those of [`crate::line_col`]: a leading BOM
+/// is not counted, and columns are Unicode scalar values.
+fn locate(
+    text: &str,
+    diagnostics: &mut [Diagnostic],
+    deadline: Option<Instant>,
+) -> Result<(), LintError> {
     let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
-    let clamp = |o: usize| {
-        let mut o = o.max(bom).min(text.len());
-        while !text.is_char_boundary(o) {
-            o -= 1;
-        }
-        o
-    };
+    let clamp = |o: usize| floor_char(text, o.max(bom).min(text.len()));
     // every start and end, in order of offset
     let mut at: Vec<(usize, usize)> = Vec::with_capacity(diagnostics.len() * 2);
     for (i, d) in diagnostics.iter().enumerate() {
@@ -610,15 +619,20 @@ fn locate(text: &str, diagnostics: &mut [Diagnostic]) {
     at.sort_unstable();
     let (mut pos, mut line, mut column) = (bom, 1u32, 1u32);
     for (offset, slot) in at {
-        for ch in text[pos..offset].chars() {
-            if ch == '\n' {
-                line += 1;
-                column = 1;
-            } else {
-                column += 1;
+        while pos < offset {
+            out_of_time(deadline)?;
+            let end = floor_char(text, offset.min(pos + LOCATE_CHUNK));
+            let end = if end <= pos { offset } else { end };
+            let chunk = &text[pos..end];
+            match chunk.rfind('\n') {
+                Some(nl) => {
+                    line += chunk.bytes().filter(|&b| b == b'\n').count() as u32;
+                    column = 1 + chunk[nl + 1..].chars().count() as u32;
+                }
+                None => column += chunk.chars().count() as u32,
             }
+            pos = end;
         }
-        pos = offset;
         let d = &mut diagnostics[slot / 2];
         if slot % 2 == 0 {
             (d.line, d.column) = (line, column);
@@ -626,6 +640,15 @@ fn locate(text: &str, diagnostics: &mut [Diagnostic]) {
             (d.end_line, d.end_column) = (line, column);
         }
     }
+    Ok(())
+}
+
+/// `o`, or the start of the character it falls inside.
+fn floor_char(text: &str, mut o: usize) -> usize {
+    while !text.is_char_boundary(o) {
+        o -= 1;
+    }
+    o
 }
 
 impl<'a> Out<'a> {

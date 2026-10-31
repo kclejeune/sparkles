@@ -259,3 +259,51 @@ fn the_term_pass_checks_the_deadline() {
         assert_eq!(lint(&text, lang, &opts), Err(LintError::Timeout));
     }
 }
+
+#[test]
+fn an_expired_deadline_is_a_timeout_on_every_path() {
+    let past = || LintOptions {
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+        ..LintOptions::default()
+    };
+    // malformed input, whose error path used to skip the clock
+    for (text, lang) in [
+        ("<urn:s> <urn:p> .", Language::NTriples),
+        (
+            "<urn:s> <urn:p> <urn:o> <urn:g> <urn:x> .",
+            Language::NQuads,
+        ),
+    ] {
+        assert_eq!(
+            lint(text, lang, &past()),
+            Err(LintError::Timeout),
+            "{lang:?}"
+        );
+    }
+    let padded = format!("{}<urn:s> <urn:p> .", " ".repeat(8 << 20));
+    assert_eq!(
+        lint(&padded, Language::NTriples, &past()),
+        Err(LintError::Timeout)
+    );
+    // every language
+    for lang in Language::ALL {
+        assert_eq!(
+            lint("x", lang, &past()),
+            Err(LintError::Timeout),
+            "{lang:?}"
+        );
+    }
+}
+
+#[test]
+fn positions_are_found_within_the_deadline() {
+    // one 16 MiB literal with a finding at its end: placing it is a long scan
+    let text = format!("<urn:s> <urn:p> \"{}\"@EN .\n", "a".repeat(16 << 20));
+    let d = diags(&text, Language::NTriples);
+    assert_eq!(d.len(), 1);
+    let mut d = d;
+    let past = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+    assert_eq!(locate(&text, &mut d, past), Err(LintError::Timeout));
+    assert_eq!(locate(&text, &mut d, None), Ok(()));
+    assert_eq!((d[0].line, d[0].column), crate::line_col(&text, d[0].start));
+}
