@@ -740,7 +740,7 @@ fn lint_sparql(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     match (reference, tree) {
         (Ok(_), Ok(tree)) => {
             let c = Cst::new(&tree);
-            prefixes::run(&c, out);
+            prefixes::run(&c, out, &Default::default());
             sparql::run(&c, out)?;
             terms::run(&c, out)?;
         }
@@ -784,9 +784,11 @@ fn lint_turtle(text: &str, trig: bool, out: &mut Out<'_>) -> Result<(), LintErro
     match crate::turtle::parse::parse(text, tokens, trig) {
         Ok(tree) => {
             let c = Cst::new(&tree);
-            prefixes::run(&c, out);
+            let (sites, declared) = embedded::turtle_sites(&c);
+            // a prefix that only a query uses is used
+            prefixes::run(&c, out, &embedded::labels(&sites));
             terms::run(&c, out)?;
-            embedded::turtle(&c, text, trig, &undeclared, out)?;
+            embedded::turtle(sites, &declared, text, trig, &undeclared, out)?;
         }
         Err(e) => out.syntax(&e),
     }

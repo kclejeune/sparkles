@@ -33,7 +33,7 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     match crate::shaclc::parse::parse(text, tokens) {
         Ok(tree) => {
             let c = Cst::new(&tree);
-            prefixes::run(&c, out);
+            prefixes::run(&c, out, &Default::default());
             terms::run(&c, out)?;
         }
         Err(e) => out.syntax(&e),

@@ -6,7 +6,10 @@
 //! A query sees the prefixes that `sh:prefixes` and `sh:declare` give it, including those
 //! of the `owl:imports` closure of the nodes `sh:prefixes` names, and the prefixes of the
 //! document itself. They are written in front of the query as `PREFIX` lines, and
-//! everything found there is dropped again. SHACL binds `$this`, `$shapesGraph`,
+//! everything found there is dropped again. Each literal is matched to the quad it makes,
+//! so the prefixes and parameters are those of the node that holds it, in its graph, even
+//! when another node holds the same text. A document prefix that a query writes counts as
+//! used, so `unused-prefix` does not remove it. SHACL binds `$this`, `$shapesGraph`,
 //! `$currentShape`, `$value` and `$PATH` before it runs a query, and a constraint
 //! component's validators also see its parameters by their local names, so the variable
 //! rules treat those as bound.
@@ -22,7 +25,7 @@ use super::{Cst, Edit, Fix, LintError, Out};
 use crate::lex::TokenKind;
 use crate::syntax::NodeKind;
 use crate::tree::Element;
-use oxrdf::{NamedOrBlankNode, Quad, Term};
+use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use std::collections::HashMap;
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
@@ -196,14 +199,8 @@ pub(super) fn decode_json(token: &str, at: usize) -> Decoded {
 
 // ---------------------------------------------------------------------- Turtle ------
 
-/// Lint the queries in a Turtle or TriG document.
-pub(super) fn turtle(
-    c: &Cst<'_, '_>,
-    text: &str,
-    trig: bool,
-    undeclared: &[String],
-    out: &mut Out<'_>,
-) -> Result<(), LintError> {
+/// The query literals of a Turtle or TriG document, and the prefixes it declares.
+pub(super) fn turtle_sites(c: &Cst<'_, '_>) -> (Vec<Site>, Vec<(String, String)>) {
     let mut sites = Vec::new();
     let mut prefixes = Vec::new();
     for n in c.nodes() {
@@ -248,9 +245,38 @@ pub(super) fn turtle(
             _ => {}
         }
     }
+    (sites, prefixes)
+}
+
+/// The prefix labels the queries of `sites` write, so that the document's declarations
+/// of them count as used. A label that a query declares itself counts too, which only
+/// keeps a declaration that could have gone.
+pub(super) fn labels(sites: &[Site]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for site in sites {
+        let q = site.text.value.as_str();
+        for t in crate::lex::lex(q, crate::lex::LexMode::Sparql) {
+            if matches!(t.kind, TokenKind::PnameNs | TokenKind::PnameLn) {
+                let s = t.text(q);
+                out.insert(s[..s.find(':').unwrap_or(s.len())].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Lint the queries of a Turtle or TriG document.
+pub(super) fn turtle(
+    sites: Vec<Site>,
+    prefixes: &[(String, String)],
+    text: &str,
+    trig: bool,
+    undeclared: &[String],
+    out: &mut Out<'_>,
+) -> Result<(), LintError> {
     run(
         sites,
-        &prefixes,
+        prefixes,
         || super::turtle_quads(text, trig, undeclared).ok(),
         out,
     )
@@ -280,12 +306,16 @@ fn plain_string(c: &Cst<'_, '_>, obj: crate::tree::NodeId) -> Option<crate::tree
 
 // ----------------------------------------------------------------------- facts ------
 
+/// A node in its graph.
+type Node = (GraphName, NamedOrBlankNode);
+
 /// What the document says about the nodes that hold queries.
 pub(super) struct Facts {
-    by_subject: HashMap<NamedOrBlankNode, Vec<(String, Term)>>,
-    parents: HashMap<NamedOrBlankNode, Vec<NamedOrBlankNode>>,
-    /// the subjects of each query property and query text
-    holders: HashMap<(String, String), Vec<NamedOrBlankNode>>,
+    by_subject: HashMap<Node, Vec<(String, Term)>>,
+    parents: HashMap<Node, Vec<NamedOrBlankNode>>,
+    /// the holders of each query property and query text, in the order of the quads,
+    /// which is the order of the literals in the document
+    holders: HashMap<(String, String), Vec<Node>>,
 }
 
 /// The prefixes and parameters a query sees.
@@ -320,12 +350,16 @@ impl Facts {
         };
         for q in quads {
             let p = q.predicate.as_str();
+            let g = q.graph_name.clone();
             f.by_subject
-                .entry(q.subject.clone())
+                .entry((g.clone(), q.subject.clone()))
                 .or_default()
                 .push((p.to_string(), q.object.clone()));
             if let Some(child) = node(&q.object) {
-                f.parents.entry(child).or_default().push(q.subject.clone());
+                f.parents
+                    .entry((g.clone(), child))
+                    .or_default()
+                    .push(q.subject.clone());
             }
             if is_query_predicate(p)
                 && let Some(v) = plain(&q.object)
@@ -333,16 +367,37 @@ impl Facts {
                 f.holders
                     .entry((p.to_string(), v.to_string()))
                     .or_default()
-                    .push(q.subject.clone());
+                    .push((g, q.subject.clone()));
             }
         }
         f
     }
 
-    /// The objects of `subject`'s `predicate`.
-    fn objects(&self, subject: &NamedOrBlankNode, predicate: &str) -> Vec<&Term> {
+    /// The holders of the `nth` site with this predicate and query text, of `count`
+    /// such sites. The literals and the quads come in the same order, so the `nth` quad
+    /// is the site's. When the counts differ, which a construct the sites do not see could
+    /// cause, every holder of the text is taken.
+    fn holders(&self, predicate: &str, query: &str, nth: usize, count: usize) -> &[Node] {
+        let all = self
+            .holders
+            .get(&(predicate.to_string(), query.to_string()))
+            .map_or(&[][..], Vec::as_slice);
+        if all.len() == count {
+            &all[nth..=nth]
+        } else {
+            all
+        }
+    }
+
+    /// The objects of `subject`'s `predicate` in `graph`.
+    fn objects(
+        &self,
+        graph: &GraphName,
+        subject: &NamedOrBlankNode,
+        predicate: &str,
+    ) -> Vec<&Term> {
         self.by_subject
-            .get(subject)
+            .get(&(graph.clone(), subject.clone()))
             .map(|v| {
                 v.iter()
                     .filter(|(p, _)| p == predicate)
@@ -352,27 +407,27 @@ impl Facts {
             .unwrap_or_default()
     }
 
-    fn info(&self, predicate: &str, query: &str) -> Info {
+    /// The prefixes and parameters the queries of `holders` see.
+    fn info(&self, holders: &[Node]) -> Info {
         let mut info = Info::default();
-        let Some(subjects) = self
-            .holders
-            .get(&(predicate.to_string(), query.to_string()))
-        else {
-            return info;
-        };
-        for s in subjects {
+        for (g, s) in holders {
             // the node itself and the nodes that point at it (the constraint of a shape,
-            // the component of a validator)
+            // the component of a validator), in its graph
             let mut holders = vec![s.clone()];
-            holders.extend(self.parents.get(s).cloned().unwrap_or_default());
+            holders.extend(
+                self.parents
+                    .get(&(g.clone(), s.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             let mut declarers: Vec<NamedOrBlankNode> = Vec::new();
             for h in &holders {
-                for o in self.objects(h, &sh("prefixes")) {
+                for o in self.objects(g, h, &sh("prefixes")) {
                     declarers.extend(node(o));
                 }
-                for p in self.objects(h, &sh("parameter")) {
+                for p in self.objects(g, h, &sh("parameter")) {
                     let Some(p) = node(p) else { continue };
-                    for path in self.objects(&p, &sh("path")) {
+                    for path in self.objects(g, &p, &sh("path")) {
                         if let Term::NamedNode(n) = path {
                             let name = n.as_str().rsplit(['#', '/', ':']).next().unwrap_or("");
                             if !name.is_empty() && !info.params.iter().any(|x| x == name) {
@@ -387,7 +442,7 @@ impl Facts {
             let mut at = 0;
             while at < declarers.len() {
                 let d = declarers[at].clone();
-                for o in self.objects(&d, imports) {
+                for o in self.objects(g, &d, imports) {
                     if let Some(n) = node(o)
                         && !declarers.contains(&n)
                     {
@@ -397,10 +452,10 @@ impl Facts {
                 at += 1;
             }
             for d in &declarers {
-                for decl in self.objects(d, &sh("declare")) {
+                for decl in self.objects(g, d, &sh("declare")) {
                     let Some(decl) = node(decl) else { continue };
                     let value = |p: &str| {
-                        self.objects(&decl, &sh(p))
+                        self.objects(g, &decl, &sh(p))
                             .into_iter()
                             .find_map(|t| match t {
                                 Term::Literal(l) => Some(l.value().to_string()),
@@ -450,12 +505,25 @@ pub(super) fn run(
         return Ok(());
     }
     let facts = quads().map(|q| Facts::new(&q));
-    for site in &sites {
+    // each site's place among the sites with its property and text
+    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+    let nth: Vec<usize> = sites
+        .iter()
+        .map(|s| {
+            let n = counts
+                .entry((s.predicate.as_str(), s.text.value.as_str()))
+                .or_default();
+            *n += 1;
+            *n - 1
+        })
+        .collect();
+    for (site, &nth) in sites.iter().zip(&nth) {
         out.deadline()?;
         let query = site.text.value.as_str();
+        let count = counts[&(site.predicate.as_str(), query)];
         let info = facts
             .as_ref()
-            .map(|f| f.info(&site.predicate, query))
+            .map(|f| f.info(f.holders(&site.predicate, query, nth, count)))
             .unwrap_or_default();
         let mut prelude = String::new();
         for (label, ns) in document_prefixes.iter().chain(&info.prefixes) {

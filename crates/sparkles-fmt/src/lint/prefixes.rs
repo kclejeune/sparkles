@@ -10,7 +10,9 @@ use crate::syntax::NodeKind;
 use crate::tree::TokenId;
 use std::collections::HashSet;
 
-pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
+/// `used` holds labels that count as used whatever the tree says: those of the SPARQL in
+/// a Turtle document's query literals.
+pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>, used: &HashSet<String>) {
     let decls: Vec<_> = c
         .nodes()
         .into_iter()
@@ -40,6 +42,9 @@ pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
                 .into_iter()
                 .find(|&t| c.token_kind(t) == TokenKind::PnameNs)
                 .map_or("", |t| c.text(t));
+            if used.contains(label.trim_end_matches(':')) {
+                continue;
+            }
             let (start, end) = c.node_span(n);
             out.report_fix(
                 "unused-prefix",

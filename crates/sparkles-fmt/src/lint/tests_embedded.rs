@@ -344,3 +344,70 @@ fn json_ld_queries_are_linted() {
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].rule, "syntax");
 }
+
+#[test]
+fn document_prefixes_used_by_queries_are_used() {
+    let doc = ttl(
+        "@prefix qq: <http://qq.org/> .\n<urn:s> sh:select \"\"\"SELECT $this { $this qq:p ?o FILTER(?o) }\"\"\" .\n",
+    );
+    assert_eq!(found_q(&doc, Language::Turtle), Vec::<String>::new());
+    let f = fix(&doc, Language::Turtle, &LintOptions::default()).unwrap();
+    assert_eq!(f.text, doc);
+    assert!(f.diagnostics.iter().all(|d| d.rule != "undefined-prefix"));
+    // in TriG too, and a prefix that nothing uses still goes
+    let doc = "@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix ex: <http://ex.org/> .\n@prefix u: <http://u/> .\n<urn:g> { <urn:s> sh:ask \"ASK { ex:a ex:b ex:c }\" }\n";
+    assert_eq!(
+        found_q(doc, Language::TriG),
+        strs(&["unused-prefix@@prefix u: <http://u/> ."])
+    );
+}
+
+#[test]
+fn each_holder_has_its_own_prefixes_and_parameters() {
+    // the same query text on two nodes, and only the first declares p:
+    let q = "SELECT $this { $this p:p ?o FILTER(?o) }";
+    let doc = ttl(&format!(
+        "<urn:a> sh:prefixes <urn:decl> ; sh:select \"{q}\" .\n<urn:b> sh:select \"{q}\" .\n<urn:decl> sh:declare [ sh:prefix \"p\" ; sh:namespace \"http://p/\" ] .\n"
+    ));
+    let d = diags(&doc, Language::Turtle);
+    let undefined: Vec<_> = d.iter().filter(|d| d.rule == "undefined-prefix").collect();
+    assert_eq!(undefined.len(), 1, "{d:?}");
+    assert!(undefined[0].start > doc.find("<urn:b>").unwrap(), "{d:?}");
+    // parameters of a component reach its own validator only
+    let q = "ASK { FILTER(?limit > 1) }";
+    let doc = ttl(&format!(
+        "<urn:c> sh:parameter [ sh:path <http://x/limit> ] ; sh:validator <urn:v1> .\n<urn:v1> sh:ask \"{q}\" .\n<urn:v2> sh:ask \"{q}\" .\n"
+    ));
+    let d = diags(&doc, Language::Turtle);
+    let unbound: Vec<_> = d.iter().filter(|d| d.rule == "unbound-variable").collect();
+    assert_eq!(unbound.len(), 1, "{d:?}");
+    assert!(unbound[0].start > doc.find("<urn:v2>").unwrap(), "{d:?}");
+    // blank nodes and named graphs keep their holders apart as well
+    let doc = format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n<urn:g1> {{ [ sh:prefixes <urn:decl> ; sh:select \"{q2}\" ] . <urn:decl> sh:declare [ sh:prefix \"p\" ; sh:namespace \"http://p/\" ] . }}\n<urn:g2> {{ [ sh:prefixes <urn:decl> ; sh:select \"{q2}\" ] . }}\n",
+        q2 = "SELECT $this { $this p:p ?o FILTER(?o) }"
+    );
+    let d = diags(&doc, Language::TriG);
+    let undefined: Vec<_> = d.iter().filter(|d| d.rule == "undefined-prefix").collect();
+    assert_eq!(undefined.len(), 1, "{d:?}");
+    assert!(undefined[0].start > doc.find("<urn:g2>").unwrap(), "{d:?}");
+}
+
+#[test]
+fn json_ld_holders_have_their_own_prefixes() {
+    let q = "SELECT $this { $this p:p ?o FILTER(?o) }";
+    let doc = format!(
+        r#"{{"@context": {{"sh": "http://www.w3.org/ns/shacl#"}}, "@graph": [
+      {{"@id": "http://e/Decl", "sh:declare": {{"sh:prefix": "p", "sh:namespace": "http://p/"}}}},
+      {{"sh:select": "{q}", "@id": "http://e/A", "sh:prefixes": {{"@id": "http://e/Decl"}}}},
+      {{"@id": "http://e/B", "sh:select": "{q}"}},
+      {{"sh:select": "{q}"}}]}}"#
+    );
+    let d = diags(&doc, Language::JsonLd);
+    let undefined: Vec<_> = d.iter().filter(|d| d.rule == "undefined-prefix").collect();
+    assert_eq!(undefined.len(), 2, "{d:?}");
+    assert!(
+        undefined[0].start > doc.find("http://e/B").unwrap(),
+        "{d:?}"
+    );
+}
