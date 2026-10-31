@@ -1238,11 +1238,28 @@ impl<'a> Planner<'a> {
             }
             GP::OrderBy { inner, expression } => {
                 let child = self.plan(inner, g, Vec::new())?;
+                // a variable that the initial bindings substitute is compiled to its
+                // constant, not to the column the BIND computes
+                let bound: Vec<_> = if self.ctx.opt.bound_order_keys {
+                    bound_expressions(inner)
+                        .into_iter()
+                        .filter(|(v, _)| !self.subst.contains_key(&self.ctx.var(v.as_str())))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let keys = expression
                     .iter()
-                    .map(|o| match o {
-                        OrderExpression::Asc(e) => (self.compile(e, g), true),
-                        OrderExpression::Desc(e) => (self.compile(e, g), false),
+                    .map(|o| {
+                        let (e, asc) = match o {
+                            OrderExpression::Asc(e) => (e, true),
+                            OrderExpression::Desc(e) => (e, false),
+                        };
+                        let e = match bound.iter().find(|(_, x)| *x == e) {
+                            Some((v, _)) => self.compile(&Expression::Variable((*v).clone()), g),
+                            None => self.compile(e, g),
+                        };
+                        (e, asc)
                     })
                     .collect::<Vec<_>>();
                 let desc = keys
@@ -4373,8 +4390,113 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
     Some((rows.min(n.est), ids.len()))
 }
 
-/// Comparison of the range variable with a numeric constant: `?v op c`.
-#[derive(Clone, Copy, PartialEq)]
+/// The variables that the BINDs directly under an ORDER BY (a chain of `Extend`s, as
+/// SELECT expressions and BIND produce) bind to an expression whose value depends only
+/// on the row. An ORDER BY key equal to such an expression orders by its variable: the
+/// variable holds the expression's value, and is unbound where the expression is an
+/// error, which orders as the error does. An expression that reads a variable bound by
+/// its own or a later BIND of the chain would read another value at the ORDER BY, so it
+/// is left out.
+fn bound_expressions(
+    gp: &GraphPattern,
+) -> Vec<(&spargebra::term::Variable, &spargebra::algebra::Expression)> {
+    let mut out = Vec::new();
+    // the variables bound between an Extend's input and the ORDER BY
+    let mut later: Vec<&spargebra::term::Variable> = Vec::new();
+    let mut gp = gp;
+    while let GraphPattern::Extend {
+        inner,
+        variable,
+        expression,
+    } = gp
+    {
+        later.push(variable);
+        let mut read = Vec::new();
+        expression_vars(expression, &mut read);
+        if row_determined(expression) && !read.iter().any(|v| later.contains(v)) {
+            out.push((variable, expression));
+        }
+        gp = inner;
+    }
+    out
+}
+
+/// The variables an expression reads (outside EXISTS, which [`row_determined`] rejects).
+fn expression_vars<'e>(
+    e: &'e spargebra::algebra::Expression,
+    out: &mut Vec<&'e spargebra::term::Variable>,
+) {
+    use spargebra::algebra::Expression as E;
+    match e {
+        E::Variable(v) | E::Bound(v) => out.push(v),
+        E::NamedNode(_) | E::Literal(_) | E::Exists(_) => {}
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => {
+            expression_vars(a, out);
+            expression_vars(b, out);
+        }
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expression_vars(a, out),
+        E::In(a, l) => {
+            expression_vars(a, out);
+            l.iter().for_each(|x| expression_vars(x, out));
+        }
+        E::If(a, b, c) => {
+            expression_vars(a, out);
+            expression_vars(b, out);
+            expression_vars(c, out);
+        }
+        E::Coalesce(l) => l.iter().for_each(|x| expression_vars(x, out)),
+        E::FunctionCall(_, l) => l.iter().for_each(|x| expression_vars(x, out)),
+    }
+}
+
+/// Whether an expression's value is the same each time it is evaluated on a row: no
+/// random or fresh values, no EXISTS, and no function other than SPARQL's and the
+/// supported XSD casts.
+fn row_determined(e: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::{Expression as E, Function as F};
+    match e {
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => true,
+        E::Exists(_) => false,
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => row_determined(a) && row_determined(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => row_determined(a),
+        E::In(a, l) => row_determined(a) && l.iter().all(row_determined),
+        E::If(a, b, c) => row_determined(a) && row_determined(b) && row_determined(c),
+        E::Coalesce(l) => l.iter().all(row_determined),
+        E::FunctionCall(f, args) => {
+            let fixed = match f {
+                F::BNode | F::Rand | F::Uuid | F::StrUuid => false,
+                F::Custom(iri) => super::expr::is_cast(iri.as_str()),
+                _ => true,
+            };
+            fixed && args.iter().all(row_determined)
+        }
+    }
+}
+
+/// Comparison of the range variable with a constant: `?v op c`.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum RangeOp {
     Lt,
     Le,
@@ -4385,6 +4507,17 @@ pub(super) enum RangeOp {
 
 /// `?v op c` for a filter conjunct comparing variable `v` with a numeric literal.
 pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, super::value::Value)> {
+    compare_atom(e, v, ctx, super::value::Value::is_numeric)
+}
+
+/// `?v op c` for a filter conjunct comparing variable `v` with a constant `c` that
+/// `accept` admits. Arithmetic in the constant is folded only over numbers.
+pub(super) fn compare_atom(
+    e: &Expr,
+    v: VarId,
+    ctx: &Ctx,
+    accept: fn(&super::value::Value) -> bool,
+) -> Option<(RangeOp, super::value::Value)> {
     use super::expr::CmpOp;
     let (a, b, op) = match e {
         Expr::Cmp(a, b, op) => (a, b, Some(*op)),
@@ -4421,7 +4554,7 @@ pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, supe
         (c, Expr::Var(x)) if *x == v => (constant(c)?, true),
         _ => return None,
     };
-    if !c.is_numeric() {
+    if !accept(&c) {
         return None;
     }
     let op = match (op, flip) {
@@ -4435,7 +4568,55 @@ pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, supe
 }
 
 /// Id ranges whose values satisfy every atom (see [`RangeSpec`]).
-fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx) -> Vec<IdRange> {
+pub(super) fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx) -> Vec<IdRange> {
+    let residual = |tag: Tag| IdRange {
+        lo: Id::new(tag, 0).0,
+        hi: Id::new(tag, crate::id::PAYLOAD_MASK).0,
+        exact: false,
+    };
+    // tags in id order: Int < Double < Vocab < Delta < Decimal
+    let segments = numeric_segments();
+    let (ints, decimals) = segments.split_at(2);
+    let segment = |&(tag, lo, hi): &(Tag, u64, u64)| numeric_segment(atoms, ctx, tag, lo, hi);
+    let out: Vec<IdRange> = ints
+        .iter()
+        .filter_map(segment)
+        .chain([Tag::Double, Tag::Vocab, Tag::Delta].map(residual))
+        .chain(decimals.iter().filter_map(segment))
+        .collect();
+    debug_assert!(out.windows(2).all(|w| w[0].hi < w[1].lo));
+    out
+}
+
+/// Bits of an inline decimal's mantissa, above which its payload holds its scale.
+pub(super) const DECIMAL_MANTISSA: u32 = 56;
+
+/// The segments of inline numeric ids in which ids sort by value, in id order, as a tag
+/// and the first and last payload: the non-negative and the negative integers, then the
+/// non-negative and the negative decimals of each scale.
+pub(super) fn numeric_segments() -> [(Tag, u64, u64); 34] {
+    let half = 1u64 << (crate::id::PAYLOAD_BITS - 1);
+    let m = 1u64 << (DECIMAL_MANTISSA - 1);
+    std::array::from_fn(|i| match i {
+        0 => (Tag::Int, 0, half - 1),
+        1 => (Tag::Int, half, 2 * half - 1),
+        _ => {
+            let (scale, upper) = (((i - 2) / 2) as u64, (i - 2) % 2 == 1);
+            let lo = (scale << DECIMAL_MANTISSA) + if upper { m } else { 0 };
+            (Tag::Decimal, lo, lo + m - 1)
+        }
+    })
+}
+
+/// The ids of one segment of [`numeric_segments`] whose values satisfy every atom,
+/// found by binary search with the ordinary comparison.
+pub(super) fn numeric_segment(
+    atoms: &[(RangeOp, super::value::Value)],
+    ctx: &Ctx,
+    tag: Tag,
+    lo: u64,
+    hi: u64,
+) -> Option<IdRange> {
     use super::value::compare;
     use std::cmp::Ordering;
     // the atoms split into lower bounds (false, then true along a segment in value order)
@@ -4474,42 +4655,14 @@ fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx) -> Vec<Id
         }
         a
     };
-    let mut out = Vec::new();
-    let segment = |tag: Tag, lo: u64, hi: u64, out: &mut Vec<IdRange>| {
-        let (lo, hi) = (Id::new(tag, lo).0, Id::new(tag, hi).0);
-        let s = first(lo, hi, &lower_ok);
-        let e = first(lo, hi, &|id| !upper_ok(id));
-        if s < e {
-            out.push(IdRange {
-                lo: s,
-                hi: e - 1,
-                exact: true,
-            });
-        }
-    };
-    let residual = |tag: Tag, out: &mut Vec<IdRange>| {
-        out.push(IdRange {
-            lo: Id::new(tag, 0).0,
-            hi: Id::new(tag, crate::id::PAYLOAD_MASK).0,
-            exact: false,
-        })
-    };
-    // tags in id order: Int < Double < Vocab < Delta < Decimal
-    let half = 1u64 << (crate::id::PAYLOAD_BITS - 1);
-    segment(Tag::Int, 0, half - 1, &mut out);
-    segment(Tag::Int, half, 2 * half - 1, &mut out);
-    residual(Tag::Double, &mut out);
-    residual(Tag::Vocab, &mut out);
-    residual(Tag::Delta, &mut out);
-    const MANTISSA: u32 = 56;
-    for scale in 0..16u64 {
-        let base = scale << MANTISSA;
-        let m = 1u64 << (MANTISSA - 1);
-        segment(Tag::Decimal, base, base + m - 1, &mut out);
-        segment(Tag::Decimal, base + m, base + 2 * m - 1, &mut out);
-    }
-    debug_assert!(out.windows(2).all(|w| w[0].hi < w[1].lo));
-    out
+    let (lo, hi) = (Id::new(tag, lo).0, Id::new(tag, hi).0);
+    let s = first(lo, hi, &lower_ok);
+    let e = first(lo, hi, &|id| !upper_ok(id));
+    (s < e).then_some(IdRange {
+        lo: s,
+        hi: e - 1,
+        exact: true,
+    })
 }
 
 /// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].

@@ -39,6 +39,7 @@ pub mod plan;
 pub mod pool;
 mod propertyext;
 pub(crate) mod query_memory;
+mod rangemask;
 pub mod rdfs;
 pub mod reasoning;
 mod registeredagg;

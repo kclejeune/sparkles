@@ -163,6 +163,10 @@ pub struct Optimizations {
     /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
     /// runs as a merge in the left side's order
     pub merge_left_join: bool,
+    /// OPTIONAL whose right side is a triple pattern sorted on a variable that every row
+    /// of the evaluated left side binds reads the pattern only for the left side's
+    /// distinct values, when probing them costs less than reading the pattern
+    pub probed_optional: bool,
     /// an OPTIONAL whose sides share no variable and whose condition equates a variable
     /// of each side pairs the rows by that equality instead of forming their product
     pub keyed_left_join: bool,
@@ -201,6 +205,9 @@ pub struct Optimizations {
     /// ORDER BY with LIMIT keeps the best rows in a bounded heap of offset + limit rows,
     /// evaluating the later keys only for rows whose first key can still enter
     pub topk_heap: bool,
+    /// an ORDER BY key equal to the expression of a BIND or SELECT expression directly
+    /// below it orders by that expression's variable instead of evaluating it again
+    pub bound_order_keys: bool,
     /// the vocabulary groups that hold a query's constants are requested together before
     /// the planner looks the constants up one after the other
     pub prefetch_constants: bool,
@@ -224,7 +231,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 44] = [
+    pub const NAMES: [&str; 46] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -250,6 +257,7 @@ impl Optimizations {
         "flat_hash_join",
         "gallop_index_join",
         "merge_left_join",
+        "probed_optional",
         "keyed_left_join",
         "keyed_join",
         "point_patterns",
@@ -262,6 +270,7 @@ impl Optimizations {
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
+        "bound_order_keys",
         "prefetch_constants",
         "prefetch_terms",
         "prefetch_first_scan",
@@ -298,6 +307,7 @@ impl Optimizations {
         flat_hash_join: true,
         gallop_index_join: true,
         merge_left_join: true,
+        probed_optional: true,
         keyed_left_join: true,
         keyed_join: true,
         point_patterns: true,
@@ -310,6 +320,7 @@ impl Optimizations {
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
+        bound_order_keys: true,
         prefetch_constants: true,
         prefetch_terms: true,
         prefetch_first_scan: true,
@@ -346,6 +357,7 @@ impl Optimizations {
         flat_hash_join: false,
         gallop_index_join: false,
         merge_left_join: false,
+        probed_optional: false,
         keyed_left_join: false,
         keyed_join: false,
         point_patterns: false,
@@ -358,6 +370,7 @@ impl Optimizations {
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
+        bound_order_keys: false,
         prefetch_constants: false,
         prefetch_terms: false,
         prefetch_first_scan: false,
@@ -394,6 +407,7 @@ impl Optimizations {
             "flat_hash_join" => &mut self.flat_hash_join,
             "gallop_index_join" => &mut self.gallop_index_join,
             "merge_left_join" => &mut self.merge_left_join,
+            "probed_optional" => &mut self.probed_optional,
             "keyed_left_join" => &mut self.keyed_left_join,
             "keyed_join" => &mut self.keyed_join,
             "point_patterns" => &mut self.point_patterns,
@@ -406,6 +420,7 @@ impl Optimizations {
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,
+            "bound_order_keys" => &mut self.bound_order_keys,
             "prefetch_constants" => &mut self.prefetch_constants,
             "prefetch_terms" => &mut self.prefetch_terms,
             "prefetch_first_scan" => &mut self.prefetch_first_scan,

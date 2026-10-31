@@ -1,0 +1,98 @@
+{
+ "explore-q7-1": {
+  "oxigraph": {
+   "exact": "2d0e0ca49533f91e",
+   "query_sha256": "9c21c01646f8c5b57a76ae3932fb3ea0b5305fcf7af5ef7ca764f65576d41a8a",
+   "rows": 2,
+   "value": "de11479dcf474a97"
+  },
+  "sparkles": {
+   "exact": "2d0e0ca49533f91e",
+   "query_sha256": "9c21c01646f8c5b57a76ae3932fb3ea0b5305fcf7af5ef7ca764f65576d41a8a",
+   "rows": 2,
+   "value": "de11479dcf474a97"
+  }
+ },
+ "explore-q7-2": {
+  "oxigraph": {
+   "exact": "99218ff7d6081212",
+   "query_sha256": "934fc07f2f3275e09c18046d11525c58e38443030f97f9123bcfadcea4621e21",
+   "rows": 2,
+   "value": "14198fe74fde102a"
+  },
+  "sparkles": {
+   "exact": "99218ff7d6081212",
+   "query_sha256": "934fc07f2f3275e09c18046d11525c58e38443030f97f9123bcfadcea4621e21",
+   "rows": 2,
+   "value": "14198fe74fde102a"
+  }
+ },
+ "explore-q7-3": {
+  "oxigraph": {
+   "exact": "00d980727535707b",
+   "query_sha256": "d8f358f9360e123e9e0c849d04cc8541b9c8e0ad25cc0cbaaf60dc18a84a2de4",
+   "rows": 9,
+   "value": "8891fb64011cf533"
+  },
+  "sparkles": {
+   "exact": "00d980727535707b",
+   "query_sha256": "d8f358f9360e123e9e0c849d04cc8541b9c8e0ad25cc0cbaaf60dc18a84a2de4",
+   "rows": 9,
+   "value": "8891fb64011cf533"
+  }
+ },
+ "explore-q8-1": {
+  "oxigraph": {
+   "boundary_rows": 0,
+   "exact": "fd0f70e83beb66e7",
+   "order": "aaa3c7fedb89cec0",
+   "query_sha256": "7bc7d7b66e14086e5948d67b956fb2d433ed5dafed0c9da27ac198d85c4ca59c",
+   "rows": 3,
+   "value": "516bd96adb772945"
+  },
+  "sparkles": {
+   "boundary_rows": 0,
+   "exact": "fd0f70e83beb66e7",
+   "order": "aaa3c7fedb89cec0",
+   "query_sha256": "7bc7d7b66e14086e5948d67b956fb2d433ed5dafed0c9da27ac198d85c4ca59c",
+   "rows": 3,
+   "value": "516bd96adb772945"
+  }
+ },
+ "explore-q8-2": {
+  "oxigraph": {
+   "boundary_rows": 0,
+   "exact": "8d23669732ad629f",
+   "order": "b62e072778a0b31a",
+   "query_sha256": "0b5f755f8a65c83a6dc77815f9bbd93d34c07c2e75aa510949b5d7d2971a287a",
+   "rows": 2,
+   "value": "e13c26846151ef17"
+  },
+  "sparkles": {
+   "boundary_rows": 0,
+   "exact": "8d23669732ad629f",
+   "order": "b62e072778a0b31a",
+   "query_sha256": "0b5f755f8a65c83a6dc77815f9bbd93d34c07c2e75aa510949b5d7d2971a287a",
+   "rows": 2,
+   "value": "e13c26846151ef17"
+  }
+ },
+ "explore-q8-3": {
+  "oxigraph": {
+   "boundary_rows": 0,
+   "exact": "b0b2d3049a625c20",
+   "order": "e14011e8e1e5315f",
+   "query_sha256": "a6115c668c85718748f1617455e8e54bde3993f6298d88b0da84b7a7f075aa73",
+   "rows": 2,
+   "value": "3a18b39522e7aeb0"
+  },
+  "sparkles": {
+   "boundary_rows": 0,
+   "exact": "b0b2d3049a625c20",
+   "order": "e14011e8e1e5315f",
+   "query_sha256": "a6115c668c85718748f1617455e8e54bde3993f6298d88b0da84b7a7f075aa73",
+   "rows": 2,
+   "value": "3a18b39522e7aeb0"
+  }
+ }
+}

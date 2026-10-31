@@ -1782,6 +1782,95 @@ pub(super) fn run(
     Ok((out.project(vars), stats))
 }
 
+/// The rows of the pattern under `probe` (a triple pattern scan with its filters, sorted
+/// on its key) whose key takes a value of `left`, read by probing the left side's
+/// distinct keys. An OPTIONAL reads its right side so when every left row binds the
+/// key: a right row with another key value is compatible with no left row, so the
+/// OPTIONAL's result is the same. `None` when the pattern cannot be probed, a left row
+/// leaves the key unbound, or probing the keys costs more than reading the pattern.
+/// The rows come in key order, as the scan returns them.
+pub(super) fn probe_for(ctx: &Ctx, probe: &Node, left: &Table) -> Result<Option<(Table, Stats)>> {
+    // an application callback in the pattern's filters runs once per row the pattern
+    // reads, which probing would change
+    if !(ctx.opt.batched_join && ctx.opt.probed_optional) || ctx.calls_extensions {
+        return Ok(None);
+    }
+    let Some((_, scan, filter)) = probe_leaf(probe) else {
+        return Ok(None);
+    };
+    let Some(side) = probe_side(probe, ctx) else {
+        return Ok(None);
+    };
+    let Some(kc) = left.col_of(side.key) else {
+        return Ok(None);
+    };
+    let col = &left.cols[kc];
+    let worth = |keys: usize| {
+        side.cost(keys as f64, probe.cost)
+            .is_some_and(|c| c < probe.cost)
+    };
+    // Probing costs more with more keys. The left side's rows bound its keys, and a
+    // left side sorted on the key counts them by its runs, up to the most keys for
+    // which probing pays; an unsorted one is not sorted only to find that probing does
+    // not pay.
+    let sorted = left.sorted.first() == Some(&side.key);
+    if !worth(col.len()) {
+        if !sorted || !worth(1) {
+            return Ok(None);
+        }
+        // An empty or one-row left side has at most one key, which pays. A longer one
+        // has the most keys that pay in [1, len).
+        if col.len() > 1 {
+            let (mut most, mut over) = (1, col.len());
+            while over - most > 1 {
+                let m = most + (over - most) / 2;
+                if worth(m) { most = m } else { over = m }
+            }
+            let mut runs = 1;
+            for w in col.windows(2) {
+                runs += usize::from(w[0] != w[1]);
+                if runs > most {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    if col.iter().any(|x| x.is_undef()) {
+        return Ok(None);
+    }
+    let held = ctx.charge(super::ctx::table_bytes(col.len(), 1))?;
+    let mut keys: Vec<u64> = col.iter().map(|x| x.0).collect();
+    if !sorted {
+        keys.sort_unstable();
+    }
+    keys.dedup();
+    let spec = IndexJoinSpec {
+        key: side.key,
+        probes: vec![Probe {
+            scan: scan.clone(),
+            filter,
+            star: None,
+        }],
+    };
+    let mut stats = Stats {
+        keys: keys.len(),
+        ..Stats::default()
+    };
+    let mut t = if keys.is_empty() {
+        Table::new(scan.cols.iter().map(|c| c.1).collect())
+    } else {
+        read_probes(ctx, &spec, &keys, false, &mut stats)?
+            .pop()
+            .expect("one probe")
+    };
+    drop(held);
+    // the probe table's first column is the key, read in key order
+    if t.cols[0].is_sorted() {
+        t.sorted = vec![side.key];
+    }
+    Ok(Some((t.project(&probe.vars), stats)))
+}
+
 /// Whether the second column is ordered within every primary-key span. Check the
 /// actual table so alternate readers and filtered scans retain their fallback.
 fn ordered_secondary(ctx: &Ctx, table: &Table) -> Result<bool> {

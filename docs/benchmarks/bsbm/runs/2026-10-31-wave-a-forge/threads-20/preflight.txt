@@ -1,0 +1,18 @@
+2026-10-31T20:58:16Z
+ 16:58:16  up 7 days  0:18,  0 users,  load average: 1.17, 1.83, 2.58
+               total        used        free      shared  buff/cache   available
+Mem:           15620        1411        4033          12       10653       14208
+Swap:           8191         456        7735
+powersave
+    PID %CPU COMMAND
+ 713806  0.9 .tailscaled-wra
+ 713759  0.2 netbird
+3882435  0.2 kworker/u81:4-kcryptd-254:0-1
+3352020  0.2 kworker/u81:21-kcryptd-254:0-1
+3871029  0.2 kworker/u81:2-kcryptd-254:0-1
+   1698  0.2 herdr
+3251136  0.2 kworker/u81:10-kcryptd-254:0-1
+3871080  0.2 kworker/u81:14-kcryptd-254:0-1
+3495722  0.2 kworker/u81:1-kcryptd-254:0-1
+ 714923  0.2 otelcol-contrib
+3426406  0.2 kworker/u81:13-events_unbound

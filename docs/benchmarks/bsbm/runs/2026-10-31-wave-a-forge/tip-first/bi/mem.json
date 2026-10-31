@@ -1,0 +1,122 @@
+{
+ "idle": {
+  "sparkles": 83,
+  "oxigraph": 30,
+  "qlever": 50
+ },
+ "queries": {
+  "explore-q7-1": {
+   "sparkles": {
+    "before": 81,
+    "peak": 97,
+    "delta": 16
+   },
+   "oxigraph": {
+    "before": 30,
+    "peak": 32,
+    "delta": 2
+   }
+  },
+  "explore-q7-2": {
+   "sparkles": {
+    "before": 105,
+    "peak": 112,
+    "delta": 7
+   },
+   "oxigraph": {
+    "before": 32,
+    "peak": 32,
+    "delta": 0
+   }
+  },
+  "explore-q7-3": {
+   "sparkles": {
+    "before": 114,
+    "peak": 124,
+    "delta": 10
+   },
+   "oxigraph": {
+    "before": 32,
+    "peak": 33,
+    "delta": 1
+   }
+  },
+  "explore-q8-1": {
+   "sparkles": {
+    "before": 124,
+    "peak": 133,
+    "delta": 9
+   },
+   "oxigraph": {
+    "before": 33,
+    "peak": 33,
+    "delta": 0
+   }
+  },
+  "explore-q8-2": {
+   "sparkles": {
+    "before": 133,
+    "peak": 136,
+    "delta": 3
+   },
+   "oxigraph": {
+    "before": 33,
+    "peak": 33,
+    "delta": 0
+   }
+  },
+  "explore-q8-3": {
+   "sparkles": {
+    "before": 136,
+    "peak": 138,
+    "delta": 2
+   },
+   "oxigraph": {
+    "before": 33,
+    "peak": 33,
+    "delta": 0
+   }
+  },
+  "bi-q3-1": {
+   "sparkles": {
+    "before": 83,
+    "peak": 192,
+    "delta": 109
+   },
+   "qlever": {
+    "before": 50,
+    "peak": 70,
+    "delta": 20
+   }
+  },
+  "bi-q3-2": {
+   "sparkles": {
+    "before": 196,
+    "peak": 264,
+    "delta": 68
+   },
+   "qlever": {
+    "before": 68,
+    "peak": 86,
+    "delta": 18
+   }
+  },
+  "bi-q3-3": {
+   "sparkles": {
+    "before": 264,
+    "peak": 288,
+    "delta": 24
+   },
+   "qlever": {
+    "before": 84,
+    "peak": 126,
+    "delta": 42
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 243,
+  "oxigraph": 33,
+  "qlever": 100
+ }
+}

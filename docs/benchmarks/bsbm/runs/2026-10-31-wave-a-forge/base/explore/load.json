@@ -1,0 +1,26 @@
+{
+ "results": [
+  {
+   "command": "sparkles",
+   "mean": 5.37355,
+   "stddev": 0.0,
+   "times": [
+    5.37355
+   ],
+   "exit_codes": [
+    0
+   ]
+  },
+  {
+   "command": "oxigraph",
+   "mean": 24.2471,
+   "stddev": 0.0,
+   "times": [
+    24.2471
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

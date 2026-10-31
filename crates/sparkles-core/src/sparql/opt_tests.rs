@@ -2074,3 +2074,256 @@ mod cold_reads {
         );
     }
 }
+
+// ------------------------------------------------------------ probed OPTIONAL ------
+
+/// 8,000 reviews with optional ratings, a few of them for one product.
+fn review_store() -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..8_000 {
+        ttl.push_str(&format!("ex:r{i} ex:for ex:p{} .\n", i % 2_000));
+        if i % 3 != 0 {
+            ttl.push_str(&format!("ex:r{i} ex:rating {} .\n", i % 10));
+        }
+        if i % 4 == 0 {
+            // a review with two values of one rating
+            ttl.push_str(&format!("ex:r{i} ex:rating {} .\n", i % 7 + 100));
+        }
+        ttl.push_str(&format!("ex:r{i} ex:title \"t{i}\" .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    s
+}
+
+#[test]
+fn optional_probes_the_pattern_for_a_small_left_side() {
+    let s = review_store();
+    for text in [
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?t ?x WHERE { ?r ex:for ex:p7 ; ex:title ?t OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x FILTER(?x > 3) } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } FILTER(!BOUND(?x) || ?x < 100) }",
+        "SELECT ?r ?x ?y WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } OPTIONAL { ?r ex:rating ?y } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ?p VALUES ?p { ex:p7 ex:p8 ex:p1999 } OPTIONAL { ?r ex:rating ?x } }",
+    ] {
+        same_answer(&s, text, "desc:probed for the left side's keys");
+    }
+}
+
+#[test]
+fn optional_reads_the_pattern_for_a_large_left_side() {
+    let s = review_store();
+    let r = run(
+        &s,
+        "SELECT ?r ?x WHERE { ?r ex:for ?p OPTIONAL { ?r ex:rating ?x } }",
+        Optimizations::ALL,
+    );
+    assert!(!has_desc(&r.plan, "probed for the left side's keys"));
+    same_rows(
+        &s,
+        "SELECT ?r ?x WHERE { ?r ex:for ?p OPTIONAL { ?r ex:rating ?x } }",
+    );
+}
+
+#[test]
+fn optional_probe_reads_changed_rows() {
+    let s = review_store();
+    update(
+        &s,
+        "DELETE DATA { ex:r7 ex:rating 7 } ; INSERT DATA { ex:r7 ex:rating 42 . ex:r2007 ex:rating 43 . ex:new ex:for ex:p7 . ex:new ex:rating 44 }",
+    );
+    let rows = same_answer(
+        &s,
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 OPTIONAL { ?r ex:rating ?x } }",
+        "desc:probed for the left side's keys",
+    );
+    assert!(rows.iter().any(|r| r.contains("\"42\"")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("\"43\"")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("\"44\"")), "{rows:?}");
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.starts_with("<http://ex.org/r7>") && r.contains("\"7\"")),
+        "{rows:?}"
+    );
+}
+
+/// A left side that leaves the key unbound in a row reads the whole pattern.
+#[test]
+fn optional_with_an_unbound_left_key_reads_the_pattern() {
+    let s = review_store();
+    let text = "SELECT ?r ?x WHERE { { ?r ex:for ex:p7 } UNION { BIND(1 AS ?one) } OPTIONAL { ?r ex:rating ?x } }";
+    let r = run(&s, text, Optimizations::ALL);
+    assert!(!has_desc(&r.plan, "probed for the left side's keys"));
+    same_rows(&s, text);
+}
+
+/// An empty left side, sorted on the key, still decides whether to probe.
+#[test]
+fn optional_with_an_empty_sorted_left_side() {
+    let s = review_store();
+    for text in [
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 FILTER(?r = ex:none) OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:none OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 . ?r ex:for ex:p8 OPTIONAL { ?r ex:rating ?x } }",
+        "SELECT ?r ?x WHERE { ?r ex:for ex:p7 FILTER(STRLEN(STR(?r)) > 100) OPTIONAL { ?r ex:rating ?x } }",
+    ] {
+        assert!(same_rows(&s, text).is_empty(), "{text}");
+    }
+}
+
+// ---------------------------------------------------- comparisons decided on ids ------
+
+/// Dates and dateTimes with and without timezones, non-canonical and invalid forms, and
+/// other kinds of value, in an object column that the filters do not scan in order.
+#[test]
+fn calendar_comparisons_match_the_generic_filter() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    let tzs = ["", "Z", "+14:00", "-14:00", "+05:30", "-09:00"];
+    for i in 0..6_000i64 {
+        let day = i % 120;
+        let (m, d) = (1 + day / 28, 1 + day % 28);
+        let tz = tzs[(i % 6) as usize];
+        let v = match i % 9 {
+            0..=3 => format!("\"2008-{m:02}-{d:02}{tz}\"^^xsd:date"),
+            4 | 5 => format!(
+                "\"2008-{m:02}-{d:02}T{:02}:30:00{tz}\"^^xsd:dateTime",
+                i % 24
+            ),
+            6 => format!("\"2008-{m}-{d}\"^^xsd:date"),
+            7 => format!("{}", 20080000 + day),
+            _ => format!("\"2008-{m:02}-{d:02}\""),
+        };
+        ttl.push_str(&format!("ex:s{i} ex:d {v} .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    for (lo, hi) in [
+        ("\"2008-02-29\"^^xsd:date", "\"2008-03-28\"^^xsd:date"),
+        (
+            "\"2008-02-01Z\"^^xsd:date",
+            "\"2008-02-03+14:00\"^^xsd:date",
+        ),
+        (
+            "\"2008-01-10T00:00:00\"^^xsd:dateTime",
+            "\"2008-04-01T12:00:00-05:00\"^^xsd:dateTime",
+        ),
+    ] {
+        for text in [
+            format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e >= {lo} && ?e < {hi}) }}"
+            ),
+            format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e > {lo}) FILTER(?e <= {hi}) }}"
+            ),
+            format!("SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER({lo} < ?e) }}"),
+            format!("SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e = {lo}) }}"),
+            format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e < {hi} && STRLEN(STR(?e)) > 10) }}"
+            ),
+        ] {
+            same_answer(&s, &text, "desc:decided on ids");
+        }
+        // a date and a number: no rule decides both
+        same_rows(
+            &s,
+            &format!(
+                "SELECT ?s ?d WHERE {{ ?s ex:d ?d BIND(?d AS ?e) FILTER(?e >= {lo} && ?e < 20080050) }}"
+            ),
+        );
+    }
+    let r = run(
+        &s,
+        "SELECT ?s WHERE { ?s ex:d ?d FILTER(?d >= \"2008-02-29\"^^xsd:date) }",
+        Optimizations::ALL,
+    );
+    assert!(!r.rows().is_empty());
+}
+
+#[test]
+fn numeric_comparisons_on_an_unordered_column_match_the_generic_filter() {
+    let s = range_store();
+    for t in THRESHOLDS {
+        same_rows(
+            &s,
+            &format!(
+                "SELECT ?s ?v WHERE {{ ?s ex:v ?v FILTER(STRSTARTS(STR(?s), \"http\") && ?v >= {t} && ?v != 3) }} ORDER BY ?s"
+            ),
+        );
+        same_rows(
+            &s,
+            &format!("SELECT ?s ?w WHERE {{ ?s ex:v ?v BIND(?v * 2 AS ?w) FILTER(?w < {t}) }}"),
+        );
+    }
+}
+
+// ------------------------------------------------------------ bound ORDER BY keys ------
+
+#[test]
+fn order_keys_equal_to_a_select_expression_order_by_its_variable() {
+    let s = range_store();
+    for text in [
+        "SELECT ?s (?v * 2 AS ?w) WHERE { ?s ex:v ?v } ORDER BY DESC(?v * 2) ?s LIMIT 7",
+        "SELECT ?s ?w WHERE { ?s ex:v ?v BIND(xsd:float(?v) / 3 AS ?w) } ORDER BY ?s DESC(xsd:float(?v) / 3) LIMIT 7",
+        "SELECT ?s (STR(?v) AS ?w) WHERE { ?s ex:v ?v } ORDER BY STR(?v) ?s OFFSET 3 LIMIT 5",
+        "SELECT ?s (?v * 2 AS ?w) WHERE { ?s ex:v ?v FILTER(?v < 10) } ORDER BY (?v * 2) ?s",
+    ] {
+        let a = run(&s, text, Optimizations::ALL);
+        let b = run(&s, text, Optimizations::NONE);
+        // ordered results: the rows must also come in the same order
+        let rows = |r: &QueryResult| -> Vec<String> {
+            r.rows().into_iter().map(|row| format!("{row:?}")).collect()
+        };
+        assert_eq!(rows(&a), rows(&b), "{text}");
+        assert!(has_desc(&a.plan, "(?w)"), "{text}: {:#?}", a.plan);
+        assert!(!has_desc(&b.plan, "(?w)"), "{text}");
+    }
+    // a random value is evaluated again
+    let r = run(
+        &s,
+        "SELECT ?s (RAND() * ?v AS ?w) WHERE { ?s ex:v ?v } ORDER BY (RAND() * ?v) LIMIT 2",
+        Optimizations::ALL,
+    );
+    assert!(!has_desc(&r.plan, "(?w)"));
+}
+
+/// A later BIND gives a variable of the expression another value at the ORDER BY.
+#[test]
+fn order_keys_reading_a_later_binding_are_evaluated_again() {
+    let s = range_store();
+    for text in [
+        "SELECT ?i WHERE { VALUES ?i { 1 2 } BIND(COALESCE(?x, ?i) AS ?sort) BIND(-?i AS ?x) } ORDER BY COALESCE(?x, ?i)",
+        "SELECT ?i WHERE { VALUES ?i { 1 2 } BIND(COALESCE(?x, ?i) AS ?sort) BIND(-?i AS ?x) } ORDER BY COALESCE(?x, ?i) LIMIT 1",
+    ] {
+        let a = run(&s, text, Optimizations::ALL);
+        let rows: Vec<String> = a.rows().into_iter().map(|r| format!("{r:?}")).collect();
+        assert!(rows[0].contains("\"2\""), "{text}: {rows:?}");
+        assert!(!has_desc(&a.plan, "(?sort)"), "{text}");
+    }
+}
+
+/// An initial binding of a BIND's variable substitutes a constant for it, so the ORDER
+/// BY key keeps its expression.
+#[test]
+fn order_keys_skip_a_bind_whose_variable_is_initially_bound() {
+    let s = range_store();
+    let text = format!(
+        "{PREFIXES}SELECT ?i WHERE {{ VALUES ?i {{ 1 2 }} BIND(-?i AS ?sort) }} ORDER BY (-?i) LIMIT 1"
+    );
+    let opts = |opt| QueryOptions {
+        optimizations: Some(opt),
+        no_cache: true,
+        initial_bindings: vec![("sort".into(), oxrdf::Literal::from(0).into())],
+        ..Default::default()
+    };
+    let a = query(s.snapshot(), &text, &opts(Optimizations::ALL)).unwrap();
+    let b = query(s.snapshot(), &text, &opts(Optimizations::NONE)).unwrap();
+    let rows = |r: &QueryResult| -> Vec<String> {
+        r.rows().into_iter().map(|row| format!("{row:?}")).collect()
+    };
+    assert_eq!(rows(&a), rows(&b));
+    assert!(rows(&a)[0].contains("\"2\""), "{:?}", rows(&a));
+}

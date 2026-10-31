@@ -1,0 +1,44 @@
+{
+ "bi-q3-1": {
+  "qlever": {
+   "exact": "004c631e7d21eab4",
+   "query_sha256": "ededf742b9927ac2fbb8aafb0d8bcabb437bab0a24f81b8143899f18db9a5a86",
+   "rows": 10,
+   "value": "ebef2c0b9b0f600e"
+  },
+  "sparkles": {
+   "exact": "ed55a5f1ff5c9080",
+   "query_sha256": "ededf742b9927ac2fbb8aafb0d8bcabb437bab0a24f81b8143899f18db9a5a86",
+   "rows": 10,
+   "value": "ebef2c0b9b0f600e"
+  }
+ },
+ "bi-q3-2": {
+  "qlever": {
+   "exact": "d4f18a5bcbefbee9",
+   "query_sha256": "7d2623be431a0cfa493017e8ffb26dbe034e834e497cb0d61e1fda030ead26da",
+   "rows": 10,
+   "value": "3234dadc9b402930"
+  },
+  "sparkles": {
+   "exact": "90723a01fb3eea50",
+   "query_sha256": "7d2623be431a0cfa493017e8ffb26dbe034e834e497cb0d61e1fda030ead26da",
+   "rows": 10,
+   "value": "3234dadc9b402930"
+  }
+ },
+ "bi-q3-3": {
+  "qlever": {
+   "exact": "0c7b4daee5765c8e",
+   "query_sha256": "3a283b1fef638f10f0a4fb18a7f47ff2baebf20ae236dfa9d0d74b55a8b1f997",
+   "rows": 10,
+   "value": "fa9410db8242c10a"
+  },
+  "sparkles": {
+   "exact": "5242c94515c9c216",
+   "query_sha256": "3a283b1fef638f10f0a4fb18a7f47ff2baebf20ae236dfa9d0d74b55a8b1f997",
+   "rows": 10,
+   "value": "fa9410db8242c10a"
+  }
+ }
+}

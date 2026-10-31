@@ -45,7 +45,16 @@ const NUMERIC_PIECE: usize = 4096;
 
 /// What one operator's expressions did, for EXPLAIN.
 #[derive(Default, Debug)]
-pub struct Report(Vec<Entry>);
+pub struct Report(Vec<Entry>, Vec<Decided>);
+
+/// Comparisons with constants that the ids of a column decided (see `rangemask`).
+#[derive(Debug)]
+struct Decided {
+    expr: String,
+    rows: usize,
+    /// the rows whose values had to be evaluated
+    tested: usize,
+}
 
 #[derive(Debug)]
 struct Entry {
@@ -58,10 +67,38 @@ struct Entry {
 impl Report {
     pub fn extend(&mut self, other: Report) {
         self.0.extend(other.0);
+        self.1.extend(other.1);
     }
 
-    /// `[expr cache: …]` for the operator's description.
+    /// Record that the ids of a column decided the comparisons `exprs` on `rows` rows,
+    /// except for `tested` rows that were evaluated.
+    pub(super) fn decided(&mut self, ctx: &Ctx, exprs: &[Expr], rows: usize, tested: usize) {
+        let expr = exprs
+            .iter()
+            .map(|e| e.display(ctx))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        self.1.push(Decided { expr, rows, tested });
+    }
+
+    /// `[decided on ids: …]` and `[expr cache: …]` for the operator's description.
     pub fn note(&self) -> Option<String> {
+        let ids = (!self.1.is_empty()).then(|| {
+            let parts: Vec<String> = self
+                .1
+                .iter()
+                .map(|d| format!("{} for {} of {} rows", d.expr, d.rows - d.tested, d.rows))
+                .collect();
+            format!("[decided on ids: {}]", parts.join("; "))
+        });
+        let cache = self.cache_note();
+        match (ids, cache) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn cache_note(&self) -> Option<String> {
         if self.0.is_empty() {
             return None;
         }

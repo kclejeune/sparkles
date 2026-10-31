@@ -2039,6 +2039,796 @@
         "durability_classes": []
       },
       "metadata_note": "The accompanying manual report and validation receipt select specific cells. Raw carried-over rows and common builder defaults do not broaden that measurement or correctness scope. Raw bytes remain unchanged."
+    },
+    {
+      "run_id": "sha256-8c1f9585e8d3842c39c3779425becd3b29cebf0b20fa5e94dd1a5e72acd97ecc",
+      "path": "runs/2026-10-31-wave-a-forge/base/explore/record.json",
+      "sha256": "8c1f9585e8d3842c39c3779425becd3b29cebf0b20fa5e94dd1a5e72acd97ecc",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-explore",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-explore",
+          "started": "2026-10-31T15:40:37Z",
+          "ended": "2026-10-31T15:41:26Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-base-d65eaf40",
+            "version": "sparkles 0.1.0",
+            "sha256": "3806d7cac9aa41d59b993d76d18a1611031c124422ab59a09456947051de7091",
+            "scripts_commit": "d65eaf40b89f2739439a69f8bdddee39227df6dc",
+            "binary_commit": "d65eaf40"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-69bce59095867375ba491a12d01036a60d6fc11b1c8181d24198acc36230c1a4",
+      "path": "runs/2026-10-31-wave-a-forge/base/bi/record.json",
+      "sha256": "69bce59095867375ba491a12d01036a60d6fc11b1c8181d24198acc36230c1a4",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-bi",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-bi",
+          "started": "2026-10-31T15:41:31Z",
+          "ended": "2026-10-31T15:42:13Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-base-d65eaf40",
+            "version": "sparkles 0.1.0",
+            "sha256": "3806d7cac9aa41d59b993d76d18a1611031c124422ab59a09456947051de7091",
+            "scripts_commit": "d65eaf40b89f2739439a69f8bdddee39227df6dc",
+            "binary_commit": "d65eaf40"
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-81a0554aa54e15d8877919ec36a0a069af29b0bd20b4403f17a96c4eb5f656c1",
+      "path": "runs/2026-10-31-wave-a-forge/tip-first/explore/record.json",
+      "sha256": "81a0554aa54e15d8877919ec36a0a069af29b0bd20b4403f17a96c4eb5f656c1",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-explore",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-explore",
+          "started": "2026-10-31T20:53:47Z",
+          "ended": "2026-10-31T20:54:06Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-0e8200a117f81a43146b057f4bdc3370e86afd4e6f6af84f1999e32cd705d24f",
+      "path": "runs/2026-10-31-wave-a-forge/tip-first/bi/record.json",
+      "sha256": "0e8200a117f81a43146b057f4bdc3370e86afd4e6f6af84f1999e32cd705d24f",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-bi",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-bi",
+          "started": "2026-10-31T20:54:08Z",
+          "ended": "2026-10-31T20:54:33Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-4d7203622e00d0e998852d8007a0ed35408f4bb8c1466e03862e8f3af9647c0f",
+      "path": "runs/2026-10-31-wave-a-forge/tip-second/explore/record.json",
+      "sha256": "4d7203622e00d0e998852d8007a0ed35408f4bb8c1466e03862e8f3af9647c0f",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-explore",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-explore",
+          "started": "2026-10-31T20:54:36Z",
+          "ended": "2026-10-31T20:54:55Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {
+            "oxigraph": {
+              "license": "MIT OR Apache-2.0",
+              "binary": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11/bin/oxigraph",
+              "sha256": "c99f9c4866b9d25f135729ac8b0e468cc0badd2c2cfe1c4b704f0db375ed8de3",
+              "version": "oxigraph 0.5.11",
+              "store_path": "/nix/store/g7ajfdk0g8bypdbsj23hnfq71izm3iz1-oxigraph-0.5.11",
+              "package": "oxigraph-0.5.11",
+              "reported_version": "oxigraph 0.5.11"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-69138311997df82b31a87da4fbd1ab85309fbf384594021bf0765c79c7cd4830",
+      "path": "runs/2026-10-31-wave-a-forge/tip-second/bi/record.json",
+      "sha256": "69138311997df82b31a87da4fbd1ab85309fbf384594021bf0765c79c7cd4830",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-bi",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-bi",
+          "started": "2026-10-31T20:54:56Z",
+          "ended": "2026-10-31T20:55:21Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {
+            "qlever": {
+              "license": "Apache-2.0",
+              "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+              "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+              "version": "0.5.48",
+              "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+              "package": "qlever-0.5.48",
+              "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+            }
+          },
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-9335cd520ab6cd7224ebd5866a596d1f31af80c09b0e3ea998a0632f633879e3",
+      "path": "runs/2026-10-31-wave-a-forge/threads-12/explore/record.json",
+      "sha256": "9335cd520ab6cd7224ebd5866a596d1f31af80c09b0e3ea998a0632f633879e3",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-explore",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-explore",
+          "started": "2026-10-31T20:56:29Z",
+          "ended": "2026-10-31T20:56:40Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {},
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-2264dac3a34bd480fbec9396047d1fa2115ce518c27c13a6101e0410d6f6e7c8",
+      "path": "runs/2026-10-31-wave-a-forge/threads-12/bi/record.json",
+      "sha256": "2264dac3a34bd480fbec9396047d1fa2115ce518c27c13a6101e0410d6f6e7c8",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-bi",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-bi",
+          "started": "2026-10-31T20:56:41Z",
+          "ended": "2026-10-31T20:58:15Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {},
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-07d24e31d6721d3e0e84b151b744164e76e4a64d2bf7d5cf796a00588ffc0d78",
+      "path": "runs/2026-10-31-wave-a-forge/threads-20/explore/record.json",
+      "sha256": "07d24e31d6721d3e0e84b151b744164e76e4a64d2bf7d5cf796a00588ffc0d78",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-explore",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-explore",
+          "started": "2026-10-31T20:58:18Z",
+          "ended": "2026-10-31T20:58:28Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {},
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
+    },
+    {
+      "run_id": "sha256-053349b8700723e3f7abb0cfe98213ca7305879cf54806de28ef5d7311f904a7",
+      "path": "runs/2026-10-31-wave-a-forge/threads-20/bi/record.json",
+      "sha256": "053349b8700723e3f7abb0cfe98213ca7305879cf54806de28ef5d7311f904a7",
+      "format": "bench-record-3",
+      "context": {
+        "suite": "bsbm-bi",
+        "scale": "10m",
+        "manifest": {
+          "suite": "bsbm-bi",
+          "started": "2026-10-31T20:58:29Z",
+          "ended": "2026-10-31T21:00:06Z",
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "ram_mib": 15620,
+            "disk_model": "",
+            "kernel": "7.2.9",
+            "filesystem": "ext4",
+            "mount_options": "rw,relatime,discard,errors=remount-ro"
+          },
+          "sparkles": {
+            "binary": "/home/kclejeune/lanes/competitive-q11-20261031/bin/sparkles-tip-47bec6f2",
+            "version": "sparkles 0.1.0",
+            "sha256": "858b6ae028d8a64f1827ebaf49035068c5b86cbd6f83297356d35fd5dd2a8bed",
+            "scripts_commit": "47bec6f206b5dbdf6ea2339b92f44cf3eccf679f",
+            "binary_commit": "47bec6f2"
+          },
+          "engines": {},
+          "memory_limit": "12G",
+          "client_cpu": "11",
+          "data": {
+            "bsbm-10m": {
+              "license": "GPL-3.0 (generator)",
+              "params": "BSBM tools 0.2 products=28480 forward-chaining seed=default triples=10095035",
+              "sha256": "db77a8d62274566c0fcf6a85634741b0313551cc217b59f4b1f26d444fd205be",
+              "bytes": 2619263591
+            }
+          },
+          "license_check": {
+            "gpl_benchmark_allowed": true,
+            "notes": [
+              "BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed"
+            ]
+          }
+        },
+        "settings": {
+          "warmup": 10,
+          "runs": 30,
+          "timer": "hyperfine+curl",
+          "resultCache": false,
+          "maxTimeSeconds": 300,
+          "serverTimeoutSeconds": 315,
+          "sparklesArgs": "",
+          "answerStreamTSVQueries": "",
+          "correctnessEngineIsolation": true,
+          "jenaHeap": "8G",
+          "jenaStack": "default",
+          "qleverMemory": "8G",
+          "bsbmMaxTimeSeconds": 1800.0,
+          "bsbmKillAfterSeconds": 5.0,
+          "bsbmWarmup": 50,
+          "bsbmRuns": 500,
+          "bsbmClients": [
+            1,
+            4,
+            16
+          ]
+        },
+        "durability_classes": []
+      }
     }
   ]
 }

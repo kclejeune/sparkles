@@ -1744,6 +1744,59 @@ cost claim from these Namespace results. Item 328 retains matched quiet Intel ch
 of these queries, including the small accepted `order-by-full` increase. Further
 optimization remains reserved for a material persistent cost or a simple broad fix.
 
+### Wave A query losses
+
+A forge recheck paired Sparkles `d65eaf40` with QLever 0.5.48 on SP²Bench `q11` at
+10M, after item 431 stopped ranking every `rdfs:seeAlso` value. Over 60 pooled requests
+in two passes with alternating engine order, Sparkles took 3.46 ms against QLever's
+43.56 ms, and both returned the same ten rows. The SP²Bench table and the loss list use
+the [run record](../benchmarks/sp2bench/runs/2026-10-31-q11-recheck-forge/README.md).
+
+BSBM Explore `q7` and `q8` read an OPTIONAL review or offer pattern whole and joined it
+with a handful of left rows. The probed OPTIONAL reads such a pattern only for the
+left side's distinct keys through the index join's reader, when its cost model says
+probing is cheaper. BI `q3` filters the 917,917 review dates twice, through
+comparisons with `xsd:date` constants, and orders by a ratio that its SELECT expression
+already computes. Comparisons decided on ids classify inline dates, dateTimes and numbers by
+their ids and evaluate only the values near a constant, in the vocabulary or computed.
+ORDER BY keys equal to a BIND or SELECT expression order by its variable. Each of the
+three is an optimization flag, and the
+[optimization guide](../internals/OPTIMIZATIONS.md) describes it.
+
+The [forge run](../benchmarks/bsbm/runs/2026-10-31-wave-a-forge/README.md) paired
+`47bec6f2` with Oxigraph and QLever in two passes with alternating engine order. Pooled
+over three instances, `q7` takes 3.78 and 3.83 ms against Oxigraph's 4.09 and 4.03 ms,
+and `q8` takes 3.75 and 3.63 ms against 3.96 and 3.93 ms. Sparkles `d65eaf40` took 5.21
+and 5.79 ms. BI `q3` takes 31.49 and 33.03 ms against QLever's 28.95 and 29.46 ms,
+where `d65eaf40` took 41.40 ms. Every instance returns the same answers from both
+engines. The Explore rows leave the loss list, and the BI `q3` row now gives QLever
+1.09 and 1.12 times.
+
+The same run timed every BI template with twelve and twenty query threads, without
+pinning the server to particular CPUs. Twelve is the number of logical CPUs of the
+performance cores. Twelve threads make `q3` take 22.65 ms instead of 34.37 ms and `q5`
+23.17 ms instead of 30.68 ms, but make `q8` 12% slower. On atlas, a host with the same
+processor, the slower side of the `q3` hash join changes between server processes.
+Work that lands on an efficiency core would explain both observations, but the run did
+not control placement. Item 449 records the thread-count effect as a possible cause of
+its slow server processes. The default pool keeps one thread per logical CPU.
+
+The Namespace screen of the first version flagged `optional-chain` at +10.6%, which
+sorted the left side's keys before the probe's cost check. It also flagged
+`subquery-agg` at +25.6%, where a numeric comparison first searched the id ranges of
+all 34 inline integer and decimal segments, about 3,800 decoded comparisons, for a
+table of 2,000 groups. The probe now checks its cost from the left side's row count or
+runs, and the comparison searches a segment only when one of its ids occurs. A pinned
+interleaved forge comparison of `d65eaf40` and `47bec6f2`, with eight rounds and one
+query thread, then measured `optional-chain` at +1.0%, `subquery-agg` at −7.0% and
+`two-hop-count`, which Namespace flagged at +8.2%, at +0.2% in server time.
+`optional-count` measured +4.9% in every round, from scanning the left side's keys
+twice before an OPTIONAL probe that did not pay. Those scans now stop at the most keys
+for which probing pays, and only an accepted probe checks for unbound keys. The same
+comparison with that change measured `optional-count` at +1.9%, about 10 µs, and
+`subquery-agg` at −7.9%, and every other query within 2.2%. A follow-up item records
+the remaining `optional-count` cost.
+
 ### Scope changes
 
 **Further engines for comparison.** The second rule in §4 left commercial editions out of scope and did not run an engine whose terms forbid publishing results. Comparisons with Virtuoso Open Source and GraphDB Free, with Blazegraph at low priority, and with RDFox and Stardog after a check of their licenses for benchmark-publication clauses, are now planned under [ROADMAP](../ROADMAP.md) item 452 in this spec's Roadmap follow-ups. A measurement stays private when publication is forbidden.
