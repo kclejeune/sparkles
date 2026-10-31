@@ -3,7 +3,7 @@
 # process uses a full CPU, then runs the harness, which holds the lock for the campaign.
 # Exits with the harness status, or 1 when the wait expires, so chain.sh stops on a failure.
 log=$1; shift
-cd ~/lanes/gc-86
+cd ~/lanes/gc-86 || exit 1
 for i in $(seq 1 1440); do
   if flock -n ~/lanes/.heavy.lock true; then
     busy=$(ps -eo pcpu=,pid=,args= | awk "\$1 > 50" | grep -v -e bench-indexed -e runlocked)

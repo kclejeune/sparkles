@@ -22,7 +22,7 @@ sparkles` from a source archive of commit `a202e8f2`, built on `atlas` and copie
 `437867bd4c39651dbd17a87a9399f10dc05c37f7bb94dc89d2fa43786b8e129b`. The `write-bench`
 client has the SHA-256 `9735fda8378e95dcec3fc8c60baefc420644973e467996ba8f1a6fd539071da6`.
 The harness is `scripts/bench-indexed-commit.py` of commit `c600c9ad`. `tools/chain.sh`
-gives the three commands. The server ran on CPUs 0 to 11 and the client on CPUs 12 and 13.
+gives the three commands. Each campaign's log ends with `exit 0`. The copies of `tools/runlocked.sh` and `tools/chain.sh` here were later changed to return the harness status and stop the chain on a failure, which the runs did not need. The server ran on CPUs 0 to 11 and the client on CPUs 12 and 13.
 
 Each cell had five blocks in the order ordinary, grouped, grouped, ordinary. Every process
 started from a fresh copy of the seed store, probed the drive first, checked every
