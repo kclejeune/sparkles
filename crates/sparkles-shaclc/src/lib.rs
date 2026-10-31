@@ -42,6 +42,8 @@ pub const EXTENSIONS: [&str; 2] = ["shaclc", "shc"];
 pub struct Document {
     /// the shapes graph (fresh blank nodes)
     pub graph: Graph,
+    /// the triples of the graph in the order the reader made them, duplicates included
+    pub triples: Vec<Triple>,
     /// the prefixes the document declares, in order
     pub prefixes: Vec<(String, String)>,
     /// the base at the end of the document (`BASE`, or the base given to the parser)

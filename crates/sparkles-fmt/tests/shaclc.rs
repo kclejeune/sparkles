@@ -697,3 +697,59 @@ fn the_output_layout_is_as_documented() {
         .text;
     assert_eq!(out, "shape <s> {\n    <p> <t> .\n}\n");
 }
+
+#[test]
+fn symmetric_shapes_format_quickly() {
+    // Several property shapes that differ only in their blank nodes make a graph whose
+    // canonical labelling is factorial in the number of symmetric nodes. The equivalence
+    // check must neither hang nor refuse the output.
+    let q = "<q> IRI . ".repeat(9);
+    let text = format!("shape <s> {{ <p> {{ {q}}} . <p> {{ {q}}} . }}");
+    let start = std::time::Instant::now();
+    let out = format(&text, Language::Shaclc, &Options::default())
+        .unwrap_or_else(|e| panic!("{e}"))
+        .text;
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(fmt(&out), out);
+    // and a larger one, with the output reformatted under another width
+    let q = "<q> IRI . ".repeat(20);
+    let body = format!("<p> {{ {q}}} . ").repeat(6);
+    let text = format!("shape <s> {{ {body}}}");
+    let start = std::time::Instant::now();
+    let opts = Options {
+        line_width: 40,
+        ..Options::default()
+    };
+    format(&text, Language::Shaclc, &opts).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn directive_only_documents_are_detected_as_shaclc() {
+    use sparkles_fmt::{Detection, detect};
+    for text in [
+        "BASE <http://e/> IMPORTS <http://e/o>",
+        "IMPORTS <http://e/o>\n",
+        "prefix ex: <http://e/>\nimports <http://e/o>\n",
+        "# header\nIMPORTS <http://e/o>\n",
+    ] {
+        assert_eq!(
+            detect(None, text),
+            Detection::Lang(Language::Shaclc),
+            "{text:?}"
+        );
+    }
+    // the SPARQL-style directives alone stay Turtle
+    assert_eq!(
+        detect(None, "BASE <http://e/>\nPREFIX ex: <http://e/>\n"),
+        Detection::Lang(Language::Turtle)
+    );
+}

@@ -102,6 +102,132 @@ pub fn isomorphic(a: &[Quad], b: &[Quad]) -> bool {
     canonical(a) == canonical(b)
 }
 
+/// The most blank nodes [`isomorphic_bounded`] canonicalizes exactly.
+pub const EXACT_BLANK_NODES: usize = 8;
+
+/// Like [`isomorphic`], with the work bounded. The fast path is the same. When it fails,
+/// a graph with at most [`EXACT_BLANK_NODES`] blank nodes on each side is canonicalized
+/// as before. A larger one is compared by colour refinement, which is polynomial but
+/// weaker. It can call two non-isomorphic graphs equal only when refinement cannot tell
+/// their blank nodes apart, which no graph a formatter's reordering produces does.
+/// Canonicalizing many symmetric blank nodes takes factorial time and does not check
+/// the formatter's deadline, so input from the network must not reach it.
+pub fn isomorphic_bounded(a: &[Quad], b: &[Quad]) -> bool {
+    if relabeled(a) == relabeled(b) {
+        return true;
+    }
+    if blank_nodes(a) <= EXACT_BLANK_NODES && blank_nodes(b) <= EXACT_BLANK_NODES {
+        return isomorphic(a, b);
+    }
+    refined(a) == refined(b)
+}
+
+fn blank_nodes(quads: &[Quad]) -> usize {
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    for q in quads {
+        let mut r = Relabel(&mut names);
+        r.subject(&q.subject);
+        r.term(&q.object);
+        if let GraphName::BlankNode(b) = &q.graph_name {
+            r.blank(b);
+        }
+    }
+    names.len()
+}
+
+/// The sorted hashes of the quads after colour refinement of the blank nodes: each
+/// round colours a blank node by its old colour and the sorted descriptions of the quads
+/// it occurs in, with other blank nodes standing for their colours.
+fn refined(quads: &[Quad]) -> Vec<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    fn h<T: Hash>(t: &T) -> u64 {
+        let mut s = DefaultHasher::new();
+        t.hash(&mut s);
+        s.finish()
+    }
+    // a term as a number: a blank node by its colour, anything else by its text
+    fn term(t: &Term, colour: &HashMap<String, u64>) -> u64 {
+        match t {
+            Term::BlankNode(b) => h(&(1u8, colour[b.as_str()])),
+            other => h(&(2u8, other.to_string())),
+        }
+    }
+    fn subject(s: &NamedOrBlankNode, colour: &HashMap<String, u64>) -> u64 {
+        match s {
+            NamedOrBlankNode::BlankNode(b) => h(&(1u8, colour[b.as_str()])),
+            other => h(&(2u8, other.to_string())),
+        }
+    }
+    fn graph(g: &GraphName, colour: &HashMap<String, u64>) -> u64 {
+        match g {
+            GraphName::BlankNode(b) => h(&(1u8, colour[b.as_str()])),
+            other => h(&(2u8, other.to_string())),
+        }
+    }
+    let mut colour: HashMap<String, u64> = HashMap::new();
+    for q in quads {
+        if let NamedOrBlankNode::BlankNode(b) = &q.subject {
+            colour.insert(b.as_str().to_string(), 0);
+        }
+        if let Term::BlankNode(b) = &q.object {
+            colour.insert(b.as_str().to_string(), 0);
+        }
+        if let GraphName::BlankNode(b) = &q.graph_name {
+            colour.insert(b.as_str().to_string(), 0);
+        }
+    }
+    // the rounds are fixed, so both sides of a comparison are refined alike
+    for _ in 0..12 {
+        let mut seen: HashMap<String, Vec<u64>> = HashMap::new();
+        for q in quads {
+            let (s, o, g) = (
+                subject(&q.subject, &colour),
+                term(&q.object, &colour),
+                graph(&q.graph_name, &colour),
+            );
+            let p = h(&q.predicate.as_str());
+            if let NamedOrBlankNode::BlankNode(b) = &q.subject {
+                seen.entry(b.as_str().to_string())
+                    .or_default()
+                    .push(h(&(0u8, p, o, g)));
+            }
+            if let Term::BlankNode(b) = &q.object {
+                seen.entry(b.as_str().to_string())
+                    .or_default()
+                    .push(h(&(1u8, p, s, g)));
+            }
+            if let GraphName::BlankNode(b) = &q.graph_name {
+                seen.entry(b.as_str().to_string())
+                    .or_default()
+                    .push(h(&(2u8, p, s, o)));
+            }
+        }
+        let next: HashMap<String, u64> = colour
+            .iter()
+            .map(|(k, c)| {
+                let mut v = seen.remove(k).unwrap_or_default();
+                v.sort_unstable();
+                (k.clone(), h(&(*c, v)))
+            })
+            .collect();
+        colour = next;
+    }
+    let mut out: Vec<u64> = quads
+        .iter()
+        .map(|q| {
+            h(&(
+                subject(&q.subject, &colour),
+                q.predicate.as_str(),
+                term(&q.object, &colour),
+                graph(&q.graph_name, &colour),
+            ))
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// A term with its blank node numbered by first occurrence, borrowing the rest: the fast
 /// path compares these without copying any string.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -187,6 +313,39 @@ mod tests {
         );
         assert!(isomorphic(&d, &e));
         assert!(!isomorphic(&d, &quads("_:a <http://e/p> 1 .", t)));
+    }
+
+    #[test]
+    fn bounded_comparison_does_not_blow_up_on_symmetric_blank_nodes() {
+        let t = Language::Turtle;
+        // two nodes with eleven identical blank children each, listed in different orders
+        let doc = |order: &[usize]| {
+            let mut s = String::new();
+            for &i in order {
+                let parent = if i < 11 { "a" } else { "b" };
+                s.push_str(&format!(
+                    "_:{parent} <http://e/p> _:c{i} . _:c{i} <http://e/q> 1 .\n"
+                ));
+            }
+            quads(&s, t)
+        };
+        let fwd: Vec<usize> = (0..22).collect();
+        let rev: Vec<usize> = (0..22).rev().collect();
+        let start = std::time::Instant::now();
+        assert!(isomorphic_bounded(&doc(&fwd), &doc(&rev)));
+        // one child fewer on one side
+        assert!(!isomorphic_bounded(&doc(&fwd), &doc(&fwd[1..])));
+        // the same shape with a different value on one child
+        let mut other = doc(&rev);
+        other.pop();
+        other.push(Quad::new(
+            oxrdf::BlankNode::new("zz").unwrap(),
+            oxrdf::NamedNode::new("http://e/q").unwrap(),
+            Literal::from(2),
+            GraphName::DefaultGraph,
+        ));
+        assert!(!isomorphic_bounded(&doc(&fwd), &other));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

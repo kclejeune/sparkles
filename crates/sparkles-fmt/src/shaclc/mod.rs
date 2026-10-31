@@ -8,7 +8,7 @@ pub mod parse;
 pub mod print;
 
 use crate::check::LangImpl;
-use crate::check::graph::isomorphic;
+use crate::check::graph::isomorphic_bounded;
 use crate::doc::Printed;
 use crate::lex::{LexMode, Token};
 use crate::tree::Tree;
@@ -44,10 +44,12 @@ pub fn parse_reference(text: &str) -> Result<Vec<Quad>, FormatError> {
             offset,
         }
     })?;
+    // in the reader's order, so equal documents number their blank nodes alike and the
+    // comparison takes its fast path
     Ok(doc
-        .graph
-        .iter()
-        .map(|t| t.into_owned().in_graph(GraphName::DefaultGraph))
+        .triples
+        .into_iter()
+        .map(|t| t.in_graph(GraphName::DefaultGraph))
         .collect::<Vec<Quad>>())
 }
 
@@ -100,7 +102,7 @@ impl LangImpl for Shaclc {
             check: Check::Graph,
         };
         let out = parse_reference(output).map_err(|_| unsafe_.clone())?;
-        match isomorphic(&r.quads, &out) {
+        match isomorphic_bounded(&r.quads, &out) {
             true => Ok(()),
             false => Err(unsafe_),
         }

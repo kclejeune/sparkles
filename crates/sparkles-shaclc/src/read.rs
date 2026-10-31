@@ -54,6 +54,7 @@ pub(crate) fn parse(text: &str, base: Option<&str>) -> Result<Document, SyntaxEr
     }
     Ok(Document {
         graph,
+        triples: p.out,
         prefixes: p.declared,
         base: p.base.map(Iri::into_inner),
     })

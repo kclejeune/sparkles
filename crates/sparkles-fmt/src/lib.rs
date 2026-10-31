@@ -232,11 +232,17 @@ fn sniff(text: &str) -> Detection {
     // the prologue: SPARQL-style directives, and Turtle's `@prefix` family (lexed as
     // language tags here) with their final `.`
     let mut i = 0;
+    let mut imports = false;
     loop {
         let turtle = at(i) == T::LangDir;
         let skip = match word(i).as_str() {
             "prefix" => 3,
-            "base" | "version" | "imports" => 2,
+            "base" | "version" => 2,
+            // no other syntax has the directive
+            "imports" => {
+                imports = true;
+                2
+            }
             _ => break,
         };
         i += skip;
@@ -265,6 +271,10 @@ fn sniff(text: &str) -> Detection {
     }
     // SHACLC: `shape` and `shapeClass` are bare words no other syntax starts with
     if at(i) == T::Word && matches!(word(i).as_str(), "shape" | "shapeclass") {
+        return Detection::Lang(Language::Shaclc);
+    }
+    // a document of directives alone, with an `IMPORTS` among them
+    if imports && at(i) == T::Eof {
         return Detection::Lang(Language::Shaclc);
     }
     if word(i) == "graph" || at(i) == T::LBrace || at(i + 1) == T::LBrace {
