@@ -1610,6 +1610,15 @@ mod tests {
         .unwrap();
         go.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap().commit.seq, 2);
+        // the transaction is abandoned and its term rolled back, as a dry run or a failed
+        // commit does
+        let generation = t.base.generation.clone();
+        generation.dvocab.rollback(&t.mark).unwrap();
+        assert_eq!(
+            generation.dvocab.len(),
+            t.mark.entries(),
+            "the rolled back term is gone"
+        );
         drop(t);
         // power loss now: only what the fences and the rollback synchronized is on disk
         let crashed = dir.path().join("crashed");

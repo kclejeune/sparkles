@@ -281,8 +281,7 @@ fn encode_chunks(first: u64, keys: &[Arc<[u8]>], header: bool) -> Result<Vec<u8>
             k.len()
         )));
     }
-    let total: usize = keys.iter().map(|k| 4 + k.len()).sum();
-    let mut out = Vec::with_capacity(HEADER + total + CHUNK_HEADER * (1 + total / MAX_CHUNK));
+    let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < keys.len() {
         let (mut end, mut size) = (start, 0usize);
@@ -290,13 +289,14 @@ fn encode_chunks(first: u64, keys: &[Arc<[u8]>], header: bool) -> Result<Vec<u8>
             size += 4 + keys[end].len();
             end += 1;
         }
-        encode_chunk(
-            &mut out,
-            first + start as u64,
-            &keys[start..end],
-            header && start == 0,
-        );
+        chunks.push(start..end);
         start = end;
+    }
+    let total: usize = keys.iter().map(|k| 4 + k.len()).sum();
+    let mut out = Vec::with_capacity(HEADER + total + CHUNK_HEADER * chunks.len());
+    for range in chunks {
+        let header = header && range.start == 0;
+        encode_chunk(&mut out, first + range.start as u64, &keys[range], header);
     }
     Ok(out)
 }
@@ -1252,6 +1252,20 @@ mod tests {
 
     fn entry(k: &[u8]) -> Vec<u8> {
         [&(k.len() as u32).to_le_bytes()[..], k].concat()
+    }
+
+    /// The buffer of a write spanning many chunks is allocated once, at its size.
+    #[test]
+    fn a_write_of_many_chunks_allocates_its_size() {
+        let keys: Vec<Arc<[u8]>> = (0..8u8)
+            .map(|n| Arc::from(vec![b'a' + n; MAX_CHUNK / 2 + 1]))
+            .collect();
+        let out = encode_chunks(0, &keys, true).unwrap();
+        assert_eq!(
+            out.len(),
+            HEADER + 8 * (CHUNK_HEADER + 4 + MAX_CHUNK / 2 + 1)
+        );
+        assert_eq!(out.capacity(), out.len());
     }
 
     /// A write of more terms than one chunk holds, such as a group commit fence's, spans
