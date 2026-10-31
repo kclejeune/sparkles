@@ -377,7 +377,7 @@ cold for Sparkles, against 13.5 and 43.8 ms for QLever. Its curl process adds ab
 Sparkles varies more between server processes than QLever does on this query. Most of its
 warm processes take 3 to 5 ms, but one of the 20 rounds took 15.4 ms for the whole
 process, and one of the five hyperfine passes took about 24 ms for each request. The
-cause is open under roadmap item NEW-ITEM, and the medians above include these processes.
+cause is open under roadmap item 449, and the medians above include these processes.
 The [run record](runs/2026-10-31-births-by-decade-forge/record.json) keeps the samples,
 binary hashes and settings of both timers.
 
