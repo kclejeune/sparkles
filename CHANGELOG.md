@@ -432,8 +432,7 @@ export is not cut off. Over HTTP a client that reads nothing for longer than the
 request's timeout ends the stream as a timeout. This applies to `execution=streaming` as
 well. A local `sparkles query --timeout` still counts the time its output is blocked.
 
-`sparkles serve --spill on` enables disk spill. It remains off by default until all
-Phase 2b acceptance gates pass. A streamed sort without LIMIT, a grouping, a
+`sparkles serve` spills to disk by default, and `--spill off` turns spill off. A streamed sort without LIMIT, a grouping, a
 DISTINCT, a hash join and a long run of equal keys in a merge join write what does not
 fit in their memory budget to `--spill-dir` (default `<data>/.spill`) and finish. The disk is limited by `--spill-max-mb` for the
 server and `--query-spill-mb` for one query, a request may lower the latter with
@@ -446,15 +445,33 @@ and may spill. A spilled hash join keeps its probe input's order only when an op
 above it may rely on that order, and otherwise emits its partitions in turn.
 `--spill encrypted` seals every spill frame with AES-256-GCM under a random key for each
 file held only in memory, so a changed, moved, reordered or truncated frame fails the
-query, and `--spill off` turns spill off. When the spill directory cannot be used, sits
-on tmpfs or ramfs, is not owned by the server's user or is writable by others, the
-server fails to start when spill is enabled. An ordinary start leaves the spill
-directory unopened. `--spill-max-mb 0` is refused. `/$/server/memory` adds a `spill` object and
+query. When the spill directory cannot be used, sits on tmpfs or ramfs, is not owned by
+the server's user or is writable by others, the server fails to start with `--spill on`
+or `--spill encrypted` given, and without `--spill` it logs a warning and runs without
+spill. `--spill off` leaves the spill directory unopened. `--spill-max-mb 0` is refused. `/$/server/memory` adds a `spill` object and
 `/$/metrics` the `sparkles_spill_*` series, `sparkles_spill_eager_retries_total`
 among them. A streamed grouping over a join can concatenate a `GROUP_CONCAT` in another
 order than an eager one, which SPARQL allows, and an ordered subquery fixes the order in
 both. Rust callers set
 `QueryOptions::spill` and `max_spill_bytes`, and `BudgetKind::Spill` is a new variant.
+
+A cursor operator that reaches its end gives back what it and the operators below it
+hold for reading, such as the decoded block that each scan keeps charged, and a later
+pass of a spilled grouping or DISTINCT sizes itself from the memory it has when it starts.
+A spilled hash join below a grouping of COUNT, SUM, AVG, MIN and MAX, or below a FILTER,
+no longer writes its output a second time to restore its probe input's order, so a
+spilled SUM or AVG of doubles may round differently in its last bits than in memory. A
+SUM or AVG of integers keeps a 128-bit running sum and is unbound only when its result
+leaves the `xsd:integer` range, where it used to fail whenever a partial sum did. A
+DISTINCT over input ordered on some of its columns holds one run of the first order
+column at a time instead of every row it emitted.
+
+At 10.5M on forge with eight threads, the grouping above a spilled join takes 1.5 s
+under a 4 MiB budget where it took 16.4 s, and writes 135 MB where it wrote 592 MB. A
+DISTINCT over input ordered on its first column holds 1.2 MB where it held 479 MB, and
+the cursor takes 174 ms where it took 800 ms. A server with spill on and the same server with spill
+off returned the same answers to all 30 synthetic queries, and their server times had
+geometric means of 0.991 and 0.995 for spill on over spill off.
 
 A streamed FILTER over an index scan reads the scan in morsels of whole index blocks and
 filters each morsel in parallel when every conjunct is a key test on the scan's key

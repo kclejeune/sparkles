@@ -1882,7 +1882,7 @@ Query parameters beyond the standard protocol:
   keeps its group state. All of that memory counts against the query budget. Sorting
   reads its whole input into budgeted memory before the first row. DESCRIBE and
   unsupported operators also read their whole input first, which the plan shows, and
-  that memory is budgeted too. With `--spill on` or `encrypted`, a sort without
+  that memory is budgeted too. With spill on, the default, a sort without
   LIMIT, a grouping, a DISTINCT and a join write what does not fit to disk and finish
   within the budget (see [Disk spill](#disk-spill)). A query that exceeds the budget
   otherwise fails, so streaming does not keep every query in constant memory. SELECT in SPARQL
@@ -9424,9 +9424,8 @@ short.
 
 The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
 Spill lets a streamed query finish within its memory budget by writing to disk what does
-not fit. It is off by default.
-`sparkles serve --spill on` enables it, and `--spill encrypted` also encrypts every
-spill file. These operators spill when it is enabled.
+not fit. `sparkles serve` spills by default, `--spill encrypted` also encrypts every
+spill file, and `--spill off` turns spill off. These operators spill when it is on.
 
 * A sort without LIMIT writes sorted runs once its input would take half the memory the
   query had when the sort started, and merges up to 64 runs at a time, with one frame of
@@ -9435,23 +9434,31 @@ spill file. These operators spill when it is enabled.
   groups it holds are still aggregated, and the rows of other groups go to 16 files by a
   hash of their keys. Each file is grouped by a pass of its own after the first groups are
   sent, so every aggregate, `GROUP_CONCAT` order and DISTINCT included, sees the rows it
-  would see in memory.
+  would see in memory. A later pass sizes itself from the memory it has when it starts,
+  and operators that have finished give back what they held for reading, such as the
+  decoded block of each scan.
 * A DISTINCT over unordered input does the same with a hash of the whole row, and the
   rows from the files come after the others. Over input ordered on all its columns it
   needs no memory. In `SELECT DISTINCT … ORDER BY` whose sort keys use only projected
   variables, the DISTINCT runs below the sort and numbers its input rows, and the sort
   orders ties by that number, so the DISTINCT may spill and the answer keeps its order.
-  Over any other ordered input, such as a join whose input is an ordered subquery or a
-  ranking, a DISTINCT keeps its whole set in memory so that the order holds, and fails
-  with the `memory` budget when the set does not fit.
+  Over input ordered on some of its columns, with spill or without, a DISTINCT holds only
+  the rows of the current run of the first order column, since equal rows lie in one
+  run, and keeps the order. Over any other ordered input, such as a join whose input is
+  an ordered subquery or a ranking, a DISTINCT keeps its whole set in memory so that the
+  order holds, and fails with the `memory` budget when the set does not fit.
 * A hash join whose build input outgrows half the memory left partitions both inputs into
   files by a hash of the join key and joins them a partition at a time, partitioning a
   partition again up to three times. A partition that one heavy key keeps too large is
   joined as a block nested loop, reading its build rows in chunks that fit. Build rows
   whose key is unbound stay in memory, and probe rows whose key is unbound are joined
   against every build row last, so OPTIONAL and MINUS see every candidate. When nothing
-  above the join relies on its order, the rows come a partition at a time. Otherwise the
-  join numbers its probe rows and merges its output files back into their order.
+  above the join relies on its order, the rows come a partition at a time. A filter does
+  not rely on it, nor does a grouping whose aggregates are COUNT, SUM, AVG, MIN and MAX.
+  Otherwise the join numbers its probe rows and merges its output files back into their
+  order. A spilled SUM or AVG of doubles may therefore round differently in its last bits
+  than in memory, and MIN or MAX may keep another of two values that compare equal, both
+  of which SPARQL leaves open.
 * A merge join spools a run of equal keys to a file once the run outgrows a quarter of
   the memory left, and reads the file again for each row of the other side's run.
 
@@ -9466,7 +9473,8 @@ Spill files live in a directory per server process under `--spill-dir`, which de
 directory cannot be used when the server's user does not own it, another user can write
 it, it cannot be created, or it sits on tmpfs or ramfs, whose files would take the memory
 that spill saves. With `--spill on` or `--spill encrypted` given, the server refuses
-to start if the directory cannot be used. With spill off, it does not open the directory. A
+to start if the directory cannot be used. Without `--spill`, it logs a warning and runs
+without spill. With `--spill off`, it does not open the directory. A
 network file system gets a warning. On a shared
 mount, such as a Kubernetes `emptyDir` or a volume owned by root, `--spill-dir` names a
 subdirectory that does not exist yet, which the server creates with mode 0700. A file has

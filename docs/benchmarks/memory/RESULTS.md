@@ -167,8 +167,8 @@ differences at 1,000 and 5,000 rows.
 
 The cursor's merge and hash joins, counts, groupings and
 DISTINCT run on column kernels, and sorts, groupings, unordered DISTINCT, hash joins,
-merge-join runs and a DISTINCT below its ORDER BY can spill (X08 Phase 2). Spill is
-opt-in. A probe binary interleaved eager and cursor runs of each query in one process,
+merge-join runs and a DISTINCT below its ORDER BY can spill (X08 Phase 2). `serve`
+spills by default. A probe binary interleaved eager and cursor runs of each query in one process,
 reading every row. The table gives the cursor's time divided by the eager time, the median
 of three to five rounds, where under 1 means streaming is faster.
 
@@ -246,28 +246,42 @@ grouping held 38 MB against 130 MB eagerly and took 1.5 to 1.7 times as long, an
 at 16 MiB 4.4 MB at 1.7 times the eager time. A budget near a tenth of the state's size
 thus costs 1.7 to 2.8 times the time, and one near half of it costs little.
 
-The same probe ran joins and an ordered DISTINCT under a budget beside the unlimited cursor
-and eager execution, and checked that the spilled rows matched the eager ones.
+The same probe ran four queries on forge under a budget beside the
+unlimited cursor and eager execution, and checked that the spilled rows matched the eager
+ones. It ran at 10.5M with eight threads and batches of 4,096 rows, and the table gives
+the median of two runs in the order A, B, B, A, each of which timed three rounds. The
+spill directory was on the local disk.
 
 | 10.5M, ms | Eager | Cursor, unlimited | Cursor, 16 MiB | Cursor, 4 MiB | Written at 4 MiB |
 |---|---:|---:|---:|---:|---:|
-| Join on `foaf:knows` under a merge join, 2.5M rows | **66** | 150 | 322 | 1,333 | 157 MB |
-| OPTIONAL with a filter, 300,191 rows | **34** | 57 | 77 | 186 | 24.6 MB |
-| MINUS, 90,161 rows | **21** | 36 | 59 | 165 | 24.6 MB |
-| `SELECT DISTINCT … ORDER BY`, 917,941 rows | 615 | **569** | 1,421 | 3,028 | 60.1 MB |
+| `ordered-join`, a grouping above a spilled join, 917,941 groups | **200** | 271 | 708 | 1,498 | 134.6 MB |
+| `distinct-order`, `SELECT DISTINCT … ORDER BY`, 917,941 rows | **589** | 606 | 824 | 1,483 | 33.3 MB |
+| `optional`, OPTIONAL with a filter, 490,540 rows | **134** | 159 | 201 | 359 | 28.9 MB |
+| `minus`, MINUS with a filter, 76,559 rows | **13** | 31 | 41 | 108 | 7.9 MB |
 
-*Measured on an 8-vCPU AMD EPYC Namespace instance on 2026-10-18, before later corrections
-to join spill that bound retained output files and repaired merge and DISTINCT accounting.
-These figures do not establish the cost of those corrections.*
+*Measured on forge at 8ca35daa. The eager column is from the unlimited runs.*
 
-The unlimited cursors held 61.8 to 90.8 MB for the joins and 1,016 MB for the DISTINCT,
-and every spilled run stayed within its budget. A join of 29.2M rows where one key holds
-nine tenths of each input took 681 ms under 1 MiB as a block nested loop, against 487 ms
-for the unlimited cursor, which held 34.3 MB, and 631 ms eagerly. The `foaf:knows` join
-sits under a merge join that relies on its order, so a spilled run writes its output a
-second time to merge it back, which is why it slows more than the OPTIONAL and MINUS joins
-at the root. The spilled joins wrote 95 to 150 MB a second. `--spill encrypted` added 1 to
-6% to the bytes written and −2 to 21% to the times under 4 MiB, most of them under 10%.
+The unlimited cursors held 366 MB for `ordered-join`, 980 MB for `distinct-order`,
+185 MB for `optional` and 54 MB for `minus`. Every spilled run stayed within its
+budget, closed with no reserved spill bytes and left its spill directory empty, and
+the cursor's rows matched the eager rows in all 88 runs. The base, d65eaf40, took
+16,370 ms and wrote 592 MB for `ordered-join` under 4 MiB, because each scan kept a
+decoded block charged after it ended and the grouping then ran one group per pass.
+Releasing the finished operators took 1,498 ms and 135 MB. A DISTINCT over input
+ordered on its first column, `SELECT DISTINCT ?s ?o { ?s ?p ?o }` over 10,527,312 rows,
+took 174 ms and 1.2 MB in the cursor where the base cursor took 800 ms and 479 MB and
+the eager plan 959 ms. `--spill encrypted` added 0% to 7% to the bytes written and
+1% to 11% to the times of the cells under 4 and 16 MiB. On the Namespace instance on
+2026-10-18 a join of 29.2M rows where one key holds nine tenths of each input took
+681 ms under 1 MiB as a block nested loop, against 487 ms for the unlimited cursor, which
+held 34.3 MB, and 631 ms eagerly.
+
+Spill is on in `serve`. A comparison of `serve --spill on` and `serve --spill off` on one
+build, 890c60ef, with one Rayon thread, eight rounds of 20 requests per query in the order A, B,
+B, A and the sides swapped in a second run, returned the same answers to all 30 queries of
+the synthetic suite at 10.5M. Spill on over spill off had server geometric means of 0.991
+and 0.995 and client geometric means of 1.000 in both runs. No query of 1 ms or more
+changed by more than 1.5%.
 
 <a id="parallel-cursor-filters"></a>
 

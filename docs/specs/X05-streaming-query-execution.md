@@ -1,7 +1,7 @@
 # X05: Streaming query execution
 
 > **Status:** implemented in part. Phases 1 and 2 shipped, and Phases 3 and 4 have
-> implemented paths with follow-ups remaining. Batch kernels and opt-in disk spill
+> implemented paths with follow-ups remaining. Batch kernels and disk spill, which `serve` enables by default,
 > are implemented under [X08](X08-disk-spill-and-server-memory.md), whose Phase 2b
 > acceptance remains open. Automatic execution is the default over HTTP, in the CLI,
 > Node and the JVM adapter, and selects streaming for measured eligible cases.
