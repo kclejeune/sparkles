@@ -107,8 +107,9 @@ impl Store {
     ///
     /// Returns the installed registry. When this returns, every commit of the dataset
     /// that has not yet published is admitted against it: it waits for every writer of
-    /// the dataset and its branches to finish, so a thread that holds one of their
-    /// write transactions must not call it. A change that fails or unwinds after its
+    /// the dataset and its branches that entered before the new registry was installed,
+    /// so a thread that holds one of their write transactions must not call it. Those
+    /// writers can still take nested family operations while it waits. A change that fails or unwinds after its
     /// first file is written leaves every write refused until the owner is enabled
     /// again.
     pub fn enable_managed(
@@ -291,15 +292,18 @@ impl Store {
     /// previous registry has published or refused. Each writer holds a family permit
     /// from before it takes its writer lock until its commit is durably published or
     /// refused, including a pending group commit whose submitter has gone and a writer
-    /// of a branch that was deleted or retired while a handle to it is retained. One
-    /// exclusive family admission therefore waits for all of them. While it waits, the
-    /// pending group publications of each live member are driven when that member's
-    /// writer is free. The caller holds no writer of the family, and a thread that holds
-    /// a write transaction of the family must not enable or detach managed graphs.
+    /// of a branch that was deleted or retired while a handle to it is retained. The
+    /// registry is installed before the gate starts a new cohort, so a permit of the
+    /// new cohort admits against it, and the wait covers exactly the permits entered
+    /// before. New permits are not held back, so a waited-for writer can still take
+    /// nested family permits. While it waits, the pending group publications of each
+    /// live member are driven when that member's writer is free. A thread that holds a
+    /// write transaction of the family must not enable or detach managed graphs.
     fn managed_barrier(&self) -> Result<()> {
         let o = crate::guard::WriteOptions::default();
         let set = self.branch_set();
-        let permit = self.family.gate.admit_draining(&o, || {
+        self.family.gate.wait_for_cohorts_before(&o, || {
+            self.failpoint("managed-barrier-waiting");
             let mut members: Vec<Arc<Store>> = Vec::new();
             if let Some(set) = &set {
                 members.extend(set.stores.lock().values().cloned());
@@ -322,9 +326,7 @@ impl Store {
             // Members are released after their writers, outside any lock.
             drop(members);
             Ok(())
-        })?;
-        drop(permit);
-        Ok(())
+        })
     }
 
     /// Admit a candidate commit's changes, as WAL records, against the registry: a

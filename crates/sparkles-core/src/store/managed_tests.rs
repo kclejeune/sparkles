@@ -862,3 +862,83 @@ fn copies_of_unknown_owners_are_refused() {
         }
     }
 }
+
+/// A writer admitted before an enablement can still take nested family permits, such
+/// as a branch table update, while the enablement waits for it: neither blocks forever.
+#[test]
+fn an_enablement_does_not_block_nested_family_operations() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (_dir, s) = setup();
+    let s = Arc::new(s);
+    let dev = s.branch("dev").unwrap().shared().unwrap();
+    let (waiting_tx, waiting) = mpsc::channel::<()>();
+    let waiting_tx = Mutex::new(Some(waiting_tx));
+    s.set_failpoint(
+        "managed-barrier-waiting",
+        Some(Arc::new(move |_| {
+            if let Some(tx) = waiting_tx.lock().take() {
+                tx.send(()).unwrap();
+            }
+        })),
+    );
+    let (held_tx, held) = mpsc::channel();
+    let (go_tx, go) = mpsc::channel::<()>();
+    let (done_tx, done) = mpsc::channel();
+    // A: a dev transaction, then a nested family operation while it is open
+    std::thread::spawn({
+        let (s, dev) = (s.clone(), dev.clone());
+        move || {
+            let mut t = dev.write();
+            put(&mut t, Some("urn:free"), "held");
+            held_tx.send(()).unwrap();
+            go.recv().unwrap();
+            // nested family operations: a table update, branch creation and renaming,
+            // and a write of another member. Deleting a branch or reading this
+            // branch's own information already waits for this transaction.
+            let nested = (|| {
+                s.set_branch_note("main", Some("nested".into()))?;
+                s.create_branch("nested", &BranchOptions::default())?;
+                s.rename_branch("nested", "renamed")?;
+                upd(&s, "INSERT DATA { GRAPH <urn:free> { <urn:x> <urn:p> 9 } }")?;
+                Ok::<_, Error>(())
+            })();
+            let committed = t.commit().map(|r| r.committed);
+            done_tx.send((nested, committed)).unwrap();
+        }
+    });
+    held.recv_timeout(Duration::from_secs(10)).unwrap();
+    // B: an enablement that reaches its barrier while A's permit is held
+    let (enabled_tx, enabled) = mpsc::channel();
+    std::thread::spawn({
+        let s = s.clone();
+        move || {
+            enabled_tx
+                .send(
+                    s.enable_managed(OwnerKind::Evidence, entry(&[M], SETTINGS), SETTINGS)
+                        .map(|_| ()),
+                )
+                .unwrap()
+        }
+    });
+    waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(enabled.try_recv().is_err(), "the enablement waits for A");
+    go_tx.send(()).unwrap();
+    let (nested, committed) = done
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the nested family operation completes while the enablement waits");
+    nested.unwrap();
+    assert!(committed.unwrap());
+    enabled
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the enablement returns once A is done")
+        .unwrap();
+    s.set_failpoint("managed-barrier-waiting", None);
+    assert_eq!(
+        managed_code(upd(
+            &dev,
+            &format!("INSERT DATA {{ GRAPH <{M}> {{ <urn:x> <urn:p> 1 }} }}")
+        )),
+        "profile-managed-graph"
+    );
+}

@@ -581,3 +581,33 @@ fn branch_lifecycle_waits_outside_table_locks() {
         worker.join().unwrap();
     }
 }
+
+#[test]
+fn cohort_waits_cover_earlier_permits_only() {
+    let family = family::Family::new(None);
+    let earlier = family.gate.enter(&Default::default()).unwrap();
+    let (done_tx, done) = mpsc::channel();
+    let (waiting_tx, waiting) = mpsc::channel();
+    let waiter = std::thread::spawn({
+        let gate = family.gate.clone();
+        move || {
+            let mut waiting_tx = Some(waiting_tx);
+            gate.wait_for_cohorts_before(&Default::default(), || {
+                if let Some(tx) = waiting_tx.take() {
+                    tx.send(()).unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+            done_tx.send(()).unwrap();
+        }
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    // later permits enter, and their lifetimes do not hold the waiter
+    let later = family.gate.enter(&no_wait()).unwrap();
+    assert!(done.try_recv().is_err());
+    drop(earlier);
+    done.recv_timeout(Duration::from_secs(5)).unwrap();
+    waiter.join().unwrap();
+    drop(later);
+}

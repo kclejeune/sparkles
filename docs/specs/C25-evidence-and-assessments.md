@@ -577,9 +577,10 @@ An owner settings file whose `format` or `profile` this build does not read is
 unavailable in the same way, even when its digest matches. Enabling the owner again
 repairs a mismatched digest. A change of the registry that fails or unwinds after its
 first file is written leaves the running dataset refusing every write until the owner
-is enabled again. Enablement returns only after one exclusive family admission, which
-waits for every writer that may have been admitted against the previous registry,
-including writers of deleted branches whose handles are retained. `Store::detach_managed`
+is enabled again. Enablement returns only after every writer that entered the family
+before the new registry was installed has published or refused, including writers of
+deleted branches whose handles are retained. Later writers, including nested family
+operations of those writers, are not held back. `Store::detach_managed`
 returns a graph to ordinary writes. Backups, restores and clones carry the registry. A
 registry that names an owner this build does not know, or whose format it does not read,
 is not copied, and the backup or clone is refused. The server
