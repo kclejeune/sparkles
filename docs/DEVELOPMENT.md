@@ -186,6 +186,7 @@ mise run test:features # the stripped-server compatibility matrix (opt-in)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
+mise run test:csvw     # W3C CSV on the Web: the RDF tests, in minimal and standard mode
 mise run ui:e2e        # Playwright end-to-end tests against a real server
 mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
 ```

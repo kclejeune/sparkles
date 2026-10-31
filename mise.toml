@@ -427,6 +427,10 @@ run = "mbx test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 description = "shexTest conformance (syntax, negative syntax and structure, representation, validation) with the ShEx 2.2 tests under crates/sparkles-shex/tests/shex22"
 run = "mbx test -p sparkles-shex --test shextest -- --nocapture"
 
+[tasks."test:csvw"]
+description = "W3C CSV on the Web conformance: the RDF tests of the CSVW test suite under testsuite/csvw, in minimal and standard mode"
+run = "mbx test -p sparkles-core --test csvw_conformance -- --nocapture"
+
 [tasks."test:bench-scripts"]
 description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare), and the crash harness's own tests (scripts/crash-harness.rs)"
 run = [

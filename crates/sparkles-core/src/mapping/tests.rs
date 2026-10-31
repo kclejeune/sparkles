@@ -956,3 +956,156 @@ fn a_map_base_wins_over_the_run_base_which_wins_over_the_document_base() {
         "{new:?}"
     );
 }
+
+const JOINS: &str = r#"@prefix rml: <http://w3id.org/rml/> . @prefix ex: <http://ex.org/> .
+    @prefix grel: <http://users.ugent.be/~bjdmeest/function/grel.ttl#> .
+    <http://ex.org/P> a rml:TriplesMap ;
+      rml:logicalSource [ rml:source "p.csv" ; rml:referenceFormulation rml:CSV ] ;
+      rml:subjectMap [ rml:template "http://ex.org/p/{id}" ] .
+    <http://ex.org/C> a rml:TriplesMap ;
+      rml:logicalSource [ rml:source "c.csv" ; rml:referenceFormulation rml:CSV ] ;
+      rml:subjectMap [ rml:template "http://ex.org/c/{id}" ] ;
+      rml:predicateObjectMap [ rml:predicate ex:p ; rml:objectMap [ rml:parentTriplesMap <http://ex.org/P> ;
+        rml:joinCondition [ CONDITION ] ] ] ."#;
+
+fn join_out(condition: &str) -> BTreeSet<String> {
+    run_text(
+        MappingKind::Rml,
+        &JOINS.replace("CONDITION", condition),
+        &[
+            ("p.csv", "id,code\n1,a-1\n2,b-2\n3,a-1\n"),
+            ("c.csv", "id,k,n\n7,A,1\n8,b,2\n9,,3\n"),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn join_conditions_compare_expression_maps() {
+    let one = |c: &str, p: &str| {
+        format!("<http://ex.org/c/{c}> <http://ex.org/p> <http://ex.org/p/{p}> .")
+    };
+    // templates on both sides compare the strings they make, without encoding
+    let out = join_out(
+        r#"rml:childMap [ rml:template "{k}-{n}" ] ; rml:parentMap [ rml:reference "code" ]"#,
+    );
+    assert_eq!(out, BTreeSet::from([one("8", "2")]), "{out:?}");
+    // a constant parent key matches every parent row of that value
+    let out =
+        join_out(r#"rml:childMap [ rml:reference "n" ] ; rml:parentMap [ rml:constant "2" ]"#);
+    assert_eq!(
+        out,
+        BTreeSet::from([one("8", "1"), one("8", "2"), one("8", "3")]),
+        "{out:?}"
+    );
+    // a constant child key matches every child row
+    let out =
+        join_out(r#"rml:childMap [ rml:constant "a-1" ] ; rml:parentMap [ rml:reference "code" ]"#);
+    assert_eq!(out.len(), 6, "{out:?}");
+    // a function key
+    let out = join_out(
+        r#"rml:childMap [ rml:functionExecution [ rml:function grel:toLowerCase ;
+             rml:input [ rml:parameter grel:valueParameter ; rml:inputValueMap [ rml:template "{k}-{n}" ] ] ] ] ;
+           rml:parentMap [ rml:reference "code" ]"#,
+    );
+    assert_eq!(
+        out,
+        BTreeSet::from([one("7", "1"), one("7", "3"), one("8", "2")]),
+        "{out:?}"
+    );
+    // a NULL key never joins, and plain references still join
+    let out = join_out(r#"rml:child "k" ; rml:parent "code""#);
+    assert!(out.is_empty(), "{out:?}");
+    // the expression map's term type is not an IRI's: nothing is percent-encoded
+    let out = run_text(
+        MappingKind::Rml,
+        &JOINS.replace(
+            "CONDITION",
+            r#"rml:childMap [ rml:template "{k}" ] ; rml:parentMap [ rml:template "{code}" ]"#,
+        ),
+        &[
+            ("p.csv", "id,code\n1,a b\n"),
+            ("c.csv", "id,k,n\n7,a b,1\n"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(out, BTreeSet::from([one("7", "1")]), "{out:?}");
+}
+
+#[test]
+fn expression_map_joins_print_and_read_back() {
+    let m = parse(
+        &JOINS.replace(
+            "CONDITION",
+            r#"rml:childMap [ rml:template "{k}-{n}" ] ; rml:parentMap [ rml:reference "code" ]"#,
+        ),
+        MappingKind::Rml,
+        None,
+    )
+    .unwrap();
+    let ttl = rdf::to_turtle(&m, false).unwrap();
+    assert!(ttl.contains("rml:childMap"), "{ttl}");
+    let fs = [
+        ("p.csv", "id,code\n1,a-1\n2,b-2\n"),
+        ("c.csv", "id,k,n\n7,b,2\n"),
+    ];
+    let back = run_text(MappingKind::Rml, &ttl, &fs).unwrap();
+    assert_eq!(
+        back,
+        BTreeSet::from(["<http://ex.org/c/7> <http://ex.org/p> <http://ex.org/p/2> .".to_string()])
+    );
+    // a join on a database compares columns, so an expression map joins in memory
+    assert!(
+        exec::describe_joins(&m)[0].contains("in-memory"),
+        "{:?}",
+        exec::describe_joins(&m)
+    );
+    // R2RML has columns only
+    assert!(rdf::to_turtle(&m, true).is_err());
+}
+
+#[test]
+fn unsafe_iris_keep_their_characters_and_must_be_valid() {
+    let m = |tt: &str| {
+        format!(
+            r#"{RML}<http://ex.org/m> a rml:TriplesMap ;
+              rml:logicalSource [ rml:source "p.csv" ; rml:referenceFormulation rml:CSV ] ;
+              rml:subjectMap [ rml:template "http://ex.org/{{who}}" ; rml:termType rml:{tt} ] ;
+              rml:predicateObjectMap [ rml:predicate ex:p ; rml:object ex:o ] ."#
+        )
+    };
+    let fs = [("p.csv", "who\nBob/Zoë?x=1\n")];
+    // the safe form encodes everything but the unreserved characters
+    let safe = run_text(MappingKind::Rml, &m("IRI"), &fs).unwrap();
+    assert!(
+        safe.contains("<http://ex.org/Bob%2FZoë%3Fx%3D1> <http://ex.org/p> <http://ex.org/o> ."),
+        "{safe:?}"
+    );
+    // the unsafe form inserts the value as it is
+    let out = run_text(MappingKind::Rml, &m("UnsafeIRI"), &fs).unwrap();
+    assert!(
+        out.contains("<http://ex.org/Bob/Zoë?x=1> <http://ex.org/p> <http://ex.org/o> ."),
+        "{out:?}"
+    );
+    // printing the mapping keeps the term type, so a converted mapping makes the same IRIs
+    for tt in ["UnsafeIRI", "URI"] {
+        let parsed = parse(&m(tt), MappingKind::Rml, None).unwrap();
+        let ttl = rdf::to_turtle(&parsed, false).unwrap();
+        assert!(ttl.contains(&format!("rml:termType rml:{tt}")), "{ttl}");
+        assert_eq!(
+            run_text(MappingKind::Rml, &ttl, &fs).unwrap(),
+            run_text(MappingKind::Rml, &m(tt), &fs).unwrap()
+        );
+        // R2RML has neither
+        assert!(rdf::to_turtle(&parsed, true).is_err());
+    }
+    // a value that makes an invalid IRI fails the run and names the value
+    let e = run_text(
+        MappingKind::Rml,
+        &m("UnsafeIRI"),
+        &[("p.csv", "who\nEmily Smith\n")],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("Emily Smith"), "{e}");
+}

@@ -1470,7 +1470,11 @@ sparkles load --loc db --mapping shop-metadata.json --csvw-mode standard
 The key values are held in memory while the load runs.
 
 A cell that does not match its datatype, or a row with the wrong number of cells, stops
-the load with the file, row and column, and nothing is committed. `sparkles csv convert`
+the load with the file, row and column, and nothing is committed. The library can
+instead follow CSVW's own processing rules with `tabular::Options.lenient`. A property or
+cell that does not conform then gives a warning and takes its default, and a cell that
+fails its datatype stays a plain string. The command line and uploads do not offer this,
+which is [roadmap](ROADMAP.md) item NEW-ITEM-1. `sparkles csv convert`
 writes the triples without loading them, as N-Triples, N-Quads (`--graph`) or Turtle.
 Its `--output` file replaces an existing file only when the conversion succeeds, and an
 input given as the output is refused.
@@ -1543,6 +1547,13 @@ the tables of a SQLite database, to edit:
 sparkles map draft --connection shop=sqlite:shop.sqlite --base http://ex.org/shop/ > shop.ttl
 sparkles load --loc db --mapping shop.ttl --connection shop=sqlite:shop.sqlite
 ```
+
+A join condition compares the values of two references. An RML-Core mapping can also write
+either side as an expression map with `rml:childMap` and `rml:parentMap`, which take a
+reference, a constant, a template or a function. The join compares the strings the two
+maps make, and such a join runs in memory. The `rml:UnsafeIRI` term type inserts a
+template's values as they are, where the other IRI term types encode them, and the run
+fails when the result is not a valid IRI.
 
 Function maps call the GREL and IDLab functions of RML's function descriptions and
 Sparkles' own `urn:x-sparkles:fn:` functions, which `sparkles map check --functions`

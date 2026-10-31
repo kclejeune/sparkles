@@ -744,7 +744,8 @@ fn standard_mode_describes_the_group_table_and_rows() {
             .count(),
         2
     );
-    // a common property that needs JSON-LD processing fails
+    // a common property that is a node object converts to a blank node, and one that
+    // names a type no one can resolve fails
     let mut o = csvw(
         &META.replace(
             "\"url\": \"people.csv\",",
@@ -754,7 +755,7 @@ fn standard_mode_describes_the_group_table_and_rows() {
     );
     o.standard = true;
     let e = run("ID,Name,Born,Tags,Employer\n7,Ann,03/04/1990,a;b,n/a\n", &o).unwrap_err();
-    assert!(e.to_string().contains("JSON-LD processing"), "{e}");
+    assert!(e.to_string().contains("not a term"), "{e}");
     // templates have no standard mode
     let mut t = template("CONSTRUCT { ?s ?p ?o } WHERE {}", None);
     t.standard = true;
@@ -959,4 +960,379 @@ CONSTRUCT { ?s ex:c ?v } WHERE { BIND(IRI(CONCAT(\"http://ex.org/\", ?v)) AS ?s)
     let t = Template::parse(q, None).unwrap();
     assert_eq!(t.len(), 3);
     assert_eq!(run("v\nx\n", &template(q, None)).unwrap().len(), 3);
+}
+
+/// The triples and the warnings of a conversion.
+fn run_stats(csv: &str, opts: &Options) -> Result<(Vec<String>, Vec<String>)> {
+    let mut out = Vec::new();
+    let stats = convert(Cursor::new(csv.as_bytes().to_vec()), opts, &mut |t| {
+        out.push(t.to_string());
+        Ok(())
+    })?;
+    out.sort();
+    Ok((out, stats.warnings))
+}
+
+/// Options that read the metadata and the cells by CSVW's processing rules.
+fn lenient(meta: &str, name: &str) -> Options {
+    let m = csvw::parse_with(meta, Some("http://e.org/meta.json"), true).unwrap();
+    let mut o = Options::new(Mapping::Csvw(Arc::new(m)), name);
+    o.lenient = true;
+    o
+}
+
+const LENIENT_META: &str = r#"{
+  "@context": "http://www.w3.org/ns/csvw",
+  "url": "t.csv",
+  "tableSchema": { "columns": [
+    { "name": "n", "titles": "n", "datatype": "integer", "separator": 3 },
+    { "name": "m", "titles": "m", "datatype": {"base": "integer", "minimum": 5} },
+    { "name": "r", "titles": "r", "required": true }
+  ] }
+}"#;
+
+#[test]
+fn lenient_reading_warns_where_strict_reading_fails() {
+    // strict: the invalid separator fails the metadata
+    assert!(csvw::parse(LENIENT_META, Some("http://e.org/meta.json")).is_err());
+    let o = lenient(LENIENT_META, "t.csv");
+    let (got, warnings) = run_stats("n,m,r\n1,2,\nx,9,z\n", &o).unwrap();
+    let text = got.join("\n");
+    assert!(text.contains("<http://e.org/t.csv#m> \"2\""), "{text}");
+    assert!(!text.contains("<http://e.org/t.csv#m> \"2\"^^"), "{text}");
+    assert!(text.contains("<http://e.org/t.csv#n> \"x\""), "{text}");
+    assert!(
+        text.contains("<http://e.org/t.csv#m> \"9\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+        "{text}"
+    );
+    assert_eq!(text.matches("#r>").count(), 1, "{text}");
+    for w in [
+        "separator",
+        "below the minimum",
+        "is required",
+        "not a valid integer",
+    ] {
+        assert!(warnings.iter().any(|x| x.contains(w)), "{w}: {warnings:?}");
+    }
+    // without the option the same cells fail the conversion
+    let mut strict = csvw(
+        &LENIENT_META.replace("\"separator\": 3", "\"separator\": \";\""),
+        "t.csv",
+    );
+    strict.base = Some("http://e.org/".into());
+    let e = run("n,m,r\n1,2,\n", &strict).unwrap_err();
+    assert!(e.to_string().contains("below the minimum"), "{e}");
+}
+
+#[test]
+fn lenient_warnings_per_column_are_capped() {
+    let o = lenient(
+        r#"{"@context": "http://www.w3.org/ns/csvw", "url": "t.csv",
+            "tableSchema": {"columns": [{"name": "n", "titles": "n", "datatype": "integer"}]}}"#,
+        "t.csv",
+    );
+    let mut csv = String::from("n\n");
+    for _ in 0..50 {
+        csv.push_str("x\n");
+    }
+    let (_, warnings) = run_stats(&csv, &o).unwrap();
+    assert_eq!(warnings.len(), 11, "{warnings:?}");
+    assert!(warnings[10].contains("further problems"), "{warnings:?}");
+}
+
+#[test]
+fn descriptions_that_cannot_be_repaired_fail_in_both_modes() {
+    let table = |extra: &str| {
+        format!(r#"{{"@context": "http://www.w3.org/ns/csvw", "url": "t.csv", {extra}}}"#)
+    };
+    let col = |dt: &str| {
+        table(&format!(
+            r#""tableSchema": {{"columns": [{{"name": "c", "titles": "c", "datatype": {dt}}}]}}"#
+        ))
+    };
+    for bad in [
+        table(r#""@id": "_:b""#),
+        table(r#""@type": "TableGroup""#),
+        table(r#""tableSchema": {"@id": "_:b", "columns": []}"#),
+        table(r#""tableSchema": {"@type": "Table", "columns": []}"#),
+        table(r#""dialect": {"@type": "Template"}"#),
+        table(r#""tableSchema": {"columns": [{"name": "c", "@id": "_:b"}]}"#),
+        col(r#"{"base": "date", "length": 5}"#),
+        col(r#"{"base": "string", "length": 3, "minLength": 4}"#),
+        col(r#"{"base": "string", "minLength": 4, "maxLength": 3}"#),
+        col(r#"{"base": "string", "minimum": 1}"#),
+        col(r#"{"base": "integer", "minimum": 1, "minExclusive": 1}"#),
+        col(r#"{"base": "integer", "minInclusive": 5, "maxInclusive": 4}"#),
+        col(r#"{"base": "integer", "minInclusive": 5, "maxExclusive": 5}"#),
+        col(r#"{"base": "string", "@id": "http://www.w3.org/2001/XMLSchema#string"}"#),
+        table(
+            r#""tableSchema": {"columns": [{"name": "c"}], "foreignKeys": [{"dc:note": "x", "columnReference": "c", "reference": {"resource": "u.csv", "columnReference": "c"}}]}"#,
+        ),
+    ] {
+        for lenient in [false, true] {
+            assert!(
+                csvw::parse_with(&bad, Some("http://e.org/m.json"), lenient).is_err(),
+                "lenient {lenient}: {bad}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keys_name_columns_by_name_when_lenient_and_by_title_otherwise() {
+    let meta = |key: &str| {
+        format!(
+            r#"{{"@context": "http://www.w3.org/ns/csvw", "url": "t.csv",
+            "tableSchema": {{"columns": [{{"titles": "id"}}, {{"name": "up", "titles": "up"}}], {key}}}}}"#
+        )
+    };
+    let pk = meta(r#""primaryKey": "id""#);
+    // CSVW's rules take a key column from the name property: the key is dropped
+    let m = csvw::parse_with(&pk, Some("http://e.org/m.json"), true).unwrap();
+    assert!(m.tables[0].primary_key.is_empty());
+    assert!(
+        m.warnings
+            .iter()
+            .any(|w| w.contains("no column of the table"))
+    );
+    // the strict reading takes the name a column has from its title
+    let m = csvw::parse(&pk, Some("http://e.org/m.json")).unwrap();
+    assert_eq!(m.tables[0].primary_key, vec!["id".to_string()]);
+    let o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+    let mut o = o;
+    o.keys = Some(Arc::new(KeyRegistry::new(None)));
+    let e = run("id,up\n1,\n1,\n", &o).unwrap_err();
+    assert!(e.to_string().contains("same primary key"), "{e}");
+    // a foreign key to a column that is not there fails when lenient, where the strict
+    // reading fails when the table is converted
+    let fk = meta(
+        r#""foreignKeys": [{"columnReference": "other", "reference": {"resource": "u.csv", "columnReference": "c"}}]"#,
+    );
+    assert!(csvw::parse_with(&fk, Some("http://e.org/m.json"), true).is_err());
+}
+
+#[test]
+fn invalid_directions_and_languages_are_reported() {
+    let m = csvw::parse(
+        r#"{"@context": "http://www.w3.org/ns/csvw", "tableDirection": "up", "textDirection": "sideways",
+            "tables": [{"url": "t.csv", "dialect": {"lineTerminators": 3},
+              "tableSchema": {"columns": [{"name": "a", "titles": {"a-bad-tag": "A", "en": "A"}}]}}]}"#,
+        Some("http://e.org/m.json"),
+    )
+    .unwrap();
+    for w in [
+        "tableDirection",
+        "textDirection",
+        "lineTerminators",
+        "a-bad-tag",
+    ] {
+        assert!(
+            m.warnings.iter().any(|x| x.contains(w)),
+            "{w}: {:?}",
+            m.warnings
+        );
+    }
+    // a header whose language differs from the title's is reported, and undetermined
+    // languages match
+    let meta = |lang: &str| {
+        format!(
+            r#"{{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv", "lang": "{lang}",
+                "tableSchema": {{"columns": [{{"name": "a", "titles": {{"en-GB": "A"}}}}]}}}}"#
+        )
+    };
+    for (lang, warns) in [
+        ("de", true),
+        ("en", false),
+        ("und", false),
+        ("UND", false),
+        ("en-gb", false),
+        ("en-GB", false),
+    ] {
+        let (_, w) = run_stats("A\nx\n", &lenient(&meta(lang), "t.csv")).unwrap();
+        assert_eq!(
+            w.iter().any(|x| x.contains("matches none")),
+            warns,
+            "{lang}: {w:?}"
+        );
+    }
+}
+
+#[test]
+fn lenient_metadata_takes_the_default_of_an_invalid_property() {
+    let m = csvw::parse_with(
+        r#"{"@context": "http://www.w3.org/ns/csvw", "url": "t.csv", "suppressOutput": 1,
+            "dialect": 7, "aboutUrl": true,
+            "tableSchema": {"columns": [{"name": "a b", "titles": ["x", 1]}], "primaryKey": "zz"}}"#,
+        Some("http://e.org/m.json"),
+        true,
+    )
+    .unwrap();
+    let t = &m.tables[0];
+    assert!(!t.suppress);
+    // a name that is not a variable is dropped, a bad title is skipped, an unknown
+    // primary key column drops the key
+    assert_eq!(t.columns[0].name, None);
+    assert_eq!(t.columns[0].titles, vec!["x".to_string()]);
+    assert!(t.primary_key.is_empty());
+    // an aboutUrl that is not a string is the empty template
+    assert_eq!(t.props.about_url.as_ref().map(|u| u.as_str()), Some(""));
+    assert!(m.warnings.len() >= 5, "{:?}", m.warnings);
+}
+
+#[test]
+fn common_properties_are_converted_like_json_ld() {
+    let meta = r#"{
+      "@context": ["http://www.w3.org/ns/csvw", {"@language": "en"}],
+      "url": "t.csv",
+      "dc:title": "Tree",
+      "dc:publisher": {"schema:name": "Town", "schema:url": {"@id": "http://e.org/"}},
+      "dc:relation": {"@type": "Table"},
+      "dc:modified": {"@value": "2010-12-31", "@type": "xsd:date"},
+      "tableSchema": {"columns": [{"name": "a", "titles": "a"}], "rowTitles": "a"}
+    }"#;
+    let mut o = lenient(meta, "t.csv");
+    o.standard = true;
+    let (got, _) = run_stats("a\nx\n", &o).unwrap();
+    let text = got.join("\n");
+    assert!(
+        text.contains("<http://purl.org/dc/terms/title> \"Tree\"@en"),
+        "{text}"
+    );
+    assert!(
+        text.contains("<http://schema.org/name> \"Town\"@en"),
+        "{text}"
+    );
+    assert!(
+        text.contains("<http://schema.org/url> <http://e.org/>"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/csvw#Table>"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"2010-12-31\"^^<http://www.w3.org/2001/XMLSchema#date>"),
+        "{text}"
+    );
+    // row titles
+    assert!(
+        text.contains("<http://www.w3.org/ns/csvw#title> \"x\""),
+        "{text}"
+    );
+    for bad in [
+        r#"{"@list": [1]}"#,
+        r#"{"@context": "http://schema.org/"}"#,
+        r#"{"@language": "en", "schema:name": "x"}"#,
+        r#"{"@value": "x", "@language": "en", "@type": "xsd:string"}"#,
+        r#"{"@id": "_:b"}"#,
+        r#"{"@type": "not a link"}"#,
+    ] {
+        let mut o = lenient(
+            &meta.replace(
+                r#""dc:relation": {"@type": "Table"}"#,
+                &format!("\"dc:relation\": {bad}"),
+            ),
+            "t.csv",
+        );
+        o.standard = true;
+        assert!(run_stats("a\nx\n", &o).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn a_declared_schema_without_columns_names_columns_by_position_when_lenient() {
+    let meta = r#"{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv", "tableSchema": {}}"#;
+    let (got, _) = run_stats("a,b\n1,2\n", &lenient(meta, "t.csv")).unwrap();
+    assert!(got.iter().any(|t| t.contains("t.csv#_col.1>")), "{got:?}");
+    // the strict reading names them by the header
+    let (got, _) = run_stats("a,b\n1,2\n", &csvw(meta, "t.csv")).unwrap();
+    assert!(got.iter().any(|t| t.contains("t.csv#a>")), "{got:?}");
+    // columns the header has beyond the metadata are named by position, with a warning
+    let meta = r#"{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv",
+        "tableSchema": {"columns": [{"name": "x", "titles": "a"}]}}"#;
+    let (got, warnings) = run_stats("a,b\n1,2\n", &lenient(meta, "t.csv")).unwrap();
+    assert!(got.iter().any(|t| t.contains("t.csv#_col.2>")), "{got:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("the header has 2 columns")),
+        "{warnings:?}"
+    );
+    assert!(run("a,b\n1,2\n", &csvw(meta, "t.csv")).is_err());
+}
+
+#[test]
+fn key_violations_are_warnings_when_lenient_and_a_table_can_reference_itself() {
+    let meta = r#"{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv",
+        "tableSchema": {"columns": [{"name": "id", "titles": "id"}, {"name": "up", "titles": "up"}],
+          "primaryKey": "id",
+          "foreignKeys": [{"columnReference": "up", "reference": {"resource": "t.csv", "columnReference": "id"}}]}}"#;
+    let with = |lenient: bool| {
+        let m = csvw::parse_with(meta, Some("http://e.org/m.json"), lenient).unwrap();
+        let mut o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+        o.lenient = lenient;
+        o.keys = Some(Arc::new(KeyRegistry::new(None)));
+        o
+    };
+    // a reference to a row that comes later is fine, and one to no row at all is not
+    assert!(run("id,up\n1,2\n2,\n", &with(false)).is_ok());
+    let e = run("id,up\n1,2\n2,9\n", &with(false)).unwrap_err();
+    assert!(e.to_string().contains("\"9\" is not among"), "{e}");
+    let (got, warnings) = run_stats("id,up\n1,2\n2,9\n1,\n", &with(true)).unwrap();
+    assert_eq!(got.len(), 5, "{got:?}");
+    assert!(
+        warnings.iter().any(|w| w.contains("same primary key")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("\"9\" is not among")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn lenient_key_checks_collect_every_row_and_keep_the_memory_budget() {
+    let meta = r#"{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv",
+        "tableSchema": {"columns": [{"name": "id", "titles": "id"}, {"name": "code", "titles": "code"}, {"name": "up", "titles": "up"}],
+          "primaryKey": "id",
+          "foreignKeys": [{"columnReference": "up", "reference": {"resource": "t.csv", "columnReference": "code"}}]}}"#;
+    let with = |budget: Option<u64>| {
+        let m = csvw::parse_with(meta, Some("http://e.org/m.json"), true).unwrap();
+        let mut o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+        o.lenient = true;
+        o.keys = Some(Arc::new(KeyRegistry::new(budget)));
+        o
+    };
+    // a duplicate row still gives its referenceable value, and only the duplicate is
+    // reported
+    let (got, warnings) = run_stats("id,code,up\n1,a,\n1,b,\n2,c,b\n", &with(None)).unwrap();
+    assert_eq!(got.len(), 7, "{got:?}");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("same primary key"), "{warnings:?}");
+    // a budget is a resource limit and stops the conversion in lenient mode too
+    let e = run_stats("id,code,up\n1,a,\n2,b,a\n", &with(Some(8))).unwrap_err();
+    assert!(e.to_string().contains("memory budget"), "{e}");
+}
+
+#[test]
+fn self_references_list_a_bounded_number_of_violations() {
+    let meta = r#"{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv",
+        "tableSchema": {"columns": [{"name": "id", "titles": "id"}, {"name": "up", "titles": "up"}],
+          "foreignKeys": [{"columnReference": "up", "reference": {"resource": "t.csv", "columnReference": "id"}}]}}"#;
+    let m = csvw::parse_with(meta, Some("http://e.org/m.json"), true).unwrap();
+    let mut o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+    o.lenient = true;
+    o.keys = Some(Arc::new(KeyRegistry::new(None)));
+    let mut csv = String::from("id,up\n");
+    for i in 0..100 {
+        csv.push_str(&format!("{i},x{i}\n"));
+    }
+    let (_, warnings) = run_stats(&csv, &o).unwrap();
+    assert_eq!(warnings.len(), 11, "{warnings:?}");
+    assert!(
+        warnings[10].contains("further key violations"),
+        "{warnings:?}"
+    );
 }

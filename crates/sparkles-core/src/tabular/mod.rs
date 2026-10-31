@@ -106,6 +106,12 @@ pub struct Options {
     pub keys: Option<Arc<KeyRegistry>>,
     /// The target dataset a template reads (spec F19 §7.2).
     pub lookup: Option<template::Lookup>,
+    /// CSVW's processing rules for a value that does not fit its column: a cell that
+    /// fails its datatype, format or constraints is kept as a string with a warning, a
+    /// required cell without a value is left out with a warning, and metadata with an
+    /// invalid property is read with that property's default. Without it such a value
+    /// or property fails the conversion, as spec C05 asks.
+    pub lenient: bool,
 }
 
 /// The key sets of a load, by table and key columns.
@@ -236,6 +242,9 @@ pub fn table_index(m: &Metadata, opts: &Options) -> Result<usize> {
     pick_table(m, opts).map(|(i, _)| i)
 }
 
+/// The warnings one column keeps for values that failed its datatype in lenient mode.
+const WARNINGS_PER_COLUMN: usize = 10;
+
 /// The most distinct values a tallied column keeps.
 pub const TALLY_DISTINCT: usize = 100_000;
 
@@ -256,6 +265,7 @@ impl Options {
             standard: false,
             keys: None,
             lookup: None,
+            lenient: false,
         }
     }
 
@@ -626,12 +636,16 @@ struct Column {
 enum Cell {
     Null,
     One(String),
-    /// the items and the value before it was split
-    List(Vec<String>, String),
+    /// a value that failed its column's datatype, kept as a string (lenient mode)
+    Bad(String),
+    /// the items, the value before it was split, and the indexes of the items that
+    /// failed the datatype and are kept as strings (lenient mode)
+    List(Vec<String>, String, Vec<usize>),
 }
 
 /// A table ready to read rows: its columns and URL.
 struct Table {
+    lenient: bool,
     columns: Vec<Column>,
     url: Option<oxiri::Iri<String>>,
     index: usize,
@@ -668,34 +682,67 @@ struct ColumnDesc2 {
 
 /// Build the columns of `desc` for a table whose header gave `titles` (one list per
 /// cell) and whose rows have `width` cells.
+/// Whether two language tags match: `und` matches any, and otherwise the subtags are
+/// equal up to the length of the shorter tag.
+fn languages_match(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case("und") || b.eq_ignore_ascii_case("und") {
+        return true;
+    }
+    a.split('-')
+        .zip(b.split('-'))
+        .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
 fn columns(
     desc: &TableDesc,
     titles: &[Vec<String>],
     width: usize,
     header: bool,
     template_vars: bool,
+    lenient: bool,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Column>, String> {
     let from_header = desc.columns.is_empty();
+    // CSVW's processing rules do not take titles from the header for a declared schema
+    let titled = !(lenient && desc.schema_declared);
     let descs: Vec<ColumnDesc> = if from_header {
         (0..width)
-            .map(|i| ColumnDesc {
-                name: None,
-                titles: titles.get(i).cloned().unwrap_or_default(),
-                ..Default::default()
+            .map(|i| {
+                let titles = titles
+                    .get(i)
+                    .filter(|_| titled)
+                    .cloned()
+                    .unwrap_or_default();
+                ColumnDesc {
+                    name: None,
+                    und_titles: titles.clone(),
+                    titles,
+                    ..Default::default()
+                }
             })
             .collect()
     } else {
         let real = desc.columns.iter().filter(|c| !c.is_virtual).count();
-        if header && width != real {
+        if header && width != real && !(lenient && width > real) {
             return Err(format!(
                 "the header has {width} columns and the metadata describes {real}"
             ));
         }
         for (i, c) in desc.columns.iter().filter(|c| !c.is_virtual).enumerate() {
+            // the header's language is the column's, or the table's, or undetermined
+            let header_lang = c
+                .props
+                .lang
+                .clone()
+                .or_else(|| desc.props.lang.clone())
+                .flatten()
+                .unwrap_or_else(|| "und".to_string());
             if let Some(h) = titles.get(i).and_then(|t| t.first())
-                && !c.titles.is_empty()
-                && !c.titles.contains(h)
+                && !c.title_langs.is_empty()
+                && !c
+                    .title_langs
+                    .iter()
+                    .any(|(l, t)| t == h && languages_match(l, &header_lang))
             {
                 warnings.push(format!(
                     "column {}: the header {h:?} matches none of the titles of column {:?}",
@@ -704,12 +751,26 @@ fn columns(
                 ));
             }
         }
-        desc.columns.clone()
+        let mut descs = desc.columns.clone();
+        if header && width > real {
+            // CSVW describes the columns the metadata lacks by their position
+            warnings.push(format!(
+                "the header has {width} columns and the metadata describes {real}"
+            ));
+            let at = descs
+                .iter()
+                .position(|c| c.is_virtual)
+                .unwrap_or(descs.len());
+            descs.splice(at..at, (real..width).map(|_| ColumnDesc::default()));
+        }
+        descs
     };
     let mut names: Vec<ColumnDesc2> = Vec::new();
     for (i, c) in descs.iter().enumerate() {
-        let mut name = match (&c.name, c.titles.first()) {
+        let named = if lenient { &c.und_titles } else { &c.titles };
+        let mut name = match (&c.name, named.first()) {
             (Some(n), _) => n.clone(),
+            (None, Some(t)) if !t.is_empty() && lenient => uritemplate::encode_variable_name(t),
             (None, Some(t)) if !t.is_empty() => uritemplate::encode_name(t),
             _ => format!("_col.{}", i + 1),
         };
@@ -805,8 +866,9 @@ fn collapse(s: &str) -> String {
 }
 
 impl Column {
-    /// CSVW's cell parsing (§3.3).
-    fn parse(&self, raw: &str) -> Result<Cell, String> {
+    /// CSVW's cell parsing (§3.3). With `lenient`, a value that fails is kept as a
+    /// string and its message is returned beside the cell.
+    fn parse(&self, raw: &str, lenient: bool) -> Result<(Cell, Option<String>), String> {
         let dt = &self.datatype;
         let mut s: Cow<'_, str> = Cow::Borrowed(raw);
         if !dt.keeps_line_breaks() && s.contains(['\r', '\n', '\t']) {
@@ -823,18 +885,30 @@ impl Column {
         if s.is_empty() {
             s = Cow::Owned(self.default.clone());
         }
+        let missing = || -> Result<(Cell, Option<String>), String> {
+            if lenient {
+                Ok((Cell::Null, Some("the value is required".into())))
+            } else {
+                Err("the value is required".into())
+            }
+        };
         if let Some(sep) = &self.separator {
             if s.is_empty() || self.null.iter().any(|n| n == &*s) {
                 if self.required {
-                    return Err("the value is required".into());
+                    return missing();
                 }
-                return Ok(if s.is_empty() {
-                    Cell::List(Vec::new(), String::new())
-                } else {
-                    Cell::Null
-                });
+                return Ok((
+                    if s.is_empty() {
+                        Cell::List(Vec::new(), String::new(), Vec::new())
+                    } else {
+                        Cell::Null
+                    },
+                    None,
+                ));
             }
             let mut items = Vec::new();
+            let mut bad = Vec::new();
+            let mut problem = None;
             for item in s.split(sep.as_str()) {
                 let item = if matches!(dt.kind, datatype::Kind::String | datatype::Kind::Any) {
                     item
@@ -844,17 +918,41 @@ impl Column {
                 if self.null.iter().any(|n| n == item) {
                     continue;
                 }
-                items.push(dt.parse(item)?);
+                match dt.parse(item) {
+                    Ok(lex) => items.push(lex),
+                    Err(m) if lenient => {
+                        bad.push(items.len());
+                        items.push(item.to_string());
+                        problem.get_or_insert(m);
+                    }
+                    Err(m) => return Err(m),
+                }
             }
-            return Ok(Cell::List(items, s.into_owned()));
+            return Ok((Cell::List(items, s.into_owned(), bad), problem));
         }
         if self.null.iter().any(|n| n == &*s) {
             if self.required {
-                return Err("the value is required".into());
+                return missing();
             }
-            return Ok(Cell::Null);
+            return Ok((Cell::Null, None));
         }
-        Ok(Cell::One(dt.parse(&s)?))
+        match dt.parse(&s) {
+            Ok(lex) => Ok((Cell::One(lex), None)),
+            Err(m) if lenient => Ok((Cell::Bad(s.into_owned()), Some(m))),
+            Err(m) => Err(m),
+        }
+    }
+
+    /// The literal of a parsed value: typed when it parsed, and otherwise a string
+    /// with the column's language.
+    fn literal(&self, lex: String, bad: bool) -> Literal {
+        if !bad {
+            return self.datatype.literal(lex, self.lang.as_deref());
+        }
+        match &self.lang {
+            Some(l) => Literal::new_language_tagged_literal_unchecked(lex, l.to_ascii_lowercase()),
+            None => Literal::new_simple_literal(lex),
+        }
     }
 }
 
@@ -873,8 +971,8 @@ impl Table {
         match slot {
             Slot::Col(i) => match &r.cells[i] {
                 Cell::Null => Value::Undef,
-                Cell::One(s) => Value::Str(Cow::Borrowed(s)),
-                Cell::List(items, _) => Value::List(items),
+                Cell::One(s) | Cell::Bad(s) => Value::Str(Cow::Borrowed(s)),
+                Cell::List(items, _, _) => Value::List(items),
             },
             Slot::Row => Value::Str(Cow::Owned(r.row.to_string())),
             Slot::SourceRow => Value::Str(Cow::Owned(r.source_row.to_string())),
@@ -978,9 +1076,13 @@ pub fn convert(
     if let Some(m) = &metadata {
         stats.warnings.extend(m.warnings.iter().cloned());
     }
-    if desc.suppress && template.is_none() {
+    // a table whose output is suppressed still contributes the values that keys check
+    let quiet = desc.suppress && template.is_none();
+    if quiet && opts.keys.is_none() {
         return Ok(stats);
     }
+    let mut discard = |_: Triple| -> Result<()> { Ok(()) };
+    let sink: &mut dyn FnMut(Triple) -> Result<()> = if quiet { &mut discard } else { sink };
     let table_url = match desc
         .url
         .clone()
@@ -1038,6 +1140,7 @@ pub fn convert(
         width,
         header,
         template.is_some(),
+        opts.lenient,
         &mut stats.warnings,
     )
     .map_err(fail)?;
@@ -1084,6 +1187,7 @@ pub fn convert(
         })
         .collect();
     let table = Table {
+        lenient: opts.lenient,
         columns: cols,
         url: table_url,
         index: opts.part,
@@ -1103,7 +1207,7 @@ pub fn convert(
     let standard = if opts.standard {
         let s = Standard::new(metadata.as_deref(), &desc, &table, opts.part).map_err(fail)?;
         for t in s.head.clone() {
-            stats.triples += 1;
+            stats.triples += u64::from(!quiet);
             sink(t)?;
         }
         Some(s)
@@ -1123,9 +1227,11 @@ pub fn convert(
     let mut batch: Vec<Vec<Option<GroundTerm>>> = Vec::new();
     let mut batch_start = 1u64;
     let mut cells: Vec<Cell> = Vec::with_capacity(width);
+    let mut warned = vec![0usize; width];
+    let mut key_warned = 0usize;
     let mut row = 0u64;
     let mut emit = |t: Triple, stats: &mut Stats| -> Result<()> {
-        stats.triples += 1;
+        stats.triples += u64::from(!quiet);
         sink(t)
     };
     while let Some((source_row, line)) = pending {
@@ -1150,7 +1256,7 @@ pub fn convert(
         cells.clear();
         for (i, f) in fields.enumerate() {
             let col = &table.columns[i];
-            let cell = col.parse(dialect.trim(f)).map_err(|m| {
+            let (cell, problem) = col.parse(dialect.trim(f), opts.lenient).map_err(|m| {
                 fail(format!(
                     "row {source_row}{}, column {} ({}): {m}",
                     line_note(source_row, Some(line)),
@@ -1158,6 +1264,23 @@ pub fn convert(
                     col.decoded
                 ))
             })?;
+            if let Some(m) = problem {
+                // a bad column would flood the warnings: keep the first of each
+                if warned[i] < WARNINGS_PER_COLUMN {
+                    stats.warnings.push(format!(
+                        "{name}: row {source_row}, column {} ({}): {m}",
+                        i + 1,
+                        col.decoded
+                    ));
+                } else if warned[i] == WARNINGS_PER_COLUMN {
+                    stats.warnings.push(format!(
+                        "{name}: column {} ({}): further problems of its values are not listed",
+                        i + 1,
+                        col.decoded
+                    ));
+                }
+                warned[i] += 1;
+            }
             cells.push(cell);
         }
         for (t, at) in stats.tallies.iter_mut().zip(&tally_at) {
@@ -1178,13 +1301,24 @@ pub fn convert(
             line,
         };
         if let Some(k) = &mut keys {
-            k.row(&table, &r).map_err(fail)?;
+            // a failure is the memory budget, which stops the load in either mode
+            let mut violations = Vec::new();
+            k.row(&table, &r, &mut violations).map_err(fail)?;
+            for m in violations {
+                if !opts.lenient {
+                    return Err(fail(m));
+                }
+                note_key_violation(&mut stats.warnings, &name, &mut key_warned, m);
+            }
         }
         match &mut runner {
             None if standard.is_some() => {
                 let mut subjects = Vec::new();
                 emit_row(&table, &r, &name, &mut |t| {
-                    if !subjects.contains(&t.subject) {
+                    // the nodes of an ordered list are not what a row describes
+                    let list =
+                        t.predicate.as_ref() == rdf::FIRST || t.predicate.as_ref() == rdf::REST;
+                    if !list && !subjects.contains(&t.subject) {
                         subjects.push(t.subject.clone());
                     }
                     emit(t, &mut stats)
@@ -1227,13 +1361,44 @@ pub fn convert(
         })?;
     }
     if let Some(k) = keys {
-        k.finish();
+        // strict mode needs only the first violation, and CSVW's rules cap the listing
+        let (violations, total) = k.finish(if opts.lenient { WARNINGS_PER_COLUMN } else { 1 });
+        if let Some(m) = violations.first()
+            && !opts.lenient
+        {
+            return Err(fail(m.clone()));
+        }
+        let listed = violations.len();
+        for m in violations {
+            note_key_violation(&mut stats.warnings, &name, &mut key_warned, m);
+        }
+        key_warned += total - listed;
+        note_unlisted_key_violations(&mut stats.warnings, &name, key_warned);
     }
     stats.rows = row;
     if template.is_some() {
         stats.lookup_commit = opts.lookup.as_ref().map(|l| l.commit);
     }
     Ok(stats)
+}
+
+/// Report a key violation as a warning, up to the cap for a table.
+fn note_key_violation(warnings: &mut Vec<String>, name: &str, count: &mut usize, m: String) {
+    if *count < WARNINGS_PER_COLUMN {
+        warnings.push(format!("{name}: {m}"));
+    }
+    *count += 1;
+    note_unlisted_key_violations(warnings, name, *count);
+}
+
+/// Say once that violations beyond the cap are not listed.
+fn note_unlisted_key_violations(warnings: &mut Vec<String>, name: &str, count: usize) {
+    if count > WARNINGS_PER_COLUMN {
+        let note = format!("{name}: further key violations are not listed");
+        if !warnings.contains(&note) {
+            warnings.push(note);
+        }
+    }
 }
 
 /// The key checks of one table (spec F19 §6.2, §6.3).
@@ -1246,7 +1411,19 @@ struct KeyCheck {
     fks: Vec<(Vec<usize>, Arc<KeySet>, String)>,
     /// the columns of this table that other tables reference, with their values
     collect: Vec<(Vec<String>, Vec<usize>, KeySet)>,
+    /// the foreign keys that reference this same table, which the end of the table
+    /// checks
+    own: Vec<OwnKey>,
     table: usize,
+}
+
+/// A foreign key of a table to its own columns.
+struct OwnKey {
+    cols: Vec<usize>,
+    ref_columns: Vec<String>,
+    desc: String,
+    /// the values to check, with the row and the name of the first column
+    pending: Vec<(Vec<String>, u64, String)>,
 }
 
 fn key_columns(
@@ -1269,8 +1446,8 @@ fn key_columns(
 fn key_value(cell: &Cell) -> Option<String> {
     match cell {
         Cell::Null => None,
-        Cell::One(s) => Some(s.clone()),
-        Cell::List(_, raw) => Some(raw.clone()),
+        Cell::One(s) | Cell::Bad(s) => Some(s.clone()),
+        Cell::List(_, raw, _) => Some(raw.clone()),
     }
 }
 
@@ -1291,10 +1468,25 @@ impl KeyCheck {
             ))
         };
         let mut fks = Vec::new();
+        let mut own = Vec::new();
         for fk in &desc.foreign_keys {
             let r = referenced_table(m, fk).ok_or_else(|| {
                 "a foreign key references a table that is not in the group".to_string()
             })?;
+            if r == ti {
+                own.push(OwnKey {
+                    cols: key_columns(cols, &fk.columns, "a foreign key")?,
+                    ref_columns: fk.ref_columns.clone(),
+                    desc: format!(
+                        "column{} {} of table {}",
+                        if fk.ref_columns.len() > 1 { "s" } else { "" },
+                        fk.ref_columns.join(", "),
+                        table_name(&m.tables[r], r)
+                    ),
+                    pending: Vec::new(),
+                });
+                continue;
+            }
             let set = reg
                 .sets
                 .lock()
@@ -1338,11 +1530,20 @@ impl KeyCheck {
             seen: Default::default(),
             fks,
             collect,
+            own,
             table: ti,
         })
     }
 
-    fn row(&mut self, table: &Table, r: &RowCtx<'_>) -> std::result::Result<(), String> {
+    /// Check a row and collect its referenceable values. A violation of a key goes to
+    /// `violations` and the row is still collected, so that a later row is not blamed for
+    /// it. An error is a failure that no mode recovers from, the memory budget.
+    fn row(
+        &mut self,
+        table: &Table,
+        r: &RowCtx<'_>,
+        violations: &mut Vec<String>,
+    ) -> std::result::Result<(), String> {
         let at = |i: usize| {
             format!(
                 "row {}{}",
@@ -1352,26 +1553,34 @@ impl KeyCheck {
         };
         if let Some((cols, names)) = &self.pk {
             let mut key = Vec::with_capacity(cols.len());
+            let mut empty = None;
             for &i in cols {
                 match key_value(&r.cells[i]) {
                     Some(v) => key.push(v),
-                    None => return Err(format!("{}: a primary key cell is empty", at(i))),
+                    None => {
+                        empty = Some(i);
+                        break;
+                    }
                 }
             }
-            let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 48;
-            self.reg
-                .charge(bytes as u64, &format!("the primary key of {}", self.name))?;
-            if let Some(first) = self.seen.insert(key.clone(), r.source_row) {
-                return Err(format!(
-                    "rows {first} and {} have the same primary key ({})",
-                    r.source_row,
-                    names
-                        .iter()
-                        .zip(&key)
-                        .map(|(n, v)| format!("{n} = {v:?}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+            if let Some(i) = empty {
+                violations.push(format!("{}: a primary key cell is empty", at(i)));
+            } else {
+                let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 48;
+                self.reg
+                    .charge(bytes as u64, &format!("the primary key of {}", self.name))?;
+                if let Some(first) = self.seen.insert(key.clone(), r.source_row) {
+                    violations.push(format!(
+                        "rows {first} and {} have the same primary key ({})",
+                        r.source_row,
+                        names
+                            .iter()
+                            .zip(&key)
+                            .map(|(n, v)| format!("{n} = {v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
             }
         }
         for (cols, set, desc) in &self.fks {
@@ -1384,7 +1593,7 @@ impl KeyCheck {
                 }
             }
             if key.len() == cols.len() && !set.contains(&key) {
-                return Err(format!(
+                violations.push(format!(
                     "{}: the value {} is not among the values of {desc}",
                     at(cols[0]),
                     key.iter()
@@ -1392,6 +1601,19 @@ impl KeyCheck {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
+            }
+        }
+        for o in &mut self.own {
+            let key: Option<Vec<String>> = o.cols.iter().map(|&i| key_value(&r.cells[i])).collect();
+            // a null in the reference passes
+            if let Some(key) = key {
+                let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 64;
+                self.reg.charge(
+                    bytes as u64,
+                    &format!("the foreign key values of {} to itself", self.name),
+                )?;
+                o.pending
+                    .push((key, r.source_row, table.columns[o.cols[0]].decoded.clone()));
             }
         }
         for (names, cols, set) in &mut self.collect {
@@ -1414,12 +1636,40 @@ impl KeyCheck {
         Ok(())
     }
 
-    /// Hand the collected values to the tables that reference them.
-    fn finish(self) {
+    /// Check the foreign keys of the table to itself, and hand the collected values to
+    /// the tables that reference them. Returns the first `limit` violations of the own
+    /// keys, formatted, and how many there are, so that a large table does not format a
+    /// message for each of its rows.
+    fn finish(self, limit: usize) -> (Vec<String>, usize) {
+        let mut listed = Vec::new();
+        let mut total = 0;
+        for o in &self.own {
+            let Some((_, _, set)) = self.collect.iter().find(|(n, _, _)| *n == o.ref_columns)
+            else {
+                continue;
+            };
+            for (key, row, col) in &o.pending {
+                if set.contains(key) {
+                    continue;
+                }
+                total += 1;
+                if listed.len() < limit {
+                    listed.push(format!(
+                        "row {row}, column {col}: the value {} is not among the values of {}",
+                        key.iter()
+                            .map(|v| format!("{v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        o.desc
+                    ));
+                }
+            }
+        }
         let mut sets = self.reg.sets.lock();
         for (names, _, set) in self.collect {
             sets.insert((self.table, names), Arc::new(set));
         }
+        (listed, total)
     }
 }
 
@@ -1430,6 +1680,8 @@ struct Standard {
     table: NamedOrBlankNode,
     url: Option<String>,
     part: usize,
+    /// the columns whose cells title the rows
+    row_titles: Vec<(usize, Column)>,
 }
 
 const CSVW_NS: &str = "http://www.w3.org/ns/csvw#";
@@ -1438,90 +1690,198 @@ fn csvw_iri(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{CSVW_NS}{local}"))
 }
 
-/// The terms of a note or a common property's JSON-LD value: a string, a number, a
-/// boolean, `{"@id"}`, `{"@value"}` with `@language` or `@type`, a language map or an
-/// array of these. Anything else needs JSON-LD processing and fails.
-fn jsonld_terms(
-    v: &serde_json::Value,
-    base: Option<&oxiri::Iri<String>>,
-    out: &mut Vec<Term>,
-) -> std::result::Result<(), String> {
-    use serde_json::Value as J;
-    match v {
-        J::String(s) => out.push(Literal::new_simple_literal(s.clone()).into()),
-        J::Bool(b) => out.push(Literal::from(*b).into()),
-        J::Number(n) => out.push(if n.is_i64() || n.is_u64() {
-            Literal::new_typed_literal(n.to_string(), oxrdf::vocab::xsd::INTEGER).into()
-        } else {
-            Literal::new_typed_literal(n.to_string(), oxrdf::vocab::xsd::DOUBLE).into()
-        }),
-        J::Array(a) => {
-            for x in a {
-                jsonld_terms(x, base, out)?;
-            }
+/// Terms of the CSVW context that a `@type` may name.
+const CSVW_TERMS: &[&str] = &[
+    "Cell",
+    "Column",
+    "Datatype",
+    "Dialect",
+    "Direction",
+    "NumericFormat",
+    "Row",
+    "Schema",
+    "Table",
+    "TableGroup",
+    "Template",
+    "Transformation",
+];
+
+/// The conversion of the JSON-LD values of notes and common properties to RDF (the
+/// rules of "Generating RDF from Tabular Data on the Web", section 6): a string, a
+/// number, a boolean, an object with `@id`, `@value`, `@language` or `@type`, a
+/// language map, an array of these, or a node object whose other properties are
+/// converted the same way. Lists, sets and contexts are not allowed in metadata.
+struct JsonLd<'a> {
+    base: Option<&'a oxiri::Iri<String>>,
+    /// the `@language` of the metadata's context, for plain strings
+    language: Option<&'a str>,
+    /// the triples of the blank nodes that node objects make
+    extra: Vec<Triple>,
+    /// the label prefix of those blank nodes, and the number of the last one
+    prefix: String,
+    next: usize,
+}
+
+impl JsonLd<'_> {
+    fn iri(&self, s: &str) -> std::result::Result<NamedNode, String> {
+        if s.starts_with("_:") {
+            return Err(format!("{s:?} is a blank node, which metadata cannot name"));
         }
-        J::Object(o) if o.len() == 1 && o.contains_key("@id") => {
-            let id = o["@id"].as_str().ok_or("@id must be a string")?;
-            let id = csvw::expand_prefixed(id).unwrap_or_else(|| id.to_string());
-            let abs = match (oxiri::Iri::parse(id.clone()), base) {
-                (Ok(i), _) => i.into_inner(),
-                (Err(_), Some(b)) => b
-                    .resolve(&id)
-                    .map_err(|e| format!("@id {id:?}: {e}"))?
-                    .into_inner(),
-                (Err(e), None) => return Err(format!("@id {id:?}: {e}")),
-            };
-            out.push(NamedNode::new(abs).map_err(|e| e.to_string())?.into());
-        }
-        J::Object(o) if o.contains_key("@value") => {
-            let val = match &o["@value"] {
-                J::String(s) => s.clone(),
-                J::Number(n) => n.to_string(),
-                J::Bool(b) => b.to_string(),
-                _ => return Err("@value must be a string, a number or a boolean".into()),
-            };
-            if o.keys()
-                .any(|k| !matches!(k.as_str(), "@value" | "@language" | "@type"))
-            {
-                return Err("a value object may hold only @value, @language and @type".into());
-            }
-            if let Some(l) = o.get("@language").and_then(|l| l.as_str()) {
-                out.push(
-                    Literal::new_language_tagged_literal(val, l)
-                        .map_err(|e| format!("@language {l:?}: {e}"))?
-                        .into(),
-                );
-            } else if let Some(t) = o.get("@type").and_then(|t| t.as_str()) {
-                let t = csvw::expand_prefixed(t).unwrap_or_else(|| t.to_string());
-                out.push(
-                    Literal::new_typed_literal(val, NamedNode::new(t).map_err(|e| e.to_string())?)
-                        .into(),
-                );
-            } else {
-                out.push(Literal::new_simple_literal(val).into());
-            }
-        }
-        J::Object(o)
-            if o.keys().all(|k| {
-                !k.starts_with('@') && oxrdf::Literal::new_language_tagged_literal("", k).is_ok()
-            }) =>
-        {
-            // a language map
-            for (lang, s) in o {
-                let s = s.as_str().ok_or("a language map holds strings")?;
-                out.push(
-                    Literal::new_language_tagged_literal_unchecked(s, lang.to_ascii_lowercase())
-                        .into(),
-                );
-            }
-        }
-        _ => {
-            return Err(
-                "a note or common property is a JSON-LD object that needs JSON-LD processing, which Sparkles does not do".into(),
-            );
-        }
+        let s = csvw::expand_prefixed(s).unwrap_or_else(|| s.to_string());
+        let abs = match (oxiri::Iri::parse(s.clone()), self.base) {
+            (Ok(i), _) => i.into_inner(),
+            (Err(_), Some(b)) => b
+                .resolve(&s)
+                .map_err(|e| format!("{s:?}: {e}"))?
+                .into_inner(),
+            (Err(e), None) => return Err(format!("{s:?}: {e}")),
+        };
+        NamedNode::new(abs).map_err(|e| e.to_string())
     }
-    Ok(())
+
+    /// A `@type`: a term of the CSVW context, a prefixed name or an absolute IRI.
+    fn type_iri(&self, v: &serde_json::Value) -> std::result::Result<NamedNode, String> {
+        let t = v.as_str().ok_or("@type must be a string")?;
+        if CSVW_TERMS.contains(&t) {
+            return Ok(csvw_iri(t));
+        }
+        if t.starts_with("_:") {
+            return Err(format!(
+                "@type {t:?} is a blank node, which metadata cannot name"
+            ));
+        }
+        let expanded = csvw::expand_prefixed(t).unwrap_or_else(|| t.to_string());
+        oxiri::Iri::parse(expanded.clone()).map_err(|_| {
+            format!("@type {t:?} is not a term, a prefixed name or an absolute IRI")
+        })?;
+        NamedNode::new(expanded).map_err(|e| e.to_string())
+    }
+
+    fn terms(
+        &mut self,
+        v: &serde_json::Value,
+        out: &mut Vec<Term>,
+    ) -> std::result::Result<(), String> {
+        use serde_json::Value as J;
+        match v {
+            J::String(s) => out.push(
+                match self.language {
+                    Some(l) => Literal::new_language_tagged_literal(s.clone(), l)
+                        .map_err(|e| format!("@language {l:?}: {e}"))?,
+                    None => Literal::new_simple_literal(s.clone()),
+                }
+                .into(),
+            ),
+            J::Bool(b) => out.push(Literal::from(*b).into()),
+            J::Number(n) => out.push(if n.is_i64() || n.is_u64() {
+                Literal::new_typed_literal(n.to_string(), oxrdf::vocab::xsd::INTEGER).into()
+            } else {
+                Literal::new_typed_literal(n.to_string(), oxrdf::vocab::xsd::DOUBLE).into()
+            }),
+            J::Array(a) => {
+                for x in a {
+                    self.terms(x, out)?;
+                }
+            }
+            J::Object(o) if o.contains_key("@value") => {
+                let val = match &o["@value"] {
+                    J::String(s) => s.clone(),
+                    J::Number(n) => n.to_string(),
+                    J::Bool(b) => b.to_string(),
+                    _ => return Err("@value must be a string, a number or a boolean".into()),
+                };
+                if o.keys()
+                    .any(|k| !matches!(k.as_str(), "@value" | "@language" | "@type"))
+                {
+                    return Err("a value object may hold only @value, @language and @type".into());
+                }
+                if o.contains_key("@language") && o.contains_key("@type") {
+                    return Err("a value object has either @language or @type, not both".into());
+                }
+                if let Some(l) = o.get("@language") {
+                    let l = l.as_str().ok_or("@language must be a string")?;
+                    out.push(
+                        Literal::new_language_tagged_literal(val, l)
+                            .map_err(|e| format!("@language {l:?}: {e}"))?
+                            .into(),
+                    );
+                } else if let Some(t) = o.get("@type") {
+                    out.push(Literal::new_typed_literal(val, self.type_iri(t)?).into());
+                } else {
+                    out.push(Literal::new_simple_literal(val).into());
+                }
+            }
+            J::Object(o)
+                if !o.is_empty()
+                    && o.iter().all(|(k, v)| {
+                        !k.starts_with('@')
+                            && v.is_string()
+                            && oxrdf::Literal::new_language_tagged_literal("", k).is_ok()
+                    }) =>
+            {
+                // a language map
+                for (lang, s) in o {
+                    let s = s.as_str().expect("checked above");
+                    out.push(
+                        Literal::new_language_tagged_literal_unchecked(
+                            s,
+                            lang.to_ascii_lowercase(),
+                        )
+                        .into(),
+                    );
+                }
+            }
+            J::Object(o) => {
+                for k in ["@context", "@list", "@set"] {
+                    if o.contains_key(k) {
+                        return Err(format!("{k} is not allowed in a note or common property"));
+                    }
+                }
+                if o.contains_key("@language") {
+                    return Err("@language is allowed only with @value".into());
+                }
+                let node: NamedOrBlankNode = match o.get("@id") {
+                    Some(id) => self.iri(id.as_str().ok_or("@id must be a string")?)?.into(),
+                    None => {
+                        self.next += 1;
+                        BlankNode::new_unchecked(format!("{}{}", self.prefix, self.next)).into()
+                    }
+                };
+                let mut triples = Vec::new();
+                if let Some(t) = o.get("@type") {
+                    let types: Vec<&J> = match t {
+                        J::Array(a) => a.iter().collect(),
+                        t => vec![t],
+                    };
+                    for t in types {
+                        triples.push(Triple::new(node.clone(), rdf::TYPE, self.type_iri(t)?));
+                    }
+                }
+                let mut values = Vec::new();
+                for (k, v) in o {
+                    if matches!(k.as_str(), "@id" | "@type") {
+                        continue;
+                    }
+                    if k.starts_with('@') {
+                        return Err(format!("{k} is not allowed in a note or common property"));
+                    }
+                    let p = csvw::expand_prefixed(k).unwrap_or_else(|| k.clone());
+                    oxiri::Iri::parse(p.clone())
+                        .map_err(|_| format!("{k:?} is not a prefixed name or an absolute IRI"))?;
+                    let p = NamedNode::new(p).map_err(|e| e.to_string())?;
+                    values.clear();
+                    self.terms(v, &mut values)?;
+                    for o in values.drain(..) {
+                        triples.push(Triple::new(node.clone(), p.clone(), o));
+                    }
+                }
+                self.extra.extend(triples);
+                out.push(node.into());
+            }
+            J::Null => {}
+        }
+        Ok(())
+    }
 }
 
 impl Standard {
@@ -1535,18 +1895,14 @@ impl Standard {
         let node =
             |id: &Option<String>, label: String| -> std::result::Result<NamedOrBlankNode, String> {
                 match id {
-                    Some(i) => {
-                        let mut t = Vec::new();
-                        jsonld_terms(&serde_json::json!({ "@id": i }), base, &mut t)?;
-                        match t.pop() {
-                            Some(Term::NamedNode(n)) => Ok(n.into()),
-                            _ => Err(format!("@id {i:?} is not an IRI")),
-                        }
-                    }
+                    Some(i) => Ok(NamedNode::new(i.clone())
+                        .map_err(|e| format!("@id {i:?} is not an IRI: {e}"))?
+                        .into()),
                     None => Ok(BlankNode::new_unchecked(label).into()),
                 }
             };
         let group = m.map(|m| m.group.clone()).unwrap_or_default();
+        let language = m.and_then(|m| m.language.as_deref());
         let g = node(&group.id, "tg".into())?;
         let t = node(&desc.described.id, format!("t{part}"))?;
         let mut head = vec![
@@ -1561,11 +1917,23 @@ impl Standard {
                 NamedNode::new_unchecked(u.as_str()),
             ));
         }
-        for (subject, d) in [(&g, &group), (&t, &desc.described)] {
+        // the blank nodes of the group's values are the same in every table of the group
+        for (subject, d, prefix) in [
+            (&g, &group, "tgv".to_string()),
+            (&t, &desc.described, format!("t{part}v")),
+        ] {
+            let mut jld = JsonLd {
+                base,
+                language,
+                extra: Vec::new(),
+                prefix,
+                next: 0,
+            };
             let mut terms = Vec::new();
             for n in &d.notes {
                 terms.clear();
-                jsonld_terms(n, base, &mut terms).map_err(|e| format!("notes: {e}"))?;
+                jld.terms(n, &mut terms)
+                    .map_err(|e| format!("notes: {e}"))?;
                 for o in terms.drain(..) {
                     head.push(Triple::new(subject.clone(), csvw_iri("note"), o));
                 }
@@ -1574,14 +1942,27 @@ impl Standard {
                 let p = csvw::expand_prefixed(k).unwrap_or_else(|| k.clone());
                 let p = NamedNode::new(p).map_err(|e| format!("common property {k:?}: {e}"))?;
                 terms.clear();
-                jsonld_terms(v, base, &mut terms).map_err(|e| format!("{k}: {e}"))?;
+                jld.terms(v, &mut terms).map_err(|e| format!("{k}: {e}"))?;
                 for o in terms.drain(..) {
                     head.push(Triple::new(subject.clone(), p.clone(), o));
                 }
             }
+            head.append(&mut jld.extra);
+        }
+        let mut row_titles = Vec::new();
+        for n in &desc.row_titles {
+            let i = table
+                .columns
+                .iter()
+                .position(|c| !c.is_virtual && (&c.name == n || &c.decoded == n))
+                .ok_or_else(|| {
+                    format!("rowTitles names the column {n:?}, which the table does not have")
+                })?;
+            row_titles.push((i, table.columns[i].clone()));
         }
         Ok(Standard {
             head,
+            row_titles,
             table: t,
             url: table
                 .url
@@ -1617,6 +1998,21 @@ impl Standard {
         for s in subjects {
             out.push(Triple::new(node.clone(), csvw_iri("describes"), s.clone()));
         }
+        for (i, c) in &self.row_titles {
+            let literals: Vec<Literal> = match &r.cells[*i] {
+                Cell::Null => Vec::new(),
+                Cell::One(lex) => vec![c.literal(lex.clone(), false)],
+                Cell::Bad(lex) => vec![c.literal(lex.clone(), true)],
+                Cell::List(items, _, bad) => items
+                    .iter()
+                    .enumerate()
+                    .map(|(k, x)| c.literal(x.clone(), bad.contains(&k)))
+                    .collect(),
+            };
+            for l in literals {
+                out.push(Triple::new(node.clone(), csvw_iri("title"), l));
+            }
+        }
         out
     }
 }
@@ -1641,10 +2037,10 @@ fn run_batch(
 fn bind(table: &Table, c: &Column, i: usize, r: &RowCtx<'_>) -> Result<Option<GroundTerm>, String> {
     Ok(match &r.cells[i] {
         Cell::Null => None,
-        Cell::List(_, raw) => Some(GroundTerm::Literal(Literal::new_simple_literal(raw))),
-        Cell::One(lex) => Some(match &c.value {
+        Cell::List(_, raw, _) => Some(GroundTerm::Literal(Literal::new_simple_literal(raw))),
+        cell @ (Cell::One(lex) | Cell::Bad(lex)) => Some(match &c.value {
             Some(t) => GroundTerm::NamedNode(table.object(c, t, r, i).map_err(|m| at(r, i, c, m))?),
-            None => GroundTerm::Literal(c.datatype.literal(lex.clone(), c.lang.as_deref())),
+            None => GroundTerm::Literal(c.literal(lex.clone(), matches!(cell, Cell::Bad(_)))),
         }),
     })
 }
@@ -1683,7 +2079,7 @@ fn emit_row(
             Some(&r.cells[i])
         };
         if matches!(cell, Some(Cell::Null))
-            || matches!(cell, Some(Cell::List(l, _)) if l.is_empty())
+            || matches!(cell, Some(Cell::List(l, _, _)) if l.is_empty())
         {
             continue;
         }
@@ -1701,8 +2097,14 @@ fn emit_row(
                     ));
                 };
                 let mut frag = String::new();
+                // CSVW's rules encode every character a variable name cannot hold
+                let safe = if table.lenient {
+                    "._"
+                } else {
+                    "-._~!$&'()*+,;=:@/?"
+                };
                 for ch in c.decoded.chars() {
-                    if ch.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/?".contains(ch) {
+                    if ch.is_ascii_alphanumeric() || safe.contains(ch) {
                         frag.push(ch);
                     } else {
                         let mut b = [0u8; 4];
@@ -1722,11 +2124,11 @@ fn emit_row(
             continue;
         }
         match cell {
-            Some(Cell::One(lex)) => {
-                let o = c.datatype.literal(lex.clone(), c.lang.as_deref());
+            Some(cell @ (Cell::One(lex) | Cell::Bad(lex))) => {
+                let o = c.literal(lex.clone(), matches!(cell, Cell::Bad(_)));
                 out(Triple::new(subject, predicate, o), sink)?;
             }
-            Some(Cell::List(items, _)) if c.ordered => {
+            Some(Cell::List(items, _, bad)) if c.ordered => {
                 let node = |k: usize| {
                     BlankNode::new_unchecked(format!(
                         "t{}r{}c{}l{k}",
@@ -1737,7 +2139,7 @@ fn emit_row(
                 };
                 out(Triple::new(subject, predicate, node(0)), sink)?;
                 for (k, item) in items.iter().enumerate() {
-                    let o = c.datatype.literal(item.clone(), c.lang.as_deref());
+                    let o = c.literal(item.clone(), bad.contains(&k));
                     out(Triple::new(node(k), rdf::FIRST, o), sink)?;
                     let rest: Term = if k + 1 == items.len() {
                         rdf::NIL.into_owned().into()
@@ -1747,9 +2149,9 @@ fn emit_row(
                     out(Triple::new(node(k), rdf::REST, rest), sink)?;
                 }
             }
-            Some(Cell::List(items, _)) => {
-                for item in items {
-                    let o = c.datatype.literal(item.clone(), c.lang.as_deref());
+            Some(Cell::List(items, _, bad)) => {
+                for (k, item) in items.iter().enumerate() {
+                    let o = c.literal(item.clone(), bad.contains(&k));
                     out(Triple::new(subject.clone(), predicate.clone(), o), sink)?;
                 }
             }
@@ -2124,6 +2526,7 @@ impl TypedColumns {
             header.len(),
             !header.is_empty(),
             false,
+            false,
             &mut warnings,
         )?;
         Ok(TypedColumns {
@@ -2141,10 +2544,10 @@ impl TypedColumns {
                 vec![Literal::new_simple_literal(raw)]
             });
         };
-        Ok(match c.parse(raw)? {
+        Ok(match c.parse(raw, false)?.0 {
             Cell::Null => Vec::new(),
-            Cell::One(lex) => vec![c.datatype.literal(lex, c.lang.as_deref())],
-            Cell::List(items, _) => items
+            Cell::One(lex) | Cell::Bad(lex) => vec![c.datatype.literal(lex, c.lang.as_deref())],
+            Cell::List(items, _, _) => items
                 .into_iter()
                 .map(|lex| c.datatype.literal(lex, c.lang.as_deref()))
                 .collect(),

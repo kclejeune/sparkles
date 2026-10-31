@@ -470,7 +470,9 @@ fn check(m: &mapping::Mapping, ins: &mapping::Inputs, out: &mut impl Write) -> R
                                 tm.references(&mut refs)
                             }
                             sparkles::mapping::model::ObjectMap::Join { conditions, .. } => {
-                                refs.extend(conditions.iter().map(|(c, _)| c.clone()))
+                                for (c, _) in conditions {
+                                    c.references(&mut refs);
+                                }
                             }
                         }
                     }

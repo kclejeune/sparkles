@@ -139,32 +139,10 @@ const RT: &str = "http://w3id.org/rml/test/";
 const DCT: &str = "http://purl.org/dc/terms/";
 
 /// RML-Core cases that are excluded, with the reason.
-const RML_CORE_EXCLUDED: &[(&str, &str)] = &[
-    (
-        "RMLTC0027b-JSON",
-        "rml:UnsafeIRI generates IRIs with spaces, which are not valid IRIs and which no Sparkles store can hold; the expected output is not even valid N-Quads",
-    ),
-    (
-        "RMLTC0030b-JSON",
-        "join conditions over templates (RML-Core expression maps as rml:childMap and rml:parentMap) are not built: join conditions compare references",
-    ),
-    (
-        "RMLTC0030c-JSON",
-        "a join condition with a constant parent map is not built",
-    ),
-    (
-        "RMLTC0030d-JSON",
-        "join conditions over a template and a constant are not built",
-    ),
-    (
-        "RMLTC0030e-JSON",
-        "a join condition with a constant child map is not built",
-    ),
-    (
-        "RMLTC0030f-JSON",
-        "join conditions over a constant and a template are not built",
-    ),
-];
+const RML_CORE_EXCLUDED: &[(&str, &str)] = &[(
+    "RMLTC0027b-JSON",
+    "rml:UnsafeIRI keeps the values as they are, and Sparkles refuses the result when it is not a valid IRI; the expected output holds IRIs with spaces, which no Sparkles store can hold and which are not valid N-Quads",
+)];
 
 #[test]
 fn rml_core_test_cases() {

@@ -434,10 +434,10 @@ standard mode of "Generating RDF from Tabular Data on the Web" around the minima
 triples that C05 writes: a `csvw:TableGroup` resource with `csvw:table` links, a
 `csvw:Table` per table with `csvw:url`, and a `csvw:Row` per row with `csvw:rownum`,
 `csvw:url` (the RFC 7111 row IRI) and `csvw:describes` links to the subjects the row
-generated, plus the table's notes and common properties as their JSON-LD values where
-those are plain strings, IRIs or language maps. Common properties that need full JSON-LD
-processing fail with a message, because Sparkles does not process JSON-LD contexts
-(C05 §3.1). Minimal mode stays the default.
+generated, plus the table's notes and common properties converted to RDF as JSON-LD does
+for strings, IRIs, language maps, value objects and node objects, whose blank nodes
+describe the property's value. Common properties that use `@context`, `@list`, `@set` or a
+blank node identifier fail with a message. Minimal mode stays the default.
 
 ### 6.2 Primary keys
 
@@ -843,8 +843,9 @@ INSERT INTO orders VALUES (10, 1, 99.50, '2026-01-02'), (11, 1, 5.00, '2026-02-0
   and the earlier rml.io test cases for CSV and JSON, excluding XML.
 - **YARRRML.** Each YARRRML test translates to RML and compares with the expected RML
   graph, then runs.
-- **CSVW.** The W3C CSVW test suite, which C05 could not run offline, is vendored as test
-  data for the RDF tests in minimal and standard mode.
+- **CSVW.** The 270 RDF tests of the W3C CSVW test suite are vendored under
+  `testsuite/csvw/` and run in minimal and standard mode. All pass. The harness reads
+  metadata and cells with CSVW's lenient rules, which warn and use the default.
 - **Virtual equivalence.** A generated query list over the A1 schema and over BSBM's
   relational form: every combination of up to four triple patterns, OPTIONAL, UNION,
   FILTER and the modifiers, run over the virtual graph and over the materialized
@@ -948,7 +949,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230, 232 to 239 and 404. Native Rust `Dataset::run_mapping_with` carries complete structured write options through direct mapping conversion and final load while preserving the existing `run_mapping` and `RunOptions` APIs, and stored runs apply the same controls to conversion. Python mapping runs have no cancellation or timeout, which is item 404. Virtual graphs remain under item 43.
+Materialized mappings over the implemented CSV, TSV, JSON, local Parquet and SQLite sources are available. The JVM and Node.js bindings expose stored and direct mapping runs. Remaining Phase 1 source and administration gaps are tracked under items 230 and 233 to 239 and 404, and in NEW-ITEM-1 for the CSVW processing rules at the command line. Native Rust `Dataset::run_mapping_with` carries complete structured write options through direct mapping conversion and final load while preserving the existing `run_mapping` and `RunOptions` APIs, and stored runs apply the same controls to conversion. Python mapping runs have no cancellation or timeout, which is item 404. Virtual graphs remain under item 43.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)
