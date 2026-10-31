@@ -25,7 +25,6 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // ----------------------------------------------------------------------- formats ----
 
@@ -476,9 +475,7 @@ pub struct PyFileReader {
     /// encoded characters of a text-mode read that did not fit the caller's buffer
     pending: Vec<u8>,
     pos: usize,
-    cancel: Option<Arc<AtomicBool>>,
-    /// set while a signal waits for the main thread to run its handlers
-    signalled: Option<Arc<AtomicBool>>,
+    signals: Option<Arc<crate::interrupt::StreamSignals>>,
 }
 
 impl PyFileReader {
@@ -487,23 +484,20 @@ impl PyFileReader {
             obj,
             pending: Vec::new(),
             pos: 0,
-            cancel: None,
-            signalled: None,
+            signals: None,
         }
     }
 
-    /// The reader, failing its reads once `cancel` is set, and leaving the GIL to the
-    /// main thread while `signalled` is set (see [`crate::interrupt::run_reading`]).
-    pub fn cancelled_by(mut self, cancel: Arc<AtomicBool>, signalled: Arc<AtomicBool>) -> Self {
-        self.cancel = Some(cancel);
-        self.signalled = Some(signalled);
+    /// The reader of a request that [`crate::interrupt::run_stream`] runs: its reads fail
+    /// once the request is cancelled, and it makes a checkpoint when a signal is pending
+    /// and at the end of the stream.
+    pub fn with_signals(mut self, signals: Arc<crate::interrupt::StreamSignals>) -> Self {
+        self.signals = Some(signals);
         self
     }
 
-    fn cancelled(&self) -> bool {
-        self.cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed))
+    fn cancelled() -> std::io::Error {
+        std::io::Error::other(sparkles::Error::Cancelled)
     }
 }
 
@@ -518,18 +512,15 @@ impl Read for PyFileReader {
             self.pos += n;
             return Ok(n);
         }
-        // A read in a tight loop could keep the GIL from the main thread, which must run
-        // the handler of a pending signal. Wait for it.
-        if let Some(signalled) = &self.signalled {
-            while signalled.load(Ordering::Acquire) && !self.cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Some(signals) = &self.signals {
+            // A read in a tight loop could keep the GIL from the main thread, which must
+            // run the handlers of a pending signal.
+            if (signals.pending() && signals.checkpoint()) || signals.cancelled() {
+                return Err(Self::cancelled());
             }
         }
-        if self.cancelled() {
-            return Err(std::io::Error::other(sparkles::Error::Cancelled));
-        }
         let want = buf.len().min(PY_READ_BYTES);
-        Python::attach(|py| -> PyResult<usize> {
+        let n = Python::attach(|py| -> PyResult<usize> {
             let data = self.obj.bind(py).call_method1("read", (want,))?;
             let mut put = |bytes: &[u8]| {
                 let n = bytes.len().min(buf.len());
@@ -552,7 +543,16 @@ impl Read for PyFileReader {
             }
             Ok(put(&data.extract::<Vec<u8>>()?))
         })
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other)?;
+        // The end of the stream waits for the handlers of a signal that arrived during
+        // the reads, so that a raising handler stops the request before it commits.
+        if n == 0
+            && let Some(signals) = &self.signals
+            && signals.checkpoint()
+        {
+            return Err(Self::cancelled());
+        }
+        Ok(n)
     }
 }
 

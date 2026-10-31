@@ -205,7 +205,8 @@ def test_ctrl_c_stops_the_reading_of_a_file_object(fmt) -> None:
 
 def test_a_file_object_writes_no_temporary_copy(tmp_path: Path) -> None:
     """With TMPDIR at a directory that does not exist, a load from a file object succeeds
-    in every mode and syntax, so it wrote no temporary file."""
+    in every syntax, in automatic and streaming mode and in buffered mode within its
+    allowance, so it wrote no temporary file."""
     names = {RdfFormat.RDF_THRIFT: "rt", RdfFormat.RDF_PROTOBUF: "rpb"}
     data = {names.get(f, f): sample(f)[0] for f, _ in FORMATS}
     script = textwrap.dedent(
@@ -258,3 +259,174 @@ def test_a_signal_whose_handler_returns_leaves_the_load_running() -> None:
             assert seen
     finally:
         signal.signal(signal.SIGUSR1, old)
+
+
+def run_child(script: str, *args: str, env: dict | None = None, timeout: float = 120):
+    """Run `script` in a child Python with this package, failing instead of hanging."""
+    full = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **(env or {}))
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script), *args],
+        env=full,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+class InterruptAtEnd(Pieces):
+    """A file object that interrupts the main thread in the read that finds its end."""
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = super().read(n)
+        if not chunk:
+            _thread.interrupt_main()
+        return chunk
+
+
+@pytest.mark.parametrize("mode", ["auto", "streaming", "buffered"])
+@pytest.mark.parametrize("fmt", ["nt", "turtle", RdfFormat.RDF_THRIFT])
+def test_an_interrupt_at_the_end_of_the_stream_commits_nothing(mode, fmt) -> None:
+    data, _ = sample(fmt)
+    filled = Dataset()
+    filled.load(nt(5), "nt")
+    for target in [Dataset(), filled]:
+        before = target.dump(format="nq")
+        with pytest.raises(KeyboardInterrupt):
+            target.load(InterruptAtEnd(data), fmt, parse_mode=mode)
+        assert target.dump(format="nq") == before
+    with pytest.raises(KeyboardInterrupt):
+        filled.replace(InterruptAtEnd(data), format=fmt)
+    assert len(filled) == 5
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="no SIGUSR1")
+def test_a_signal_handler_can_query_while_a_file_object_loads() -> None:
+    out = run_child(
+        """
+        import io, signal
+        import sparkles
+        other = sparkles.Dataset()
+        other.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+        answers = []
+        signal.signal(signal.SIGUSR1, lambda *_: answers.append(other.ask("ASK { ?s ?p ?o }")))
+        data = "".join(f'<http://e/s{i}> <http://e/p> "{i}" .\\n' for i in range(20000)).encode()
+
+        class Signals(io.RawIOBase):
+            def __init__(self):
+                self.pos = 0
+                self.reads = 0
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                self.reads += 1
+                if self.reads % 5 == 0:
+                    signal.raise_signal(signal.SIGUSR1)
+                chunk = data[self.pos : self.pos + min(n, 4096)]
+                self.pos += len(chunk)
+                return chunk
+
+        ds = sparkles.Dataset()
+        n = ds.load(Signals(), "nt")
+        ds.replace(Signals(), format="nt")
+        print(n, len(ds), len(answers) > 0 and all(answers))
+        """,
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["20000", "20000", "True"]
+
+
+def test_ctrl_c_and_a_token_stop_a_replacement_from_a_file_object() -> None:
+    out = run_child(
+        """
+        import _thread, io
+        import sparkles
+
+        class Endless(io.RawIOBase):
+            def __init__(self, after, token=None):
+                self.after, self.token, self.reads, self.n = after, token, 0, 0
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                self.reads += 1
+                if self.reads == self.after:
+                    if self.token:
+                        self.token.cancel()
+                    else:
+                        _thread.interrupt_main()
+                if self.reads > 100000:
+                    return b""
+                out, size = [], 0
+                while size < n:
+                    line = b'<http://e/s%d> <http://e/p> "%d" .\\n' % (self.n, self.n)
+                    self.n += 1
+                    out.append(line)
+                    size += len(line)
+                return b"".join(out)
+
+        ds = sparkles.Dataset()
+        ds.load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+        for fmt in ["nt", "turtle"]:
+            src = Endless(50)
+            try:
+                ds.replace(src, format=fmt)
+                print("no-interrupt")
+            except KeyboardInterrupt:
+                print("interrupted", src.reads < 70, len(ds))
+            token = sparkles.CancelToken()
+            src = Endless(50, token)
+            try:
+                ds.replace(src, format=fmt, cancel=token)
+                print("no-cancel")
+            except sparkles.CancelledError:
+                print("cancelled", src.reads < 70, len(ds))
+        """,
+        timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == ["interrupted True 1", "cancelled True 1"] * 2
+
+
+def test_a_tiny_file_object_allocates_no_block() -> None:
+    out = run_child(
+        """
+        import io, resource, sys
+        import sparkles
+        def peak():
+            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return r if sys.platform == "darwin" else r * 1024
+        line = b'<http://e/a> <http://e/b> <http://e/c> .\\n'
+        sparkles.Dataset().load(line, "nt")
+        before = peak()
+        for compress in [False, True]:
+            import gzip
+            data = gzip.compress(line) if compress else line
+            assert sparkles.Dataset().load(io.BytesIO(data), "nt") == 1
+        print(peak() - before)
+        """
+    )
+    assert out.returncode == 0, out.stderr
+    assert int(out.stdout) < 64 << 20, int(out.stdout)
+
+
+def test_a_large_buffered_stream_spills_beyond_its_allowance(tmp_path: Path) -> None:
+    script = """
+        import io, sys
+        import sparkles
+        data = "".join(f'<http://e/s{i}> <http://e/p> "{i}" .\\n' for i in range(5000)).encode()
+        ds = sparkles.Dataset(sys.argv[2])
+        print(ds.load(io.BytesIO(data), "nt", parse_mode="buffered", auto_buffer_bytes=int(sys.argv[1])))
+        """
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    # within the allowance, nothing touches the temporary directory
+    out = run_child(script, str(1 << 20), str(tmp_path / "a"), env={"TMPDIR": str(tmp_path / "missing")})
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["5000"]
+    # past it, the stream goes to an unnamed temporary file
+    out = run_child(script, "1024", str(tmp_path / "b"), env={"TMPDIR": str(tmp_path / "missing")})
+    assert out.returncode != 0
+    out = run_child(script, "1024", str(tmp_path / "c"), env={"TMPDIR": str(spool)})
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["5000"]
+    assert list(spool.iterdir()) == []

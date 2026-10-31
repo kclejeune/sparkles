@@ -513,15 +513,16 @@ impl PyDataset {
         let Some(obj) = file_object else {
             return py.detach(|| ds.store().load(&[src])).py(py);
         };
-        // A file object is read once as the loader parses it. Ctrl-C sets the flag, which
-        // fails the next read and stops the loader at its next check.
+        // A file object is read once as the loader parses it. A signal handler that
+        // raises, such as Ctrl-C's, fails the next read and stops the loader at its next
+        // check, and the end of the stream waits for the handlers.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let signalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signals = interrupt::StreamSignals::new(cancel.clone());
         src.data = sparkles::io::SourceData::reader(
-            crate::io::PyFileReader::new(obj).cancelled_by(cancel.clone(), signalled.clone()),
+            crate::io::PyFileReader::new(obj).with_signals(signals.clone()),
         );
         let flag = cancel.clone();
-        interrupt::run_reading(py, &cancel, &signalled, move || {
+        interrupt::run_stream(py, &signals, move || {
             let o = sparkles::guard::WriteOptions {
                 cancel: Some(flag),
                 ..Default::default()
@@ -1391,7 +1392,11 @@ impl PyDataset {
                 _ => return Err(invalid(py, "target cannot be a blank node")),
             },
         };
-        let src = source_from_py(
+        let file_object = match input.filter(|i| !i.is_none()) {
+            Some(i) if path.is_none() && crate::io::is_file_object(i)? => Some(i.clone().unbind()),
+            _ => None,
+        };
+        let mut src = source_from_py(
             py,
             input,
             format,
@@ -1401,10 +1406,32 @@ impl PyDataset {
             compression,
             lenient,
         )?;
-        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+        let flag = interrupt::flag(cancel)?;
+        // a file object is read by the replacement, which its signals and the token stop
+        let signals = file_object.map(|obj| {
+            let signals = interrupt::StreamSignals::new(flag.clone());
+            src.data = sparkles::io::SourceData::reader(
+                crate::io::PyFileReader::new(obj).with_signals(signals.clone()),
+            );
+            signals
+        });
+        let r = interrupt::controlled_stream(py, flag, signals, progress, timeout, move |ctl| {
             ctl.progress.report(0.0, "replacing data");
             ctl.check()?;
-            let r = ds.replace(target, &[src])?;
+            let o = sparkles::guard::WriteOptions {
+                cancel: Some(ctl.cancel.flag()),
+                deadline: ctl.deadline,
+                ..Default::default()
+            };
+            let r = ds
+                .store()
+                .replace_with(
+                    target,
+                    &[src],
+                    sparkles::commit::CommitKind::Transaction,
+                    &o,
+                )?
+                .0;
             ctl.progress.report(1.0, "replaced data");
             Ok(r)
         })?;
