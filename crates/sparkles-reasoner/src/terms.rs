@@ -427,6 +427,19 @@ impl Terms {
             .flatten()
     }
 
+    /// The vocabulary key of a local id's IRI or literal, without cloning it, or
+    /// `None` for a blank node or an id that is not local.
+    pub(crate) fn local_key(&self, id: u64) -> Option<&[u8]> {
+        let i = Id(id);
+        if i.tag() != Tag::Local {
+            return None;
+        }
+        match self.table.get(i.payload())? {
+            LocalTerm::Key(k) => Some(k),
+            _ => None,
+        }
+    }
+
     /// The kind of a local id's term, without cloning it.
     fn local_kind(&self, id: u64) -> Kind {
         match self.table.get(Id(id).payload()) {

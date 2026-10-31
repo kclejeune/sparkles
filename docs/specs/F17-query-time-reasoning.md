@@ -913,8 +913,10 @@ or GeoSPARQL default geometries, neither reads nor fills the table. Like the sch
 the equality table is a property of the view, and `no_cache` does not bypass it.
 
 The table is charged to the derived-table cache's capacity, and the facts a session adds
-from it are charged to the session's memory budget as they are read. The workspace that
-builds the table is charged to the session's budget first. A table larger than the
+from it are charged to the session's memory budget as they are read, and the map from
+the table's local terms to the session's ids is charged at its full size before it is
+made. The workspace that builds the table is counted and charged to the session's budget
+before each list is made at that size, and the keys of local terms are copied once. A table larger than the
 cache's capacity, or one whose workspace does not fit the budget, is not kept, and the
 session's answers do not change. This trades memory for time. A view's
 table holds every fact the first session had derived when its lower stages finished,
