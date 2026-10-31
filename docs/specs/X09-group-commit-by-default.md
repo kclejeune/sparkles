@@ -1850,8 +1850,9 @@ walk it again, so its growth is not counted twice.
 
 A fence writes the terms of its whole prefix at once, which can be far more than one
 commit's. The vocabulary now writes any set of terms as chunks of at most 1 MiB of
-payload, since a chunk's header records its payload length in 32 bits, and refuses a
-term too large for a chunk before it writes anything. The file was always a sequence of
+payload, or of one term when that term alone is larger, since a chunk's header records
+its payload length in 32 bits. It refuses a term too large for a chunk's header before it
+writes anything. The file was always a sequence of
 chunks, so its format is unchanged.
 
 **Fences in two stages (item 447).** A fence now has two stages. Its leader writes and

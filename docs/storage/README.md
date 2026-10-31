@@ -120,15 +120,19 @@ These read paths are tuned for queries over data that is not yet in memory
   ever names a commit that the log could lose. A commit that does not qualify, or one made
   while a full-text index recovers or rebuilds or while a spatial index builds, takes the
   ordinary path.
-* A fence's leader writes the records and new terms of all its commits at once, through
-  the same write-through handles as an ordinary commit when they fit in the space the
-  log has preallocated, so a fence persists without a device cache flush on a drive with
-  FUA. A prefix larger than 64 KiB, or one that needs the log to grow, is written with
-  buffered writes and `fdatasync`. The next fence synchronizes while the last one
+* A fence's leader writes the records and new terms of all its commits at once. When
+  the records fit in the space the log has preallocated and in one write of at most
+  64 KiB, and the terms fit the same way in the vocabulary, both go through the same
+  write-through handles as an ordinary commit, so the fence persists without a device
+  cache flush on a drive with FUA. Otherwise the file that does not fit, such as the
+  vocabulary of a fence that adds a long literal, is written with a buffered write and
+  `fdatasync`. The next fence synchronizes while the last one
   publishes and applies its full-text changes.
 * Group commit costs memory. A persistent dataset queues up to 64 commits or 4 MiB of
   log records and staged full-text documents, plus the speculative snapshots of the
-  commits in flight. The queued records wait on the heap until their fence writes them. On an indexed
+  commits in flight. The 4 MiB is an admission threshold, and a single commit larger than
+  it drains the queue and is queued alone, so the queue then holds that commit's size.
+  The queued records wait on the heap until their fence writes them. On an indexed
   10.5M-triple dataset with sixteen writers, that state raised peak resident memory by
   15 to 21 MiB.
 * `/$/metrics` reports the synchronization time, the commits per fence, the wait, and why
