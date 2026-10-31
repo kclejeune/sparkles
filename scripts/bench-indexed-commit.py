@@ -1737,6 +1737,113 @@ def drive_probe(directory, writes):
     return result
 
 
+def variant_order(args):
+    """ABBA order of one block: ordinary and grouped commits of one build, or with
+    --compare-binary the grouped path of two builds."""
+    binary = getattr(args, "binary", None)
+    if getattr(args, "compare_binary", None):
+        a, b = ("A", binary, True), ("B", args.compare_binary, True)
+    else:
+        a, b = ("ordinary", binary, False), ("grouped", binary, True)
+    return (a, b, b, a)
+
+
+def validation_variants(args):
+    """The two alternatives that a paced calibration validates, A and B of the order."""
+    return variant_order(args)[:2]
+
+
+def comparison_load_checks(results):
+    """Load-quality verdict of an A/B of two builds, which judges no gate but must not
+    accept a mixed process that missed its offered rate or its schedule."""
+    rows = [r for r in results if r["scenario"] == "mixed"]
+    failed = [
+        {
+            "namespace": r.get("namespace"),
+            "block": r.get("block"),
+            "variant": r.get("variant"),
+            **{
+                name: check
+                for name, check in r["mixed_load_checks"].items()
+                if not check["passed"]
+            },
+        }
+        for r in rows
+        if not all(check["passed"] for check in r["mixed_load_checks"].values())
+    ]
+    return {"mixed_processes": len(rows), "failed": failed, "passed": not failed}
+
+
+def run_campaign(args, root):
+    """Run every block of the matrix under ``root`` and judge it. Exits with status 3,
+    after saving all evidence, when a gate or a load-quality check fails."""
+    results = []
+    order = variant_order(args)
+    for people in args.people:
+        args.current_people = people
+        for index in args.indexes:
+            cell = root / f"{index}-{people}"
+            cell.mkdir()
+            triples = prepare(args, cell, index, people)
+            write_rate = args.write_rate
+            if "mixed" in args.scenarios and index != "embed":
+                write_rate = calibrate_mixed(args, cell, index, triples, write_rate)
+            for block in range(args.blocks):
+                for scenario in args.scenarios:
+                    if index == "embed" and scenario == "mixed":
+                        continue
+                    for pos, (variant, binary, grouped) in enumerate(order):
+                        args.server_binary = binary
+                        result = measure(
+                            args,
+                            cell,
+                            index,
+                            scenario,
+                            grouped,
+                            triples,
+                            f"b{block}-{scenario}-{pos}",
+                            write_rate,
+                        )
+                        result["block"] = block
+                        result["variant"] = variant
+                        result["binary"] = binary
+                        results.append(result)
+                        save(root / "results.json", results)
+                        if pos == 3 and not args.compare_binary:
+                            save(root / "gate-summary.json", summarize(results))
+                        print(json.dumps(result), flush=True)
+    if args.compare_binary:
+        # an A/B of two builds on the grouped path judges no gate, but its loads must
+        # have held their schedule
+        checks = comparison_load_checks(results)
+        save(root / "load-checks.json", checks)
+        save(
+            root / "completed.json",
+            {
+                "finished_unix": time.time(),
+                "processes": len(results),
+                "load_checks_passed": checks["passed"],
+            },
+        )
+        if not checks["passed"]:
+            raise SystemExit(3)
+        return results
+    summary = summarize(results)
+    save(root / "gate-summary.json", summary)
+    save(
+        root / "completed.json",
+        {
+            "finished_unix": time.time(),
+            "processes": len(results),
+            "gates_passed": summary["passed"],
+            "full_protocol": full_protocol(args),
+        },
+    )
+    if not summary["passed"]:
+        raise SystemExit(3)
+    return results
+
+
 def calibrate_mixed(args, cell, index, triples, requested_rate):
     """Discover and validate one aggregate rate with the actual indexed readers."""
     assert index in ("text", "geo")
@@ -1752,6 +1859,7 @@ def calibrate_mixed(args, cell, index, triples, requested_rate):
     save(path, receipt)
     rate = requested_rate
     if not rate:
+        args.server_binary = getattr(args, "binary", None)
         for position, grouped in enumerate((False, True, True, False)):
             row = measure(
                 args,
@@ -1782,7 +1890,8 @@ def calibrate_mixed(args, cell, index, triples, requested_rate):
         rate = slowest * args.rate_fraction
         receipt["common_rate"] = rate
         save(path, receipt)
-    for grouped in (False, True):
+    for position, (variant, binary, grouped) in enumerate(validation_variants(args)):
+        args.server_binary = binary
         row = measure(
             args,
             cell,
@@ -1790,10 +1899,12 @@ def calibrate_mixed(args, cell, index, triples, requested_rate):
             "mixed",
             grouped,
             triples,
-            f"cal-paced-{int(grouped)}",
+            f"cal-paced-{position}",
             rate,
             calibration=True,
         )
+        row["variant"] = variant
+        row["binary"] = binary
         receipt["validation"].append(row)
         save(path, receipt)
     receipt["achieved_rate_validated"] = all(
@@ -1951,77 +2062,7 @@ def main():
                 time.sleep(0.05)
         else:
             raise RuntimeError("provider startup")
-        results = []
-        # ABBA blocks: ordinary and grouped commits of one build, or with
-        # --compare-binary the grouped path of two builds
-        order = (
-            (
-                ("A", args.binary, True),
-                ("B", args.compare_binary, True),
-                ("B", args.compare_binary, True),
-                ("A", args.binary, True),
-            )
-            if args.compare_binary
-            else (
-                ("ordinary", args.binary, False),
-                ("grouped", args.binary, True),
-                ("grouped", args.binary, True),
-                ("ordinary", args.binary, False),
-            )
-        )
-        for people in args.people:
-            args.current_people = people
-            for index in args.indexes:
-                cell = root / f"{index}-{people}"
-                cell.mkdir()
-                triples = prepare(args, cell, index, people)
-                write_rate = args.write_rate
-                if "mixed" in args.scenarios and index != "embed":
-                    write_rate = calibrate_mixed(args, cell, index, triples, write_rate)
-                for block in range(args.blocks):
-                    for scenario in args.scenarios:
-                        if index == "embed" and scenario == "mixed":
-                            continue
-                        for pos, (variant, binary, grouped) in enumerate(order):
-                            args.server_binary = binary
-                            result = measure(
-                                args,
-                                cell,
-                                index,
-                                scenario,
-                                grouped,
-                                triples,
-                                f"b{block}-{scenario}-{pos}",
-                                write_rate,
-                            )
-                            result["block"] = block
-                            result["variant"] = variant
-                            result["binary"] = binary
-                            results.append(result)
-                            save(root / "results.json", results)
-                            if pos == 3 and not args.compare_binary:
-                                save(root / "gate-summary.json", summarize(results))
-                            print(json.dumps(result), flush=True)
-        if args.compare_binary:
-            # an A/B of two builds on the grouped path judges no gate
-            save(
-                root / "completed.json",
-                {"finished_unix": time.time(), "processes": len(results)},
-            )
-            return
-        summary = summarize(results)
-        save(root / "gate-summary.json", summary)
-        save(
-            root / "completed.json",
-            {
-                "finished_unix": time.time(),
-                "processes": len(results),
-                "gates_passed": summary["passed"],
-                "full_protocol": full_protocol(args),
-            },
-        )
-        if not summary["passed"]:
-            raise SystemExit(3)
+        run_campaign(args, root)
     finally:
         try:
             stop_owned(provider)

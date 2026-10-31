@@ -616,7 +616,10 @@ checks the harness and estimates the runtime.
 
 With `--compare-binary`, the harness runs the grouped path of `--binary` and of the
 other build in A, B, B, A blocks instead of the two commit paths of one build, and
-judges no gate. Such an A/B of mixed loads needs a fixed `--write-rate`. Each result
+judges no gate. Such an A/B of mixed loads needs a fixed `--write-rate`, which the
+calibration validates on the grouped path of both builds. A mixed process of either
+build that misses its offered rate or its schedule lag fails the run with exit status 3,
+after `load-checks.json` and `completed.json` record which processes missed. Each result
 names its variant and binary.
 
 Writer latency is the client's HTTP request and response interval, so it does not
