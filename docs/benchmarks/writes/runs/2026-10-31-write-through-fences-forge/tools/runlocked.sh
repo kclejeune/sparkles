@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# usage: runlocked.sh LOG harness-args...  Waits until the heavy lock is free and no other
+# process uses more than half a CPU, then runs the harness, which takes the lock itself
+# without waiting and holds it for the campaign. When another job took the lock first, the
+# harness stops with BlockingIOError and this waits again. Exits with the harness status,
+# or 1 when the wait expires.
+log=$1; shift
+cd ~/lanes/group-commit-446-447-20261031 || exit 1
+for i in $(seq 1 1440); do
+  if flock -n ~/lanes/.heavy.lock true; then
+    busy=$(ps -eo pcpu=,pid=,args= | awk "\$1 > 50" | grep -v -e bench-indexed -e runlocked -e "ps -eo")
+    if [ -z "$busy" ]; then
+      { date; uptime; ps -eo pid,pcpu,etime,args --sort=-pcpu | head -15; } > "$log.start"
+      timeout 14400 python3 src/scripts/bench-indexed-commit.py "$@" > "$log" 2>&1
+      rc=$?
+      echo "exit $rc" >> "$log"
+      if [ $rc -ne 0 ] && grep -q BlockingIOError "$log"; then sleep 30; continue; fi
+      exit $rc
+    fi
+    echo "$(date) busy: $busy" >> "$log.wait"
+  fi
+  sleep 30
+done
+echo "gave up waiting for the heavy lock" > "$log"
+exit 1

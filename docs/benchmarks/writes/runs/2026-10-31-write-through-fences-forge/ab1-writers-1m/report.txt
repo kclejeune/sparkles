@@ -1,0 +1,6 @@
+geo-100000 writers: pairs=10 tps B/A median 2.053 [1.01 0.69 2.26 0.71 2.26 0.73 2.24 2.26 2.02 2.09] p50 0.234 p90 0.882 fence 0.406
+   A: tps median 1232.8 range 1156-3754
+   B: tps median 2614.1 range 2458-2681
+text-100000 writers: pairs=10 tps B/A median 1.020 [0.91 0.83 1.04 1.36 1.28 0.41 2.09 1.82 1.00 0.84] p50 0.939 p90 0.937 fence 0.968
+   A: tps median 1435.9 range 1162-3098
+   B: tps median 1470.9 range 1280-2459

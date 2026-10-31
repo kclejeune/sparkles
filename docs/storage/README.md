@@ -120,8 +120,15 @@ These read paths are tuned for queries over data that is not yet in memory
   ever names a commit that the log could lose. A commit that does not qualify, or one made
   while a full-text index recovers or rebuilds or while a spatial index builds, takes the
   ordinary path.
+* A fence's leader writes the records and new terms of all its commits at once, through
+  the same write-through handles as an ordinary commit when they fit in the space the
+  log has preallocated, so a fence persists without a device cache flush on a drive with
+  FUA. A prefix larger than 64 KiB, or one that needs the log to grow, is written with
+  buffered writes and `fdatasync`. The next fence synchronizes while the last one
+  publishes and applies its full-text changes.
 * Group commit costs memory. A persistent dataset queues up to 64 commits or 4 MiB of
-  log records, plus the speculative snapshots of the commits in flight. On an indexed
+  log records and staged full-text documents, plus the speculative snapshots of the
+  commits in flight. The queued records wait on the heap until their fence writes them. On an indexed
   10.5M-triple dataset with sixteen writers, that state raised peak resident memory by
   15 to 21 MiB.
 * `/$/metrics` reports the synchronization time, the commits per fence, the wait, and why
@@ -308,17 +315,20 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   cold `star-lookup` at 10.5M, and that comparison has not been repeated on index format
   3. Index format 3 makes cold `star-join` at 10.5M 6% to 8% slower. Dense reads on the
   1.01B dataset are unmeasured. Roadmap item 4.
-* Group commit on datasets with a full-text, spatial or embedding index meets its gates,
-  but a fence costs more than it needs to when the drive is slow
-  ([X09](../specs/X09-group-commit-by-default.md#phase-4)). It ends with an `fdatasync` of
-  the log and of the vocabulary, two device cache flushes, while an ordinary commit writes
-  through with none. On the SK hynix drives of the benchmark hosts in their slow state a
-  fence then synchronizes in 1.3 to 1.5 ms against about 1.0 ms for one ordinary commit,
-  which is roadmap item 446. Staged full-text documents do not count toward the
-  queue's byte limit, and the leader applies text changes while its fence is still active,
-  which is item 447. A serial commit pays 0.1% to 0.3% more instructions for the group's
-  admission checks, and spatial readers at 1.05M under mixed load measured a p50 ratio of
-  1.028, both within their gates, which is item 448.
+* Group commit on datasets with a full-text, spatial or embedding index meets its gates
+  ([X09](../specs/X09-group-commit-by-default.md#phase-4)). A serial commit pays 0.1% to
+  0.3% more instructions for the group's admission checks, and spatial readers at 1.05M
+  under mixed load measured a p50 ratio of 1.028, both within their gates, which is
+  item 448.
+* A fence whose commits carry a commit message or a change digest still synchronizes
+  `annotations.bin` with an `fdatasync`, which costs a device cache flush, while its log
+  records and terms go through the write-through handles. Roadmap item NEW-ITEM-1.
+* Write-through fences remove the device cache flush, which doubles the throughput of four
+  writers when the drive of the benchmark hosts is in its slow state. In its fast state a
+  fence that writes and flushes measured faster, and write-through fences gain little on
+  the full-text dataset
+  ([results](../benchmarks/writes/RESULTS.md#write-through-fences)). Roadmap item
+  NEW-ITEM-2.
 * Automatic execution streams eligible large scans, groupings and ASK joins. Other
   plans remain eager, including an EXISTS evaluated once per outer key when its cursor
   is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays
@@ -382,7 +392,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 446](../ROADMAP.md), [item 447](../ROADMAP.md), [item 448](../ROADMAP.md).
+The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -24,6 +24,22 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+Group commit fences write through. Writers leave the log to the leader of their fence,
+which writes the whole prefix's records and new terms through the same `O_DIRECT` and
+`O_DSYNC` handles as an ordinary commit when they fit in preallocated space, so a fence
+persists without a device cache flush on a drive with FUA. A larger prefix is written
+with buffered writes and `fdatasync` as before. The next fence synchronizes while the
+last one publishes and applies its full-text changes. Staged full-text documents count
+in the queue's 4 MiB limit, and the quota and the free-space reserve count queued records
+and terms, and a fence's preallocation, until their fence writes them. Queued records
+now wait on the heap, at most 4 MiB per dataset, until their fence writes them. The delta
+vocabulary writes a large set of terms as several chunks of at most 1 MiB, so a fence
+with more than 4 GiB of new terms stays readable. On `forge` the fences issued 0.001 to 0.005 device cache flushes per commit instead of
+1.00 to 1.14, and four writers on the spatial dataset at 1.05M committed 2.05 times as many
+transactions/s with the drive in its slow state. In the drive's fast state, flushing
+fences were faster than write-through ones in three of ten pairs, which roadmap item
+NEW-ITEM-2 measures.
+
 Change feeds, live queries and long polls end with `access-changed` when the session
 or token they were opened with expires, including a session's idle timeout. OIDC
 sign-ins decide admission and the session lifetime under the policy current after the

@@ -1,0 +1,17 @@
+Sat Oct 31 06:34:50 PM EDT 2026
+ 18:34:50  up 7 days  1:55,  0 users,  load average: 2.01, 2.09, 2.14
+    PID %CPU     ELAPSED COMMAND
+ 713806  0.9    14:25:52 /nix/store/wfi3zyi4p723ib7qvpzclr1lyxhysywg-tailscale-1.104.2/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641 --tun tailscale0
+3973792  0.3    01:13:11 [kworker/u81:10-kcryptd-254:0-1]
+ 713759  0.2    14:25:53 /nix/store/1l6pk0v0fwdd7irylacnjrsyvvfyhfyz-netbird-client-0.81.5/bin/netbird service run
+3973801  0.2    01:13:11 [kworker/u81:21-kcryptd-254:0-1]
+3973798  0.2    01:13:11 [kworker/u81:16-kcryptd-254:0-1]
+3973793  0.2    01:13:11 [kworker/u81:11-kcryptd-254:0-1]
+3976727  0.2    01:05:12 [kworker/u81:23-kcryptd-254:0-1]
+3973800  0.2    01:13:11 [kworker/u81:19-kcryptd-254:0-1]
+4057359  0.2       18:31 [kworker/u81:4-kcryptd-254:0-1]
+4030289  0.2       48:52 [kworker/u81:9-kcryptd-254:0-1]
+3973796  0.2    01:13:11 [kworker/u81:15-kcryptd-254:0-1]
+4039476  0.2       41:01 [kworker/u81:12-kcryptd-254:0-1]
+   1698  0.2  7-01:55:03 /nix/store/x0019gyv8baqma5kqwjld2bvwynmf1yc-herdr-0.9.3/bin/herdr server
+ 714923  0.2    14:25:48 /nix/store/jjqk5711npw54k21izspv0bx53c3ji9h-otelcol-contrib-0.155.0/bin/otelcol-contrib --config=file:/nix/store/x663rz5jnxayskqsym0dfrjr4yk0fh4g-config.yaml
