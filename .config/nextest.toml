@@ -32,7 +32,7 @@ path = "junit.xml"
 # soon after its timeout. They run one at a time and alone, with no other test on the
 # machine, since other work stretches the time a stop takes. CI runs them in a job of
 # their own and leaves them out of the test shards (.github/workflows/ci.yml), so a new
-# test here needs the same filter there.
+# test here needs the same filter there, in TIMING, and its binary in TIMING_BINARIES.
 [test-groups.timing]
 max-threads = 1
 

@@ -77,13 +77,15 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   NEXTEST_VERSION: "0.9.146"
-  # The test binaries with the slowest tests, which run in two shards of their own with a
-  # smaller archive, and the `timing` group of .config/nextest.toml, which runs alone. The
-  # other tests are split by count over the remaining shards. A binary named here must
-  # exist, or nextest refuses the filter. Measured shard times are in docs/DEVELOPMENT.md.
-  HEAVY_1: binary_id(/^sparkles-core::(spill_join|power_loss|w3c)$/)
-  HEAVY_2: binary_id(/^(sparkles-core::(query_cursor|geo_join)|sparkles-reasoner::(explain_demand|demand)|sparkles-fmt::(w3c_turtle|turtle_stream))$/)
+  # The test binaries with the slowest tests, which run in two shards of their own, and the
+  # `timing` group of .config/nextest.toml, which runs alone. These three shards use a small
+  # archive of HEAVY_1, HEAVY_2 and TIMING_BINARIES. The other tests are split by count
+  # over the remaining shards. Each regular expression must match a binary, or nextest
+  # refuses the filter. A new test in the timing group needs its binary in TIMING_BINARIES.
+  HEAVY_1: binary_id(/^(sparkles-core::(spill_join|power_loss|w3c|geo_join)|sparkles-fmt::w3c_turtle)$/)
+  HEAVY_2: binary_id(/^(sparkles-core::query_cursor|sparkles-reasoner::(explain_demand|demand)|sparkles-fmt::turtle_stream)$/)
   TIMING: test(planning_at_the_limit_stops_at_the_timeout) | test(a_large_json_ld_document_keeps_to_a_short_deadline)
+  TIMING_BINARIES: binary_id(/^(sparkles::nesting|sparkles-fmt)$/)
 
 jobs:
   # Whether the change can affect the Rust jobs. Changes only to the UI, the JavaScript
@@ -275,9 +277,9 @@ jobs:
         if: ${{ always() }}
         run: df -h "$GITHUB_WORKSPACE"
 
-  # The tests are built once and archived, and the shards run the archives. The heavy
-  # shards get a second, small archive with only their binaries, so they skip most of
-  # the download and extraction. The doctests run in a job of their own, so the shards
+  # The tests are built once and archived, and the shards run the archives. The heavy and
+  # timing shards get a second, small archive with only their binaries, so they skip most
+  # of the download and extraction. The doctests run in a job of their own, so the shards
   # do not wait for them.
   build:
     permissions:
@@ -344,7 +346,7 @@ jobs:
           # shellcheck disable=SC2016 # the inner shell expands the variables
           PATH="$PWD/scripts:$PATH" mbx sparkles-task -- bash -euo pipefail -c '
             mbx nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
-            mbx nextest archive --locked --workspace -E "$HEAVY_1 | $HEAVY_2" --zstd-level 3 \
+            mbx nextest archive --locked --workspace -E "$HEAVY_1 | $HEAVY_2 | $TIMING_BINARIES" --zstd-level 3 \
               --archive-file "$RUNNER_TEMP/heavy/tests.tar.zst"
             tar --zstd -cf "$RUNNER_TEMP/server/sparkles.tar.zst" target/debug/sparkles
           '
@@ -421,8 +423,8 @@ jobs:
   # heavy-1 and heavy-2 run the binaries in HEAVY_1 and HEAVY_2. The numbered shards split
   # every other test by count. The tests of the `timing` group need the machine to
   # themselves, and one of them runs for about two minutes on a runner, which would stall
-  # the shard it fell into, so they run in the timing shard. The four filters together
-  # select every test exactly once.
+  # the shard it fell into, so they run in the timing shard. The filters together select
+  # every test exactly once, as long as HEAVY_1 and HEAVY_2 share no binary.
   test:
     name: Test (${{ matrix.shard }})
     needs: [changes, build]
@@ -439,7 +441,7 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ startsWith(matrix.shard, 'heavy-') && 'nextest-archive-heavy' || 'nextest-archive' }}
+          name: ${{ (startsWith(matrix.shard, 'heavy-') || matrix.shard == 'timing') && 'nextest-archive-heavy' || 'nextest-archive' }}
           path: ${{ runner.temp }}
       # shallow sparse checkouts of Apache Jena's and Oxigraph's test directories, about
       # 35 MB, which take a few seconds
@@ -454,11 +456,13 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           tar -xf "$RUNNER_TEMP/ui-build.tar"
+          # A timing test outside TIMING_BINARIES runs in a numbered or heavy shard instead.
+          timing="($TIMING_BINARIES) & ($TIMING)"
           case "$SHARD" in
-            timing) select=(-E "$TIMING") ;;
-            heavy-1) select=(-E "($HEAVY_1) & not ($TIMING)") ;;
-            heavy-2) select=(-E "($HEAVY_2) & not ($TIMING)") ;;
-            *) select=(-E "not ($TIMING) & not ($HEAVY_1) & not ($HEAVY_2)" --partition "slice:$SHARD") ;;
+            timing) select=(-E "$timing") ;;
+            heavy-1) select=(-E "($HEAVY_1) & not ($timing)") ;;
+            heavy-2) select=(-E "($HEAVY_2) & not ($timing)") ;;
+            *) select=(-E "not ($timing) & not ($HEAVY_1) & not ($HEAVY_2)" --partition "slice:$SHARD") ;;
           esac
           cargo-nextest nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" \
             --workspace-remap . --extract-to . --profile ci "${select[@]}"
