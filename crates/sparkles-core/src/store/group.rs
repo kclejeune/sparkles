@@ -571,7 +571,24 @@ impl Store {
             .as_deref()
             .filter(|_| self.opts.wal_direct_writes)
             .map(|d| d.join("wal.log"));
-        dvocab.set_prealloc(last.prealloc);
+        // The preallocation was allowed when the last commit queued, before the commits
+        // still queued around this prefix were counted. The log and the vocabulary each
+        // preallocate after the whole prefix, so the reserve must hold that as well as
+        // every queued commit's bytes (this prefix's among them), or neither preallocates.
+        let prealloc = if last.prealloc > 0
+            && self
+                .check_disk(
+                    self.quota
+                        .queued()
+                        .saturating_add(2 * last.prealloc.saturating_add(4096)),
+                )
+                .is_err()
+        {
+            0
+        } else {
+            last.prealloc
+        };
+        dvocab.set_prealloc(prealloc);
         let measures = self.quota.measures();
         let (alloc_before, vocab_before) = (io.alloc, dvocab.allocated());
         let written = (|| -> Result<bool> {
@@ -588,7 +605,7 @@ impl Store {
             if dvocab.needs_sync_to(upto) {
                 dvocab.flush_to(upto)?;
             }
-            wal::write_commit(&last.wal, at, &mut io.alloc, data, last.prealloc)?;
+            wal::write_commit(&last.wal, at, &mut io.alloc, data, prealloc)?;
             sync_commit_reused(&last.wal, dvocab, worker, upto)?;
             Ok(false)
         })();
@@ -2462,13 +2479,14 @@ mod tests {
     /// records and terms are not on disk yet.
     #[test]
     fn queued_commits_count_against_the_free_space_reserve() {
+        const RESERVE: u64 = 1 << 20;
         let dir = tempfile::tempdir().unwrap();
-        let free = crate::disk::free_bytes(dir.path()).unwrap();
+        let _disk = crate::disk::fake::install(dir.path(), RESERVE + (8 << 20));
         let s = Arc::new(
             Store::open(
                 dir.path(),
                 StoreOptions {
-                    min_free_disk_bytes: Some(free.saturating_sub(8 << 20)),
+                    min_free_disk_bytes: Some(RESERVE),
                     ..options()
                 },
             )
@@ -2523,7 +2541,7 @@ mod tests {
             "{refused:?}"
         );
         assert!(
-            waiting.len() < 9,
+            waiting.len() < 8,
             "{} commits of 1 MiB fit in 8 MiB",
             waiting.len()
         );
@@ -2532,6 +2550,88 @@ mod tests {
         for t in waiting {
             t.join().unwrap().unwrap();
         }
+    }
+
+    /// A fence preallocates after its whole prefix only when the free-space reserve holds
+    /// the prefix and the preallocation, so the files it grows stay within the space the
+    /// reserve leaves.
+    #[test]
+    fn a_fence_preallocates_only_within_the_free_space_reserve() {
+        const STEP: u64 = 256 << 10;
+        const HEADROOM: u64 = 320 << 10;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = || StoreOptions {
+            wal_prealloc_bytes: STEP,
+            ..options()
+        };
+        let commit = |s: &Store, i: usize| {
+            let quads: String = (0..300)
+                .map(|j| format!("<urn:c{i}-{j}> <urn:p> <urn:o> . "))
+                .collect();
+            crate::sparql::update::update(
+                s,
+                &format!("INSERT DATA {{ {quads} }}"),
+                &Default::default(),
+            )
+            .map(|_| ())
+        };
+        {
+            // a log longer than the step, so the step is the whole preallocation
+            let s = Store::open(dir.path(), opts()).unwrap();
+            for i in 0..40 {
+                commit(&s, i).unwrap();
+            }
+        }
+        const RESERVE: u64 = 1 << 20;
+        let held = crate::store::dir_size(dir.path());
+        let _disk = crate::disk::fake::install(dir.path(), held + RESERVE + HEADROOM);
+        let s = Arc::new(
+            Store::open(
+                dir.path(),
+                StoreOptions {
+                    min_free_disk_bytes: Some(RESERVE),
+                    ..opts()
+                },
+            )
+            .unwrap(),
+        );
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || commit(&s, 100))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut waiting = Vec::new();
+        for i in 0..16 {
+            let t = {
+                let s = s.clone();
+                thread::spawn(move || commit(&s, 101 + i))
+            };
+            let until = Instant::now() + Duration::from_secs(5);
+            while s.group.as_ref().unwrap().queued() <= waiting.len() {
+                assert!(!t.is_finished(), "commit {i} was refused: {:?}", t.join());
+                assert!(Instant::now() < until, "commit {i} never queued");
+                thread::sleep(Duration::from_millis(1));
+            }
+            waiting.push(t);
+        }
+        let queued = s.quota.queued();
+        assert!(
+            queued + STEP > HEADROOM,
+            "the queue of {queued} bytes leaves room for the step"
+        );
+        go.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        for t in waiting {
+            t.join().unwrap().unwrap();
+        }
+        let free = crate::disk::free_bytes(dir.path()).unwrap();
+        // the catalog and the other small files grow by a few bytes a commit, which no
+        // check counts, on the ordinary path as well
+        assert!(
+            free + (64 << 10) >= RESERVE,
+            "the fences left {free} bytes free, under the reserve of {RESERVE}"
+        );
     }
 
     /// A walk that began before a fence read the walk count, and read the directory
