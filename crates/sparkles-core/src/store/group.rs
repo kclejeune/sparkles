@@ -785,6 +785,11 @@ impl WriteTxn<'_> {
             }
         }
         let ticket = Arc::new(Ticket::default());
+        // Staged documents hold their whole literals, so they count against the queue's
+        // limit with the records (X09 item 447).
+        #[cfg(feature = "text")]
+        let staged = text.as_ref().map_or(0, crate::text::Staged::bytes);
+        #[cfg(not(feature = "text"))]
         let staged = 0;
         let pending = Pending {
             info: c,

@@ -213,6 +213,48 @@ fn a_search_from_a_speculative_head_waits_for_its_publication() {
     }
 }
 
+/// A commit's staged documents count against the queue's 4 MiB limit with its records
+/// (X09 item 447). One label of 5 MiB has a few records but stages a document that holds
+/// the whole literal, so the queue is full behind it and the next commit drains first,
+/// leading a fence of its own.
+#[cfg(feature = "text")]
+#[test]
+fn staged_documents_count_against_the_queue_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+    s.enable_text(Default::default()).unwrap();
+    label(&s, "a", "alpha").unwrap();
+    let (observed, resume) = pause(&s, "group-sealed");
+    let first = {
+        let s = s.clone();
+        thread::spawn(move || label(&s, "b", "bravo"))
+    };
+    observed.recv_timeout(Duration::from_secs(10)).unwrap();
+    let long = format!("charlie {}", "x".repeat(5 << 20));
+    let second = {
+        let s = s.clone();
+        thread::spawn(move || label(&s, "c", &long))
+    };
+    let g = s.group.as_ref().unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while !g.full(0) {
+        assert!(
+            Instant::now() < until,
+            "the long label did not fill the queue"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    resume.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    second.join().unwrap().unwrap();
+    assert_eq!(s.snapshot().commit, 3);
+    assert_eq!(
+        text_hits(s.snapshot(), "bravo").unwrap(),
+        BTreeSet::from(["urn:b".to_string()])
+    );
+    assert!(g.idle());
+}
+
 #[cfg(feature = "text")]
 #[test]
 fn a_failed_text_update_at_publication_leaves_the_commit_and_marks_the_index_stale() {

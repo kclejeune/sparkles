@@ -13,7 +13,10 @@
 //!
 //! A second test runs the same model on a dataset with a full-text, a spatial and an
 //! embedding index (X09 section 17.8), with failed index updates among its faults, and
-//! checks every index against the data of each snapshot a reader sees.
+//! checks every index against the data of each snapshot a reader sees. Some of its
+//! inserts first search the full-text index of the state their transaction starts from,
+//! which is often a speculative head whose fence is still running, and the hits must be
+//! exactly that state's labelled subjects.
 #![cfg_attr(not(all(feature = "text", feature = "geo")), allow(dead_code))]
 use super::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -50,6 +53,9 @@ enum Kind {
     DryRun,
     Holds,
     Fails,
+    /// on an indexed dataset, an insert whose transaction first searches the full-text
+    /// index of the state it starts from, which may be a speculative head
+    Search,
 }
 
 impl Kind {
@@ -57,7 +63,7 @@ impl Kind {
     fn commits(self) -> bool {
         matches!(
             self,
-            Kind::Insert | Kind::Delete | Kind::Multi | Kind::Holds
+            Kind::Insert | Kind::Delete | Kind::Multi | Kind::Holds | Kind::Search
         )
     }
 }
@@ -269,6 +275,48 @@ fn holds(snap: &Snapshot, name: &str) -> bool {
     snap.contains(&[s, p, o, Id::DEFAULT_GRAPH]).unwrap()
 }
 
+/// Searches of a speculative head, which the indexed runs must make.
+static SPECULATIVE_SEARCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Search the full-text index of the state a transaction starts from, before it changes
+/// anything, and compare the hits with that state's labelled subjects. The state may be
+/// the speculative head of commits still in their fence, and the search then waits for
+/// their publication (X09 item 447). `Err` when the search cannot answer for a reason the
+/// transaction must report: the fence failed, so the writer is poisoned.
+#[cfg(all(feature = "text", feature = "geo"))]
+fn search_base(t: &WriteTxn<'_>, mismatch: &mut Option<String>) -> Result<()> {
+    let view = Arc::new(t.view());
+    if view.commit > t.store.snapshot().commit {
+        SPECULATIVE_SEARCHES.fetch_add(1, Ordering::Relaxed);
+    }
+    let expected = subjects_of(&view, LABEL);
+    let q = "PREFIX text:<http://jena.apache.org/text#> SELECT ?s { ?s text:query \"common\" }";
+    match crate::sparql::query(view.clone(), q, &Default::default()) {
+        Ok(r) => {
+            let hits: BTreeSet<String> = r
+                .rows()
+                .into_iter()
+                .filter_map(|row| row[0].as_ref().map(|t| t.to_string()))
+                .collect();
+            if hits != expected {
+                *mismatch = Some(format!(
+                    "a transaction's search of its base {} found {hits:?}, the base holds {expected:?}",
+                    view.commit
+                ));
+            }
+            Ok(())
+        }
+        // stale after an injected failure: the search refuses, as it does for a reader
+        Err(Error::TextUnavailable(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(all(feature = "text", feature = "geo")))]
+fn search_base(_: &WriteTxn<'_>, _: &mut Option<String>) -> Result<()> {
+    unreachable!("searching runs need the text and geo features")
+}
+
 /// Run one operation, returning its outcome.
 fn run_op(s: &Store, op: &Op, indexed: bool) -> Outcome {
     let mut opts = crate::guard::WriteOptions {
@@ -298,9 +346,13 @@ fn run_op(s: &Store, op: &Op, indexed: bool) -> Outcome {
         }
         _ => {}
     }
+    let mut mismatch = None;
     let r = catch_unwind(AssertUnwindSafe(|| {
         // the fallible form, which checks the options (`write_with` takes none of them)
         let mut t = s.try_write_with(CommitKind::Update, opts)?;
+        if op.kind == Kind::Search {
+            search_base(&t, &mut mismatch)?;
+        }
         for n in &op.inserts {
             for q in quads(n, indexed) {
                 let ids = t.encode_quad(&q, &mut Default::default())?;
@@ -315,6 +367,10 @@ fn run_op(s: &Store, op: &Op, indexed: bool) -> Outcome {
         }
         t.commit()
     }));
+    // outside the unwind guard, so that a wrong search fails the run
+    if let Some(m) = mismatch {
+        panic!("{m}");
+    }
     match r {
         Err(_) => Outcome::Uncertain("panicked".into()),
         Ok(Ok(r)) if r.committed => {
@@ -369,8 +425,15 @@ fn worker(
             83..=91 => Kind::Holds,
             _ => Kind::Fails,
         };
+        let kind = if indexed && kind == Kind::Insert && rng.below(3) == 0 {
+            Kind::Search
+        } else {
+            kind
+        };
         let (inserts, deletes) = match kind {
-            Kind::Insert | Kind::Holds | Kind::DryRun | Kind::Fails => (vec![fresh()], vec![]),
+            Kind::Insert | Kind::Holds | Kind::DryRun | Kind::Fails | Kind::Search => {
+                (vec![fresh()], vec![])
+            }
             Kind::Multi => (vec![fresh(), fresh(), fresh()], vec![]),
             Kind::Delete => {
                 let i = rng.below(live.len() as u64) as usize;
@@ -851,10 +914,15 @@ fn concurrent_random_writes_match_a_sequential_model() {
 #[cfg(all(feature = "text", feature = "geo"))]
 #[test]
 fn concurrent_random_writes_on_an_indexed_dataset_match_a_sequential_model() {
+    let runs = env_num("SPARKLES_GROUP_MODEL_INDEX_RUNS", 12);
     model_runs(
-        env_num("SPARKLES_GROUP_MODEL_INDEX_RUNS", 12),
+        runs,
         env_num("SPARKLES_GROUP_MODEL_SEED", 0x1d_e7ed_5eed),
         &INDEX_FAULTS,
         true,
     );
+    // the runs searched from a state still in its fence, so the wait of such a search for
+    // its base's publication was exercised under concurrent commits
+    let searches = SPECULATIVE_SEARCHES.load(Ordering::Relaxed);
+    assert!(runs < 4 || searches > 0, "no search of a speculative head");
 }

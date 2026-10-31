@@ -1407,6 +1407,22 @@ mod imp {
     }
 
     impl Staged {
+        /// The heap the staged documents hold, which counts against the group commit
+        /// queue's limit (X09 item 447): each document's serialized fields, its literal
+        /// among them, at their allocated size.
+        pub fn bytes(&self) -> u64 {
+            let docs = match &self.docs {
+                Some(Ok(docs)) => docs,
+                _ => return 0,
+            };
+            docs.iter()
+                .map(|d| {
+                    std::mem::size_of::<StagedDoc>()
+                        + d.doc.as_ref().map_or(0, |doc| doc.node_data.capacity())
+                })
+                .sum::<usize>() as u64
+        }
+
         /// Apply the commit's changes to the live index, as the ordinary path does for a
         /// commit it has synchronized, and return its view. `snap` is the commit's
         /// snapshot, from which the documents are made again if the index was replaced
