@@ -25,7 +25,8 @@ pub struct LintArgs {
     /// and .trig; .gitignore and .sparklesfmtignore apply). With no PATH, reads stdin
     #[arg(value_name = "PATH")]
     pub paths: Vec<PathBuf>,
-    /// sparql | turtle | trig (default: from the extension, else the content)
+    /// sparql | turtle | trig | ntriples | nquads | jsonld | shaclc (default: from the
+    /// extension, else the content)
     #[arg(long, value_name = "LANG", value_parser = parse_language)]
     pub language: Option<Language>,
     /// Name of the stdin input, for language detection, config and ignore files
@@ -80,7 +81,7 @@ fn walk_takes(path: &Path) -> bool {
     matches!(sparkles_fmt::detect_path(path), Some(Detection::Lang(l)) if lint::lints(l))
 }
 
-const EXTENSIONS: [&str; 5] = [".rq", ".ru", ".sparql", ".ttl", ".trig"];
+const EXTENSIONS: [&str; 7] = [".rq", ".ru", ".sparql", ".ttl", ".trig", ".nt", ".nq"];
 
 /// Run `sparkles lint`.
 pub fn run(args: LintArgs) -> Result<()> {
@@ -415,13 +416,7 @@ fn process(j: &Job, args: &LintArgs) -> Outcome {
     };
     o.language = Some(lang);
     if !lint::lints(lang) {
-        return fail(
-            o,
-            format!(
-                "{} is not linted: lint takes SPARQL, Turtle and TriG",
-                lang.display_name()
-            ),
-        );
+        return fail(o, format!("{} is not linted", lang.display_name()));
     }
     if args.fix {
         match lint::fix(&text, lang, opts) {
@@ -449,26 +444,30 @@ fn process(j: &Job, args: &LintArgs) -> Outcome {
     o
 }
 
-/// `--list-rules`: each rule with its default severity, its languages and whether
-/// `--fix` fixes it.
+/// `--list-rules`: each rule with its default severity, whether `--fix` fixes it, and its
+/// languages.
 fn list_rules() {
     println!(
-        "{:<24} {:<8} {:<14} {:<4} summary",
-        "rule", "default", "languages", "fix"
+        "{:<24} {:<8} {:<4} summary (languages)",
+        "rule", "default", "fix"
     );
     for r in lint::RULES {
-        let langs = match (r.sparql, r.turtle) {
-            (true, true) => "sparql, turtle",
-            (true, false) => "sparql",
-            _ => "turtle",
-        };
+        let mut langs = r
+            .languages
+            .iter()
+            .map(|l| l.name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if r.embedded {
+            langs.push_str("; also the SPARQL of SHACL literals");
+        }
         println!(
-            "{:<24} {:<8} {:<14} {:<4} {}",
+            "{:<24} {:<8} {:<4} {} ({})",
             r.id,
             r.default.name(),
-            langs,
             if r.safe_fix { "yes" } else { "" },
-            r.summary
+            r.summary,
+            langs
         );
     }
 }

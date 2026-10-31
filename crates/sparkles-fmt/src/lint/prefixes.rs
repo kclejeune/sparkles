@@ -57,14 +57,17 @@ pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
     if out.on("undefined-prefix") {
         for i in 0..c.tree.tokens.len() {
             let t = TokenId(i as u32);
-            if !matches!(c.token_kind(t), TokenKind::PnameNs | TokenKind::PnameLn)
-                || labels.contains(&t)
+            if !matches!(
+                c.token_kind(t),
+                TokenKind::PnameNs | TokenKind::PnameLn | TokenKind::AtPname
+            ) || labels.contains(&t)
             {
                 continue;
             }
-            let text = c.text(t);
+            // SHACLC's `@ex:Shape` has the `@` before its label
+            let text = c.text(t).trim_start_matches('@');
             let label = &text[..text.find(':').unwrap_or(text.len())];
-            if c.scope.resolve(label, t).is_none() {
+            if c.namespace(label, t).is_none() {
                 let (start, end) = c.span(t);
                 out.report(
                     "undefined-prefix",

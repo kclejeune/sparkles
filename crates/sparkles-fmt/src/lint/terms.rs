@@ -16,7 +16,7 @@ const OWL_DATA_RANGE: &str = "http://www.w3.org/2002/07/owl#DataRange";
 pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
     for n in c.nodes() {
         match c.kind(n) {
-            NodeKind::Literal => literal(c, n, out),
+            NodeKind::Literal | NodeKind::ShaclcLiteral => literal(c, n, out),
             NodeKind::Call => call(c, n, out),
             _ => {}
         }

@@ -69,7 +69,9 @@ pub(super) async fn lint_handler(
             }
         },
         Some(J::String(n)) => Language::from_name(n).ok_or_else(|| {
-            bad_request(format!("unknown language '{n}': sparql, turtle or trig"))
+            bad_request(format!(
+                "unknown language '{n}': sparql, turtle, trig, ntriples, nquads, jsonld or shaclc"
+            ))
         })?,
         Some(_) => return Err(bad_request("`language` must be a string")),
     };
