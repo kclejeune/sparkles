@@ -312,3 +312,42 @@ pinned server and client cores, and return matching sorted TSV answers for all t
 queries. The [immutable run record](runs/2026-10-26-post-adc2dcbe-intel-control/validation.json)
 contains the source and binary identities, settings, initial flags, longer rerun and
 compressed request samples.
+
+## Short-query check of the startup and credential changes
+
+A Namespace screen of the batch that added bind-before-open startup and credential
+expiry measured `values-star` about 16% slower in server time, 0.021 against 0.025 ms.
+A pinned check on Forge did not reproduce a cost of that size. It built `34b69139`, the
+parent of both changes, the flagged batch `65e369db` and `1acdc38a`, the head when the
+check started, on the host with identical compilers. The base then ran against each of
+the other two for 24 interleaved rounds of A, B, B and A, with 200 timed requests per query
+and server process over 1.05 million generated triples. Each side loaded its own store.
+The server and the client ran on separate cores of an Intel Core i5-13500 that held the
+host's benchmark locks, and steal time was zero.
+
+| query | base (ms) | `65e369db` (ms) | ratio | base (ms) | `1acdc38a` (ms) | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `values-star` | 0.0143 | 0.0137 | 0.959 | 0.0140 | 0.0143 | 1.019 |
+| `count-all` | 0.0041 | 0.0041 | 0.995 | 0.0042 | 0.0040 | 0.967 |
+| `star-lookup` | 0.0579 | 0.0558 | 0.964 | 0.0579 | 0.0570 | 0.984 |
+| `employee-docs` | 0.0315 | 0.0316 | 1.005 | 0.0314 | 0.0319 | 1.016 |
+| `minus` | 0.2954 | 0.2951 | 0.999 | 0.2948 | 0.2964 | 1.006 |
+| `path-plus` | 0.0091 | 0.0086 | 0.945 | 0.0091 | 0.0094 | 1.026 |
+| `star-join` | 1.486 | 1.366 | 0.919 | 1.488 | 1.363 | 0.916 |
+
+Each cell is the median server execution time over every sample of a side. The flagged
+batch ran `values-star` 4.1% faster than the base and was slower in one round of 24. The
+head ran it 1.9% slower, which is about 0.3 microseconds, and was slower in 18 rounds of
+24 with round ratios from 0.939 to 1.065. The medians of the server processes of one
+build spanned 10% to 13% of their own median, which is more than either change. Client
+time is dominated by 2 ms of curl process start, and it moved by 0.4% or less on
+`values-star`. All sorted answers match across the three builds.
+
+The flagged batch is therefore not slower on Forge. The later drift is about the 2.8%
+that the earlier [integration control](#short-query-integration-control) accepted under
+roadmap item 328. The builds differ in both directions on the queries that take a few
+microseconds, which matches code placement better than added work. `star-join` is 8%
+faster in both builds. The
+[immutable run record](runs/2026-10-31-values-star-startup-forge/validation.json)
+holds the revisions, binary hashes, settings, per-round ratios and compressed request
+samples. These are internal comparisons and make no cross-engine claim.

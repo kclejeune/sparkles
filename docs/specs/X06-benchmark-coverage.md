@@ -1676,6 +1676,20 @@ it when the short-query execution path next changes, distinguishing instruction 
 from code placement. A material persistent cost or a simple broad improvement should
 drive further optimization.
 
+### `values-star` after the startup and credential changes
+
+A Namespace screen of the batch with bind-before-open startup and credential expiry
+measured `values-star` about 16% slower in server time. Item 440 ran a pinned
+interleaved check on forge of the parent `34b69139` against the flagged batch
+`65e369db` and against `1acdc38a`, with 24 rounds and 200 requests per query and server
+process. The flagged batch took 4.1% less server time than the parent, and `1acdc38a`
+took 1.9% more, about 0.3 microseconds. The spread between server processes of one build
+is larger than either change, and the six control queries move by at most 5.5% in both
+directions. The flagged batch is not slower on forge, so no per-request lookup change
+was needed. Item 328 keeps the small accepted drift of this query. The
+[qualified result and immutable samples](../benchmarks/synthetic/RESULTS.md#short-query-check-of-the-startup-and-credential-changes)
+keep the comparison separate from cross-engine tables.
+
 ### Standard capability integration screen
 
 The `c0b2f7fb` to `a71fd2ab` comparison includes the standard local embedding, OCR and
