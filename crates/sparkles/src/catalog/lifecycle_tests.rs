@@ -1269,4 +1269,34 @@ mod callback_management {
         let r = cat.reserve("x", ReservationKind::Restore, "2").unwrap();
         assert_eq!(cat.publish_restored(r, &staged).unwrap().dataset_id(), id);
     }
+
+    #[test]
+    fn deferrals_made_while_an_unwound_queue_is_discarded_are_discarded_too() {
+        /// Defers an operation that holds the catalog when it is dropped.
+        struct DefersOnDrop(Catalog);
+        impl Drop for DefersOnDrop {
+            fn drop(&mut self) {
+                let held = self.0.clone();
+                self.0.defer(move |_| drop(held));
+            }
+        }
+        let cat = Catalog::memory(Default::default());
+        let weak = Arc::downgrade(&cat.inner);
+        let capture = DefersOnDrop(cat.clone());
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _batch = cat.batch_scope();
+            cat.defer(move |_| drop(capture));
+            std::panic::panic_any("management call unwinds");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            cat.inner.manage.deferred.lock().is_empty(),
+            "no deferral is stranded"
+        );
+        drop(cat);
+        assert!(
+            weak.upgrade().is_none(),
+            "the catalog is not retained by its own queue"
+        );
+    }
 }

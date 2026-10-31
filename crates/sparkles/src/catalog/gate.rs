@@ -21,7 +21,7 @@ type Deferred = Box<dyn FnOnce(&Catalog) + Send>;
 
 pub(crate) struct ManageGate {
     lock: Mutex<()>,
-    deferred: Mutex<Vec<(ThreadId, Deferred)>>,
+    pub(super) deferred: Mutex<Vec<(ThreadId, Deferred)>>,
 }
 impl ManageGate {
     pub(crate) fn new() -> Self {
@@ -230,7 +230,7 @@ fn drop_payload(payload: Box<dyn std::any::Any + Send>) {
 
 /// Run the operations that this thread deferred on the catalog, in a loop that also
 /// runs whatever they defer. During an unwind they are dropped, since running them
-/// could abort the process.
+/// could abort the process, and so is anything their destructors defer.
 fn run_deferred(catalog: &Catalog) {
     let me = std::thread::current().id();
     let key = key(&catalog.inner);
@@ -254,7 +254,11 @@ fn run_deferred(catalog: &Catalog) {
                 dropped = ops.len(),
                 "deferred catalog operations were dropped because the call that queued them unwound"
             );
-            return;
+            // Drop them outside the queue lock while the draining mark is still set.
+            // A destructor that defers again queues more work, which the next pass
+            // discards too, so nothing stays queued to retain the catalog.
+            drop(ops);
+            continue;
         }
         for op in ops {
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(catalog)));
