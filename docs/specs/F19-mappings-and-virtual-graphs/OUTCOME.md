@@ -87,8 +87,9 @@ roadmap item 43.
   suite at commit b3f461db0e86a68c019bc1f912e86f3555907e34, and
   `crates/sparkles-core/tests/csvw_conformance.rs` runs them in minimal and standard
   mode with `mise run test:csvw`. All 270 pass, which include 136 tests that expect warnings and 58 negative tests.
-  The harness locates metadata by the suite's rules and reads it leniently. The suite
-  needs no excluded test.
+  The harness locates metadata by the suite's rules and reads it leniently, and it
+  checks that a test that expects warnings reports some and that the others report none.
+  The suite needs no excluded test.
 * **Templates.** `tarql:expandPrefix` and `tarql:expandPrefixedName` resolve prefixes
   of the template, then those of the dataset. A file may hold several CONSTRUCT
   queries, and each runs for every batch. `apf:strSplit` is tested in a template. A

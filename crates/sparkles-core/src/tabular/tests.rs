@@ -1068,9 +1068,6 @@ fn descriptions_that_cannot_be_repaired_fail_in_both_modes() {
         table(
             r#""tableSchema": {"columns": [{"name": "c"}], "foreignKeys": [{"dc:note": "x", "columnReference": "c", "reference": {"resource": "u.csv", "columnReference": "c"}}]}"#,
         ),
-        table(
-            r#""tableSchema": {"columns": [{"name": "c", "titles": "c"}], "foreignKeys": [{"columnReference": "other", "reference": {"resource": "u.csv", "columnReference": "c"}}]}"#,
-        ),
     ] {
         for lenient in [false, true] {
             assert!(
@@ -1078,6 +1075,83 @@ fn descriptions_that_cannot_be_repaired_fail_in_both_modes() {
                 "lenient {lenient}: {bad}"
             );
         }
+    }
+}
+
+#[test]
+fn keys_name_columns_by_name_when_lenient_and_by_title_otherwise() {
+    let meta = |key: &str| {
+        format!(
+            r#"{{"@context": "http://www.w3.org/ns/csvw", "url": "t.csv",
+            "tableSchema": {{"columns": [{{"titles": "id"}}, {{"name": "up", "titles": "up"}}], {key}}}}}"#
+        )
+    };
+    let pk = meta(r#""primaryKey": "id""#);
+    // CSVW's rules take a key column from the name property: the key is dropped
+    let m = csvw::parse_with(&pk, Some("http://e.org/m.json"), true).unwrap();
+    assert!(m.tables[0].primary_key.is_empty());
+    assert!(
+        m.warnings
+            .iter()
+            .any(|w| w.contains("no column of the table"))
+    );
+    // the strict reading takes the name a column has from its title
+    let m = csvw::parse(&pk, Some("http://e.org/m.json")).unwrap();
+    assert_eq!(m.tables[0].primary_key, vec!["id".to_string()]);
+    let o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+    let mut o = o;
+    o.keys = Some(Arc::new(KeyRegistry::new(None)));
+    let e = run("id,up\n1,\n1,\n", &o).unwrap_err();
+    assert!(e.to_string().contains("same primary key"), "{e}");
+    // a foreign key to a column that is not there fails when lenient, where the strict
+    // reading fails when the table is converted
+    let fk = meta(
+        r#""foreignKeys": [{"columnReference": "other", "reference": {"resource": "u.csv", "columnReference": "c"}}]"#,
+    );
+    assert!(csvw::parse_with(&fk, Some("http://e.org/m.json"), true).is_err());
+}
+
+#[test]
+fn invalid_directions_and_languages_are_reported() {
+    let m = csvw::parse(
+        r#"{"@context": "http://www.w3.org/ns/csvw", "tableDirection": "up", "textDirection": "sideways",
+            "tables": [{"url": "t.csv", "dialect": {"lineTerminators": 3},
+              "tableSchema": {"columns": [{"name": "a", "titles": {"a-bad-tag": "A", "en": "A"}}]}}]}"#,
+        Some("http://e.org/m.json"),
+    )
+    .unwrap();
+    for w in [
+        "tableDirection",
+        "textDirection",
+        "lineTerminators",
+        "a-bad-tag",
+    ] {
+        assert!(
+            m.warnings.iter().any(|x| x.contains(w)),
+            "{w}: {:?}",
+            m.warnings
+        );
+    }
+    // a header whose language differs from the title's is reported, and undetermined
+    // languages match
+    let meta = |lang: &str| {
+        format!(
+            r#"{{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv", "lang": "{lang}",
+                "tableSchema": {{"columns": [{{"name": "a", "titles": {{"en-GB": "A"}}}}]}}}}"#
+        )
+    };
+    for (lang, warns) in [
+        ("de", true),
+        ("en", false),
+        ("und", false),
+        ("en-GB", false),
+    ] {
+        let (_, w) = run_stats("A\nx\n", &lenient(&meta(lang), "t.csv")).unwrap();
+        assert_eq!(
+            w.iter().any(|x| x.contains("matches none")),
+            warns,
+            "{lang}: {w:?}"
+        );
     }
 }
 
@@ -1212,6 +1286,51 @@ fn key_violations_are_warnings_when_lenient_and_a_table_can_reference_itself() {
     );
     assert!(
         warnings.iter().any(|w| w.contains("\"9\" is not among")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn lenient_key_checks_collect_every_row_and_keep_the_memory_budget() {
+    let meta = r#"{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv",
+        "tableSchema": {"columns": [{"name": "id", "titles": "id"}, {"name": "code", "titles": "code"}, {"name": "up", "titles": "up"}],
+          "primaryKey": "id",
+          "foreignKeys": [{"columnReference": "up", "reference": {"resource": "t.csv", "columnReference": "code"}}]}}"#;
+    let with = |budget: Option<u64>| {
+        let m = csvw::parse_with(meta, Some("http://e.org/m.json"), true).unwrap();
+        let mut o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+        o.lenient = true;
+        o.keys = Some(Arc::new(KeyRegistry::new(budget)));
+        o
+    };
+    // a duplicate row still gives its referenceable value, and only the duplicate is
+    // reported
+    let (got, warnings) = run_stats("id,code,up\n1,a,\n1,b,\n2,c,b\n", &with(None)).unwrap();
+    assert_eq!(got.len(), 7, "{got:?}");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("same primary key"), "{warnings:?}");
+    // a budget is a resource limit and stops the conversion in lenient mode too
+    let e = run_stats("id,code,up\n1,a,\n2,b,a\n", &with(Some(8))).unwrap_err();
+    assert!(e.to_string().contains("memory budget"), "{e}");
+}
+
+#[test]
+fn self_references_list_a_bounded_number_of_violations() {
+    let meta = r#"{"@context": "http://www.w3.org/ns/csvw", "url": "http://e.org/t.csv",
+        "tableSchema": {"columns": [{"name": "id", "titles": "id"}, {"name": "up", "titles": "up"}],
+          "foreignKeys": [{"columnReference": "up", "reference": {"resource": "t.csv", "columnReference": "id"}}]}}"#;
+    let m = csvw::parse_with(meta, Some("http://e.org/m.json"), true).unwrap();
+    let mut o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+    o.lenient = true;
+    o.keys = Some(Arc::new(KeyRegistry::new(None)));
+    let mut csv = String::from("id,up\n");
+    for i in 0..100 {
+        csv.push_str(&format!("{i},x{i}\n"));
+    }
+    let (_, warnings) = run_stats(&csv, &o).unwrap();
+    assert_eq!(warnings.len(), 11, "{warnings:?}");
+    assert!(
+        warnings[10].contains("further key violations"),
         "{warnings:?}"
     );
 }

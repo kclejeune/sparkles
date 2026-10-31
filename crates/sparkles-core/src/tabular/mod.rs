@@ -682,6 +682,17 @@ struct ColumnDesc2 {
 
 /// Build the columns of `desc` for a table whose header gave `titles` (one list per
 /// cell) and whose rows have `width` cells.
+/// Whether two language tags match: `und` matches any, and otherwise the subtags are
+/// equal up to the length of the shorter tag.
+fn languages_match(a: &str, b: &str) -> bool {
+    if a == "und" || b == "und" {
+        return true;
+    }
+    a.split('-')
+        .zip(b.split('-'))
+        .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
 fn columns(
     desc: &TableDesc,
     titles: &[Vec<String>],
@@ -718,9 +729,20 @@ fn columns(
             ));
         }
         for (i, c) in desc.columns.iter().filter(|c| !c.is_virtual).enumerate() {
+            // the header's language is the column's, or the table's, or undetermined
+            let header_lang = c
+                .props
+                .lang
+                .clone()
+                .or_else(|| desc.props.lang.clone())
+                .flatten()
+                .unwrap_or_else(|| "und".to_string());
             if let Some(h) = titles.get(i).and_then(|t| t.first())
-                && !c.titles.is_empty()
-                && !c.titles.contains(h)
+                && !c.title_langs.is_empty()
+                && !c
+                    .title_langs
+                    .iter()
+                    .any(|(l, t)| t == h && languages_match(l, &header_lang))
             {
                 warnings.push(format!(
                     "column {}: the header {h:?} matches none of the titles of column {:?}",
@@ -1278,21 +1300,16 @@ pub fn convert(
             source_row,
             line,
         };
-        if let Some(k) = &mut keys
-            && let Err(m) = k.row(&table, &r)
-        {
-            if !opts.lenient {
-                return Err(fail(m));
+        if let Some(k) = &mut keys {
+            // a failure is the memory budget, which stops the load in either mode
+            let mut violations = Vec::new();
+            k.row(&table, &r, &mut violations).map_err(fail)?;
+            for m in violations {
+                if !opts.lenient {
+                    return Err(fail(m));
+                }
+                note_key_violation(&mut stats.warnings, &name, &mut key_warned, m);
             }
-            // CSVW treats a key violation as a problem to report, not a reason to stop
-            if key_warned < WARNINGS_PER_COLUMN {
-                stats.warnings.push(format!("{name}: {m}"));
-            } else if key_warned == WARNINGS_PER_COLUMN {
-                stats
-                    .warnings
-                    .push(format!("{name}: further key violations are not listed"));
-            }
-            key_warned += 1;
         }
         match &mut runner {
             None if standard.is_some() => {
@@ -1344,21 +1361,44 @@ pub fn convert(
         })?;
     }
     if let Some(k) = keys {
-        for m in k.finish() {
-            if !opts.lenient {
-                return Err(fail(m));
-            }
-            if key_warned < WARNINGS_PER_COLUMN {
-                stats.warnings.push(format!("{name}: {m}"));
-            }
-            key_warned += 1;
+        // strict mode needs only the first violation, and CSVW's rules cap the listing
+        let (violations, total) = k.finish(if opts.lenient { WARNINGS_PER_COLUMN } else { 1 });
+        if let Some(m) = violations.first()
+            && !opts.lenient
+        {
+            return Err(fail(m.clone()));
         }
+        let listed = violations.len();
+        for m in violations {
+            note_key_violation(&mut stats.warnings, &name, &mut key_warned, m);
+        }
+        key_warned += total - listed;
+        note_unlisted_key_violations(&mut stats.warnings, &name, key_warned);
     }
     stats.rows = row;
     if template.is_some() {
         stats.lookup_commit = opts.lookup.as_ref().map(|l| l.commit);
     }
     Ok(stats)
+}
+
+/// Report a key violation as a warning, up to the cap for a table.
+fn note_key_violation(warnings: &mut Vec<String>, name: &str, count: &mut usize, m: String) {
+    if *count < WARNINGS_PER_COLUMN {
+        warnings.push(format!("{name}: {m}"));
+    }
+    *count += 1;
+    note_unlisted_key_violations(warnings, name, *count);
+}
+
+/// Say once that violations beyond the cap are not listed.
+fn note_unlisted_key_violations(warnings: &mut Vec<String>, name: &str, count: usize) {
+    if count > WARNINGS_PER_COLUMN {
+        let note = format!("{name}: further key violations are not listed");
+        if !warnings.contains(&note) {
+            warnings.push(note);
+        }
+    }
 }
 
 /// The key checks of one table (spec F19 §6.2, §6.3).
@@ -1495,7 +1535,15 @@ impl KeyCheck {
         })
     }
 
-    fn row(&mut self, table: &Table, r: &RowCtx<'_>) -> std::result::Result<(), String> {
+    /// Check a row and collect its referenceable values. A violation of a key goes to
+    /// `violations` and the row is still collected, so that a later row is not blamed for
+    /// it. An error is a failure that no mode recovers from, the memory budget.
+    fn row(
+        &mut self,
+        table: &Table,
+        r: &RowCtx<'_>,
+        violations: &mut Vec<String>,
+    ) -> std::result::Result<(), String> {
         let at = |i: usize| {
             format!(
                 "row {}{}",
@@ -1505,26 +1553,34 @@ impl KeyCheck {
         };
         if let Some((cols, names)) = &self.pk {
             let mut key = Vec::with_capacity(cols.len());
+            let mut empty = None;
             for &i in cols {
                 match key_value(&r.cells[i]) {
                     Some(v) => key.push(v),
-                    None => return Err(format!("{}: a primary key cell is empty", at(i))),
+                    None => {
+                        empty = Some(i);
+                        break;
+                    }
                 }
             }
-            let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 48;
-            self.reg
-                .charge(bytes as u64, &format!("the primary key of {}", self.name))?;
-            if let Some(first) = self.seen.insert(key.clone(), r.source_row) {
-                return Err(format!(
-                    "rows {first} and {} have the same primary key ({})",
-                    r.source_row,
-                    names
-                        .iter()
-                        .zip(&key)
-                        .map(|(n, v)| format!("{n} = {v:?}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+            if let Some(i) = empty {
+                violations.push(format!("{}: a primary key cell is empty", at(i)));
+            } else {
+                let bytes: usize = key.iter().map(|k| k.len() + 32).sum::<usize>() + 48;
+                self.reg
+                    .charge(bytes as u64, &format!("the primary key of {}", self.name))?;
+                if let Some(first) = self.seen.insert(key.clone(), r.source_row) {
+                    violations.push(format!(
+                        "rows {first} and {} have the same primary key ({})",
+                        r.source_row,
+                        names
+                            .iter()
+                            .zip(&key)
+                            .map(|(n, v)| format!("{n} = {v:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
             }
         }
         for (cols, set, desc) in &self.fks {
@@ -1537,7 +1593,7 @@ impl KeyCheck {
                 }
             }
             if key.len() == cols.len() && !set.contains(&key) {
-                return Err(format!(
+                violations.push(format!(
                     "{}: the value {} is not among the values of {desc}",
                     at(cols[0]),
                     key.iter()
@@ -1581,17 +1637,24 @@ impl KeyCheck {
     }
 
     /// Check the foreign keys of the table to itself, and hand the collected values to
-    /// the tables that reference them. Returns what the own keys violate.
-    fn finish(self) -> Vec<String> {
-        let mut violations = Vec::new();
+    /// the tables that reference them. Returns the first `limit` violations of the own
+    /// keys, formatted, and how many there are, so that a large table does not format a
+    /// message for each of its rows.
+    fn finish(self, limit: usize) -> (Vec<String>, usize) {
+        let mut listed = Vec::new();
+        let mut total = 0;
         for o in &self.own {
             let Some((_, _, set)) = self.collect.iter().find(|(n, _, _)| *n == o.ref_columns)
             else {
                 continue;
             };
             for (key, row, col) in &o.pending {
-                if !set.contains(key) {
-                    violations.push(format!(
+                if set.contains(key) {
+                    continue;
+                }
+                total += 1;
+                if listed.len() < limit {
+                    listed.push(format!(
                         "row {row}, column {col}: the value {} is not among the values of {}",
                         key.iter()
                             .map(|v| format!("{v:?}"))
@@ -1606,7 +1669,7 @@ impl KeyCheck {
         for (names, _, set) in self.collect {
             sets.insert((self.table, names), Arc::new(set));
         }
-        violations
+        (listed, total)
     }
 }
 

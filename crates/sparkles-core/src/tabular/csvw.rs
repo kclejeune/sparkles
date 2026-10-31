@@ -74,6 +74,8 @@ pub struct ColumnDesc {
     pub titles: Vec<String>,
     /// The titles in the language `und`, which name a column without a `name`.
     pub und_titles: Vec<String>,
+    /// Every title with its language, `und` for a title given without one.
+    pub title_langs: Vec<(String, String)>,
     pub is_virtual: bool,
     pub suppress: bool,
     /// The column's own inherited properties (not yet merged with the schema's).
@@ -458,6 +460,7 @@ pub fn parse_resolving(
             &["@context", "tables", "dialect", "transformations"],
         );
         check_id_type(o, "TableGroup", &mut cx)?;
+        check_direction(o, "tableDirection", &mut cx);
         transformations(o, &mut cx)?;
         let props = props(o, &mut cx)?;
         let dialect = match o.get("dialect") {
@@ -542,6 +545,7 @@ fn table(
         ],
     );
     check_id_type(o, "Table", cx)?;
+    check_direction(o, "tableDirection", cx);
     transformations(o, cx)?;
     if o.contains_key("transformations") {
         cx.warn("transformations are ignored".into());
@@ -653,8 +657,10 @@ fn table(
         }
         Some(_) => cx.soft::<()>(Err("tableSchema must be an object".into()))?,
     }
-    // a key names columns of the table by their `name` property
-    if !columns.is_empty() {
+    // CSVW's processing rules take a key column from the `name` property. The strict
+    // reading also accepts the name that a column takes from its first title, which
+    // `key_columns` resolves when the table is converted.
+    if cx.lenient && !columns.is_empty() {
         let named = |n: &String| columns.iter().any(|c| c.name.as_ref() == Some(n));
         let missing = |n: &String| {
             format!(
@@ -662,8 +668,8 @@ fn table(
             )
         };
         if let Some(n) = primary_key.iter().find(|n| !named(n)) {
-            // a primary key is dropped in lenient mode, and a foreign key is an error
-            cx.soft::<()>(Err(missing(n)))?;
+            // a primary key is dropped, and a foreign key is an error
+            cx.warn(missing(n));
             primary_key.clear();
         }
         if let Some(n) = fks
@@ -711,11 +717,13 @@ fn column(o: &Map<String, J>, cx: &mut Ctx) -> Result<ColumnDesc, String> {
     })?;
     let mut titles = Vec::new();
     let mut und_titles = Vec::new();
-    let mut title = |cx: &mut Ctx, v: &J, und: bool| -> Result<(), String> {
+    let mut title_langs = Vec::new();
+    let mut title = |cx: &mut Ctx, v: &J, lang: &str| -> Result<(), String> {
         match v.as_str() {
             Some(t) => {
                 titles.push(t.to_string());
-                if und {
+                title_langs.push((lang.to_string(), t.to_string()));
+                if lang == "und" {
                     und_titles.push(t.to_string());
                 }
             }
@@ -727,22 +735,33 @@ fn column(o: &Map<String, J>, cx: &mut Ctx) -> Result<ColumnDesc, String> {
         None => {}
         Some(J::Array(a)) => {
             for t in a {
-                title(cx, t, true)?;
+                title(cx, t, "und")?;
             }
         }
         Some(J::Object(m)) => {
             for (lang, v) in m {
+                if lang != "und"
+                    && oxrdf::Literal::new_language_tagged_literal("", lang.as_str()).is_err()
+                {
+                    // the titles of a language that is not a language tag are ignored
+                    cx.warn(format!(
+                        "titles in the language {lang:?}, which is not a language tag"
+                    ));
+                    if cx.lenient {
+                        continue;
+                    }
+                }
                 match v {
                     J::Array(a) => {
                         for t in a {
-                            title(cx, t, lang == "und")?;
+                            title(cx, t, lang)?;
                         }
                     }
-                    v => title(cx, v, lang == "und")?,
+                    v => title(cx, v, lang)?,
                 }
             }
         }
-        Some(v @ J::String(_)) => title(cx, v, true)?,
+        Some(v @ J::String(_)) => title(cx, v, "und")?,
         Some(_) => cx.soft::<()>(Err(
             "titles must be a string, an array or a language map".into()
         ))?,
@@ -767,6 +786,7 @@ fn column(o: &Map<String, J>, cx: &mut Ctx) -> Result<ColumnDesc, String> {
         name,
         titles,
         und_titles,
+        title_langs,
         is_virtual,
         suppress: cx.soft(bool_prop(o, "suppressOutput"))?.unwrap_or(false),
         props,
@@ -841,7 +861,20 @@ fn template(o: &Map<String, J>, k: &str, cx: &mut Ctx) -> Result<Option<UriTempl
     }
 }
 
+/// A direction property is `ltr`, `rtl` or `auto`, and anything else is ignored with a
+/// warning. `textDirection` also allows `inherit`.
+fn check_direction(o: &Map<String, J>, key: &str, cx: &mut Ctx) {
+    let ok =
+        |v: &str| matches!(v, "ltr" | "rtl" | "auto") || (key == "textDirection" && v == "inherit");
+    if let Some(v) = o.get(key)
+        && !v.as_str().is_some_and(ok)
+    {
+        cx.warn(format!("{key} {v} is ignored: use ltr, rtl or auto"));
+    }
+}
+
 fn props(o: &Map<String, J>, cx: &mut Ctx) -> Result<Props, String> {
+    check_direction(o, "textDirection", cx);
     let about_url = template(o, "aboutUrl", cx)?;
     let property_url = template(o, "propertyUrl", cx)?;
     let value_url = template(o, "valueUrl", cx)?;
@@ -1006,7 +1039,20 @@ fn dialect(v: &J, cx: &mut Ctx) -> Result<DialectDesc, String> {
                     "dialect encoding {v} is not supported: use utf-8"
                 )))?,
             },
-            "lineTerminators" | "@id" | "@type" => {}
+            "lineTerminators" => {
+                let strings = match v {
+                    J::String(_) => true,
+                    J::Array(a) => a.iter().all(J::is_string),
+                    _ => false,
+                };
+                if !strings {
+                    cx.warn(
+                        "dialect lineTerminators is ignored: use a string or an array of strings"
+                            .into(),
+                    );
+                }
+            }
+            "@id" | "@type" => {}
             _ => cx.warn(format!("dialect property {k:?} is ignored")),
         }
     }

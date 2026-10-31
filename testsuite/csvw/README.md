@@ -12,7 +12,8 @@ and as part of `mbx test`. It plays the part of the processor that locates metad
 it applies the test's user metadata, then the `Link` header the test names, then
 `{url}-metadata.json`, `csv-metadata.json`, `{url}.json` and `csvm.json`, and takes the
 first document that exists and describes the file. It reads the metadata and the cells
-with the lenient rules of CSVW, which warn about a problem and use the default. It
+with the lenient rules of CSVW, which warn about a problem and use the default. A test
+that expects warnings must report some, and a test that expects none must report none. It
 converts in minimal mode, or in standard mode unless the test says `csvt:minimal`,
 compares the output with the expected Turtle by dataset isomorphism, and requires the
 negative tests to fail. `CSVW_ONLY=test001,test002` runs some tests and prints their

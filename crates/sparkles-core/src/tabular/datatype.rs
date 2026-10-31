@@ -53,12 +53,11 @@ pub struct Datatype {
 }
 
 /// A bound of a value constraint: a number, or a point in time for the date and time
-/// types (seconds and nanoseconds from the epoch, a value without a time zone read as
-/// UTC).
+/// types (see `instant`).
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 enum Bound {
     Num(f64),
-    Time(i64, u32),
+    Time(i128),
 }
 
 #[derive(Clone, Debug)]
@@ -319,7 +318,7 @@ impl Datatype {
             } else {
                 v.as_str()
                     .and_then(|s| instant(s.trim(), dt.kind))
-                    .map(|(secs, nanos, _)| Bound::Time(secs, nanos))
+                    .map(Bound::Time)
                     .ok_or_else(|| format!("datatype {k} must be a {}", dt.name))
             };
             if let Some(n) = soft(lenient, warn, bound)? {
@@ -544,9 +543,9 @@ impl Datatype {
         if self.lower.is_none() && self.upper.is_none() {
             return Ok(());
         }
-        let (secs, nanos, _) =
+        let t =
             instant(lex, self.kind).ok_or_else(|| format!("{v:?} is not a valid {}", self.name))?;
-        self.in_bounds(Bound::Time(secs, nanos), v)
+        self.in_bounds(Bound::Time(t), v)
     }
 
     fn in_bounds(&self, x: Bound, v: &str) -> Result<(), String> {
@@ -962,91 +961,19 @@ enum Field {
     Second,
 }
 
-/// The point in time of an XSD date, time or dateTime value: seconds and nanoseconds from
-/// the epoch (a date at its start, a time on 1 January 1970) and whether it has a time
-/// zone. A value without a time zone is read as UTC.
-fn instant(lex: &str, kind: Kind) -> Option<(i64, u32, bool)> {
-    // the date part ends after the two digits of the day, and a date's time zone follows
-    let split_day = |d: &str| -> Option<(String, String)> {
-        let (neg, body) = match d.strip_prefix('-') {
-            Some(x) => (true, x),
-            None => (false, d),
-        };
-        let mut it = body.splitn(3, '-');
-        let (y, m, rest) = (it.next()?, it.next()?, it.next()?);
-        if rest.len() < 2 || !rest.is_char_boundary(2) {
-            return None;
-        }
-        let (day, zone) = rest.split_at(2);
-        Some((
-            format!("{}{y}-{m}-{day}", if neg { "-" } else { "" }),
-            zone.to_string(),
-        ))
+/// The point in time of an XSD date, time or dateTime value as the signed count of
+/// 10^-18 seconds that `oxsdatatypes` keeps, so that values compare to the precision
+/// the XSD types support. A date is at its start, a time is on a fixed day, and a value
+/// without a time zone is read as UTC. The lexical form must be valid XSD.
+fn instant(lex: &str, kind: Kind) -> Option<i128> {
+    use oxsdatatypes::{Date, DateTime, Time};
+    use std::str::FromStr;
+    let bytes = match kind {
+        Kind::Date => Date::from_str(lex).ok()?.to_be_bytes(),
+        Kind::Time => Time::from_str(lex).ok()?.to_be_bytes(),
+        _ => DateTime::from_str(lex).ok()?.to_be_bytes(),
     };
-    let mut date_zone = String::new();
-    let (date, rest) = match kind {
-        Kind::Time => (None, lex.to_string()),
-        Kind::Date => {
-            let (d, z) = split_day(lex)?;
-            date_zone = z;
-            (Some(d), String::new())
-        }
-        _ => {
-            let (d, t) = lex.split_once('T')?;
-            (Some(d.to_string()), t.to_string())
-        }
-    };
-    let rest = rest.as_str();
-    let days = match date.as_deref() {
-        Some(d) => {
-            let (neg, d) = match d.strip_prefix('-') {
-                Some(x) => (true, x),
-                None => (false, d),
-            };
-            let mut it = d.split('-');
-            let y: i64 = it.next()?.parse().ok()?;
-            let m: i64 = it.next()?.parse().ok()?;
-            let dd: i64 = it.next()?.parse().ok()?;
-            let y = if neg { -y } else { y };
-            // days from the civil date (Howard Hinnant's algorithm)
-            let y = if m <= 2 { y - 1 } else { y };
-            let era = y.div_euclid(400);
-            let yoe = y - era * 400;
-            let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + dd - 1;
-            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-            era * 146_097 + doe - 719_468
-        }
-        None => 0,
-    };
-    let (time, zone) = match kind {
-        Kind::Date => ("00:00:00", date_zone.as_str()),
-        _ => {
-            let end = rest.find(['Z', '+']).or_else(|| rest.rfind('-'));
-            rest.split_at(end.unwrap_or(rest.len()))
-        }
-    };
-    let mut it = time.split(':');
-    let h: i64 = it.next()?.parse().ok()?;
-    let mi: i64 = it.next()?.parse().ok()?;
-    let sec = it.next()?;
-    let (s, frac) = sec.split_once('.').unwrap_or((sec, ""));
-    let s: i64 = s.parse().ok()?;
-    let nanos: u32 = if frac.is_empty() {
-        0
-    } else {
-        format!("{frac:0<9}")[..9].parse().ok()?
-    };
-    let offset = match zone {
-        "" => None,
-        "Z" => Some(0),
-        z => {
-            let sign = if z.starts_with('-') { -1 } else { 1 };
-            let (hh, mm) = z[1..].split_once(':')?;
-            Some(sign * (hh.parse::<i64>().ok()? * 3600 + mm.parse::<i64>().ok()? * 60))
-        }
-    };
-    let secs = days * 86_400 + h * 3600 + mi * 60 + s - offset.unwrap_or(0);
-    Some((secs, nanos, offset.is_some()))
+    Some(i128::from_be_bytes(bytes[..16].try_into().ok()?))
 }
 
 fn date_pattern(p: &str, kind: Kind) -> Result<Vec<Tok>, String> {
@@ -1391,6 +1318,25 @@ mod tests {
         let t = dt(json!({"base": "time", "maximum": "12:00:00"}));
         assert!(t.parse("11:59:59").is_ok());
         assert!(t.parse("12:00:01").is_err());
+        // fractions beyond nine digits still order, and malformed input is refused
+        let p = dt(json!({"base": "time", "minExclusive": "12:00:00.1234567891"}));
+        assert!(p.parse("12:00:00.1234567899").is_ok());
+        assert!(p.parse("12:00:00.1234567891").is_err());
+        assert!(t.parse("12:00:00.12345678é").is_err());
+        assert!(
+            Datatype::from_json(
+                &json!({"base": "date", "minimum": "2024-02-31"}),
+                &mut |_| {}
+            )
+            .is_err()
+        );
+        assert!(
+            Datatype::from_json(
+                &json!({"base": "date", "minimum": "2024-02-3é"}),
+                &mut |_| {}
+            )
+            .is_err()
+        );
         // bounds that nothing satisfies, and bounds on types that have no order
         for bad in [
             json!({"base": "date", "minInclusive": "2015-06-05", "maxInclusive": "2015-06-04"}),

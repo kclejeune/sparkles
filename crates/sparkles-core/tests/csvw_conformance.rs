@@ -7,7 +7,8 @@
 //! plays the part of the processor that locates metadata: it applies the user metadata of
 //! the test, the `Link` header the test names, `{url}-metadata.json` and
 //! `csv-metadata.json`, and keeps a metadata document only when it describes the file.
-//! A negative test must fail to read or to convert. Excluded tests are listed with a
+//! A test that expects warnings must report some, and a test that expects none must report
+//! none. A negative test must fail to read or to convert. Excluded tests are listed with a
 //! reason. The test fails when a test outside the list fails, and when a listed test
 //! passes, so the list stays honest.
 
@@ -139,14 +140,18 @@ fn describes(text: &str, location: &str, url: &str) -> bool {
 /// and `csv-metadata.json`, which are the locations of the default site-wide
 /// configuration, and the two further names that the suite's site-wide configuration
 /// adds (`{url}.json` and `csvm.json`), applies when it describes the file.
-fn find_metadata(case: &Case) -> Option<(String, String)> {
+fn find_metadata(case: &Case) -> (Option<(String, String)>, Vec<String>) {
     let read = |url: &str| {
+        // a name with a query component is no file
+        if url.contains('?') {
+            return None;
+        }
         std::fs::read_to_string(local(url))
             .ok()
             .map(|t| (url.to_string(), t))
     };
     if let Some(u) = &case.user_metadata {
-        return read(u);
+        return (read(u), Vec::new());
     }
     let url = case.action.as_str();
     let mut candidates = Vec::new();
@@ -164,24 +169,37 @@ fn find_metadata(case: &Case) -> Option<(String, String)> {
     candidates.push(resolve(url, "csv-metadata.json"));
     candidates.push(format!("{url}.json"));
     candidates.push(resolve(url, "csvm.json"));
-    candidates
-        .iter()
-        .filter_map(|u| read(u))
-        .find(|(u, t)| describes(t, u, &case.action))
+    // a document that does not describe the file is ignored, with a warning
+    let mut warnings = Vec::new();
+    for (u, t) in candidates.iter().filter_map(|u| read(u)) {
+        if describes(&t, &u, &case.action) {
+            return (Some((u, t)), warnings);
+        }
+        warnings.push(format!(
+            "the metadata at {u} does not describe {}",
+            case.action
+        ));
+    }
+    (None, warnings)
 }
 
 /// Convert every table of the metadata that applies (or the table at the file when
 /// there is no metadata) into one N-Triples document. Tables of one group share the
 /// document, and the blank node of their group is the same label in each, so the
 /// document describes one table group.
-fn convert(case: &Case) -> Result<Vec<u8>, String> {
+fn convert(case: &Case) -> Result<(Vec<u8>, Vec<String>), String> {
     let url = case.action.clone();
+    let (found, mut warnings) = if case.action.ends_with(".json") {
+        (None, Vec::new())
+    } else {
+        find_metadata(case)
+    };
     let (metadata, tables): (Metadata, Vec<usize>) = if case.action.ends_with(".json") {
         let text = std::fs::read_to_string(local(&case.action)).map_err(|e| e.to_string())?;
         let m = parse(&text, &case.action)?;
         let n = m.tables.len();
         (m, (0..n).collect())
-    } else if let Some((loc, text)) = find_metadata(case) {
+    } else if let Some((loc, text)) = found {
         let m = parse(&text, &loc)?;
         let n = m.tables.len();
         match m.tables.iter().position(|t| t.url.as_deref() == Some(&url)) {
@@ -196,6 +214,7 @@ fn convert(case: &Case) -> Result<Vec<u8>, String> {
         });
         (parse(&doc.to_string(), &url)?, vec![0])
     };
+    warnings.extend(metadata.warnings.iter().cloned());
     let metadata = Arc::new(metadata);
     let registry = Arc::new(tabular::KeyRegistry::new(None));
     let mut out = Vec::new();
@@ -210,10 +229,11 @@ fn convert(case: &Case) -> Result<Vec<u8>, String> {
         o.lenient = true;
         o.keys = Some(registry.clone());
         o.tsv = tabular::tabular_kind(&path) == Some(tabular::TabularKind::Tsv);
-        tabular::write(input, &o, &mut out, oxrdfio::RdfFormat::NTriples, None)
+        let stats = tabular::write(input, &o, &mut out, oxrdfio::RdfFormat::NTriples, None)
             .map_err(|e| e.to_string())?;
+        warnings.extend(stats.warnings);
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 
 fn canonical(triples: impl Iterator<Item = oxrdf::Triple>) -> Dataset {
@@ -235,13 +255,29 @@ fn run(case: &Case) -> Result<(), String> {
     if case.kind == "NegativeRdfTest" {
         return match got {
             Err(_) => Ok(()),
-            Ok(out) => Err(format!(
+            Ok((out, _)) => Err(format!(
                 "an error was expected, and the run gave:\n{}",
                 String::from_utf8_lossy(&out)
             )),
         };
     }
-    let got = got?;
+    let (got, mut warnings) = got?;
+    // a test with warnings expects the processor to report some, and a test without
+    // them expects none
+    // the suite's validators raise errors for a key that is violated, which the converter
+    // reports as warnings and carries on
+    warnings.retain(|w| {
+        !(KEY_VIOLATION_TESTS.contains(&case.id.as_str()) && w.contains("primary key"))
+    });
+    match (case.kind.as_str(), warnings.is_empty()) {
+        ("ToRdfTestWithWarnings", true) => {
+            return Err("the test expects warnings and the run gave none".into());
+        }
+        ("ToRdfTest", false) => {
+            return Err(format!("the run warned: {}", warnings.join("; ")));
+        }
+        _ => {}
+    }
     let want_path = local(case.result.as_deref().ok_or("no expected result")?);
     let want_text = std::fs::read_to_string(&want_path).map_err(|e| e.to_string())?;
     let want = canonical(
@@ -278,6 +314,10 @@ fn run(case: &Case) -> Result<(), String> {
     ))
 }
 
+/// Tests whose rows violate a primary key and that expect no warning, because CSVW leaves
+/// the violation to validators.
+const KEY_VIOLATION_TESTS: &[&str] = &["test232", "test234"];
+
 /// Tests that are excluded, with the reason.
 const EXCLUDED: &[(&str, &str)] = &[];
 
@@ -289,8 +329,13 @@ fn csvw_rdf_tests() {
     if let Ok(only) = std::env::var("CSVW_ONLY") {
         cases.retain(|c| only.split(',').any(|o| o == c.id));
         for c in &cases {
-            if let Ok(out) = convert(c) {
-                eprintln!("{} output:\n{}", c.id, String::from_utf8_lossy(&out));
+            if let Ok((out, warnings)) = convert(c) {
+                eprintln!(
+                    "{} output ({} warnings):\n{}",
+                    c.id,
+                    warnings.len(),
+                    String::from_utf8_lossy(&out)
+                );
             }
         }
     }
