@@ -98,8 +98,8 @@ Wave A holds the work that most improves the engine against objective measures.
 * The Stage A lanes of item 17 are items 413 to 417. They deliver the safety net,
   internal circuits, the provenance algebra, reasoner witnesses and the fixed-point
   operator.
-* Small lanes that finish a capability run in free capacity. These are items 277 and
-  77, and the CSVW and RML conformance gaps in items 235 and 232.
+* Small lanes that finish a capability run in free capacity. These are item 77 and the
+  CSVW and RML conformance gaps in items 235 and 232.
 
 ### Wave B: memory and entities
 
@@ -254,7 +254,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F04](specs/F04-vector-search.md#outcome) | 34, 82 | Deliver the chosen quantization modes, result caching and statistics. Measure catch-up, worker sizing and binary16 recall on all named distance distributions, and verify cancellation, version invalidation and memory ownership. |
 | [F05](specs/F05-snapshot-repositories/SPEC.md#outcome) | 61, 65, 401 | Restore whole-server and multi-dataset runs with consistent, versioned definitions and paused external work. Complete repository transfer, chunking adoption, optional retained-history capture and storage-retention controls, proving restored retained commits and preserving older backup readers. |
 | [F06](specs/F06-snapshots-and-point-in-time.md#outcome) | 23, 52, 395 | Complete pin rebasing, per-quad periods, graph feeds, expired-state reconstruction and settings history, with full-text reads at pins supplied by 23. Compare historical answers and diffs with fresh reconstruction through compaction and retention boundaries. Add bounded replay and permission preparation through item 395. |
-| [F07](specs/F07-path-search.md#outcome) | 275, 276, 277 | Add length-bounded weighted search and bidirectional tied shortest paths with the reference path/cost tests. Resolve or explicitly disposition the measured control costs without weakening visit budgets or zero-weight semantics. |
+| [F07](specs/F07-path-search.md#outcome) | 275, 276 | Add length-bounded weighted search with the reference path/cost tests. Resolve or explicitly disposition the measured control costs without weakening visit budgets or zero-weight semantics. |
 | [F09](specs/F09-branches-and-merges.md#outcome) | 45 | Finish relink from the remote CLI and remote/archive cloning. Compare relink identities and clone contents with offline operations, including chosen commits, lineage, cancellation and corrupt-transfer refusal. |
 | [F10](specs/F10-replication.md#outcome) | 74, 280, 66 | Settle the replication contract before implementing replicas, bootstrap, archives, promotion, synchronous acknowledgement and fenced failover. Test exact primary identities, stream gaps, restart and declared data-loss guarantees, and separately complete multi-transaction patch and blank-node semantics. |
 | [F11](specs/F11-encryption-at-rest.md#outcome) | 61, 65, 58, 59 | Finish key workflows and recovery, Phase 2 chunking and write-only age-recipient repositories, then live-file and derived-index encryption. Pass the remaining phase acceptance for provider outages, read-authority separation, rotation, locked states and format compatibility. Standard builds include repository encryption with protected keys on Linux and macOS; later phases remain open. |
@@ -291,7 +291,7 @@ These decisions fix what completes four capabilities in the [capability matrix](
 
 * Formatting, linting and command-line tools are complete. Item 55 is a follow-up
   outside that capability.
-* Paths and graph algorithms complete with items 8, 275, 276 and 277. OpenCypher
+* Paths and graph algorithms complete with items 8, 275 and 276. OpenCypher
   procedures belong to item 20 under additional query languages, and the C23 writer belongs
   to item 36 under batched updates and triggers. The weighted-betweenness extensions in
   items 79 and 80 are optional and outside the completion path.
@@ -510,7 +510,8 @@ Rows that need backend work name it first.
 | 141 | **Frame times of the linked views on a GPU.** Run U11's A9 frame-rate and lasso targets in a Playwright performance project on a GPU runner, since they were measured only in software rendering. | [U11](specs/U11-linked-views.md#outcome) | S |
 | 142 | **Projections on disk and for partial callers.** Decide whether to write projections beside the index in a versioned file, and whether to serve a projection filtered to what a caller can read instead of answering `403`. | [U11](specs/U11-linked-views.md#10-open-questions) | M |
 | 275 | **Weighted shortest paths under a length limit.** A weighted shortest search with `path:maxLength` lists paths by cost until one is short enough, so a pair whose short paths are all dear runs to the visit limit, and the path finder always sends a limit. Search over pairs of node and length, keeping a label only when no other label at the node is both cheaper and shorter, and use the same search for Yen's spurs. | [F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24), [U09](specs/U09-path-finder.md#outcome) | M |
-| 277 | **Weighted `path:allShortest` from both ends.** Every cheapest path of one pair without `path:maxLength`, cycles through the source and searches to several targets still run Dijkstra's algorithm from the source alone. Keep every tied parent on both ends and join the halves at every cheapest meeting. | [F07](specs/F07-path-search.md#weighted-searches-from-both-ends-2026-10-24) | S–M |
+| NEW-ITEM-1 | **Pair searches for a few bound targets.** A source with several bound targets runs one search from the source, with or without weights, while a search from both ends per pair settles far fewer nodes when the targets are few and distant. Choose between them from the number of targets and the work of the first pair searches, and keep one search from the source for many targets. | [F07](specs/F07-path-search.md#every-cheapest-path-from-both-ends-2026-10-31) | S–M |
+| NEW-ITEM-2 | **Weighted cycle spurs from both ends.** Yen's weighted spur searches that close a cycle through the source still run Dijkstra's algorithm from one end. Give the search from both ends of item 277 Yen's banned nodes and edges and use it for these spurs. | [F07](specs/F07-path-search.md#every-cheapest-path-from-both-ends-2026-10-31) | S |
 
 | 285 | **Explain intensional query result cells.** Offer a Why? action on a result row when the query's triple pattern was intensional, carrying the row bindings into the existing explanation panel. | [F18](specs/F18-explanations-and-entailment-diffs.md#outcome) | S–M |
 | 286 | **Why-not explanations for unbound query patterns.** Extend target patterns beyond a ground triple so `why_empty` can explain a failing intensional pattern with unbound variables, without inventing constant values. | [F18](specs/F18-explanations-and-entailment-diffs.md#outcome) | M |
@@ -606,6 +607,7 @@ linked spec Outcome records how they landed.
 - **111.** Spatial serial commits at 10.5M, which take the ordinary path in both settings and met their gates on forge. The admission cost remains under item 448. [X09](specs/X09-group-commit-by-default.md#phase-4)
 - **112.** Fence cost of group commit on indexed datasets, traced to two device flushes per fence. The write-through fence remains under item 446. [X09](specs/X09-group-commit-by-default.md#phase-4)
 - **171.** The spatial mixed cell at 1.05M, calibrated for the drive's slow state. [X09](specs/X09-group-commit-by-default.md#phase-4)
+- **277.** Weighted `path:allShortest` of one pair and the cheapest weighted cycles through a node from both ends, with ties decided on exact sums. [F07](specs/F07-path-search.md#every-cheapest-path-from-both-ends-2026-10-31)
 - **5.** Correctness fixes in path search, change logs and Fuseki endpoints. [F07](specs/F07-path-search.md#roadmap-follow-ups-2026-10-12), [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12), [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12)
 - **10.** Vector index maintenance. [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12)
 - **11.** Time slider. [U01](specs/U01-time-slider.md)
