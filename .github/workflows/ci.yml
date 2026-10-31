@@ -335,17 +335,23 @@ jobs:
       # get it next to the archive. The Jena clients job gets the server binary alone.
       - name: Disk space before test archive
         run: df -h "$GITHUB_WORKSPACE"
+      # One managed-target lease (scripts/cargo-sparkles-task) covers both archive commands
+      # and the copy of the server binary. Without it Boxington collects the target after
+      # the first command, and the second rebuilds the workspace.
       - name: Build the test archives
         run: |
           mkdir -p "$RUNNER_TEMP/archive" "$RUNNER_TEMP/heavy" "$RUNNER_TEMP/server"
-          mbx nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
+          # shellcheck disable=SC2016 # the inner shell expands the variables
+          PATH="$PWD/scripts:$PATH" mbx sparkles-task -- bash -euo pipefail -c '
+            mbx nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
+            mbx nextest archive --locked --workspace -E "$HEAVY_1 | $HEAVY_2" --zstd-level 3 \
+              --archive-file "$RUNNER_TEMP/heavy/tests.tar.zst"
+            tar --zstd -cf "$RUNNER_TEMP/server/sparkles.tar.zst" target/debug/sparkles
+          '
           zstd -q -d -c "$RUNNER_TEMP/raw.tar.zst" | zstd -q -1 -T0 --long=27 -o "$RUNNER_TEMP/archive/tests.tar.zst"
           rm "$RUNNER_TEMP/raw.tar.zst"
-          mbx nextest archive --locked --workspace -E "$HEAVY_1 | $HEAVY_2" --zstd-level 3 \
-            --archive-file "$RUNNER_TEMP/heavy/tests.tar.zst"
           tar -cf "$RUNNER_TEMP/archive/ui-build.tar" ui/build
           cp "$RUNNER_TEMP/archive/ui-build.tar" "$RUNNER_TEMP/heavy/"
-          tar --zstd -cf "$RUNNER_TEMP/server/sparkles.tar.zst" target/debug/sparkles
           ls -l "$RUNNER_TEMP"/archive/* "$RUNNER_TEMP"/heavy/* "$RUNNER_TEMP"/server/*
       - name: Disk space after test archive
         if: ${{ always() }}
