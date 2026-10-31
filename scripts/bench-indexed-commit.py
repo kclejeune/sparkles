@@ -817,7 +817,7 @@ class Server:
             "taskset",
             "-c",
             args.server_cpus,
-            args.binary,
+            getattr(args, "server_binary", None) or args.binary,
             "--result-cache-mb",
             "0",
         ]
@@ -1393,6 +1393,8 @@ def _measure(
     store = directory / "store"
     shutil.copytree(cell / "seed", store)
     save(directory / "clone-sync.json", flush_owned_tree(store))
+    writes = getattr(args, "drive_probe", 0)
+    probe = drive_probe(directory, writes) if writes else None
     server = Server(args, store, directory, grouped)
     stop = threading.Event()
     samples, errors, futures, memory = [], [], [], []
@@ -1546,6 +1548,13 @@ def _measure(
             assert admitted > 0, "four-writer run admitted no grouped commits"
         result["grouped_admissions"] = admitted
         result["internal_embed_commits"] = internal
+        syncs = delta.get("sparkles_commit_sync_seconds_count", 0)
+        result["sync_mean_ms"] = (
+            delta.get("sparkles_commit_sync_seconds_sum", 0) * 1000 / syncs
+            if syncs
+            else None
+        )
+        result["drive_probe"] = probe
         # The exact generated subject namespace gives an independent data oracle.
         expected = changes + (args.warmup if scenario.startswith("serial-") else 0)
         if scenario == "serial-delete":
@@ -1670,6 +1679,64 @@ def _measure(
         shutil.rmtree(store)
 
 
+def slow_state_capacity(tps, sync_mean_ms, slow_sync_ms):
+    """Transactions/s of an ordinary writer whose commits take `slow_sync_ms` to sync.
+
+    Ordinary commits are synchronized one after the other, so a process's time per
+    commit is its mean synchronization time plus the rest of the commit. Replacing the
+    measured mean by the drive's slow-state synchronization time gives the rate the
+    same process sustains while the drive stays in that state. A process measured in the
+    slow state keeps its own rate.
+    """
+    assert tps > 0 and sync_mean_ms >= 0 and slow_sync_ms >= 0
+    per_commit = 1000.0 / tps
+    return 1000.0 / (per_commit - sync_mean_ms + max(sync_mean_ms, slow_sync_ms))
+
+
+def drive_probe(directory, writes):
+    """Time `writes` 4 KiB write-through writes and as many writes with fdatasync.
+
+    The drive's flush time moves between a fast and a slow state that lasts for
+    minutes, so each process records the state it started in. The probe file lies in
+    the process's directory on the store's device and is removed afterwards.
+    """
+    import mmap
+
+    path = directory / "drive-probe.bin"
+    block = mmap.mmap(-1, 4096)
+    block.write(b"p" * 4096)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        for i in range(writes):
+            os.pwrite(fd, block, i * 4096)
+        os.fsync(fd)
+        buffered = []
+        for i in range(writes):
+            t = time.perf_counter()
+            os.pwrite(fd, block, i * 4096)
+            os.fdatasync(fd)
+            buffered.append((time.perf_counter() - t) * 1000)
+    finally:
+        os.close(fd)
+    fd = os.open(path, os.O_RDWR | os.O_DIRECT | os.O_DSYNC)
+    try:
+        direct = []
+        for i in range(writes):
+            t = time.perf_counter()
+            os.pwrite(fd, block, i * 4096)
+            direct.append((time.perf_counter() - t) * 1000)
+    finally:
+        os.close(fd)
+        path.unlink()
+    result = {
+        "writes": writes,
+        "direct_p50_ms": statistics.median(direct),
+        "fdatasync_p50_ms": statistics.median(buffered),
+    }
+    save(directory / "drive-probe.json", result)
+    return result
+
+
 def calibrate_mixed(args, cell, index, triples, requested_rate):
     """Discover and validate one aggregate rate with the actual indexed readers."""
     assert index in ("text", "geo")
@@ -1699,7 +1766,20 @@ def calibrate_mixed(args, cell, index, triples, requested_rate):
             )
             receipt["unpaced"].append(row)
             save(path, receipt)
-        rate = min(row["tps"] for row in receipt["unpaced"]) * args.rate_fraction
+        slowest = min(row["tps"] for row in receipt["unpaced"])
+        slow_sync = getattr(args, "slow_sync_ms", 0)
+        if slow_sync:
+            # The ordinary writer is the one bounded by the drive's flush time, and an
+            # unpaced process can average the fast and the slow state (item 171).
+            capacities = [
+                slow_state_capacity(row["tps"], row["sync_mean_ms"], slow_sync)
+                for row in receipt["unpaced"]
+                if not row["grouped"]
+            ]
+            receipt["slow_sync_ms"] = slow_sync
+            receipt["slow_state_capacity"] = capacities
+            slowest = min([slowest, *capacities])
+        rate = slowest * args.rate_fraction
         receipt["common_rate"] = rate
         save(path, receipt)
     for grouped in (False, True):
@@ -1731,6 +1811,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--provider", type=int, help=argparse.SUPPRESS)
     p.add_argument("--binary")
+    p.add_argument(
+        "--compare-binary",
+        help="A/B mode: run the grouped path of --binary (A) and of this build (B) in "
+        "ABBA blocks, judge no gate, and require --write-rate for mixed",
+    )
     p.add_argument("--write-bench")
     p.add_argument("--out")
     p.add_argument("--source-commit")
@@ -1763,6 +1848,19 @@ def main():
         default=0.8,
         help="discovered mixed rate as a fraction of the slowest unpaced calibration process",
     )
+    p.add_argument(
+        "--slow-sync-ms",
+        type=float,
+        default=0,
+        help="cap the discovered mixed rate at the ordinary writer's rate when each "
+        "commit synchronization takes this long, the drive's slow state; 0 disables",
+    )
+    p.add_argument(
+        "--drive-probe",
+        type=int,
+        default=64,
+        help="write-through and fdatasync probe writes before each process; 0 disables",
+    )
     p.add_argument("--port", type=int, default=3986)
     p.add_argument("--provider-port", type=int, default=3987)
     p.add_argument("--server-cpus", default="0-11")
@@ -1781,6 +1879,7 @@ def main():
     assert args.serial_changes > 0 and args.writer_changes > 0 and args.warmup >= 0
     assert math.isfinite(args.write_rate) and args.write_rate >= 0
     assert 0 < args.rate_fraction <= 1
+    assert args.slow_sync_ms >= 0 and args.drive_probe >= 0
     server_cpus, client_cpus, provider_cpus = map(
         cpu_set, (args.server_cpus, args.client_cpus, args.provider_cpus)
     )
@@ -1805,6 +1904,11 @@ def main():
     args.binary, args.write_bench = map(
         os.path.abspath, (args.binary, args.write_bench)
     )
+    if args.compare_binary:
+        args.compare_binary = os.path.abspath(args.compare_binary)
+        assert "mixed" not in args.scenarios or args.write_rate, (
+            "an A/B of mixed loads needs a fixed --write-rate"
+        )
     root = pathlib.Path(args.out).resolve()
     root.mkdir(parents=True, exist_ok=False)
     save(
@@ -1812,6 +1916,9 @@ def main():
         {
             "settings": vars(args),
             "binary_sha256": digest(args.binary),
+            "compare_binary_sha256": digest(args.compare_binary)
+            if args.compare_binary
+            else None,
             "client_sha256": digest(args.write_bench),
             "harness_sha256": digest(__file__),
             "uname": os.uname()._asdict()
@@ -1845,6 +1952,23 @@ def main():
         else:
             raise RuntimeError("provider startup")
         results = []
+        # ABBA blocks: ordinary and grouped commits of one build, or with
+        # --compare-binary the grouped path of two builds
+        order = (
+            (
+                ("A", args.binary, True),
+                ("B", args.compare_binary, True),
+                ("B", args.compare_binary, True),
+                ("A", args.binary, True),
+            )
+            if args.compare_binary
+            else (
+                ("ordinary", args.binary, False),
+                ("grouped", args.binary, True),
+                ("grouped", args.binary, True),
+                ("ordinary", args.binary, False),
+            )
+        )
         for people in args.people:
             args.current_people = people
             for index in args.indexes:
@@ -1858,7 +1982,8 @@ def main():
                     for scenario in args.scenarios:
                         if index == "embed" and scenario == "mixed":
                             continue
-                        for pos, grouped in enumerate((False, True, True, False)):
+                        for pos, (variant, binary, grouped) in enumerate(order):
+                            args.server_binary = binary
                             result = measure(
                                 args,
                                 cell,
@@ -1870,11 +1995,20 @@ def main():
                                 write_rate,
                             )
                             result["block"] = block
+                            result["variant"] = variant
+                            result["binary"] = binary
                             results.append(result)
                             save(root / "results.json", results)
-                            if pos == 3:
+                            if pos == 3 and not args.compare_binary:
                                 save(root / "gate-summary.json", summarize(results))
                             print(json.dumps(result), flush=True)
+        if args.compare_binary:
+            # an A/B of two builds on the grouped path judges no gate
+            save(
+                root / "completed.json",
+                {"finished_unix": time.time(), "processes": len(results)},
+            )
+            return
         summary = summarize(results)
         save(root / "gate-summary.json", summary)
         save(

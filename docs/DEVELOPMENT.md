@@ -611,7 +611,13 @@ checks the harness and estimates the runtime.
 | Memory | It resets the server's Linux high-water mark before the client starts and reads it after the client exits, and it samples resident memory with wall timestamps. The reported peak is the larger of the kernel bound and the samples taken within the writer interval. The memory comparison uses the grouped writer's outer bound minus the ordinary writer's sampled lower bound, and a run without interval samples fails. A disposable child first checks that the kernel can reset the peak, and a failed reset stops the measurement. |
 | Reader latency | Readers started during the writes keep their full latency, and a timeout fails the observation. |
 | Load quality | Each mixed process must reach its offered write rate within five percent, with a maximum schedule lag of 50 ms or two client periods, whichever is longer. Lag is measured at each request's start, after connection readiness. |
-| Offered rate | Without a supplied rate, an unpaced calibration block chooses 80 percent of the slowest writer throughput. The rate is validated on both alternatives before the acceptance processes start and stays fixed for the matrix. Calibration results never enter acceptance summaries. |
+| Offered rate | Without a supplied rate, an unpaced calibration block chooses 80 percent of the slowest writer throughput. With `--slow-sync-ms`, the slowest throughput is capped at the rate each ordinary calibration process would sustain if every commit synchronization took that long, which is the drive's slow state. The rate is validated on both alternatives before the acceptance processes start and stays fixed for the matrix. Calibration results never enter acceptance summaries. |
+| Drive state | Before each process starts its server, a probe times 64 write-through writes of 4 KiB and 64 writes with `fdatasync` on the store's device, and the result records both medians. `--drive-probe 0` turns the probe off. |
+
+With `--compare-binary`, the harness runs the grouped path of `--binary` and of the
+other build in A, B, B, A blocks instead of the two commit paths of one build, and
+judges no gate. Such an A/B of mixed loads needs a fixed `--write-rate`. Each result
+names its variant and binary.
 
 Writer latency is the client's HTTP request and response interval, so it does not
 isolate engine execution or storage synchronization. Latencies, elapsed times and

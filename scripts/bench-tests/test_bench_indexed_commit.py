@@ -1007,6 +1007,58 @@ class Oracles(unittest.TestCase):
             self.assertEqual(receipt["rate_fraction"], 0.6)
             self.assertAlmostEqual(receipt["common_rate"], 420.0)
 
+    def test_slow_state_caps_the_rate_at_the_ordinary_writers_slow_capacity(self):
+        # An ordinary process that averaged a fast drive: 972 tx/s with a mean
+        # synchronization of 0.6 ms runs at 1000 / (1.029 - 0.6 + 1.3) tx/s in the
+        # slow state, below the fraction of the slowest unpaced process.
+        self.assertAlmostEqual(
+            BENCH.slow_state_capacity(972.0, 0.6, 1.3), 1000 / (1000 / 972 + 0.7)
+        )
+        # a process measured in the slow state keeps its rate
+        self.assertAlmostEqual(BENCH.slow_state_capacity(570.0, 1.5, 1.3), 570.0)
+        discovery = iter(((972.0, 0.6), (1400.0, 1.0), (1300.0, 1.0), (1000.0, 1.3)))
+
+        def process(
+            args, cell, index, scenario, grouped, triples, run_id, rate, *, calibration
+        ):
+            tps, sync = next(discovery) if not rate else (rate, 1.0)
+            row = {
+                "calibration": True,
+                "scenario": scenario,
+                "grouped": grouped,
+                "write_rate": rate,
+                "tps": tps,
+                "sync_mean_ms": sync,
+                "max_schedule_lag_ms": 10 if rate else 0,
+                "reopen": "passed",
+            }
+            row["mixed_load_checks"] = BENCH.mixed_load_checks(row) if rate else None
+            return row
+
+        with tempfile.TemporaryDirectory(prefix="sparkles-slow-state-") as temp:
+            root = pathlib.Path(temp)
+            args = SimpleNamespace(rate_fraction=0.8, slow_sync_ms=1.3)
+            with mock.patch.object(BENCH, "measure", side_effect=process):
+                rate = BENCH.calibrate_mixed(args, root, "geo", 10, 0)
+            slow = BENCH.slow_state_capacity(972.0, 0.6, 1.3)
+            self.assertAlmostEqual(rate, slow * 0.8)
+            receipt = json.loads((root / "rate-calibration.json").read_text())
+            self.assertEqual(receipt["slow_sync_ms"], 1.3)
+            self.assertEqual(len(receipt["slow_state_capacity"]), 2)
+
+    def test_drive_probe_records_both_primitives_and_removes_its_file(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-probe-", dir=".") as temp:
+            root = pathlib.Path(temp)
+            try:
+                probe = BENCH.drive_probe(root, 4)
+            except OSError as error:
+                self.skipTest(f"no direct I/O here: {error}")
+            self.assertEqual(probe["writes"], 4)
+            self.assertGreater(probe["direct_p50_ms"], 0)
+            self.assertGreater(probe["fdatasync_p50_ms"], 0)
+            self.assertFalse((root / "drive-probe.bin").exists())
+            self.assertEqual(json.loads((root / "drive-probe.json").read_text()), probe)
+
     def test_failed_common_rate_preserves_both_alternatives_without_retry(self):
         rates = []
 
