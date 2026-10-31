@@ -50,7 +50,7 @@ mod inline;
 pub(crate) use sparkles::jena_formats;
 mod gsp_csv;
 #[cfg(feature = "fmt")]
-mod lint;
+pub(crate) mod lint;
 mod live;
 mod mappings;
 mod patch;

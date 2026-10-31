@@ -24,6 +24,8 @@ pub(crate) mod explain;
 mod format;
 #[cfg(feature = "graphql")]
 mod graphql;
+#[cfg(feature = "fmt")]
+mod lint;
 #[cfg(feature = "graphql")]
 use graphql::graphql_on;
 

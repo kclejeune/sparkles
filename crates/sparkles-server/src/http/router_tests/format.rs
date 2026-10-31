@@ -463,11 +463,16 @@ async fn lints_json_bodies() {
     let r = post_json(
         &app,
         "/$/lint",
-        json!({ "text": "<a> <b> <c> .", "language": "ntriples" }),
+        json!({ "text": "<a> <b> <c> .", "language": "rdfxml" }),
     )
     .await;
-    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert_eq!(r.json()["code"], "unsupported-language");
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(
+        r.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown language")
+    );
     let r = post_json(
         &app,
         "/$/lint",

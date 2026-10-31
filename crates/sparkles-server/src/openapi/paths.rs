@@ -2763,8 +2763,8 @@ fn format_and_mcp(p: &mut Paths) {
             .errors(&[400, 408, 413, 415, 422]),
     );
     p.add(
-        op(POST, "/$/lint", "lint", "Formatting", "Lint SPARQL, Turtle or TriG")
-            .doc("Lints a SPARQL query or update, or a Turtle or TriG document, with the rules of `sparkles lint`. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.")
+        op(POST, "/$/lint", "lint", "Formatting", "Lint SPARQL or RDF")
+            .doc("Lints a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACLC document, with the rules of `sparkles lint`. The SPARQL in `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals is linted too. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.")
             .see("linting")
             .body(
                 true,

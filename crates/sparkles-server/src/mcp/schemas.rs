@@ -48,6 +48,7 @@ pub fn all_tools() -> Vec<&'static str> {
     }
     if cfg!(feature = "fmt") {
         v.push("format");
+        v.push("lint");
     }
     if cfg!(feature = "graphql") {
         v.push("graphql_query");
@@ -812,6 +813,36 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "warnings":{"type":"array","items":{"type":"object","required":["code","message","line","column"],"properties":{
                     "code":{"type":"string"},"message":{"type":"string"},
                     "line":{"type":"integer"},"column":{"type":"integer"}}}}}})),
+        ),
+        read(
+            "lint",
+            "Lint SPARQL or RDF",
+            "Lint a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACL Compact Syntax (SHACLC) with the rules of `sparkles lint`, including the SPARQL inside sh:select, sh:ask, sh:construct and sh:update literals. Returns each finding with its rule, severity, message and range (lines and columns, and UTF-16 offsets from and to), the counts by severity, and with fix true the fixed text, whose findings are the ones returned. A syntax error is a finding. Reads no dataset and writes nothing.",
+            json!({"type":"object","additionalProperties":false,"required":["text"],"properties":{
+                "text": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"The document to lint"},
+                "language": {"enum":["sparql","turtle","trig","ntriples","nquads","jsonld","shaclc"],"description":"Detected from the text when left out (N-Triples reads as Turtle)"},
+                "options": {"type":"object","description":"Rule levels, as in the [lint] table of .sparklesfmt.toml but with camelCase rule names such as unusedPrefix: each value is error, warning, info, hint or off. Syntax errors cannot be turned off","additionalProperties":{"enum":["error","warning","info","hint","off"]}},
+                "fix": {"type":"boolean","default":false,"description":"Also apply the safe fixes and return the fixed text and the number of fixes applied"},
+                "timeoutSeconds": to(cfg)}}),
+            Some(json!({"type":"object","required":["language","diagnostics","total","counts"],"properties":{
+                "language":{"enum":["sparql","turtle","trig","ntriples","nquads","jsonld","shaclc"]},
+                "diagnostics":{"type":"array","items":{"type":"object","required":["rule","severity","message","line","column","endLine","endColumn","from","to"],"properties":{
+                    "rule":{"type":"string"},
+                    "severity":{"enum":["error","warning","info","hint"]},
+                    "message":{"type":"string"},
+                    "line":{"type":"integer"},"column":{"type":"integer"},
+                    "endLine":{"type":"integer"},"endColumn":{"type":"integer"},
+                    "from":{"type":"integer"},"to":{"type":"integer"},
+                    "fix":{"type":"object","required":["title","edits"],"properties":{
+                        "title":{"type":"string"},
+                        "edits":{"type":"array","items":{"type":"object","required":["from","to","insert"],"properties":{
+                            "from":{"type":"integer"},"to":{"type":"integer"},"insert":{"type":"string"}}}}}}}}},
+                "total":{"type":"integer","description":"The number of findings, which can be more than diagnostics lists"},
+                "truncated":{"type":"boolean","description":"Some findings were left out to fit maxBytes"},
+                "counts":{"type":"object","required":["error","warning","info","hint"],"properties":{
+                    "error":{"type":"integer"},"warning":{"type":"integer"},"info":{"type":"integer"},"hint":{"type":"integer"}}},
+                "fixed":{"type":"string","description":"With fix: the document with the safe fixes applied"},
+                "applied":{"type":"integer","description":"With fix: the number of fixes applied"}}})),
         ),
         read(
             "graphql_query",

@@ -158,6 +158,8 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "validate_shex" => t.validate_shex(args),
         #[cfg(feature = "fmt")]
         "format" => t.format(args),
+        #[cfg(feature = "fmt")]
+        "lint" => t.lint(args),
         #[cfg(feature = "graphql")]
         "graphql_query" => t.graphql_query(args),
         "check_query" => t.check_query(args),
