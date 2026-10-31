@@ -24,6 +24,15 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+An OPTIONAL whose right side is a triple pattern reads it only for the distinct keys of
+an evaluated left side when its cost model says probing is cheaper (`probed_optional`).
+A FILTER comparison of a column with numeric, `xsd:date` or `xsd:dateTime` constants
+decides most rows on their ids (part of `range_pushdown`). An ORDER BY key equal to a
+BIND or SELECT expression orders by its variable (`bound_order_keys`). On forge at 10M,
+BSBM Explore `q7` and `q8` now take 3.8 ms instead of 5.2 and 5.8 ms, ahead of
+Oxigraph, and BI `q3` takes 31.5 ms instead of 41.4 ms. A recheck of SP²Bench `q11`
+at 10M on forge measured 3.46 ms against QLever's 43.56 ms, so it leaves the loss list.
+
 Change feeds, live queries and long polls end with `access-changed` when the session
 or token they were opened with expires, including a session's idle timeout. OIDC
 sign-ins decide admission and the session lifetime under the policy current after the

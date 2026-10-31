@@ -7,13 +7,13 @@ qualifications are preserved, and are not regenerated from the JSON records. Rea
 ## Comparison summary
 
 In the 10M Explore comparison, the paired `q5` pooled median is 4.65 ms against
-  Fluree's 5.59 ms, with the closest instance within 4%. Oxigraph is faster on q7 and
-  q8. Fluree's driver throughput is two to three times Sparkles' in both
+  Fluree's 5.59 ms, with the closest instance within 4%. The paired `q7` and `q8`
+  medians are 3.78 and 3.75 ms against Oxigraph's 4.09 and 3.96 ms. Fluree's driver throughput is two to three times Sparkles' in both
   mixes, but it is not ranked because its q8, q11 and q12 answers differ.
 
 In the 10M BI comparison, every engine's q4 and q5 averages pass an exact oracle
   within float rounding. The paired `q2` median is 20.54 ms against QLever's 162.30 ms.
-  QLever remains 1.24× faster on q3. No engine completes a driver throughput run with
+  QLever remains 1.09× faster on q3 in the paired forge run. No engine completes a driver throughput run with
   answers qualified against the others.
 
 ## BSBM
@@ -36,8 +36,8 @@ marks an unresolved answer disagreement, whose latency is not ranked.
 | q3 | **4.02** | 8.22 | 12.64 | 4.53 | 4.79 |
 | q4 | **4.11** | 8.23 | 25.43 | 5.25 | 5.65 |
 | q5 | **4.65** | 629.44 | 20.26 | 5.59 | 42.65 |
-| q7 | 5.27 | 7.23 | 90.64 | 5.07 | **4.51** |
-| q8 | 5.97 | 7.26 | 50.76 | 4.29 † | **4.13** |
+| q7 | **3.78** | 7.23 | 90.64 | 5.07 | 4.09 |
+| q8 | **3.75** | 7.26 | 50.76 | 4.29 † | 3.96 |
 | q9, unranked | 3.46 | 6.61 | 6.24 | 3.61 | 3.67 |
 | q10 | **4.12** | 6.98 | 139.03 | 5.55 | 4.35 |
 | q11 | **3.41** | 6.63 | 6.13 | 3.56 † | 3.54 |
@@ -45,7 +45,10 @@ marks an unresolved answer disagreement, whose latency is not ranked.
 
 *The paired `q5` cells for Sparkles, QLever and Fluree come from the
 [query record](../2026-10-25-competitive-query-pairs-forge.json), with Sparkles
-at `2ec8a266`. The [Explore record](../2026-10-23-bsbm-10m-explore-forge.json)
+at `2ec8a266`. The paired `q7` and `q8` cells for Sparkles and Oxigraph come from the
+first pass of the [Wave A run](runs/2026-10-31-wave-a-forge/README.md), with Sparkles
+at `47bec6f2`, and pool ninety samples after ten warm-ups per instance. The
+[Explore record](../2026-10-23-bsbm-10m-explore-forge.json)
 keeps the other cells, measured with Sparkles at `6699f27d`, and the driver status.*
 
 Direct checks against the generated triples independently confirm Sparkles' answers to
@@ -54,8 +57,12 @@ product offers and CONSTRUCT triples without a SPARQL engine. Fluree's retained 
 fingerprints differ on those nine instances. QLever differs on q12. The
 q9 row is a DESCRIBE whose answers are not compared, so it is not ranked.
 Sparkles has the lower pooled q5 median in both paired passes. The closest instance
-takes a mean of 4.58 ms against Fluree's 4.76 ms, within 4%. Oxigraph was fastest on
-q7, 1.17 times faster, and on q8, 1.45 times.
+takes a mean of 4.58 ms against Fluree's 4.76 ms, within 4%. Sparkles also has the
+lower pooled q7 and q8 medians in both paired passes against Oxigraph. The second pass
+gives 3.83 and 3.63 ms against 4.03 and 3.93 ms, and all six instances return the same
+answers from both engines. Before the probed OPTIONAL and the comparisons decided on
+ids, the same forge pairing gave Sparkles `d65eaf40` 5.21 and 5.79 ms against 4.11 and
+3.91 ms.
 
 The driver ran fifty warm-up mixes and five hundred measured mixes with each
 client count. The standard mix includes DESCRIBE and CONSTRUCT, which the driver
@@ -108,7 +115,7 @@ the run.
 |---|---:|---:|---:|---:|---:|
 | q1 | **13.59** | 3,241.71 | 52.51 | 155.26 | 2,077.28 |
 | q2 | **20.54** | 3,562.21 | 162.30 | 22.50 † | 32,569.39 |
-| q3 | 35.18 | 1,733.90 | **28.45** | 287.78 † | 3,287.87 |
+| q3 | 31.49 | 1,733.90 | **28.95** | 287.78 † | 3,287.87 |
 | q4 | **152.80** | 8,452.57 | 1,848.57 | 162.22 | 6,868.73 |
 | q5 | **27.32** | 198.17 | 98.63 | 693.70 | 138.93 |
 | q6 | **16.50** | 23.72 | 67.88 | 338.27 | 28.77 |
@@ -117,7 +124,10 @@ the run.
 
 *The paired `q2` cells for Sparkles, QLever and Fluree come from the
 [query record](../2026-10-25-competitive-query-pairs-forge.json), with Sparkles
-at `2ec8a266`. The [BI record](../2026-10-23-bsbm-10m-bi-forge.json) preserves
+at `2ec8a266`. The paired `q3` cells for Sparkles and QLever come from the first pass
+of the [Wave A run](runs/2026-10-31-wave-a-forge/README.md), with Sparkles at
+`47bec6f2`, and pool ninety samples after ten warm-ups per instance. The
+[BI record](../2026-10-23-bsbm-10m-bi-forge.json) preserves
 the other cells, measured with Sparkles at `6699f27d`, including failures.*
 
 The answer checks compare raw answers captured on atlas, where each engine served the same
@@ -149,7 +159,13 @@ differs from that independently verified result, and remains unranked.
 Fluree's q3 and q8 answers and two QLever q8 answers remain unresolved fingerprint
 disagreements. The q3 and q8 exclusions have no independent data oracle. Sparkles has
 the lowest median on q1, q2 and q4 to q8. Its q4 lead over Fluree is within 10%.
-QLever remains 1.24 times faster on q3, where its answers agree with Sparkles'. Its two
+QLever remains 1.09 times faster on q3, where its answers agree with Sparkles'. The
+second paired pass gives 33.03 ms against 29.46 ms, 1.12 times, and Sparkles `d65eaf40`
+took 41.40 ms against 31.09 ms. Sparkles leads on the first and third instances and
+trails on the second. Its q3 time depends on the size of the query thread pool on the
+hybrid cores of forge, where twelve threads give 22.65 ms and the default of twenty
+gives 34.37 ms, as the [Wave A run](runs/2026-10-31-wave-a-forge/README.md#thread-pool-size)
+records. Its two
 q8 instances whose answers differ from the majority carry a dagger.
 
 The driver uses generated parameters beyond the three fixed instances. It requested

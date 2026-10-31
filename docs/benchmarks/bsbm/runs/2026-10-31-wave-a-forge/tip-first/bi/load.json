@@ -1,0 +1,37 @@
+{
+ "results": [
+  {
+   "command": "oxigraph",
+   "mean": 24.2471,
+   "stddev": 0.0,
+   "times": [
+    24.2471
+   ],
+   "exit_codes": [
+    0
+   ]
+  },
+  {
+   "command": "sparkles",
+   "mean": 5.76212,
+   "stddev": 0.0,
+   "times": [
+    5.76212
+   ],
+   "exit_codes": [
+    0
+   ]
+  },
+  {
+   "command": "qlever",
+   "mean": 10.7159,
+   "stddev": 0.0,
+   "times": [
+    10.7159
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}

@@ -228,6 +228,18 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   range, found by binary search with the ordinary comparison. Doubles and vocabulary
   literals are read and tested. Booleans, dates and blank nodes are skipped. The planner
   costs the scan from an exact count of the rows in those ranges (`IndexRangeScan`).
+* **Comparisons decided on ids** (part of `range_pushdown`). A FILTER that compares one
+  variable with numeric, `xsd:date` or `xsd:dateTime` constants, over a table that a
+  range scan cannot read, first classifies the ids of the variable's column. Numbers use
+  the id ranges of the numeric range scan. Inline dates and dateTimes sort by their local
+  calendar fields, and a value whose local day lies three days or more from a constant's
+  day is earlier or later in every timezone, because timezones span 14 hours on either
+  side. Inline values of other kinds cannot compare with the constant and fail. Values
+  in the vocabulary, computed values and inline values near a constant are evaluated as
+  before, once per distinct value where the expression cache admits them. The id range
+  of an integer or decimal segment is searched when an id of the segment first occurs.
+  With ORDER BY keys from BIND, BSBM BI `q3` at 10M takes 31.5 ms instead of 41.4 ms on
+  forge. EXPLAIN notes `[decided on ids: … for N of M rows]`.
 * **Top-k heap** (`topk_heap`). `ORDER BY … LIMIT k` (with or without OFFSET) keeps the
   best k rows in a bounded heap. Each key is classified once, so most comparisons are
   of exact decimals, doubles or strings, and the remaining pairs go to the ordinary
@@ -242,6 +254,12 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   come before it. The later keys, often IRIs or strings that must be decoded, are
   evaluated only for the rows that remain. EXPLAIN notes `[first-key prefilter kept N
   rows]`.
+* **ORDER BY keys from BIND** (`bound_order_keys`). An ORDER BY key equal to the
+  expression of a BIND or SELECT expression directly below it orders by that
+  expression's variable, so `SELECT (?a / ?b AS ?r) … ORDER BY DESC(?a / ?b)` evaluates
+  the division once per row. The variable is unbound where the expression is an error,
+  and both order first. Expressions with `RAND`, `UUID`, `STRUUID`, `BNODE`, `EXISTS` or
+  a function outside SPARQL and the XSD casts are evaluated again.
 * **Ordered-scan top-k.** `ORDER BY ?v LIMIT k` (with or without OFFSET) over one triple
   pattern and its FILTERs reads the pattern in `?v` order and stops once the first k rows
   are proven (`IndexTopK`). The scan switches to a permutation sorted on `?v`. Inline
@@ -311,6 +329,15 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   is kept alone. At 10.5M triples, `optional-count` runs in 6 ms instead of 15 ms on a
   warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
   puts the unmatched left rows last.
+* **Probed OPTIONAL** (`probed_optional`). An OPTIONAL whose right side is a triple
+  pattern, with its FILTERs, sorted on a variable that every row of the evaluated left
+  side binds reads the pattern only for the left side's distinct values. It uses the
+  index join's reader and cost model and runs when probing those keys costs less than
+  reading the pattern. The pattern's other rows match no left row, so the result is
+  unchanged, and the merge or hash join then runs on the rows read. EXPLAIN notes
+  `[probed for the left side's keys: N keys, … rows read]` on the pattern. BSBM
+  Explore `q7` and `q8` at 10M take 3.8 ms instead of 5.2 and 5.8 ms on forge. Eager
+  execution runs it. A streamed OPTIONAL reads its right side as before.
 * Groups linked only by a FILTER equality use a keyed inner join when `keyed_join` is
   enabled. The keys propose candidate pairs and the full FILTER still decides which
   pairs pass. An eager LIMIT bounds the larger input in growing prefixes. A large ASK
