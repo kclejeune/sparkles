@@ -57,6 +57,14 @@ pub enum OnFailure {
     Reject,
 }
 
+fn on_failure_is_default(v: &Option<OnFailure>) -> bool {
+    v.is_none_or(|f| f == OnFailure::Suspend)
+}
+
+fn declassify_is_default(v: &Option<bool>) -> bool {
+    v.is_none_or(|d| !d)
+}
+
 fn main_branch() -> Vec<String> {
     vec!["main".into()]
 }
@@ -94,12 +102,14 @@ pub struct ViewDef {
     pub memory_bytes: u64,
     #[serde(default)]
     pub keep_commits: u64,
-    /// what a failed pass at commit does (Phase 2, `view.json` format 3)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// what a failed pass at commit does (Phase 2, `view.json` format 3). The default,
+    /// `suspend`, is not written, so a format 1 file stays readable by releases that
+    /// do not know the member.
+    #[serde(default, skip_serializing_if = "on_failure_is_default")]
     pub on_failure: Option<OnFailure>,
     /// whether a `graph` view's output is released to whoever reads its graph (Phase
-    /// 2, `view.json` format 3)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 2, `view.json` format 3). `false` is not written, as for `onFailure`.
+    #[serde(default, skip_serializing_if = "declassify_is_default")]
     pub declassify: Option<bool>,
 }
 

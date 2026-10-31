@@ -36,7 +36,8 @@ load and on every attach, and such a view is listed as failed with `unsupported-
 until it is defined again. The other views of the dataset open and run as before.
 A view definition may now name `onFailure` and `declassify`, the members that spec F13
 adds for commit-time and graph views. Their defaults, `suspend` and `false`, run as
-before, and other values are refused with `unsupported-option`. A stored `view.json` of
+before and are not written to `view.json`, and other values are refused with
+`unsupported-option`. A stored `view.json` of
 format 1 with such a member used to make every view of the dataset unreadable and now
 marks only that view failed.
 

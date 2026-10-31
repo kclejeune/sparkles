@@ -1746,6 +1746,33 @@ fn later_members_in_format_1_fail_only_their_view() {
             other => panic!("{name}: {other:?}"),
         }
     }
+    // a definition that names the defaults is written without them, so a release that
+    // reads only the Phase 1 members still reads the file
+    let def: ViewDef = serde_json::from_value(
+        serde_json::json!({"query": query, "onFailure": "suspend", "declassify": false}),
+    )
+    .unwrap();
+    rt.put(&s, "explicit-defaults", def).unwrap();
+    let written: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("views/explicit-defaults/view.json")).unwrap(),
+    )
+    .unwrap();
+    const PHASE_1: &[&str] = &[
+        "format",
+        "query",
+        "storedQuery",
+        "mode",
+        "graph",
+        "principal",
+        "provenance",
+        "maintenance",
+        "branches",
+        "memoryBytes",
+        "keepCommits",
+    ];
+    for k in written.as_object().unwrap().keys() {
+        assert!(PHASE_1.contains(&k.as_str()), "{k} is written: {written}");
+    }
     // a definition with the member is refused, and one without it replaces the file
     let def: ViewDef =
         serde_json::from_value(serde_json::json!({"query": query, "declassify": true})).unwrap();

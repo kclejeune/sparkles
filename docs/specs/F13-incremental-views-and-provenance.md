@@ -1022,7 +1022,9 @@ that holds an option a later phase adds, such as `mode: graph`, a `graph` name,
 runs. Such a file can come from a hand edit or from a release that supports the option
 at the same format. `onFailure` and `declassify` are part of the definition schema, so a
 file that names them fails only its own view and does not make the whole set
-unreadable. Their defaults, `suspend` and `false`, mean what Phase 1 does and run. The
+unreadable. Their defaults, `suspend` and `false`, mean what Phase 1 does and run, and they are
+not written to `view.json`, so a release that reads only the Phase 1 members still
+reads the file. The
 other views of the dataset attach and run, and defining the view again replaces the
 file. A `view.json` of a format this release does not know, such as format 3, still
 refuses changes to every view, so that a newer release's definitions are never
