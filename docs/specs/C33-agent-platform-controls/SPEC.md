@@ -11,8 +11,10 @@ The design covers mCP tool profiles, shape templates, an approval queue for agen
 ## Problem and goal
 
 The MCP server exposes about 34 tools from one schema to every session, which costs
-tokens and confuses small models. Only `assert_facts` has a review path, agents poll for
-changes, and agent frameworks that do not speak MCP cannot use the memory tools.
+tokens and confuses small models. Only `assert_facts` has a review path, and agents poll
+for changes. Agent frameworks that do not speak MCP reach the memory tools only through
+the generic HTTP routes, such as `POST /{ds}/recall` and `POST /{ds}/facts`, because no
+adapter fits them into those frameworks' abstractions.
 
 The goal is a set of controls and adapters that let agents use Sparkles safely and
 cheaply from the hosts and frameworks they run in.
