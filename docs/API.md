@@ -3602,8 +3602,10 @@ the request fails with `413`. That limit counts bytes after HTTP decompression. 
 default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
 means unlimited. `--max-decompressed-mb` caps the RDF sources separately as they are
 parsed, both files compressed inside the body and plain RDF. A body in RDF Thrift, RDF
-Protobuf, RDF/JSON or TriX is read as it arrives, with no translated copy, and its bytes
-count against that cap as they are read, as the bytes of any other syntax do. Before each 64 MiB of a spooled body is written to the
+Protobuf, RDF/JSON or TriX is read as it arrives, with no translated copy. Its bytes count
+against that cap as they are read, and so does the size of its quads written as N-Quads,
+since a prefix or a repeated term lets a small body expand into much more. A request
+whose quads pass the cap fails with `413`. Before each 64 MiB of a spooled body is written to the
 temporary directory, the server checks that the file system keeps `--min-free-disk-mb`
 free (default 1024, `0` for no check). Otherwise the request fails with `507`.
 

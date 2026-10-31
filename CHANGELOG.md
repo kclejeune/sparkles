@@ -77,10 +77,11 @@ them from a stream or a file, and the Node.js binding accepts them in `load`, `d
 through their streaming readers, so `sparkles load`, `Dataset::load_file`, uploads, Graph
 Store writes and the Python `Dataset.load` no longer write a temporary N-Quads copy. A
 malformed RDF Thrift or RDF Protobuf body now reports how many statements were read
-before the fault. The decompressed-size cap of the server now counts the bytes of a
-Thrift, Protobuf, RDF/JSON or TriX body as it does for every other syntax, instead of the
-size of the N-Quads that the body used to be rewritten as. Loading a file in one of these
-syntaxes takes 11 to 28 percent less time and no longer needs the disk room of the copy.
+before the fault. The decompressed-size cap of the server still bounds a Thrift, Protobuf,
+RDF/JSON or TriX body by the size of its quads as N-Quads, as the rewrite did, and it
+also counts the bytes read. A body that expands through a prefix is refused with `413`.
+Loading a file in one of these syntaxes takes 11 to 28 percent less time and no longer
+needs the disk room of the copy.
 
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay

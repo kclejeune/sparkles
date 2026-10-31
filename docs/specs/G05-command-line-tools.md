@@ -526,7 +526,7 @@ SPARQL `LOAD`, and Jena's syntaxes loaded without a temporary N-Quads copy.**
     `RdfSyntax`. `RdfSyntax::from_name`, `from_extension` and `from_path` find a syntax by
     any of its names, so the bindings share one lookup.
   * `parse_source` sends a Jena syntax to one decoder on the calling thread. The decoder
-    passes batches of 4096 quads through a bounded channel to as many sinks as the loader
+    passes batches of up to 4096 quads or 1 MiB through a bounded channel to as many sinks as the loader
     has threads, so the encoding and sorting stay parallel behind a decoder that cannot
     split its input. The transaction path reads the same decoder through
     `parse_source_into`.
@@ -552,8 +552,18 @@ SPARQL `LOAD`, and Jena's syntaxes loaded without a temporary N-Quads copy.**
   Graph Store bodies wrote one past a size, and the Python `Dataset.load` wrote one.
 * **Deviations and decisions.**
   * The server's `--max-decompressed-mb` counts the bytes of a Thrift, Protobuf, RDF/JSON
-    or TriX body as the reader takes them, as it counts those of every other syntax. It
-    counted the size of the N-Quads rewrite before.
+    or TriX body as the reader takes them, and also the size of its quads as N-Quads
+    lines, which `jena_formats::nquads_len` computes with one pass over each literal. The
+    second count keeps the bound that the rewrite gave, since a Protobuf prefix or a
+    repeated term expands a body of a few kilobytes into hundreds of megabytes. It applies
+    to Graph Store writes, uploads, and SPARQL `LOAD` over HTTP with the outbound
+    response ceiling. A file `LOAD` and the CLI have no cap, as before.
+  * The decoder groups quads into batches of 4096 quads or 1 MiB of N-Quads, whichever
+    comes first, and a single larger quad is a batch of its own. The quads in flight are
+    at most three batches per loader thread and one more, so large literals cannot pile
+    up in the channel. A sink that fails stops the decoder at its next quad.
+  * A targeted upload, with `graph`, sets `Source::triples_only` as the Graph Store routes
+    do, so a named graph in one of these bodies is refused with `400`.
   * `Source::triples_only` keeps the refusal of a named graph in a TriX, RDF Thrift or RDF
     Protobuf body sent to one graph, which the rewrite as N-Triples gave. The Graph Store
     routes set it. The W3C quad syntaxes keep their graphs there, as before.
