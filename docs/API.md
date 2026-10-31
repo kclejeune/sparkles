@@ -3641,8 +3641,10 @@ each source, as do `Source.auto_buffer_bytes` in Rust and `auto_buffer_bytes` in
 Python. Zero skips the size check. The cutoff applies to each load, so concurrent loads
 can each use that much memory. Lower it or choose streaming when several loads share a
 memory budget. Plain bytes that the caller already holds in memory are parsed without a
-copy. In automatic mode, small transactional loads and Python file objects are parsed
-from a reader. `--parse-mode streaming` always uses a sequential reader, and
+copy. In automatic mode, small transactional loads are parsed from a reader. A stream
+that is read once, such as a Python file object or `SourceData::Reader` in Rust, is cut
+into bounded parallel blocks when it is N-Triples or N-Quads, whatever its compression.
+In another syntax it is read ahead up to the cutoff, as a compressed document is. `--parse-mode streaming` always uses a sequential reader, and
 `--parse-mode buffered` always reads the whole document into memory first. A buffered
 compressed input needs RAM for its full decompressed size. These modes only affect
 parsing. Transactional changes, the vocabulary, the map of blank-node labels and

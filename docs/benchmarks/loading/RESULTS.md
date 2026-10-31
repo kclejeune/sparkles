@@ -88,6 +88,32 @@ thread, so a file that is mostly decoding gains less than one that is mostly enc
 final loader also sizes each quad as an N-Quads line, to bound its batches and to hold the
 decoded quads to the decompressed-size cap, and that work is inside these times.*
 
+### Python file objects
+
+`Dataset.load` reads a Python file object once, as a stream, through the bulk loader
+and its parallel encoders. The previous binding inserted the quads of a file object one
+at a time into a transaction in automatic mode, and copied the file object to a
+temporary file first in buffered mode. The table gives the median wall time and peak RSS
+of 3 loads of a 5M-triple file into a new database, with the two builds interleaved.
+
+| Input | Before | After | Peak RSS before and after |
+|---|---:|---:|---:|
+| N-Triples file object | 22.19 s | **1.81 s** | 3,068 and 1,295 MiB |
+| N-Triples file object, buffered | 1.98 s | **1.92 s** | 1,050 and 1,255 MiB |
+| Turtle file object | 20.35 s | **6.25 s** | 3,068 and 562 MiB |
+| RDF Thrift file object | 20.98 s | **4.73 s** | 3,068 and 923 MiB |
+| N-Triples path, for reference | not measured | 2.10 s | 1,023 MiB after |
+
+*The measurements are from atlas, an Intel Core i5-13500 with 20 logical CPUs, which ran
+nothing else. The records and the scripts are in
+[`runs/2026-10-31-python-file-objects-atlas`](runs/2026-10-31-python-file-objects-atlas/README.md).
+An N-Triples stream is cut into blocks of 256 MiB that are parsed in parallel, so it
+holds about 270 MiB more than a load of the same file by its path, which maps the file
+instead. A buffered load now holds the whole stream in memory instead of a temporary file,
+which costs about 200 MiB here and writes nothing to disk. A Turtle stream larger than the
+128 MiB read-ahead is parsed by one reader, and the decoder of RDF Thrift is one thread,
+so those loads gain less than N-Triples does.*
+
 ### Index builds
 
 | Build | Time | Result |

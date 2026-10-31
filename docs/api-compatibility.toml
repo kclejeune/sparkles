@@ -1,5 +1,9 @@
 # X12 Phase 4a. This commit baseline is not a published release.
 schema_version = 1
+# The Rust surface is pending, so this inventory has no Rust entries to compare yet.
+# Reviewed Rust additions that a release comparison must accept:
+# - sparkles::io::SourceData::Reader, a new variant of an exhaustive public enum, with
+#   sparkles::io::ReaderSource and Source::from_reader (roadmap item 438, CHANGELOG).
 enforced = ["http", "cli"]
 pending = ["rust", "bindings", "mcp", "metrics", "cli-json-exit", "deprecation", "release-install"]
 

@@ -1289,3 +1289,27 @@ The [usage guide](../USAGE.md#async-datasets-and-cursors) explains configuration
 early-close behavior and cancellation. Async administration and bulk methods remain
 outside this initial surface. No artifact publication or full item 58 completion is
 included in this delivery.
+
+### File objects through the loader (item 438)
+
+`Dataset.load` hands a file object to the loader as `SourceData::Reader`, a stream that
+the loader reads once. The binding's per-quad stream into a transaction, the temporary
+copy of buffered loads and of Jena's syntaxes, and the N-Quads pipe of Jena's syntaxes
+are no longer used by `load`. An empty dataset takes the stream through the bulk loader
+with parallel encoders, and a dataset that holds data takes it in one transaction. The
+reader takes the GIL for each read of at most 64 KiB. A Python exception that `read`
+raises reaches the caller as itself. Ctrl-C sets a flag through the watcher of Python's
+signal wakeup descriptor, the reader leaves the GIL to the main thread while a signal is
+pending, and a handler that raises cancels the load. Compression detection reads the
+first bytes of the stream ahead, and automatic parsing reads at most the source's
+buffering allowance ahead. No loader path reads its source twice, so no stream is
+spilled to disk.
+
+`tests/test_file_object_loads.py` loads binary and text file objects in Turtle,
+N-Triples, N-Quads, TriG, RDF/XML, JSON-LD, RDF Thrift and RDF Protobuf in every parse
+mode. It also covers sniffed compression, exceptions from `read`, Ctrl-C, signals whose
+handlers return, and loads in a child process whose `TMPDIR` does not exist. Against the
+previous binding, the tests of exceptions in RDF Thrift and of the missing `TMPDIR`
+failed. A load of a 5M-triple N-Triples file object took 1.81 s
+instead of 22.19 s on atlas, as the
+[loading results](../benchmarks/loading/RESULTS.md#python-file-objects) record.

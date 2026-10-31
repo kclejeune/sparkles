@@ -74,7 +74,9 @@ removal of source bytes required by a durable consumer.
   and later on Linux and macOS ([USAGE.md](../USAGE.md#python),
   [P01](../specs/P01-python-bindings.md)). It covers datasets, loads, SPARQL, transactions,
   history, search indexes, reasoning and validation, and has an rdflib store plugin and
-  the query builder. Calls release the GIL, and Ctrl-C stops a running query.
+  the query builder. Calls release the GIL, and Ctrl-C stops a running query. A load
+  from a file object streams it to the bulk loader once, with no temporary copy, and
+  Ctrl-C stops it too.
   `sparkles.aio` provides async queries, bounded cursors and transactions, with owned
   cancellation and explicit async cleanup.
 * `sparkles-jena` is a Jena `DatasetGraph` backed by Sparkles for JVM programs

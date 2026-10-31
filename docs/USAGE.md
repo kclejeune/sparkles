@@ -5945,11 +5945,9 @@ variable, and `row.get("name", default)` returns the default instead.
 (`RDF_THRIFT`), RDF Protobuf (`RDF_PROTOBUF`) and RDF/JSON (`RDF_JSON`). `load`, `dump`,
 `parse` and `serialize` take all of them, by name, extension or media type as well.
 An input in one of Jena's syntaxes streams through the engine's reader on a thread of
-its own. `parse` and a file object's `load` take the quads as the reader finds them.
-`load` from a path or from bytes passes them to the loader, which reads them as it reads
-the W3C syntaxes and writes no temporary copy. A file object is the exception, since
-`load` first copies it to a temporary file, as it does for every syntax. The reader of
-RDF/JSON reads its whole document first. RDF/JSON holds one
+its own. `parse` takes the quads as the reader finds them. `load` passes a path, bytes
+or a file object to the loader, which reads these syntaxes as it reads the W3C ones and
+writes no temporary copy. The reader of RDF/JSON reads its whole document first. RDF/JSON holds one
 graph, so `dump` writes the default graph, or `from_graph`.
 
 `load` reads a CSV or TSV table when the format is `"csv"` or `"tsv"`, or the path ends
@@ -5975,9 +5973,23 @@ ds.mappings.run("people", sources={"people.csv": "data/people.csv"}, replace=Tru
 
 `sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
 quads come before the input has been read to the end. A syntax error is raised by the
-iteration, after the quads that came before it. `Dataset.load` from a file object streams
-the same way into one transaction. Loads from a path or from bytes go through the
-engine's bulk loader instead.
+iteration, after the quads that came before it.
+
+`Dataset.load` reads a file object once, as it arrives, in every syntax and parse mode,
+and never copies it to a temporary file. Into an empty dataset it runs the bulk loader
+with its parallel encoders, as a load from a path does. Into a dataset that holds data
+it inserts the quads in one transaction, since the size of a stream is not known before
+it is read. Each read asks the file object for at most 64 KiB, or 64 Ki characters of a
+text-mode file, whose text is encoded as UTF-8. The compression is detected from the
+first bytes of the stream. N-Triples and N-Quads are cut into blocks of at least 256 MiB
+that are parsed in parallel, as compressed files are. Two blocks can be in memory at
+once, so such a load holds up to about 512 MiB of input, where a load by path maps the
+file instead. The memory buys a parallel parse. A stream in
+another syntax is read ahead up to `auto_buffer_bytes`, and parsed in memory when it
+ends within that allowance or from the stream otherwise. `parse_mode="buffered"` reads
+the whole stream into memory first. An exception that the file object's `read` raises
+propagates as itself and leaves the dataset unchanged. Ctrl-C stops the reading at the
+next read and raises `KeyboardInterrupt`, and the load changes nothing.
 
 ### Terms
 

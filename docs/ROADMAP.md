@@ -656,6 +656,7 @@ linked spec Outcome records how they landed.
 
 - **397.** Native Rust direct mapping controls through conversion and the final atomic load. [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome)
 - **403.** Credential expiry for long-lived reads and fenced OIDC sign-in. [C09](specs/C09-dataset-access-control.md)
+- **438.** Python file objects load through a one-shot reader source, with no temporary copy. [Libraries and integrations](integrations/README.md#libraries-and-bindings), [Loading results](benchmarks/loading/RESULTS.md#python-file-objects)
 - **433.** A FILTER over two variables of different UNION branches keeps the rows that a later pattern of the group completes. [Querying](querying/README.md#standards-conformance)
 - **434.** A FILTER on a variable that `VALUES … { UNDEF }` leaves unbound keeps the rows that a later property path binds. [Querying](querying/README.md#standards-conformance)
 - **439.** View circuits answer `EXISTS` and `NOT EXISTS` over a zero-length path from an outer variable by substitution, as SPARQL does. [F13](specs/F13-incremental-views-and-provenance.md#outcome)
