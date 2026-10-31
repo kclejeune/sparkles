@@ -157,6 +157,11 @@ request goes to the endpoint. The pages' Content Security Policy includes
 `'wasm-unsafe-eval'` for it. `VITE_FMT_WASM=off` leaves the module out of a build or of
 `vite dev`. The mock tests below set it, so that the mock's stand-in formatter answers.
 
+Linting goes through the same module and the same fallback. The query editor lints SPARQL,
+and the shapes editor on a dataset's page lints its Turtle or SHACLC shapes, including the
+SPARQL in `sh:select` and the other query literals, through the module's `lint` export or
+`POST /$/lint`. Both mark the findings and count them next to the Format button.
+
 The query page's Pattern pane (spec U08) reads a query's pattern from the same module's
 `pattern` export, and it has no server fallback. `VITE_FMT_WASM=off` therefore leaves the
 module in for the pane when it was built, and `VITE_PATTERN_WASM=off` takes it out too.

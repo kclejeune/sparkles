@@ -96,6 +96,61 @@ pub fn position(text: &str, offset: usize, enc: Encoding) -> (u32, u32) {
     (line, character as u32)
 }
 
+/// The [`position`] of each of `offsets`, found in one pass over `text`, so that many
+/// offsets cost one scan rather than one each. `None` once `deadline` passes.
+pub fn positions(
+    text: &str,
+    offsets: &[usize],
+    enc: Encoding,
+    deadline: Option<std::time::Instant>,
+) -> Option<std::collections::HashMap<usize, (u32, u32)>> {
+    let late = || deadline.is_some_and(|d| std::time::Instant::now() > d);
+    if late() {
+        return None;
+    }
+    let mut since = 0usize;
+    let mut sorted = offsets.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let b = text.as_bytes();
+    let (mut i, mut line, mut units) = (0usize, 0u32, 0usize);
+    let mut out = std::collections::HashMap::with_capacity(sorted.len());
+    for o in sorted {
+        let mut target = o.min(text.len());
+        while !text.is_char_boundary(target) {
+            target -= 1;
+        }
+        // between the `\r` and `\n` of a line break: the end of the line
+        let stop = if target > 0 && b[target - 1] == b'\r' && b.get(target) == Some(&b'\n') {
+            target - 1
+        } else {
+            target
+        };
+        while i < stop {
+            let c = text[i..].chars().next().expect("a character");
+            match c {
+                '\n' => (line, units) = (line + 1, 0),
+                '\r' if b.get(i + 1) == Some(&b'\n') => {
+                    (line, units) = (line + 1, 0);
+                    i += 1;
+                }
+                '\r' => (line, units) = (line + 1, 0),
+                c => units += enc.width(c),
+            }
+            i += c.len_utf8();
+            since += c.len_utf8();
+            if since >= 1 << 16 {
+                since = 0;
+                if late() {
+                    return None;
+                }
+            }
+        }
+        out.insert(o, (line, units as u32));
+    }
+    Some(out)
+}
+
 /// One replacement: bytes `start..end` of the old text become `insert`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edit {
@@ -144,6 +199,28 @@ pub fn minimal_edit(old: &str, new: &str) -> Option<Edit> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn positions_keep_to_the_deadline() {
+        let text = "a".repeat(1 << 20);
+        let past = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert_eq!(
+            super::positions(&text, &[text.len()], Encoding::Utf16, past),
+            None
+        );
+    }
+
+    #[test]
+    fn positions_match_position() {
+        let text = "a\r\nbé\u{1F600}c\rd\n\ne\u{1F600}";
+        let offsets: Vec<usize> = (0..=text.len() + 2).rev().collect();
+        for enc in [Encoding::Utf8, Encoding::Utf16] {
+            let all = super::positions(text, &offsets, enc, None).unwrap();
+            for &o in &offsets {
+                assert_eq!(all[&o], super::position(text, o, enc), "{o} {enc:?}");
+            }
+        }
+    }
+
     use super::*;
     use Encoding::{Utf8, Utf16};
 

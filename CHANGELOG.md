@@ -83,6 +83,28 @@ also counts the bytes read. A body that expands through a prefix is refused with
 Loading a file in one of these syntaxes takes 11 to 22 percent less time and no longer
 needs the disk room of the copy.
 
+`sparkles lint`, `POST /$/lint`, `sparkles lsp`, the WebAssembly module and the new MCP
+`lint` tool now check N-Triples, N-Quads, JSON-LD and SHACL Compact Syntax as well as
+SPARQL, Turtle and TriG. The term rules apply to every language. SHACLC also gets the
+prefix rules, and JSON-LD gets `unused-context-term`, a hint whose fix removes the term,
+and `unmapped-key`, a warning for a key that no context maps. In Turtle, TriG and JSON-LD
+shapes, the SPARQL in `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals is
+linted with the prefixes of `sh:declare` and SHACL's pre-bound variables, and each finding
+is placed inside the literal. The shapes editor lints Turtle and SHACLC shapes while you
+type. `sparkles lint` walks `.nt`, `.nq`, `.jsonld`, `.shaclc` and `.shc` files, and
+`--list-rules` shows the languages of each rule. A `--fix` on a Turtle or SHACLC document
+with an undefined prefix used to fail with `unsafe-fix` and now applies its fixes. The MCP
+tool takes rule levels as camelCase `options`. JSON-LD documents are expanded with
+`oxjsonld` to check that a fix keeps their dataset. `POST /$/lint` now answers `415` with
+`unsupported-language` for RDF/XML instead of `400`. A document with many findings is
+placed in one pass, and the lint checks its deadline on every path, so it keeps to its
+timeout. JSON-LD queries come from the document's expansion, every JSON-LD fix is checked
+against the expansion before it is offered, and an embedded query whose holder is
+ambiguous, or whose source string cannot be proved, is skipped. The bounded isomorphism
+check of the SHACLC formatter and the linter no longer canonicalizes small graphs exactly,
+so a few symmetric blank nodes cannot run past the deadline. The query editor no longer shows the
+findings of a lint that answered after the query changed or linting was turned off.
+
 Signing in, minting a token and expiry pruning no longer move the shared authority
 generation. Concurrent logins of other users succeed, cached Basic credentials stay
 cached, and other users' change feeds, live queries and long polls keep running.

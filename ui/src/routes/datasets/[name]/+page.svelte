@@ -11,7 +11,9 @@
   import { diffGraphHref } from '$lib/diff-graph';
   import { normalizeAt, validAt } from '$lib/history';
   import { formatEditor } from '$lib/fmt-edit';
-  import { formatAny } from '$lib/fmt-wasm';
+  import { formatAny, lintAny } from '$lib/fmt-wasm';
+  import { lintCounts, lintSummary } from '$lib/lint-view';
+  import { lintRunner } from '$lib/lint-runner';
   import { formatFailure } from '$lib/fmt-view';
   import { compactionSummary, lastCompaction } from '$lib/compaction';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
@@ -21,6 +23,7 @@
     readShaclSyntax,
     shaclSyntaxKey,
     shapesFormatLanguage,
+    shapesLintRequest,
     shapesLabel,
     shapesPrefixes,
     type ShaclSyntax,
@@ -476,6 +479,37 @@ ex:PersonShape a sh:NodeShape ;
 
   let shapesEditor = $state<TurtleEditor>();
   let formattingShapes = $state(false);
+
+  // lint the shapes a moment after they stop changing, in the browser when the module is
+  // there, else through POST /$/lint: the editor's syntax is the linter's language, and the
+  // SPARQL of sh:select and the like is linted with it
+  let shapesLint = $state<api.LintDiagnostic[]>([]);
+  /** the server refused linting (turned off, or not for this caller): stop asking */
+  let shapesLintRefused = false;
+  const shapesLintCount = $derived(lintCounts(shapesLint));
+  const shapesLinter = lintRunner<NonNullable<ReturnType<typeof shapesLintRequest>>>({
+    delay: 400,
+    run: async (req) => {
+      if (shapesLintRefused) return [];
+      try {
+        return (await lintAny(req)).diagnostics;
+      } catch (e) {
+        if (e instanceof api.ApiError && [401, 403, 404].includes(e.status))
+          shapesLintRefused = true;
+        return [];
+      }
+    },
+    show: (found) => {
+      shapesLint = found;
+      shapesEditor?.setLint(found);
+    },
+  });
+
+  // every new text, blank or not, starts a new lint and drops the answer of the last one
+  $effect(() => {
+    if (!shapesEditor) return;
+    return shapesLinter.schedule(shapesLintRequest(shapes, shapesSyntax));
+  });
 
   /** Format the shapes graph, in the browser or on the server (Format and Shift+Alt+F). */
   async function formatShapes() {
@@ -1071,6 +1105,23 @@ ex:PersonShape a sh:NodeShape ;
                     size={13}
                   />{/if} Format
               </button>
+              {#if shapesLint.length}
+                <span
+                  class="lint-status"
+                  class:error={shapesLintCount.error > 0}
+                  class:warning={shapesLintCount.error === 0 && shapesLintCount.warning > 0}
+                  role="status"
+                  title={shapesLint
+                    .map((d) => `${d.line}:${d.column} ${d.message} [${d.rule}]`)
+                    .join('\n')}
+                >
+                  <Icon
+                    name={shapesLintCount.error || shapesLintCount.warning ? 'alert' : 'info'}
+                    size={12}
+                  />
+                  {lintSummary(shapesLint)}
+                </span>
+              {/if}
               <label class="inline">
                 <span class="faint">Data graph</span>
                 <select class="select" bind:value={shaclGraph} aria-label="Data graph">
@@ -2046,5 +2097,19 @@ ex:PersonShape a sh:NodeShape ;
   .badge.past {
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
+  }
+  .lint-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  .lint-status.warning {
+    color: var(--warn);
+  }
+  .lint-status.error {
+    color: var(--danger);
   }
 </style>

@@ -372,7 +372,7 @@ impl Server {
         let Some(doc) = self.docs.get_mut(uri) else {
             return Response::new_ok(id, Vec::<CodeActionOrCommand>::new());
         };
-        let Some(linted) = doc.lint(uri).clone() else {
+        let Some(linted) = doc.lint(uri, Instant::now() + DEADLINE).clone() else {
             return Response::new_ok(id, Vec::<CodeActionOrCommand>::new());
         };
         let text = doc.text.clone();
@@ -514,14 +514,15 @@ impl Doc {
     }
 
     /// The lint findings of the document, computed again only when the text or the rule
-    /// levels changed. `None` for a language lint does not take, or when linting failed.
-    fn lint(&mut self, uri: &Uri) -> &Option<Linted> {
+    /// levels changed, within `deadline`. `None` for a language lint does not take, or
+    /// when linting failed.
+    fn lint(&mut self, uri: &Uri, deadline: Instant) -> &Option<Linted> {
         let opts = self.lint_options(uri);
         if !matches!(&self.linted, Some((o, _)) if *o == opts) {
             let linted = match (&opts, language(&self.language_id, uri.as_str(), &self.text)) {
                 (Ok(o), Ok(lang)) if lint::lints(lang) => {
                     let mut o = o.clone();
-                    o.deadline = Some(Instant::now() + DEADLINE);
+                    o.deadline = Some(deadline);
                     let text = &self.text;
                     std::panic::catch_unwind(|| lint::lint(text, lang, &o))
                         .ok()
@@ -536,16 +537,41 @@ impl Doc {
 
     /// The formatter's diagnostics, then the lint findings (syntax errors once).
     fn diagnostics(&mut self, uri: &Uri, enc: Encoding) -> Vec<Diagnostic> {
+        self.diagnostics_by(uri, enc, Instant::now() + DEADLINE)
+    }
+
+    /// [`Doc::diagnostics`] with one deadline for the request: the lint, the positions of
+    /// its findings and their publication. Past it, the lint findings are left out.
+    fn diagnostics_by(&mut self, uri: &Uri, enc: Encoding, deadline: Instant) -> Vec<Diagnostic> {
         let mut out = self.format_diagnostics(uri, enc);
-        if let Some(l) = self.lint(uri).clone() {
+        if let Some(l) = self.lint(uri, deadline).clone() {
             // the lint's own findings replace the formatter's note on undeclared prefixes
             out.retain(|d| d.code != Some(NumberOrString::String("undeclared-prefix".to_string())));
-            out.extend(
-                l.diagnostics
-                    .iter()
-                    .filter(|d| d.rule != "syntax")
-                    .map(|d| lint_diagnostic(&self.text, d, enc)),
-            );
+            let found: Vec<&lint::Diagnostic> = l
+                .diagnostics
+                .iter()
+                .filter(|d| d.rule != "syntax")
+                .collect();
+            // every position in one pass over the text
+            let offsets: Vec<usize> = found.iter().flat_map(|d| [d.start, d.end]).collect();
+            // within the request's time; past it, the findings are not shown
+            let Some(at) = text::positions(&self.text, &offsets, enc, Some(deadline)) else {
+                return out;
+            };
+            if Instant::now() > deadline {
+                return out;
+            }
+            let pos = |b: usize| {
+                let (line, character) = at[&b];
+                Position { line, character }
+            };
+            out.extend(found.into_iter().map(|d| {
+                let range = Range {
+                    start: pos(d.start),
+                    end: pos(d.end),
+                };
+                lint_diagnostic_at(d, range)
+            }));
         }
         out
     }
@@ -616,6 +642,11 @@ fn warning_severity(code: &str) -> DiagnosticSeverity {
 
 /// A lint finding as an LSP diagnostic, over its whole range.
 fn lint_diagnostic(text: &str, d: &lint::Diagnostic, enc: Encoding) -> Diagnostic {
+    lint_diagnostic_at(d, range(text, d.start, d.end, enc))
+}
+
+/// A lint finding as an LSP diagnostic over `range`.
+fn lint_diagnostic_at(d: &lint::Diagnostic, range: Range) -> Diagnostic {
     let severity = match d.severity {
         Severity::Error => DiagnosticSeverity::ERROR,
         Severity::Warning => DiagnosticSeverity::WARNING,
@@ -623,7 +654,7 @@ fn lint_diagnostic(text: &str, d: &lint::Diagnostic, enc: Encoding) -> Diagnosti
         Severity::Hint => DiagnosticSeverity::HINT,
     };
     Diagnostic {
-        range: range(text, d.start, d.end, enc),
+        range,
         severity: Some(severity),
         code: Some(NumberOrString::String(d.rule.to_string())),
         source: Some("sparkles lint".to_string()),
@@ -765,6 +796,34 @@ fn file_path(uri: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lint_findings_share_the_request_deadline() {
+        let doc = || Doc {
+            text: "PREFIX u: <http://u/>\nASK {}".to_string(),
+            language_id: "sparql".to_string(),
+            version: 1,
+            result: None,
+            linted: None,
+        };
+        let uri: Uri = "untitled:q.rq".parse().unwrap();
+        let lint_found = |d: &[Diagnostic]| {
+            d.iter()
+                .filter(|d| d.source.as_deref() == Some("sparkles lint"))
+                .count()
+        };
+        let d = doc().diagnostics_by(&uri, Encoding::Utf16, Instant::now() + DEADLINE);
+        assert_eq!(lint_found(&d), 1, "{d:?}");
+        // a deadline that has passed: no lint findings, however positions would fare
+        let past = Instant::now() - Duration::from_millis(1);
+        let d = doc().diagnostics_by(&uri, Encoding::Utf16, past);
+        assert_eq!(lint_found(&d), 0, "{d:?}");
+        // a lint cached within its time is not published once the request is out of time
+        let mut cached = doc();
+        cached.lint(&uri, Instant::now() + DEADLINE);
+        let d = cached.diagnostics_by(&uri, Encoding::Utf16, past);
+        assert_eq!(lint_found(&d), 0, "{d:?}");
+    }
 
     #[test]
     fn languages() {

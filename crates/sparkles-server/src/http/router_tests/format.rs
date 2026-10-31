@@ -463,11 +463,35 @@ async fn lints_json_bodies() {
     let r = post_json(
         &app,
         "/$/lint",
-        json!({ "text": "<a> <b> <c> .", "language": "ntriples" }),
+        json!({ "text": "<a> <b> <c> .", "language": "rdfxml" }),
     )
     .await;
     assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(r.json()["code"], "unsupported-language");
+    // and so is RDF/XML that the language is detected from
+    let r = post_json(
+        &app,
+        "/$/lint",
+        json!({ "text": "<?xml version=\"1.0\"?><rdf:RDF/>" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(r.json()["code"], "unsupported-language");
+    // a name the server does not know is a bad request
+    let r = post_json(
+        &app,
+        "/$/lint",
+        json!({ "text": "<a> <b> <c> .", "language": "cobol" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["code"], "bad-request");
+    assert!(
+        r.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown language")
+    );
     let r = post_json(
         &app,
         "/$/lint",

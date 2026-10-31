@@ -39,6 +39,7 @@
   import type { AnyEdit } from '$lib/pattern-edits';
   import { toSparql } from '$lib/rdf';
   import { lintCounts, lintSummary } from '$lib/lint-view';
+  import { lintRunner } from '$lib/lint-runner';
   import { LatestRun } from '$lib/supersede';
   import { load, save } from '$lib/storage';
   import { rejectionReport } from '$lib/write-validation';
@@ -201,7 +202,6 @@
   let lintDiagnostics = $state<api.LintDiagnostic[]>([]);
   /** the server refused linting (turned off, or not for this caller): stop asking */
   let lintRefused = false;
-  let lintSeq = 0;
   const lintCount = $derived(lintCounts(lintDiagnostics));
   const fixable = $derived(lintDiagnostics.some((d) => d.fix));
   let renaming = $state<string | null>(null);
@@ -1273,33 +1273,30 @@
   }
 
   // lint the active query a moment after it stops changing, in the browser when the
-  // module is there, else through POST /$/lint
-  $effect(() => {
-    const text = active.query;
-    const tab = activeId;
-    if (!lintOn || !editor) {
-      lintDiagnostics = [];
-      editor?.setLint([]);
-      return;
-    }
-    const timer = setTimeout(() => void lintQuery(text, tab), 400);
-    return () => clearTimeout(timer);
-  });
-
-  async function lintQuery(text: string, tab: string) {
-    const seq = ++lintSeq;
-    let found: api.LintDiagnostic[] = [];
-    if (text.trim() && !lintRefused) {
+  // module is there, else through POST /$/lint; every new text, tab or setting drops the
+  // answer of the lint before it
+  const queryLinter = lintRunner<string>({
+    delay: 400,
+    run: async (text) => {
+      if (!text.trim() || lintRefused) return [];
       try {
-        found = (await lintAny({ text, language: 'sparql' })).diagnostics;
+        return (await lintAny({ text, language: 'sparql' })).diagnostics;
       } catch (e) {
         if (e instanceof api.ApiError && [401, 403, 404].includes(e.status)) lintRefused = true;
+        return [];
       }
-    }
-    if (seq !== lintSeq || tab !== activeId) return;
-    lintDiagnostics = found;
-    editor?.setLint(found);
-  }
+    },
+    show: (found) => {
+      lintDiagnostics = found;
+      editor?.setLint(found);
+    },
+  });
+
+  $effect(() => {
+    const text = active.query;
+    void activeId;
+    return queryLinter.schedule(lintOn && editor ? text : null);
+  });
 
   /** Apply the lint's safe fixes, as one undoable change. */
   async function fixQuery() {

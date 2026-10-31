@@ -783,7 +783,7 @@ export type LintSeverity = 'error' | 'warning' | 'info' | 'hint';
 /** `POST /$/lint` (and the browser module's `lint`): SPARQL, Turtle or TriG. */
 export type LintRequest = {
   text: string;
-  language?: 'sparql' | 'turtle' | 'trig';
+  language?: FormatLanguage;
   /** rule levels over the defaults: a severity or `off` */
   rules?: Record<string, LintSeverity | 'off'>;
   /** apply the safe fixes and return the fixed `text` */

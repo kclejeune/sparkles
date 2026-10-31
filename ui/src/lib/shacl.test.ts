@@ -3,6 +3,7 @@ import {
   readShaclSyntax,
   shaclSyntaxKey,
   shapesFormatLanguage,
+  shapesLintRequest,
   shapesLabel,
   shapesMediaType,
   shapesPrefixes,
@@ -26,6 +27,20 @@ describe('shapes syntax', () => {
   it('asks the formatter for the language of the syntax', () => {
     expect(shapesFormatLanguage('turtle')).toBe('turtle');
     expect(shapesFormatLanguage('shaclc')).toBe('shaclc');
+  });
+
+  it('lints the shapes in the language of the syntax', () => {
+    expect(shapesLintRequest('ex:S a sh:NodeShape .', 'turtle')).toEqual({
+      text: 'ex:S a sh:NodeShape .',
+      language: 'turtle',
+    });
+    expect(shapesLintRequest('shape <s> { }', 'shaclc', true)).toEqual({
+      text: 'shape <s> { }',
+      language: 'shaclc',
+      fix: true,
+    });
+    // a blank editor has nothing to lint
+    expect(shapesLintRequest('  \n', 'turtle')).toBeNull();
   });
 
   it('collects the declared prefixes of both syntaxes', () => {

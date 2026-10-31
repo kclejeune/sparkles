@@ -23,7 +23,7 @@ struct FormatArgs {
 }
 
 /// The language a call names, else the one the text looks like.
-fn language(name: Option<&str>, text: &str) -> Result<Language, ToolError> {
+pub(super) fn language(name: Option<&str>, text: &str) -> Result<Language, ToolError> {
     let rdf_xml = || {
         ToolError::new("unsupported-language", 415, sparkles_fmt::RDF_XML_MESSAGE)
             .hint("convert the document to Turtle first")

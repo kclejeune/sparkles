@@ -607,8 +607,13 @@ mod tests {
         assert_eq!(r["applied"], 2);
         assert_eq!(r["text"], "SELECT ?s { ?s ?p \"\u{1F600}\"@en-US }");
         // errors
-        let r = call_lint(json!({ "text": "<a> <b> <c> .", "language": "ntriples" }));
+        let r = call_lint(json!({ "text": "<a> <b> <c> .", "language": "rdfxml" }));
         assert_eq!(r["status"], 415);
+        let r = call_lint(
+            json!({ "text": "<http://a> <http://b> <http://c> .", "language": "ntriples" }),
+        );
+        assert_eq!(r["language"], "ntriples");
+        assert_eq!(r["diagnostics"], json!([]));
         let r = call_lint(json!({ "text": "x", "language": "sparql", "rules": { "nope": "off" } }));
         assert_eq!(r["status"], 400);
         let r = call_lint(json!({ "text": "SELECT * {", "language": "sparql" }));

@@ -41,7 +41,8 @@ nothing. The server provides:
     position appears at the start of the document. An example is `option-not-implemented`,
     for a config key this build does not act on yet.
 
-  SPARQL, Turtle and TriG documents are also linted. Each finding has the source
+  Documents in every language the formatter handles are also linted, and so is the SPARQL in the
+  `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals of a shapes graph. Each finding has the source
   `sparkles lint`, its rule as the code (`unused-prefix`, `cartesian-product`, …) and the
   rule's severity, with the levels of the `[lint]` table of the nearest
   `.sparklesfmt.toml`. The lint's `undefined-prefix` error takes the place of the

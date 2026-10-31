@@ -84,6 +84,13 @@ request or on every write, and the schema report counts what the data holds.
 ### SHACL
 
 * `sparkles-shacl` validates SHACL Core and SHACL-SPARQL in parallel over the indexes.
+* `sparkles lint`, `POST /$/lint`, the MCP `lint` tool and the shapes editor check a
+  shapes graph before it runs. They lint the SPARQL in `sh:select`, `sh:ask`,
+  `sh:construct` and `sh:update` literals with the prefixes of `sh:prefixes` and
+  `sh:declare` and with SHACL's pre-bound variables, such as `$this`, `$value` and
+  `$currentShape`, counted as bound. A finding is placed inside the literal. Turtle,
+  TriG, JSON-LD and SHACL Compact Syntax shapes are all linted, and the compact syntax
+  has no syntax for these literals ([USAGE.md](../USAGE.md#linting)).
 * SHACL 1.2 support covers `sh:targetWhere`, the list constraints `sh:memberShape`,
   `sh:minListLength`, `sh:maxListLength` and `sh:uniqueMembers` with `sh:detail` results,
   and node expressions in the Working Group's `shnex:` vocabulary. Node expressions work as

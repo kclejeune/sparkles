@@ -10,7 +10,9 @@ use crate::syntax::NodeKind;
 use crate::tree::TokenId;
 use std::collections::HashSet;
 
-pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
+/// `used` holds labels that count as used whatever the tree says: those of the SPARQL in
+/// a Turtle document's query literals.
+pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>, used: &HashSet<String>) {
     let decls: Vec<_> = c
         .nodes()
         .into_iter()
@@ -40,6 +42,9 @@ pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
                 .into_iter()
                 .find(|&t| c.token_kind(t) == TokenKind::PnameNs)
                 .map_or("", |t| c.text(t));
+            if used.contains(label.trim_end_matches(':')) {
+                continue;
+            }
             let (start, end) = c.node_span(n);
             out.report_fix(
                 "unused-prefix",
@@ -57,14 +62,17 @@ pub(super) fn run(c: &Cst<'_, '_>, out: &mut Out<'_>) {
     if out.on("undefined-prefix") {
         for i in 0..c.tree.tokens.len() {
             let t = TokenId(i as u32);
-            if !matches!(c.token_kind(t), TokenKind::PnameNs | TokenKind::PnameLn)
-                || labels.contains(&t)
+            if !matches!(
+                c.token_kind(t),
+                TokenKind::PnameNs | TokenKind::PnameLn | TokenKind::AtPname
+            ) || labels.contains(&t)
             {
                 continue;
             }
-            let text = c.text(t);
+            // SHACLC's `@ex:Shape` has the `@` before its label
+            let text = c.text(t).trim_start_matches('@');
             let label = &text[..text.find(':').unwrap_or(text.len())];
-            if c.scope.resolve(label, t).is_none() {
+            if c.namespace(label, t).is_none() {
                 let (start, end) = c.span(t);
                 out.report(
                     "undefined-prefix",

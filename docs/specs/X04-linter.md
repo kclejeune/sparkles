@@ -2,10 +2,12 @@
 
 > **Status:** implemented
 >
-> **Phases:** one phase. It covers the rules of §3 for SPARQL, Turtle and TriG, the
-> `sparkles lint` command with `--fix`, the `[lint]` table of the formatter's config file,
-> diagnostics and quick fixes in `sparkles lsp`, `POST /$/lint`, the browser module's
-> `lint`, and linting in the query editor.
+> **Phases:** one phase and a later extension. The phase covers the rules of §3 for SPARQL,
+> Turtle and TriG, the `sparkles lint` command with `--fix`, the `[lint]` table of the
+> formatter's config file, diagnostics and quick fixes in `sparkles lsp`, `POST /$/lint`,
+> the browser module's `lint`, and linting in the query editor. The
+> [extension](#linter-extensions-item-48-part-b) adds N-Triples, N-Quads, JSON-LD and
+> SHACLC, the SPARQL in SHACL literals, an MCP tool and linting in the shapes editor.
 >
 > **User docs:** [API: Linting](../API.md#linting) · [Usage](../USAGE.md#linting) · [Editor integration](../editors.md) · [Features](../querying/README.md#formatter-and-editor-support)
 >
@@ -42,12 +44,14 @@ range, and it can fix the findings whose fix never changes what the document mea
 
 **Non-goals**
 
-- Linting N-Triples, N-Quads, JSON-LD or RDF/XML. The line formats are usually machine
-  output, and their documents can be larger than memory.
+- Linting RDF/XML. The first version also left out N-Triples, N-Quads and JSON-LD, because
+  the line formats are usually machine output and their documents can be larger than
+  memory. The [extension](#linter-extensions-item-48-part-b) added them.
 - Checks that need the data, such as a predicate that no triple uses or a class with no
   instances. The schema browser (C02) covers those.
-- Linting SPARQL inside SHACL literals (`sh:select`). The literal would have to be
-  extracted, with its own positions and prefixes.
+- Linting SPARQL inside SHACL literals (`sh:select`) in the first version. The literal has
+  to be extracted, with its own positions and prefixes, and the
+  [extension](#linter-extensions-item-48-part-b) does that.
 - Plugins or user-defined rules.
 
 ## 2. User-visible behaviour
@@ -284,8 +288,9 @@ ends.
 **Performance.** Not measured separately. The rules make a few passes over the syntax
 tree, and the reference parse that the formatter also runs dominates the cost.
 
-**Not built.** Linting N-Triples, N-Quads and JSON-LD, linting the SPARQL inside SHACL
-literals, an MCP tool, and linting in the shapes editor.
+**Not built at landing.** Linting N-Triples, N-Quads and JSON-LD, linting the SPARQL inside
+SHACL literals, an MCP tool, and linting in the shapes editor. The extension below built
+them, together with linting for SHACLC.
 
 ### Roadmap follow-ups (2026-10-12)
 
@@ -318,3 +323,204 @@ Tier 5, [ROADMAP](../ROADMAP.md)). SHACLC formatting, the other half of item 48,
   like `format`, and returns the findings with rule, severity, range and message, and
   `fixed` text when `fix` is true. It reads no dataset, is capped by `--mcp-max-bytes`,
   and runs within `timeoutSeconds`.
+
+### Linter extensions (item 48, part b)
+
+**Delivered on 2026-10-31.** The follow-up above is built as designed, except where the
+deviations below say otherwise. The linter now takes every language the formatter does,
+and RDF/XML stays out. `lint::lints` is true for all seven languages.
+
+**Languages.**
+
+* N-Triples and N-Quads get the term rules of §3.4 and no others. The Turtle lexer reads
+  their terms, and the rules run over a flat tree that wraps each string with its language
+  tag or datatype in the node the Turtle rules read. oxttl is the reference parser and
+  decides what a syntax error is. An IRI with a space is an `iri-space` error, as in Turtle.
+* SHACLC gets the prefix rules and the term rules. The reader of `sparkles-shaclc` is the
+  reference parser. It refuses an undeclared prefix, so the lint declares those for the
+  reference parse and reports `undefined-prefix` itself, as it does for Turtle. The four
+  prefixes that every SHACLC document starts with, `rdf`, `rdfs`, `sh` and `xsd`, are
+  declared and are never unused. SHACLC has no syntax for `sh:select` or the other query
+  properties, so it has no embedded SPARQL.
+* JSON-LD gets the term rules over value objects (`@language`, and `@type` against
+  `@value`), over the strings of terms whose definition coerces a datatype, and over the
+  IRIs of `@id`, `@type` and `@context`. A language tag fix rewrites the string, and a
+  redundant `xsd:string` fix removes the `@type` member with its comma.
+
+**JSON-LD rules.** `unused-context-term` is a hint with a fix that removes the term and its
+comma. A term counts as used when any string of the document outside the keys that
+define terms equals it or starts with `term:`. That covers keys, `@type` values, coerced
+`@vocab` values, the prefixes of compact IRIs and the other definitions. A string with
+spaces counts for each `label:` it holds, so a prefix that a SHACL query uses is used.
+`unmapped-key` is a warning. It follows the contexts in effect for each object, including
+the scoped contexts of terms and of `@type` values, and it skips the keys of map
+containers, the values of JSON literals and value objects. It stays silent for a document
+without a context, beside a context given by URL or `@import`, and under `@vocab`, because
+any of them can define the key. A term defined as `null` is dropped on purpose and is not
+reported. These rules read the document through a model of its contexts that follows
+`@vocab`, keyword aliases and the scoped contexts of terms, types and aliases of `@nest`.
+A JSON literal, the value of a term typed `@json` or of a value object whose type is
+`@json`, is data, and nothing in it is read as a context, a term definition or a use of a
+term. The model only guides the rules. Each fix of a JSON-LD finding is offered, in `fix`
+and as an editor's quick fix alike, only when oxjsonld expands the document with that one
+edit applied to a dataset isomorphic to the document's own, within the deadline. A
+document with more than 256 fixable findings gets the findings without fixes, so the check
+stays bounded. A document that cannot be expanded here, because it names a context by URL,
+gets no fixes and keeps its text under `fix`.
+oxjsonld became a dependency of `sparkles-fmt`, and the crate still builds for
+`wasm32-unknown-unknown`.
+
+**SPARQL in SHACL.** In Turtle, TriG and JSON-LD, the plain string objects of `sh:select`,
+`sh:ask`, `sh:construct` and `sh:update` are linted as SPARQL. A string with a language tag
+or a datatype other than `xsd:string` is not a query. The document is read a second time
+as RDF, only when it has such a literal, to find the holder of each query and the
+prefixes and parameters it sees. A query sees those of the node that holds it, in its own
+graph, and a literal is linted only when that holder is certain.
+
+* *Turtle and TriG.* When the statement's subject is an absolute IRI, a prefixed name or a
+  blank node label, in the default graph or in a graph block with such a label, the
+  holder is that node in that graph, confirmed by a quad of the parse. A literal in a blank
+  node property list, a reified triple or an annotation has no holder in the source. It is
+  linted when exactly one node holds its property and text and exactly one string literal
+  of the document has that text.
+* *JSON-LD.* Which values are queries comes from oxjsonld's expansion of the document, so
+  `@vocab`, keyword aliases, default and scoped languages, coercions and redefined terms
+  are decided as JSON-LD decides them. A query quad is mapped back to the source when
+  exactly one value string of the document has its text, exactly one node holds it, and a
+  probe shows that the string makes the quad: the document with that string replaced by a
+  fresh text expands to the same dataset with only that quad's literal replaced. A query
+  made from something else, such as the key of an `@index` map, fails the probe. The fresh
+  text is a marker that no IRI, literal, datatype or language of the document's expansion
+  contains. The probe streams the expansion under the deadline without keeping its quads.
+  Exactly one quad must carry the fresh text, and it must be the query quad with the new
+  text. With the old text put back in it, the probe's quads must match the document's by
+  count and by the wrapping sum of their keyed 128-bit hashes. The parser names anonymous
+  nodes afresh in each expansion, so blank nodes are hashed by the order in which they
+  first appear. A probe whose expansion meets them in another order fails, and its query
+  is skipped. At
+  most 256 strings are probed, and a document that cannot be expanded here gets no query
+  findings.
+* *Work.* Each probe and each fix check expands the whole document again. Together they
+  expand at most four times the document, or 1 MiB for a small one, and never more than
+  64 MiB, with or without a deadline, so linting in the browser stays bounded too. With a
+  deadline, one is not started when an expansion as long as the document's own would end
+  past it, because an expansion that must read the whole document before its first quad
+  cannot stop early. A probe or check that does not fit is skipped, so its query gets no
+  findings or its finding no fix. A JSON-LD document over 8 MiB is not expanded at all,
+  so it gets no query findings and no fixes.
+* *Ambiguity.* Any other literal is skipped. The same query text on two anonymous nodes,
+  or a text that another string of the document repeats, costs the findings of that query
+  and never gives one node the findings of another.
+
+* *Prefixes.* A query sees the document's own prefixes first and then the `sh:declare`
+  pairs of the nodes that `sh:prefixes` names on the node that holds the query and on the
+  nodes that point at it, with the `owl:imports` closure. The prefixes are written in front
+  of the query as `PREFIX` lines, and a finding in front of the query is dropped, so an
+  injected prefix is never reported as unused. The engine of `sparkles-shacl` resolves
+  only the `sh:declare` prefixes, so a query that works through the document's prefixes
+  lints clean and fails at validation. That leniency follows the design above. A document
+  prefix that a query writes counts as used, so `unused-prefix` does not report it and
+  `fix` does not remove it.
+* *Pre-bound variables.* `$this`, `$shapesGraph`, `$currentShape`, `$value` and `$PATH`
+  are bound, and so are the parameters of a constraint component, by the local name of each
+  `sh:path`, when the query is one of its validators. The variable rules do not report them
+  as unbound, single-use or unused. They are not bound for `filter-scope`, because that
+  rule is about where a pattern binds.
+* *Positions.* Each string is decoded into a table that holds, for every byte of the
+  value, where its source character starts and ends in the document. An escape such as
+  `\n`, `\"`, `\u00e9` or a JSON surrogate pair is one source character, so a finding that
+  covers it covers all of it. Multi-line long strings, non-ASCII text and escapes before the
+  finding all land on the right bytes, and the line and column are those of the document.
+  This is a table of its own and not the formatter's cursor map, which maps between an
+  input and its formatted output and has no meaning for a string literal.
+* *Fixes.* A finding has a fix only in a long string (`"""` or `'''`) without escapes,
+  where the query text is the source text and an edit lands exactly. The edited query must
+  parse to the same algebra, the string must not gain its own delimiter, and the edit may
+  not insert a quote or a backslash. `fix` compares a Turtle or TriG document before and
+  after as RDF with the text of its `xsd:string` query literals blanked, because the
+  embedded linter has already checked that each query means what it meant. JSON strings
+  are never long, so JSON-LD queries have findings and no fixes, and a JSON-LD document is
+  compared with nothing blanked.
+
+**Surfaces.** `sparkles lint` walks `.nt`, `.nq`, `.jsonld`, `.shaclc` and `.shc` files
+too, and `--list-rules` shows each rule's languages. `sparkles lsp`, `POST /$/lint` and the
+browser module take the new languages without a change of their own. The MCP `lint` tool
+takes `text`, `language`, `options` with the rule names in camelCase, `fix` and
+`timeoutSeconds`, as `format` takes its options. It returns each finding with its rule,
+severity, message and range, the counts, and with `fix` the fixed text. The result is
+measured as its structured content serializes, escapes included. A fixed text that does not
+fit is refused with `too-large`, and a result with more findings than fit lists the ones
+that do and sets `truncated`. `POST /$/lint` answers `415` with `unsupported-language` for
+RDF/XML, named or detected, and `400` for a language name it does not know. The shapes editor on a
+dataset's page lints 400 ms after the text stops changing, in the browser module when it
+is there and through the endpoint otherwise, in Turtle and in SHACLC, with a count next to
+the Format button.
+
+**Deviations and decisions.**
+
+* The first run of `fix` on a Turtle or SHACLC document with an `undefined-prefix` finding
+  failed with `unsafe-fix`, because the check that compares the input with the fixed text
+  parsed both with the prefix undeclared. The check now declares the undeclared prefixes of
+  both, as the lint does, and a test covers it.
+* The MCP option names are camelCase rule names, `unusedPrefix` for `unused-prefix`, and
+  the kebab-case names are accepted too. The HTTP endpoint keeps its `rules` object.
+* The line formats are read whole, so the CLI's `--max-bytes` applies to them. Linting a
+  document larger than memory in bounded memory is left open. The reference parse streams
+  without keeping the quads, and it and the term rules check the deadline every few steps.
+  The lines and columns of all findings are set in one pass over the text, and so are the
+  UTF-16 offsets of the HTTP endpoint and the MCP tool and the positions of the language
+  server, so a document with many findings costs one scan rather than one per finding.
+  Each of those passes checks the deadline as it goes, and the lint never returns findings
+  once the deadline has passed. The language server gives each diagnostics request one
+  deadline for the lint, the positions and the publication.
+* The isomorphism check behind the JSON-LD fixes, the provenance probes and the SHACLC
+  formatter never canonicalizes exactly, which takes factorial time on a few symmetric
+  blank nodes and cannot be stopped. Graphs of any size are compared by colour refinement
+  and a budgeted search that checks the deadline, and whatever that cannot verify is
+  refused.
+* Memory. Only the query literals that are linted get a position table, which holds two
+  offsets for each byte of the query. The texts of anonymous query literals are counted
+  among the document's strings without tables, and a string too long to be one of them is
+  not decoded, so a large data literal costs no copy.
+* N-Triples and N-Quads are not read for SHACL query literals. The three languages that
+  can carry shapes in practice are covered.
+
+**Review fixes.** An independent review of the extension found that a JSON literal's
+payload could get a context-term fix, that the line-format pass ignored its deadline and
+placed each finding by rescanning the text before it, that a prefix used only by a query
+was removed by `fix`, that queries with the same text shared their holders' prefixes and
+parameters, that JSON-LD queries were chosen without expanding types, languages, `@vocab`
+and keyword aliases, that the MCP tool measured the fixed text before JSON escaping, that
+the shapes editor could show the findings of text it no longer held, and that the API
+promised a `415` for RDF/XML that the endpoint did not give. A second review found that
+the hand-written model of JSON-LD contexts still let a fix reach a JSON literal through a
+context scoped on an `@nest` alias and still misread scoped languages and redefined terms,
+that matching literals to quads by their order swapped holders, and that error paths and
+the final placing of findings ran past the deadline. Queries and fixes in JSON-LD now rest
+on the real expansion, holders on identity or an unambiguous match, and the lint checks the
+deadline before every parse, on every error path, while placing findings and before it
+returns. The HTTP endpoint's and the MCP tool's UTF-16 offsets and the language server's
+positions are counted under the same deadline. A third review found that the bounded
+isomorphism check still canonicalized small graphs without a deadline, that holders were
+deduplicated by a quadratic scan, that a JSON-LD query made from an `@index` key could be
+placed on an unrelated string with its text, that every Turtle string got a position
+table, and that the language server renewed its deadline for positions. The search
+replaced the exact canonicalization, holders are hash sets built under the deadline, each
+JSON-LD query's source is proved by a probe, only query literals get tables, and the
+language server keeps one deadline per request. A fourth review found that timing the
+JSON-LD expansion read the clock in the browser, where the WebAssembly build has none, and
+that a probe could accept a string whose replacement moved the query to another predicate
+while an escaped literal that looked like the marker supplied the fresh text. The clock is
+now read only under a deadline, and the probe compares the whole dataset by digest with a
+marker chosen against the decoded terms. Each case has a regression test.
+
+**Tests.** `crates/sparkles-fmt/src/lint` has unit tests for N-Triples, N-Quads, SHACLC,
+JSON-LD and the embedded queries. They cover the pre-bound variables, the prefix sources,
+escapes, multi-line and non-ASCII literals, long strings and the fix conditions.
+`tests/lint_corpus.rs` also runs the W3C N-Triples and N-Quads suites, Jena's SHACLC files
+and the JSON-LD files of the Jena and Oxigraph checkouts: no `syntax` finding on a valid
+document, an error on every invalid one, and `fix` accepted by the equivalence checks. The
+MCP tool has tests in `mcp/lint_tests.rs`, and the tool-list test lists it. The shapes
+editor has a unit test of its lint request and a mock-backend test of the marks, and
+`ui/src/lib/lint-runner.test.ts` tests that both editors drop the answer of a lint whose
+text has changed, been cleared or been closed.

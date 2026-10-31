@@ -48,7 +48,22 @@ fn setup() -> tempfile::TempDir {
     std::fs::create_dir(d.path().join("q")).unwrap();
     std::fs::write(d.path().join("q/a.rq"), QUERY).unwrap();
     std::fs::write(d.path().join("q/b.ttl"), TURTLE).unwrap();
-    std::fs::write(d.path().join("q/c.nt"), "<a> <b> <c> .\n").unwrap();
+    std::fs::write(
+        d.path().join("q/c.nt"),
+        "<http://x/a> <http://x/b> \"c\"@EN .\n",
+    )
+    .unwrap();
+    std::fs::write(d.path().join("q/d.rdf"), "<rdf:RDF/>").unwrap();
+    std::fs::write(
+        d.path().join("q/e.jsonld"),
+        "{\"@context\": {\"a\": \"http://x/a\"}, \"@id\": \"http://x/s\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("q/f.shaclc"),
+        "PREFIX u: <http://u/>\nshape <http://x/S> { <http://x/p> IRI . }\n",
+    )
+    .unwrap();
     d
 }
 
@@ -56,7 +71,7 @@ fn setup() -> tempfile::TempDir {
 fn reports_and_exit_statuses() {
     let d = setup();
     let dir = d.path();
-    // warnings only: exit 0; the walk skips the N-Triples file
+    // warnings only: exit 0; the walk skips the RDF/XML file
     let o = run(dir, &["lint", "q"]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     let text = out(&o);
@@ -75,7 +90,19 @@ fn reports_and_exit_statuses() {
         text.contains("q/b.ttl:2:11: warning [suspicious-datatype]"),
         "{text}"
     );
-    assert!(!text.contains("c.nt"), "{text}");
+    assert!(
+        text.contains("q/c.nt:1:30: warning [language-tag-case]"),
+        "{text}"
+    );
+    assert!(!text.contains("d.rdf"), "{text}");
+    assert!(
+        text.contains("q/e.jsonld:1:15: hint [unused-context-term]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("q/f.shaclc:1:1: warning [unused-prefix]"),
+        "{text}"
+    );
     assert!(err(&o).contains("problems ("), "{}", err(&o));
     // --strict fails on warnings, and --rule raises one to an error
     assert_eq!(run(dir, &["lint", "--strict", "q"]).status.code(), Some(1));
@@ -91,9 +118,9 @@ fn reports_and_exit_statuses() {
         out(&o)
     );
     // files lint does not take, and bad flags
-    let o = run(dir, &["lint", "q/c.nt"]);
+    let o = run(dir, &["lint", "q/d.rdf"]);
     assert_eq!(o.status.code(), Some(2));
-    assert!(err(&o).contains("N-Triples is not linted"), "{}", err(&o));
+    assert!(err(&o).contains("RDF/XML is not linted"), "{}", err(&o));
     assert_eq!(
         run(dir, &["lint", "--rule", "nope=off", "q"]).status.code(),
         Some(2)

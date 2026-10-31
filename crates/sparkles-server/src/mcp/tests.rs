@@ -168,6 +168,10 @@ mod validate;
 #[path = "format_tests.rs"]
 mod format;
 
+#[cfg(feature = "fmt")]
+#[path = "lint_tests.rs"]
+mod lint;
+
 #[path = "phase3_tests.rs"]
 mod phase3;
 
@@ -591,6 +595,16 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "options": {"type":"object","description":"Style options, as in .sparklesfmt.toml but in camelCase: lineWidth, indentWidth, sort, prunePrefixes, directiveStyle, prefixGroups, typeShorthand, compactIris, quoteStyle, operatorPosition, turtleLayout, alignValues"},
                 "timeoutSeconds": to}}),
         ),
+        #[cfg(feature = "fmt")]
+        (
+            "lint",
+            json!({"type":"object","additionalProperties":false,"required":["text"],"properties":{
+                "text": {"type":"string","minLength":1,"maxLength":1048576,"description":"The document to lint"},
+                "language": {"enum":["sparql","turtle","trig","ntriples","nquads","jsonld","shaclc"],"description":"Detected from the text when left out (N-Triples reads as Turtle)"},
+                "options": {"type":"object","description":"Rule levels, as in the [lint] table of .sparklesfmt.toml but with camelCase rule names such as unusedPrefix: each value is error, warning, info, hint or off. Syntax errors cannot be turned off","additionalProperties":{"enum":["error","warning","info","hint","off"]}},
+                "fix": {"type":"boolean","default":false,"description":"Also apply the safe fixes and return the fixed text and the number of fixes applied"},
+                "timeoutSeconds": to}}),
+        ),
         (
             "read_chunks",
             json!({"type":"object","additionalProperties":false,"required":["rendition"],"properties":{
@@ -665,6 +679,8 @@ async fn a03_tool_list() {
             "validate_shex",
             #[cfg(feature = "fmt")]
             "format",
+            #[cfg(feature = "fmt")]
+            "lint",
             "read_chunks",
             "list_sources",
             "ingest_profile",

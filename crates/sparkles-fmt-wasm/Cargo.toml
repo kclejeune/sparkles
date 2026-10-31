@@ -18,3 +18,7 @@ serde_json.workspace = true
 # rand (through spargebra and oxrdf) takes its entropy from the browser's crypto API
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# the lint and format entry points run in a real wasm runtime (node) in the tests
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"

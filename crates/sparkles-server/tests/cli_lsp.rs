@@ -493,7 +493,7 @@ fn every_language_the_library_formats() {
         (
             Language::NTriples,
             "nt",
-            "<http://example.org/a>   <http://example.org/b> \"c\"@EN .",
+            "<http://example.org/a>   <http://example.org/b> \"c\"@en .",
         ),
         (
             Language::NQuads,

@@ -349,18 +349,11 @@ fn fixes() {
 }
 
 #[test]
-fn other_languages_are_refused() {
-    assert_eq!(
-        lint("<a> <b> <c> .", Language::NTriples, &LintOptions::default()),
-        Err(LintError::UnsupportedLanguage("N-Triples"))
-    );
-}
-
-#[test]
 fn every_rule_is_documented_once() {
     let mut ids: Vec<&str> = RULES.iter().map(|r| r.id).collect();
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), RULES.len());
     assert!(RULES.iter().all(|r| !r.summary.is_empty()));
+    assert!(RULES.iter().all(|r| !r.languages.is_empty()));
 }
