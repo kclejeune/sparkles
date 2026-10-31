@@ -95,9 +95,8 @@ Wave A holds the work that most improves the engine against objective measures.
   mixed-load writes follow through items 446 and 447, and cold point lookups
   through item 4.
 * Streaming execution and spill follow through items 7 and 93.
-* The Stage A lanes of item 17 are items 413 to 417. They deliver the safety net,
-  internal circuits, the provenance algebra, reasoner witnesses and the fixed-point
-  operator.
+* The remaining Stage A lanes of item 17 are items 414 to 417. They deliver internal
+  circuits, the provenance algebra, reasoner witnesses and the fixed-point operator.
 * Small lanes that finish a capability run in free capacity. These are items 277 and
   77, and the CSVW and RML conformance gaps in items 235 and 232.
 
@@ -105,7 +104,7 @@ Wave A holds the work that most improves the engine against objective measures.
 
 Wave B starts with item 81 Phase 3, then items 341, 396 and 435 and the remaining C18
 work. Item 18 Phase 3 and item 12 follow once the item 17 lanes they need have landed.
-Item 12 needs items 413 and 414, and item 18 Phase 3 needs items 415 and 416.
+Item 12 needs item 414, and item 18 Phase 3 needs items 415 and 416.
 
 ### Production readiness
 
@@ -177,7 +176,7 @@ not to every extension in a spec or to phases that have already shipped.
 | Track | Open items | Specs |
 |---|---|---|
 | **Performance** | 1 refreshes the evidence while 7 and 4 address their remaining gates. Item 93 controls the spill default, and 446 lowers the fence cost of indexed group commit. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
-| **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 413 and 414. | F14, C22, F13 |
+| **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 414. | F14, C22, F13 |
 | **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. | F16, F17, F13, F18 |
 | **Evidence and maintained analyses** | 81 and 339 can run independently, and both feed 340's shared representation and durable execution. Item 396 specializes the available evidence and temporal profiles with entity modeling and offline fixtures. Item 341 adds validity, and later incremental maintenance uses the lanes of item 17. | C25, C26, A01, F22, C27, C22b |
 
@@ -189,12 +188,9 @@ incremental execution exists.
 flowchart LR
     E["81 · Shared evidence"] --> A["340 · Maintained analyses"]
     J["339 · Durable jobs and delivery"] --> A
-    L0["413 · Safety net and load checks"] --> L1["414 · Internal circuits"]
-    L0 --> L2["415 · Provenance algebra"]
-    L2 --> L3["416 · Reasoner witnesses"]
+    L2["415 · Provenance algebra"] --> L3["416 · Reasoner witnesses"]
     L2 --> L4["417 · Fixed-point operator"]
-    L0 --> R["12 · View-based report refresh"]
-    L1 --> R
+    L1["414 · Internal circuits"] --> R["12 · View-based report refresh"]
     L2 --> V["18 · F18 Phase 3 supported visibility"]
     L3 --> V
     E --> V
@@ -210,8 +206,8 @@ flowchart LR
 
 Item 226 goes with item 414, because the change ring is copied for every commit once an
 internal circuit consumes it. Item 223 comes before item 427, and item 222 comes before
-items 424 and 426. The other item 17 lanes in Stage B and Stage C depend on item 413 and
-are listed in the [lane table](#lanes-of-item-17).
+items 424 and 426. The other item 17 lanes in Stage B and Stage C are listed in the
+[lane table](#lanes-of-item-17).
 
 Item 19 Phase 2 does not wait for F13 Phase 3. Its `auto` mode must account for the
 materialization states available when it lands. Item 100 Phase 1's report configurations
@@ -258,7 +254,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F09](specs/F09-branches-and-merges.md#outcome) | 45 | Finish relink from the remote CLI and remote/archive cloning. Compare relink identities and clone contents with offline operations, including chosen commits, lineage, cancellation and corrupt-transfer refusal. |
 | [F10](specs/F10-replication.md#outcome) | 74, 280, 66 | Settle the replication contract before implementing replicas, bootstrap, archives, promotion, synchronous acknowledgement and fenced failover. Test exact primary identities, stream gaps, restart and declared data-loss guarantees, and separately complete multi-transaction patch and blank-node semantics. |
 | [F11](specs/F11-encryption-at-rest.md#outcome) | 61, 65, 58, 59 | Finish key workflows and recovery, Phase 2 chunking and write-only age-recipient repositories, then live-file and derived-index encryption. Pass the remaining phase acceptance for provider outages, read-authority separation, rotation, locked states and format compatibility. Standard builds include repository encryption with protected keys on Linux and macOS; later phases remain open. |
-| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 413–430, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
+| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 414–430, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
 | [F14](specs/F14-graph-algorithms.md#outcome) | 8 | Finish Graphalytics acceptance, completion, background progress and the remaining algorithm surfaces. The C23 writer is item 36 and openCypher procedures are item 20, and each belongs to its own capability. Items 79 and 80 extend weighted betweenness as optional work, and the exact refusal boundaries stand until a broader domain is defined and independently validated. |
 | [F16](specs/F16-materialization-at-scale.md#outcome) | 9, 113 | Deliver the separate derived layer, canonical equality representatives and the remaining barrier-free and incremental-equality execution. Re-run the scale, differential, datatype and kept-closure memory gates, and settle the named small-change costs with matched measurements. |
 | [F17](specs/F17-query-time-reasoning.md#outcome) | 19, 190, 192, 193 | Finish automatic cost selection, hybrid rules, OWL 2 QL, settings and client surfaces, then F13-maintained tables and provenance. Close Phase 1's cache accounting, DESCRIBE and per-query costs with demand/materialization equivalence tests. |
@@ -330,7 +326,7 @@ continues within its caller-visible evidence and measured-latency scope.
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 17 | **Incremental computation core.** This umbrella item is split into one item per lane, items 413 to 429, so that each lane has its own size and dependencies. Item 17 is complete when all of its lanes are. The [lane table](#lanes-of-item-17) lists them. GraphQL subscriptions are deferred under item 37 until a workload asks for them. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
+| 17 | **Incremental computation core.** This umbrella item is split into one item per lane, items 413 to 429, so that each lane has its own size and dependencies. Item 17 is complete when all of its lanes are. Item 413 is complete, and the [lane table](#lanes-of-item-17) lists the others. GraphQL subscriptions are deferred under item 37 until a workload asks for them. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
 | 18 | **Explanations.** Provenance-aware protections with `reviewedOnly` over derived facts. Demand derivation trees, bounded why-not searches, entailment diffs and minimal justifications are available. Phase 3 needs the provenance algebra and reasoner witnesses of items 415 and 416. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
 | 23 | **Full-text parity.** Online enabling and reconfiguring, search after uncommitted writes, and historical search remain. The analyzers that follow Lucene's and the dictionary analyzers are built. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
 | 24 | **GeoSPARQL completion.** Add per-row nearest-neighbour joins that run at least 50 times faster than the generic plan, QLever's `spatialSearch:` syntax, metric-property rewrites and polygon approximations in a versioned index format. Add exact Helmert datum shifts and geographic CRSs on datums other than WGS 84, opt-in grid-based shifts from operator-supplied grid files that still refuse when a needed grid is missing, and curved GML segments read by densifying arcs into line segments within a stated tolerance. Exact arithmetic on curves, GML solids, 3D constructions and splitting lines at crossings are not adopted. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | L | Medium |
@@ -340,7 +336,7 @@ continues within its caller-visible evidence and measured-latency scope.
 | 7 | **Batch-oriented execution and disk spill.** The full-scale spill matrix passes, while execution follow-ups and the default decision remain under item 93. Spill stays opt-in, and several cases still run eagerly. The [remaining work](#remaining-work-for-item-7) is listed below. | [X08](specs/X08-disk-spill-and-server-memory.md) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
 | 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress, remaining algorithm surfaces, and the remaining algorithm surfaces remain. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
 | 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. Representatives would also let derivation on demand read equality without the `eq-rep-*` rules. Today a demand on a small view where `owl:sameAs` relates classes and properties can take much longer than materializing the whole view. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
-| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit remains planned and waits for items 413 and 414. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
+| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit remains planned and waits for item 414. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 14 | **Compaction and operation progress.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. Shared controlled load and compaction progress must also reach the Node callbacks without weakening cancellation or memory budgets. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#operation-progress) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 113 | **Small changes and undos over a kept closure.** Changes of 100 triples at 16 threads and undos at 1 thread remain slower than before the F16 follow-up, and a profile of the full run should find or rule out a cost of about 5%. The options are an opt-in in-memory index of the input facts, charged to the memory budget, and per-thread counters in the block cache. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
@@ -349,7 +345,7 @@ continues within its caller-visible evidence and measured-latency scope.
 
 Stage A makes the incremental core safe and supplies what items 12, 18 and 19 need.
 Items 12, 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 12 needs
-items 413 and 414, item 18 Phase 3 needs items 415 and 416, and item 19 Phase 3 needs
+item 414, item 18 Phase 3 needs items 415 and 416, and item 19 Phase 3 needs
 items 415 and 417. Stage B delivers the rest of Phase 2. Stage C delivers view
 provenance. The F13 spec records the design decisions that the lanes follow. Items that
 affect the write path measure with the `--views none|async:N|commit:Q|graph:N` option of
@@ -357,19 +353,18 @@ affect the write path measure with the `--views none|async:N|commit:Q|graph:N` o
 
 | # | Item | Spec | Size | Depends on |
 |---|---|---|---|---|
-| 413 | **Safety net and load checks.** Apply `ViewDef::check()` when a view loads or attaches, so a format 1 `view.json` that carries graph, commit, branch or `keepCommits` members is refused and no longer runs silently as an async table view. Add the `COMPILER` version bump test and reduce the complexity of `runtime.rs`. | [F13](specs/F13-incremental-views-and-provenance.md#84-persistence) | S–M | None |
-| 414 | **Internal circuits.** Let the server attach circuits that no user defined, with an accumulator sink and a server-only `InternalAccess`. The accumulator keeps each changed fact's identity to the sink, which sums the absolute weight per key and fact and then per key, so an addition followed by a removal counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the existing feed-based counter does. Item 12 counts per-community changes with one. Tests cover churn across commits, a same-commit replacement and deletion-only workloads against that counter. Item 226 goes with this lane, and the lane adds the `--views none\|async:N\|commit:Q\|graph:N` option to `scripts/nsc-writes.sh` so that write-path gates can measure views. | [F13](specs/F13-incremental-views-and-provenance.md#36-internal-circuits), [C22](specs/C22-graph-rag-community-summaries.md#5-refresh) | S–M | 413 |
-| 415 | **Provenance algebra.** Add the `count`, `lineage` and `why` annotations with a 128-bit `FactKey` over vocabulary keys and bounded witness sets. | [F13](specs/F13-incremental-views-and-provenance.md#5-provenance) | S–M | 413 |
+| 414 | **Internal circuits.** Let the server attach circuits that no user defined, with an accumulator sink and a server-only `InternalAccess`. The accumulator keeps each changed fact's identity to the sink, which sums the absolute weight per key and fact and then per key, so an addition followed by a removal counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the existing feed-based counter does. Item 12 counts per-community changes with one. Tests cover churn across commits, a same-commit replacement and deletion-only workloads against that counter. Item 226 goes with this lane, and the lane adds the `--views none\|async:N\|commit:Q\|graph:N` option to `scripts/nsc-writes.sh` so that write-path gates can measure views. | [F13](specs/F13-incremental-views-and-provenance.md#36-internal-circuits), [C22](specs/C22-graph-rag-community-summaries.md#5-refresh) | S–M | None |
+| 415 | **Provenance algebra.** Add the `count`, `lineage` and `why` annotations with a 128-bit `FactKey` over vocabulary keys and bounded witness sets. | [F13](specs/F13-incremental-views-and-provenance.md#5-provenance) | S–M | None |
 | 416 | **Reasoner witnesses.** Record witnesses in the reasoner with F13's algebra, off unless a protection needs supported visibility, and define how witness sets converge under truncation. | [F18](specs/F18-explanations-and-entailment-diffs.md#71-protections) | M | 415 |
 | 417 | **Fixed-point operator.** Host one fixed-point interface in F13 with a reasoner plug-in, maintain property paths with `+` and `*` through backward and forward rederivation, and add `VIEW_STATE` format 2 for its state. | [F13](specs/F13-incremental-views-and-provenance.md#43-added-in-phase-3), [F17](specs/F17-query-time-reasoning.md#63-kept-current-phase-3) | M | 415 |
-| 418 | **Aggregates and correlated EXISTS.** Maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`, `HAVING` and correlated `EXISTS` instead of recomputing them. | [F13](specs/F13-incremental-views-and-provenance.md#42-added-in-phase-2) | M | 413 |
-| 419 | **Ordered windows.** Keep `ORDER BY` with `LIMIT` and `OFFSET` as a window with a reserve, and report row positions in live diffs. | [F13](specs/F13-incremental-views-and-provenance.md#44-ordered-windows) | S–M | 413 |
-| 420 | **Asynchronous graph views.** Add `graph` views with `view.json` format 3, the `View` commit kind, reserved graphs and skolem IRIs over distinct solutions. On a dataset that restricts reads, a graph view always needs `declassify: true` with an audit record naming the view, its query, the output graph and the declassifying principal. A view without it marks its output graph when it first writes it. The mark stays with the graph and its history after the view is deleted, with or without `dropGraph`, and under a read-restricting policy only administrators read a marked graph until one declassifies the graph with an audit record. Installing such a policy first suspends every undeclassified graph view, including one that has not written its graph, and applies the restriction before the policy is visible. The mark lives in a versioned dataset file that older releases refuse, and this item defines the format. Tests read a populated output graph across the policy transition, cover a C12b protection that hides an input triple, cover a view with no output yet, and delete the view with and without `dropGraph` before checking that current and historical reads are refused to non-administrators. This is the graph-view counterpart of the `view:{name}` grant of item 222. | [F13](specs/F13-incremental-views-and-provenance.md#22-reading-a-view) | M | 413 |
-| 421 | **Commit-time table views.** Maintain table views inside the commit with a defined position relative to the WAL, a fall back from group commit, and suspension on failure by default. Write-path competitive work goes first. | [F13](specs/F13-incremental-views-and-provenance.md#33-maintenance-passes) | L | 413 and the write-path work of item 446 |
+| 418 | **Aggregates and correlated EXISTS.** Maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`, `HAVING` and correlated `EXISTS` instead of recomputing them. | [F13](specs/F13-incremental-views-and-provenance.md#42-added-in-phase-2) | M | None |
+| 419 | **Ordered windows.** Keep `ORDER BY` with `LIMIT` and `OFFSET` as a window with a reserve, and report row positions in live diffs. | [F13](specs/F13-incremental-views-and-provenance.md#44-ordered-windows) | S–M | None |
+| 420 | **Asynchronous graph views.** Add `graph` views with `view.json` format 3, the `View` commit kind, reserved graphs and skolem IRIs over distinct solutions. On a dataset that restricts reads, a graph view always needs `declassify: true` with an audit record naming the view, its query, the output graph and the declassifying principal. A view without it marks its output graph when it first writes it. The mark stays with the graph and its history after the view is deleted, with or without `dropGraph`, and under a read-restricting policy only administrators read a marked graph until one declassifies the graph with an audit record. Installing such a policy first suspends every undeclassified graph view, including one that has not written its graph, and applies the restriction before the policy is visible. The mark lives in a versioned dataset file that older releases refuse, and this item defines the format. Tests read a populated output graph across the policy transition, cover a C12b protection that hides an input triple, cover a view with no output yet, and delete the view with and without `dropGraph` before checking that current and historical reads are refused to non-administrators. This is the graph-view counterpart of the `view:{name}` grant of item 222. | [F13](specs/F13-incremental-views-and-provenance.md#22-reading-a-view) | M | None |
+| 421 | **Commit-time table views.** Maintain table views inside the commit with a defined position relative to the WAL, a fall back from group commit, and suspension on failure by default. Write-path competitive work goes first. | [F13](specs/F13-incremental-views-and-provenance.md#33-maintenance-passes) | L | The write-path work of item 446 |
 | 422 | **Commit-time graph views.** Write a graph view's triples in the commit that caused them. | [F13](specs/F13-incremental-views-and-provenance.md#33-maintenance-passes) | M | 420, 421 |
-| 423 | **WebSocket transport.** Serve live queries over WebSocket with axum's `ws` feature and include item 224's server-wide limit of live queries. | [F13](specs/F13-incremental-views-and-provenance.md#12-dependencies) | M | 413 |
+| 423 | **WebSocket transport.** Serve live queries over WebSocket with axum's `ws` feature and include item 224's server-wide limit of live queries. | [F13](specs/F13-incremental-views-and-provenance.md#12-dependencies) | M | None |
 | 424 | **MCP views.** Add `watch_query`, `list_views` and `read_view` to the MCP server. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | S–M | 222 |
-| 425 | **Node and JVM view APIs.** Expose views and live queries in the Node and JVM bindings. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | M | 413 |
+| 425 | **Node and JVM view APIs.** Expose views and live queries in the Node and JVM bindings. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | M | None |
 | 426 | **Views in the UI.** Add view management and live results to the web UI. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | M | 222 |
 | 427 | **Per-branch views and `keepCommits`.** Keep state per branch with defined fork semantics, and keep recent diffs in memory only for reads at past commits. | [F13](specs/F13-incremental-views-and-provenance.md#7-branches-and-history) | M | 223 |
 | 428 | **Data-dependent protections as views.** Compile protections that depend on data into views, so a live reader no longer recomputes its whole query. | [F13](specs/F13-incremental-views-and-provenance.md#62-live-queries) | L | 417 |
@@ -600,6 +595,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **413.** Load-time checks of view definitions, the `COMPILER` version test and the views runtime split into modules. [F13](specs/F13-incremental-views-and-provenance.md#outcome)
 - **2.** Server-wide cache sizing and query memory pool. [X08](specs/X08-disk-spill-and-server-memory.md) Phase 1
 - **3.** Group commit as the default. [X09](specs/X09-group-commit-by-default.md)
 - **86.** Group commit for datasets with a full-text, spatial or embedding index, meeting the gates of X09 section 17.9. [X09](specs/X09-group-commit-by-default.md#phase-4) Phase 4

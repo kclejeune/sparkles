@@ -7,7 +7,7 @@
 > graph views, commit-time maintenance, additional transports and branch views remain
 > planned. Phase 3's per-fact provenance and recursive incremental execution remain
 > planned, and GraphQL subscriptions are deferred until a workload asks for them. The
-> remaining work is split into the lanes of roadmap items 413 to 429.
+> remaining work is split into the lanes of roadmap items 414 to 429.
 >
 > **User docs:** [Incremental views](../API.md#incremental-views),
 > [live queries](../API.md#live-queries) and [usage](../USAGE.md#incremental-views).
@@ -866,15 +866,20 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-**Phase 1 delivered on 2026-10-24.** Phases 2 and 3 are not built, and
-[ROADMAP](../ROADMAP.md) item 17 tracks them as items 413 to 429.
+**Phase 1 delivered on 2026-10-24.** Item 413, the load-time checks and the split of the
+runtime into modules, was delivered on 2026-10-31. Phases 2 and 3 are not built, and
+[ROADMAP](../ROADMAP.md) item 17 tracks them as items 414 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
   operators in `ops/`, and `circuit.rs` runs a circuit's passes. `footprint.rs` resolves
   a circuit's (graph, predicate, constant) entries against a snapshot. `persist.rs`
-  writes checkpoints, `views.rs` reads and writes `view.json`, `live.rs` holds the
-  subscriptions and `runtime.rs` runs a dataset's passes.
+  writes checkpoints, `views.rs` reads and writes `view.json` and `live.rs` holds the
+  subscriptions. `runtime/` runs a dataset's passes, with one module per concern.
+  `registry.rs` loads and checks the definitions, `attach.rs` attaches views and
+  recovers their checkpoints, `round.rs` runs the passes, `catalog.rs`, `read.rs` and
+  `subscribe.rs` serve definitions, reads and live queries, `key.rs` holds the circuit
+  key and `COMPILER`, and `worker.rs` holds the worker thread and shutdown.
 - `Store::commit_deltas` returns each commit's net changes as ids. While someone
   subscribes (`Store::subscribe_deltas`), the commit path copies each commit's changes
   into a ring of at most 4,096 commits and 4M changes before it publishes the commit.
@@ -1009,11 +1014,19 @@ capabilities and remaining work are described by the spec status and Outcome.
   rather than running the evaluation in the task.
 
 **Load-time checks.** `Runtime::open` and every attach check a definition as `PUT`
-does. A `view.json` of format 1 that holds an option a later phase adds, such as
-`mode: graph`, `maintenance: commit`, other branches, `keepCommits` or provenance, is
-listed as failed with `unsupported-option` and never runs. Such a file can come from a
-hand edit or from a release that supports the option at the same format. The other
-views of the dataset attach and run, and defining the view again replaces the file.
+does. Every definition enters the runtime through `ViewEntry::new`, which applies
+`ViewDef::check`, whether it comes from disk or from `PUT`. A `view.json` of format 1
+that holds an option a later phase adds, such as `mode: graph`, a `graph` name,
+`maintenance: commit`, `onFailure: reject`, `declassify: true`, other branches,
+`keepCommits` or provenance, is listed as failed with `unsupported-option` and never
+runs. Such a file can come from a hand edit or from a release that supports the option
+at the same format. `onFailure` and `declassify` are part of the definition schema, so a
+file that names them fails only its own view and does not make the whole set
+unreadable. Their defaults, `suspend` and `false`, mean what Phase 1 does and run. The
+other views of the dataset attach and run, and defining the view again replaces the
+file. A `view.json` of a format this release does not know, such as format 3, still
+refuses changes to every view, so that a newer release's definitions are never
+overwritten.
 
 **Differential and recovery tests.** The differential tests of §11 draw queries from a
 grammar-driven generator in `incr/gen.rs`. It covers the fragment of §4.1 and the
@@ -1057,7 +1070,8 @@ pass after the switch. After an open, every view loads its checkpoint, applies t
 commits since and matches the oracle. A checkpoint interrupted before its rename used to
 leave its temporary file behind, and the next checkpoint now removes it. A further test
 fingerprints the variants of the operator enum and fails when they change while
-`COMPILER`, which checkpoint fingerprints include, keeps its name.
+`COMPILER` in `incr/runtime/key.rs`, which checkpoint fingerprints include, keeps its
+name.
 
 **Measurements.** See [BENCHMARKS](../benchmarks/writes/RESULTS.md#incremental-views). Three pinned forge
 runs at 200,000 and 1,000,000 people put touching rounds near one query evaluation, with
