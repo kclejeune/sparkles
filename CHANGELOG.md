@@ -501,6 +501,11 @@ reply, key redacted, in `replies.jsonl`.
 
 ### Fixed
 
+A delete or rename of a dataset waits up to two seconds for the requests and workers
+that still hold it, such as the first round of a new dataset's view worker, before it
+answers `409` with "still has live requests". Right after a create or clone, such a call
+no longer fails now and then.
+
 A view or live query whose `FILTER EXISTS` or `FILTER NOT EXISTS` holds a path that
 matches the empty path, such as `:p*` or `:p?`, from a variable of the outer rows now
 gives the query's answer (roadmap item 439). The circuit joined the outer rows with

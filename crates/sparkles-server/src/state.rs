@@ -1261,9 +1261,10 @@ impl AppState {
         let leaving = self.leave(name)?;
         let cached = self.routing.lock().remove(name);
         // Only a managed persistent dataset has files that an old handle could write.
-        if cached.as_ref().is_some_and(|ds| {
-            ds.kind == DbType::Persistent && !ds.ephemeral && Arc::strong_count(ds) > 1
-        }) {
+        if cached
+            .as_ref()
+            .is_some_and(|ds| ds.kind == DbType::Persistent && !ds.ephemeral && !drained(ds))
+        {
             self.routing
                 .lock()
                 .insert(name.to_string(), cached.expect("checked"));
@@ -1331,7 +1332,7 @@ impl AppState {
         }
         let leaving = self.leave(from)?;
         let cached = self.routing.lock().remove(from);
-        if cached.as_ref().is_some_and(|ds| Arc::strong_count(ds) > 1) {
+        if cached.as_ref().is_some_and(|ds| !drained(ds)) {
             self.routing
                 .lock()
                 .insert(from.to_string(), cached.expect("checked"));
@@ -1821,6 +1822,24 @@ pub fn uptime_secs(state: &AppState) -> u64 {
     state.started.elapsed().as_secs()
 }
 
+/// How long a delete or rename waits for the requests and workers that still hold a
+/// leaving dataset, such as the first round of a new dataset's view worker.
+const LEAVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `ds` is held by its caller alone, waiting up to [`LEAVE_DRAIN`] for other
+/// holders to let go. Lookups no longer find a leaving dataset, so no new holder
+/// appears meanwhile.
+fn drained<T>(ds: &Arc<T>) -> bool {
+    let end = Instant::now() + LEAVE_DRAIN;
+    while Arc::strong_count(ds) > 1 {
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2000,6 +2019,39 @@ pub(crate) mod tests {
             .expect("cancelled unrun work must release its catalog before terminal status");
         release.send(()).unwrap();
         drop(reopened);
+    }
+
+    #[test]
+    fn delete_and_rename_wait_for_a_short_lived_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        for name in ["held-briefly", "renamed-briefly"] {
+            drop(st.create(name, DbType::Persistent).unwrap());
+        }
+        // Like the first round of a new dataset's view worker, a holder that lets go
+        // within the drain window does not refuse the change.
+        let brief = |ds: Arc<Dataset>| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(ds);
+            })
+        };
+        let holder = brief(st.get("held-briefly").unwrap());
+        assert!(st.delete("held-briefly").unwrap());
+        holder.join().unwrap();
+        let holder = brief(st.get("renamed-briefly").unwrap());
+        st.rename("renamed-briefly", "renamed-after").unwrap();
+        holder.join().unwrap();
+        assert!(st.get("renamed-after").is_some());
+        // A holder that outlasts the window is still refused, and the dataset stays.
+        let kept = st.get("renamed-after").unwrap();
+        let started = Instant::now();
+        let e = st.delete("renamed-after").unwrap_err().to_string();
+        assert!(e.contains("still has live requests"), "{e}");
+        assert!(started.elapsed() >= LEAVE_DRAIN);
+        drop(kept);
+        assert!(st.get("renamed-after").is_some());
     }
 
     #[test]
