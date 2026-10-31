@@ -314,9 +314,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the log and of the vocabulary, two device cache flushes, while an ordinary commit writes
   through with none. On the SK hynix drives of the benchmark hosts in their slow state a
   fence then synchronizes in 1.3 to 1.5 ms against about 1.0 ms for one ordinary commit,
-  which is roadmap item NEW-ITEM-1. Staged full-text documents do not count toward the
+  which is roadmap item 446. Staged full-text documents do not count toward the
   queue's byte limit, and the leader applies text changes while its fence is still active,
-  which is item NEW-ITEM-2.
+  which is item 447. A serial commit pays 0.1% to 0.3% more instructions for the group's
+  admission checks, and spatial readers at 1.05M under mixed load measured a p50 ratio of
+  1.028, both within their gates, which is item 448.
 * Automatic execution streams eligible large scans, groupings and ASK joins. Other
   plans remain eager, including an EXISTS evaluated once per outer key when its cursor
   is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays
@@ -380,7 +382,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md), [item 343](../ROADMAP.md).
+The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 93](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 446](../ROADMAP.md), [item 447](../ROADMAP.md), [item 448](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

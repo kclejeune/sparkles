@@ -1,0 +1,7 @@
+{
+  "people": 1000000,
+  "index": "geo",
+  "triples": 10527336,
+  "input_lines": 10527340,
+  "sha256": "ebefaed1b484e50cce044a03bf3aeb2935a1a079494cf2c15093dee265c00693"
+}

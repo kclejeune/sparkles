@@ -1,0 +1,419 @@
+{
+  "gates": [
+    {
+      "people": 100000,
+      "index": "geo",
+      "scenario": "mixed",
+      "processes_per_variant": 10,
+      "checks": {
+        "peak_rss": {
+          "delta_kib": -3836,
+          "certified_delta_upper_kib": -3836,
+          "passed": true,
+          "ordinary_interval_sampled_lower_kib": 218920,
+          "grouped_outer_upper_kib": 215084
+        },
+        "achieved_rate": {
+          "processes": [
+            {
+              "namespace": "item86_685e887303bd46afa23c140cf8da7a6e",
+              "grouped": false,
+              "block": 0,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885993828,
+              "ratio": 0.9999299462747552,
+              "passed": true
+            },
+            {
+              "namespace": "item86_1bc2b67d2ecc4ec6a5a8c1240b0f8012",
+              "grouped": true,
+              "block": 0,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.886019282,
+              "ratio": 0.9999299995347737,
+              "passed": true
+            },
+            {
+              "namespace": "item86_b1670e9f67df459a915e7cdbaf12f90a",
+              "grouped": true,
+              "block": 0,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885017316,
+              "ratio": 0.9999279030184047,
+              "passed": true
+            },
+            {
+              "namespace": "item86_d1819f761da8434595047ad017386ff7",
+              "grouped": false,
+              "block": 0,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.88632325,
+              "ratio": 0.9999306355582391,
+              "passed": true
+            },
+            {
+              "namespace": "item86_18136c36226d456f91cdc83cdd40bf24",
+              "grouped": false,
+              "block": 1,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.88527025,
+              "ratio": 0.9999284322581906,
+              "passed": true
+            },
+            {
+              "namespace": "item86_932dbfdbb27a4b60a8691367fec7fcf4",
+              "grouped": true,
+              "block": 1,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885738468,
+              "ratio": 0.9999294119588004,
+              "passed": true
+            },
+            {
+              "namespace": "item86_625ff1292d7a4559ace933e793370eaa",
+              "grouped": true,
+              "block": 1,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.886379818,
+              "ratio": 0.9999307539212755,
+              "passed": true
+            },
+            {
+              "namespace": "item86_9b967a5203d64db4ac4234efdc0ac2c6",
+              "grouped": false,
+              "block": 1,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.884872449,
+              "ratio": 0.999927599898302,
+              "passed": true
+            },
+            {
+              "namespace": "item86_1a8bba57ccd74b85b543113b91cfe1dd",
+              "grouped": false,
+              "block": 2,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885575573,
+              "ratio": 0.9999290711168617,
+              "passed": true
+            },
+            {
+              "namespace": "item86_b07168c8fca44859afdea70f0e24861b",
+              "grouped": true,
+              "block": 2,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885179165,
+              "ratio": 0.9999282416716903,
+              "passed": true
+            },
+            {
+              "namespace": "item86_cd8752928e7940518abc9763f06e4006",
+              "grouped": true,
+              "block": 2,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885831942,
+              "ratio": 0.9999296075440508,
+              "passed": true
+            },
+            {
+              "namespace": "item86_5e9b669a89294105a990afc41c0d7125",
+              "grouped": false,
+              "block": 2,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885888483,
+              "ratio": 0.9999297258505921,
+              "passed": true
+            },
+            {
+              "namespace": "item86_fd898750c94146168ab847b10f52a9f4",
+              "grouped": false,
+              "block": 3,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.88602173,
+              "ratio": 0.9999300046569755,
+              "passed": true
+            },
+            {
+              "namespace": "item86_ddae87bcd55049e1bd876a5551275311",
+              "grouped": true,
+              "block": 3,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885448551,
+              "ratio": 0.9999288053356854,
+              "passed": true
+            },
+            {
+              "namespace": "item86_1ee12b9672dd43a1974b13e87cfc24b2",
+              "grouped": true,
+              "block": 3,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885635179,
+              "ratio": 0.9999291958366174,
+              "passed": true
+            },
+            {
+              "namespace": "item86_0a2d6d68cd12447588ab8d8834219596",
+              "grouped": false,
+              "block": 3,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885207945,
+              "ratio": 0.99992830189104,
+              "passed": true
+            },
+            {
+              "namespace": "item86_3f981bb8e9084a00ab581dbedd908828",
+              "grouped": false,
+              "block": 4,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885130878,
+              "ratio": 0.9999281406358407,
+              "passed": true
+            },
+            {
+              "namespace": "item86_8cb91949550547e2a3f9637580e2d8b6",
+              "grouped": true,
+              "block": 4,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.886207061,
+              "ratio": 0.9999303924440612,
+              "passed": true
+            },
+            {
+              "namespace": "item86_f6c154ea834b4216b6ccfef7644b78ed",
+              "grouped": true,
+              "block": 4,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885331354,
+              "ratio": 0.9999285601123655,
+              "passed": true
+            },
+            {
+              "namespace": "item86_0d9c6366ec9c4b5f9512a9a8cb7b834e",
+              "grouped": false,
+              "block": 4,
+              "requirement": "harness load quality",
+              "target_tps": 477.91947386751144,
+              "achieved_tps": 477.885783056,
+              "ratio": 0.9999295052548522,
+              "passed": true
+            }
+          ],
+          "passed": true
+        },
+        "schedule_lag": {
+          "processes": [
+            {
+              "namespace": "item86_685e887303bd46afa23c140cf8da7a6e",
+              "grouped": false,
+              "block": 0,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 4.813548,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_1bc2b67d2ecc4ec6a5a8c1240b0f8012",
+              "grouped": true,
+              "block": 0,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 6.873011,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_b1670e9f67df459a915e7cdbaf12f90a",
+              "grouped": true,
+              "block": 0,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 8.485283,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_d1819f761da8434595047ad017386ff7",
+              "grouped": false,
+              "block": 0,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 6.531433,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_18136c36226d456f91cdc83cdd40bf24",
+              "grouped": false,
+              "block": 1,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 6.684931,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_932dbfdbb27a4b60a8691367fec7fcf4",
+              "grouped": true,
+              "block": 1,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 6.493054,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_625ff1292d7a4559ace933e793370eaa",
+              "grouped": true,
+              "block": 1,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 5.225405,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_9b967a5203d64db4ac4234efdc0ac2c6",
+              "grouped": false,
+              "block": 1,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 4.740672,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_1a8bba57ccd74b85b543113b91cfe1dd",
+              "grouped": false,
+              "block": 2,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 5.998655,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_b07168c8fca44859afdea70f0e24861b",
+              "grouped": true,
+              "block": 2,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 4.798104,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_cd8752928e7940518abc9763f06e4006",
+              "grouped": true,
+              "block": 2,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 6.535934,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_5e9b669a89294105a990afc41c0d7125",
+              "grouped": false,
+              "block": 2,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 6.799828,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_fd898750c94146168ab847b10f52a9f4",
+              "grouped": false,
+              "block": 3,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 5.697085,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_ddae87bcd55049e1bd876a5551275311",
+              "grouped": true,
+              "block": 3,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 3.618218,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_1ee12b9672dd43a1974b13e87cfc24b2",
+              "grouped": true,
+              "block": 3,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 6.810535,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_0a2d6d68cd12447588ab8d8834219596",
+              "grouped": false,
+              "block": 3,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 4.950304,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_3f981bb8e9084a00ab581dbedd908828",
+              "grouped": false,
+              "block": 4,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 8.531133,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_8cb91949550547e2a3f9637580e2d8b6",
+              "grouped": true,
+              "block": 4,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 5.775156,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_f6c154ea834b4216b6ccfef7644b78ed",
+              "grouped": true,
+              "block": 4,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 7.389824,
+              "limit_ms": 50,
+              "passed": true
+            },
+            {
+              "namespace": "item86_0d9c6366ec9c4b5f9512a9a8cb7b834e",
+              "grouped": false,
+              "block": 4,
+              "requirement": "harness load quality; not an X09 numeric threshold",
+              "max_ms": 3.325048,
+              "limit_ms": 50,
+              "passed": true
+            }
+          ],
+          "passed": true
+        },
+        "p50_ms": {
+          "ratio": 1.0157001280569304,
+          "passed": true
+        },
+        "p99_ms": {
+          "ratio": 1.0029478248120476,
+          "passed": true
+        }
+      },
+      "passed": true
+    }
+  ],
+  "passed": true
+}

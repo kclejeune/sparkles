@@ -3,7 +3,7 @@
 > **Status:** Phases 1, 2 and 3 built, with exceptions listed in the Outcome. Group
 > commit is on by default for persistent stores. Phase 4 is built and passes its crash
 > runs, so it also groups the commits of datasets with a full-text, spatial or embedding
-> index, and it meets its performance gates of section 17.9.
+> index, and it meets its performance gates of section 17.9 on `forge`.
 >
 > **Phases:** Phase 1 is the measurements and fixes that the switch depends on: serial
 > latency, reader tails, metrics and power-loss and sync-failure tests. Phase 2 widens
@@ -759,8 +759,9 @@ commit. A throughput with the synchronization time subtracted leaves about 7% of
 ordinary commit, so noise dominates it.
 
 `scripts/bench-indexed-report.py` judges these two gates. The harness's `gate-summary.json`
-keeps the verdicts as first written. The `atlas` campaigns that the Outcome describes were
-the first to judge the amended gates before they had any data, and they confirm them.
+keeps the verdicts as first written. The `atlas` and `forge` campaigns of 2026-10-31 that
+the Outcome describes were the first to judge the amended gates before they had any data,
+and they confirm them.
 
 ### 17.10 Open questions
 
@@ -1691,27 +1692,28 @@ the time it saves. [PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#wr
 records it. The remaining lever is to write a fence through the write-through handles that
 the ordinary path uses, so that the leader writes the prefix's records and terms with FUA
 writes and no flush. That needs the writers to stop writing their records and terms to the
-files and the leader to own those writes, and [ROADMAP](../ROADMAP.md) item NEW-ITEM-1
+files and the leader to own those writes, and [ROADMAP](../ROADMAP.md) item 446
 follows it up.
 
 **Serial spatial commits (item 111).** A serial commit finds the group idle and takes the
 ordinary path, so both settings run the same code, and item 111 found no cost of grouping
-in it. Counted with `perf stat` on `atlas` over three rounds of the order ordinary, grouped,
-grouped, ordinary at 10.5M, a grouped process ran 1,071,300 user instructions per IRI
-insert against 1,070,176 ordinary, and 263,930 per geometry insert against 263,043. That is
-0.1% and 0.3%, about 1,000 instructions or 0.3 µs for the admission checks of the group,
-on commits of 0.57 to 0.66 ms. The latency medians of the two settings matched within each
-drive state, and the processes that ran in the slow state were slow in both settings. The
-`forge` campaign shows the same. Its grouped spatial literal processes had a median mean
-synchronization of 1.31 ms against 1.25 ms for the ordinary ones, with identical
-write-through syncs, and the engine overhead per process, the mean latency less the mean
-synchronization, had a median of 0.223 ms grouped and 0.225 ms ordinary. The missed p90 of 1.077 and the
-earlier figure of 0.240 against 0.213 ms followed which processes the drive slowed. The
-serial gates of the spatial dataset at 10.5M ran again on `atlas` with five blocks, and
-all six checks were met. The paired ratios of grouped to ordinary were 0.984 at p50 and
-0.973 at p90 for literal inserts, 0.999 and 1.000 for IRI inserts, and 1.016 and 1.019 for
-deletes. The 0.1% to 0.3% of instructions is the tradeoff of
-the admission checks, and it stays.
+in it. Counted with `perf stat` on `atlas` over three rounds of the order ordinary,
+grouped, grouped, ordinary at 10.5M, a grouped process ran 1,071,300 user instructions per
+IRI insert against 1,070,176 ordinary, and 263,930 per geometry insert against 263,043.
+That is 0.1% and 0.3%, about 1,000 instructions or 0.3 µs for the admission checks of the
+group, on commits of 0.57 to 0.66 ms. The latency medians of the two settings matched
+within each drive state, and the processes that ran in the slow state were slow in both
+settings. The `forge` campaign shows the same. Its grouped spatial literal processes had a
+median mean synchronization of 1.31 ms against 1.25 ms for the ordinary ones, with
+identical write-through syncs, and the engine overhead per process, the mean latency less
+the mean synchronization, had a median of 0.223 ms grouped and 0.225 ms ordinary. The
+missed p90 of 1.077 and the earlier figure of 0.240 against 0.213 ms followed which
+processes the drive slowed. The serial gates of the spatial dataset at 10.5M ran again
+with five blocks on `atlas` and on `forge`, described below, and all six checks were met
+on both. On `atlas` the paired ratios of grouped to ordinary were 0.984 at p50 and 0.973
+at p90 for literal inserts, 0.999 and 1.000 for IRI inserts, and 1.016 and 1.019 for
+deletes. The 0.1% to 0.3% of instructions is the tradeoff of the admission checks, and it
+stays. [ROADMAP](../ROADMAP.md) item 448 follows up that cost and the delete ratios.
 
 **Four writers on `atlas`.** Five blocks of four writers inserting literals at 1.05M ran
 on `atlas` on 2026-10-31 under the amended throughput gate, which they judged before any of
@@ -1725,7 +1727,7 @@ to 2,370 transactions/s, and in the other thirteen the fences took 1.27 to 1.90 
 the server committed 1,000 to 1,370. Against its ordinary neighbour, a grouped process of
 the second kind had a median gain of 1.40, within a range of 1.20 to 2.15. A fence carried
 1.70 to 1.99 commits. The gain is smaller in the slow state because each fence then pays
-for two slow flushes, which [ROADMAP](../ROADMAP.md) item NEW-ITEM-1 addresses.
+for two slow flushes, which [ROADMAP](../ROADMAP.md) item 446 addresses.
 
 **Spatial readers at 1.05M (item 171).** The harness now probes the drive before each
 process and can calibrate the offered rate for the slow state. With `--slow-sync-ms`, it
@@ -1733,29 +1735,48 @@ computes the rate that each unpaced ordinary process would sustain if every comm
 synchronization took that long, as the inverse of its mean commit time with the measured
 synchronization replaced by the slow one, and it offers the given fraction of the smallest
 of those rates and of the slowest unpaced process. On `atlas` the unpaced ordinary writer
-committed 907 transactions/s with a mean synchronization of 0.989 ms, and at 1.6 ms the two
-ordinary calibration processes gave 583.6 and 582.6 transactions/s, so the cell offered 80%
-of 582.6, or 466.05. The first campaign at that rate kept every process within 10 to 20 ms
-of its schedule in four blocks. In its fifth block every process of both settings saw the
-drive's writes take 7 to 12 ms and fell behind by 658 to 2,496 ms, which points to I/O from
-outside the campaign, so the cell ran again at the same rate. In the second campaign every
-process kept its schedule, with a largest lag of 11.3 to 21.0 ms ordinary and 11.1 to 13.6
-ms grouped. The reader medians were 1.654 and 1.653 ms at p50 and 2.204 and 2.187 ms at
-p99, the paired ratios were 0.999 and 1.005, and the certified peak resident memory
-difference was −2.2 MiB, so the spatial reader gate at 1.05M is met. The first campaign's
-four complete blocks gave paired ratios of 1.000 and 1.012. The offered rate is lower than
-the 583 of the `forge` rerun because four ordinary writers sustain only about 570
-transactions/s in the slow state, and the calibration leaves room below that.
+committed 907 transactions/s with a mean synchronization of 0.989 ms, and at 1.6 ms the
+two ordinary calibration processes gave 583.6 and 582.6 transactions/s, so the cell
+offered 80% of 582.6, or 466.05. The first campaign at that rate kept every process within
+10 to 20 ms of its schedule in four blocks. In its fifth block every process of both
+settings saw the drive's writes take 7 to 12 ms and fell behind by 658 to 2,496 ms, which
+points to I/O from outside the campaign, so the cell ran again at the same rate. In the
+second campaign every process kept its schedule, with a largest lag of 11.3 to 21.0 ms
+ordinary and 11.1 to 13.6 ms grouped. The reader medians were 1.654 and 1.653 ms at p50
+and 2.204 and 2.187 ms at p99, the paired ratios were 0.999 and 1.005, and the certified
+peak resident memory difference was −2.2 MiB, so the spatial reader gate at 1.05M is met
+on `atlas`. The first campaign's four complete blocks gave paired ratios of 1.000 and
+1.012. The offered rate is lower than the 583 of the `forge` rerun because four ordinary
+writers sustain only about 570 transactions/s in the slow state, and the calibration
+leaves room below that.
 
-**Gates of Phase 4.** Every gate of section 17.9 is met. The serial gates, the throughput
-gates of the full-text and spatial datasets at 1.05M and the spatial reader gate at 1.05M
-were judged on `atlas`, which has the CPU and the drive model of `forge`, and the other
-cells on `forge`. The cost that remains is the fence's two device flushes in the drive's
-slow state, which NEW-ITEM-1 addresses. Three smaller items remain under
-[ROADMAP](../ROADMAP.md) item NEW-ITEM-2. Staged documents could count their bytes in the
-queue's limit, since a queue of long literals now holds more than 4 MiB of them. The leader
-applies a prefix's text changes, a Tantivy commit included when the batch is full, while
-its fence is still active, which delays the next fence and is question 4 of section 17.10.
-The rerun after item 110 had no text process above the 50 ms lag at either size, so this
-delay stays within the load-quality rule there. The model test has no write transaction
-that searches text, so the wait of a search on a speculative head has only unit tests.
+**Forge acceptance on 2026-10-31.** The cells that the earlier `forge` campaigns missed or
+did not establish ran again on `forge` with a release build of `a202e8f2`, five blocks
+each, while another lane shared the host under its heavy-job lock. The
+[run record](../benchmarks/writes/runs/2026-10-31-indexed-group-commit-forge/README.md)
+holds them. The serial spatial cell at 10.5M met all six checks, with paired p50 and p90
+ratios of 1.002 and 1.012 for literal inserts, 1.001 and 0.992 for IRI inserts, and 0.997
+and 1.005 for deletes. Four writers at 1.05M gained 1.564 on the spatial and 1.564 on the
+full-text dataset, against 1.257 and 1.240 required, because the ordinary synchronization
+took a median of only 0.62 and 0.58 ms, with peak resident memory differences of 3.5 and
+1.3 MiB. The spatial mixed cell at 1.05M calibrated a slow-state capacity of 597.4
+transactions/s from unpaced ordinary writers at 1,535 and 1,538 transactions/s, and offered
+477.9. Every process kept its schedule within 3.3 to 8.5 ms, the paired reader p50 and p99
+ratios were 1.028 and 1.003, and the memory difference was −3.7 MiB. The drive spent most of
+these campaigns in its fast state, where a fence took 0.61 to 0.89 ms and carried 1.80 to
+1.87 commits. The `atlas` campaigns above found the slow state in more of their processes,
+and they support the same verdicts.
+
+**Gates of Phase 4.** Every gate of section 17.9 is met on `forge`. The cost that remains
+is the fence's two device flushes in the drive's slow state, which
+[ROADMAP](../ROADMAP.md) item 446 addresses. The reader p50 ratio of 1.028 of the spatial
+mixed cell, the serial delete ratios of 1.016 and 1.019 on `atlas` and the instructions of
+the admission checks are within their gates and stay under item 448. Three smaller items
+remain under [ROADMAP](../ROADMAP.md) item 447. Staged documents could count their bytes
+in the queue's limit, since a queue of long literals now holds more than 4 MiB of them.
+The leader applies a prefix's text changes, a Tantivy commit included when the batch is
+full, while its fence is still active, which delays the next fence and is question 4 of
+section 17.10. The rerun after item 110 had no text process above the 50 ms lag at either
+size, so this delay stays within the load-quality rule there. The model test has no write
+transaction that searches text, so the wait of a search on a speculative head has only
+unit tests.

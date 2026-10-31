@@ -1,0 +1,47 @@
+{
+  "settings": {
+    "provider": null,
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2",
+    "compare_binary": null,
+    "write_bench": "/home/kclejeune/lanes/gc-86/bin/write-bench",
+    "out": "runs/f2-writers-1m",
+    "source_commit": "a202e8f2",
+    "blocks": 5,
+    "people": [
+      100000
+    ],
+    "indexes": [
+      "geo",
+      "text"
+    ],
+    "scenarios": [
+      "writers"
+    ],
+    "serial_changes": 2000,
+    "warmup": 200,
+    "writer_changes": 50000,
+    "write_rate": 0,
+    "rate_fraction": 0.8,
+    "slow_sync_ms": 0,
+    "drive_probe": 64,
+    "port": 41800,
+    "provider_port": 41801,
+    "server_cpus": "0-11",
+    "client_cpus": "12-13",
+    "provider_cpus": "14",
+    "heavy_lock": "/home/kclejeune/lanes/.heavy.lock"
+  },
+  "binary_sha256": "437867bd4c39651dbd17a87a9399f10dc05c37f7bb94dc89d2fa43786b8e129b",
+  "compare_binary_sha256": null,
+  "client_sha256": "9735fda8378e95dcec3fc8c60baefc420644973e467996ba8f1a6fd539071da6",
+  "harness_sha256": "020f1f28e22ae447903adf9f3de192144f86f652ff05451f25e4e51967ec3e33",
+  "uname": [
+    "Linux",
+    "forge",
+    "7.2.9",
+    "#1-NixOS SMP PREEMPT_DYNAMIC Sat Oct  3 10:43:16 UTC 2026",
+    "x86_64"
+  ],
+  "started_unix": 1793444836.2843764,
+  "scope": "native storage; no injected sync delay"
+}

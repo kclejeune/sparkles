@@ -127,17 +127,18 @@ scenario has ten processes per setting. Every process started from a fresh copy 
 seed store, checked every acknowledgement and the index answers, and reopened cold to
 check them again.
 
-Every gate is met. On `forge`, 35 of 36 serial checks, all six throughput gates, all ten
-memory gates and three of the four reader gates are met. The p90 of spatial literal inserts
-at 10.5M missed there, and the spatial reader gate at 1.05M was not established, because
-its ordinary writer did not keep the offered schedule. The [rerun on atlas](#rerun-on-atlas),
-a host with the same CPU and drive model, met the serial gates of that spatial cell, the
-spatial reader gate at 1.05M with a rate calibrated for the drive's slow state, and the
-throughput and memory gates of the full-text and spatial cells at 1.05M.
+Every gate is met on `forge`. The campaigns of 2026-10-23 and 2026-10-24 met 35 of 36
+serial checks, all six throughput gates, all ten memory gates and three of the four reader
+gates. The p90 of spatial literal inserts at 10.5M missed there, and the spatial reader gate
+at 1.05M was not established, because its ordinary writer did not keep the offered
+schedule. The [rerun on forge](#rerun-on-forge) met both, with a rate calibrated for the
+drive's slow state, and met the throughput and memory gates of the full-text and spatial
+cells at 1.05M again. The [rerun on atlas](#rerun-on-atlas), a host with the same CPU and
+drive model, found the slow state in more of its processes and supports the same verdicts.
 
 *The serial, writer and memory cells were measured on forge on 2026-10-23 at commit
 5b40d0ec, the mixed cells on forge on 2026-10-24 with the bounded full-text checkpoint, and
-the rerun on atlas on 2026-10-31 at commit a202e8f2.*
+the reruns on forge and atlas on 2026-10-31 at commit a202e8f2.*
 
 #### Serial commits
 
@@ -176,8 +177,8 @@ processes, 32 of 180 ordinary and 27 of 180 grouped ones had a mean synchronizat
 have p50 medians of 0.464 and 1.053 ms and a paired ratio of 1.001. The engine overhead,
 the mean request latency less the mean synchronization, differs by at most 3.6% between the
 settings in 8 of 10 cells where it can be computed. It is 12.7% higher with grouping for
-spatial literals at 10.5M, 0.240 against 0.213 ms, the cell that misses, and the rerun on
-atlas met both of its gates. Of the 36 paired
+spatial literals at 10.5M, 0.240 against 0.213 ms, the cell that misses, and the reruns on
+forge and atlas met both of its gates. Of the 36 paired
 medians, 19 are above 1.0, with a median of 1.001 and a sign test p value of 0.43, so the
 single-writer path shows no general cost.
 
@@ -226,8 +227,8 @@ ordinary, and the gate asks for at most 1.10 with a schedule lag of at most 50 m
 No text process stalled. The ordinary spatial processes at 1.05M had no slow request, but
 in 36 to 56 of their 86 seconds four queued commit synchronizations took about 7 ms, so
 they sustained about 570 transactions/s against the offered 583. The unpaced calibration
-averaged the drive's fast and slow states, and the rerun on atlas calibrated the rate for
-the slow state instead.
+averaged the drive's fast and slow states, and the reruns on forge and atlas calibrated the
+rate for the slow state instead.
 The text readers' paired ratios of 1.001 and 1.008 are within the gate and the spread of
 the runs, and [roadmap](../../ROADMAP.md) item 170 measures them with more rounds.
 
@@ -237,6 +238,33 @@ Every cell stayed under the 64 MiB limit. The certified peak resident memory
 difference was between −3.4 and 19.6 MiB for the writer scenarios and between 0.3 and
 5.6 MiB for the mixed scenarios, where both settings run for the same time. The
 certificate subtracts the lower sampled bound of the ordinary process, so it errs upward.
+
+#### Rerun on forge
+
+These campaigns ran on `forge` with a release build of commit `a202e8f2`, five blocks each
+in the order ordinary, grouped, grouped, ordinary, while another lane shared the host under
+its heavy-job lock. The [run record](runs/2026-10-31-indexed-group-commit-forge/README.md)
+holds the results, the gate summaries and the process list at the start of each campaign.
+
+| Cell | Measurement | Ordinary | Grouped | Paired ratio | Gate |
+|---|---|---:|---:|---:|---|
+| Spatial at 10.5M, serial literal | p50 and p90 (ms) | 0.432, 0.468 | 0.434, 0.480 | 1.002, 1.012 | Met. |
+| Spatial at 10.5M, serial IRI | p50 and p90 (ms) | 0.487, 1.383 | 0.480, 1.374 | 1.001, 0.992 | Met. |
+| Spatial at 10.5M, serial delete | p50 and p90 (ms) | 0.423, 0.453 | 0.424, 0.462 | 0.997, 1.005 | Met. |
+| Spatial at 1.05M, four writers | tx/s | 1,439 (1,269–1,816) | 2,253 (2,011–2,814) | 1.564 | Met, with 1.257 required. |
+| Full-text at 1.05M, four writers | tx/s | 1,524 (1,423–2,339) | 2,381 (2,002–2,755) | 1.564 | Met, with 1.240 required. |
+| Spatial at 1.05M, readers at 478 tx/s | Reader p50 and p99 (ms) | 0.972, 1.394 | 0.988, 1.398 | 1.028, 1.003 | Met. |
+
+The drive spent most of these campaigns in its fast state. The ordinary writers
+synchronized in a median of 0.62 and 0.58 ms, which sets the required gains, and a fence
+took 0.61 to 0.89 ms and carried 1.80 to 1.87 commits. The certified peak resident memory
+differences were 3.5 and 1.3 MiB for the writers and −3.7 MiB for the readers. The reader
+cell's calibration measured the unpaced ordinary writers at 1,535 and 1,538
+transactions/s with a mean synchronization of 0.58 ms. At 1.6 ms per synchronization they
+would sustain 597.4, and the cell offered 80% of that. Every process kept its schedule
+within 3.3 to 8.5 ms. The reader p50 ratio of 1.028 is within the gate, and
+[roadmap](../../ROADMAP.md) item 448 follows it up with the other small costs that the
+gates accept.
 
 #### Rerun on atlas
 
