@@ -1,0 +1,59 @@
+locks held 2026-10-31T11:06:28Z
+load: 2.18 2.76 3.27 3/620 3015382 free:   20G
+load 11:06:29
+[07:06:29] preflight: 19 GiB free (4% of the filesystem), last trim 2026-10-27 19:14 (/home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/preflight-20261031T070629.txt)
+[07:06:29] warning: the filesystem was last trimmed 3 days ago; on an SSD without online discard, writes may stall (fstrim -v / before a full load)
+[07:06:29] warning: only 4% of the filesystem is free; a full load needs about 100 GiB of temporary space and a full SSD writes more slowly
+[07:06:29] PSI pressure sampled once per second to /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/psi-20261031T070629.tsv
+[07:06:29] scale 50m: 38 files
+[07:06:29] sparkles: loading (log: /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/load-sparkles.log)
+sparkles: 27 s, peak RSS 3126 MiB, index 1.5 GiB
+[07:06:56] qlever: loading (log: /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/load-qlever.log)
+qlever: 0 s, peak RSS 62 MiB, index 0.0 GiB
+load done 11:06:57
+pass 1 11:06:57 load 2.76 2.86 3.29
+[07:06:57] preflight: 20 GiB free (4% of the filesystem), last trim 2026-10-27 19:14 (/home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/preflight-20261031T070657.txt)
+[07:06:57] warning: the filesystem was last trimmed 3 days ago; on an SSD without online discard, writes may stall (fstrim -v / before a full load)
+[07:06:57] warning: only 4% of the filesystem is free; a full load needs about 100 GiB of temporary space and a full SSD writes more slowly
+[07:06:57] PSI pressure sampled once per second to /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/psi-20261031T070657.tsv
+[07:06:58] cold sparkles births-by-decade: 0.047986
+[07:06:58] cold qlever births-by-decade: 0.009963
+
+rows                         sparkles       qlever
+births-by-decade                   80            0
+[07:07:00] sparkles: warming selected queries
+
+== sparkles births-by-decade
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     19.8 ms  ±     2.1 ms      16.7 ms  …    22.3 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+[07:07:03] qlever: warming selected queries
+
+== qlever births-by-decade
+Benchmark 1: qlever (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      4.5 ms  ±     0.2 ms       4.3 ms  …     5.1 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.1 MiB …    11.4 MiB
+ 
+[07:07:06] server RSS (MiB): {
+ "sparkles": "121",
+ "qlever": "45"
+}
+Scale 50m: 38 files of dbpedia-2022.12.tsv; engines: sparkles qlever
+
+Traceback (most recent call last):
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 104, in <module>
+    row(n, rs, bad, err="error", mark=mark, unranked=wrong | split)
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 47, in row
+    best = better(rank, key=lambda c: key(rank[c])) if rank else None
+           ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 47, in <lambda>
+    best = better(rank, key=lambda c: key(rank[c])) if rank else None
+                                      ~~~^^^^^^^^^
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 42, in <lambda>
+    def row(label, rs, bad=frozenset(), f=fmt, better=min, key=lambda r: r["mean"], err="error",
+                                                                         ~^^^^^^^^
+KeyError: 'mean'

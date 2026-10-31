@@ -1650,8 +1650,35 @@ flagged `count-all`, `distinct-obj`, `predicate-subjects`, `values-star` and `mi
 all under 0.3 ms with spreads between server processes of 44% to 220%. Eight rounds
 of 100 requests brought every one of them within 6.5% of the base in server time and
 within 2.8% in client time. Item 328 keeps the quiet Intel checks of these small
-queries. The same-host QLever run is internal evidence. The published ranking and the loss
-list change only after the paired forge comparison that item 432 holds.
+queries. The same-host QLever run is internal evidence. The paired forge comparison under
+[births-by-decade after decimal arithmetic on forge](#births-by-decade-after-decimal-arithmetic-on-forge)
+changes the published ranking and the loss list.
+
+### `births-by-decade` after decimal arithmetic on forge
+
+Item 432 paired `1acdc38a` with QLever 0.5.48 on forge over freshly loaded stores of the 50M
+slice, with both host locks held and each engine alone. The complete-HTTP timer of the
+cursor assessment ran 20 rounds, each with three cold restarts after file-cache eviction and
+one warm process of 20 timed requests per engine. Sparkles took 3.9 ms warm and 27.5 ms cold
+against 17.2 and 29.3 ms for QLever, where the same contract gave 50.2 and 68.1 ms before the
+change. Warm, Sparkles is 4.5 times faster. Cold, it leads by 6%, inside the ten-percent tie
+band. The hyperfine and curl timer of the comparative tables gives 7.1 and 37.8 ms against
+13.5 and 43.8 ms, with five passes of ten warm requests and five cold restarts. Both
+engines return the same 80 groups and one value fingerprint in every request.
+
+The DBpedia tables and the loss list now show Sparkles ahead of QLever on this query. The
+`births-by-decade` row of the 50M tables mixes this run for Sparkles and QLever with the
+earlier run for the other three engines, and its footnote says so. The 1.24-billion-triple
+guards stay internal A/B comparisons.
+
+The run also shows that a Sparkles server process sometimes runs this query three to four
+times slower for its whole life. One of 20 timer rounds took 15.4 ms for the process and one
+of five hyperfine passes about 24 ms per request, against the usual 3 to 5 ms and 6 to
+7 ms. The medians include these processes. A follow-up item records the investigation, since
+the cause could be thread placement on the hybrid cores of the host, the frequency
+governor or the parallel evaluation of the BIND. The
+[run record](../benchmarks/dbpedia/runs/2026-10-31-births-by-decade-forge/README.md)
+keeps both timers' samples and the failed attempts that preceded the run.
 
 ### Preparation-batch short-query control
 
@@ -1675,6 +1702,20 @@ Item 328 retains the accepted `values-star` drift of about 0.4 microseconds. Rec
 it when the short-query execution path next changes, distinguishing instruction cost
 from code placement. A material persistent cost or a simple broad improvement should
 drive further optimization.
+
+### `values-star` after the startup and credential changes
+
+A Namespace screen of the batch with bind-before-open startup and credential expiry
+measured `values-star` about 16% slower in server time. Item 440 ran a pinned
+interleaved check on forge of the parent `34b69139` against the flagged batch
+`65e369db` and against `1acdc38a`, with 24 rounds and 200 requests per query and server
+process. The flagged batch took 4.1% less server time than the parent, and `1acdc38a`
+took 1.9% more, about 0.3 microseconds. The spread between server processes of one build
+is larger than either change. Five of the six control queries move by at most 5.5% in
+both directions, and `star-join` is about 8% faster in both builds. The flagged batch is not slower on forge, so no per-request lookup change
+was needed. Item 328 keeps the small accepted drift of this query. The
+[qualified result and immutable samples](../benchmarks/synthetic/RESULTS.md#short-query-check-of-the-startup-and-credential-changes)
+keep the comparison separate from cross-engine tables.
 
 ### Standard capability integration screen
 

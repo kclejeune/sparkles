@@ -1,0 +1,26 @@
+	Command being timed: "timeout --kill-after=60 1h bash -c 
+      mkdir -p "$1" && cd "$1" && shift &&
+      echo "{\"num-triples-per-batch\": 5000000}" > settings.json &&
+      "$1" -dc "${@:4}" | "$2" -i dbpedia -f - -F nt -p true -s settings.json -m "$3" _ /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/qlever-index /run/current-system/sw/bin/zstd /nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-index 10G /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/anchor-text_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/article-templates_lang=en_nested.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/article-templates_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/categories_lang=en_articles.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/categories_lang=en_labels.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/categories_lang=en_skos.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/citations_lang=en_data.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/citations_lang=en_links.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/commons-sameas-links_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/disambiguations_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/external-links_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/geo-coordinates_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/geo-coordinates-mappingbased_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/homepages_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/images_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/infobox-properties_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/infobox-property-definitions_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/instance-types_lang=en_specific.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/instance-types_lang=en_transitive.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/interlanguage-links_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/labels_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/long-abstracts_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-literals_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-objects_lang=en_disjointDomain.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-objects_lang=en_disjointRange.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-objects_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/ontology--DEV_type=parsed.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/page_lang=en_ids.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/page_lang=en_length.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/persondata_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/redirects_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/redirects_lang=en_transitive.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/revisions_lang=en_ids.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/revisions_lang=en_uris.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/short-abstracts_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/specific-mappingbased-properties_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/wikilinks_lang=en.nt.zst /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/wikipedia-links_lang=en.nt.zst"
+	User time (seconds): 568.33
+	System time (seconds): 58.46
+	Percent of CPU this job got: 1242%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:50.45
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 7273776
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 59
+	Minor (reclaiming a frame) page faults: 23964868
+	Voluntary context switches: 695484
+	Involuntary context switches: 235156
+	Swaps: 0
+	File system inputs: 2252824
+	File system outputs: 8644016
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

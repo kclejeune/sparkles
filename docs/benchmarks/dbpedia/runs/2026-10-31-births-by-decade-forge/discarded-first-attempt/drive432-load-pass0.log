@@ -1,0 +1,61 @@
+locks held 2026-10-31T11:28:10Z
+load: 2.31 2.51 2.66 1/616 3038348 free:   20G
+load 11:28:12
+[07:28:12] preflight: 19 GiB free (4% of the filesystem), last trim 2026-10-27 19:14 (/home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/preflight-20261031T072812.txt)
+[07:28:12] warning: the filesystem was last trimmed 3 days ago; on an SSD without online discard, writes may stall (fstrim -v / before a full load)
+[07:28:12] warning: only 4% of the filesystem is free; a full load needs about 100 GiB of temporary space and a full SSD writes more slowly
+[07:28:12] PSI pressure sampled once per second to /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/psi-20261031T072812.tsv
+[07:28:12] scale 50m: 38 files
+[07:28:12] sparkles: loading (log: /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/load-sparkles.log)
+sparkles: 27 s, peak RSS 3106 MiB, index 1.5 GiB
+[07:28:40] qlever: loading (log: /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/load-qlever.log)
+qlever: 50 s, peak RSS 7103 MiB, index 1.6 GiB
+load done 11:29:30
+pass 1 11:29:30 load 9.37 4.88 3.49
+[07:29:30] preflight: 18 GiB free (4% of the filesystem), last trim 2026-10-27 19:14 (/home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/preflight-20261031T072930.txt)
+[07:29:30] warning: the filesystem was last trimmed 3 days ago; on an SSD without online discard, writes may stall (fstrim -v / before a full load)
+[07:29:30] warning: only 4% of the filesystem is free; a full load needs about 100 GiB of temporary space and a full SSD writes more slowly
+[07:29:30] PSI pressure sampled once per second to /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/logs/psi-20261031T072930.tsv
+[07:29:31] cold sparkles births-by-decade: 0.032599
+[07:29:32] cold qlever births-by-decade: 0.038296
+
+rows                         sparkles       qlever
+births-by-decade                   80           80
+[07:29:34] sparkles: warming selected queries
+
+== sparkles births-by-decade
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     17.4 ms  ±     5.9 ms       6.7 ms  …    24.4 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.4 MiB
+ 
+[07:29:37] qlever: warming selected queries
+
+== qlever births-by-decade
+Benchmark 1: qlever (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time     14.4 ms  ±     4.2 ms      11.6 ms  …    25.5 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.6 MiB
+ 
+  Warning: The first benchmarking run for this command was significantly slower than the rest (25.5 ms). This could be caused by (filesystem) caches that were not filled until after the first run. You are already using both the '--warmup' option as well as the '--prepare' option. Consider re-running the benchmark on a quiet system. Maybe it was a random outlier. Alternatively, consider increasing the warmup count.
+ 
+[07:29:40] server RSS (MiB): {
+ "sparkles": "131",
+ "qlever": "174"
+}
+Scale 50m: 38 files of dbpedia-2022.12.tsv; engines: sparkles qlever
+
+Traceback (most recent call last):
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 104, in <module>
+    row(n, rs, bad, err="error", mark=mark, unranked=wrong | split)
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 47, in row
+    best = better(rank, key=lambda c: key(rank[c])) if rank else None
+           ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 47, in <lambda>
+    best = better(rank, key=lambda c: key(rank[c])) if rank else None
+                                      ~~~^^^^^^^^^
+  File "/home/kclejeune/lanes/forge-checks-440-432-20261031/src/1acdc38a/scripts/bench-summary.py", line 42, in <lambda>
+    def row(label, rs, bad=frozenset(), f=fmt, better=min, key=lambda r: r["mean"], err="error",
+                                                                         ~^^^^^^^^
+KeyError: 'mean'

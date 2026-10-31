@@ -1,0 +1,58 @@
+locks held 2026-10-31T12:18:53Z
+start 12:19:53 load 0.21 0.37 0.69
+1 S cold [27.4, 31.9, 31.8] warm median 4.29
+1 Q cold [32.5, 19.9, 58.9] warm median 16.98
+2 Q cold [55.6, 56.1, 55.1] warm median 16.24
+2 S cold [25.6, 28.4, 26.3] warm median 2.76
+3 S cold [27.4, 36.5, 31.8] warm median 6.62
+3 Q cold [21.3, 23.8, 30.1] warm median 17.17
+4 Q cold [47.7, 52.6, 43.2] warm median 16.13
+4 S cold [24.5, 25.5, 32.8] warm median 15.35
+5 S cold [25.4, 30.2, 21.5] warm median 3.74
+5 Q cold [23.8, 49.7, 18.4] warm median 17.53
+6 Q cold [58.5, 49.3, 48.6] warm median 17.79
+6 S cold [23.5, 26.7, 29.6] warm median 2.96
+7 S cold [25.0, 28.9, 22.2] warm median 4.62
+7 Q cold [17.5, 28.3, 19.7] warm median 18.34
+8 Q cold [44.7, 19.6, 47.5] warm median 17.58
+8 S cold [30.0, 28.8, 24.6] warm median 3.9
+9 S cold [30.1, 24.9, 24.1] warm median 4.71
+9 Q cold [19.7, 22.7, 46.7] warm median 17.07
+10 Q cold [28.4, 26.4, 20.6] warm median 17.84
+10 S cold [25.6, 34.0, 27.3] warm median 3.84
+11 S cold [25.7, 38.4, 25.5] warm median 4.63
+11 Q cold [19.5, 20.6, 20.2] warm median 14.43
+12 Q cold [24.4, 38.5, 30.5] warm median 16.88
+12 S cold [25.2, 27.7, 30.7] warm median 3.26
+13 S cold [29.2, 32.0, 30.4] warm median 3.41
+13 Q cold [41.5, 22.7, 34.5] warm median 17.78
+14 Q cold [18.3, 25.9, 36.0] warm median 17.79
+14 S cold [34.7, 27.9, 26.3] warm median 5.0
+15 S cold [23.4, 23.5, 33.9] warm median 4.48
+15 Q cold [43.7, 21.9, 19.6] warm median 17.53
+16 Q cold [23.8, 46.7, 22.9] warm median 15.87
+16 S cold [29.6, 32.4, 25.7] warm median 3.05
+17 S cold [24.6, 29.0, 31.0] warm median 3.85
+17 Q cold [62.4, 52.5, 60.0] warm median 13.05
+18 Q cold [51.8, 27.8, 54.4] warm median 17.54
+18 S cold [25.0, 27.9, 34.8] warm median 4.51
+19 S cold [24.4, 30.5, 26.8] warm median 3.37
+19 Q cold [23.4, 46.9, 19.2] warm median 17.28
+20 Q cold [19.0, 58.8, 23.7] warm median 16.94
+20 S cold [26.1, 22.3, 28.9] warm median 3.47
+{
+ "S": {
+  "warm_median_ms": 3.855250484775752,
+  "cold_median_ms": 27.539659989997745,
+  "n_warm": 400,
+  "n_cold": 60
+ },
+ "Q": {
+  "warm_median_ms": 17.166421515867114,
+  "cold_median_ms": 29.269034566823393,
+  "n_warm": 400,
+  "n_cold": 60
+ }
+}
+COMPLETE /home/kclejeune/lanes/forge-checks-440-432-20261031/births-http-20261031T121953Z
+all done 12:20:36

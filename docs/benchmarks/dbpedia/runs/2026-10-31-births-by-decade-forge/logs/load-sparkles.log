@@ -1,0 +1,67 @@
+[2m2026-10-31T11:28:12.682718Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase parse: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:12.682751Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m merging 0 partial vocabularies (0 input quads, 0 hot keys)
+[2m2026-10-31T11:28:12.686099Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase vocabulary merge: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:12.686109Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m vocabulary: 0 terms
+[2m2026-10-31T11:28:12.687232Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations spo, sop, gspo
+[2m2026-10-31T11:28:12.691731Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations osp, ops
+[2m2026-10-31T11:28:12.695789Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations pso, pos
+[2m2026-10-31T11:28:12.698866Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase sort and permutations: 0.01s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:12.698887Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m writing predicate patterns
+[2m2026-10-31T11:28:12.699853Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase predicate patterns: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:12.702138Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase statistics: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:12.702155Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase total: 0.02s, storage written 0.1 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:12.702214Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index files: 0.0 MB
+[2m2026-10-31T11:28:12.702218Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index complete: 0 quads, 0 terms
+[2m2026-10-31T11:28:12.707599Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/anchor-text_lang=en.nt.zst
+[2m2026-10-31T11:28:14.236986Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/article-templates_lang=en_nested.nt.zst
+[2m2026-10-31T11:28:14.356347Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/article-templates_lang=en.nt.zst
+[2m2026-10-31T11:28:14.789574Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/categories_lang=en_articles.nt.zst
+[2m2026-10-31T11:28:15.043970Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/categories_lang=en_labels.nt.zst
+[2m2026-10-31T11:28:15.298519Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/categories_lang=en_skos.nt.zst
+[2m2026-10-31T11:28:15.409484Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/citations_lang=en_data.nt.zst
+[2m2026-10-31T11:28:16.393639Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/citations_lang=en_links.nt.zst
+[2m2026-10-31T11:28:16.769258Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/commons-sameas-links_lang=en.nt.zst
+[2m2026-10-31T11:28:16.786229Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/disambiguations_lang=en.nt.zst
+[2m2026-10-31T11:28:16.861468Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/external-links_lang=en.nt.zst
+[2m2026-10-31T11:28:17.007996Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/geo-coordinates_lang=en.nt.zst
+[2m2026-10-31T11:28:17.099805Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/geo-coordinates-mappingbased_lang=en.nt.zst
+[2m2026-10-31T11:28:17.184510Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/homepages_lang=en.nt.zst
+[2m2026-10-31T11:28:17.224700Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/images_lang=en.nt.zst
+[2m2026-10-31T11:28:17.998371Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/infobox-properties_lang=en.nt.zst
+[2m2026-10-31T11:28:18.793090Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/infobox-property-definitions_lang=en.nt.zst
+[2m2026-10-31T11:28:18.816822Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/instance-types_lang=en_specific.nt.zst
+[2m2026-10-31T11:28:18.919672Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/instance-types_lang=en_transitive.nt.zst
+[2m2026-10-31T11:28:19.163539Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/interlanguage-links_lang=en.nt.zst
+[2m2026-10-31T11:28:19.183638Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/labels_lang=en.nt.zst
+[2m2026-10-31T11:28:19.392544Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/long-abstracts_lang=en.nt.zst
+[2m2026-10-31T11:28:19.737722Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-literals_lang=en.nt.zst
+[2m2026-10-31T11:28:19.929856Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-objects_lang=en_disjointDomain.nt.zst
+[2m2026-10-31T11:28:19.941422Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-objects_lang=en_disjointRange.nt.zst
+[2m2026-10-31T11:28:19.955432Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/mappingbased-objects_lang=en.nt.zst
+[2m2026-10-31T11:28:20.134560Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/ontology--DEV_type=parsed.nt.zst
+[2m2026-10-31T11:28:20.147954Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/page_lang=en_ids.nt.zst
+[2m2026-10-31T11:28:20.321920Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/page_lang=en_length.nt.zst
+[2m2026-10-31T11:28:20.489206Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/persondata_lang=en.nt.zst
+[2m2026-10-31T11:28:20.502230Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/redirects_lang=en.nt.zst
+[2m2026-10-31T11:28:20.636198Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/redirects_lang=en_transitive.nt.zst
+[2m2026-10-31T11:28:20.773948Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/revisions_lang=en_ids.nt.zst
+[2m2026-10-31T11:28:20.948837Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/revisions_lang=en_uris.nt.zst
+[2m2026-10-31T11:28:21.182890Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/short-abstracts_lang=en.nt.zst
+[2m2026-10-31T11:28:21.478787Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/specific-mappingbased-properties_lang=en.nt.zst
+[2m2026-10-31T11:28:21.524633Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/wikilinks_lang=en.nt.zst
+[2m2026-10-31T11:28:23.297055Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing /home/kclejeune/lanes/forge-checks-440-432-20261031/billion/50m/data/wikipedia-links_lang=en.nt.zst
+[2m2026-10-31T11:28:26.482938Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase parse: 13.78s, storage written 597.5 MB (cancelled 0.0 MB), read 0.0 MB, temporary files written: quads 163.5 MB, partial vocabularies 419.9 MB, hot key lists 11.9 MB
+[2m2026-10-31T11:28:26.482951Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m merging 382 partial vocabularies (50143058 input quads, 5032215 hot keys)
+[2m2026-10-31T11:28:27.954238Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase vocabulary merge: 1.47s, storage written 524.8 MB (cancelled 422.1 MB), read 0.0 MB, temporary files written: maps 27.6 MB
+[2m2026-10-31T11:28:27.954254Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m vocabulary: 16058349 terms
+[2m2026-10-31T11:28:29.382252Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations spo, sop, gspo
+[2m2026-10-31T11:28:32.487038Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations osp, ops
+[2m2026-10-31T11:28:35.256541Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations pso, pos
+[2m2026-10-31T11:28:39.589630Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase sort and permutations: 11.64s, storage written 1067.2 MB (cancelled 204.5 MB), read 0.0 MB
+[2m2026-10-31T11:28:39.667948Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m writing predicate patterns
+[2m2026-10-31T11:28:40.022287Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase predicate patterns: 0.43s, storage written 24.8 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:40.036471Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase statistics: 0.01s, storage written 5.8 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-10-31T11:28:40.036488Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase total: 27.33s, storage written 2220.1 MB (cancelled 626.6 MB), read 0.0 MB, temporary files written: quads 163.5 MB, partial vocabularies 419.9 MB, hot key lists 11.9 MB, maps 27.6 MB
+[2m2026-10-31T11:28:40.036532Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index files: 1577.4 MB
+[2m2026-10-31T11:28:40.036534Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index complete: 41127700 quads, 16058349 terms
+loaded 41127700 quads in 27.36s (1503201 quads/s); database now has 41127700 quads; commit 1
