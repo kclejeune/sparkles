@@ -838,7 +838,7 @@ relaxes, and when they lie further apart, when the cheapest cost is past the lar
 double, or when a meeting yields no join, it returns nothing and the search from the
 source alone answers on the same visit budget. Both searches then always return the same
 paths, but beyond that range the search from the source alone can round too, so a tie of
-exact sums can still be missed. NEW-ITEM-3 would decide ties exactly at any range. In
+exact sums can still be missed. 493 would decide ties exactly at any range. In
 plain doubles `0.1 + 0.2 + 0.3` and `0.3 + 0.2 + 0.1` differ, so
 the search from one end used to return only one of two equally cheap paths. `path:cost` now
 reports the double-double sum rounded to the nearest double in every weighted mode, so
@@ -850,11 +850,11 @@ plain double sum, as `10^16 + 1 + 1` reports 10000000000000002 where it reported
 
 * A cycle through the source searches from both ends in both shortest modes, because the
   virtual id makes it an ordinary pair. Yen's spur searches that close a cycle, in
-  `path:kShortest`, still search from one end, which NEW-ITEM-2 addresses.
+  `path:kShortest`, still search from one end, which 492 addresses.
 * A source with several bound targets keeps one search from the source, as the unweighted
   search and the single cheapest path do. That search settles the region near the source
   once for all targets, while a search per pair settles it again for each target, and which
-  costs less depends on the number of targets and how far apart they are. NEW-ITEM-1 would
+  costs less depends on the number of targets and how far apart they are. 491 would
   choose between them. A source with an unbound target and a target without a source have
   only one end to search from.
 
