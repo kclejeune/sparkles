@@ -359,6 +359,99 @@ async fn trix_in_and_out() {
     assert_eq!(r.json()["count"], 2);
 }
 
+/// A Protobuf body of about 64 KiB whose 100 statements each use a 64 KiB prefix for
+/// three terms, which is some 19 MiB of N-Quads.
+fn expanding_protobuf() -> Vec<u8> {
+    fn varint(mut v: usize, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        varint(payload.len(), &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+    let iri = format!("http://ex.org/{}/", "x".repeat(64 << 10));
+    let mut prefix = field(0x0a, b"p");
+    prefix.extend(field(0x12, iri.as_bytes()));
+    let mut body = Vec::new();
+    let mut row = |row: Vec<u8>| {
+        varint(row.len(), &mut body);
+        body.extend(row);
+    };
+    row(field(0x0a, &prefix));
+    let mut pname = field(0x0a, b"p");
+    pname.extend(field(0x12, b"a"));
+    let pname = field(0x22, &pname);
+    let predicate = field(0x0a, &field(0x0a, b"http://ex.org/p"));
+    let mut statement = field(0x0a, &pname);
+    statement.extend(field(0x12, &predicate));
+    statement.extend(field(0x1a, &pname));
+    for _ in 0..100 {
+        row(field(0x12, &statement));
+    }
+    body
+}
+
+/// The decompressed-size limit holds a Jena body by the quads it expands to as well as by
+/// its own bytes, on the Graph Store routes and on uploads.
+#[tokio::test]
+async fn a_jena_body_that_expands_past_the_decompressed_limit_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.limits.max_decompressed_bytes = Some(1 << 20);
+    let state = Arc::new(st);
+    state.attach("ds", DbType::Mem, None).unwrap();
+    let app = router(state.clone());
+    let body = expanding_protobuf();
+    assert!(body.len() < 80 << 10, "{}", body.len());
+    for (method, uri) in [
+        ("PUT", "/ds/data?default"),
+        ("POST", "/ds/data?default"),
+        ("POST", "/ds/data"),
+        ("POST", "/ds/upload"),
+        ("POST", "/ds/upload?graph=urn:t:g"),
+    ] {
+        let r = call(
+            &app,
+            method,
+            uri,
+            Some("application/rdf+protobuf"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{method} {uri}: {}",
+            r.text()
+        );
+    }
+    assert_eq!(state.get("ds").unwrap().store.snapshot().len(), 0);
+    // under the limit the same body loads
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.limits.max_decompressed_bytes = Some(64 << 20);
+    let state = Arc::new(st);
+    state.attach("open", DbType::Mem, None).unwrap();
+    let app = router(state);
+    let r = call(
+        &app,
+        "POST",
+        "/open/upload",
+        Some("application/rdf+protobuf"),
+        body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
 #[tokio::test]
 async fn the_union_graph_is_read_only() {
     let s = server();

@@ -927,7 +927,7 @@ fn load(
         let name = path.display().to_string();
         let (codec, head) = crate::io::sniff_codec(&mut f, Some(&path), &name)?;
         let r = codec.reader(std::io::Cursor::new(head).chain(f), None)?;
-        return insert_parsed(txn, r, format, &name, &into, stats, req);
+        return insert_parsed(txn, r, format, &name, &into, None, stats, req);
     }
     if opts.forbid_remote_load {
         return Err(Error::NotPermitted(
@@ -983,7 +983,17 @@ fn load(
         Some(budget) => Box::new(crate::outbound::Counted { inner: r, budget }),
         None => r,
     };
-    insert_parsed(txn, r, format, url, &into, stats, req).map_err(|e| read_error(url, e))
+    insert_parsed(
+        txn,
+        r,
+        format,
+        url,
+        &into,
+        Some(policy.max_response_bytes),
+        stats,
+        req,
+    )
+    .map_err(|e| read_error(url, e))
 }
 
 /// Where the quads of a `LOAD` go.
@@ -995,13 +1005,17 @@ struct Into<'a> {
     silent: bool,
 }
 
-/// Parse `r` as it streams in and insert its quads.
+/// Parse `r` as it streams in and insert its quads. A body in one of Jena's syntaxes can
+/// expand far past its own size, so its quads, counted as N-Quads, are held to
+/// `expansion_limit` as well.
+#[allow(clippy::too_many_arguments)]
 fn insert_parsed(
     txn: &mut WriteTxn<'_>,
     r: impl Read,
     syntax: RdfSyntax,
     name: &str,
     into: &Into<'_>,
+    expansion_limit: Option<u64>,
     stats: &mut UpdateStats,
     req: &Request<'_>,
 ) -> Result<()> {
@@ -1038,9 +1052,13 @@ fn insert_parsed(
             }
         }
         RdfSyntax::Jena(format) => {
+            let mut expansion = crate::jena_formats::Expansion::new(expansion_limit);
             crate::jena_formats::read_into(format, r, Some(into.base), name, |mut q| {
                 if let (Some(g), oxrdf::GraphName::DefaultGraph) = (&into.graph, &q.graph_name) {
                     q.graph_name = oxrdf::GraphName::NamedNode(g.clone());
+                }
+                if expansion.is_limited() {
+                    expansion.add(crate::jena_formats::nquads_len(&q))?;
                 }
                 insert(q)
             })?;

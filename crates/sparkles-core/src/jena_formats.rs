@@ -420,6 +420,96 @@ impl Terms {
     }
 }
 
+/// The size of `q` as an N-Quads line in bytes, within a few bytes of the line itself and
+/// never below it. It is the measure of how far a decoded body has expanded, for the
+/// loaders' byte cap and for the size of a batch of quads, and it takes one pass over
+/// each literal's bytes and nothing else.
+pub fn nquads_len(q: &Quad) -> u64 {
+    fn iri(s: &str) -> u64 {
+        s.len() as u64 + 2
+    }
+    fn lexical(s: &str) -> u64 {
+        // a quote, a backslash or a line break takes two bytes, another control character
+        // up to six, and anything else its own length
+        let mut n = 2u64;
+        for &b in s.as_bytes() {
+            n += match b {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' => 2,
+                0..0x20 | 0x7f => 6,
+                _ => 1,
+            };
+        }
+        n
+    }
+    fn literal(l: &Literal) -> u64 {
+        let base = lexical(l.value());
+        match l.language() {
+            Some(tag) => base + 1 + tag.len() as u64 + l.direction().map_or(0, |_| 5),
+            None if l.datatype() == xsd::STRING => base,
+            None => base + 2 + iri(l.datatype().as_str()),
+        }
+    }
+    fn term(t: &Term) -> u64 {
+        match t {
+            Term::NamedNode(n) => iri(n.as_str()),
+            Term::BlankNode(b) => 2 + b.as_str().len() as u64,
+            Term::Literal(l) => literal(l),
+            Term::Triple(t) => triple(t),
+        }
+    }
+    fn subject(s: &NamedOrBlankNode) -> u64 {
+        match s {
+            NamedOrBlankNode::NamedNode(n) => iri(n.as_str()),
+            NamedOrBlankNode::BlankNode(b) => 2 + b.as_str().len() as u64,
+        }
+    }
+    // `<<( s p o )>>` with its spaces
+    fn triple(t: &Triple) -> u64 {
+        10 + subject(&t.subject) + iri(t.predicate.as_str()) + term(&t.object)
+    }
+    let graph = match &q.graph_name {
+        GraphName::DefaultGraph => 0,
+        GraphName::NamedNode(n) => 1 + iri(n.as_str()),
+        GraphName::BlankNode(b) => 3 + b.as_str().len() as u64,
+    };
+    // three spaces, the dot and the line break
+    5 + subject(&q.subject) + iri(q.predicate.as_str()) + term(&q.object) + graph
+}
+
+/// The running size of the quads of one body as N-Quads, held to a limit. A Protobuf or
+/// Thrift body can expand far past its own size through a prefix or a repeated term, so a
+/// cap on the bytes read does not bound what the loader receives.
+pub struct Expansion {
+    limit: Option<u64>,
+    total: u64,
+}
+
+impl Expansion {
+    pub fn new(limit: Option<u64>) -> Expansion {
+        Expansion { limit, total: 0 }
+    }
+
+    /// Whether anything is measured, which the callers use to skip the sizes.
+    pub fn is_limited(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    /// Add a quad of `bytes` bytes, failing once the total passes the limit.
+    pub fn add(&mut self, bytes: u64) -> crate::Result<()> {
+        self.total = self.total.saturating_add(bytes);
+        match self.limit {
+            Some(limit) if self.total > limit => {
+                Err(crate::Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::error::BudgetKind::DecompressedBytes,
+                    limit,
+                    requested: self.total,
+                }))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Jena's names for the default graph.
 fn is_default_graph(iri: &str) -> bool {
     matches!(iri, "urn:x-arq:DefaultGraph" | "urn:x-arq:DefaultGraphNode")
@@ -2058,5 +2148,39 @@ mod tests {
         assert_eq!(double_lexical(3.5), "3.5E0");
         assert_eq!(double_lexical(100.0), "1.0E2");
         assert_eq!(double_lexical(-0.001), "-1.0E-3");
+    }
+
+    #[test]
+    fn nquads_len_covers_the_serialized_line_within_a_few_bytes() {
+        let ex = |s: &str| NamedNode::new(format!("http://example.org/{s}")).unwrap();
+        let mut quads = sample();
+        let nasty = "a\"b\\c\nd\re\tf\u{1}g\u{7f}h \u{e9}\u{1f600}";
+        for object in [
+            Term::from(Literal::new_simple_literal(nasty)),
+            Literal::new_language_tagged_literal(nasty, "en-GB")
+                .unwrap()
+                .into(),
+            Literal::new_typed_literal(nasty, ex("dt")).into(),
+            ex("o").into(),
+            BlankNode::new("b9").unwrap().into(),
+        ] {
+            for graph in [
+                GraphName::DefaultGraph,
+                GraphName::NamedNode(ex("g")),
+                GraphName::BlankNode(BlankNode::new("g1").unwrap()),
+            ] {
+                quads.push(Quad::new(ex("s"), ex("p"), object.clone(), graph));
+            }
+        }
+        for q in quads {
+            let line = format!("{q} .\n");
+            let n = nquads_len(&q);
+            assert!(n >= line.len() as u64, "{n} < {} for {line}", line.len());
+            assert!(
+                n <= line.len() as u64 + 24,
+                "{n} is far over {} for {line}",
+                line.len()
+            );
+        }
     }
 }

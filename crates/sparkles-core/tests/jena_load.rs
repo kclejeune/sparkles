@@ -270,6 +270,85 @@ fn a_byte_budget_stops_a_jena_source() {
     }
 }
 
+fn varint(mut v: usize, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v & 0x7f) as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// A protobuf field holding `payload`.
+fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    varint(payload.len(), &mut out);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A Protobuf body with one prefix of `prefix_len` bytes and `statements` statements that
+/// each use it for their subject and object. It is small and expands a thousand-fold.
+fn prefix_bomb(prefix_len: usize, statements: usize) -> Vec<u8> {
+    let iri = format!("http://ex.org/{}/", "x".repeat(prefix_len));
+    let mut prefix = field(0x0a, b"p");
+    prefix.extend(field(0x12, iri.as_bytes()));
+    let mut body = Vec::new();
+    let mut row = |row: Vec<u8>| {
+        varint(row.len(), &mut body);
+        body.extend(row);
+    };
+    row(field(0x0a, &prefix));
+    let mut pname = field(0x0a, b"p");
+    pname.extend(field(0x12, b"a"));
+    let pname = field(0x22, &pname);
+    let predicate = field(0x0a, &field(0x0a, b"http://ex.org/p"));
+    let mut statement = field(0x0a, &pname);
+    statement.extend(field(0x12, &predicate));
+    statement.extend(field(0x1a, &pname));
+    for _ in 0..statements {
+        row(field(0x12, &statement));
+    }
+    body
+}
+
+#[test]
+fn a_prefix_that_expands_the_body_is_held_to_the_byte_budget() {
+    // 100 statements of three 64 KiB terms from a body of about 64 KiB
+    let body = prefix_bomb(64 << 10, 100);
+    assert!(body.len() < 80 << 10, "{}", body.len());
+    let limit = 1 << 20;
+    // the input is far under the limit, and the decoded quads are far over it
+    let mut src = Source::from_bytes(body.clone(), JenaFormat::Protobuf, None);
+    src.max_decompressed = Some(limit);
+    let store = Store::in_memory(StoreOptions::default());
+    let e = store.load(&[src]).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::DecompressedBytes,
+                ..
+            })
+        ),
+        "{e:?}"
+    );
+    assert_eq!(store.snapshot().len(), 0);
+    // the transaction path holds it too
+    let mut src = Source::from_bytes(body.clone(), JenaFormat::Protobuf, None);
+    src.max_decompressed = Some(limit);
+    let e = sparkles_core::io::parse_source_into(&src, |_| Ok(())).unwrap_err();
+    assert!(matches!(e, Error::BudgetExceeded(_)), "{e:?}");
+    // without a limit the body loads: the cap is what stops it
+    let src = Source::from_bytes(body, JenaFormat::Protobuf, None);
+    let mut n = 0;
+    sparkles_core::io::parse_source_into(&src, |_| {
+        n += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(n, 100);
+}
+
 /// A malformed body of each syntax, with what its message names.
 fn malformed() -> Vec<(JenaFormat, Vec<u8>, &'static str)> {
     let thrift = encode(JenaFormat::Thrift, &fixture(JenaFormat::Thrift));
@@ -425,6 +504,38 @@ fn load_picks_the_syntax_from_the_url_when_the_media_type_says_nothing() {
     let store = Store::in_memory(StoreOptions::default());
     update(&store, &format!("LOAD <http://127.0.0.1:{port}/d.rt>")).unwrap();
     assert_eq!(canonical(&store), expected(&fixture(format)));
+}
+
+#[test]
+fn load_over_http_holds_a_body_that_expands_to_the_response_ceiling() {
+    let body = prefix_bomb(64 << 10, 100);
+    let port = serve(JenaFormat::Protobuf.media_type(), body, 1);
+    let store = Store::in_memory(StoreOptions::default());
+    let opts = QueryOptions {
+        outbound: OutboundPolicy {
+            allow_private: true,
+            max_response_bytes: 1 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let e = sparkles_core::sparql::update::update(
+        &store,
+        &format!("LOAD <http://127.0.0.1:{port}/d>"),
+        &opts,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::DecompressedBytes,
+                ..
+            })
+        ),
+        "{e:?}"
+    );
+    assert_eq!(store.snapshot().len(), 0);
 }
 
 #[test]

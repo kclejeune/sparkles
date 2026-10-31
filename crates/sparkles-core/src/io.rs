@@ -618,7 +618,8 @@ pub fn parse_source_into(
     sink: impl FnMut(Quad) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
     if let Some(j) = src.format.jena() {
-        parse_jena(src, j, sink)?;
+        let mut sink = sink;
+        parse_jena(src, j, false, |q, _| sink(q))?;
         return Ok(BTreeMap::new());
     }
     if src.parse_mode == ParseMode::Buffered {
@@ -646,11 +647,20 @@ pub fn parse_source_into(
 /// decompressing reader. A TriX document resolves relative IRIs against the source's
 /// base, and triples in the default graph go to the source's graph, as the W3C syntaxes
 /// do. Byte budgets and codec failures keep their own errors.
+///
+/// The callback also gets the quad's size as an N-Quads line, the measure of the
+/// source's expansion. The input-byte cap of [`Source::max_decompressed`] does not bound a
+/// Protobuf or Thrift body whose prefixes or repeated terms expand into much larger
+/// quads, so the sum of those sizes is held to the same cap and fails with the same
+/// error. The size is computed only when the cap or the caller needs it.
 fn parse_jena(
     src: &Source,
     format: JenaFormat,
-    mut sink: impl FnMut(Quad) -> Result<()>,
+    sized: bool,
+    mut sink: impl FnMut(Quad, u64) -> Result<()>,
 ) -> Result<()> {
+    let mut expansion = crate::jena_formats::Expansion::new(src.max_decompressed);
+    let measure = sized || expansion.is_limited();
     crate::jena_formats::read_into(
         format,
         source_reader(src, src.codec()?)?,
@@ -668,13 +678,25 @@ fn parse_jena(
             if let (GraphName::DefaultGraph, Some(g)) = (&q.graph_name, &src.graph) {
                 q.graph_name = GraphName::NamedNode(g.clone());
             }
-            sink(q)
+            let bytes = if measure {
+                crate::jena_formats::nquads_len(&q)
+            } else {
+                0
+            };
+            expansion.add(bytes)?;
+            sink(q, bytes)
         },
     )
 }
 
 /// Quads a decoder hands to the sinks at once.
 const JENA_BATCH: usize = 4096;
+
+/// Decoded bytes, as N-Quads lines, at which a batch goes to the sinks before it holds
+/// [`JENA_BATCH`] quads. A quad that is larger alone goes in a batch of its own. The
+/// quads in flight are then at most `3 * workers + 1` batches of this size and one quad
+/// each, however large the literals are.
+const JENA_BATCH_BYTES: u64 = 1 << 20;
 
 /// Read a source in one of Jena's syntaxes with one decoder, and encode its quads on
 /// `parallelism` sinks. A Thrift or Protobuf stream has no record boundaries to split
@@ -687,53 +709,77 @@ fn parse_jena_bulk<S: QuadSink, F: Fn() -> S + Sync>(
     parallelism: usize,
     make_sink: F,
 ) -> Result<()> {
+    pipe_quads(parallelism, make_sink, |emit| {
+        parse_jena(src, format, true, emit)
+    })
+}
+
+/// Run `decode` on the calling thread and hand the quads it emits, with their sizes in
+/// bytes, to `parallelism` sinks in batches that hold at most [`JENA_BATCH`] quads or
+/// [`JENA_BATCH_BYTES`] bytes. A sink that fails stops the decoder at its next quad, and
+/// the first failure is the error returned.
+fn pipe_quads<S: QuadSink, F: Fn() -> S + Sync>(
+    parallelism: usize,
+    make_sink: F,
+    decode: impl FnOnce(&mut dyn FnMut(Quad, u64) -> Result<()>) -> Result<()>,
+) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let workers = parallelism.max(1);
     if workers == 1 {
         let mut sink = make_sink();
-        parse_jena(src, format, |q| sink.quad(q))?;
+        decode(&mut |q, _| sink.quad(q))?;
         return sink.finish();
     }
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Quad>>(workers * 2);
     let rx = Mutex::new(rx);
     let failed = AtomicBool::new(false);
     let failure: Mutex<Option<Error>> = Mutex::new(None);
+    let fail = |e: Error| {
+        failure.lock().get_or_insert(e);
+        // the decoder looks at this before every quad
+        failed.store(true, Ordering::Release);
+    };
     let mut decoded = Ok(());
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
                 let mut sink = make_sink();
-                let mut result = Ok(());
+                let mut broken = false;
                 loop {
                     // one sink waits for the next batch while the others encode
                     let Ok(batch) = rx.lock().recv() else { break };
-                    if result.is_err() {
+                    if broken {
                         // keep draining, so that the decoder never blocks on a full channel
                         continue;
                     }
                     for q in batch {
                         if let Err(e) = sink.quad(q) {
-                            result = Err(e);
+                            failure.lock().get_or_insert(e);
+                            broken = true;
                             break;
                         }
                     }
                 }
-                let result = result.and_then(|()| sink.finish());
-                if let Err(e) = result {
-                    failed.store(true, Ordering::Relaxed);
-                    failure.lock().get_or_insert(e);
+                if broken {
+                    failed.store(true, Ordering::Release);
+                }
+                if !broken && let Err(e) = sink.finish() {
+                    fail(e);
                 }
             });
         }
         let mut batch = Vec::with_capacity(JENA_BATCH);
-        decoded = parse_jena(src, format, |q| {
-            if failed.load(Ordering::Relaxed) {
+        let mut batch_bytes = 0u64;
+        decoded = decode(&mut |q, bytes| {
+            if failed.load(Ordering::Acquire) {
                 // a sink failed: stop decoding, its error is the one to report
                 return Err(Error::Cancelled);
             }
             batch.push(q);
+            batch_bytes += bytes;
             if batch.len() == JENA_BATCH {
                 let full = std::mem::replace(&mut batch, Vec::with_capacity(JENA_BATCH));
+                batch_bytes = 0;
                 tx.send(full).map_err(|_| Error::Cancelled)?;
             }
             Ok(())
