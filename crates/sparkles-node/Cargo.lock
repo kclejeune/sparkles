@@ -3140,6 +3140,7 @@ dependencies = [
  "json-event-parser",
  "lz4_flex 0.14.0",
  "oxiri",
+ "oxjsonld",
  "oxrdf",
  "oxsdatatypes",
  "oxttl",
