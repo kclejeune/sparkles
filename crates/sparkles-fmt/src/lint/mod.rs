@@ -494,12 +494,13 @@ pub fn apply(text: &str, edits: &[Edit]) -> String {
 
 /// `quads` with the text of every SHACL query blanked. A fix inside a query changes the
 /// string and nothing else, and the embedded linter has checked that the query still
-/// means the same.
+/// means the same. Only Turtle and TriG queries get such fixes, and only in `xsd:string`
+/// literals, so only those are blanked: a JSON-LD dataset is compared whole.
 fn masked(mut quads: Vec<oxrdf::Quad>) -> Vec<oxrdf::Quad> {
     for q in &mut quads {
         if embedded::is_query_predicate(q.predicate.as_str())
             && let oxrdf::Term::Literal(l) = &q.object
-            && l.language().is_none()
+            && l.datatype() == oxrdf::vocab::xsd::STRING
         {
             q.object = oxrdf::Literal::new_simple_literal("").into();
         }
@@ -549,7 +550,7 @@ fn same_meaning(a: &str, b: &str, lang: Language) -> bool {
             }
         }
         Language::JsonLd => match (jsonld_quads(a), jsonld_quads(b)) {
-            (Some(qa), Some(qb)) => crate::check::graph::isomorphic(&masked(qa), &masked(qb)),
+            (Some(qa), Some(qb)) => crate::check::graph::isomorphic(&qa, &qb),
             _ => false,
         },
         Language::Shaclc => {

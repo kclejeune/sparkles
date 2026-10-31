@@ -10,8 +10,11 @@
 //! contexts that apply to each object, including the contexts of terms and types that are
 //! scoped. What they cannot know they leave alone. A context given as a URL may define
 //! any term, so `unmapped-key` is silent beside one and so is a document that has no
-//! context. `@vocab` maps every key. The values of a term with a map container, of a
-//! term typed `@json` and of a value object are data, not properties.
+//! context. `@vocab` maps every key, and its IRI expands the names relative to it. A
+//! term that aliases a keyword stands for the keyword. The values of a term with a map
+//! container and of a value object are data, not properties. A JSON literal, the value of
+//! a term typed `@json` or of a value object whose type is `@json`, is not read at all, so
+//! nothing in it counts as a context, a term or a use of one.
 
 use super::{Cst, Edit, Fix, LintError, Out, embedded, terms};
 use crate::lex::TokenKind;
@@ -36,14 +39,19 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     };
     let c = Cst::new(&tree);
     let root = build(&c, c.tree.root());
-    let mut scan = Scan::default();
-    scan.value(&root);
     let mut walk = Walk {
         out,
         sites: Vec::new(),
+        json: HashSet::new(),
     };
     walk.value(&root, &Ctx::default());
     let sites = std::mem::take(&mut walk.sites);
+    // the values of JSON literals are data: no term is defined or used in them
+    let mut scan = Scan {
+        json: std::mem::take(&mut walk.json),
+        ..Scan::default()
+    };
+    scan.value(&root);
     out.deadline()?;
     embedded::run(sites, &scan.prefixes(), || super::jsonld_quads(text), out)?;
     context_rules(&scan, out);
@@ -225,6 +233,10 @@ struct Ctx<'a> {
     terms: HashMap<String, Term<'a>>,
     /// a `@vocab` maps every key
     vocab: bool,
+    /// the IRI of the `@vocab`, when it can be told
+    vocab_iri: Option<String>,
+    /// the default language of plain strings
+    language: Option<String>,
     /// a context given by URL (or `@import`) may define anything
     remote: bool,
     /// some context has been applied
@@ -239,8 +251,14 @@ struct Term<'a> {
     coerce: Option<String>,
     /// its container is a language, index, id or type map
     map: bool,
+    /// its container is a list
+    list: bool,
     /// its values are JSON literals
     json: bool,
+    /// its own `@language`: `Some(None)` for `null`, which turns the default off
+    language: Option<Option<String>>,
+    /// the keyword the term is an alias of
+    keyword: Option<String>,
     /// the context of its definition
     scoped: Option<&'a Val>,
 }
@@ -268,9 +286,24 @@ fn apply<'a>(ctx: &mut Ctx<'a>, v: &'a Val) {
                 .map(|m| (m.key.value.as_str(), &m.value))
                 .collect();
             for m in &o.members {
-                match m.key.value.as_str() {
-                    "@vocab" => ctx.vocab = matches!(m.value, Val::Str(_)),
-                    "@import" => ctx.remote = true,
+                match (m.key.value.as_str(), &m.value) {
+                    ("@vocab", Val::Str(v)) => {
+                        // an absolute or compact IRI; one relative to the base is unknown
+                        let iri = if v.value.contains(':') {
+                            expand(&v.value, &raw, ctx, 0, true)
+                        } else {
+                            None
+                        };
+                        ctx.vocab = true;
+                        ctx.vocab_iri = iri.filter(|i| i.contains(':'));
+                    }
+                    ("@vocab", _) => {
+                        ctx.vocab = false;
+                        ctx.vocab_iri = None;
+                    }
+                    ("@language", Val::Str(l)) => ctx.language = Some(l.value.clone()),
+                    ("@language", _) => ctx.language = None,
+                    ("@import", _) => ctx.remote = true,
                     _ => {}
                 }
             }
@@ -285,8 +318,12 @@ fn apply<'a>(ctx: &mut Ctx<'a>, v: &'a Val) {
 
 fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>) -> Term<'a> {
     match def {
+        Val::Str(s) if KEYWORDS.contains(&s.value.as_str()) => Term {
+            keyword: Some(s.value.clone()),
+            ..Term::default()
+        },
         Val::Str(s) => Term {
-            iri: expand(&s.value, raw, ctx, 0),
+            iri: expand(&s.value, raw, ctx, 0, true),
             ..Term::default()
         },
         Val::Obj(o) => {
@@ -296,19 +333,29 @@ fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>)
                 }) => Some(s.value.as_str()),
                 _ => None,
             };
+            if let Some(k) = string("@id").filter(|k| KEYWORDS.contains(k)) {
+                return Term {
+                    keyword: Some(k.to_string()),
+                    ..Term::default()
+                };
+            }
             let iri = match (o.get("@id"), string("@id")) {
-                (_, Some(id)) => expand(id, raw, ctx, 0),
+                (_, Some(id)) => expand(id, raw, ctx, 0, true),
                 (Some(_), None) => None,
-                (None, None) if key.contains(':') => expand(key, raw, ctx, 0),
-                (None, None) => None,
+                (None, None) => expand(key, raw, ctx, 0, true),
             };
             let coerce = string("@type").and_then(|t| {
                 if t.starts_with('@') {
                     Some(t.to_string())
                 } else {
-                    expand(t, raw, ctx, 0)
+                    expand(t, raw, ctx, 0, true)
                 }
             });
+            let language = match o.get("@language").map(|m| &m.value) {
+                Some(Val::Str(l)) => Some(Some(l.value.clone())),
+                Some(Val::Null) => Some(None),
+                _ => None,
+            };
             let containers: Vec<&str> = match o.get("@container").map(|m| &m.value) {
                 Some(Val::Str(s)) => vec![s.value.as_str()],
                 Some(Val::Arr(a)) => a
@@ -325,7 +372,10 @@ fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>)
                 map: containers
                     .iter()
                     .any(|c| matches!(*c, "@language" | "@index" | "@id" | "@type")),
+                list: containers.contains(&"@list"),
                 json: coerce.as_deref() == Some("@json"),
+                language,
+                keyword: None,
                 coerce,
                 scoped: o.get("@context").map(|m| &m.value),
             }
@@ -334,9 +384,43 @@ fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>)
     }
 }
 
+/// The keywords of JSON-LD 1.1 that a term can be an alias of.
+const KEYWORDS: &[&str] = &[
+    "@base",
+    "@container",
+    "@direction",
+    "@graph",
+    "@id",
+    "@import",
+    "@included",
+    "@index",
+    "@json",
+    "@language",
+    "@list",
+    "@nest",
+    "@none",
+    "@prefix",
+    "@propagate",
+    "@protected",
+    "@reverse",
+    "@set",
+    "@type",
+    "@value",
+    "@version",
+    "@vocab",
+];
+
 /// The IRI a name stands for: an absolute IRI as it is, a compact IRI through its
-/// prefix, a term through its definition. A name relative to `@vocab` is unknown.
-fn expand(s: &str, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>, depth: usize) -> Option<String> {
+/// prefix, a term through its definition. With `vocab`, as for keys, types and the IRIs
+/// of term definitions, any other name is relative to the `@vocab` IRI. Without it, as
+/// for `@id`, such a name is relative to the base and unknown here.
+fn expand(
+    s: &str,
+    raw: &HashMap<&str, &Val>,
+    ctx: &Ctx<'_>,
+    depth: usize,
+    vocab: bool,
+) -> Option<String> {
     if depth > 8 || s.starts_with('@') {
         return None;
     }
@@ -352,17 +436,25 @@ fn expand(s: &str, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>, depth: usize) -> Op
             None => s.to_string(),
         });
     }
-    term_iri(s, raw, ctx, depth)
+    if vocab && (raw.contains_key(s) || ctx.terms.contains_key(s)) {
+        return term_iri(s, raw, ctx, depth);
+    }
+    match (vocab, &ctx.vocab_iri) {
+        (true, Some(v)) => Some(format!("{v}{s}")),
+        _ => None,
+    }
 }
 
 fn term_iri(name: &str, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>, depth: usize) -> Option<String> {
     match raw.get(name) {
-        Some(Val::Str(s)) => expand(&s.value, raw, ctx, depth + 1),
+        Some(Val::Str(s)) => expand(&s.value, raw, ctx, depth + 1, true),
         Some(Val::Obj(o)) => match o.get("@id") {
             Some(Member {
                 value: Val::Str(s), ..
-            }) => expand(&s.value, raw, ctx, depth + 1),
-            _ => None,
+            }) => expand(&s.value, raw, ctx, depth + 1, true),
+            Some(_) => None,
+            None => expand(name, &HashMap::new(), ctx, depth + 1, true)
+                .filter(|_| name.contains(':') || ctx.vocab_iri.is_some()),
         },
         Some(_) => None,
         None => ctx.terms.get(name).and_then(|t| t.iri.clone()),
@@ -370,8 +462,29 @@ fn term_iri(name: &str, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>, depth: usize) 
 }
 
 impl Ctx<'_> {
-    fn expand(&self, name: &str) -> Option<String> {
-        expand(name, &HashMap::new(), self, 0)
+    /// A name relative to the vocabulary: a key, a type or a datatype.
+    fn expand_vocab(&self, name: &str) -> Option<String> {
+        expand(name, &HashMap::new(), self, 0, true)
+    }
+
+    /// A name relative to the document: the value of `@id`.
+    fn expand_id(&self, name: &str) -> Option<String> {
+        expand(name, &HashMap::new(), self, 0, false)
+    }
+
+    /// The keyword `key` is, written as it is or through an alias.
+    fn keyword<'k>(&'k self, key: &'k str) -> Option<&'k str> {
+        if key.starts_with('@') {
+            return Some(key);
+        }
+        self.terms.get(key).and_then(|t| t.keyword.as_deref())
+    }
+
+    /// The member of `o` for keyword `kw`, written as it is or through an alias.
+    fn find<'o>(&self, o: &'o Obj, kw: &str) -> Option<&'o Member> {
+        o.members
+            .iter()
+            .find(|m| self.keyword(&m.key.value) == Some(kw))
     }
 }
 
@@ -381,6 +494,8 @@ struct Walk<'o, 'c> {
     out: &'o mut Out<'c>,
     /// the strings that hold SHACL queries
     sites: Vec<embedded::Site>,
+    /// the spans of the members whose values are JSON literals
+    json: HashSet<(usize, usize)>,
 }
 
 impl<'a> Walk<'_, '_> {
@@ -399,14 +514,14 @@ impl<'a> Walk<'_, '_> {
             apply(&mut c, &m.value);
             here = Cow::Owned(c);
         }
-        if o.get("@value").is_some() {
+        if here.find(o, "@value").is_some() {
             self.value_object(o, &here);
             return;
         }
         // the contexts of the object's types apply to its keys, and not to what is below
         let mut keys = Cow::Borrowed(&*here);
-        for ty in o
-            .get("@type")
+        for ty in here
+            .find(o, "@type")
             .map(|m| strings(&m.value))
             .unwrap_or_default()
         {
@@ -421,8 +536,14 @@ impl<'a> Walk<'_, '_> {
             if k == "@context" {
                 continue;
             }
-            if k.starts_with('@') {
-                self.keyword(k, &m.value, &here);
+            // `@type` is read in the object's own context, the other keys in the one its
+            // types scope
+            let kw = here
+                .keyword(k)
+                .filter(|kw| *kw == "@type")
+                .or_else(|| keys.keyword(k));
+            if let Some(kw) = kw {
+                self.keyword(kw, &m.value, &here);
                 continue;
             }
             let term = keys.terms.get(k);
@@ -437,33 +558,62 @@ impl<'a> Walk<'_, '_> {
                     ),
                 );
             }
-            let iri = term.and_then(|t| t.iri.clone()).or_else(|| keys.expand(k));
-            if let Some(iri) = iri.filter(|i| embedded::is_query_predicate(i)) {
-                self.queries(&iri, &m.value);
+            if term.is_some_and(|t| t.json) {
+                self.json.insert((m.start, m.end));
+                continue;
+            }
+            let iri = match term {
+                Some(t) => t.iri.clone(),
+                None => keys.expand_vocab(k),
+            };
+            if let Some(iri) = iri.filter(|i| embedded::is_query_predicate(i))
+                && !term.is_some_and(|t| t.map || t.list)
+            {
+                self.queries(&iri, &m.value, term, &here);
             }
             self.property(term, &m.value, &here);
         }
     }
 
-    /// The plain strings among `v` (a string, a value object or an array of them) are
-    /// queries.
-    fn queries(&mut self, predicate: &str, v: &Val) {
+    /// The values among `v` (a string, a value object or an array of them) that expand
+    /// to plain strings, `xsd:string` literals, are queries. A string under a term that
+    /// coerces it to an IRI or another datatype is not, nor is one with a language,
+    /// its term's or the context's default.
+    fn queries(&mut self, predicate: &str, v: &Val, term: Option<&Term<'_>>, ctx: &Ctx<'_>) {
+        let xsd_string = format!("{}string", terms::XSD);
         let string = match v {
-            Val::Str(s) => Some(s),
-            Val::Obj(o) if o.get("@language").is_none() => {
-                match (o.get("@value"), o.get("@type")) {
-                    (
-                        Some(Member {
-                            value: Val::Str(s), ..
-                        }),
-                        None,
-                    ) => Some(s),
+            Val::Arr(items) => {
+                items
+                    .iter()
+                    .for_each(|i| self.queries(predicate, i, term, ctx));
+                None
+            }
+            Val::Str(s) => {
+                let plain = match term.and_then(|t| t.coerce.as_deref()) {
+                    None | Some("@none") => term
+                        .and_then(|t| t.language.clone())
+                        .unwrap_or_else(|| ctx.language.clone())
+                        .is_none(),
+                    Some(dt) => dt == xsd_string,
+                };
+                plain.then_some(s)
+            }
+            Val::Obj(o)
+                if ctx.find(o, "@language").is_none() && ctx.find(o, "@direction").is_none() =>
+            {
+                let plain = match ctx.find(o, "@type").map(|m| &m.value) {
+                    None => true,
+                    Some(Val::Str(t)) => {
+                        ctx.expand_vocab(&t.value).as_deref() == Some(xsd_string.as_str())
+                    }
+                    Some(_) => false,
+                };
+                match ctx.find(o, "@value") {
+                    Some(Member {
+                        value: Val::Str(s), ..
+                    }) if plain => Some(s),
                     _ => None,
                 }
-            }
-            Val::Arr(items) => {
-                items.iter().for_each(|i| self.queries(predicate, i));
-                None
             }
             _ => None,
         };
@@ -480,9 +630,14 @@ impl<'a> Walk<'_, '_> {
 
     fn keyword(&mut self, k: &str, v: &'a Val, ctx: &Ctx<'a>) {
         match k {
-            "@id" | "@type" => {
+            "@id" => {
                 for s in strings_of(v) {
-                    self.iri(s, ctx);
+                    self.iri(s, ctx.expand_id(&s.value));
+                }
+            }
+            "@type" => {
+                for s in strings_of(v) {
+                    self.iri(s, ctx.expand_vocab(&s.value));
                 }
             }
             "@graph" | "@included" | "@reverse" | "@nest" | "@list" | "@set" => self.value(v, ctx),
@@ -495,9 +650,6 @@ impl<'a> Walk<'_, '_> {
         let Some(t) = term else {
             return self.value(v, ctx);
         };
-        if t.json {
-            return;
-        }
         let mut child = Cow::Borrowed(ctx);
         if let Some(scoped) = t.scoped {
             let mut c = ctx.clone();
@@ -524,9 +676,8 @@ impl<'a> Walk<'_, '_> {
         self.value(v, &child);
     }
 
-    /// An IRI written as the value of `@id` or `@type`.
-    fn iri(&mut self, s: &Str, ctx: &Ctx<'_>) {
-        let resolved = ctx.expand(&s.value);
+    /// An IRI written as the value of `@id` or `@type`, and what it expands to.
+    fn iri(&mut self, s: &Str, resolved: Option<String>) {
         terms::iri_checks(
             resolved.as_deref().unwrap_or(&s.value),
             s.start,
@@ -535,31 +686,43 @@ impl<'a> Walk<'_, '_> {
         );
     }
 
-    /// `{ "@value": …, "@type": …, "@language": … }`
+    /// `{ "@value": …, "@type": …, "@language": … }`, the keywords written as they are or
+    /// through aliases
     fn value_object(&mut self, o: &Obj, ctx: &Ctx<'_>) {
         if let Some(Member {
             value: Val::Str(l), ..
-        }) = o.get("@language")
+        }) = ctx.find(o, "@language")
         {
             terms::language_tag_at(&l.value, l.start, l.end, &|t| format!("\"{t}\""), self.out);
         }
-        let Some(ty) = o.members.iter().position(|m| m.key.value == "@type") else {
+        let Some(ty) = o
+            .members
+            .iter()
+            .position(|m| ctx.keyword(&m.key.value) == Some("@type"))
+        else {
             return;
         };
         let Val::Str(t) = &o.members[ty].value else {
             return;
         };
+        if ctx.keyword(&t.value) == Some("@json") {
+            // a JSON literal: its value is data
+            if let Some(v) = ctx.find(o, "@value") {
+                self.json.insert((v.start, v.end));
+            }
+            return;
+        }
         if t.value.starts_with('@') {
             return;
         }
-        let Some(iri) = ctx.expand(&t.value) else {
+        let Some(iri) = ctx.expand_vocab(&t.value) else {
             return;
         };
-        self.iri(t, ctx);
+        self.iri(t, Some(iri.clone()));
         let Some(Member {
             value: Val::Str(lexical),
             ..
-        }) = o.get("@value")
+        }) = ctx.find(o, "@value")
         else {
             return;
         };
@@ -572,7 +735,7 @@ impl<'a> Walk<'_, '_> {
                 datatype_span: (t.start, t.end),
                 redundant_span: (m.start, m.end),
                 drop: o.removal(ty),
-                drop_title: format!("Remove \"@type\": \"{}\"", t.value),
+                drop_title: format!("Remove \"{}\": \"{}\"", m.key.value, t.value),
             },
             &iri,
             self.out,
@@ -633,6 +796,8 @@ fn context_rules(scan: &Scan<'_>, out: &mut Out<'_>) {
 
 #[derive(Default)]
 struct Scan<'a> {
+    /// the spans of the members whose values are JSON literals, which are not read
+    json: HashSet<(usize, usize)>,
     /// the term definitions: the object of the context and the index of the member
     defs: Vec<(&'a Obj, usize)>,
     /// every string of the document except the keys that define terms, and the prefix of
@@ -723,6 +888,9 @@ impl<'a> Scan<'a> {
                         _ => {}
                     }
                 }
+            }
+            if self.json.contains(&(m.start, m.end)) {
+                continue;
             }
             if k == "@context" {
                 self.context(&m.value);

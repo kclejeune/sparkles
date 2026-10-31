@@ -332,3 +332,114 @@ fn json_ld_positions_are_in_the_input() {
         ("language-tag-case", 4, 46)
     );
 }
+
+#[test]
+fn json_literals_are_data() {
+    // a JSON literal holds what looks like a context, and nothing in it is a term
+    for doc in [
+        r#"{"@context": {"data": {"@id": "http://www.w3.org/ns/shacl#select", "@type": "@json"}}, "@id": "urn:s", "data": {"@context": {"unused": "urn:unused"}}}"#,
+        r#"{"@context": {"data": {"@id": "http://x/data", "@type": "@json"}}, "@id": "urn:s", "data": [{"@context": {"unused": "urn:unused"}}]}"#,
+        r#"{"@id": "urn:s", "http://x/data": {"@value": {"@context": {"unused": "urn:unused"}}, "@type": "@json"}}"#,
+        r#"{"@context": {"v": "@value", "t": "@type"}, "@id": "urn:s", "http://x/data": {"v": {"@context": {"unused": "urn:unused"}}, "t": "@json"}}"#,
+    ] {
+        assert!(
+            !found(doc).iter().any(|f| f.contains("unused\"")),
+            "{doc}: {:?}",
+            found(doc)
+        );
+        let f = fix(doc, Language::JsonLd, &LintOptions::default()).unwrap();
+        assert_eq!(f.text, doc);
+    }
+}
+
+#[test]
+fn json_ld_fixes_compare_the_whole_dataset() {
+    // a query literal is part of the dataset: JSON-LD's query literals never get edits
+    let a = r#"{"@id": "urn:s", "http://www.w3.org/ns/shacl#select": "SELECT * {}"}"#;
+    let b = r#"{"@id": "urn:s", "http://www.w3.org/ns/shacl#select": "SELECT * { }"}"#;
+    assert!(!same_meaning(a, b, Language::JsonLd));
+    assert!(same_meaning(a, a, Language::JsonLd));
+}
+
+const BAD_QUERY: &str = "SELECT $this { FILTER(?bad) }";
+
+fn queries(doc: &str) -> Vec<String> {
+    found(doc)
+        .into_iter()
+        .filter(|f| f.starts_with("unbound-variable"))
+        .collect()
+}
+
+#[test]
+fn the_vocabulary_expands_names() {
+    let doc = format!(
+        r#"{{"@context": {{"@vocab": "http://www.w3.org/ns/shacl#"}}, "@id": "urn:s", "select": "{BAD_QUERY}"}}"#
+    );
+    assert_eq!(queries(&doc), strs(&["unbound-variable@?bad"]));
+    // a vocabulary-relative datatype
+    let doc = r#"{"@context": {"@vocab": "http://www.w3.org/2001/XMLSchema#"}, "@id": "urn:s", "http://x/p": {"@value": "abc", "@type": "integer"}}"#;
+    assert!(
+        found(doc)
+            .iter()
+            .any(|f| f.starts_with("suspicious-datatype")),
+        "{:?}",
+        found(doc)
+    );
+    // and a vocabulary-relative coercion
+    let doc = r#"{"@context": {"@vocab": "http://www.w3.org/2001/XMLSchema#", "n": {"@id": "http://x/n", "@type": "integer"}}, "@id": "urn:s", "n": "abc"}"#;
+    assert!(
+        found(doc)
+            .iter()
+            .any(|f| f.starts_with("suspicious-datatype")),
+        "{:?}",
+        found(doc)
+    );
+}
+
+#[test]
+fn keyword_aliases_are_keywords() {
+    let doc = r#"{"@context": {"v": "@value", "lang": "@language", "ex": "http://x/"}, "@id": "urn:s", "ex:p": {"v": "a", "lang": "EN"}}"#;
+    assert_eq!(found(doc), strs(&["language-tag-case@\"EN\""]));
+    let doc = r#"{"@context": {"id": "@id", "type": "@type", "ex": "http://x/"}, "id": "urn:s", "ex:p": {"@value": "abc", "type": "http://www.w3.org/2001/XMLSchema#integer"}}"#;
+    assert!(
+        found(doc)
+            .iter()
+            .any(|f| f.starts_with("suspicious-datatype")),
+        "{:?}",
+        found(doc)
+    );
+    // an alias of @value is not a key that needs a mapping
+    let doc = r#"{"@context": {"v": {"@id": "@value"}, "ex": "http://x/"}, "@id": "urn:s", "ex:p": {"v": "a"}}"#;
+    assert_eq!(found(doc), Vec::<String>::new());
+}
+
+#[test]
+fn query_eligibility_follows_the_expanded_literal() {
+    let sh = r#""sh": "http://www.w3.org/ns/shacl#""#;
+    // an explicit xsd:string is a plain string
+    let doc = format!(
+        r#"{{"@context": {{{sh}}}, "@id": "urn:s", "sh:select": {{"@value": "{BAD_QUERY}", "@type": "http://www.w3.org/2001/XMLSchema#string"}}}}"#
+    );
+    assert_eq!(queries(&doc), strs(&["unbound-variable@?bad"]));
+    let doc = format!(
+        r#"{{"@context": {{{sh}, "xsd": "http://www.w3.org/2001/XMLSchema#", "q": {{"@id": "sh:select", "@type": "xsd:string"}}}}, "@id": "urn:s", "q": "{BAD_QUERY}"}}"#
+    );
+    assert_eq!(queries(&doc), strs(&["unbound-variable@?bad"]));
+    // a default language makes a language-tagged string
+    let doc = format!(
+        r#"{{"@context": {{{sh}, "@language": "en"}}, "@id": "urn:s", "sh:select": "{BAD_QUERY}"}}"#
+    );
+    assert_eq!(queries(&doc), Vec::<String>::new());
+    // unless the term turns it off
+    let doc = format!(
+        r#"{{"@context": {{{sh}, "@language": "en", "q": {{"@id": "sh:select", "@language": null}}}}, "@id": "urn:s", "q": "{BAD_QUERY}"}}"#
+    );
+    assert_eq!(queries(&doc), strs(&["unbound-variable@?bad"]));
+    // @id and @vocab coercions make IRIs, and other datatypes typed literals
+    for ty in ["@id", "@vocab", "http://x/dt"] {
+        let doc = format!(
+            r#"{{"@context": {{"q": {{"@id": "http://www.w3.org/ns/shacl#select", "@type": "{ty}"}}}}, "@id": "urn:s", "q": "{BAD_QUERY}"}}"#
+        );
+        assert_eq!(queries(&doc), Vec::<String>::new(), "{ty}");
+    }
+}
