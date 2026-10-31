@@ -171,21 +171,21 @@ for output in outputs:
         self.assertEqual(p.stdout.strip(), "chosen")
         self.assertEqual(self.nix_calls(), [])
 
-    def test_relative_hyperfine_override_resolves_from_the_caller(self):
+    def test_hyperfine_override_must_be_an_absolute_executable_file(self):
         tools = self.work / "tools"
         tools.mkdir()
-        chosen = tools / "timer"
-        chosen.write_text("#!/bin/sh\necho relative\n")
-        chosen.chmod(0o755)
-        p = subprocess.run(["bash", "-euc", 'source "$1"; use_hyperfine; hyperfine', "bash", str(TOOLS)],
-                           env=self.env | {"HYPERFINE": "tools/timer", "FAIL_NIX": "1"}, cwd=self.work,
-                           capture_output=True, text=True)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout.strip(), "relative")
-        p = self.shell("use_hyperfine; echo started", HYPERFINE=str(self.work / "missing"), FAIL_NIX="1")
-        self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(p.stdout, "")
-        self.assertIn("not an executable", p.stderr)
+        timer = tools / "timer"
+        timer.write_text("#!/bin/sh\nexit 0\n")
+        timer.chmod(0o755)
+        for override in ["tools/timer", "timer", str(self.work / "missing"), str(tools)]:
+            with self.subTest(override=override):
+                p = subprocess.run(["bash", "-euc", 'source "$1"; use_hyperfine; echo started', "bash", str(TOOLS)],
+                                   env=self.env | {"HYPERFINE": override, "FAIL_NIX": "1", "PATH": f"tools:{self.env['PATH']}"},
+                                   cwd=self.work, capture_output=True, text=True)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(p.stdout, "")
+                self.assertIn("absolute path of an executable file", p.stderr)
+        self.assertEqual(self.nix_calls(), [])
 
     def test_resolve_tools_leaves_the_timer_to_runners_that_time(self):
         p = self.shell("has() { false; }; resolve_tools", FAIL_NIX="1")

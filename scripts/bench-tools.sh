@@ -66,24 +66,16 @@ fluree_bin() {
 
 # Put the flake's hyperfine first on PATH, so the runners' bare `hyperfine` calls, including
 # those behind a CPU-pinning client prefix, time with the pinned version. HYPERFINE names
-# another executable, which runs whatever its file name. Runners that time requests call
+# the absolute path of another executable, which runs whatever its file name. Runners that time requests call
 # this after resolve_tools.
 use_hyperfine() {
   local binary=${HYPERFINE:-}
   if [ -z "$binary" ]; then
     binary=$(nixbin hyperfine hyperfine) || return
-  elif [[ $binary != */* ]]; then
-    binary=$(type -P "$binary") || {
-      echo "HYPERFINE=$HYPERFINE is not on PATH" >&2
-      return 1
-    }
-  elif [[ $binary != /* ]]; then
-    binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")" || return
-  fi
-  [ -x "$binary" ] || {
-    echo "HYPERFINE=$binary is not an executable" >&2
+  elif [[ $binary != /* ]] || [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+    echo "HYPERFINE=$binary must be the absolute path of an executable file" >&2
     return 1
-  }
+  fi
   mkdir -p "$WORK/timer" || return
   ln -sfn "$binary" "$WORK/timer/hyperfine" || return
   PATH="$WORK/timer:$PATH"
