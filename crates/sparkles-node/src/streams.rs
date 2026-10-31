@@ -13,6 +13,7 @@ enum StreamResult {
     Streaming(sparkles::sparql::QueryExecution),
 }
 /// The W3C syntax named by `format`, for the places that read no other (SHACL shapes).
+#[cfg(feature = "shacl")]
 pub(crate) fn format(v: &Value) -> sparkles::Result<sparkles::io::RdfFormat> {
     sparkles::sparql::results::rdf_format_from_name(v["format"].as_str().unwrap_or("nq"))
         .ok_or_else(|| EngineError::invalid("unsupported RDF format"))
