@@ -391,7 +391,10 @@ if [ "$(uname -s)" = Darwin ]; then
   mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
   ulimit -c 0
 fi
-mbx nextest run --workspace --no-fail-fast
+rc=0
+mbx nextest run --workspace --no-fail-fast || rc=$?
+python3 scripts/nextest-slow.py target/nextest/default/junit.xml .artifacts/ci/slow-tests.txt
+exit $rc
 ''',
   '''
 set -e

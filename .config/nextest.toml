@@ -12,6 +12,11 @@ fail-fast = false
 # ten minutes is stopped and counted as failed instead of hanging the run.
 slow-timeout = { period = "120s", terminate-after = 5 }
 
+# The test task reads this report to warn about tests slow enough to time out on
+# GitHub's runners (scripts/nextest-slow.py).
+[profile.default.junit]
+path = "junit.xml"
+
 [profile.ci]
 failure-output = "immediate-final"
 success-output = "never"

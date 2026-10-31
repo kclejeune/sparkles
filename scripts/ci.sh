@@ -284,6 +284,10 @@ main() {
 
   echo
   cat "$summary"
+  if [ -s "$out/slow-tests.txt" ]; then
+    printf '\nwarning: tests that may time out on GitHub runners (scripts/nextest-slow.py):\n'
+    cat "$out/slow-tests.txt"
+  fi
   if [ ${#failed[@]} -gt 0 ]; then
     for t in "${failed[@]}"; do
       printf '\n==== %s (last 40 lines of %s)\n' "$t" "$out/logs/${t//:/_}.log"
