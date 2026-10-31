@@ -343,6 +343,10 @@ C26 jobs and outbox entries, credential references and the remapping of referenc
 clone's new identity are not built and remain with
 [C26](../C26-durable-jobs-and-delivery.md).
 
+A stored view that fails its check refuses the whole capture, so one such view blocks
+every backup and persistent clone of its dataset. Roadmap item 442 tracks keeping it as
+a failed definition instead.
+
 The acceptance tests cover a round trip of two views with identical rows after
 resumption, the pause across a restart, a clone, an in-memory dataset and a backup
 without views that keeps the older layout. They cover every refusal: traversal,
