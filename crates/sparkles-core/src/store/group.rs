@@ -2449,6 +2449,53 @@ mod tests {
         assert_eq!(counted, measured, "the fence's growth was counted twice");
     }
 
+    /// A walk that began before a fence read the walk count, and read the directory
+    /// after the fence grew it, also makes the fence measure again.
+    #[test]
+    fn a_quota_walk_running_across_a_fence_is_not_counted_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        s.set_quota(Some(1 << 40)).unwrap();
+        let (hit, go) = pause(&s, "group-sealed");
+        let fenced = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        // a walk starts while the fence is sealed and reads the directory only once the
+        // fence has written
+        let (walking_tx, walking) = mpsc::channel();
+        let (grown_tx, grown) = mpsc::channel::<()>();
+        s.quota.on_next_walk(move || {
+            walking_tx.send(()).unwrap();
+            let _ = grown.recv_timeout(Duration::from_secs(10));
+        });
+        let walker = {
+            let s = s.clone();
+            thread::spawn(move || {
+                s.quota.remeasure();
+                s.quota.used()
+            })
+        };
+        walking.recv_timeout(Duration::from_secs(5)).unwrap();
+        let grown_tx = Mutex::new(Some(grown_tx));
+        s.set_failpoint(
+            "group-written",
+            Some(Arc::new(move |_| {
+                grown_tx.lock().take();
+            })),
+        );
+        go.send(()).unwrap();
+        fenced.join().unwrap().unwrap();
+        walker.join().unwrap();
+        s.set_failpoint("group-sealed", None);
+        s.set_failpoint("group-written", None);
+        let counted = s.quota.used();
+        s.quota.remeasure();
+        let measured = s.quota.used();
+        assert_eq!(counted, measured, "the fence's growth was counted twice");
+    }
+
     /// A fence releases its commits' quota reservations as it counts their growth, in one
     /// step, even while its annotation synchronization still runs, so no writer's check
     /// counts the prefix twice meanwhile.

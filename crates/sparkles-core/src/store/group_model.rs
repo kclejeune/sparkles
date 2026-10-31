@@ -111,6 +111,11 @@ impl Fault {
     fn poisons(self) -> bool {
         self.syncs() || matches!(self, Fault::Panic(_))
     }
+
+    /// whether the fault can leave the full-text index stale, so that its searches refuse
+    fn stales_text(self) -> bool {
+        matches!(self, Fault::TextUpdate)
+    }
 }
 
 fn quad(name: &str) -> Quad {
@@ -288,9 +293,10 @@ static SPECULATIVE_SEARCHES: AtomicU64 = AtomicU64::new(0);
 /// anything, and compare the hits with that state's labelled subjects. The state may be
 /// the speculative head of commits still in their fence, and the search then waits for
 /// their publication (X09 item 447). `Err` when the search cannot answer for a reason the
-/// transaction must report: the fence failed, so the writer is poisoned.
+/// transaction must report: the fence failed, so the writer is poisoned. An error that
+/// the run's fault does not explain is a mismatch.
 #[cfg(all(feature = "text", feature = "geo"))]
-fn search_base(t: &WriteTxn<'_>, poisoning: bool, mismatch: &mut Option<String>) -> Result<()> {
+fn search_base(t: &WriteTxn<'_>, fault: Fault, mismatch: &mut Option<String>) -> Result<()> {
     let view = Arc::new(t.view());
     let speculative = view.commit > t.store.snapshot().commit;
     let expected = subjects_of(&view, LABEL);
@@ -312,14 +318,15 @@ fn search_base(t: &WriteTxn<'_>, poisoning: bool, mismatch: &mut Option<String>)
             }
             Ok(())
         }
-        // stale after an injected failure: the search refuses, as it does for a reader
-        Err(Error::TextUnavailable(_)) => Ok(()),
+        // stale after an injected index failure: the search refuses, as it does for a
+        // reader
+        Err(Error::TextUnavailable(_)) if fault.stales_text() => Ok(()),
         // only a fault that poisons the writer may fail the search of a base whose fence
         // was still running
-        Err(e) if poisoning => Err(e),
+        Err(e) if fault.poisons() && !matches!(e, Error::TextUnavailable(_)) => Err(e),
         Err(e) => {
             *mismatch = Some(format!(
-                "a transaction's search of its base {} failed in a run without a poisoning fault: {e}",
+                "a transaction's search of its base {} failed in a run with fault {fault:?}: {e}",
                 view.commit
             ));
             Err(e)
@@ -328,13 +335,13 @@ fn search_base(t: &WriteTxn<'_>, poisoning: bool, mismatch: &mut Option<String>)
 }
 
 #[cfg(not(all(feature = "text", feature = "geo")))]
-fn search_base(_: &WriteTxn<'_>, _: bool, _: &mut Option<String>) -> Result<()> {
+fn search_base(_: &WriteTxn<'_>, _: Fault, _: &mut Option<String>) -> Result<()> {
     unreachable!("searching runs need the text and geo features")
 }
 
 /// Run one operation, returning its outcome.
-/// `poisoning` says whether the run's fault can poison the writer.
-fn run_op(s: &Store, op: &Op, indexed: bool, poisoning: bool) -> Outcome {
+/// `fault` is the run's armed fault, which decides the errors a search may return.
+fn run_op(s: &Store, op: &Op, indexed: bool, fault: Fault) -> Outcome {
     let mut opts = crate::guard::WriteOptions {
         message: op.message.as_deref().map(Into::into),
         ..Default::default()
@@ -367,7 +374,7 @@ fn run_op(s: &Store, op: &Op, indexed: bool, poisoning: bool) -> Outcome {
         // the fallible form, which checks the options (`write_with` takes none of them)
         let mut t = s.try_write_with(CommitKind::Update, opts)?;
         if op.kind == Kind::Search {
-            search_base(&t, poisoning, &mut mismatch)?;
+            search_base(&t, fault, &mut mismatch)?;
         }
         for n in &op.inserts {
             for q in quads(n, indexed) {
@@ -470,7 +477,7 @@ fn worker(
             message,
             outcome: Outcome::NoCommit,
         };
-        op.outcome = run_op(s, &op, indexed, fault.poisons());
+        op.outcome = run_op(s, &op, indexed, fault);
         match &op.outcome {
             Outcome::Acked(_) if op.kind.commits() => live.extend(op.inserts.iter().cloned()),
             Outcome::Acked(_) | Outcome::NoCommit => {}

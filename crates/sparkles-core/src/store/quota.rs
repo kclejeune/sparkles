@@ -77,8 +77,11 @@ pub(crate) struct Quota {
     /// the records of grouped commits queued for their fence, which the leader writes to
     /// the log later: counted as if they were in it
     queued: AtomicU64,
-    /// directory walks so far
+    /// directory walks completed so far
     measures: AtomicU64,
+    /// runs inside the next walk, before it reads the directory (for tests)
+    #[cfg(test)]
+    walking: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Quota {
@@ -100,6 +103,8 @@ impl Quota {
             vocab_preallocated: AtomicU64::new(0),
             queued: AtomicU64::new(0),
             measures: AtomicU64::new(0),
+            #[cfg(test)]
+            walking: Mutex::new(None),
         })
     }
 
@@ -118,11 +123,17 @@ impl Quota {
         let Some(root) = &self.root else { return 0 };
         let mut m = self.measured.lock();
         if m.is_none_or(|t| t.elapsed() >= MAX_AGE) {
-            self.measures.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(hook) = self.walking.lock().take() {
+                hook();
+            }
             let building = self.excluded.lock().as_deref().map_or(0, dir_size);
             self.used
                 .store(dir_size(root).saturating_sub(building), Ordering::Relaxed);
             *m = Some(Instant::now());
+            // counted once the walk is done, so that a fence that read the count while
+            // this walk was reading the directory sees it change
+            self.measures.fetch_add(1, Ordering::Relaxed);
         }
         // the zero bytes preallocated after the last commit of the log, and after the
         // last chunk of the delta vocabulary, are not data
@@ -132,8 +143,9 @@ impl Quota {
         )
     }
 
-    /// How many times the directory was walked, so that a group commit fence can tell
-    /// whether a walk saw part of its growth.
+    /// How many walks of the directory have finished, so that a group commit fence can
+    /// tell whether a walk saw part of its growth. A walk that finishes after the fence
+    /// read this count may have seen it, and a walk that finished before cannot have.
     pub(crate) fn measures(&self) -> u64 {
         self.measures.load(Ordering::Relaxed)
     }
@@ -142,6 +154,13 @@ impl Quota {
     /// the fence's growth, which the fence then counted again.
     pub(crate) fn remeasure(&self) {
         *self.measured.lock() = None;
+    }
+
+    /// Run `hook` inside the next directory walk, while it holds the measurement's lock
+    /// and before it reads the directory (for tests).
+    #[cfg(test)]
+    pub(crate) fn on_next_walk(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.walking.lock() = Some(Box::new(hook));
     }
 
     /// The bytes reserved for queued commits (for tests).
