@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-An ontology editor in the web UI with class, property and individual trees, entity frames, a SKOS thesaurus editor, a DL Query tab and an editable schema diagram.
+The design covers an ontology editor in the web UI with class, property and individual trees, entity frames, a SKOS thesaurus editor, a DL Query tab and an editable schema diagram.
 
 ## Problem and goal
 

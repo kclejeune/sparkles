@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-A canonical git serialization, export of branches to git, import and sync from git refs, and remotes with fetch, push and pull between Sparkles servers.
+The design covers a canonical git serialization, export of branches to git, import and sync from git refs, and remotes with fetch, push and pull between Sparkles servers.
 
 ## Problem and goal
 

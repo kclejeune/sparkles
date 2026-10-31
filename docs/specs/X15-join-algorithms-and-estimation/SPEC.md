@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Correlation-aware cardinality estimation, worst-case-optimal joins, scalable join enumeration, adaptive re-optimization, OPTIONAL reordering, a reachability index and factorized intermediate results.
+The design covers correlation-aware cardinality estimation, worst-case-optimal joins, scalable join enumeration, adaptive re-optimization, OPTIONAL reordering, a reachability index and factorized intermediate results.
 
 ## Problem and goal
 

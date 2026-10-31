@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Content negotiation for hosted namespaces, term and ontology pages with generated documentation, catalog-wide term search and an OLS API subset.
+The design covers content negotiation for hosted namespaces, term and ontology pages with generated documentation, catalog-wide term search and an OLS API subset.
 
 ## Problem and goal
 

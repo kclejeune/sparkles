@@ -1764,7 +1764,7 @@ These phases belong to [ROADMAP](../ROADMAP.md) item 452, the benchmark gates an
 
 **BSBM Explore multi-client throughput gap.** Find why Fluree's driver throughput is two to three times Sparkles' at 1, 4 and 16 clients, separating its answer differences from real per-mix cost. The cell is unranked because Fluree's q8, q11 and q12 answers differ, so the losses table omits a large concurrency signal. It depends on item 1.
 
-**BSBM BI driver completion.** Make the BI driver finish. Fix the generated `q6` that needs 200,003,584 intermediate rows and the `q4` and `q2` pool pressure, and do it before item 1 reruns the cells. Sparkles fails all three BI cells and reaches the wall limit after 218 of 500 mixes, and item 1 only reruns them. It depends on items 1, 7 and 93.
+**BSBM BI driver completion.** Make the BI driver finish. Fix the generated `q6` that needs 200,003,584 intermediate rows and the `q4` and `q2` pool pressure, and do it before item 1 reruns the cells. Sparkles fails all three BI cells and reaches the wall limit after 218 of 500 mixes, and item 1 only reruns them. It depends on items 7 and 93.
 
 **Long write and compaction comparison across engines.** Run the built `bench-longwrite` harness for an hour per engine and four hours for Sparkles, with durability classes and post-SIGKILL checks. Only one-minute smoke runs exist, and item 14's adaptive policy depends on these measurements. It depends on items 1 and 290.
 

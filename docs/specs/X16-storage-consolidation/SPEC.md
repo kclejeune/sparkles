@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-A first-release format cutoff, budgeted readers through one Control trait, a shared commit publish tail, one load plan, partitioned vocabularies with per-range generations, and the remaining replica, clone and format-policy work.
+The design covers a first-release format cutoff, budgeted readers through one Control trait, a shared commit publish tail, one load plan, partitioned vocabularies with per-range generations, and the remaining replica, clone and format-policy work.
 
 ## Problem and goal
 

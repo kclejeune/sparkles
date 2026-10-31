@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Time-respecting paths and temporal projections over valid time, custody-chain checks and algorithm results across time slices with change-point detection.
+The design covers time-respecting paths and temporal projections over valid time, custody-chain checks and algorithm results across time slices with change-point detection.
 
 ## Problem and goal
 

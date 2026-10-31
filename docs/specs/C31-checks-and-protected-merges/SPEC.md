@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Gate suites of SHACL, ShEx, lint, reasoning and quality checks defined in RDF, required checks on protected branches, breaking-change analysis, change-request workflows and comments.
+The design covers gate suites of SHACL, ShEx, lint, reasoning and quality checks defined in RDF, required checks on protected branches, breaking-change analysis, change-request workflows and comments.
 
 ## Problem and goal
 

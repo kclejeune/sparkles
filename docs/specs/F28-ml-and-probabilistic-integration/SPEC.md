@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Integration with ML pipelines, model registries and probabilistic engines through Croissant, Parquet, MLflow, Hugging Face Hub, ONNX, KServe, Triton, Feast, OpenLineage, PSL and ProbLog.
+The design covers integration with ML pipelines, model registries and probabilistic engines through Croissant, Parquet, MLflow, Hugging Face Hub, ONNX, KServe, Triton, Feast, OpenLineage, PSL and ProbLog.
 
 ## Problem and goal
 

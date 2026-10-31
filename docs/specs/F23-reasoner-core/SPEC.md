@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Specialized closure operators, complete OWL 2 RL rules, cost-based rule planning, a columnar derived tier, compact provenance, a native n-ary Datalog core, rule frontends and one incremental-maintenance core shared with views.
+The design covers specialized closure operators, complete OWL 2 RL rules, cost-based rule planning, a columnar derived tier, compact provenance, a native n-ary Datalog core, rule frontends and one incremental-maintenance core shared with views.
 
 ## Problem and goal
 

@@ -140,15 +140,15 @@ a second gate host is available.
 
 ### How the waves share capacity
 
-The waves run in parallel, and each has its own capacity. Wave B keeps one dedicated
-lane. When work competes for gate, review or benchmark time, the dependency order and how
-ready the work is decide which goes first, not the wave it belongs to. The goal at the
-start of this section states what Sparkles optimizes for, and it does not order the
-waves.
+The waves run in parallel, and each has its own capacity. Wave B always has one stream
+of work reserved for it. When work competes for gate, review or benchmark time, the
+dependency order and how ready the work is decide which goes first, not the wave it
+belongs to. The goal at the start of this section states what Sparkles optimizes
+for, and it does not order the waves.
 
-The waves set the order of execution, and the tiers below rate value. A wave can
-therefore hold items from several tiers, and a high-value item can wait in a later wave
-for its dependencies.
+The waves group the work by delivery, and the tiers below rate its value. A wave can
+therefore hold items from several tiers. Within a wave, the order its section gives
+applies, and across waves the dependency order and readiness decide.
 
 ### Production readiness
 
@@ -251,7 +251,8 @@ flowchart LR
     G --> QF["485–487 · Reasoning quick fixes"]
     S1["474–478 · Cheap deletions"] --> XM
     FC["479 · Format cutoff"] --> XM
-    PL["480–484 · Policy plumbing"] --> XM
+    PL["480–483 · Policy plumbing"] --> XM
+    PT["484 · Commit publish tail"] --> XM
     I7["7 · Batch execution and spill"] --> XM
     I93["93 · Spill costs and default"] --> XM
     XM --> JA["454 · Join algorithms and estimation"]

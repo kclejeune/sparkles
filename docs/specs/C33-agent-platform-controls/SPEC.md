@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-MCP tool profiles, shape templates, an approval queue for agent updates, data-change resources, composite tools, branch handoff, framework adapters, in-process memory APIs and A2A skills.
+The design covers mCP tool profiles, shape templates, an approval queue for agent updates, data-change resources, composite tools, branch handoff, framework adapters, in-process memory APIs and A2A skills.
 
 ## Problem and goal
 

@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Immutable generations uploaded to S3-compatible storage after compaction, fetched as whole segments into a local disk cache and memory-mapped from there, with lazy dataset open and idle unload.
+The design covers immutable generations uploaded to S3-compatible storage after compaction, fetched as whole segments into a local disk cache and memory-mapped from there, with lazy dataset open and idle unload.
 
 ## Problem and goal
 

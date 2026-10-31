@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Each source version indexed once into an immutable fragment generation, and datasets composed by a k-way merge of fragment vocabularies and sorted permutations.
+The design covers immutable fragment generations that index each source version once, and datasets composed by a k-way merge of fragment vocabularies and sorted permutations.
 
 ## Problem and goal
 

@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-A tamper-evident audit stream of data access and agent activity, personal-data erasure across history and backups, field-level encryption with crypto-shredding, PII detection, comparable digests and verifiable credentials.
+The design covers a tamper-evident audit stream of data access and agent activity, personal-data erasure across history and backups, field-level encryption with crypto-shredding, PII detection, comparable digests and verifiable credentials.
 
 ## Problem and goal
 

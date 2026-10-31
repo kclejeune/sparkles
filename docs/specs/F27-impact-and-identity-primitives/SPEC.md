@@ -6,7 +6,7 @@
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-Generic entity-resolution primitives, tier and concentration metrics, decaying weighted reachability, recommendation explanations and survivorship rules.
+The design covers generic entity-resolution primitives, tier and concentration metrics, decaying weighted reachability, recommendation explanations and survivorship rules.
 
 ## Problem and goal
 
