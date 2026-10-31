@@ -319,6 +319,8 @@ jobs:
             sudo swapon "$swapfile"; }; then
             echo '::warning::the runner refused a swap file'
             sudo rm -f "$swapfile" || true
+          else
+            echo "CI_SWAPFILE=$swapfile" >> "$GITHUB_ENV"
           fi
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
@@ -365,6 +367,12 @@ jobs:
       - name: Disk space after test archive
         if: ${{ always() }}
         run: df -h "$GITHUB_WORKSPACE"
+      # A persistent runner keeps the machine, so the job removes its own swap file.
+      - name: Remove swap
+        if: ${{ always() && env.CI_SWAPFILE != '' }}
+        run: &remove-swap |
+          sudo swapoff "$CI_SWAPFILE" || true
+          sudo rm -f "$CI_SWAPFILE" || true
       # The archives are zstd already.
       - uses: actions/upload-artifact@v4
         with:
@@ -420,6 +428,9 @@ jobs:
           save-on-workflow-dispatch: ${{ github.ref == 'refs/heads/main' }}
       - name: Doctests
         run: mbx test --locked --workspace --doc
+      - name: Remove swap
+        if: ${{ always() && env.CI_SWAPFILE != '' }}
+        run: *remove-swap
 
   # Each shard runs a part of the tests from an archive. The settings come from
   # .config/nextest.toml: every failure reported at the end, the slowest tests started
@@ -464,14 +475,16 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
         run: |
+          # The link assumes one job at a time on the machine, as on ephemeral runners.
           build_workspace=$(cat "$RUNNER_TEMP/build-workspace")
           if [ "$build_workspace" != "$GITHUB_WORKSPACE" ]; then
-            if [ -e "$build_workspace" ]; then
+            if [ -e "$build_workspace" ] && [ ! -L "$build_workspace" ]; then
               echo "the build's checkout path $build_workspace exists on this runner" >&2
               exit 1
             fi
             sudo mkdir -p "$(dirname "$build_workspace")"
-            sudo ln -s "$GITHUB_WORKSPACE" "$build_workspace"
+            sudo ln -sfn "$GITHUB_WORKSPACE" "$build_workspace"
+            echo "CI_WORKSPACE_LINK=$build_workspace" >> "$GITHUB_ENV"
           fi
           tar -xf "$RUNNER_TEMP/ui-build.tar"
           # A timing test outside TIMING_BINARIES runs in a numbered or heavy shard instead.
@@ -491,6 +504,9 @@ jobs:
           path: target/nextest/ci/junit.xml
           retention-days: 7
           if-no-files-found: ignore
+      - name: Remove the checkout link
+        if: ${{ always() && env.CI_WORKSPACE_LINK != '' }}
+        run: sudo rm -f "$CI_WORKSPACE_LINK" || true
 
   # The server's unit and integration tests with the default features off and one feature
   # set on (scripts/test-features.sh, mise run test:features). The archive above builds

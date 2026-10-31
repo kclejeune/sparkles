@@ -730,7 +730,11 @@ value as an opaque label, so any provider that registers runners for the reposit
 `SPARKLES_TEST_SLICES` sets how many shards split the tests outside the heavy and timing
 shards, from 1 to 16, and defaults to 4.
 
-A job on a runner with at least 24 GiB of memory adds no swap file. On a runner whose file
+The test binaries find the server binary, the UI and their fixtures by paths fixed when
+they compile. When the build and a test shard run on runners with different checkout
+paths, the shard links the build's path to its own checkout, which needs `sudo` and
+assumes one job at a time on a machine, as on ephemeral runners. A job on a runner with
+at least 24 GiB of memory adds no swap file, and a job that adds one removes it at the end. On a runner whose file
 system refuses one, the job warns and continues. On a large runner the server candidate's
 container keeps its process limit and drops its 4 CPU and 14 GB limits, and Cargo runs one
 compiler job for each CPU instead of two in total.
