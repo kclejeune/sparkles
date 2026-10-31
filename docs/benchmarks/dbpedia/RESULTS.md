@@ -8,12 +8,12 @@ qualifications are preserved, and are not regenerated from the JSON records. Rea
 
 At the 50M slice, among the 27 queries with complete, agreeing content
   checks across all five engines, Sparkles has the lowest median on 24 warm and 26 cold.
-  Fluree is within 5% ahead on two small warm queries. QLever's lead on
-  `births-by-decade` in these tables predates the
-  [decimal arithmetic change](#decimal-arithmetic-and-inline-dates). A paired
-  complete-HTTP comparison on atlas now gives Sparkles 4.7 against QLever's 15.0 ms
-  warm and 29.8 against 33.6 ms cold. Its timing contract differs from the comparative
-  TSV tables.
+  Fluree is within 5% ahead on two small warm queries. The focused complete-HTTP
+  [cursor assessment](#cursor-expression-reuse-controls) puts `births-by-decade` at
+  50.2 versus QLever's 16.6 ms warm and 68.1 versus 27.6 ms cold, about 3.0× and 2.5×
+  slower. Its timing contract differs from the comparative TSV tables. The
+  [decimal arithmetic change](#decimal-arithmetic-and-inline-dates) shortens this query,
+  and a paired forge comparison under item 432 will decide its ranking.
 
 At 1.24 billion triples, Sparkles loads English DBpedia in 480 s, against
   QLever's 1,674 s and Fluree's 2,919 s. The comparative tables report lower times than
@@ -36,8 +36,8 @@ timing with a 300 second limit, and their result also qualifies the cold compari
 Of the 27 queries with complete, agreeing content checks across all five engines,
 Sparkles has the lowest median on 24 warm and 26 cold. QLever wins `births-by-decade`,
 taking 11.1 ms against Sparkles' 54.4 ms warm and 41.0 ms against 71.4 ms cold. The
-[decimal arithmetic change](#decimal-arithmetic-and-inline-dates) reverses that result
-in a later paired comparison. Fluree's
+[decimal arithmetic change](#decimal-arithmetic-and-inline-dates) shortens this query,
+and a paired forge comparison under item 432 will update this result. Fluree's
 warm medians are lower on `inlinks-count-2`, 3.7 against 3.9 ms, and on `place-union-1`,
 3.9 against 4.0 ms, both within 10%. This is agreement between engines, rather than an
 independent oracle. Several small-query medians and throughput rates are within 10%.
@@ -340,19 +340,16 @@ pack into inline ids without text, and YEAR and the other date parts read an inl
 date's fields. The [X06 Outcome](../../specs/X06-benchmark-coverage.md#decimal-arithmetic-and-inline-date-components)
 describes the profile and the tests.
 
-A paired comparison on atlas, an Intel Core i5-13500, ran each engine alone over the
-same 50M slice indexes with the complete-HTTP JSON timer of the cursor assessment.
-Four rounds gave each engine 80 warm requests and 12 cold restarts after file-cache
-eviction. Every build returned the same 80 groups and counts.
-
-| build | warm median (ms) | cold median (ms) |
-|---|---:|---:|
-| Sparkles `4196fb84` | 48.9 | 64.5 |
-| Sparkles `249f5f35` | **4.7** | **29.8** |
-| QLever 0.5.48 | 15.0 | 33.6 |
+An internal comparison on atlas, an Intel Core i5-13500, ran the two Sparkles builds
+alone over the same 50M slice indexes with the complete-HTTP JSON timer of the cursor
+assessment. Four rounds gave each build 80 warm requests and 12 cold restarts after
+file-cache eviction. `4196fb84` took 48.9 ms warm and 64.5 ms cold, and `249f5f35`
+took 4.7 and 29.8 ms, with the same 80 groups and counts. The
+[record](../2026-10-30-births-decimal-atlas.json) also keeps a QLever run on the same
+host, which is not a published ranking. Item 432 holds the paired forge comparison
+that will update the tables and the loss list.
 
 On forge, the full 1.24-billion-triple store took 161.7 ms warm and 229.0 ms cold with
 `4196fb84`, against 58.9 and 109.5 ms with `249f5f35`, and both kept all 171 groups.
 The change adds no state, so inputs with many distinct values pay no new cost. The
-[record](../2026-10-30-births-decimal-atlas.json) keeps every sample, the binary hashes
-and the settings. These are not forge cross-engine table cells.
+record keeps every sample, the binary hashes and the settings.

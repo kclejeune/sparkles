@@ -1650,8 +1650,8 @@ flagged `count-all`, `distinct-obj`, `predicate-subjects`, `values-star` and `mi
 all under 0.3 ms with spreads between server processes of 44% to 220%. Eight rounds
 of 100 requests brought every one of them within 6.5% of the base in server time and
 within 2.8% in client time. Item 328 keeps the quiet Intel checks of these small
-queries. Atlas has the same processor as forge, and a pinned forge comparison with
-QLever follows under the usual post-push checks.
+queries. The same-host QLever run is internal evidence. The published ranking and the loss
+list change only after the paired forge comparison that item 432 holds.
 
 ### Preparation-batch short-query control
 

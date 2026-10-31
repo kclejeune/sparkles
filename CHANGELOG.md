@@ -143,8 +143,8 @@ computed in one 128-bit operation, with the same results and overflow errors as 
 Decimal results take their inline ids without being written as text and parsed again,
 and YEAR, MONTH, DAY, HOURS and MINUTES read the fields of an inline date or dateTime.
 DBpedia's `births-by-decade` at the 50M slice takes 4.7 ms warm and 29.8 ms cold on
-atlas instead of 48.9 and 64.5 ms, against QLever's 15.0 and 33.6 ms on the same host.
-The full 1.24-billion-triple store takes 58.9 ms warm on forge instead of 161.7 ms.
+atlas instead of 48.9 and 64.5 ms, and on the full 1.24-billion-triple store it takes
+58.9 ms warm on forge instead of 161.7 ms.
 
 Eager results are now serialized into an 8 KiB buffer of the engine's own and written to
 the response in pieces of that size, where the serializers used to write a few bytes at a
