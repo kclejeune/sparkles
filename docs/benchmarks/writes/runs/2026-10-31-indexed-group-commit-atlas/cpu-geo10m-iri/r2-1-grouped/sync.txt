@@ -1,0 +1,4 @@
+sparkles_commit_sync_seconds_sum{dataset="bench",path="direct"} 2.116259
+sparkles_commit_sync_seconds_count{dataset="bench",path="direct"} 2197
+sparkles_commit_sync_seconds_sum{dataset="bench",path="buffered"} 0.021545
+sparkles_commit_sync_seconds_count{dataset="bench",path="buffered"} 3

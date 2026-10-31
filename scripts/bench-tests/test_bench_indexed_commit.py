@@ -1007,6 +1007,58 @@ class Oracles(unittest.TestCase):
             self.assertEqual(receipt["rate_fraction"], 0.6)
             self.assertAlmostEqual(receipt["common_rate"], 420.0)
 
+    def test_slow_state_caps_the_rate_at_the_ordinary_writers_slow_capacity(self):
+        # An ordinary process that averaged a fast drive: 972 tx/s with a mean
+        # synchronization of 0.6 ms runs at 1000 / (1.029 - 0.6 + 1.3) tx/s in the
+        # slow state, below the fraction of the slowest unpaced process.
+        self.assertAlmostEqual(
+            BENCH.slow_state_capacity(972.0, 0.6, 1.3), 1000 / (1000 / 972 + 0.7)
+        )
+        # a process measured in the slow state keeps its rate
+        self.assertAlmostEqual(BENCH.slow_state_capacity(570.0, 1.5, 1.3), 570.0)
+        discovery = iter(((972.0, 0.6), (1400.0, 1.0), (1300.0, 1.0), (1000.0, 1.3)))
+
+        def process(
+            args, cell, index, scenario, grouped, triples, run_id, rate, *, calibration
+        ):
+            tps, sync = next(discovery) if not rate else (rate, 1.0)
+            row = {
+                "calibration": True,
+                "scenario": scenario,
+                "grouped": grouped,
+                "write_rate": rate,
+                "tps": tps,
+                "sync_mean_ms": sync,
+                "max_schedule_lag_ms": 10 if rate else 0,
+                "reopen": "passed",
+            }
+            row["mixed_load_checks"] = BENCH.mixed_load_checks(row) if rate else None
+            return row
+
+        with tempfile.TemporaryDirectory(prefix="sparkles-slow-state-") as temp:
+            root = pathlib.Path(temp)
+            args = SimpleNamespace(rate_fraction=0.8, slow_sync_ms=1.3)
+            with mock.patch.object(BENCH, "measure", side_effect=process):
+                rate = BENCH.calibrate_mixed(args, root, "geo", 10, 0)
+            slow = BENCH.slow_state_capacity(972.0, 0.6, 1.3)
+            self.assertAlmostEqual(rate, slow * 0.8)
+            receipt = json.loads((root / "rate-calibration.json").read_text())
+            self.assertEqual(receipt["slow_sync_ms"], 1.3)
+            self.assertEqual(len(receipt["slow_state_capacity"]), 2)
+
+    def test_drive_probe_records_both_primitives_and_removes_its_file(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-probe-", dir=".") as temp:
+            root = pathlib.Path(temp)
+            try:
+                probe = BENCH.drive_probe(root, 4)
+            except OSError as error:
+                self.skipTest(f"no direct I/O here: {error}")
+            self.assertEqual(probe["writes"], 4)
+            self.assertGreater(probe["direct_p50_ms"], 0)
+            self.assertGreater(probe["fdatasync_p50_ms"], 0)
+            self.assertFalse((root / "drive-probe.bin").exists())
+            self.assertEqual(json.loads((root / "drive-probe.json").read_text()), probe)
+
     def test_failed_common_rate_preserves_both_alternatives_without_retry(self):
         rates = []
 
@@ -1042,6 +1094,106 @@ class Oracles(unittest.TestCase):
             self.assertEqual(receipt["unpaced"], [])
             self.assertEqual(len(receipt["validation"]), 2)
             self.assertTrue(all(r["reopen"] == "passed" for r in receipt["validation"]))
+
+    def comparison_args(self, root):
+        return SimpleNamespace(
+            binary="/builds/a",
+            compare_binary="/builds/b",
+            rate_fraction=0.8,
+            people=[10],
+            indexes=["geo"],
+            scenarios=["mixed"],
+            blocks=1,
+            write_rate=100,
+            out=str(root),
+        )
+
+    def comparison_process(self, slow_binary, calls):
+        def process(
+            args, cell, index, scenario, grouped, triples, run_id, rate, **kwargs
+        ):
+            binary = args.server_binary
+            calls.append((run_id, binary, grouped))
+            slow = binary == slow_binary and not kwargs.get("calibration")
+            row = {
+                "calibration": kwargs.get("calibration", False),
+                "scenario": scenario,
+                "grouped": grouped,
+                "write_rate": rate,
+                "tps": 20 if slow else rate,
+                "max_schedule_lag_ms": 10000 if slow else 0,
+                "namespace": run_id,
+                "reopen": "passed",
+            }
+            row["mixed_load_checks"] = BENCH.mixed_load_checks(row)
+            return row
+
+        return process
+
+    def test_comparison_calibration_validates_both_grouped_builds(self):
+        calls = []
+        with tempfile.TemporaryDirectory(prefix="sparkles-compare-cal-") as temp:
+            root = pathlib.Path(temp)
+            args = self.comparison_args(root)
+            with mock.patch.object(
+                BENCH, "measure", side_effect=self.comparison_process(None, calls)
+            ):
+                self.assertEqual(BENCH.calibrate_mixed(args, root, "geo", 10, 100), 100)
+            receipt = json.loads((root / "rate-calibration.json").read_text())
+        self.assertEqual(
+            calls,
+            [("cal-paced-0", "/builds/a", True), ("cal-paced-1", "/builds/b", True)],
+        )
+        self.assertEqual([r["variant"] for r in receipt["validation"]], ["A", "B"])
+
+    def test_comparison_rejects_a_mixed_run_that_missed_rate_or_schedule(self):
+        calls = []
+        with tempfile.TemporaryDirectory(prefix="sparkles-compare-lag-") as temp:
+            root = pathlib.Path(temp)
+            args = self.comparison_args(root)
+            with (
+                mock.patch.object(BENCH, "prepare", return_value=10),
+                mock.patch.object(
+                    BENCH,
+                    "measure",
+                    side_effect=self.comparison_process("/builds/b", calls),
+                ),
+                mock.patch("builtins.print"),
+                self.assertRaises(SystemExit) as stop,
+            ):
+                BENCH.run_campaign(args, root)
+            self.assertEqual(stop.exception.code, 3)
+            completed = json.loads((root / "completed.json").read_text())
+            checks = json.loads((root / "load-checks.json").read_text())
+            results = json.loads((root / "results.json").read_text())
+        self.assertFalse(completed["load_checks_passed"])
+        self.assertEqual(len(results), 4)
+        self.assertEqual(checks["mixed_processes"], 4)
+        self.assertEqual([f["variant"] for f in checks["failed"]], ["B", "B"])
+        for failure in checks["failed"]:
+            self.assertFalse(failure["achieved_rate"]["passed"])
+            self.assertFalse(failure["schedule_lag"]["passed"])
+
+    def test_comparison_with_kept_schedules_completes(self):
+        calls = []
+        with tempfile.TemporaryDirectory(prefix="sparkles-compare-ok-") as temp:
+            root = pathlib.Path(temp)
+            args = self.comparison_args(root)
+            with (
+                mock.patch.object(BENCH, "prepare", return_value=10),
+                mock.patch.object(
+                    BENCH, "measure", side_effect=self.comparison_process(None, calls)
+                ),
+                mock.patch("builtins.print"),
+            ):
+                results = BENCH.run_campaign(args, root)
+            completed = json.loads((root / "completed.json").read_text())
+        self.assertTrue(completed["load_checks_passed"])
+        self.assertEqual([r["variant"] for r in results], ["A", "B", "B", "A"])
+        self.assertEqual(
+            [c[1] for c in calls[2:]],
+            ["/builds/a", "/builds/b", "/builds/b", "/builds/a"],
+        )
 
     def test_unpaced_mixed_acceptance_is_refused_before_creating_run(self):
         with tempfile.TemporaryDirectory(prefix="sparkles-unpaced-refusal-") as temp:

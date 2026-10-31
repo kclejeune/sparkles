@@ -1,0 +1,17 @@
+Sat Oct 31 07:30:10 AM EDT 2026
+ 07:30:10  up 6 days 14:50,  0 users,  load average: 4.80, 4.27, 3.34
+    PID %CPU     ELAPSED COMMAND
+ 713806  0.8    03:21:12 /nix/store/wfi3zyi4p723ib7qvpzclr1lyxhysywg-tailscale-1.104.2/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641 --tun tailscale0
+3006406  0.4       27:29 [kworker/u81:20-kcryptd-254:0-1]
+3006242  0.4       27:46 [kworker/u81:4-kcryptd-254:0-1]
+3006399  0.4       27:29 [kworker/u81:5-kcryptd-254:0-1]
+3006400  0.4       27:29 [kworker/u81:8-kcryptd-254:0-1]
+3006403  0.4       27:29 [kworker/u81:13-kcryptd-254:0-1]
+3006404  0.4       27:29 [kworker/u81:14-kcryptd-254:0-1]
+3006626  0.4       27:02 [kworker/u81:21-kcryptd-254:0-1]
+2739286  0.4       35:20 [kworker/u81:2-kcryptd-254:0-1]
+3006405  0.3       27:29 [kworker/u81:15-kcryptd-254:0-1]
+3047338  0.3       01:15 [kworker/u81:12-kcryptd-254:0-1]
+3025787  0.3       12:13 [kworker/u81:11-kcryptd-254:0-1]
+3021625  0.3       17:27 [kworker/u81:10-kcryptd-254:0-1]
+2136761  0.3       52:24 [kworker/u81:0-events_unbound]

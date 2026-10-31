@@ -1,0 +1,28 @@
+cpu-geo10m-iri ordinary n=6 instr/commit=1070176 cycles/commit=507663 cpu-ms/commit=0.0000 p50=1.291 p90=2.259
+    r1-0-ordinary          instr=1070148 cycles=502922 p50=0.717 p90=2.125
+    r1-3-ordinary          instr=1070142 cycles=576092 p50=2.161 p90=3.738
+    r2-0-ordinary          instr=1070205 cycles=512404 p50=1.865 p90=2.392
+    r2-3-ordinary          instr=1070219 cycles=547924 p50=1.894 p90=2.638
+    r3-0-ordinary          instr=1070348 cycles=495446 p50=0.644 p90=2.031
+    r3-3-ordinary          instr=1070066 cycles=500586 p50=0.654 p90=2.086
+cpu-geo10m-iri grouped  n=6 instr/commit=1071300 cycles/commit=546025 cpu-ms/commit=0.0000 p50=1.932 p90=2.646
+    r1-1-grouped           instr=1071473 cycles=551991 p50=2.020 p90=2.671
+    r1-2-grouped           instr=1071617 cycles=607854 p50=2.296 p90=3.888
+    r2-1-grouped           instr=1071485 cycles=582056 p50=1.989 p90=2.908
+    r2-2-grouped           instr=1071127 cycles=540059 p50=1.875 p90=2.620
+    r3-1-grouped           instr=1071017 cycles=517313 p50=0.655 p90=1.808
+    r3-2-grouped           instr=1070860 cycles=511181 p50=0.657 p90=2.034
+cpu-geo10m-geo ordinary n=6 instr/commit=263043 cycles/commit=272036 cpu-ms/commit=0.0000 p50=0.575 p90=0.639
+    r1-0-ordinary          instr=262910 cycles=263379 p50=0.569 p90=0.612
+    r1-3-ordinary          instr=263276 cycles=270015 p50=0.567 p90=0.633
+    r2-0-ordinary          instr=262863 cycles=276640 p50=0.577 p90=0.644
+    r2-3-ordinary          instr=262991 cycles=274056 p50=0.573 p90=0.648
+    r3-0-ordinary          instr=263180 cycles=285665 p50=0.607 p90=0.659
+    r3-3-ordinary          instr=263095 cycles=266259 p50=0.579 p90=0.633
+cpu-geo10m-geo grouped  n=6 instr/commit=263930 cycles/commit=273089 cpu-ms/commit=0.0000 p50=0.575 p90=0.631
+    r1-1-grouped           instr=263825 cycles=278692 p50=0.581 p90=0.634
+    r1-2-grouped           instr=264000 cycles=270560 p50=0.571 p90=0.627
+    r2-1-grouped           instr=263906 cycles=283349 p50=0.594 p90=0.685
+    r2-2-grouped           instr=264210 cycles=266941 p50=0.563 p90=0.625
+    r3-1-grouped           instr=263953 cycles=264329 p50=0.569 p90=0.620
+    r3-2-grouped           instr=263859 cycles=275618 p50=0.579 p90=0.646

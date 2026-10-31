@@ -1,0 +1,433 @@
+{
+  "requested_rate": 0,
+  "unpaced": [
+    {
+      "scenario": "mixed",
+      "op": "geo",
+      "clients": 4,
+      "write_rate": 0,
+      "changes": 50000,
+      "errors": 0,
+      "missing_receipts": 0,
+      "seconds": 55.129295397,
+      "tps": 906.95880729,
+      "writers": {
+        "n": 50000,
+        "p50_ms": 6.679982,
+        "p90_ms": 7.284092,
+        "p99_ms": 7.839511,
+        "mean_ms": 4.399513412,
+        "max_ms": 27.624589
+      },
+      "receipts_contiguous": true,
+      "receipts_distinct": true,
+      "first_receipt": 2,
+      "per_client": [
+        12509,
+        12488,
+        12500,
+        12503
+      ],
+      "max_share_deviation": 0.001,
+      "readers": {
+        "n": 2756,
+        "p50_ms": 1.6814820701256394,
+        "p99_ms": 2.3737200535833836
+      },
+      "reader_violations": 0,
+      "write_start_unix": 1793431625.41012,
+      "write_end_unix": 1793431680.5330427,
+      "max_schedule_lag_ms": 0.0,
+      "calibration": true,
+      "mixed_load_checks": null,
+      "peak_rss_kib": 206712,
+      "rss_peak_components": {
+        "peak_rss_kib": 206712,
+        "reset_hwm_outer_window_kib": 205740,
+        "sampled_writer_interval_peak_kib": 206712,
+        "writer_interval_sample_count": 548,
+        "write_start_unix": 1793431625.41012,
+        "write_end_unix": 1793431680.5330427,
+        "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+      },
+      "grouped_admissions": 0,
+      "internal_embed_commits": 0,
+      "sync_mean_ms": 0.9890024199999999,
+      "drive_probe": {
+        "writes": 64,
+        "direct_p50_ms": 0.26269949739798903,
+        "fdatasync_p50_ms": 0.34945301013067365
+      },
+      "write_namespace_count": 50000,
+      "grouped": false,
+      "index": "geo",
+      "people": 100000,
+      "elapsed": 55.74662502296269,
+      "namespace": "item86_fd9c16a25004442f8f3af4589f56cc2b",
+      "reopen": "passed"
+    },
+    {
+      "scenario": "mixed",
+      "op": "geo",
+      "clients": 4,
+      "write_rate": 0,
+      "changes": 50000,
+      "errors": 0,
+      "missing_receipts": 0,
+      "seconds": 21.224240464,
+      "tps": 2355.796905185,
+      "writers": {
+        "n": 50000,
+        "p50_ms": 1.327435,
+        "p90_ms": 3.483463,
+        "p99_ms": 4.216373,
+        "mean_ms": 1.690107015,
+        "max_ms": 15.771936
+      },
+      "receipts_contiguous": true,
+      "receipts_distinct": true,
+      "first_receipt": 2,
+      "per_client": [
+        12520,
+        12472,
+        12511,
+        12497
+      ],
+      "max_share_deviation": 0.002,
+      "readers": {
+        "n": 1060,
+        "p50_ms": 1.684239017777145,
+        "p99_ms": 2.4137540021911263
+      },
+      "reader_violations": 0,
+      "write_start_unix": 1793431684.7153425,
+      "write_end_unix": 1793431705.9353902,
+      "max_schedule_lag_ms": 0.0,
+      "calibration": true,
+      "mixed_load_checks": null,
+      "peak_rss_kib": 212720,
+      "rss_peak_components": {
+        "peak_rss_kib": 212720,
+        "reset_hwm_outer_window_kib": 211792,
+        "sampled_writer_interval_peak_kib": 212720,
+        "writer_interval_sample_count": 211,
+        "write_start_unix": 1793431684.7153425,
+        "write_end_unix": 1793431705.9353902,
+        "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+      },
+      "grouped_admissions": 45259.0,
+      "internal_embed_commits": 0,
+      "sync_mean_ms": 0.5690240502253702,
+      "drive_probe": {
+        "writes": 64,
+        "direct_p50_ms": 1.5493964892812073,
+        "fdatasync_p50_ms": 1.7215695115737617
+      },
+      "write_namespace_count": 50000,
+      "grouped": true,
+      "index": "geo",
+      "people": 100000,
+      "elapsed": 21.847782679949887,
+      "namespace": "item86_73f9e8d650cd4b919e26923f48203c4c",
+      "reopen": "passed"
+    },
+    {
+      "scenario": "mixed",
+      "op": "geo",
+      "clients": 4,
+      "write_rate": 0,
+      "changes": 50000,
+      "errors": 0,
+      "missing_receipts": 0,
+      "seconds": 23.714788753,
+      "tps": 2108.389010789,
+      "writers": {
+        "n": 50000,
+        "p50_ms": 1.347172,
+        "p90_ms": 3.572247,
+        "p99_ms": 5.321134,
+        "mean_ms": 1.889095291,
+        "max_ms": 25.838025
+      },
+      "receipts_contiguous": true,
+      "receipts_distinct": true,
+      "first_receipt": 2,
+      "per_client": [
+        12503,
+        12552,
+        12494,
+        12451
+      ],
+      "max_share_deviation": 0.004,
+      "readers": {
+        "n": 1184,
+        "p50_ms": 1.6839309828355908,
+        "p99_ms": 2.3466109996661544
+      },
+      "reader_violations": 0,
+      "write_start_unix": 1793431710.2613447,
+      "write_end_unix": 1793431733.9706979,
+      "max_schedule_lag_ms": 0.0,
+      "calibration": true,
+      "mixed_load_checks": null,
+      "peak_rss_kib": 209412,
+      "rss_peak_components": {
+        "peak_rss_kib": 209412,
+        "reset_hwm_outer_window_kib": 208348,
+        "sampled_writer_interval_peak_kib": 209412,
+        "writer_interval_sample_count": 236,
+        "write_start_unix": 1793431710.2613447,
+        "write_end_unix": 1793431733.9706979,
+        "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+      },
+      "grouped_admissions": 45489.0,
+      "internal_embed_commits": 0,
+      "sync_mean_ms": 0.6638336710018953,
+      "drive_probe": {
+        "writes": 64,
+        "direct_p50_ms": 1.7314350116066635,
+        "fdatasync_p50_ms": 1.8491469672881067
+      },
+      "write_namespace_count": 50000,
+      "grouped": true,
+      "index": "geo",
+      "people": 100000,
+      "elapsed": 24.329534305958077,
+      "namespace": "item86_6a3a2bb8d4954f0294903a86c1b12359",
+      "reopen": "passed"
+    },
+    {
+      "scenario": "mixed",
+      "op": "geo",
+      "clients": 4,
+      "write_rate": 0,
+      "changes": 50000,
+      "errors": 0,
+      "missing_receipts": 0,
+      "seconds": 73.473163691,
+      "tps": 680.520580416,
+      "writers": {
+        "n": 50000,
+        "p50_ms": 6.805537,
+        "p90_ms": 7.377727,
+        "p99_ms": 8.074379,
+        "mean_ms": 5.867285714,
+        "max_ms": 28.399445
+      },
+      "receipts_contiguous": true,
+      "receipts_distinct": true,
+      "first_receipt": 2,
+      "per_client": [
+        12499,
+        12497,
+        12500,
+        12504
+      ],
+      "max_share_deviation": 0.0,
+      "readers": {
+        "n": 3672,
+        "p50_ms": 1.9258820684626698,
+        "p99_ms": 2.9185019666329026
+      },
+      "reader_violations": 0,
+      "write_start_unix": 1793431737.5124238,
+      "write_end_unix": 1793431810.9805639,
+      "max_schedule_lag_ms": 0.0,
+      "calibration": true,
+      "mixed_load_checks": null,
+      "peak_rss_kib": 216740,
+      "rss_peak_components": {
+        "peak_rss_kib": 216740,
+        "reset_hwm_outer_window_kib": 215432,
+        "sampled_writer_interval_peak_kib": 216740,
+        "writer_interval_sample_count": 731,
+        "write_start_unix": 1793431737.5124238,
+        "write_end_unix": 1793431810.9805639,
+        "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+      },
+      "grouped_admissions": 0,
+      "internal_embed_commits": 0,
+      "sync_mean_ms": 1.3529148000000002,
+      "drive_probe": {
+        "writes": 64,
+        "direct_p50_ms": 0.2504310104995966,
+        "fdatasync_p50_ms": 0.31253404449671507
+      },
+      "write_namespace_count": 50000,
+      "grouped": false,
+      "index": "geo",
+      "people": 100000,
+      "elapsed": 74.08435550599825,
+      "namespace": "item86_d69b5be914fb4a96ac711275d306ba5c",
+      "reopen": "passed"
+    }
+  ],
+  "validation": [
+    {
+      "scenario": "mixed",
+      "op": "geo",
+      "clients": 4,
+      "write_rate": 466.05150521597045,
+      "changes": 50000,
+      "errors": 0,
+      "missing_receipts": 0,
+      "seconds": 107.292436511,
+      "tps": 466.016073695,
+      "writers": {
+        "n": 50000,
+        "p50_ms": 2.047514,
+        "p90_ms": 2.42358,
+        "p99_ms": 7.16341,
+        "mean_ms": 1.986985151,
+        "max_ms": 27.800252
+      },
+      "receipts_contiguous": true,
+      "receipts_distinct": true,
+      "first_receipt": 2,
+      "per_client": [
+        12500,
+        12500,
+        12500,
+        12500
+      ],
+      "max_share_deviation": 0.0,
+      "readers": {
+        "n": 5364,
+        "p50_ms": 1.7395250033587217,
+        "p99_ms": 2.3607200710102916
+      },
+      "reader_violations": 0,
+      "write_start_unix": 1793431814.7171009,
+      "write_end_unix": 1793431922.0012243,
+      "max_schedule_lag_ms": 28.007585,
+      "calibration": true,
+      "mixed_load_checks": {
+        "achieved_rate": {
+          "requirement": "harness load quality",
+          "target_tps": 466.05150521597045,
+          "achieved_tps": 466.016073695,
+          "ratio": 0.9999239750959413,
+          "passed": true
+        },
+        "schedule_lag": {
+          "requirement": "harness load quality; not an X09 numeric threshold",
+          "max_ms": 28.007585,
+          "limit_ms": 50,
+          "passed": true
+        }
+      },
+      "peak_rss_kib": 217268,
+      "rss_peak_components": {
+        "peak_rss_kib": 217268,
+        "reset_hwm_outer_window_kib": 216400,
+        "sampled_writer_interval_peak_kib": 217268,
+        "writer_interval_sample_count": 1068,
+        "write_start_unix": 1793431814.7171009,
+        "write_end_unix": 1793431922.0012243,
+        "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+      },
+      "grouped_admissions": 0,
+      "internal_embed_commits": 0,
+      "sync_mean_ms": 1.3549389,
+      "drive_probe": {
+        "writes": 64,
+        "direct_p50_ms": 0.2527515171095729,
+        "fdatasync_p50_ms": 0.3477879799902439
+      },
+      "write_namespace_count": 50000,
+      "grouped": false,
+      "index": "geo",
+      "people": 100000,
+      "elapsed": 107.93609784496948,
+      "namespace": "item86_4a3e8e04efe44f5097bbdf435456101f",
+      "reopen": "passed"
+    },
+    {
+      "scenario": "mixed",
+      "op": "geo",
+      "clients": 4,
+      "write_rate": 466.05150521597045,
+      "changes": 50000,
+      "errors": 0,
+      "missing_receipts": 0,
+      "seconds": 107.292575164,
+      "tps": 466.015471467,
+      "writers": {
+        "n": 50000,
+        "p50_ms": 1.978322,
+        "p90_ms": 2.333626,
+        "p99_ms": 2.686648,
+        "mean_ms": 1.582409617,
+        "max_ms": 21.289472
+      },
+      "receipts_contiguous": true,
+      "receipts_distinct": true,
+      "first_receipt": 2,
+      "per_client": [
+        12500,
+        12500,
+        12500,
+        12500
+      ],
+      "max_share_deviation": 0.0,
+      "readers": {
+        "n": 5364,
+        "p50_ms": 1.5997070586308837,
+        "p99_ms": 2.1499779541045427
+      },
+      "reader_violations": 0,
+      "write_start_unix": 1793431926.379258,
+      "write_end_unix": 1793432033.6637697,
+      "max_schedule_lag_ms": 16.985534,
+      "calibration": true,
+      "mixed_load_checks": {
+        "achieved_rate": {
+          "requirement": "harness load quality",
+          "target_tps": 466.05150521597045,
+          "achieved_tps": 466.015471467,
+          "ratio": 0.9999226829039984,
+          "passed": true
+        },
+        "schedule_lag": {
+          "requirement": "harness load quality; not an X09 numeric threshold",
+          "max_ms": 16.985534,
+          "limit_ms": 50,
+          "passed": true
+        }
+      },
+      "peak_rss_kib": 210644,
+      "rss_peak_components": {
+        "peak_rss_kib": 210644,
+        "reset_hwm_outer_window_kib": 209160,
+        "sampled_writer_interval_peak_kib": 210644,
+        "writer_interval_sample_count": 1068,
+        "write_start_unix": 1793431926.379258,
+        "write_end_unix": 1793432033.6637697,
+        "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+      },
+      "grouped_admissions": 325.0,
+      "internal_embed_commits": 0,
+      "sync_mean_ms": 1.0672822105558448,
+      "drive_probe": {
+        "writes": 64,
+        "direct_p50_ms": 1.6215154901146889,
+        "fdatasync_p50_ms": 1.6648445161990821
+      },
+      "write_namespace_count": 50000,
+      "grouped": true,
+      "index": "geo",
+      "people": 100000,
+      "elapsed": 107.93315814097878,
+      "namespace": "item86_0217b7f213e3441f881639dfaf79705a",
+      "reopen": "passed"
+    }
+  ],
+  "common_rate": 466.05150521597045,
+  "rate_fraction": 0.8,
+  "achieved_rate_validated": true,
+  "slow_sync_ms": 1.6,
+  "slow_state_capacity": [
+    583.5723832762736,
+    582.564381519963
+  ]
+}

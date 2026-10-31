@@ -1,0 +1,21 @@
+campaign g1-geo10m-serial
+1000000 geo serial-delete (10/10 processes) p50_ms=ok p90_ms=ok
+    amended gate p50_ms: ok paired 1.016, limit 1.05
+    amended gate p90_ms: ok paired 1.019, limit 1.05
+    p50_ms: off 0.541 [0.531-0.564], on 0.558 [0.533-0.584], ratio 1.032, paired 1.016 [0.957-1.091]
+    p90_ms: off 0.612 [0.570-0.624], on 0.619 [0.571-0.649], ratio 1.013, paired 1.019 [0.924-1.082]
+    sync_ms: off 0.266 [0.260-0.269], on 0.267 [0.262-0.270], ratio 1.005, paired 1.005 [0.979-1.027]
+1000000 geo serial-iri (10/10 processes) p50_ms=ok p90_ms=ok
+    amended gate p50_ms: ok paired 0.999, limit 1.05
+    amended gate p90_ms: ok paired 1.000, limit 1.05
+    p50_ms: off 0.648 [0.634-0.665], on 0.646 [0.630-0.671], ratio 0.997, paired 0.999 [0.971-1.034]
+    p90_ms: off 2.018 [1.925-2.140], on 2.020 [1.441-2.149], ratio 1.001, paired 1.000 [0.673-1.034]
+    sync_ms: off 0.273 [0.264-0.278], on 0.272 [0.266-0.281], ratio 0.998, paired 0.997 [0.963-1.039]
+    overhead_ms: off 0.567 [0.538-0.578], on 0.557 [0.492-0.587], ratio 0.983, paired 0.994 [0.861-1.042]
+1000000 geo serial-literal (10/10 processes) p50_ms=ok p90_ms=ok
+    amended gate p50_ms: ok paired 0.984, limit 1.05
+    amended gate p90_ms: ok paired 0.973, limit 1.05
+    p50_ms: off 0.568 [0.549-2.012], on 0.561 [0.554-1.891], ratio 0.987, paired 0.984 [0.940-1.136]
+    p90_ms: off 0.641 [0.598-2.210], on 0.629 [0.594-2.131], ratio 0.982, paired 0.973 [0.938-3.183]
+    sync_ms: off 0.282 [0.277-1.490], on 0.283 [0.278-1.272], ratio 1.001, paired 0.998 [0.854-2.021]
+    overhead_ms: off 0.308 [0.287-0.424], on 0.303 [0.289-0.403], ratio 0.982, paired 0.975 [0.950-1.245]

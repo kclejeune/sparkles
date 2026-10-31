@@ -1,0 +1,9 @@
+campaign g4-geo1m-mixed
+100000 geo mixed (10/10 processes) peak_rss=ok achieved_rate=ok schedule_lag=ok p50_ms=ok p99_ms=ok
+    tps: off 466.016 [466.015-466.017], on 466.016 [466.015-466.016], ratio 1.000, paired 1.000 [1.000-1.000]
+    peak_rss_mib: off 212.695 [206.555-220.605], on 209.586 [199.324-218.434], ratio 0.985, paired 0.995 [0.936-1.051]
+    sync_ms: off 1.232 [0.903-1.339], on 1.234 [0.909-1.341], ratio 1.002, paired 1.003 [0.680-1.484]
+    reader_p50_ms: off 1.654 [1.631-1.702], on 1.653 [1.630-1.714], ratio 0.999, paired 0.999 [0.963-1.035]
+    reader_p99_ms: off 2.204 [2.138-2.384], on 2.187 [2.170-2.401], ratio 0.992, paired 1.005 [0.942-1.075]
+    max_schedule_lag_ms: off 12.629 [11.345-20.971], on 11.676 [11.081-13.565], ratio 0.925, paired 0.925 [0.551-1.196]
+    write_p99_ms: off 4.732 [2.961-6.598], on 2.695 [2.641-2.912], ratio 0.570, paired 0.563 [0.406-0.956]

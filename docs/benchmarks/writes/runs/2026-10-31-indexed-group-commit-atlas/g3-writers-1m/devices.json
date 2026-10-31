@@ -1,0 +1,62 @@
+{
+   "blockdevices": [
+      {
+         "name": "nvme0n1",
+         "type": "disk",
+         "fstype": null,
+         "rota": false,
+         "model": "SKHynix_HFS512GEJ9X102N",
+         "mountpoints": [],
+         "children": [
+            {
+               "name": "nvme0n1p1",
+               "type": "part",
+               "fstype": "vfat",
+               "rota": false,
+               "model": null,
+               "mountpoints": [
+                   "/boot"
+               ]
+            },{
+               "name": "nvme0n1p2",
+               "type": "part",
+               "fstype": "crypto_LUKS",
+               "rota": false,
+               "model": null,
+               "mountpoints": [],
+               "children": [
+                  {
+                     "name": "cryptroot",
+                     "type": "crypt",
+                     "fstype": "LVM2_member",
+                     "rota": false,
+                     "model": null,
+                     "mountpoints": [],
+                     "children": [
+                        {
+                           "name": "vg-swap",
+                           "type": "lvm",
+                           "fstype": "swap",
+                           "rota": false,
+                           "model": null,
+                           "mountpoints": [
+                               "[SWAP]"
+                           ]
+                        },{
+                           "name": "vg-root",
+                           "type": "lvm",
+                           "fstype": "ext4",
+                           "rota": false,
+                           "model": null,
+                           "mountpoints": [
+                               "/nix/store", "/"
+                           ]
+                        }
+                     ]
+                  }
+               ]
+            }
+         ]
+      }
+   ]
+}

@@ -1,0 +1,1642 @@
+[
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292339001,
+    "tps": 466.016497222,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.026138,
+      "p90_ms": 2.35636,
+      "p99_ms": 5.135491,
+      "mean_ms": 1.835447394,
+      "max_ms": 19.402992
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6135739861056209,
+      "p99_ms": 2.105714986100793
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432037.7296073,
+    "write_end_unix": 1793432145.0138903,
+    "max_schedule_lag_ms": 10.907472,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.016497222,
+        "ratio": 0.9999248838517232,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 10.907472,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 213868,
+    "rss_peak_components": {
+      "peak_rss_kib": 213868,
+      "reset_hwm_outer_window_kib": 212620,
+      "sampled_writer_interval_peak_kib": 213868,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432037.7296073,
+      "write_end_unix": 1793432145.0138903,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.28446084,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 1.0586290154606104,
+      "fdatasync_p50_ms": 1.1835049372166395
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93124837602954,
+    "namespace": "item86_8d4c2aeea4b544728eaf0474bc0d7e7e",
+    "reopen": "passed",
+    "block": 0,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292521434,
+    "tps": 466.015704839,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.035739,
+      "p90_ms": 2.379562,
+      "p99_ms": 2.752297,
+      "mean_ms": 1.840274659,
+      "max_ms": 28.287763
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6358960419893265,
+      "p99_ms": 2.174269058741629
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432149.0501628,
+    "write_end_unix": 1793432256.3343706,
+    "max_schedule_lag_ms": 19.804482,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015704839,
+        "ratio": 0.9999231836469366,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 19.804482,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 206440,
+    "rss_peak_components": {
+      "peak_rss_kib": 206440,
+      "reset_hwm_outer_window_kib": 206440,
+      "sampled_writer_interval_peak_kib": 205940,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432149.0501628,
+      "write_end_unix": 1793432256.3343706,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 318.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3243259192465684,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 1.5459544956684113,
+      "fdatasync_p50_ms": 1.7005634726956487
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.94361862796359,
+    "namespace": "item86_04ef5913e712473e9e0cffca35b6d1a6",
+    "reopen": "passed",
+    "block": 0,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292591601,
+    "tps": 466.015400075,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.027886,
+      "p90_ms": 2.40059,
+      "p99_ms": 4.556906,
+      "mean_ms": 1.829073483,
+      "max_ms": 20.314028
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.639945083297789,
+      "p99_ms": 2.1405030274763703
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432260.5877125,
+    "write_end_unix": 1793432367.872083,
+    "max_schedule_lag_ms": 11.805752,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015400075,
+        "ratio": 0.9999225297192127,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 11.805752,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 215064,
+    "rss_peak_components": {
+      "peak_rss_kib": 215064,
+      "reset_hwm_outer_window_kib": 214068,
+      "sampled_writer_interval_peak_kib": 215064,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432260.5877125,
+      "write_end_unix": 1793432367.872083,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 858.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.2739829865016872,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9610389824956656,
+      "fdatasync_p50_ms": 1.1539344559423625
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93513021699619,
+    "namespace": "item86_cf2d634981bd4b998c1b96e43904ff80",
+    "reopen": "passed",
+    "block": 0,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292596656,
+    "tps": 466.015378119,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.044027,
+      "p90_ms": 2.391397,
+      "p99_ms": 5.569724,
+      "mean_ms": 1.904194086,
+      "max_ms": 21.104952
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.740607083775103,
+      "p99_ms": 2.6431219885125756
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432372.022248,
+    "write_end_unix": 1793432479.306583,
+    "max_schedule_lag_ms": 12.600851,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015378119,
+        "ratio": 0.9999224826085398,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 12.600851,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 206800,
+    "rss_peak_components": {
+      "peak_rss_kib": 206800,
+      "reset_hwm_outer_window_kib": 206024,
+      "sampled_writer_interval_peak_kib": 206800,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432372.022248,
+      "write_end_unix": 1793432479.306583,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3384707999999998,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9603694779798388,
+      "fdatasync_p50_ms": 1.0405569919385016
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93341486493591,
+    "namespace": "item86_cc28f2e5ea8d48c885f1f7e4fab58819",
+    "reopen": "passed",
+    "block": 0,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292452821,
+    "tps": 466.016002854,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.034255,
+      "p90_ms": 2.377655,
+      "p99_ms": 4.72316,
+      "mean_ms": 1.788586821,
+      "max_ms": 19.450179
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.655203988775611,
+      "p99_ms": 2.1716520423069596
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432483.304064,
+    "write_end_unix": 1793432590.5885499,
+    "max_schedule_lag_ms": 19.164131,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.016002854,
+        "ratio": 0.9999238230934283,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 19.164131,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 203856,
+    "rss_peak_components": {
+      "peak_rss_kib": 203856,
+      "reset_hwm_outer_window_kib": 202864,
+      "sampled_writer_interval_peak_kib": 203856,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432483.304064,
+      "write_end_unix": 1793432590.5885499,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.23478866,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.956589006818831,
+      "fdatasync_p50_ms": 1.1897945078089833
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93330208898988,
+    "namespace": "item86_7d02db3803fa40269122e1879d0a912c",
+    "reopen": "passed",
+    "block": 1,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292452371,
+    "tps": 466.016004808,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.050824,
+      "p90_ms": 2.381365,
+      "p99_ms": 3.077483,
+      "mean_ms": 1.905504507,
+      "max_ms": 24.3882
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6424070345237851,
+      "p99_ms": 2.2922679781913757
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432594.7160075,
+    "write_end_unix": 1793432702.0001512,
+    "max_schedule_lag_ms": 16.935409,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.016004808,
+        "ratio": 0.9999238272860979,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 16.935409,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 222800,
+    "rss_peak_components": {
+      "peak_rss_kib": 222800,
+      "reset_hwm_outer_window_kib": 221824,
+      "sampled_writer_interval_peak_kib": 222800,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432594.7160075,
+      "write_end_unix": 1793432702.0001512,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 471.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3837416417641042,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 1.5562595217488706,
+      "fdatasync_p50_ms": 1.1433999752625823
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93298516201321,
+    "namespace": "item86_392055201ad343cd9d6d15fdac8300ef",
+    "reopen": "passed",
+    "block": 1,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292346933,
+    "tps": 466.01646277,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.041339,
+      "p90_ms": 2.36027,
+      "p99_ms": 2.789207,
+      "mean_ms": 1.845149433,
+      "max_ms": 21.173884
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.658956054598093,
+      "p99_ms": 2.1645789965987206
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432705.9857354,
+    "write_end_unix": 1793432813.269986,
+    "max_schedule_lag_ms": 12.668641,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.01646277,
+        "ratio": 0.999924809928563,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 12.668641,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 206784,
+    "rss_peak_components": {
+      "peak_rss_kib": 206784,
+      "reset_hwm_outer_window_kib": 206264,
+      "sampled_writer_interval_peak_kib": 206784,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432705.9857354,
+      "write_end_unix": 1793432813.269986,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 378.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3230792954190214,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9292774484492838,
+      "fdatasync_p50_ms": 1.0752049856819212
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93012885202188,
+    "namespace": "item86_08d9503ce5fe48e48980619847a195ef",
+    "reopen": "passed",
+    "block": 1,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292313725,
+    "tps": 466.016607006,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.025365,
+      "p90_ms": 2.358613,
+      "p99_ms": 4.851424,
+      "mean_ms": 1.821629596,
+      "max_ms": 20.215682
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6654819482937455,
+      "p99_ms": 2.2192939650267363
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432817.2745013,
+    "write_end_unix": 1793432924.5591419,
+    "max_schedule_lag_ms": 12.476488,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.016607006,
+        "ratio": 0.9999251194136702,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 12.476488,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 209096,
+    "rss_peak_components": {
+      "peak_rss_kib": 209096,
+      "reset_hwm_outer_window_kib": 209096,
+      "sampled_writer_interval_peak_kib": 206544,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432817.2745013,
+      "write_end_unix": 1793432924.5591419,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.27737506,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9151305421255529,
+      "fdatasync_p50_ms": 1.1216285056434572
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93249290401582,
+    "namespace": "item86_e9dc99e752044ae3945b7c5a058de475",
+    "reopen": "passed",
+    "block": 1,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292452717,
+    "tps": 466.016003305,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.035816,
+      "p90_ms": 2.362445,
+      "p99_ms": 4.794139,
+      "mean_ms": 1.865206166,
+      "max_ms": 19.55059
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6216470394283533,
+      "p99_ms": 2.11734208278358
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793432928.5468018,
+    "write_end_unix": 1793433035.83137,
+    "max_schedule_lag_ms": 13.114096,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.016003305,
+        "ratio": 0.9999238240611326,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 13.114096,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 192080,
+    "rss_peak_components": {
+      "peak_rss_kib": 192080,
+      "reset_hwm_outer_window_kib": 191128,
+      "sampled_writer_interval_peak_kib": 192080,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793432928.5468018,
+      "write_end_unix": 1793433035.83137,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3149366,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9193954756483436,
+      "fdatasync_p50_ms": 1.130632997956127
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93354320595972,
+    "namespace": "item86_5448599ca8fc49dfafd88aa06514f1e2",
+    "reopen": "passed",
+    "block": 2,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292585882,
+    "tps": 466.015424915,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.028545,
+      "p90_ms": 2.346665,
+      "p99_ms": 2.731366,
+      "mean_ms": 1.791152566,
+      "max_ms": 19.661013
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6761419828981161,
+      "p99_ms": 2.304463996551931
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433039.8260865,
+    "write_end_unix": 1793433147.1104257,
+    "max_schedule_lag_ms": 11.160875,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015424915,
+        "ratio": 0.9999225830180427,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 11.160875,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 220160,
+    "rss_peak_components": {
+      "peak_rss_kib": 220160,
+      "reset_hwm_outer_window_kib": 220160,
+      "sampled_writer_interval_peak_kib": 220076,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793433039.8260865,
+      "write_end_unix": 1793433147.1104257,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 345.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.280155130260521,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9457385167479515,
+      "fdatasync_p50_ms": 1.117085455916822
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93321654794272,
+    "namespace": "item86_37befa8290934426ba5e51f5f04ff914",
+    "reopen": "passed",
+    "block": 2,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292663709,
+    "tps": 466.015086881,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.045245,
+      "p90_ms": 2.362402,
+      "p99_ms": 2.832522,
+      "mean_ms": 1.841173404,
+      "max_ms": 21.565649
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.624993048608303,
+      "p99_ms": 2.155162044800818
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433151.076012,
+    "write_end_unix": 1793433258.3603466,
+    "max_schedule_lag_ms": 13.067646,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015086881,
+        "ratio": 0.9999218577033593,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 13.067646,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 215376,
+    "rss_peak_components": {
+      "peak_rss_kib": 215376,
+      "reset_hwm_outer_window_kib": 215376,
+      "sampled_writer_interval_peak_kib": 208168,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793433151.076012,
+      "write_end_unix": 1793433258.3603466,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 390.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3192001242634386,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9171604760922492,
+      "fdatasync_p50_ms": 1.0454484727233648
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93381986604072,
+    "namespace": "item86_e0934facf14e4df48af63b69e1666e66",
+    "reopen": "passed",
+    "block": 2,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292350434,
+    "tps": 466.016447564,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.029147,
+      "p90_ms": 2.377884,
+      "p99_ms": 5.890209,
+      "mean_ms": 1.838223052,
+      "max_ms": 20.527096
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6203559935092926,
+      "p99_ms": 2.204747055657208
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433262.3194609,
+    "write_end_unix": 1793433369.6037898,
+    "max_schedule_lag_ms": 13.527079,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.016447564,
+        "ratio": 0.9999247773012679,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 13.527079,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 206256,
+    "rss_peak_components": {
+      "peak_rss_kib": 206256,
+      "reset_hwm_outer_window_kib": 204700,
+      "sampled_writer_interval_peak_kib": 206256,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793433262.3194609,
+      "write_end_unix": 1793433369.6037898,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.2744725799999999,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 1.0334310354664922,
+      "fdatasync_p50_ms": 1.080291927792132
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93380824197084,
+    "namespace": "item86_cf3747a2dcdf4f86842d4a3cb50ce4b9",
+    "reopen": "passed",
+    "block": 2,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292496199,
+    "tps": 466.015814445,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.041206,
+      "p90_ms": 2.367569,
+      "p99_ms": 5.236472,
+      "mean_ms": 1.879313376,
+      "max_ms": 21.672044
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.631600083783269,
+      "p99_ms": 2.1766229765489697
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433373.5114284,
+    "write_end_unix": 1793433480.796151,
+    "max_schedule_lag_ms": 13.171074,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015814445,
+        "ratio": 0.9999234188269515,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 13.171074,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 208120,
+    "rss_peak_components": {
+      "peak_rss_kib": 208120,
+      "reset_hwm_outer_window_kib": 207372,
+      "sampled_writer_interval_peak_kib": 208120,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793433373.5114284,
+      "write_end_unix": 1793433480.796151,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3198773400000003,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9192409925162792,
+      "fdatasync_p50_ms": 1.0459264740347862
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.932378645055,
+    "namespace": "item86_4c05fff59374467ab102232733a02d6a",
+    "reopen": "passed",
+    "block": 3,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292541291,
+    "tps": 466.015618592,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.040478,
+      "p90_ms": 2.392818,
+      "p99_ms": 2.779354,
+      "mean_ms": 1.809047162,
+      "max_ms": 20.264755
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.6264260048046708,
+      "p99_ms": 2.1585230715572834
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433484.7920718,
+    "write_end_unix": 1793433592.0763159,
+    "max_schedule_lag_ms": 11.786097,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015618592,
+        "ratio": 0.9999229985879913,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 11.786097,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 208688,
+    "rss_peak_components": {
+      "peak_rss_kib": 208688,
+      "reset_hwm_outer_window_kib": 208688,
+      "sampled_writer_interval_peak_kib": 207060,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793433484.7920718,
+      "write_end_unix": 1793433592.0763159,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 375.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.2797222389226237,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.8983394363895059,
+      "fdatasync_p50_ms": 1.1579690035432577
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.93670644704252,
+    "namespace": "item86_f909bc3ab8464c04bd63f84d8199258d",
+    "reopen": "passed",
+    "block": 3,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292500349,
+    "tps": 466.01579642,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.032754,
+      "p90_ms": 2.351402,
+      "p99_ms": 2.800858,
+      "mean_ms": 1.832788096,
+      "max_ms": 18.751198
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.694041071459651,
+      "p99_ms": 2.359209000132978
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433596.056252,
+    "write_end_unix": 1793433703.3405066,
+    "max_schedule_lag_ms": 10.258968,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.01579642,
+        "ratio": 0.9999233801509687,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 10.258968,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 205828,
+    "rss_peak_components": {
+      "peak_rss_kib": 205828,
+      "reset_hwm_outer_window_kib": 205828,
+      "sampled_writer_interval_peak_kib": 200848,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793433596.056252,
+      "write_end_unix": 1793433703.3405066,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 364.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.3175281506712082,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9272909956052899,
+      "fdatasync_p50_ms": 1.08946900581941
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.9350525769405,
+    "namespace": "item86_207e5bb6ec974d54ad8d98950a6c982c",
+    "reopen": "passed",
+    "block": 3,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292440133,
+    "tps": 466.016057963,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.032271,
+      "p90_ms": 2.375964,
+      "p99_ms": 5.301694,
+      "mean_ms": 1.82844657,
+      "max_ms": 19.975639
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 1.652072067372501,
+      "p99_ms": 2.236638916656375
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433707.3620448,
+    "write_end_unix": 1793433814.6461205,
+    "max_schedule_lag_ms": 11.469659,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.016057963,
+        "ratio": 0.9999239413400155,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 11.469659,
+        "limit_ms": 50,
+        "passed": true
+      }
+    },
+    "peak_rss_kib": 210388,
+    "rss_peak_components": {
+      "peak_rss_kib": 210388,
+      "reset_hwm_outer_window_kib": 209564,
+      "sampled_writer_interval_peak_kib": 210388,
+      "writer_interval_sample_count": 1068,
+      "write_start_unix": 1793433707.3620448,
+      "write_end_unix": 1793433814.6461205,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.27728262,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9115459397435188,
+      "fdatasync_p50_ms": 1.0446695378050208
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.9322529209312,
+    "namespace": "item86_82a3ded019b74ab0812885634fa518ef",
+    "reopen": "passed",
+    "block": 3,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.731245549,
+    "tps": 464.117905118,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 1.999011,
+      "p90_ms": 6.466701,
+      "p99_ms": 8.387017,
+      "mean_ms": 2.773324252,
+      "max_ms": 437.950396
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12501,
+      12500,
+      12500,
+      12499
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5386,
+      "p50_ms": 1.5678140334784985,
+      "p99_ms": 2.459937008097768
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433818.6816685,
+    "write_end_unix": 1793433926.4119945,
+    "max_schedule_lag_ms": 658.172824,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 464.117905118,
+        "ratio": 0.9958511021285632,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 658.172824,
+        "limit_ms": 50,
+        "passed": false
+      }
+    },
+    "peak_rss_kib": 205804,
+    "rss_peak_components": {
+      "peak_rss_kib": 205804,
+      "reset_hwm_outer_window_kib": 204596,
+      "sampled_writer_interval_peak_kib": 205804,
+      "writer_interval_sample_count": 1073,
+      "write_start_unix": 1793433818.6816685,
+      "write_end_unix": 1793433926.4119945,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.4015729399999997,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 0.9323584963567555,
+      "fdatasync_p50_ms": 1.1815624893642962
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 108.42352250090335,
+    "namespace": "item86_cb715140a6894a43b1906da2f6e6044f",
+    "reopen": "passed",
+    "block": 4,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.292492499,
+    "tps": 466.015830516,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.183783,
+      "p90_ms": 3.561223,
+      "p99_ms": 7.896343,
+      "mean_ms": 3.078072256,
+      "max_ms": 503.833872
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5364,
+      "p50_ms": 2.143781050108373,
+      "p99_ms": 4.557513049803674
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793433930.2813473,
+    "write_end_unix": 1793434037.5657167,
+    "max_schedule_lag_ms": 1564.588586,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 466.015830516,
+        "ratio": 0.9999234533102647,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 1564.588586,
+        "limit_ms": 50,
+        "passed": false
+      }
+    },
+    "peak_rss_kib": 190664,
+    "rss_peak_components": {
+      "peak_rss_kib": 190664,
+      "reset_hwm_outer_window_kib": 189672,
+      "sampled_writer_interval_peak_kib": 190664,
+      "writer_interval_sample_count": 1066,
+      "write_start_unix": 1793433930.2813473,
+      "write_end_unix": 1793434037.5657167,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 8621.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.7251015628391575,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 1.5347199514508247,
+      "fdatasync_p50_ms": 1.688801043201238
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 107.9361179349944,
+    "namespace": "item86_1466e07a1ec84e49bb75366f7091a394",
+    "reopen": "passed",
+    "block": 4,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 107.600049804,
+    "tps": 464.683799785,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 2.2107,
+      "p90_ms": 5.174401,
+      "p99_ms": 14.374984,
+      "mean_ms": 3.740242699,
+      "max_ms": 1171.822409
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12500,
+      12500,
+      12500,
+      12500
+    ],
+    "max_share_deviation": 0.0,
+    "readers": {
+      "n": 5380,
+      "p50_ms": 1.726389047689736,
+      "p99_ms": 4.278477979823947
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793434041.940164,
+    "write_end_unix": 1793434149.5350301,
+    "max_schedule_lag_ms": 1703.860616,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 464.683799785,
+        "ratio": 0.9970653341622905,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 1703.860616,
+        "limit_ms": 50,
+        "passed": false
+      }
+    },
+    "peak_rss_kib": 210752,
+    "rss_peak_components": {
+      "peak_rss_kib": 210752,
+      "reset_hwm_outer_window_kib": 210440,
+      "sampled_writer_interval_peak_kib": 210752,
+      "writer_interval_sample_count": 1070,
+      "write_start_unix": 1793434041.940164,
+      "write_end_unix": 1793434149.5350301,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 15484.0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.9302904085665702,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 1.6162010142579675,
+      "fdatasync_p50_ms": 1.826028514187783
+    },
+    "write_namespace_count": 50000,
+    "grouped": true,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 108.26246394892223,
+    "namespace": "item86_e604b6e1b8bd4bd4adfb3781221508cd",
+    "reopen": "passed",
+    "block": 4,
+    "variant": "grouped",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  },
+  {
+    "scenario": "mixed",
+    "op": "geo",
+    "clients": 4,
+    "write_rate": 466.05150521597045,
+    "changes": 50000,
+    "errors": 0,
+    "missing_receipts": 0,
+    "seconds": 108.185683549,
+    "tps": 462.168360542,
+    "writers": {
+      "n": 50000,
+      "p50_ms": 6.382411,
+      "p90_ms": 8.763011,
+      "p99_ms": 17.147611,
+      "mean_ms": 5.569682949,
+      "max_ms": 551.196138
+    },
+    "receipts_contiguous": true,
+    "receipts_distinct": true,
+    "first_receipt": 2,
+    "per_client": [
+      12494,
+      12507,
+      12500,
+      12499
+    ],
+    "max_share_deviation": 0.001,
+    "readers": {
+      "n": 5410,
+      "p50_ms": 1.5091650420799851,
+      "p99_ms": 2.639599028043449
+    },
+    "reader_violations": 0,
+    "write_start_unix": 1793434154.2250392,
+    "write_end_unix": 1793434262.4059463,
+    "max_schedule_lag_ms": 2496.418975,
+    "calibration": false,
+    "mixed_load_checks": {
+      "achieved_rate": {
+        "requirement": "harness load quality",
+        "target_tps": 466.05150521597045,
+        "achieved_tps": 462.168360542,
+        "ratio": 0.9916679924203421,
+        "passed": true
+      },
+      "schedule_lag": {
+        "requirement": "harness load quality; not an X09 numeric threshold",
+        "max_ms": 2496.418975,
+        "limit_ms": 50,
+        "passed": false
+      }
+    },
+    "peak_rss_kib": 190860,
+    "rss_peak_components": {
+      "peak_rss_kib": 190860,
+      "reset_hwm_outer_window_kib": 190860,
+      "sampled_writer_interval_peak_kib": 190244,
+      "writer_interval_sample_count": 1077,
+      "write_start_unix": 1793434154.2250392,
+      "write_end_unix": 1793434262.4059463,
+      "hwm_scope": "reset before client startup; observed after client raw-output finalization"
+    },
+    "grouped_admissions": 0,
+    "internal_embed_commits": 0,
+    "sync_mean_ms": 1.83846116,
+    "drive_probe": {
+      "writes": 64,
+      "direct_p50_ms": 1.6902724746614695,
+      "fdatasync_p50_ms": 2.802614006213844
+    },
+    "write_namespace_count": 50000,
+    "grouped": false,
+    "index": "geo",
+    "people": 100000,
+    "elapsed": 108.84816505096387,
+    "namespace": "item86_34d7ded85820434ea5e2504bcd8f13b0",
+    "reopen": "passed",
+    "block": 4,
+    "variant": "ordinary",
+    "binary": "/home/kclejeune/lanes/gc-86/bin/sparkles-main-a202e8f2"
+  }
+]

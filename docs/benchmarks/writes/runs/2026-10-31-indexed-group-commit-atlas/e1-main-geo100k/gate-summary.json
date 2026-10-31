@@ -1,0 +1,42 @@
+{
+  "gates": [
+    {
+      "people": 100000,
+      "index": "geo",
+      "scenario": "serial-literal",
+      "processes_per_variant": 2,
+      "checks": {
+        "p50_ms": {
+          "ratio": 0.9566713807685493,
+          "passed": true
+        },
+        "p90_ms": {
+          "ratio": 0.9325590504672433,
+          "passed": false
+        }
+      },
+      "passed": false
+    },
+    {
+      "people": 100000,
+      "index": "geo",
+      "scenario": "writers",
+      "processes_per_variant": 2,
+      "checks": {
+        "peak_rss": {
+          "delta_kib": 4628,
+          "certified_delta_upper_kib": 4628,
+          "passed": true,
+          "ordinary_interval_sampled_lower_kib": 193576,
+          "grouped_outer_upper_kib": 198204
+        },
+        "throughput": {
+          "ratio": 1.7295072263600142,
+          "passed": true
+        }
+      },
+      "passed": true
+    }
+  ],
+  "passed": false
+}

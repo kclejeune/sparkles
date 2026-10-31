@@ -1,0 +1,8 @@
+e1-main-geo100k/geo-100000/b0-serial-literal-0                g=0 tps=  1677.8 p50=0.569 p90=0.643 direct=0.277ms/2197 buf=1.703ms/3 group=- size=- w/c=2.24 fl/c=0.004 wms/w=0.197 fms/f=0.222
+e1-main-geo100k/geo-100000/b0-serial-literal-1                g=1 tps=  1770.2 p50=0.546 p90=0.590 direct=0.277ms/2197 buf=1.815ms/3 group=- size=- w/c=2.23 fl/c=0.004 wms/w=0.197 fms/f=0.375
+e1-main-geo100k/geo-100000/b0-serial-literal-2                g=1 tps=  1724.8 p50=0.555 p90=0.610 direct=0.284ms/2197 buf=1.551ms/3 group=- size=- w/c=2.23 fl/c=0.004 wms/w=0.199 fms/f=0.250
+e1-main-geo100k/geo-100000/b0-serial-literal-3                g=0 tps=  1647.3 p50=0.582 p90=0.644 direct=0.287ms/2197 buf=2.339ms/3 group=- size=- w/c=2.24 fl/c=0.004 wms/w=0.201 fms/f=0.222
+e1-main-geo100k/geo-100000/b0-writers-0                       g=0 tps=   826.1 p50=6.759 p90=7.339 direct=1.092ms/49993 buf=2.979ms/7 group=- size=- w/c=2.02 fl/c=0.002 wms/w=0.910 fms/f=1.341
+e1-main-geo100k/geo-100000/b0-writers-1                       g=1 tps=  1829.9 p50=1.478 p90=4.023 direct=0.450ms/3581 buf=8.877ms/2 group=0.857ms/26519 size=1.75/26519 w/c=2.21 fl/c=1.034 wms/w=0.361 fms/f=0.716
+e1-main-geo100k/geo-100000/b0-writers-2                       g=1 tps=  1130.9 p50=3.544 p90=3.867 direct=0.483ms/338 buf=3.138ms/1 group=1.684ms/25053 size=1.98/25053 w/c=2.03 fl/c=1.002 wms/w=0.766 fms/f=1.512
+e1-main-geo100k/geo-100000/b0-writers-3                       g=0 tps=   885.8 p50=6.678 p90=7.254 direct=1.011ms/49993 buf=5.335ms/7 group=- size=- w/c=2.02 fl/c=0.002 wms/w=0.891 fms/f=1.435

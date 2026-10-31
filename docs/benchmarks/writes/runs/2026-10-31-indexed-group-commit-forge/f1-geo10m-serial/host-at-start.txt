@@ -1,0 +1,17 @@
+Sat Oct 31 07:02:25 AM EDT 2026
+ 07:02:25  up 6 days 14:23,  0 users,  load average: 3.49, 3.66, 3.67
+    PID %CPU     ELAPSED COMMAND
+ 713806  0.6    02:53:27 /nix/store/wfi3zyi4p723ib7qvpzclr1lyxhysywg-tailscale-1.104.2/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641 --tun tailscale0
+ 713620  0.2    02:53:30 /nix/store/yw0bbhjxlcz5yzmwfi3pa2m8q96s5yav-nsncd-1.5.3/bin/nsncd
+ 713759  0.2    02:53:28 /nix/store/1l6pk0v0fwdd7irylacnjrsyvvfyhfyz-netbird-client-0.81.5/bin/netbird service run
+   1698  0.2  6-14:22:38 /nix/store/x0019gyv8baqma5kqwjld2bvwynmf1yc-herdr-0.9.3/bin/herdr server
+ 714923  0.2    02:53:23 /nix/store/jjqk5711npw54k21izspv0bx53c3ji9h-otelcol-contrib-0.155.0/bin/otelcol-contrib --config=file:/nix/store/x663rz5jnxayskqsym0dfrjr4yk0fh4g-config.yaml
+ 736737  0.2    01:46:16 [kworker/u81:19-kcryptd-254:0-1]
+ 734544  0.2    01:52:56 [kworker/u81:6-kcryptd-254:0-1]
+2739286  0.1       07:35 [kworker/u81:2-kcryptd-254:0-1]
+2136761  0.1       24:39 [kworker/u81:0-kcryptd-254:0-1]
+ 772249  0.1    01:12:39 [kworker/u81:12-kcryptd-254:0-1]
+1892880  0.1       31:35 [kworker/u81:16-events_unbound]
+3255689  0.1  3-09:16:15 /bin/sh -s
+1622915  0.1       39:16 [kworker/u81:1-kcryptd-254:0-1]
+1892876  0.1       31:35 [kworker/u81:9-kcryptd-254:0-1]

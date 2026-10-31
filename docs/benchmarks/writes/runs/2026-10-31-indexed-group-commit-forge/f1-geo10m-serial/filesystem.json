@@ -1,0 +1,10 @@
+{
+   "filesystems": [
+      {
+         "target": "/",
+         "source": "/dev/mapper/vg-root",
+         "fstype": "ext4",
+         "options": "rw,relatime,discard,errors=remount-ro"
+      }
+   ]
+}
