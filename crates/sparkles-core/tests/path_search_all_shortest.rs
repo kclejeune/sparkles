@@ -278,6 +278,19 @@ fn random_weighted_all_shortest_from_both_ends_against_one_end() {
             };
             let pair = paths_of(&rows(&s, &q(&format!("ex:n{t}"), "")), None);
             check(&pair, "from both ends");
+            // path:shortest returns one of them, a cycle through the source too
+            let one = paths_of(
+                &rows(
+                    &s,
+                    &q(&format!("ex:n{t}"), "").replace("path:allShortest", "path:shortest"),
+                ),
+                None,
+            );
+            assert_eq!(one.len(), usize::from(!want.is_empty()), "{ctx}: shortest");
+            if let Some((p, c)) = one.first() {
+                assert!(want.contains(p), "{ctx}: shortest {p:?}");
+                assert_eq!(*c, rounded(least.unwrap()), "{ctx}: the cost of {p:?}");
+            }
             // the target bound beside another one runs from the source alone
             let other = (t + 1) % n;
             let two = paths_of(

@@ -2426,7 +2426,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Every cheapest path from `s` to `t` by Dijkstra's algorithm from both ends
-    /// (ROADMAP item 277), given to `emit` one at a time until it returns false. When `s`
+    /// (ROADMAP item 277), given to `emit` one at a time until it returns false, so
+    /// `path:shortest` takes the first. When `s`
     /// and `t` are the same node the paths are the cheapest cycles through it, and the
     /// backward search starts from the virtual id, which stands for `s` as the end.
     ///
@@ -3101,10 +3102,11 @@ pub fn run(
                     }
                     continue;
                 }
-                // every cheapest path of one pair, or cycle through the source: from both
-                // ends
-                if single && weighted && all {
-                    let t = *targets.set.first().unwrap();
+                // every cheapest path of one pair, and the cheapest cycles through the
+                // source: from both ends
+                let t0 = targets.set.first().copied();
+                if single && weighted && (all || t0 == Some(s)) {
+                    let t = t0.unwrap();
                     eng.begin();
                     if spec.min_len == 0 && s == t {
                         if !add(&mut found, s, t, Vec::new(), None, true)? {
@@ -3116,7 +3118,8 @@ pub fn run(
                     eng.dijkstra_pair_all(s, t, &mut |p| {
                         let more = add(&mut found, s, t, p, None, true)?;
                         stop = !more;
-                        Ok(more)
+                        // path:shortest keeps the first cheapest cycle
+                        Ok(more && all)
                     })?;
                     if stop {
                         break 'sources;
@@ -3124,17 +3127,15 @@ pub fn run(
                     continue;
                 }
                 // one cheapest path between two different nodes: from both ends
-                if single && weighted && !all {
-                    let t = *targets.set.first().unwrap();
-                    if t != s {
-                        eng.begin();
-                        if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
-                            && !add(&mut found, s, t, p, None, true)?
-                        {
-                            break 'sources;
-                        }
-                        continue;
+                if single && weighted {
+                    let t = t0.unwrap();
+                    eng.begin();
+                    if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
+                        && !add(&mut found, s, t, p, None, true)?
+                    {
+                        break 'sources;
                     }
+                    continue;
                 }
                 eng.begin();
                 let close = targets.any || tset.contains(&s);
