@@ -292,6 +292,9 @@ pub(crate) struct Stage {
     pub seeds: Vec<Triple>,
     /// evaluate the stage only when a fact with this predicate holds
     pub only_if: Option<u64>,
+    /// an equality stage (spec F17 §3.5), which derives `owl:sameAs` with the free
+    /// adornment whatever the query asks
+    pub equality: bool,
 }
 
 impl Stage {
@@ -340,6 +343,7 @@ pub(crate) fn compact_roots(terms: &Terms, roots: &[Key]) -> Result<Program, Mem
             magic,
             seeds: Vec::new(),
             only_if: None,
+            equality: false,
         }],
         magic_preds,
         dummy,
@@ -2046,6 +2050,7 @@ fn transform_in(
                 magic: FxHashMap::default(),
                 seeds: Vec::new(),
                 only_if,
+                equality: phase > 0,
             },
             todo: VecDeque::new(),
             magic_preds: &mut magic_preds,

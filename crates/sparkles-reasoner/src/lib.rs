@@ -15,6 +15,8 @@
 //! [`materialize_incremental`] updates a previous materialization from the changes to
 //! the input graphs since its commit, with the same result as a full run.
 
+#[cfg(test)]
+mod alloc_probe;
 pub mod analysis;
 mod budget;
 mod builtins;

@@ -893,3 +893,86 @@ and eligibility controls. These checks establish bounded completion and explanat
 They do not establish a current-head latency ratio or the selective-query cost target
 in section 13. Item 190 retains matched Forge measurement, the temporary-closure
 memory tradeoff and any measured control costs before performance acceptance.
+
+
+### Equality stage table
+
+When rules derive and read `owl:sameAs`, a demand program ends with equality stages that
+derive `owl:sameAs` with the free adornment, whatever the query asks (§3.5). The first
+session over a cacheable view keeps every derived fact its graph holds once these lower
+stages finish in the derived-table cache. Later sessions over the same view add those
+facts and skip the equality stages. The key is the view, the rules' digest and whether the
+program rewrites linear recursion. Explanation sessions keep the rules' linear recursion
+and so keep a table of their own. The kept facts include the premises of every fact the
+equality stages derived, including generalized facts that RDF cannot state, such as an
+`owl:sameAs` fact whose subject is a literal. An explanation over cached facts therefore
+still finds well-founded trees, and a warm query derives what a cold one does. A program
+that reads `now` neither reads nor fills the table, since each session reads its own
+time. A session whose graph holds facts from outside the view, such as why-not hypotheses
+or GeoSPARQL default geometries, neither reads nor fills the table. Like the schema table,
+the equality table is a property of the view, and `no_cache` does not bypass it.
+
+The table is charged to the derived-table cache's capacity, and the facts a session adds
+from it are charged to the session's memory budget as they are read, and the map from
+the table's local terms to the session's ids is charged at its full size before it is
+made. The workspace that builds the table is counted and charged to the session's budget
+before each list is made at that size, and the keys of local terms are copied once. A table larger than the
+cache's capacity, or one whose workspace does not fit the budget, is not kept, and the
+session's answers do not change. This trades memory for time. A view's
+table holds every fact the first session had derived when its lower stages finished,
+which can be many more facts than a selective query derives. Tables whose facts hold a
+blank node a rule made are not kept.
+
+### Planning by predicate
+
+The semi-naive engine indexes a program's rules by the constant predicates of their
+atoms. After the first iteration it plans only the rules with an atom whose predicate has
+a row among the iteration's new rows, together with the rules that have an atom of a
+variable predicate or a builtin that reads facts outside its atoms. The predicates with
+new rows come from the graph's predicate index rather than from the rows themselves. A demand program
+guards nearly every rule with a magic predicate of its own, so most rules have no new
+facts in a given iteration, and a full scan of the program dominated planning. The
+index and each iteration's list of rules are charged to the run's memory budget while
+they are held. The planned tasks are the same as without the index. A property test compares them on random
+programs, graphs and row ranges. An iteration whose new rows include the base tier still
+plans every rule, since the base tier's predicates are not listed, and so does a graph
+with more predicates than the program has atoms, where a scan of the rules is cheaper.
+
+### Local measurements of the equality table and rule index
+
+These are diagnostic measurements on a shared 16-core development host whose one-minute
+load ranged from 17 to 48 during the runs, with a median of 29. They are not published
+results. Small effects and current-head claims need the quiet Forge host (item 190). Each
+release build ran six interleaved rounds with the order rotated. The table gives the
+median process CPU time per query in milliseconds. CPU time varied less than wall time
+under this load. For the soundness fixture, it is the CPU time per ASK and explanation
+pair. The fixture covers three 40-triple OWL RL views with 12 sampled inferred triples
+each. The selective views hold 5,000 instances in an eight-class hierarchy, and the
+equality variant adds 100 `owl:sameAs` links.
+
+| Workload | Before | Equality table | With rule index |
+|---|---|---|---|
+| Soundness fixture, per ASK and explanation | 2,438 | 1,033 | 898 |
+| Selective OWL RL with equality | 4,993 | 1,523 | 1,535 |
+| Schema query with equality | 4,881 | 1,548 | 1,595 |
+| Schema-heavy 9-triple view | 1,006 | 388 | 345 |
+| Selective OWL RL without equality facts | 111 | 105 | 111 |
+| Selective RDFS | 47 | 47 | 37 |
+| Asserted answers under OWL RL | 12 | 14 | 14 |
+| Tiny positive feedback view | 3,373 | 3,278 | 3,442 |
+
+The equality table removes about 60 to 70% of the CPU time of warm queries over views
+whose programs have equality stages. The rule index removes a further 10 to 20% on the
+large demand programs of the soundness fixture and the schema-heavy view. Controls
+without equality stages stay within the 10 ms resolution of the measurement. Wall times
+of materialization moved by up to 20% in both directions between rounds, including for
+the equality table, which does not touch the materializer. So this run does not resolve
+the rule index's effect on materialization.
+
+The equality table raised the derived-table cache's use from 8 KB to 579 KB for the
+5,000-instance view with equality, from 349 KB to 430 KB over the three soundness
+views, and from 8 KB to 19 KB for the schema-heavy view. In two interleaved development-build
+runs of `every_inferred_triple_has_a_sound_demand_tree`, the test took 214 s and 387 s
+before these changes and 107 s and 167 s after, with the host's one-minute load between
+16 and 47.
+

@@ -1527,3 +1527,122 @@ fn schema_heavy_demand_answers_like_materialization() {
 /// finish within the deadline in a development build, among them 16 and 25, which found
 /// the derived meta type cases above. `SCHEMA_HEAVY_SEEDS=1,2,3` runs others.
 const SCHEMA_HEAVY_SEEDS: &[u64] = &[1, 3, 9, 15, 16, 17, 18, 24, 25];
+
+/// The equality stages' table is kept per view: the graphs a caller reads and the commit
+/// choose it, and the answers equal those of a session that asks for no tables.
+#[test]
+fn equality_table_respects_graph_visibility_and_commits() {
+    use sparkles_core::access::{GraphAccess, GraphRule, Graphs};
+    use std::sync::Arc;
+    let inputs = Inputs {
+        data_graphs: vec![
+            sparkles_reasoner::GraphRef::Default,
+            sparkles_reasoner::GraphRef::Named("http://ex.org/hidden".into()),
+        ],
+        ..Inputs::default()
+    };
+    let qr = QueryReasoner::new(Profile::OwlRl, &Extras::default(), inputs).unwrap();
+    let s = store("ex:a owl:sameAs ex:b . ex:b a ex:C .");
+    s.load(&[Source::from_bytes(
+        format!("{PREFIXES} GRAPH <http://ex.org/hidden> {{ ex:c owl:sameAs ex:b . }}")
+            .into_bytes(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let q = "SELECT ?x { ?x a ex:C }";
+    let all = vec![
+        "<http://ex.org/a>",
+        "<http://ex.org/b>",
+        "<http://ex.org/c>",
+    ];
+    let mut visible = demand(&qr);
+    visible.graphs = Some(Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["default"], &[])),
+        Graphs::none(),
+    )));
+    let mut uncached = demand(&qr);
+    uncached.no_cache = true;
+    for _ in 0..2 {
+        assert_eq!(rows(&run(&s, q, &demand(&qr))), all);
+        assert_eq!(rows(&run(&s, q, &uncached)), all);
+        assert_eq!(
+            rows(&run(&s, q, &visible)),
+            vec!["<http://ex.org/a>", "<http://ex.org/b>"]
+        );
+    }
+    let pinned = s.snapshot();
+    sparkles_core::sparql::update::update(
+        &s,
+        "DELETE DATA { <http://ex.org/a> <http://www.w3.org/2002/07/owl#sameAs> <http://ex.org/b> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(rows(&run(&s, q, &visible)), vec!["<http://ex.org/b>"]);
+        assert_eq!(
+            rows(&run(&s, q, &demand(&qr))),
+            vec!["<http://ex.org/b>", "<http://ex.org/c>"]
+        );
+    }
+    assert_eq!(rows(&query(pinned, q, &demand(&qr)).unwrap()), all);
+}
+
+/// Rules with a schema vocabulary, so that demand specializes them, whose equality runs
+/// through a generalized fact: `"1" owl:sameAs ex:a` has a literal subject.
+fn generalized_equality_profile() -> Profile {
+    Profile::Rules(format!(
+        "{PREFIXES}
+        [domain: (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+        [same: (?x ex:val ?v) -> (?v owl:sameAs ?x)]
+        [out: (?v owl:sameAs ?x) -> (?x ex:out ?v)]"
+    ))
+}
+
+/// A session that reads the equality stages' table keeps the generalized facts those
+/// stages derived, so warm answers equal cold ones.
+#[test]
+fn equality_table_keeps_generalized_facts() {
+    let s = store("ex:a ex:val \"1\" .");
+    let qr = reasoner(&generalized_equality_profile());
+    let q = "SELECT ?v { ex:a ex:out ?v }";
+    for no_cache in [true, true, false] {
+        let mut options = demand(&qr);
+        options.no_cache = no_cache;
+        assert_eq!(
+            rows(&run(&s, q, &options)),
+            vec!["\"1\""],
+            "no_cache {no_cache}"
+        );
+    }
+}
+
+/// `now` gives each session its own time, so a program that reads it does not keep
+/// the equality stages' facts: a later session derives its own time only, not the
+/// time of a session before it.
+#[test]
+fn equality_table_is_not_kept_for_programs_that_read_now() {
+    let profile = Profile::Rules(format!(
+        "{PREFIXES}
+        [domain: (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+        [stamp: (?x ex:val ?v), now(?t) -> (?x ex:stamp ?t)]
+        [same: (?x ex:stamp ?t) -> (?t owl:sameAs ?x)]
+        [out: (?t owl:sameAs ?x), (?x ex:stamp ?t) -> (?x ex:out ?t)]"
+    ));
+    let s = store("ex:a ex:val 1 .");
+    let qr = reasoner(&profile);
+    let q = "SELECT ?t { ex:a ex:out ?t }";
+    let mut options = demand(&qr);
+    options.no_cache = true;
+    let mut seen: Vec<String> = Vec::new();
+    for i in 0..3 {
+        let got = rows(&run(&s, q, &options));
+        assert_eq!(got.len(), 1, "session {i}: {got:?}");
+        assert!(
+            !seen.contains(&got[0]),
+            "session {i} got an earlier session's time: {got:?} after {seen:?}"
+        );
+        seen.push(got[0].clone());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
