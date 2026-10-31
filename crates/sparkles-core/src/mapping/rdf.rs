@@ -1093,11 +1093,26 @@ impl Printer {
             }
             Value::Fresh => {}
         }
-        if t.term_type != role_default || matches!(t.value, Value::Fresh) {
-            let tt = match t.term_type {
-                TermType::Iri => "IRI",
-                TermType::BlankNode => "BlankNode",
-                TermType::Literal => "Literal",
+        // a template that inserts its values unencoded or URI-encoded says so in its term type
+        let encoding = match &t.value {
+            Value::Template(tp) if t.term_type == TermType::Iri => tp.encoding(),
+            _ => Encoding::Iri,
+        };
+        if encoding != Encoding::Iri && self.r2rml {
+            return Err(Error::invalid(
+                "R2RML has no rml:URI or rml:UnsafeIRI templates; convert to RML instead",
+            ));
+        }
+        if t.term_type != role_default
+            || matches!(t.value, Value::Fresh)
+            || encoding != Encoding::Iri
+        {
+            let tt = match (t.term_type, encoding) {
+                (TermType::Iri, Encoding::Unsafe) => "UnsafeIRI",
+                (TermType::Iri, Encoding::Uri) => "URI",
+                (TermType::Iri, Encoding::Iri) => "IRI",
+                (TermType::BlankNode, _) => "BlankNode",
+                (TermType::Literal, _) => "Literal",
             };
             out.push_str(&format!("{inner}{p}:termType {p}:{tt} ;\n"));
         }

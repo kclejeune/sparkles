@@ -1087,6 +1087,18 @@ fn unsafe_iris_keep_their_characters_and_must_be_valid() {
         out.contains("<http://ex.org/Bob/Zoë?x=1> <http://ex.org/p> <http://ex.org/o> ."),
         "{out:?}"
     );
+    // printing the mapping keeps the term type, so a converted mapping makes the same IRIs
+    for tt in ["UnsafeIRI", "URI"] {
+        let parsed = parse(&m(tt), MappingKind::Rml, None).unwrap();
+        let ttl = rdf::to_turtle(&parsed, false).unwrap();
+        assert!(ttl.contains(&format!("rml:termType rml:{tt}")), "{ttl}");
+        assert_eq!(
+            run_text(MappingKind::Rml, &ttl, &fs).unwrap(),
+            run_text(MappingKind::Rml, &m(tt), &fs).unwrap()
+        );
+        // R2RML has neither
+        assert!(rdf::to_turtle(&parsed, true).is_err());
+    }
     // a value that makes an invalid IRI fails the run and names the value
     let e = run_text(
         MappingKind::Rml,
