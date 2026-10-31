@@ -649,6 +649,54 @@ judges the serial and four-writer throughput thresholds on the ratios between
 neighbouring processes, as X09 section 17.9 defines them, and prints those verdicts on
 separate lines.
 
+## Batch gate
+
+The batch gate before a push runs `scripts/ci.sh --force --jobs 1`, `test:w3c`,
+`test:shacl`, `test:shex` and the plain and encrypted spill matrices on the build hosts
+rather than the laptop. `scripts/gate/gate.sh <rev>` pushes the commit to the host's bare
+repository `~/gate/repo.git`, starts the run and waits for it. On the host each run is a
+systemd user unit `gate-<name>` in the detached worktree `~/gate/wt-<name>`, where the name
+is the first eight hex digits of the commit. The unit holds `~/gate/.lock`, which is the
+same file as `~/lanes/.heavy.lock`, so gates and the heavy work of lanes on that host take
+turns. Its memory cap is the smaller of 24 GiB and the host's RAM less 2 GiB, with 2 GiB of
+swap. A passing run removes its worktree, and a failing one keeps the sources and drops the
+build directories.
+
+By default `scripts/ci.sh` runs on wally while the conformance steps run on atlas for the
+same commit. The conformance half takes about 18 minutes and the ci half about 45, so the
+gate's critical path is the ci half alone. Each host keeps its own lock, mbx cache and
+queue. The two hosts cannot reach each other over ssh, so the laptop merges the halves
+when it waits, fetches or prints the status. The merged directory has one `steps.txt` that
+names the host of each step and one `gate.exit` that is 0 only when both halves pass. A
+fetch after both halves finish also copies the merged files back into the primary host's
+`~/gate/out/<name>/`. When atlas cannot be reached at the start, wally runs every step in
+sequence and its `progress.log` records the fallback.
+
+| Invocation | Effect |
+|---|---|
+| `gate.sh <rev>` | Pushes and starts the gate, waits for it, fetches the merged results and exits with the gate's code. |
+| `gate.sh --no-wait <rev>` | Pushes and starts the gate, then returns, for agents with bounded waits. |
+| `gate.sh --status <rev>` | Prints each half's progress, steps and last memory sample. The last line is `active` while either half runs. |
+| `gate.sh --fetch <rev>` | Copies and merges the results into `.artifacts/gates/main-gate-<name>-<host>/` of the main checkout. |
+| `gate.sh --hosts` | Prints each host's lock state, number of gate units and free disk. |
+| `gate.sh --host atlas <rev>` | Runs the whole gate on one host. |
+| `gate.sh --auto <rev>` | Splits when both hosts are idle and otherwise runs the whole gate on the idle host that has the disk for it. |
+| `gate.sh --jobs 2 --tag j2 <rev>` | Passes `--jobs 2` to `scripts/ci.sh` and names the run `<short>-j2`, so it can run beside a default run of the same commit. |
+
+The tag also applies to `--status` and `--fetch`. `GATE_HELPER=none` turns the split off,
+and a `GATE_HELPER` that does not resolve exercises the unreachable-host fallback.
+`GATE_PRIMARY` changes the default primary host. The driver refuses forge, which is
+reserved for benchmarks. `~/.local/bin/wally-gate.sh` on the laptop is a wrapper that runs
+this script from the main checkout, so older invocations keep working.
+
+The driver installs `scripts/gate/remote/gate-start.sh` and `gate-inner.sh` on each host
+under `~/gate/bin/v-<hash>/`, named by the hash of their contents. A new version therefore
+never rewrites a script that a queued or running gate is reading. The host also needs
+`~/gate/suites` with the conformance suites, `~/gate/conformance.env` and the pytest venv
+`~/gate/py-venv`. `scripts/gate/setup-host.sh <host>` creates them, copies the suites from
+wally through the laptop and checks linger, mbx and free disk. A ci half needs about
+30 GiB of free disk for its target and a conformance half about 15 GiB.
+
 ## Continuous integration
 
 The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free
