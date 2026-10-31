@@ -175,10 +175,12 @@ impl Cx<'_> {
                 name: NamedNodePattern::Variable(_),
                 inner,
             } if reaches(gp) => self.graph_count().saturating_mul(self.copies(inner)),
+            // a child adds the copies beyond the one it receives, and a `GRAPH ?g` over
+            // no named graphs makes none
             _ => {
                 let mut n = 1usize;
                 for c in children(gp) {
-                    n = n.saturating_add(self.copies(c) - 1);
+                    n = n.saturating_add(self.copies(c).saturating_sub(1));
                 }
                 n
             }
@@ -1010,6 +1012,31 @@ mod tests {
             let (on, off) = both(&s, q);
             assert_eq!(on, off, "{q}");
             assert!(!on.is_empty(), "{q}");
+        }
+    }
+
+    #[test]
+    fn a_graph_variable_over_no_named_graphs_counts_no_copies() {
+        // a GRAPH ?g under a FILTER or BIND counts zero copies when the dataset has no
+        // named graphs, which the count of its wrapper must not take one from
+        let wrapped = [
+            "SELECT * WHERE { VALUES ?o { 1 } { GRAPH ?g { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } } FILTER(?o > 0) } }",
+            "SELECT * WHERE { VALUES ?o { 1 } { GRAPH ?g { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } } BIND(?o + 1 AS ?n) } }",
+        ];
+        for q in wrapped {
+            assert!(rewrite(&body(q), &no_calls, &|| 0).is_some(), "{q}");
+        }
+        // planned and run over a store with only a default graph
+        let s = crate::store::Store::in_memory(Default::default());
+        s.load(&[crate::io::Source::from_bytes(
+            b"<urn:s1> <urn:p> 1 .\n".to_vec(),
+            crate::io::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+        for q in wrapped {
+            let (on, off) = both(&s, q);
+            assert!(on.is_empty() && off.is_empty(), "{q}: {on:?} {off:?}");
         }
     }
 }
