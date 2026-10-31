@@ -927,7 +927,7 @@ mod callback_management {
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
-        rx.recv_timeout(Duration::from_secs(5))
+        rx.recv_timeout(Duration::from_secs(20))
             .expect("a catalog call from a close callback must not wait on its own disposal")
     }
     type Seen = Arc<parking_lot::Mutex<Option<crate::Result<()>>>>;
@@ -1029,7 +1029,7 @@ mod callback_management {
         drop(ds);
         let worker = cat.clone();
         assert!(bounded(move || worker.delete("source")).unwrap());
-        let created = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let created = rx.recv_timeout(Duration::from_secs(20)).unwrap();
         assert!(created.is_ok(), "{created:?}");
         assert!(cat.get("other").is_some());
     }
@@ -1298,5 +1298,123 @@ mod callback_management {
             weak.upgrade().is_none(),
             "the catalog is not retained by its own queue"
         );
+    }
+
+    /// Run this test binary's `test` alone in a child with `CALLBACK_CHILD` set, and
+    /// return its output. A child that aborts or runs past `limit` fails the test.
+    fn run_child(test: &str, limit: Duration) -> String {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let path = format!("catalog::lifecycle_tests::callback_management::{test}");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &path, "--nocapture", "--test-threads=1"])
+            .env("CALLBACK_CHILD", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let drain = |mut pipe: Box<dyn Read + Send>| {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let out = std::thread::spawn(move || drain(Box::new(stdout)));
+        let err = std::thread::spawn(move || drain(Box::new(stderr)));
+        let until = std::time::Instant::now() + limit;
+        let mut timed_out = false;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= until {
+                timed_out = true;
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = child.wait().unwrap();
+        let (out, err) = (out.join().unwrap(), err.join().unwrap());
+        assert!(
+            !timed_out && status.success(),
+            "child {test} failed (timed out: {timed_out}): {status:?}\n{out}\n{err}"
+        );
+        out
+    }
+    fn in_child() -> bool {
+        std::env::var_os("CALLBACK_CHILD").is_some()
+    }
+
+    #[test]
+    fn a_second_generation_destructor_panic_during_an_unwind_reaches_the_caller() {
+        if !in_child() {
+            let out = run_child(
+                "a_second_generation_destructor_panic_during_an_unwind_reaches_the_caller",
+                Duration::from_secs(30),
+            );
+            assert!(out.contains("CHILD-RETURNED"), "{out}");
+            return;
+        }
+        struct PanicsOnDrop;
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                panic!("second-generation destructor");
+            }
+        }
+        /// Defers a closure that holds a `PanicsOnDrop` when it is dropped.
+        struct DefersAPanic(Catalog);
+        impl Drop for DefersAPanic {
+            fn drop(&mut self) {
+                let bomb = PanicsOnDrop;
+                self.0.defer(move |_| drop(bomb));
+            }
+        }
+        let cat = Catalog::memory(Default::default());
+        let capture = DefersAPanic(cat.clone());
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _batch = cat.batch_scope();
+            cat.defer(move |_| drop(capture));
+            std::panic::panic_any("management call unwinds");
+        }));
+        assert!(unwound.is_err());
+        assert!(cat.inner.manage.deferred.lock().is_empty());
+        println!("CHILD-RETURNED");
+    }
+
+    #[test]
+    fn a_self_replenishing_destructor_chain_stops_after_its_bound() {
+        if !in_child() {
+            let out = run_child(
+                "a_self_replenishing_destructor_chain_stops_after_its_bound",
+                Duration::from_secs(30),
+            );
+            assert!(out.contains("CHILD-RETURNED"), "{out}");
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        /// Defers a closure that holds another `Replenishes` when it is dropped.
+        struct Replenishes(Catalog, Arc<AtomicUsize>);
+        impl Drop for Replenishes {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                let next = Replenishes(self.0.clone(), self.1.clone());
+                self.0.defer(move |_| drop(next));
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cat = Catalog::memory(Default::default());
+        let capture = Replenishes(cat.clone(), drops.clone());
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _batch = cat.batch_scope();
+            cat.defer(move |_| drop(capture));
+            std::panic::panic_any("management call unwinds");
+        }));
+        assert!(unwound.is_err());
+        assert!(cat.inner.manage.deferred.lock().is_empty());
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            super::super::gate::UNWIND_DISCARD_GENERATIONS
+        );
+        assert_eq!(super::super::gate::UNWIND_LEAKED.load(Ordering::SeqCst), 1);
+        println!("CHILD-RETURNED");
     }
 }

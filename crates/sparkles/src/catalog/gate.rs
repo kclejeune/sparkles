@@ -186,6 +186,12 @@ impl Catalog {
     /// operation for durability. A deferred operation that panics is logged, and the
     /// operations queued after it still run. Operations that a deferred operation
     /// defers run in the same loop, so a long chain needs no extra stack.
+    ///
+    /// When the disposing call unwinds, its queued operations are dropped without
+    /// running, each under its own panic boundary. Operations that their destructors
+    /// defer are dropped as well, for at most 64 generations. Anything a destructor
+    /// chain still defers after that is leaked with an error log, so a destructor that
+    /// keeps deferring cannot stop the unwind from finishing.
     pub fn defer(&self, op: impl FnOnce(&Catalog) + Send + 'static) {
         if marked(&self.inner, None) {
             self.inner
@@ -198,6 +204,14 @@ impl Catalog {
         }
     }
 }
+
+/// How many generations of deferred operations an unwinding drain drops, when the
+/// destructors of each generation defer the next. What remains after that is leaked.
+pub(crate) const UNWIND_DISCARD_GENERATIONS: usize = 64;
+/// The operations that unwinding drains leaked, for tests.
+#[cfg(test)]
+pub(crate) static UNWIND_LEAKED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Removes the draining mark of a drain loop, also when the loop unwinds, without
 /// starting another drain.
@@ -230,12 +244,14 @@ fn drop_payload(payload: Box<dyn std::any::Any + Send>) {
 
 /// Run the operations that this thread deferred on the catalog, in a loop that also
 /// runs whatever they defer. During an unwind they are dropped, since running them
-/// could abort the process, and so is anything their destructors defer.
+/// could abort the process, and so is anything their destructors defer, for at most
+/// [`UNWIND_DISCARD_GENERATIONS`] generations.
 fn run_deferred(catalog: &Catalog) {
     let me = std::thread::current().id();
     let key = key(&catalog.inner);
     MARKS.with_borrow_mut(|marks| marks.push((key, Mark::Draining)));
     let _draining = DrainMark(key);
+    let mut discarded = 0;
     loop {
         let ops: Vec<Deferred> = {
             let mut queue = catalog.inner.manage.deferred.lock();
@@ -249,15 +265,42 @@ fn run_deferred(catalog: &Catalog) {
             return;
         }
         if std::thread::panicking() {
-            tracing::error!(
-                target: "sparkles::catalog",
-                dropped = ops.len(),
-                "deferred catalog operations were dropped because the call that queued them unwound"
-            );
+            discarded += 1;
+            if discarded > UNWIND_DISCARD_GENERATIONS {
+                tracing::error!(
+                    target: "sparkles::catalog",
+                    leaked = ops.len(),
+                    generations = UNWIND_DISCARD_GENERATIONS,
+                    "deferred catalog operations kept deferring more as they were dropped during an unwind; the rest are leaked"
+                );
+                #[cfg(test)]
+                UNWIND_LEAKED.fetch_add(ops.len(), std::sync::atomic::Ordering::SeqCst);
+                std::mem::forget(ops);
+                return;
+            }
+            if discarded == 1 {
+                tracing::error!(
+                    target: "sparkles::catalog",
+                    dropped = ops.len(),
+                    "deferred catalog operations were dropped because the call that queued them unwound"
+                );
+            }
             // Drop them outside the queue lock while the draining mark is still set.
             // A destructor that defers again queues more work, which the next pass
-            // discards too, so nothing stays queued to retain the catalog.
-            drop(ops);
+            // discards too, so nothing stays queued to retain the catalog. Each drop
+            // has its own panic boundary, so a destructor panic during the unwind
+            // cannot abort the process.
+            for op in ops {
+                let dropped =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(op)));
+                if let Err(payload) = dropped {
+                    tracing::error!(
+                        target: "sparkles::catalog",
+                        "a discarded deferred catalog operation panicked when dropped"
+                    );
+                    drop_payload(payload);
+                }
+            }
             continue;
         }
         for op in ops {
