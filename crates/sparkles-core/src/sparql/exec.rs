@@ -3118,10 +3118,16 @@ enum Lexical {
     /// these ids, proper prefixes of the last one read, can still win: read their rows
     Read(Vec<u64>),
     /// the ids cannot decide: the k-th candidate is a literal that unread plain strings
-    /// may beat. The generic plan answers instead, which also keeps its order of tied
-    /// rows.
+    /// may beat, or the last string read has too many prefixes to look up. The generic
+    /// plan answers instead, which also keeps its order of tied rows.
     Generic,
 }
+
+/// The longest prefix, in bytes, that a check of a lexical run looks up. A check looks up
+/// every prefix of the last string read up to the k-th candidate, each a search of
+/// about the prefix's length, so a longer string gives the query to the generic plan
+/// rather than spend time quadratic in its length.
+const LEXICAL_PREFIX_BYTES: usize = 256;
 
 /// The [`Lexical`] verdict on a lexical run, after a step, for the k-th candidate `kth`.
 ///
@@ -3168,19 +3174,27 @@ fn lexical_check(
         k
     };
     let mut read = Vec::new();
-    let mut probe = Vec::with_capacity(lex.len() + 2);
+    // the key of the prefix, grown a character at a time, without its 0xFF
+    let mut probe = vec![b'"'];
     // the proper prefixes, shortest first: once one is greater than the k-th
     // candidate, so are the longer ones
-    for (end, _) in lex.char_indices() {
+    for (n, (end, c)) in lex.char_indices().enumerate() {
         let p = &lex[..end];
         if p > &**s {
             break;
         }
-        probe.clear();
-        probe.push(b'"');
-        probe.extend_from_slice(p.as_bytes());
+        if end > LEXICAL_PREFIX_BYTES {
+            return Ok(Lexical::Generic);
+        }
+        if n % 32 == 31 {
+            ctx.check()?;
+        }
         probe.push(crate::id::KEY_SEP);
-        let Ok(at) = vocab.find(&probe) else {
+        let found = vocab.find(&probe);
+        probe.pop();
+        let mut utf8 = [0; 4];
+        probe.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+        let Ok(at) = found else {
             continue;
         };
         let id = Id::vocab(at).0;

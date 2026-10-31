@@ -255,9 +255,9 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   datatype, so ids follow lexical forms except that a form sorts after the longer forms
   it begins. When the k-th candidate is a plain string, an unread plain string can only
   beat it if it is a prefix of the last string read, and the reader looks those prefixes
-  up in the vocabulary and reads their rows. Literals of every other kind rank after the
-  plain strings, so when the k-th candidate is one of them, the rest of the literals is
-  read whole. Literals in descending order, blank nodes and the terms that updates added
+  up in the vocabulary and reads their rows. The plain sort answers instead when the
+  k-th candidate is a literal of another kind, which unread plain strings may beat, and
+  when the prefixes to look up exceed 256 bytes. Literals in descending order, blank nodes and the terms that updates added
   since the last rebuild are not in value order by id, so they are read whole. Candidates are ranked by the ordinary ORDER BY in the plain scan's
   row order, so ties come out the same. NaN, dates and durations have no total order and
   use the plain sort. The planner picks this operator, from exact row counts per segment,

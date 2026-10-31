@@ -1340,6 +1340,26 @@ fn ordered_top_k_lexical_steps_fall_back_on_partially_ordered_values() {
     assert!(has_desc(&r.plan, "ran the generic plan"), "{:#?}", r.plan);
 }
 
+/// A long plain string at the low end ties with the k-th candidate, so each of its
+/// prefixes could still win. Looking them all up is quadratic in its length, so the
+/// ordered read gives the query to the generic plan instead.
+#[test]
+fn ordered_top_k_bounds_the_prefix_lookups_of_long_strings() {
+    let long = "a".repeat(4096);
+    let mut ttl = String::new();
+    for i in 0..32 {
+        ttl.push_str(&format!("ex:l{i} ex:p \"{long}\" .\n"));
+    }
+    for i in 0..20_000 {
+        ttl.push_str(&format!("ex:s{i} ex:p \"b{i}\" .\n"));
+    }
+    let r = lexical_case(
+        &ttl,
+        "SELECT ?s ?v WHERE { ?s ex:p ?v } ORDER BY ?v LIMIT 10",
+    );
+    assert!(has_desc(&r.plan, "ran the generic plan"), "{:#?}", r.plan);
+}
+
 /// IRIs whose order differs from the order of their keys' bytes under other encodings
 /// (a prefix of another IRI, `/`, `#` and `-` against `>`, case, multi-byte characters),
 /// mixed with blank nodes, literals and numbers, and IRIs that updates add with delta ids
