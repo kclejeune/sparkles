@@ -13,6 +13,7 @@
   import { formatEditor } from '$lib/fmt-edit';
   import { formatAny, lintAny } from '$lib/fmt-wasm';
   import { lintCounts, lintSummary } from '$lib/lint-view';
+  import { lintRunner } from '$lib/lint-runner';
   import { formatFailure } from '$lib/fmt-view';
   import { compactionSummary, lastCompaction } from '$lib/compaction';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
@@ -485,34 +486,29 @@ ex:PersonShape a sh:NodeShape ;
   let shapesLint = $state<api.LintDiagnostic[]>([]);
   /** the server refused linting (turned off, or not for this caller): stop asking */
   let shapesLintRefused = false;
-  let shapesLintSeq = 0;
   const shapesLintCount = $derived(lintCounts(shapesLint));
-
-  $effect(() => {
-    const ed = shapesEditor;
-    if (!ed) return;
-    const req = shapesLintRequest(shapes, shapesSyntax);
-    if (!req) {
-      shapesLint = [];
-      ed.setLint([]);
-      return;
-    }
-    const timer = setTimeout(async () => {
-      const seq = ++shapesLintSeq;
-      let found: api.LintDiagnostic[] = [];
-      if (!shapesLintRefused) {
-        try {
-          found = (await lintAny(req)).diagnostics;
-        } catch (e) {
-          if (e instanceof api.ApiError && [401, 403, 404].includes(e.status))
-            shapesLintRefused = true;
-        }
+  const shapesLinter = lintRunner<NonNullable<ReturnType<typeof shapesLintRequest>>>({
+    delay: 400,
+    run: async (req) => {
+      if (shapesLintRefused) return [];
+      try {
+        return (await lintAny(req)).diagnostics;
+      } catch (e) {
+        if (e instanceof api.ApiError && [401, 403, 404].includes(e.status))
+          shapesLintRefused = true;
+        return [];
       }
-      if (seq !== shapesLintSeq) return;
+    },
+    show: (found) => {
       shapesLint = found;
-      ed.setLint(found);
-    }, 400);
-    return () => clearTimeout(timer);
+      shapesEditor?.setLint(found);
+    },
+  });
+
+  // every new text, blank or not, starts a new lint and drops the answer of the last one
+  $effect(() => {
+    if (!shapesEditor) return;
+    return shapesLinter.schedule(shapesLintRequest(shapes, shapesSyntax));
   });
 
   /** Format the shapes graph, in the browser or on the server (Format and Shift+Alt+F). */
