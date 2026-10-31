@@ -204,15 +204,29 @@ permutations of a cold mask are written in parallel, as the legacy path writes t
 and hidden keys are sorted in pieces of 16,384 merged through an admitted buffer.
 Writes to the shared delta report the nodes they copy, split or grow, which is how
 each batch keeps only the bytes it allocated. A cached disclosure index is read in
-place without charging the shared index to the request.
+place without charging the shared index to the request. A cold disclosure index skips
+a row whose graph and footprint match a row in a fixed table of 256 recent pairs,
+since a repeated pair cannot change the index.
 
 A release diagnostic (`controlled_preparation_cost_diagnostic`) compared these changes
 with the previous controlled path on one host, interleaving three runs of each under
-a load average of 40. Results matched the legacy masks. On stores of 20,000 and
+a load average of about 13. Results matched the legacy masks. On stores of 20,000 and
 100,000 quads held in an uncompacted delta, the smallest cap that admitted a cold mask
-fell from 87 MB to 7.9 MB and from 431 MB to 41 MB. On a compacted store of 100,000
-quads it fell from 22 MB to 5.6 MB. A delta-vocabulary lookup fell from 0.18 ms and
-2.9 ms to about 0.3 µs. Cold mask medians fell from 23 ms to 15 ms, from 103 ms to
-34 ms and from 17 ms to 11 ms. Cached views stayed between 3 and 5 µs. Total
+fell from 87 MB to 8.0 MB and from 431 MB to 41 MB. On a compacted store of 100,000
+quads it fell from 22 MB to 5.8 MB. A delta-vocabulary lookup fell from 61–80 µs and
+0.2–0.6 ms to about 0.2 µs. Cold mask medians fell from 5.1 ms to 2.8 ms, from 15 ms
+to 14 ms and from 5.0 ms to 2.9 ms. Cached views stayed between 3 and 16 µs. Total
 allocation of a cold mask is unchanged within 7%, since it is the copied delta nodes
-themselves. These loaded-host diagnostics are not published benchmark results.
+themselves. Legacy masks now meter their writes for the shared cache, and repeated
+runs showed no difference outside the host's noise. Item 409 tracks a check on a quiet
+host.
+
+The provider diagnostic (`controlled_provider_preparation_cost_diagnostic`) compared
+the disclosure guard the same way under a load average of about 16, and every
+controlled answer matched the legacy guard. With 2,000 and 20,000 report rows that
+link one footprint, a cold controlled index fell from 3.0 ms to 38 µs and from 24 ms
+to 0.18 ms, against 0.67 ms and 4.5 ms for the legacy index. Cached calls fell from
+1.2–2.0 µs to 0.7–1.5 µs. When each of 20,000 rows sits in its own guarded graph, no
+pair repeats and a cold controlled index still takes 25 ms against 5.4 ms for the
+legacy index. Item 409 tracks that per-row cost. These loaded-host diagnostics are not
+published benchmark results.

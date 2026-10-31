@@ -252,8 +252,9 @@ or selecting another state.
 Controlled preparation polls its controls and admits storage before allocating it.
 A delta-vocabulary lookup is one index probe, and a cold mask writes its seven
 permutations in parallel as the legacy path does. The view is charged for the delta
-nodes its mask copies rather than for the shared input delta, so a cap of a few
-megabytes admits a mask over an uncompacted delta of 100,000 quads. A cold disclosure
-call still rebuilds its local index. The C29
+nodes its mask copies rather than for the shared input delta, so a cap near 40 MB
+admits a mask over an uncompacted delta of 100,000 quads. A cold disclosure call still
+rebuilds its local index, but it skips a disclosure row whose graph and footprint
+repeat a recently read row. The C29
 [Outcome](../specs/C29-bounded-view-preparation/SPEC.md#outcome) records release
 diagnostics of these costs.
