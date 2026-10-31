@@ -10,6 +10,10 @@
 //!    policy as the attempt, unless `budget.providerCounting` is off;
 //! 3. the byte bound of [`byte_bound`].
 //!
+//! An attempt whose body marks prefixes for the provider's cache reserves its input
+//! bound at the price of a cache write, since every input token can be written, and is
+//! settled with each class of input at its price ([`Usage::budget`]).
+//!
 //! The budget is strict as long as the bounds hold. A reported usage above its
 //! reservation is an accounting anomaly: the ledger counts the reported figure and the
 //! build admits no further attempt.
@@ -297,7 +301,7 @@ impl Ledger {
             day,
             Usage {
                 input: used,
-                output: 0,
+                ..Default::default()
             },
         );
     }
@@ -310,9 +314,10 @@ impl Ledger {
         }
     }
 
-    /// Replace a reservation made on `day` by the reported usage.
+    /// Replace a reservation made on `day` by the reported usage, priced as
+    /// [`Usage::budget`] prices it.
     fn settle(&self, bound: &InputBound, reserved: u64, day: u64, usage: Usage) {
-        let actual = usage.input.saturating_add(usage.output);
+        let actual = usage.budget();
         let mut inner = self.inner.lock();
         let mut d = self.day.lock();
         let same_day = d.day == day;
@@ -468,8 +473,8 @@ impl Admission for BuildAdmission {
         if self.provider_counting && a.provider_count.is_some() {
             live()?;
         }
-        let tokens = bound
-            .tokens
+        // a cached prefix can be charged a cache write for every input token
+        let tokens = crate::models::admission::input_budget_bound(bound.tokens, a.cache_ttl)
             .saturating_add(u64::from(a.request.max_output_tokens));
         let day = self
             .ledger

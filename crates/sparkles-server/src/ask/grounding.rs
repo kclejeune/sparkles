@@ -22,6 +22,22 @@ pub(super) fn balanced_entries(common: &Value, relevant: &Value, max: usize) -> 
         .collect()
 }
 
+/// How many of the first `entries` that [`balanced_entries`] chose come from the head
+/// of `common`, the part of the list that is the same for every question.
+pub(super) fn common_head(common: &Value, entries: &[Value], max: usize) -> usize {
+    let head: std::collections::BTreeSet<&str> = common
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(max / 2)
+        .filter_map(|e| e["iri"].as_str())
+        .collect();
+    entries
+        .iter()
+        .take_while(|e| e["iri"].as_str().is_some_and(|i| head.contains(i)))
+        .count()
+}
+
 fn local(iri: &str) -> Option<String> {
     let iri = iri.trim_matches(['<', '>']);
     // A prefixed category keeps its namespace marker in the local component.

@@ -81,16 +81,71 @@ class UpstreamFailure(Exception):
         self.reason, self.sent = reason, sent
 
 
-def bound(model, body_len, max_tokens):
+def bound(model, body_len, max_tokens, cache_ttl=None):
     """An upper bound on one request's cost from its size alone.
 
     A token never covers less than one byte, so doubling the body and adding room
-    for the system prompt and schema overhead bounds the input tokens.
+    for the system prompt and schema overhead bounds the input tokens. A request that
+    marks prefixes for the prompt cache can have every input token written to the
+    cache, so its input is bounded at the write rate of its TTL, which is dearer than
+    uncached input and than a read.
     """
     rates = RATES[model]
-    input_rate = max(r[0] for r in rates)
+    column = {None: 0, "5m": 1, "1h": 2}[cache_ttl]
+    input_rate = max(r[column] for r in rates)
     output_rate = max(r[4] for r in rates)
     return (2 * body_len + 8192) * input_rate + max_tokens * output_rate
+
+
+MAX_BREAKPOINTS = 4
+
+
+def cache_ttl(body):
+    """The TTL of the cache breakpoints of a checked body, or None without any.
+
+    Every breakpoint is a text block's `{"type": "ephemeral"}`, with `"ttl": "5m"` or
+    `"1h"` at most. More than four breakpoints, another place or another shape is
+    refused, and so is a mix of TTLs, so that the bound has one write rate. A
+    top-level `cache_control` is refused because the server never sends one.
+    """
+    marks = []
+    blocks = list(body["system"]) if isinstance(body.get("system"), list) else []
+    for m in body.get("messages") or []:
+        if isinstance(m.get("content"), list):
+            blocks.extend(m["content"])
+    for b in blocks:
+        if "cache_control" not in b:
+            continue
+        c = b["cache_control"]
+        if (
+            not isinstance(c, dict)
+            or c.get("type") != "ephemeral"
+            or c.keys() - {"type", "ttl"}
+            or c.get("ttl", "5m") not in ("5m", "1h")
+        ):
+            raise Refused("unsupported cache control")
+        marks.append(c.get("ttl", "5m"))
+    if len(marks) > MAX_BREAKPOINTS or len(set(marks)) > 1:
+        raise Refused("unsupported cache control")
+    return marks[0] if marks else None
+
+
+def text_content(value):
+    """Whether a system or message content is text: a string, or text blocks that
+    carry nothing but their text and a cache breakpoint."""
+    if isinstance(value, str):
+        return True
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(
+            isinstance(b, dict)
+            and b.get("type") == "text"
+            and isinstance(b.get("text"), str)
+            and not b.keys() - {"type", "text", "cache_control"}
+            for b in value
+        )
+    )
 
 
 def count(value):
@@ -733,20 +788,27 @@ class Proxy:
             raise Refused("request is not JSON") from None
         if not isinstance(body, dict) or body.keys() - ALLOWED_FIELDS:
             raise Refused("unsupported request field, tools are not allowed")
-        if has_key(body, "cache_control"):
-            raise Refused("cache control is not allowed")
         max_tokens = body.get("max_tokens")
         if body.get("model") not in self.models:
             raise Refused("model not allowed")
         if type(max_tokens) is not int or not 0 < max_tokens <= self.max_output_tokens:
             raise Refused("max_tokens out of range")
-        if not isinstance(body.get("system", ""), str) or any(
-            not isinstance(m, dict) or not isinstance(m.get("content"), str)
+        if not text_content(body.get("system", "")) or any(
+            not isinstance(m, dict)
+            or m.keys() - {"role", "content"}
+            or not text_content(m.get("content"))
             for m in body.get("messages") or [None]
         ):
             # Only text bodies keep the byte-based bound valid. An image can cost
             # more tokens than its bytes.
             raise Refused("only text content is allowed")
+        # a cache breakpoint anywhere else, such as in the output schema, is refused
+        if has_key(
+            {k: v for k, v in body.items() if k not in ("system", "messages")},
+            "cache_control",
+        ):
+            raise Refused("unsupported cache control")
+        cache_ttl(body)
         body["stream"] = False
         if self.effort:
             config = body.setdefault("output_config", {})
@@ -773,7 +835,7 @@ class Proxy:
             return 400, [], error_body("invalid_request_error", str(refusal))
         model = body["model"]
         payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
-        limit = bound(model, len(payload), body["max_tokens"])
+        limit = bound(model, len(payload), body["max_tokens"], cache_ttl(body))
         try:
             ident = self.ledger.reserve(model, limit, self.case)
         except CapExceeded:

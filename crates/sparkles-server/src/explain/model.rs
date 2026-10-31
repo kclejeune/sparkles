@@ -341,13 +341,15 @@ impl Written {
         let (i, o) = self.steps.iter().fold((0, 0), |(i, o), s| {
             (i + s.input_tokens, o + s.output_tokens)
         });
-        json!({
+        let mut j = json!({
             "inputTokens": i,
             "outputTokens": o,
             "modelCalls": self.steps.len(),
             "failedCalls": self.steps.iter().filter(|s| s.outcome != "ok").count(),
             "steps": self.steps.iter().map(StepRecord::json).collect::<Vec<_>>(),
-        })
+        });
+        crate::models::cache_json(&mut j, &crate::models::usage_total(&self.steps));
+        j
     }
 }
 

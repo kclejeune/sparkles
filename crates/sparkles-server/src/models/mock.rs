@@ -220,12 +220,21 @@ pub fn answer(kind: super::Kind, text: &str) -> Value {
     }
 }
 
+/// The text of a system or content member: a string, or the text blocks that prompt
+/// caching sends, joined.
+pub fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
 /// The text of the last user message of a request of any kind.
 pub fn prompt_of(r: &Received) -> String {
     r.body["messages"]
         .as_array()
         .and_then(|m| m.last())
-        .and_then(|m| m["content"].as_str())
-        .unwrap_or("")
-        .to_string()
+        .map(|m| text_of(&m["content"]))
+        .unwrap_or_default()
 }

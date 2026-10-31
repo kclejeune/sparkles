@@ -16,7 +16,7 @@
 
 use super::pipeline::{Failed, Run};
 use crate::mcp::memory::ingest::fold_ws;
-use crate::models::{Models, OutputSchema, Pair, Role, StepError};
+use crate::models::{Models, OutputSchema, Pair, Part, Prompt, Role, StepError};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 
@@ -188,11 +188,26 @@ const SYSTEM: &str = "You extract facts from a document into a fixed vocabulary 
 const TEXT_INSTRUCTION: &str = "Answer with one JSON object {\"mentions\": [...], \"facts\": [...]} in a ```json block, as described above, and nothing else.";
 
 fn user_prompt(v: &str, context: &str, chunk: &str) -> String {
+    let mut s = vocabulary_prompt(v);
+    s.push_str(&chunk_prompt(context, chunk));
+    s
+}
+
+/// The part of the user message that every chunk of a document shares: the vocabulary
+/// and what to list.
+fn vocabulary_prompt(v: &str) -> String {
     let mut s = String::from("Vocabulary\n\n");
     s.push_str(v);
     s.push_str(
         "\nList the entities the text mentions (mentions: a key, the name as written, and one class from the vocabulary), and the facts it states between them (facts: s and o are mention keys; for a literal object leave o empty and give literal, with datatype or lang when they apply, else empty strings). quote is the shortest exact passage of the text that states the fact, copied character for character. confidence is how sure you are, from 0 to 1. Use only the classes and predicates listed.\n",
     );
+    s
+}
+
+/// The part of the user message of one chunk: the end of the previous part and the
+/// chunk itself.
+fn chunk_prompt(context: &str, chunk: &str) -> String {
+    let mut s = String::new();
     if !context.is_empty() {
         s.push_str(
             "\nThe end of the previous part, for reference only (do not extract from it):\n<<<\n",
@@ -392,18 +407,25 @@ pub fn extract(
         };
         let context: String = chars[ctx_from..*a].iter().collect();
         let chunk: String = chars[*a..*b].iter().collect();
-        let user = user_prompt(&vocab, &context, &chunk);
+        // the vocabulary is the same for every chunk, so it ends a cached prefix (C18 §3.6)
+        let prompt = Prompt {
+            system: vec![Part::cached(SYSTEM)],
+            user: vec![
+                Part::cached(vocabulary_prompt(&vocab)),
+                Part::text(chunk_prompt(&context, &chunk)),
+            ],
+        };
         let answer = loop {
             let Some(pair) = pairs.get(pos) else {
                 break None;
             };
-            match models.call(
+            match models.call_prompt(
                 Some(Role::Extract),
                 pair,
-                SYSTEM,
-                &user,
+                &prompt,
                 &schema,
                 r.ctx.deadline,
+                None,
             ) {
                 Ok(ans) => {
                     r.usage.steps.push(ans.record);

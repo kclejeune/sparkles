@@ -341,6 +341,73 @@ fn daily_budget_and_cost() {
     assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 30);
 }
 
+/// An Anthropic answer that reports cache writes and reads is charged each class at its
+/// price: in the step's record and cost, in the provider's daily budget, and in the
+/// budget tokens of its JSON. Counting only `input_tokens` would count 10 of the
+/// 4010 prompt tokens.
+#[test]
+fn cache_tokens_are_charged_at_their_prices() {
+    let mock = MockModel::start(|_, n| {
+        let (written, read) = if n == 0 { (4000, 0) } else { (0, 4000) };
+        (
+            200,
+            json!({
+                "content": [{ "type": "text", "text": r#"{"query":"ASK {}"}"# }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 10, "output_tokens": 5,
+                    "cache_creation_input_tokens": written, "cache_read_input_tokens": read,
+                    "cache_creation": { "ephemeral_5m_input_tokens": written, "ephemeral_1h_input_tokens": 0 } }
+            }),
+        )
+    });
+    let m = models(
+        json!({ "a": {
+            "kind": "anthropic", "endpoint": mock.url(), "budget": {"tokensPerDay": 5500},
+            "models": {"m1": {"pricing": {"inputPerMTok": 1.0, "outputPerMTok": 5.0}}}
+        } }),
+        &[],
+    );
+    let a = call(&m, "a").unwrap();
+    assert_eq!(a.record.cache_write_5m_tokens, 4000);
+    // 10 + 1.25 × 4000 input-token equivalents, and 5 output tokens
+    assert_eq!(a.record.budget_tokens(), 5015);
+    let cost = a.record.estimated_cost.unwrap();
+    assert!(
+        (cost - (10.0 + 5000.0 + 25.0) / 1e6).abs() < 1e-12,
+        "{cost}"
+    );
+    let j = a.record.json();
+    assert_eq!(
+        (
+            j["cacheWriteInputTokens"].clone(),
+            j["cacheReadInputTokens"].clone()
+        ),
+        (json!(4000), json!(0))
+    );
+    assert_eq!(j["budgetTokens"], 5015);
+    assert_eq!(usage_json(&j).budget(), 5015);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 5015);
+    // the read is a tenth of the price: 10 + 400 + 5
+    let b = call(&m, "a").unwrap();
+    assert_eq!(b.record.cache_read_tokens, 4000);
+    assert_eq!(b.record.budget_tokens(), 415);
+    assert!((b.record.estimated_cost.unwrap() - (10.0 + 400.0 + 25.0) / 1e6).abs() < 1e-12);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 5430);
+    // the cap holds: 5430 of 5500 leaves room for one more, and then none
+    assert!(call(&m, "a").is_ok());
+    assert_eq!(call(&m, "a").unwrap_err().error.code(), "budget-exceeded");
+    assert_eq!(mock.requests().len(), 3);
+    let p = &m.describe()["providers"][0];
+    assert_eq!(p["promptCaching"], json!({ "enabled": true, "ttl": "5m" }));
+    assert_eq!(p["models"][0]["pricing"]["cacheReadPerMTok"], json!(0.1));
+    // the request marked the system text for the cache
+    let r = &mock.requests()[0];
+    assert_eq!(
+        r.body["system"][0]["cache_control"],
+        json!({ "type": "ephemeral" })
+    );
+}
+
 #[test]
 fn a_reload_shares_the_token_count_with_requests_on_the_old_config() {
     let mock = MockModel::start(|_, _| (200, mock::ollama(r#"{"query":"ASK {}"}"#)));

@@ -8,7 +8,7 @@
 //! and says why.
 
 use super::{AskMode, Asking, prompts};
-use crate::models::{OutputSchema, Pair, Role};
+use crate::models::{OutputSchema, Pair, Prompt, Role};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -548,7 +548,11 @@ impl Asking<'_, '_> {
                     format!("the ask used its {} tokens", self.o.max_tokens),
                 );
             }
-            match self.call(Role::Summarize, MAP_SYSTEM, &prompt(&groups[gi]), &schema) {
+            match self.call(
+                Role::Summarize,
+                &Prompt::plain(MAP_SYSTEM, &prompt(&groups[gi])),
+                &schema,
+            ) {
                 Ok((v, _, _)) => answers[gi] = Some(v),
                 Err((code, message)) => return self.error(code, message),
             }
@@ -660,8 +664,11 @@ impl Asking<'_, '_> {
             prompts::data_block(&question),
             prompts::data_block(&lines)
         );
-        let (value, pair) = match self.call(Role::Summarize, REDUCE_SYSTEM, &user, &reduce_schema())
-        {
+        let (value, pair) = match self.call(
+            Role::Summarize,
+            &Prompt::plain(REDUCE_SYSTEM, &user),
+            &reduce_schema(),
+        ) {
             Ok((v, _, p)) => (v, p),
             Err((code, message)) => return self.error(code, message),
         };

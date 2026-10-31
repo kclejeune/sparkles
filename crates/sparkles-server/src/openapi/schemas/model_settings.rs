@@ -124,10 +124,13 @@ fn model_options() -> (Vec<&'static str>, J) {
             "title": "Pricing",
             "description": "Prices per million tokens, for cost estimates only.",
             "additionalProperties": false,
-            "x-sparkles-order": ["inputPerMTok", "outputPerMTok"],
+            "x-sparkles-order": ["inputPerMTok", "outputPerMTok", "cacheWritePerMTok", "cacheWrite1hPerMTok", "cacheReadPerMTok"],
             "properties": {
-                "inputPerMTok": default(at_least(titled(num(), "Input price", "The price of one million input tokens. A model's prices replace both of the provider's prices."), 0.0), json!(0)),
-                "outputPerMTok": default(at_least(titled(num(), "Output price", "The price of one million output tokens. A model's prices replace both of the provider's prices."), 0.0), json!(0)),
+                "inputPerMTok": default(at_least(titled(num(), "Input price", "The price of one million input tokens. A model's prices replace all of the provider's prices."), 0.0), json!(0)),
+                "outputPerMTok": default(at_least(titled(num(), "Output price", "The price of one million output tokens. A model's prices replace all of the provider's prices."), 0.0), json!(0)),
+                "cacheWritePerMTok": unset(at_least(titled(num(), "Cache write price", "The price of one million input tokens written to the prompt cache with the 5-minute TTL."), 0.0), "1.25 times the input price"),
+                "cacheWrite1hPerMTok": unset(at_least(titled(num(), "1-hour cache write price", "The price of one million input tokens written to the prompt cache with the 1-hour TTL."), 0.0), "2 times the input price"),
+                "cacheReadPerMTok": unset(at_least(titled(num(), "Cache read price", "The price of one million input tokens read from the prompt cache. Claude Opus 5.5 and Sonnet 5.5 read at 0.05 times the input price and Claude Fable 5.1 at 0.025 times."), 0.0), "0.1 times the input price"),
             },
         },
         "repo": kinds(titled(string(), "Repository", "The Hugging Face repository that holds the model snapshot."), local),
@@ -205,6 +208,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "headers",
         "keepAlive",
         "version",
+        "promptCaching",
         "tls",
     ];
     order.extend(option_order.iter().copied());
@@ -259,6 +263,15 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
             v
         }, "Ollama's default"), &["ollama"]),
         "version": kinds(default(titled(string(), "API version", "The anthropic-version header."), json!("2023-06-01")), &["anthropic"]),
+        "promptCaching": kinds({
+            let mut v = ordered(&["enabled", "ttl"], json!({
+                "enabled": default(titled(boolean(), "Prompt caching", "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL."), json!(true)),
+                "ttl": default(titled(string_enum(&["5m", "1h"]), "Cache lifetime", "How long the provider keeps a cached prefix after its last use. The 1-hour TTL doubles the write price and pays when calls sharing a prefix come more than 5 minutes apart."), json!("5m")),
+            }));
+            v["title"] = "Prompt caching".into();
+            v["description"] = "Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.".into();
+            v
+        }, &["anthropic"]),
         "tls": tls,
         "models": {
             "type": "object",

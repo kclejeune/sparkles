@@ -4,31 +4,74 @@
 //! read from its named secret for each request and never enters a log line, an error
 //! message or a response.
 
-use super::config::{DEFAULT_ANTHROPIC_VERSION, Kind, Level, ProviderConfig};
+use super::admission::Usage;
+use super::config::{CacheTtl, DEFAULT_ANTHROPIC_VERSION, Kind, Level, ProviderConfig};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+/// A run of prompt text. A part marked `cache` ends a prefix that a provider with prompt
+/// caching keeps for the requests after it (spec C18 §3.6). The provider reads the parts
+/// of a system text or a message joined, so the marks only say where a reusable prefix
+/// ends and change nothing that the model is told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub text: String,
+    pub cache: bool,
+}
+
+impl Part {
+    /// A part that ends no cached prefix.
+    pub fn text(s: impl Into<String>) -> Part {
+        Part {
+            text: s.into(),
+            cache: false,
+        }
+    }
+
+    /// A part that ends a cached prefix.
+    pub fn cached(s: impl Into<String>) -> Part {
+        Part {
+            text: s.into(),
+            cache: true,
+        }
+    }
+}
+
+/// The parts joined.
+pub fn joined(parts: &[Part]) -> String {
+    parts.iter().map(|p| p.text.as_str()).collect()
+}
 
 /// One message of a conversation.
 #[derive(Clone, Debug)]
 pub struct Message {
     /// `user` or `assistant`
     pub role: &'static str,
-    pub content: String,
+    pub parts: Vec<Part>,
 }
 
 impl Message {
     pub fn user(s: impl Into<String>) -> Message {
+        Message::user_parts(vec![Part::text(s)])
+    }
+
+    pub fn user_parts(parts: Vec<Part>) -> Message {
         Message {
             role: "user",
-            content: s.into(),
+            parts,
         }
     }
 
     pub fn assistant(s: impl Into<String>) -> Message {
         Message {
             role: "assistant",
-            content: s.into(),
+            parts: vec![Part::text(s)],
         }
+    }
+
+    /// The message's text, its parts joined.
+    pub fn text(&self) -> String {
+        joined(&self.parts)
     }
 }
 
@@ -36,7 +79,7 @@ impl Message {
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub model: String,
-    pub system: String,
+    pub system: Vec<Part>,
     pub messages: Vec<Message>,
     /// the JSON Schema the answer must match, with a name for the protocols that need
     /// one; ignored at the `text` level
@@ -55,10 +98,10 @@ pub struct ChatRequest {
 pub struct ChatResponse {
     /// the text blocks of the answer
     pub text: String,
-    /// the input of a forced tool call (the `tool` level)
+    /// the input of a tool call (the `tool` level)
     pub tool_input: Option<Value>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    /// the tokens the provider reported
+    pub usage: super::admission::Usage,
     /// the provider's reason for stopping, as it gave it
     pub stop: Option<String>,
     pub latency: Duration,
@@ -130,16 +173,90 @@ pub struct Transport<'a> {
     pub key: Option<String>,
 }
 
+/// The most cache breakpoints one Anthropic request may carry.
+pub const MAX_BREAKPOINTS: usize = 4;
+
+/// The TTL of the prefixes that `req` asks `p` to cache: the provider's prompt caching
+/// when it is on and the request marks at least one part, else `None`.
+pub fn cache_ttl(p: &ProviderConfig, req: &ChatRequest) -> Option<CacheTtl> {
+    let marked = req
+        .system
+        .iter()
+        .chain(req.messages.iter().flat_map(|m| &m.parts))
+        .any(|x| x.cache);
+    p.cache_ttl().filter(|_| marked)
+}
+
+/// The marks a request keeps: the last [`MAX_BREAKPOINTS`] marked parts, in order of
+/// the prompt (the system text, then each message), as (message, part) with `None` for
+/// the system text. A later breakpoint covers a longer prefix, so the earliest marks
+/// are the ones dropped.
+fn kept_marks(req: &ChatRequest) -> Vec<(Option<usize>, usize)> {
+    let mut marks: Vec<(Option<usize>, usize)> = req
+        .system
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.cache)
+        .map(|(i, _)| (None, i))
+        .collect();
+    for (m, msg) in req.messages.iter().enumerate() {
+        marks.extend(
+            msg.parts
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| x.cache)
+                .map(|(i, _)| (Some(m), i)),
+        );
+    }
+    let drop = marks.len().saturating_sub(MAX_BREAKPOINTS);
+    marks.split_off(drop)
+}
+
+/// The `cache_control` member of a breakpoint.
+fn cache_control(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::FiveMinutes => json!({ "type": "ephemeral" }),
+        CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
+    }
+}
+
+/// The Anthropic content of `parts`: one string when no breakpoint falls in them, as
+/// without caching, else text blocks that end at each kept breakpoint, with the rest
+/// in a last block. Joined, the blocks hold the same text as the string.
+fn anthropic_content(parts: &[Part], kept: &[usize], ttl: CacheTtl) -> Value {
+    if kept.is_empty() {
+        return Value::String(joined(parts));
+    }
+    let mut blocks = Vec::new();
+    let mut text = String::new();
+    for (i, x) in parts.iter().enumerate() {
+        text.push_str(&x.text);
+        // a block must hold text, so a breakpoint on an empty run is dropped
+        if kept.contains(&i) && !text.is_empty() {
+            blocks.push(json!({
+                "type": "text",
+                "text": std::mem::take(&mut text),
+                "cache_control": cache_control(ttl),
+            }));
+        }
+    }
+    if !text.is_empty() {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+    Value::Array(blocks)
+}
+
 /// The request body and URL of a call, for its provider's kind.
 pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
     let base = p.endpoint.trim_end_matches('/');
+    let system = joined(&req.system);
     match p.kind {
         Kind::Ollama => {
-            let mut messages = vec![json!({"role": "system", "content": req.system})];
+            let mut messages = vec![json!({"role": "system", "content": system})];
             messages.extend(
                 req.messages
                     .iter()
-                    .map(|m| json!({"role": m.role, "content": m.content})),
+                    .map(|m| json!({"role": m.role, "content": m.text()})),
             );
             let mut options = json!({ "num_predict": req.max_output_tokens });
             if let Some(t) = req.temperature {
@@ -167,11 +284,11 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
             (format!("{base}/api/chat"), body)
         }
         Kind::Openai => {
-            let mut messages = vec![json!({"role": "system", "content": req.system})];
+            let mut messages = vec![json!({"role": "system", "content": system})];
             messages.extend(
                 req.messages
                     .iter()
-                    .map(|m| json!({"role": m.role, "content": m.content})),
+                    .map(|m| json!({"role": m.role, "content": m.text()})),
             );
             let mut body = json!({
                 "model": req.model,
@@ -204,15 +321,34 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
             (format!("{base}/chat/completions"), body)
         }
         Kind::Anthropic => {
+            let ttl = cache_ttl(p, req);
+            let kept = if ttl.is_some() {
+                kept_marks(req)
+            } else {
+                Vec::new()
+            };
+            let ttl = ttl.unwrap_or_default();
+            let marks_of = |at: Option<usize>| -> Vec<usize> {
+                kept.iter()
+                    .filter(|(m, _)| *m == at)
+                    .map(|(_, i)| *i)
+                    .collect()
+            };
             let messages: Vec<Value> = req
                 .messages
                 .iter()
-                .map(|m| json!({"role": m.role, "content": m.content}))
+                .enumerate()
+                .map(|(i, m)| {
+                    json!({
+                        "role": m.role,
+                        "content": anthropic_content(&m.parts, &marks_of(Some(i)), ttl),
+                    })
+                })
                 .collect();
             let mut body = json!({
                 "model": req.model,
                 "max_tokens": req.max_output_tokens,
-                "system": req.system,
+                "system": anthropic_content(&req.system, &marks_of(None), ttl),
                 "messages": messages,
             });
             if let Some(t) = req.temperature {
@@ -225,10 +361,16 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
                     });
                 }
                 (Level::Tool, Some((name, s))) => {
+                    // Claude Opus 5.5, Sonnet 5.5 and Fable 5.1 answer a forced tool
+                    // choice with a 400, so the model may call the strict tool, and an
+                    // answer in text is read and validated like any other
                     body["tools"] = json!([{
-                        "name": name, "description": "Give the answer.", "input_schema": s,
+                        "name": name,
+                        "description": "Give the answer.",
+                        "input_schema": anthropic_schema(s),
+                        "strict": true,
                     }]);
-                    body["tool_choice"] = json!({ "type": "tool", "name": name });
+                    body["tool_choice"] = json!({ "type": "auto" });
                 }
                 _ => {}
             }
@@ -239,10 +381,12 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
     }
 }
 
-/// The usage a response body reports, read apart from its content so that an answer
-/// whose content is refused or malformed still settles what it used.
-pub fn usage_of(kind: Kind, body: &[u8]) -> Option<super::admission::Usage> {
-    let v: Value = serde_json::from_slice(body).ok()?;
+/// The usage a response body reports, and whether it reported every member a
+/// settlement needs. An Anthropic answer reports its cache writes apart from its
+/// uncached input, split by TTL. A write the answer does not split is taken at `ttl`,
+/// the TTL of every breakpoint of the request, and a split that does not add up, or a
+/// write without a known TTL, is taken at the dearer 1-hour rate.
+fn read_usage(kind: Kind, v: &Value, ttl: Option<CacheTtl>) -> (Usage, bool) {
     let (i, o) = match kind {
         Kind::Ollama => (&v["prompt_eval_count"], &v["eval_count"]),
         Kind::Openai => (
@@ -250,19 +394,51 @@ pub fn usage_of(kind: Kind, body: &[u8]) -> Option<super::admission::Usage> {
             &v["usage"]["completion_tokens"],
         ),
         Kind::Anthropic => (&v["usage"]["input_tokens"], &v["usage"]["output_tokens"]),
-        Kind::Local => return None,
+        Kind::Local => return (Usage::default(), false),
     };
-    Some(super::admission::Usage {
-        input: i.as_u64()?,
-        output: o.as_u64()?,
-    })
+    let complete = i.as_u64().is_some() && o.as_u64().is_some();
+    let mut u = Usage {
+        input: i.as_u64().unwrap_or(0),
+        output: o.as_u64().unwrap_or(0),
+        ..Default::default()
+    };
+    if kind == Kind::Anthropic {
+        let r = &v["usage"];
+        let written = r["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let split = &r["cache_creation"];
+        let (five, hour) = (
+            split["ephemeral_5m_input_tokens"].as_u64(),
+            split["ephemeral_1h_input_tokens"].as_u64(),
+        );
+        (u.cache_write_5m, u.cache_write_1h) = match (five, hour) {
+            (None, None) if ttl == Some(CacheTtl::FiveMinutes) => (written, 0),
+            (None, None) => (0, written),
+            (a, b) if a.unwrap_or(0) + b.unwrap_or(0) == written => {
+                (a.unwrap_or(0), b.unwrap_or(0))
+            }
+            (a, b) => (0, written.max(a.unwrap_or(0) + b.unwrap_or(0))),
+        };
+        u.cache_read = r["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    }
+    (u, complete)
+}
+
+/// The usage a response body reports, read apart from its content so that an answer
+/// whose content is refused or malformed still settles what it used. `ttl` is the TTL
+/// of the request's breakpoints ([`cache_ttl`]).
+pub fn usage_of(kind: Kind, body: &[u8], ttl: Option<CacheTtl>) -> Option<Usage> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    match read_usage(kind, &v, ttl) {
+        (u, true) => Some(u),
+        _ => None,
+    }
 }
 
 /// The answer of a successful (`2xx`) response.
-pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
+pub fn parse(kind: Kind, body: &[u8], ttl: Option<CacheTtl>) -> Result<ChatResponse, CallError> {
     let v: Value = serde_json::from_slice(body)
         .map_err(|_| CallError::Invalid("the provider's answer is not JSON".into()))?;
-    let n = |x: &Value| x.as_u64().unwrap_or(0);
+    let usage = read_usage(kind, &v, ttl).0;
     match kind {
         Kind::Ollama => {
             let text = v["message"]["content"]
@@ -271,8 +447,7 @@ pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
             Ok(ChatResponse {
                 text: text.to_string(),
                 tool_input: None,
-                input_tokens: n(&v["prompt_eval_count"]),
-                output_tokens: n(&v["eval_count"]),
+                usage,
                 stop: v["done_reason"].as_str().map(str::to_string),
                 latency: Duration::ZERO,
             })
@@ -304,8 +479,7 @@ pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
             Ok(ChatResponse {
                 text: msg["content"].as_str().unwrap_or("").to_string(),
                 tool_input,
-                input_tokens: n(&v["usage"]["prompt_tokens"]),
-                output_tokens: n(&v["usage"]["completion_tokens"]),
+                usage,
                 stop: finish,
                 latency: Duration::ZERO,
             })
@@ -332,8 +506,7 @@ pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
             Ok(ChatResponse {
                 text,
                 tool_input,
-                input_tokens: n(&v["usage"]["input_tokens"]),
-                output_tokens: n(&v["usage"]["output_tokens"]),
+                usage,
                 stop,
                 latency: Duration::ZERO,
             })
@@ -483,6 +656,7 @@ pub fn send_admitted(
     admission: Option<&dyn super::admission::Admission>,
 ) -> Result<ChatResponse, CallError> {
     let (url, body) = build(p, req);
+    let ttl = cache_ttl(p, req);
     let hs = headers(p, t.key.as_deref());
     let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let bytes = body_bytes(&body);
@@ -520,6 +694,7 @@ pub fn send_admitted(
                     url: &url,
                     body: &body,
                     bytes: &bytes,
+                    cache_ttl: ttl,
                     provider_count: if has_counter { Some(&counter) } else { None },
                 })
                 .map_err(|e| match e {
@@ -558,11 +733,11 @@ pub fn send_admitted(
             };
         // the usage settles the reservation whatever the content holds
         if let Some(tk) = ticket {
-            tk.settle(usage_of(p.kind, &posted.body));
+            tk.settle(usage_of(p.kind, &posted.body, ttl));
         }
         let status = posted.status.as_u16();
         if (200..300).contains(&status) {
-            let mut r = parse(p.kind, &posted.body).map_err(|e| match e {
+            let mut r = parse(p.kind, &posted.body, ttl).map_err(|e| match e {
                 CallError::Invalid(m) => CallError::Invalid(format!("provider {name}: {m}")),
                 e => e,
             })?;
@@ -803,7 +978,7 @@ mod tests {
     fn req(level: Level) -> ChatRequest {
         ChatRequest {
             model: "m".into(),
-            system: "sys".into(),
+            system: vec![Part::cached("sys")],
             messages: vec![Message::user("q")],
             schema: Some(("Draft".into(), json!({"type": "object"}))),
             level,
@@ -836,9 +1011,12 @@ mod tests {
         let (u, b) = build(&provider(Kind::Anthropic), &req(Level::JsonSchema));
         assert_eq!(u, "http://h/v1/v1/messages");
         assert_eq!(b["output_config"]["format"]["type"], "json_schema");
-        assert_eq!(b["system"], "sys");
+        assert_eq!(
+            b["system"],
+            json!([{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }])
+        );
         let (_, b) = build(&provider(Kind::Anthropic), &req(Level::Tool));
-        assert_eq!(b["tool_choice"]["type"], "tool");
+        assert_eq!(b["tool_choice"], json!({ "type": "auto" }));
         assert_eq!(
             headers(&provider(Kind::Anthropic), Some("k"))[1].0,
             "anthropic-version"
@@ -850,55 +1028,352 @@ mod tests {
         let r = parse(
             Kind::Ollama,
             br#"{"message":{"content":"{}"},"prompt_eval_count":3,"eval_count":4}"#,
+            None,
         )
         .unwrap();
         assert_eq!(
-            (r.text.as_str(), r.input_tokens, r.output_tokens),
+            (r.text.as_str(), r.usage.input, r.usage.output),
             ("{}", 3, 4)
         );
         let r = parse(
             Kind::Openai,
             br#"{"choices":[{"message":{"content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            None,
         )
         .unwrap();
         assert_eq!(r.text, "x");
         assert!(matches!(
             parse(
                 Kind::Openai,
-                br#"{"choices":[{"message":{"content":null,"refusal":"no"}}]}"#
+                br#"{"choices":[{"message":{"content":null,"refusal":"no"}}]}"#,
+                None,
             ),
             Err(CallError::Refusal(_))
         ));
         assert!(matches!(
             parse(
                 Kind::Openai,
-                br#"{"choices":[{"message":{"content":""},"finish_reason":"content_filter"}]}"#
+                br#"{"choices":[{"message":{"content":""},"finish_reason":"content_filter"}]}"#,
+                None,
             ),
             Err(CallError::Refusal(_))
         ));
         let r = parse(
             Kind::Openai,
             br#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"D","arguments":"{\"a\":1}"}}]}}]}"#,
+            None,
         )
         .unwrap();
         assert_eq!(r.tool_input, Some(json!({"a": 1})));
         let r = parse(
             Kind::Anthropic,
             br#"{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":6}}"#,
+            None,
         )
         .unwrap();
-        assert_eq!((r.text.as_str(), r.input_tokens), ("hi", 5));
+        assert_eq!((r.text.as_str(), r.usage.input), ("hi", 5));
         assert!(matches!(
             parse(
                 Kind::Anthropic,
-                br#"{"content":[],"stop_reason":"refusal"}"#
+                br#"{"content":[],"stop_reason":"refusal"}"#,
+                None,
             ),
             Err(CallError::Refusal(_))
         ));
         assert!(matches!(
-            parse(Kind::Anthropic, b"<html>"),
+            parse(Kind::Anthropic, b"<html>", None),
             Err(CallError::Invalid(_))
         ));
+    }
+
+    fn anthropic(extra: Value) -> ProviderConfig {
+        let mut v = json!({ "kind": "anthropic", "endpoint": "http://h/" });
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            o.extend(e.clone());
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// A request whose user message has a dataset part, a question part and a tail.
+    fn layered(question: &str) -> ChatRequest {
+        let mut r = req(Level::JsonSchema);
+        r.messages = vec![Message::user_parts(vec![
+            Part::cached("Context:\n<data>\nstable vocabulary\n"),
+            Part::cached(format!(
+                "question context\n</data>\n\nQuestion: {question}\n"
+            )),
+            Part::text("\nThe format."),
+        ])];
+        r
+    }
+
+    /// The breakpoints of a body, as the paths of the blocks that carry them.
+    fn breakpoints(body: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in body["system"].as_array().into_iter().flatten().enumerate() {
+            if !b["cache_control"].is_null() {
+                out.push(format!("system.{i}"));
+            }
+        }
+        for (m, msg) in body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (i, b) in msg["content"].as_array().into_iter().flatten().enumerate() {
+                if !b["cache_control"].is_null() {
+                    out.push(format!("messages.{m}.{i}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// The text of a system or content member, a string or text blocks.
+    fn text_of(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect(),
+            _ => String::new(),
+        }
+    }
+
+    /// Prompt caching marks the end of each stable prefix and leaves the text as it was:
+    /// the blocks join to the text the other kinds send in one string.
+    #[test]
+    fn anthropic_bodies_mark_the_cached_prefixes() {
+        let r = layered("Who leads payments?");
+        let (_, b) = build(&anthropic(json!({})), &r);
+        assert_eq!(
+            breakpoints(&b),
+            ["system.0", "messages.0.0", "messages.0.1"]
+        );
+        let content = &b["messages"][0]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 3);
+        assert!(content[2]["cache_control"].is_null());
+        assert_eq!(content[0]["cache_control"], json!({ "type": "ephemeral" }));
+        let (_, o) = build(&provider(Kind::Openai), &r);
+        assert_eq!(
+            text_of(content),
+            o["messages"][1]["content"].as_str().unwrap()
+        );
+        assert_eq!(
+            text_of(&b["system"]),
+            o["messages"][0]["content"].as_str().unwrap()
+        );
+        // the other kinds never see a mark
+        for kind in [Kind::Openai, Kind::Ollama] {
+            let (_, o) = build(&provider(kind), &r);
+            assert!(
+                !String::from_utf8(body_bytes(&o))
+                    .unwrap()
+                    .contains("cache_control")
+            );
+        }
+    }
+
+    /// Two questions on the same dataset share every byte of the body up to the end of
+    /// the dataset's part, the second breakpoint.
+    #[test]
+    fn two_questions_share_the_prefix_to_the_dataset_breakpoint() {
+        let p = anthropic(json!({}));
+        let prefix = |q: &str| {
+            let (_, mut b) = build(&p, &layered(q));
+            // the cacheable prefix in render order: the system, then the first block
+            let content = b["messages"][0]["content"].as_array().unwrap()[0].clone();
+            b["messages"][0]["content"] = json!([content]);
+            body_bytes(&json!({ "system": b["system"], "messages": b["messages"],
+                "output_config": b["output_config"], "model": b["model"] }))
+        };
+        assert_eq!(
+            prefix("Who leads payments?"),
+            prefix("How many teams are there?")
+        );
+        let (_, a) = build(&p, &layered("Who leads payments?"));
+        let (_, c) = build(&p, &layered("How many teams are there?"));
+        assert_ne!(
+            a["messages"][0]["content"][1],
+            c["messages"][0]["content"][1]
+        );
+    }
+
+    /// `promptCaching.enabled: false` sends the body of a provider without caching, and
+    /// `ttl: "1h"` puts the 1-hour TTL on every breakpoint.
+    #[test]
+    fn the_off_switch_and_the_hour_ttl() {
+        let r = layered("q");
+        let (_, off) = build(
+            &anthropic(json!({ "promptCaching": { "enabled": false } })),
+            &r,
+        );
+        assert_eq!(off["system"], "sys");
+        assert_eq!(
+            off["messages"][0]["content"],
+            text_of(&build(&anthropic(json!({})), &r).1["messages"][0]["content"]).as_str()
+        );
+        assert!(
+            !String::from_utf8(body_bytes(&off))
+                .unwrap()
+                .contains("cache_control")
+        );
+        assert_eq!(
+            cache_ttl(
+                &anthropic(json!({ "promptCaching": { "enabled": false } })),
+                &r
+            ),
+            None
+        );
+        let p = anthropic(json!({ "promptCaching": { "ttl": "1h" } }));
+        let (_, hour) = build(&p, &r);
+        assert_eq!(breakpoints(&hour).len(), 3);
+        for b in [&hour["system"][0], &hour["messages"][0]["content"][0]] {
+            assert_eq!(
+                b["cache_control"],
+                json!({ "type": "ephemeral", "ttl": "1h" })
+            );
+        }
+        assert_eq!(cache_ttl(&p, &r), Some(CacheTtl::OneHour));
+        // a request that marks nothing is sent as without caching
+        let mut plain = r.clone();
+        plain.system = vec![Part::text("sys")];
+        plain.messages = vec![Message::user("q")];
+        let (_, b) = build(&anthropic(json!({})), &plain);
+        assert_eq!(
+            (b["system"].clone(), b["messages"][0]["content"].clone()),
+            (json!("sys"), json!("q"))
+        );
+        assert_eq!(cache_ttl(&anthropic(json!({})), &plain), None);
+    }
+
+    /// A request may carry at most four breakpoints. The earliest marks are dropped,
+    /// their text kept, and a mark on an empty run is dropped too.
+    #[test]
+    fn at_most_four_breakpoints() {
+        let mut r = req(Level::JsonSchema);
+        r.system = vec![Part::cached("a"), Part::cached("b")];
+        r.messages = vec![
+            Message::user_parts(vec![Part::cached("c"), Part::cached("d")]),
+            Message::assistant("e"),
+            Message::user_parts(vec![Part::cached("f"), Part::text("g")]),
+        ];
+        let (_, b) = build(&anthropic(json!({})), &r);
+        assert_eq!(
+            breakpoints(&b),
+            ["system.0", "messages.0.0", "messages.0.1", "messages.2.0"]
+        );
+        // the dropped mark's text is kept in the block of the next kept mark
+        assert_eq!(b["system"][0]["text"], "ab");
+        assert_eq!(b["messages"][1]["content"], "e");
+        assert_eq!(text_of(&b["messages"][2]["content"]), "fg");
+        let n = String::from_utf8(body_bytes(&b))
+            .unwrap()
+            .matches("cache_control")
+            .count();
+        assert_eq!(n, MAX_BREAKPOINTS);
+        r.system = vec![Part::cached(""), Part::text("a")];
+        r.messages = vec![Message::user("q")];
+        let (_, b) = build(&anthropic(json!({})), &r);
+        assert_eq!(b["system"], json!([{ "type": "text", "text": "a" }]));
+        // a mark on an empty part ends the text before it
+        r.system = vec![Part::text("a"), Part::cached("")];
+        let (_, b) = build(&anthropic(json!({})), &r);
+        assert_eq!(breakpoints(&b), ["system.0"]);
+    }
+
+    /// The tool level lets the model choose the strict tool, because current models
+    /// refuse a forced tool choice, and sends the schema without the bounds the strict
+    /// grammar refuses.
+    #[test]
+    fn anthropic_tool_level_is_not_forced() {
+        let mut r = req(Level::Tool);
+        r.schema = Some((
+            "Draft".into(),
+            json!({ "type": "object", "properties": { "q": { "type": "string", "maxLength": 9 } },
+                    "required": ["q"], "additionalProperties": false }),
+        ));
+        let (_, b) = build(&anthropic(json!({})), &r);
+        assert_eq!(b["tool_choice"], json!({ "type": "auto" }));
+        assert_eq!(b["tools"][0]["strict"], true);
+        assert_eq!(
+            b["tools"][0]["input_schema"]["properties"]["q"],
+            json!({ "type": "string" })
+        );
+        let (_, c) = count_request(&anthropic(json!({})), &r).unwrap();
+        assert_eq!(c["tool_choice"], json!({ "type": "auto" }));
+        // the OpenAI protocol keeps its forced function call
+        let (_, o) = build(&provider(Kind::Openai), &r);
+        assert_eq!(o["tool_choice"]["function"]["name"], "Draft");
+    }
+
+    /// Anthropic reports cache writes, by TTL, and cache reads apart from the uncached
+    /// input. An unsplit write is taken at the request's TTL, and a split that does not
+    /// add up, or a write without a known TTL, at the 1-hour rate.
+    #[test]
+    fn anthropic_usage_reads_the_cache_classes() {
+        let body =
+            |u: Value| json!({ "content": [], "stop_reason": "end_turn", "usage": u }).to_string();
+        let split = body(json!({ "input_tokens": 7, "output_tokens": 3,
+            "cache_creation_input_tokens": 30, "cache_read_input_tokens": 500,
+            "cache_creation": { "ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 10 } }));
+        let u = usage_of(
+            Kind::Anthropic,
+            split.as_bytes(),
+            Some(CacheTtl::FiveMinutes),
+        )
+        .unwrap();
+        assert_eq!(
+            u,
+            Usage {
+                input: 7,
+                output: 3,
+                cache_write_5m: 20,
+                cache_write_1h: 10,
+                cache_read: 500
+            }
+        );
+        assert_eq!(
+            parse(Kind::Anthropic, split.as_bytes(), None)
+                .unwrap()
+                .usage,
+            u
+        );
+        let unsplit = body(json!({ "input_tokens": 1, "output_tokens": 1,
+            "cache_creation_input_tokens": 40 }));
+        let at = |ttl| usage_of(Kind::Anthropic, unsplit.as_bytes(), ttl).unwrap();
+        assert_eq!(
+            (
+                at(Some(CacheTtl::FiveMinutes)).cache_write_5m,
+                at(Some(CacheTtl::FiveMinutes)).cache_write_1h
+            ),
+            (40, 0)
+        );
+        assert_eq!(
+            (
+                at(Some(CacheTtl::OneHour)).cache_write_5m,
+                at(Some(CacheTtl::OneHour)).cache_write_1h
+            ),
+            (0, 40)
+        );
+        assert_eq!(at(None).cache_write_1h, 40);
+        let wrong = body(json!({ "input_tokens": 1, "output_tokens": 1,
+            "cache_creation_input_tokens": 40, "cache_creation": { "ephemeral_5m_input_tokens": 50 } }));
+        let u = usage_of(
+            Kind::Anthropic,
+            wrong.as_bytes(),
+            Some(CacheTtl::FiveMinutes),
+        )
+        .unwrap();
+        assert_eq!((u.cache_write_5m, u.cache_write_1h), (0, 50));
+        // the usage is unknown without input or output
+        assert_eq!(
+            usage_of(
+                Kind::Anthropic,
+                body(json!({ "input_tokens": 1 })).as_bytes(),
+                None
+            ),
+            None
+        );
     }
 
     #[test]
