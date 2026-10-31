@@ -807,11 +807,11 @@ fn lint_turtle(text: &str, trig: bool, out: &mut Out<'_>) -> Result<(), LintErro
     match crate::turtle::parse::parse(text, tokens, trig) {
         Ok(tree) => {
             let c = Cst::new(&tree);
-            let (sites, declared) = embedded::turtle_sites(&c);
+            let (sites, declared, sources) = embedded::turtle_sites(&c);
             // a prefix that only a query uses is used
             prefixes::run(&c, out, &embedded::labels(&sites));
             terms::run(&c, out)?;
-            embedded::turtle(sites, &declared, text, trig, &undeclared, out)?;
+            embedded::turtle(sites, &declared, &sources, text, trig, &undeclared, out)?;
         }
         Err(e) => out.syntax(&e),
     }

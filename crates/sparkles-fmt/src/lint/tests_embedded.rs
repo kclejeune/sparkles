@@ -382,10 +382,10 @@ fn each_holder_has_its_own_prefixes_and_parameters() {
     let unbound: Vec<_> = d.iter().filter(|d| d.rule == "unbound-variable").collect();
     assert_eq!(unbound.len(), 1, "{d:?}");
     assert!(unbound[0].start > doc.find("<urn:v2>").unwrap(), "{d:?}");
-    // blank nodes and named graphs keep their holders apart as well
+    // named graphs keep their holders apart: the same subject in two graphs
+    let q2 = "SELECT $this { $this p:p ?o FILTER(?o) }";
     let doc = format!(
-        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n<urn:g1> {{ [ sh:prefixes <urn:decl> ; sh:select \"{q2}\" ] . <urn:decl> sh:declare [ sh:prefix \"p\" ; sh:namespace \"http://p/\" ] . }}\n<urn:g2> {{ [ sh:prefixes <urn:decl> ; sh:select \"{q2}\" ] . }}\n",
-        q2 = "SELECT $this { $this p:p ?o FILTER(?o) }"
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n<urn:g1> {{ <urn:s> sh:prefixes <urn:decl> ; sh:select \"{q2}\" . <urn:decl> sh:declare [ sh:prefix \"p\" ; sh:namespace \"http://p/\" ] . }}\n<urn:g2> {{ <urn:s> sh:prefixes <urn:decl> ; sh:select \"{q2}\" . }}\n"
     );
     let d = diags(&doc, Language::TriG);
     let undefined: Vec<_> = d.iter().filter(|d| d.rule == "undefined-prefix").collect();
@@ -393,9 +393,50 @@ fn each_holder_has_its_own_prefixes_and_parameters() {
     assert!(undefined[0].start > doc.find("<urn:g2>").unwrap(), "{d:?}");
 }
 
+/// The findings of `rule` in `doc`, as the text before each one.
+fn starts(doc: &str, lang: Language, rule: &str) -> Vec<usize> {
+    diags(doc, lang)
+        .into_iter()
+        .filter(|d| d.rule == rule)
+        .map(|d| d.start)
+        .collect()
+}
+
 #[test]
-fn json_ld_holders_have_their_own_prefixes() {
+fn anonymous_holders_are_linted_only_when_unambiguous() {
     let q = "SELECT $this { $this p:p ?o FILTER(?o) }";
+    let decl = "<urn:decl> sh:declare [ sh:prefix \"p\" ; sh:namespace \"http://p/\" ] .\n";
+    // the same text in two blank nodes of one object list: skipped, never a false error
+    let doc = ttl(&format!(
+        "<urn:a> sh:property [ sh:select \"{q}\" ], [ sh:prefixes <urn:decl> ; sh:select \"{q}\" ] .\n{decl}"
+    ));
+    assert_eq!(
+        starts(&doc, Language::Turtle, "undefined-prefix"),
+        Vec::<usize>::new()
+    );
+    // distinct texts are each linted with their own holder's prefixes
+    let q1 = "SELECT $this { $this p:p ?o FILTER(?o) }";
+    let q2 = "SELECT $this { $this p:q ?o FILTER(?o) }";
+    let doc = ttl(&format!(
+        "<urn:a> sh:property [ sh:prefixes <urn:decl> ; sh:select \"{q1}\" ], [ sh:select \"{q2}\" ] .\n{decl}"
+    ));
+    let found = starts(&doc, Language::Turtle, "undefined-prefix");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0] > doc.find(q2).unwrap(), "{found:?}");
+    // a text that another string of the document repeats is skipped as well
+    let doc = ttl(&format!(
+        "[ sh:select \"{q2}\" ] .\n<urn:x> <http://www.w3.org/2000/01/rdf-schema#comment> \"{q2}\" .\n"
+    ));
+    assert_eq!(
+        starts(&doc, Language::Turtle, "undefined-prefix"),
+        Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn json_ld_holders_come_from_the_expansion() {
+    let q = "SELECT $this { $this p:p ?o FILTER(?o) }";
+    // the same text on three nodes: the holder is not certain, so nothing is reported
     let doc = format!(
         r#"{{"@context": {{"sh": "http://www.w3.org/ns/shacl#"}}, "@graph": [
       {{"@id": "http://e/Decl", "sh:declare": {{"sh:prefix": "p", "sh:namespace": "http://p/"}}}},
@@ -403,11 +444,27 @@ fn json_ld_holders_have_their_own_prefixes() {
       {{"@id": "http://e/B", "sh:select": "{q}"}},
       {{"sh:select": "{q}"}}]}}"#
     );
-    let d = diags(&doc, Language::JsonLd);
-    let undefined: Vec<_> = d.iter().filter(|d| d.rule == "undefined-prefix").collect();
-    assert_eq!(undefined.len(), 2, "{d:?}");
-    assert!(
-        undefined[0].start > doc.find("http://e/B").unwrap(),
-        "{d:?}"
+    assert_eq!(
+        starts(&doc, Language::JsonLd, "undefined-prefix"),
+        Vec::<usize>::new()
+    );
+    // a node's @graph before its own query: each query keeps its own holder
+    let inner = "SELECT $this { $this p:p ?o FILTER(?o) }";
+    let outer = "SELECT $this { $this p:q ?o FILTER(?o) }";
+    let doc = format!(
+        r#"{{"@context": {{"sh": "http://www.w3.org/ns/shacl#"}}, "@id": "http://e/Outer",
+      "@graph": [{{"@id": "http://e/Inner", "sh:select": "{inner}"}}],
+      "sh:prefixes": {{"@id": "http://e/Decl"}}, "sh:select": "{outer}",
+      "@included": [{{"@id": "http://e/Decl", "sh:declare": {{"sh:prefix": "p", "sh:namespace": "http://p/"}}}}]}}"#
+    );
+    let found = starts(&doc, Language::JsonLd, "undefined-prefix");
+    assert_eq!(found.len(), 1, "{found:?}");
+    let at = doc.find(inner).unwrap();
+    assert!(found[0] > at && found[0] < at + inner.len(), "{found:?}");
+    // and with the same text in both, neither gets a finding that is not its own
+    let doc = doc.replace(outer, inner);
+    assert_eq!(
+        starts(&doc, Language::JsonLd, "undefined-prefix"),
+        Vec::<usize>::new()
     );
 }

@@ -6,9 +6,13 @@
 //! A query sees the prefixes that `sh:prefixes` and `sh:declare` give it, including those
 //! of the `owl:imports` closure of the nodes `sh:prefixes` names, and the prefixes of the
 //! document itself. They are written in front of the query as `PREFIX` lines, and
-//! everything found there is dropped again. Each literal is matched to the quad it makes,
-//! so the prefixes and parameters are those of the node that holds it, in its graph, even
-//! when another node holds the same text. A document prefix that a query writes counts as
+//! everything found there is dropped again. The prefixes and parameters are those of the
+//! node that holds the literal, in its graph. The holder must be certain: in Turtle and
+//! TriG, a statement whose subject the source names, confirmed by a quad of the parse; in
+//! JSON-LD, and for a blank node property list, the one node that the parse gives the
+//! literal, when one string of the document has its text. An ambiguous literal is skipped,
+//! so the cost of not knowing is a missed finding and never a finding about another node's
+//! query. A document prefix that a query writes counts as
 //! used, so `unused-prefix` does not remove it. SHACL binds `$this`, `$shapesGraph`,
 //! `$currentShape`, `$value` and `$PATH` before it runs a query, and a constraint
 //! component's validators also see its parameters by their local names, so the variable
@@ -53,6 +57,8 @@ pub(super) struct Site {
     pub long: bool,
     /// the quote character of a long string
     pub quote: char,
+    /// the node that holds the literal, in its graph, when the source names it
+    pub holder: Option<Node>,
 }
 
 /// The value of a string literal and, for each byte of it, where its source is.
@@ -65,6 +71,13 @@ pub(super) struct Decoded {
     ends: Vec<usize>,
     /// the source holds no escape, so the value is the source text
     pub plain: bool,
+}
+
+impl Decoded {
+    /// Where the content of the string starts in the document.
+    pub fn start(&self) -> usize {
+        self.ends[0]
+    }
 }
 
 struct Builder {
@@ -199,10 +212,24 @@ pub(super) fn decode_json(token: &str, at: usize) -> Decoded {
 
 // ---------------------------------------------------------------------- Turtle ------
 
-/// The query literals of a Turtle or TriG document, and the prefixes it declares.
-pub(super) fn turtle_sites(c: &Cst<'_, '_>) -> (Vec<Site>, Vec<(String, String)>) {
+/// The prefixes a document declares, as labels and namespaces.
+pub(super) type Prefixes = Vec<(String, String)>;
+
+/// The query literals of a Turtle or TriG document, the prefixes it declares, and how
+/// many string literals of the document have each value.
+pub(super) fn turtle_sites(c: &Cst<'_, '_>) -> (Vec<Site>, Prefixes, HashMap<String, usize>) {
     let mut sites = Vec::new();
     let mut prefixes = Vec::new();
+    let mut sources: HashMap<String, usize> = HashMap::new();
+    for i in 0..c.tree.tokens.len() {
+        let t = crate::tree::TokenId(i as u32);
+        if c.token_kind(t).is_string() {
+            let (s, _) = c.span(t);
+            *sources
+                .entry(decode_turtle(c.text(t), s).0.value)
+                .or_default() += 1;
+        }
+    }
     for n in c.nodes() {
         match c.kind(n) {
             NodeKind::PrefixDecl => {
@@ -239,13 +266,66 @@ pub(super) fn turtle_sites(c: &Cst<'_, '_>) -> (Vec<Site>, Vec<(String, String)>
                         text,
                         long,
                         quote,
+                        holder: turtle_holder(c, n),
                     });
                 }
             }
             _ => {}
         }
     }
-    (sites, prefixes)
+    (sites, prefixes, sources)
+}
+
+/// The subject and graph of a property list entry, when the source names both: a
+/// statement whose subject is an absolute IRI, a prefixed name or a blank node label, in
+/// the default graph or in a graph block with such a label. A blank node property list,
+/// a reified triple or an annotation has no name in the source.
+fn turtle_holder(c: &Cst<'_, '_>, entry: crate::tree::NodeId) -> Option<Node> {
+    let stmt = c.tree.parent(entry)?;
+    if c.kind(stmt) != NodeKind::TriplesStmt {
+        return None;
+    }
+    let subject = match *c.tree.children(stmt).first()? {
+        Element::Token(t) => turtle_node(c, t)?,
+        Element::Node(_) => return None,
+    };
+    let graph = match c.tree.parent(stmt) {
+        Some(b) if c.kind(b) == NodeKind::GraphBlock => {
+            // `GRAPH label {`, `label {` or `{`
+            let label = c.tree.children(b).iter().find_map(|e| match *e {
+                Element::Token(t) => match c.token_kind(t) {
+                    TokenKind::LBrace => Some(None),
+                    TokenKind::IriRef
+                    | TokenKind::PnameLn
+                    | TokenKind::PnameNs
+                    | TokenKind::BlankNodeLabel => Some(Some(t)),
+                    _ => None,
+                },
+                Element::Node(_) => Some(None),
+            })?;
+            match label {
+                Some(t) => GraphName::from(turtle_node(c, t)?),
+                None => GraphName::DefaultGraph,
+            }
+        }
+        _ => GraphName::DefaultGraph,
+    };
+    Some((graph, subject))
+}
+
+/// The node an IRI, prefixed name or blank node label token names, when it is absolute.
+fn turtle_node(c: &Cst<'_, '_>, t: crate::tree::TokenId) -> Option<NamedOrBlankNode> {
+    match c.token_kind(t) {
+        TokenKind::BlankNodeLabel => oxrdf::BlankNode::new(&c.text(t)[2..])
+            .ok()
+            .map(NamedOrBlankNode::from),
+        TokenKind::IriRef | TokenKind::PnameLn | TokenKind::PnameNs => {
+            oxrdf::NamedNode::new(c.iri(t)?)
+                .ok()
+                .map(NamedOrBlankNode::from)
+        }
+        _ => None,
+    }
 }
 
 /// The prefix labels the queries of `sites` write, so that the document's declarations
@@ -266,20 +346,21 @@ pub(super) fn labels(sites: &[Site]) -> std::collections::HashSet<String> {
 }
 
 /// Lint the queries of a Turtle or TriG document.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn turtle(
     sites: Vec<Site>,
     prefixes: &[(String, String)],
+    sources: &HashMap<String, usize>,
     text: &str,
     trig: bool,
     undeclared: &[String],
     out: &mut Out<'_>,
 ) -> Result<(), LintError> {
-    run(
-        sites,
-        prefixes,
-        || super::turtle_quads(text, trig, undeclared).ok(),
-        out,
-    )
+    if sites.is_empty() {
+        return Ok(());
+    }
+    let quads = super::turtle_quads(text, trig, undeclared).ok();
+    run(sites, prefixes, quads.as_deref(), sources, out)
 }
 
 /// The string token of an object that is a plain string: one without a language tag, or
@@ -307,14 +388,13 @@ fn plain_string(c: &Cst<'_, '_>, obj: crate::tree::NodeId) -> Option<crate::tree
 // ----------------------------------------------------------------------- facts ------
 
 /// A node in its graph.
-type Node = (GraphName, NamedOrBlankNode);
+pub(super) type Node = (GraphName, NamedOrBlankNode);
 
 /// What the document says about the nodes that hold queries.
 pub(super) struct Facts {
     by_subject: HashMap<Node, Vec<(String, Term)>>,
     parents: HashMap<Node, Vec<NamedOrBlankNode>>,
-    /// the holders of each query property and query text, in the order of the quads,
-    /// which is the order of the literals in the document
+    /// the holders of each query property and query text, each once
     holders: HashMap<(String, String), Vec<Node>>,
 }
 
@@ -333,10 +413,10 @@ fn node(t: &Term) -> Option<NamedOrBlankNode> {
     }
 }
 
-/// The value of a literal without a language tag.
-fn plain(t: &Term) -> Option<&str> {
+/// The value of an `xsd:string` literal, the only literals that are queries.
+pub(super) fn query_text(t: &Term) -> Option<&str> {
     match t {
-        Term::Literal(l) if l.language().is_none() => Some(l.value()),
+        Term::Literal(l) if l.datatype() == oxrdf::vocab::xsd::STRING => Some(l.value()),
         _ => None,
     }
 }
@@ -362,31 +442,23 @@ impl Facts {
                     .push(q.subject.clone());
             }
             if is_query_predicate(p)
-                && let Some(v) = plain(&q.object)
+                && let Some(v) = query_text(&q.object)
             {
-                f.holders
-                    .entry((p.to_string(), v.to_string()))
-                    .or_default()
-                    .push((g, q.subject.clone()));
+                let holders = f.holders.entry((p.to_string(), v.to_string())).or_default();
+                let h = (g, q.subject.clone());
+                if !holders.contains(&h) {
+                    holders.push(h);
+                }
             }
         }
         f
     }
 
-    /// The holders of the `nth` site with this predicate and query text, of `count`
-    /// such sites. The literals and the quads come in the same order, so the `nth` quad
-    /// is the site's. When the counts differ, which a construct the sites do not see could
-    /// cause, every holder of the text is taken.
-    fn holders(&self, predicate: &str, query: &str, nth: usize, count: usize) -> &[Node] {
-        let all = self
-            .holders
+    /// The holders of `predicate` with the query text `query`.
+    pub fn holders_of(&self, predicate: &str, query: &str) -> &[Node] {
+        self.holders
             .get(&(predicate.to_string(), query.to_string()))
-            .map_or(&[][..], Vec::as_slice);
-        if all.len() == count {
-            &all[nth..=nth]
-        } else {
-            all
-        }
+            .map_or(&[][..], Vec::as_slice)
     }
 
     /// The objects of `subject`'s `predicate` in `graph`.
@@ -493,38 +565,39 @@ fn writable(label: &str, ns: &str) -> bool {
 }
 
 /// Lint the query of each site as SPARQL and report the findings in the document.
-/// `document_prefixes` are the prefixes the document declares itself, and `quads` reads
-/// the document's triples for the `sh:prefixes` and `sh:declare` of the queries.
+/// `document_prefixes` are the prefixes the document declares itself, and `quads` are the
+/// document's quads, which give each query its holder and the `sh:prefixes` and
+/// `sh:declare` it sees. A site is linted only when its holder is certain: the holder the
+/// source names, confirmed by a quad, or else the one holder of its property and text
+/// when `sources` counts a single string literal with that text in the document. Any
+/// other site is skipped, so an ambiguous literal costs a finding and never gets one
+/// that is not its own.
 pub(super) fn run(
     sites: Vec<Site>,
     document_prefixes: &[(String, String)],
-    quads: impl FnOnce() -> Option<Vec<Quad>>,
+    quads: Option<&[Quad]>,
+    sources: &HashMap<String, usize>,
     out: &mut Out<'_>,
 ) -> Result<(), LintError> {
-    if sites.is_empty() {
+    let Some(quads) = quads.filter(|_| !sites.is_empty()) else {
         return Ok(());
-    }
-    let facts = quads().map(|q| Facts::new(&q));
-    // each site's place among the sites with its property and text
-    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
-    let nth: Vec<usize> = sites
-        .iter()
-        .map(|s| {
-            let n = counts
-                .entry((s.predicate.as_str(), s.text.value.as_str()))
-                .or_default();
-            *n += 1;
-            *n - 1
-        })
-        .collect();
-    for (site, &nth) in sites.iter().zip(&nth) {
+    };
+    let facts = Facts::new(quads);
+    for site in &sites {
         out.deadline()?;
         let query = site.text.value.as_str();
-        let count = counts[&(site.predicate.as_str(), query)];
-        let info = facts
-            .as_ref()
-            .map(|f| f.info(f.holders(&site.predicate, query, nth, count)))
-            .unwrap_or_default();
+        let holders = facts.holders_of(&site.predicate, query);
+        let holder = match &site.holder {
+            Some(h) => holders.contains(h).then(|| h.clone()),
+            None => match holders {
+                [h] if sources.get(query) == Some(&1) => Some(h.clone()),
+                _ => None,
+            },
+        };
+        let Some(holder) = holder else {
+            continue;
+        };
+        let info = facts.info(std::slice::from_ref(&holder));
         let mut prelude = String::new();
         for (label, ns) in document_prefixes.iter().chain(&info.prefixes) {
             if writable(label, ns) {

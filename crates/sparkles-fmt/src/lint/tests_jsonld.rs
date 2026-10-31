@@ -443,3 +443,61 @@ fn query_eligibility_follows_the_expanded_literal() {
         assert_eq!(queries(&doc), Vec::<String>::new(), "{ty}");
     }
 }
+
+#[test]
+fn json_ld_edits_are_checked_by_expansion() {
+    // an @nest alias scopes a context that makes `data` a JSON literal: the value object
+    // inside is data, and no edit may land in it
+    let doc = r#"{"@context": {"n": {"@id": "@nest", "@context": {"data": {"@id": "http://x/data", "@type": "@json"}}}}, "@id": "urn:s", "n": {"data": {"@value": "abc", "@type": "http://www.w3.org/2001/XMLSchema#string"}}}"#;
+    let payload = doc.find(r#"{"@value""#).unwrap();
+    for d in diags(doc) {
+        if let Some(f) = &d.fix {
+            assert!(
+                f.edits.iter().all(|e| e.end <= payload),
+                "{d:?} edits the JSON literal"
+            );
+        }
+    }
+    let f = fix(doc, Language::JsonLd, &LintOptions::default()).unwrap();
+    assert_eq!(f.text, doc);
+    // an ordinary fix still gets through
+    let doc = r#"{"@id": "urn:s", "http://x/p": {"@value": "a", "@type": "http://www.w3.org/2001/XMLSchema#string"}}"#;
+    assert!(
+        diags(doc)
+            .iter()
+            .any(|d| d.rule == "redundant-datatype" && d.fix.is_some())
+    );
+}
+
+#[test]
+fn queries_follow_scoped_value_contexts() {
+    // a type-scoped context turns the default language off: the query is a plain string
+    let doc = format!(
+        r#"{{"@context": {{"sh": "http://www.w3.org/ns/shacl#", "@language": "en", "S": {{"@id": "http://x/S", "@context": {{"@language": null}}}}}}, "@id": "urn:s", "@type": "S", "sh:select": "{BAD_QUERY}"}}"#
+    );
+    assert_eq!(queries(&doc), strs(&["unbound-variable@?bad"]));
+    // a property-scoped alias of @value
+    let doc = format!(
+        r#"{{"@context": {{"sh": "http://www.w3.org/ns/shacl#", "q": {{"@id": "sh:select", "@context": {{"v": "@value"}}}}}}, "@id": "urn:s", "q": {{"v": "{BAD_QUERY}"}}}}"#
+    );
+    assert_eq!(queries(&doc), strs(&["unbound-variable@?bad"]));
+}
+
+#[test]
+fn a_redefined_term_does_not_keep_its_old_iri() {
+    let doc = r#"{"@context": [{"select": "http://www.w3.org/ns/shacl#select"}, {"@vocab": "urn:other:", "select": {}}], "@id": "urn:s", "select": "not a query"}"#;
+    assert!(
+        diags(doc).iter().all(|d| d.rule != "syntax"),
+        "{:?}",
+        found(doc)
+    );
+}
+
+#[test]
+fn json_ld_without_an_expansion_has_no_query_findings() {
+    // a context by URL cannot be expanded here: the query is skipped, not guessed at
+    let doc = format!(
+        r#"{{"@context": ["https://example.org/context.jsonld", {{"sh": "http://www.w3.org/ns/shacl#"}}], "@id": "urn:s", "sh:select": "{BAD_QUERY}"}}"#
+    );
+    assert_eq!(queries(&doc), Vec::<String>::new());
+}

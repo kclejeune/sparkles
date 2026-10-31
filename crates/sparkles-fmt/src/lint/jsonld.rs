@@ -15,6 +15,11 @@
 //! container and of a value object are data, not properties. A JSON literal, the value of
 //! a term typed `@json` or of a value object whose type is `@json`, is not read at all, so
 //! nothing in it counts as a context, a term or a use of one.
+//!
+//! The model is only a guide. Which values are SHACL queries, and which node holds each, is
+//! read from oxjsonld's expansion of the document, and every fix is kept only when the
+//! document with that one edit expands to the same dataset. A document that cannot be
+//! expanded here, because it names a context by URL, gets neither queries nor fixes.
 
 use super::{Cst, Edit, Fix, LintError, Out, embedded, terms};
 use crate::lex::TokenKind;
@@ -39,13 +44,12 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     };
     let c = Cst::new(&tree);
     let root = build(&c, c.tree.root());
+    let before = out.found.len();
     let mut walk = Walk {
         out,
-        sites: Vec::new(),
         json: HashSet::new(),
     };
     walk.value(&root, &Ctx::default());
-    let sites = std::mem::take(&mut walk.sites);
     // the values of JSON literals are data: no term is defined or used in them
     let mut scan = Scan {
         json: std::mem::take(&mut walk.json),
@@ -53,9 +57,118 @@ pub(super) fn run(text: &str, out: &mut Out<'_>) -> Result<(), LintError> {
     };
     scan.value(&root);
     out.deadline()?;
-    embedded::run(sites, &scan.prefixes(), || super::jsonld_quads(text), out)?;
+    // the real expansion decides which values are queries and who holds them
+    let quads = super::jsonld_quads(text);
+    out.deadline()?;
+    if let Some(quads) = &quads {
+        let mut strings: HashMap<&str, Vec<&Str>> = HashMap::new();
+        value_strings(&root, &mut strings);
+        let sources: HashMap<String, usize> = strings
+            .iter()
+            .map(|(v, s)| ((*v).to_string(), s.len()))
+            .collect();
+        let sites = query_sites(quads, &strings, text);
+        embedded::run(sites, &scan.prefixes(), Some(quads), &sources, out)?;
+    }
     context_rules(&scan, out);
+    gate_fixes(
+        text,
+        quads.as_deref(),
+        &mut out.found[before..],
+        out.opts.deadline,
+    )
+}
+
+/// The most fixes [`gate_fixes`] checks one by one. The fixes of a document with more
+/// findings are dropped, and the findings stay.
+const GATED_FIXES: usize = 256;
+
+/// Keep a fix of a JSON-LD finding only when the document with that one edit applied
+/// expands to a dataset isomorphic to the document's own, within the deadline. The rules
+/// read JSON-LD with a model of its contexts, and this check is what makes their edits
+/// safe however the model is wrong: an edit inside a JSON literal, through a context the
+/// model missed, changes the dataset and is dropped. A document that cannot be expanded
+/// here gets no fixes.
+fn gate_fixes(
+    text: &str,
+    quads: Option<&[oxrdf::Quad]>,
+    found: &mut [super::Diagnostic],
+    deadline: Option<std::time::Instant>,
+) -> Result<(), LintError> {
+    let fixable = found.iter().filter(|d| d.fix.is_some()).count();
+    for d in found.iter_mut().filter(|d| d.fix.is_some()) {
+        let keep = match quads {
+            Some(before) if fixable <= GATED_FIXES => {
+                crate::check::deadline(deadline).map_err(|_| LintError::Timeout)?;
+                let mut edits = d.fix.as_ref().expect("a fix").edits.clone();
+                edits.sort_by_key(|e| e.start);
+                let after = super::jsonld_quads(&super::apply(text, &edits));
+                match after {
+                    Some(after) => {
+                        match crate::check::graph::isomorphic_bounded(before, &after, deadline) {
+                            Ok(same) => same == Some(true),
+                            Err(_) => return Err(LintError::Timeout),
+                        }
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        if !keep {
+            d.fix = None;
+        }
+    }
     Ok(())
+}
+
+/// Every string of the document that is a value, not a key, by its value.
+fn value_strings<'v>(v: &'v Val, out: &mut HashMap<&'v str, Vec<&'v Str>>) {
+    match v {
+        Val::Str(s) => out.entry(s.value.as_str()).or_default().push(s),
+        Val::Arr(items) => items.iter().for_each(|i| value_strings(i, out)),
+        Val::Obj(o) => o.members.iter().for_each(|m| value_strings(&m.value, out)),
+        Val::Null | Val::Other => {}
+    }
+}
+
+/// The SHACL queries of the expanded document that map back to the source without doubt:
+/// an `xsd:string` object of a query property whose text is written by exactly one string
+/// of the document and held by exactly one node. Each becomes a site with that holder.
+/// Any other query is skipped.
+fn query_sites(
+    quads: &[oxrdf::Quad],
+    strings: &HashMap<&str, Vec<&Str>>,
+    text: &str,
+) -> Vec<embedded::Site> {
+    let facts = embedded::Facts::new(quads);
+    let mut seen = HashSet::new();
+    let mut sites = Vec::new();
+    for q in quads {
+        let p = q.predicate.as_str();
+        let Some(v) = embedded::is_query_predicate(p)
+            .then(|| embedded::query_text(&q.object))
+            .flatten()
+        else {
+            continue;
+        };
+        if !seen.insert((p, v)) {
+            continue;
+        }
+        let ([holder], Some([s])) = (facts.holders_of(p, v), strings.get(v).map(Vec::as_slice))
+        else {
+            continue;
+        };
+        sites.push(embedded::Site {
+            predicate: p.to_string(),
+            text: embedded::decode_json(&text[s.start..s.end], s.start),
+            long: false,
+            quote: '"',
+            holder: Some(holder.clone()),
+        });
+    }
+    sites.sort_by_key(|s| s.text.start());
+    sites
 }
 
 // ----------------------------------------------------------------------- model ------
@@ -235,8 +348,6 @@ struct Ctx<'a> {
     vocab: bool,
     /// the IRI of the `@vocab`, when it can be told
     vocab_iri: Option<String>,
-    /// the default language of plain strings
-    language: Option<String>,
     /// a context given by URL (or `@import`) may define anything
     remote: bool,
     /// some context has been applied
@@ -251,12 +362,8 @@ struct Term<'a> {
     coerce: Option<String>,
     /// its container is a language, index, id or type map
     map: bool,
-    /// its container is a list
-    list: bool,
     /// its values are JSON literals
     json: bool,
-    /// its own `@language`: `Some(None)` for `null`, which turns the default off
-    language: Option<Option<String>>,
     /// the keyword the term is an alias of
     keyword: Option<String>,
     /// the context of its definition
@@ -301,8 +408,6 @@ fn apply<'a>(ctx: &mut Ctx<'a>, v: &'a Val) {
                         ctx.vocab = false;
                         ctx.vocab_iri = None;
                     }
-                    ("@language", Val::Str(l)) => ctx.language = Some(l.value.clone()),
-                    ("@language", _) => ctx.language = None,
                     ("@import", _) => ctx.remote = true,
                     _ => {}
                 }
@@ -334,15 +439,17 @@ fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>)
                 _ => None,
             };
             if let Some(k) = string("@id").filter(|k| KEYWORDS.contains(k)) {
+                // an alias of `@nest` may scope a context over what it nests
                 return Term {
                     keyword: Some(k.to_string()),
+                    scoped: o.get("@context").map(|m| &m.value),
                     ..Term::default()
                 };
             }
             let iri = match (o.get("@id"), string("@id")) {
                 (_, Some(id)) => expand(id, raw, ctx, 0, true),
                 (Some(_), None) => None,
-                (None, None) => expand(key, raw, ctx, 0, true),
+                (None, None) => implicit_iri(key, raw, ctx),
             };
             let coerce = string("@type").and_then(|t| {
                 if t.starts_with('@') {
@@ -351,11 +458,7 @@ fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>)
                     expand(t, raw, ctx, 0, true)
                 }
             });
-            let language = match o.get("@language").map(|m| &m.value) {
-                Some(Val::Str(l)) => Some(Some(l.value.clone())),
-                Some(Val::Null) => Some(None),
-                _ => None,
-            };
+
             let containers: Vec<&str> = match o.get("@container").map(|m| &m.value) {
                 Some(Val::Str(s)) => vec![s.value.as_str()],
                 Some(Val::Arr(a)) => a
@@ -372,9 +475,7 @@ fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>)
                 map: containers
                     .iter()
                     .any(|c| matches!(*c, "@language" | "@index" | "@id" | "@type")),
-                list: containers.contains(&"@list"),
                 json: coerce.as_deref() == Some("@json"),
-                language,
                 keyword: None,
                 coerce,
                 scoped: o.get("@context").map(|m| &m.value),
@@ -382,6 +483,16 @@ fn define<'a>(key: &str, def: &'a Val, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>)
         }
         _ => Term::default(),
     }
+}
+
+/// The IRI of a term defined without `@id`: a compact IRI or absolute IRI as written, or
+/// the key relative to the vocabulary. An earlier definition of the same term does not
+/// count, because this definition replaces it.
+fn implicit_iri(key: &str, raw: &HashMap<&str, &Val>, ctx: &Ctx<'_>) -> Option<String> {
+    if key.contains(':') {
+        return expand(key, raw, ctx, 0, false);
+    }
+    ctx.vocab_iri.as_ref().map(|v| format!("{v}{key}"))
 }
 
 /// The keywords of JSON-LD 1.1 that a term can be an alias of.
@@ -492,8 +603,6 @@ impl Ctx<'_> {
 
 struct Walk<'o, 'c> {
     out: &'o mut Out<'c>,
-    /// the strings that hold SHACL queries
-    sites: Vec<embedded::Site>,
     /// the spans of the members whose values are JSON literals
     json: HashSet<(usize, usize)>,
 }
@@ -543,7 +652,15 @@ impl<'a> Walk<'_, '_> {
                 .filter(|kw| *kw == "@type")
                 .or_else(|| keys.keyword(k));
             if let Some(kw) = kw {
-                self.keyword(kw, &m.value, &here);
+                // an alias's scoped context applies to what it nests
+                match keys.terms.get(k).and_then(|t| t.scoped) {
+                    Some(scoped) => {
+                        let mut c = (*here).clone();
+                        apply(&mut c, scoped);
+                        self.keyword(kw, &m.value, &c);
+                    }
+                    None => self.keyword(kw, &m.value, &here),
+                }
                 continue;
             }
             let term = keys.terms.get(k);
@@ -562,69 +679,7 @@ impl<'a> Walk<'_, '_> {
                 self.json.insert((m.start, m.end));
                 continue;
             }
-            let iri = match term {
-                Some(t) => t.iri.clone(),
-                None => keys.expand_vocab(k),
-            };
-            if let Some(iri) = iri.filter(|i| embedded::is_query_predicate(i))
-                && !term.is_some_and(|t| t.map || t.list)
-            {
-                self.queries(&iri, &m.value, term, &here);
-            }
             self.property(term, &m.value, &here);
-        }
-    }
-
-    /// The values among `v` (a string, a value object or an array of them) that expand
-    /// to plain strings, `xsd:string` literals, are queries. A string under a term that
-    /// coerces it to an IRI or another datatype is not, nor is one with a language,
-    /// its term's or the context's default.
-    fn queries(&mut self, predicate: &str, v: &Val, term: Option<&Term<'_>>, ctx: &Ctx<'_>) {
-        let xsd_string = format!("{}string", terms::XSD);
-        let string = match v {
-            Val::Arr(items) => {
-                items
-                    .iter()
-                    .for_each(|i| self.queries(predicate, i, term, ctx));
-                None
-            }
-            Val::Str(s) => {
-                let plain = match term.and_then(|t| t.coerce.as_deref()) {
-                    None | Some("@none") => term
-                        .and_then(|t| t.language.clone())
-                        .unwrap_or_else(|| ctx.language.clone())
-                        .is_none(),
-                    Some(dt) => dt == xsd_string,
-                };
-                plain.then_some(s)
-            }
-            Val::Obj(o)
-                if ctx.find(o, "@language").is_none() && ctx.find(o, "@direction").is_none() =>
-            {
-                let plain = match ctx.find(o, "@type").map(|m| &m.value) {
-                    None => true,
-                    Some(Val::Str(t)) => {
-                        ctx.expand_vocab(&t.value).as_deref() == Some(xsd_string.as_str())
-                    }
-                    Some(_) => false,
-                };
-                match ctx.find(o, "@value") {
-                    Some(Member {
-                        value: Val::Str(s), ..
-                    }) if plain => Some(s),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        if let Some(s) = string {
-            let text = embedded::decode_json(&self.out.text[s.start..s.end], s.start);
-            self.sites.push(embedded::Site {
-                predicate: predicate.to_string(),
-                text,
-                long: false,
-                quote: '"',
-            });
         }
     }
 
