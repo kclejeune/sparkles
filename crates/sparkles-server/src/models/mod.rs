@@ -878,11 +878,13 @@ impl Models {
                     Err(errors) => {
                         last = Some(StepError::InvalidOutput(errors.clone()));
                         if attempt == 0 {
-                            // a tool answer has no text, and Anthropic refuses an
-                            // empty assistant message, so the retry shows its input
-                            let said = match (&resp.tool_input, resp.text.trim().is_empty()) {
-                                (Some(v), true) => v.to_string(),
-                                _ => resp.text.clone(),
+                            // the retry shows the answer that was validated: a tool
+                            // answer's input, after any text the model wrote first,
+                            // since Anthropic refuses an empty assistant message
+                            let said = match &resp.tool_input {
+                                Some(v) if resp.text.trim().is_empty() => v.to_string(),
+                                Some(v) => format!("{}\n{v}", resp.text.trim_end()),
+                                None => resp.text.clone(),
                             };
                             messages.push(Message::assistant(said));
                             messages.push(structured::retry_message(&errors));

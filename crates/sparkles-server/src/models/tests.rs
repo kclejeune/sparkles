@@ -467,49 +467,60 @@ fn the_provider_budget_rounds_each_step_once() {
 /// since Anthropic refuses an empty assistant message.
 #[test]
 fn a_tool_answer_is_replayed_in_its_retry() {
-    let mock = MockModel::start(|_, n| {
-        let q = if n == 0 {
-            "SELECT * WHERE { ?s ?p ?o }"
+    for preamble in ["", "Here is the query."] {
+        let mock = MockModel::start(move |_, n| {
+            let q = if n == 0 {
+                "SELECT * WHERE { ?s ?p ?o }"
+            } else {
+                "ASK {}"
+            };
+            let mut content = vec![
+                json!({ "type": "tool_use", "id": "t", "name": "Draft", "input": { "query": q } }),
+            ];
+            if !preamble.is_empty() {
+                content.insert(0, json!({ "type": "text", "text": preamble }));
+            }
+            (
+                200,
+                json!({
+                    "content": content,
+                    "stop_reason": "tool_use", "usage": { "input_tokens": 10, "output_tokens": 5 }
+                }),
+            )
+        });
+        let m = models(
+            json!({ "a": { "kind": "anthropic", "endpoint": mock.url(), "structuredOutput": "tool" } }),
+            &[],
+        );
+        let mut out = draft_schema();
+        out.schema["properties"]["query"]["maxLength"] = json!(10);
+        let a = m
+            .call(
+                Some(Role::Draft),
+                &Pair::new("a", "m1"),
+                "system text",
+                "user text",
+                &out,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(a.value, json!({ "query": "ASK {}" }));
+        let r = mock.requests();
+        assert_eq!(r[0].body["tool_choice"], json!({ "type": "auto" }));
+        assert_eq!(
+            r[0].body["tools"][0]["input_schema"]["properties"]["query"],
+            json!({ "type": "string" })
+        );
+        let said = &r[1].body["messages"][1];
+        assert_eq!(said["role"], "assistant");
+        let input = r#"{"query":"SELECT * WHERE { ?s ?p ?o }"}"#;
+        let expected = if preamble.is_empty() {
+            input.to_string()
         } else {
-            "ASK {}"
+            format!("{preamble}\n{input}")
         };
-        (
-            200,
-            json!({
-                "content": [{ "type": "tool_use", "id": "t", "name": "Draft", "input": { "query": q } }],
-                "stop_reason": "tool_use", "usage": { "input_tokens": 10, "output_tokens": 5 }
-            }),
-        )
-    });
-    let m = models(
-        json!({ "a": { "kind": "anthropic", "endpoint": mock.url(), "structuredOutput": "tool" } }),
-        &[],
-    );
-    let mut out = draft_schema();
-    out.schema["properties"]["query"]["maxLength"] = json!(10);
-    let a = m
-        .call(
-            Some(Role::Draft),
-            &Pair::new("a", "m1"),
-            "system text",
-            "user text",
-            &out,
-            Instant::now() + Duration::from_secs(10),
-        )
-        .unwrap();
-    assert_eq!(a.value, json!({ "query": "ASK {}" }));
-    let r = mock.requests();
-    assert_eq!(r[0].body["tool_choice"], json!({ "type": "auto" }));
-    assert_eq!(
-        r[0].body["tools"][0]["input_schema"]["properties"]["query"],
-        json!({ "type": "string" })
-    );
-    let said = &r[1].body["messages"][1];
-    assert_eq!(said["role"], "assistant");
-    assert_eq!(
-        said["content"],
-        r#"{"query":"SELECT * WHERE { ?s ?p ?o }"}"#
-    );
+        assert_eq!(said["content"], expected.as_str());
+    }
 }
 
 #[test]
