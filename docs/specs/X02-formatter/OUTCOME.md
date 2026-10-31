@@ -122,6 +122,15 @@ shared document model.
 * **Reference parse.** `sparkles_shaclc::parse` is the authority for syntax errors and for
   the shapes graph. The formatter's tree follows the reader's decisions, such as the
   `|` after a path continuing the path only before an IRI, a prefixed name, `(` or `^`.
+* **Bounded graph check.** The reader returns its triples in the order it made them, so
+  the input and the output number their blank nodes alike and the comparison takes the
+  fast path of the RDF check. When the order differs, a graph of at most eight blank
+  nodes is canonicalized exactly. A larger one is compared by colour refinement, which
+  takes polynomial time. Canonicalization of many symmetric blank nodes is factorial
+  and does not look at the deadline, which made a 211-byte input of two property shapes
+  with nine identical constraints each take 33 seconds. Refinement is weaker than an
+  isomorphism test, and the formatter's reordering does not produce the graphs where
+  the two differ.
 * **Layout.** Directives stay in the order written, and `BASE`, `PREFIX` and `IMPORTS`
   are written in upper case. One blank line separates shapes, and a shape's header stays
   on one line. A nested body is a block, and each property takes one line indented by
@@ -143,8 +152,8 @@ shared document model.
   can stay on one line, and a constraint that follows a comment starts on a new line.
   The idempotence check found both rules.
 * **Detection.** The extensions `.shaclc` and `.shc` name SHACLC, and `.shc` was skipped
-  in walks before. Sniffing recognises a first word of `shape` or `shapeClass`, or an
-  `IMPORTS` directive in the prologue. The media type is `text/shaclc`.
+  in walks before. Sniffing recognises a first word of `shape` or `shapeClass`, and a document of
+  directives alone with an `IMPORTS` among them. The media type is `text/shaclc`.
 * **Surfaces.** `sparkles fmt` by extension and `--language shaclc`, `POST /$/format` with
   `language: "shaclc"` or the media type `text/shaclc`, the MCP `format` tool, `sparkles lsp` with the
   language id `shaclc`, `sparkles-fmt-wasm`, and the shapes editor, whose Format button

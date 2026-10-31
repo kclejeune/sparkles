@@ -9053,7 +9053,8 @@ curl -s localhost:3030/'$/format' -H 'Content-Type: application/json' \
 
 Without `language`, the text decides. Its first significant token after comments and a
 `PREFIX`/`BASE`/`VERSION`/`IMPORTS` prologue sets the language. For example, `SELECT` or `INSERT`
-means SPARQL, and `shape` or `shapeClass` means SHACLC. N-Triples is also valid Turtle, so it needs `language` or its media type.
+means SPARQL, and `shape` or `shapeClass` means SHACLC. A document of directives alone is SHACLC
+when an `IMPORTS` is among them. N-Triples is also valid Turtle, so it needs `language` or its media type.
 The cursor stays next to the same token. A byte order mark is dropped.
 
 **Raw body.** This is the form to use with curl. The body is the document, and its media
