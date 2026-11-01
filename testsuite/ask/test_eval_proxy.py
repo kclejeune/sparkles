@@ -862,6 +862,57 @@ class Cap(Base):
         self.assertEqual(proxy.ledger.case_costs(), {("c1", HAIKU): 2 * HAIKU_COST})
 
 
+class ConcurrentCases(Base):
+    def test_a_case_hold_keeps_other_cases_from_its_share(self):
+        ledger = self.ledger(cap=1000)
+        self.assertTrue(ledger.hold("a", 600))
+        self.assertFalse(ledger.hold("b", 500))  # 600 held and 500 more pass 1000
+        self.assertTrue(ledger.hold("b", 400))
+        # b may not spend into what a still holds, though the cap has room.
+        with self.assertRaises(px.CapExceeded):
+            ledger.reserve(HAIKU, 401, "b")
+        ident = ledger.reserve(HAIKU, 400, "b")
+        ledger.settle(ident, 400, "ok")
+        # a spends within its own hold.
+        ident = ledger.reserve(HAIKU, 600, "a")
+        ledger.settle(ident, 100, "ok")
+        ledger.release("a")
+        ledger.release("b")
+        self.assertTrue(ledger.hold("c", 500))
+        self.assertLessEqual(ledger.spent(), 1000)
+        with self.assertRaises(Invalid):
+            ledger.hold("c", 1)
+
+    def test_case_tokens_route_requests_and_replies_flush_in_order(self):
+        proxy = self.proxy(Upstream(), replies=self.root / "replies.jsonl")
+        proxy.ordered_replies = True
+        ta, tb = proxy.open_case("a"), proxy.open_case("b")
+        self.assertEqual(proxy.case_for(ta), "a")
+        self.assertEqual(proxy.case_for(proxy.token), None)
+        self.assertIs(proxy.case_for("unknown"), False)
+        proxy.handle(raw(text="b1"), "b")
+        proxy.handle(raw(text="a1"), "a")
+        proxy.handle(raw(text="a2"), "a")
+        self.assertFalse((self.root / "replies.jsonl").exists())
+        proxy.flush_replies("a")
+        proxy.flush_replies("b")
+        texts = [
+            json.loads(x)["request"]["messages"][0]["content"]
+            for x in (self.root / "replies.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(texts, ["a1", "a2", "b1"])
+        self.assertEqual(proxy.case_cost("a"), 2 * HAIKU_COST)
+        self.assertTrue(proxy.wait_idle(1, case="a"))
+        proxy.close_case(ta)
+        self.assertIs(proxy.case_for(ta), False)
+
+    def test_a_refusal_counts_for_its_own_case(self):
+        proxy = self.proxy(Upstream(), ledger=self.ledger(cap=1))
+        status, _, _ = proxy.handle(raw(), "a")
+        self.assertEqual(status, 402)
+        self.assertEqual((proxy.refusals_for("a"), proxy.refusals_for("b")), (1, 0))
+
+
 class Preflight(Base):
     def test_every_model_is_tried_with_the_runs_request_shape(self):
         upstream = Upstream()

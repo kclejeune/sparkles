@@ -283,6 +283,10 @@ class Ledger:
         # Every settled request by id, with its case, model, bound, status and charge.
         self.charges = {}
         self.reconciled = {}  # target -> its reconcile line
+        # Projected costs held for cases in flight, by case. They are not charges and
+        # are never written. They keep one case's requests from spending what another
+        # case in flight needs, so concurrent cases cannot pass the cap together.
+        self.holds = {}
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise Invalid("absolute ledger path required")
         if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > HARD_CAP:
@@ -429,9 +433,40 @@ class Ledger:
             + sum(r["bound"] for r in self.reserved.values())
         )
 
+    def case_spent(self, case):
+        """Settled and reserved nanodollars of one case. The caller holds the mutex."""
+        settled = sum(c["cost"] for c in self.charges.values() if c["case"] == case)
+        return settled + sum(
+            r["bound"] for r in self.reserved.values() if r.get("case") == case
+        )
+
+    def outstanding(self, but=None):
+        """What the holds of the cases in flight still cover beyond what they spent.
+        The caller holds the mutex."""
+        return sum(
+            max(0, amount - self.case_spent(case))
+            for case, amount in self.holds.items()
+            if case != but
+        )
+
+    def hold(self, case, amount):
+        """Hold `amount` for a case about to start, or return False when it does not
+        fit beside what is spent and what the other cases in flight hold."""
+        with self.mutex:
+            if case in self.holds:
+                raise Invalid("case already held")
+            if self.spent() + self.outstanding() + amount > self.cap:
+                return False
+            self.holds[case] = amount
+            return True
+
+    def release(self, case):
+        with self.mutex:
+            self.holds.pop(case, None)
+
     def reserve(self, model, request_bound, case=None):
         with self.mutex:
-            if self.spent() + request_bound > self.cap:
+            if self.spent() + self.outstanding(but=case) + request_bound > self.cap:
                 raise CapExceeded("cost cap")
             ident = self.next_id
             line = {
@@ -744,6 +779,11 @@ class Proxy:
         self.effort, self.timeout = effort, timeout
         self.token = secrets.token_urlsafe(32)
         self.case = None
+        # One gate token per concurrent case, so each request names its case.
+        self.case_tokens = {}
+        self.case_in_flight, self.case_refusals = {}, {}
+        # With ordered replies, each case's reply lines wait until flush_replies().
+        self.ordered_replies, self.held_replies = False, {}
         self.cap_refusals = 0
         self.last_headers = []
         self.request_bytes = []
@@ -755,14 +795,50 @@ class Proxy:
     def set_case(self, case):
         self.case = case
 
-    def wait_idle(self, timeout=None):
-        """Wait until no request is in flight. A child killed on a timeout can leave
-        one behind, and its cost belongs to the case that sent it."""
+    def open_case(self, case):
+        """A gate token for one case that runs beside others."""
+        token = secrets.token_urlsafe(32)
+        with self.mutex:
+            self.case_tokens[token] = case
+        return token
+
+    def close_case(self, token):
+        with self.mutex:
+            self.case_tokens.pop(token, None)
+
+    def case_for(self, token):
+        """The case a gate token names, or False for an unknown token."""
+        if hmac.compare_digest(token.encode(), self.token.encode()):
+            return self.case
+        with self.mutex:
+            for known, case in self.case_tokens.items():
+                if hmac.compare_digest(token.encode(), known.encode()):
+                    return case
+        return False
+
+    def refusals_for(self, case):
+        with self.mutex:
+            return self.case_refusals.get(case, 0)
+
+    def wait_idle(self, timeout=None, case=None):
+        """Wait until no request is in flight, or none of `case`. A child killed on a
+        timeout can leave one behind, and its cost belongs to the case that sent it."""
         with self.idle:
             return self.idle.wait_for(
-                lambda: self.in_flight == 0,
+                lambda: (
+                    self.in_flight == 0
+                    if case is None
+                    else self.case_in_flight.get(case, 0) == 0
+                ),
                 self.timeout + 5 if timeout is None else timeout,
             )
+
+    def flush_replies(self, case):
+        """Append a case's held reply lines, in the order its requests were sent."""
+        with self.mutex:
+            lines = self.held_replies.pop(case, [])
+        for _, text in sorted(lines):
+            self.append_reply(text)
 
     def case_cost(self, case):
         """Nanodollars settled so far for one case, over every model it called."""
@@ -817,18 +893,23 @@ class Proxy:
             config.setdefault("effort", self.effort)
         return body
 
-    def handle(self, raw):
+    def handle(self, raw, case=None):
         """Forward one request. Return (status, headers, body) for the child."""
+        case = self.case if case is None else case
         with self.mutex:
             self.in_flight += 1
+            if case is not None:
+                self.case_in_flight[case] = self.case_in_flight.get(case, 0) + 1
         try:
-            return self.handle_one(raw)
+            return self.handle_one(raw, case)
         finally:
             with self.idle:
                 self.in_flight -= 1
+                if case is not None:
+                    self.case_in_flight[case] -= 1
                 self.idle.notify_all()
 
-    def handle_one(self, raw):
+    def handle_one(self, raw, case=None):
         try:
             body = self.prepare(raw)
         except Refused as refusal:
@@ -837,14 +918,15 @@ class Proxy:
         payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
         limit = bound(model, len(payload), body["max_tokens"], cache_ttl(body))
         try:
-            ident = self.ledger.reserve(model, limit, self.case)
+            ident = self.ledger.reserve(model, limit, case)
         except CapExceeded:
             with self.mutex:
                 self.cap_refusals += 1
+                self.case_refusals[case] = self.case_refusals.get(case, 0) + 1
             return 402, [], error_body("evaluation_budget", "the cost cap is reached")
         with self.mutex:
             self.request_bytes.append(len(payload))
-        return self.forward(ident, model, limit, payload, self.case)
+        return self.forward(ident, model, limit, payload, case)
 
     def forward(self, ident, model, limit, payload, case=None):
         try:
@@ -920,6 +1002,16 @@ class Proxy:
                 "reply": reply,
             }
             text = json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
+            if self.ordered_replies and case is not None:
+                with self.mutex:
+                    self.held_replies.setdefault(case, []).append((ident, text))
+                return
+            self.append_reply(text)
+        except Exception:  # noqa: BLE001, S110 -- a diagnosis record never fails a request
+            pass
+
+    def append_reply(self, text):
+        try:
             with self.mutex:
                 fd = os.open(
                     self.replies,
@@ -963,9 +1055,8 @@ class Proxy:
                 self.connection.settimeout(proxy.timeout + 30)
                 token = self.headers.get("x-api-key", "")
                 length = self.headers.get("Content-Length", "")
-                if self.path != "/v1/messages" or not hmac.compare_digest(
-                    token.encode(), proxy.token.encode()
-                ):
+                case = proxy.case_for(token) if token.isascii() else False
+                if self.path != "/v1/messages" or case is False:
                     return self.reply(
                         401, [], error_body("authentication_error", "bad route")
                     )
@@ -982,7 +1073,7 @@ class Proxy:
                     return self.reply(
                         400, [], error_body("invalid_request_error", "short body")
                     )
-                self.reply(*proxy.handle(raw))
+                self.reply(*proxy.handle(raw, case))
 
             def do_GET(self):
                 self.reply(405, [], error_body("invalid_request_error", "method"))

@@ -104,17 +104,21 @@ def percentile(values, share):
 def admission(ledger, run):
     """Admit a model's block only when its projected cost fits what the cap leaves."""
 
-    def admit(pair, questions):
+    def unit(pair):
         model = pair.split("/", 1)[1]
         seen = [v for (_, m), v in ledger.case_costs().items() if m == model]
-        unit = (
+        return (
             percentile(seen, 0.9)
             if len(seen) >= 5
             else run["priorCaseCostNanodollars"][model]
         )
-        projected = len(questions) * unit * run["projectionMargin"]
+
+    def admit(pair, questions):
+        projected = len(questions) * unit(pair) * run["projectionMargin"]
         return ledger.spent() + projected <= ledger.cap
 
+    # What a concurrent case holds of the cap before it starts.
+    admit.case_bound = lambda pair: math.ceil(unit(pair) * run["projectionMargin"])
     return admit
 
 
@@ -188,6 +192,16 @@ def main():
         metavar="TARGET",
         help="replace a held charge, 'carryover' or a request id, with the billed amount",
     )
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="cases asked at once; each holds its projected cost before it starts",
+    )
+    ap.add_argument(
+        "--child-memory-max",
+        help="each child's own memory limit under --jobs, 4G by default there",
+    )
     ap.add_argument("--billed-nanodollars", type=int)
     ap.add_argument("--evidence", help="where the billed amount comes from")
     ap.add_argument(
@@ -251,6 +265,7 @@ def main():
         "askTokenBudget": run["askTokenBudget"],
         "clarifications": run.get("clarifications", "answer"),
         "contextTokens": run.get("contextTokens"),
+        "jobs": args.jobs,
         "sets": {},
     }
     code = 2
@@ -300,6 +315,10 @@ def main():
             if set_.get("loc"):
                 argv += ["--loc", set_["loc"]]
             argv += ["--clarifications", run.get("clarifications", "answer")]
+            argv += ["--jobs", str(args.jobs)]
+            memory = args.child_memory_max or ("4G" if args.jobs > 1 else None)
+            if memory:
+                argv += ["--child-memory-max", memory]
             for model in set_["models"]:
                 argv += ["--pair", "evaluation/" + model]
             ev = mod.parse_args(argv)

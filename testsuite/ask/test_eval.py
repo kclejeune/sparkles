@@ -1350,3 +1350,132 @@ class RecordShapes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParallelCases(unittest.TestCase):
+    """run_parallel with stand-ins for the runner and the proxy."""
+
+    def setup(self, holds=None, fail=None):
+        import threading
+
+        lock = threading.Lock()
+        state = {"now": 0, "most": 0, "held": 0}
+
+        class Ledger:
+            def hold(self, case, amount):
+                with lock:
+                    if holds is not None and state["held"] >= holds:
+                        return False
+                    state["held"] += 1
+                    return True
+
+            def release(self, case):
+                pass
+
+        class Proxy:
+            ledger = Ledger()
+            ordered_replies = False
+            flushed = []
+
+            def open_case(self, case):
+                return "token-" + case
+
+            def close_case(self, token):
+                pass
+
+            def flush_replies(self, case):
+                self.flushed.append(case)
+
+            def wait_idle(self, timeout=None, case=None):
+                return True
+
+            def case_cost(self, case):
+                return 1
+
+        class Runner:
+            tl = threading.local()
+
+            def check(self):
+                pass
+
+            def enter_case(self, case, token):
+                self.tl.case = case
+
+            @property
+            def last_record(self):
+                return getattr(self.tl, "record", None)
+
+            @last_record.setter
+            def last_record(self, value):
+                self.tl.record = value
+
+            def ask(self, pair, q):
+                with lock:
+                    state["now"] += 1
+                    state["most"] = max(state["most"], state["now"])
+                time.sleep(0.05 * (5 - int(q["id"][1:]) % 5))  # later cases end first
+                with lock:
+                    state["now"] -= 1
+                self.last_record = {"pid": 1}
+                if q["id"] == fail:
+                    raise eval_ask.Invalid("child execution incomplete")
+                return {"outcome": "answered"}
+
+        report = {
+            "executed": 0,
+            "attempted": 0,
+            "attemptedCases": [],
+            "budgetStopped": False,
+            "unattemptedIds": {},
+        }
+        return Runner(), Proxy(), report, state
+
+    def test_cases_finish_in_question_order_with_jobs_at_once(self):
+        runner, proxy, report, state = self.setup()
+        qs = [{"id": f"q{i}"} for i in range(10)]
+        seen = []
+        bound = lambda pair: 5  # noqa: E731
+        admit = lambda pair, qs: True  # noqa: E731
+        admit.case_bound = bound
+        eval_ask.run_parallel(
+            runner, proxy, "p", qs, 3, admit, report,
+            lambda q, case, answer: seen.append(q["id"]) and False,
+        )
+        self.assertEqual(seen, [q["id"] for q in qs])
+        self.assertEqual(proxy.flushed, [eval_ask.case_of("p", q) for q in qs])
+        self.assertEqual(state["most"], 3)
+        self.assertEqual((report["attempted"], report["executed"]), (10, 10))
+
+    def test_a_hold_that_does_not_fit_stops_the_run(self):
+        runner, proxy, report, _ = self.setup(holds=4)
+        qs = [{"id": f"q{i}"} for i in range(10)]
+        admit = lambda pair, qs: True  # noqa: E731
+        admit.case_bound = lambda pair: 5
+        seen = []
+        eval_ask.run_parallel(
+            runner, proxy, "p", qs, 3, admit, report,
+            lambda q, case, answer: seen.append(q["id"]) and False,
+        )
+        self.assertEqual(seen, ["q0", "q1", "q2", "q3"])
+        self.assertTrue(report["budgetStopped"])
+        self.assertEqual(report["unattemptedIds"]["p"], [f"q{i}" for i in range(4, 10)])
+
+    def test_a_failed_case_raises_in_order_after_its_peers_end(self):
+        runner, proxy, report, state = self.setup(fail="q2")
+        qs = [{"id": f"q{i}"} for i in range(6)]
+        admit = lambda pair, qs: True  # noqa: E731
+        admit.case_bound = lambda pair: 5
+        seen = []
+        with self.assertRaises(eval_ask.Invalid):
+            eval_ask.run_parallel(
+                runner, proxy, "p", qs, 3, admit, report,
+                lambda q, case, answer: seen.append(q["id"]) and False,
+            )
+        self.assertEqual(seen, ["q0", "q1"])
+        self.assertEqual(report["failedCase"]["id"], "q2")
+        self.assertEqual(state["now"], 0)  # no case is left running
+
+    def test_jobs_above_one_refuse_a_database_directory(self):
+        args = eval_ask.parse_args(["--sparkles", "/bin/true", "--jobs", "2", "--loc", "/x"])
+        with self.assertRaises(eval_ask.Invalid):
+            eval_ask.validate_args(args)

@@ -158,6 +158,23 @@ chunked and close-delimited replies, structured-output retries, a downgrade, a
 rate limit, an overload that clears and a cascade. `--dry-run` runs a whole run file
 against the fake, reads no key and reports request sizes. Neither contacts a provider.
 
+## Concurrent cases
+
+`--jobs N` on `scripts/eval-ask` and `scripts/eval-ask-anthropic` asks up to N cases at
+once, and the default of 1 runs them one at a time. Each case finishes in question order,
+so the report, the per-case files and `replies.jsonl` come out in the same order as a
+serial run. The proxy holds a case's reply lines until that case and every earlier one
+are done. Each concurrent case gets its own gate token, so the proxy books every request
+to the case that sent it. Before a case starts, the ledger holds its projected cost, the
+90th percentile of the model's case costs so far times the projection margin. A request
+may not spend what another case in flight still holds, so the cases in flight together
+stay within the cap. A case whose hold does not fit waits for the cases in flight, and
+with none in flight it ends the run as the cap would. `--child-memory-max 4G` runs each
+child in its own systemd user scope with that memory limit and no swap, so the kernel
+kills only that child, which scores as `killed`. The Anthropic runner sets 4G whenever
+`--jobs` is above 1. A database directory admits one process at a time, so `--jobs`
+above 1 needs a set's data file and refuses `--loc`.
+
 ## The cost cap
 
 `scripts/eval-ask-anthropic` starts a proxy on a loopback port and gives the children a
