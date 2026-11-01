@@ -516,6 +516,11 @@ struct Parser<'a> {
     /// parsing in progress, to stop on cycles
     active: FxHashSet<BlankNode>,
     nesting_reported: bool,
+    /// the depth of each expression read, to bound expressions built from memoized ones
+    depth: FxHashMap<BlankNode, usize>,
+    /// the deepest child of each expression being read
+    frames: Vec<usize>,
+    depth_failures: usize,
     shared_warned: FxHashSet<BlankNode>,
     axioms: BTreeMap<Axiom, Vec<Origin>>,
     diags: Vec<Diagnostic>,
@@ -566,6 +571,9 @@ impl<'a> Parser<'a> {
             dr_memo: FxHashMap::default(),
             active: FxHashSet::default(),
             nesting_reported: false,
+            depth: FxHashMap::default(),
+            frames: Vec::new(),
+            depth_failures: 0,
             shared_warned: FxHashSet::default(),
             axioms: BTreeMap::new(),
             diags: Vec::new(),
@@ -607,9 +615,57 @@ impl<'a> Parser<'a> {
         self.diag(Severity::Warning, code, message, triples);
     }
 
+    /// A memoized expression at `b`, unless using it here would nest the expression
+    /// being read deeper than [`MAX_NESTING`].
+    fn reuse<T>(&mut self, b: &BlankNode, m: Option<T>) -> Option<T> {
+        let d = self.depth.get(b).copied().unwrap_or(1);
+        if self.active.len() + d > MAX_NESTING {
+            self.too_deep(b);
+            return None;
+        }
+        self.note_depth(d);
+        m
+    }
+
+    /// Start reading the expression at `b`: the count of depth failures so far, or
+    /// `None` when `b` is already being read or the expression is too deep.
+    fn enter(&mut self, b: &BlankNode) -> Option<usize> {
+        if self.active.len() >= MAX_NESTING {
+            self.too_deep(b);
+            return None;
+        }
+        if !self.active.insert(b.clone()) {
+            return None;
+        }
+        self.frames.push(0);
+        Some(self.depth_failures)
+    }
+
+    /// Finish reading the expression at `b`, recording its depth. Whether its result
+    /// may be memoized: a failure that only the depth limit caused depends on where the
+    /// expression was reached from, so it is not.
+    fn leave(&mut self, b: &BlankNode, failures: usize, ok: bool) -> bool {
+        let inner = self.frames.pop().unwrap_or(0);
+        self.active.remove(b);
+        if !ok && self.depth_failures != failures {
+            return false;
+        }
+        let d = inner + 1;
+        self.depth.insert(b.clone(), d);
+        self.note_depth(d);
+        true
+    }
+
+    fn note_depth(&mut self, d: usize) {
+        if let Some(top) = self.frames.last_mut() {
+            *top = (*top).max(d);
+        }
+    }
+
     /// An expression nested deeper than [`MAX_NESTING`]: it stays unmapped, once
     /// reported, so that a long chain of blank nodes cannot exhaust the stack.
     fn too_deep(&mut self, b: &BlankNode) {
+        self.depth_failures += 1;
         if !self.nesting_reported {
             self.nesting_reported = true;
             self.diag(
@@ -1474,22 +1530,18 @@ impl<'a> Parser<'a> {
             }
             Term::BlankNode(b) => {
                 if let Some(m) = self.dr_memo.get(b) {
-                    return m.clone();
+                    let m = m.clone();
+                    return self.reuse(b, m);
                 }
-                if self.active.len() >= MAX_NESTING {
-                    self.too_deep(b);
-                    return None;
-                }
-                if !self.active.insert(b.clone()) {
-                    return None;
-                }
+                let failures = self.enter(b)?;
                 let r = if self.check_shared(b) {
                     self.data_range_node(b)
                 } else {
                     None
                 };
-                self.active.remove(b);
-                self.dr_memo.insert(b.clone(), r.clone());
+                if self.leave(b, failures, r.is_some()) {
+                    self.dr_memo.insert(b.clone(), r.clone());
+                }
                 r
             }
             _ => None,
@@ -1623,22 +1675,18 @@ impl<'a> Parser<'a> {
             }),
             Term::BlankNode(b) => {
                 if let Some(m) = self.ce_memo.get(b) {
-                    return m.clone();
+                    let m = m.clone();
+                    return self.reuse(b, m);
                 }
-                if self.active.len() >= MAX_NESTING {
-                    self.too_deep(b);
-                    return None;
-                }
-                if !self.active.insert(b.clone()) {
-                    return None;
-                }
+                let failures = self.enter(b)?;
                 let r = if self.check_shared(b) {
                     self.class_expression_node(b)
                 } else {
                     None
                 };
-                self.active.remove(b);
-                self.ce_memo.insert(b.clone(), r.clone());
+                if self.leave(b, failures, r.is_some()) {
+                    self.ce_memo.insert(b.clone(), r.clone());
+                }
                 r
             }
             _ => None,

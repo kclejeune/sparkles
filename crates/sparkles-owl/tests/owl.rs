@@ -1054,3 +1054,62 @@ fn el_ranges_pass_through_equivalent_properties() {
     ));
     assert_profiles(&o, &[Profile::Dl], &[(Profile::El, "§2.2.6")]);
 }
+
+#[test]
+fn nesting_is_bounded_bottom_up_and_independent_of_order() {
+    // each _:c{i} is the superclass of :A{i} and the complement inside _:c{i+1}, so a
+    // read that reaches the shallow ones first builds deeper expressions from memos
+    let n = 1000;
+    let mut body = decl("_:c0 a owl:Class ; owl:complementOf :B .\n");
+    for i in 0..n {
+        body.push_str(&format!(":A{i} a owl:Class ; rdfs:subClassOf _:c{i} .\n"));
+        if i > 0 {
+            body.push_str(&format!(
+                "_:c{i} a owl:Class ; owl:complementOf _:c{} .\n",
+                i - 1
+            ));
+        }
+    }
+    let o = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || lenient(&body))
+        .unwrap()
+        .join()
+        .expect("the read does not overflow its stack");
+    let sub = |i: usize| {
+        o.axiom_set().any(|a| {
+            matches!(&a.kind, AxiomKind::SubClassOf(ClassExpression::Class(c), _)
+                if c.as_str() == format!("http://example.org/A{i}"))
+        })
+    };
+    assert!(sub(0) && sub(5) && sub(100), "shallow expressions are read");
+    assert!(!sub(n - 1), "the deepest expression is not");
+    assert!(o.diagnostics.iter().any(|d| d.code == "nesting"));
+}
+
+#[test]
+fn a_too_deep_root_does_not_spoil_a_shallow_suffix() {
+    // datatype definitions: the outermost one is too deep, the innermost two are not
+    let n = 200;
+    let mut body = format!(
+        "{HEADER}:T a rdfs:Datatype . :U a rdfs:Datatype .\n:T owl:equivalentClass _:d{} .\n",
+        n - 1
+    );
+    body.push_str(":U owl:equivalentClass _:d1 .\n");
+    body.push_str("_:d0 a rdfs:Datatype ; owl:datatypeComplementOf xsd:integer .\n");
+    for i in 1..n {
+        body.push_str(&format!(
+            "_:d{i} a rdfs:Datatype ; owl:datatypeComplementOf _:d{} .\n",
+            i - 1
+        ));
+    }
+    let o = lenient(&body);
+    let defined = |t: &str| {
+        o.axiom_set().any(|a| {
+            matches!(&a.kind, AxiomKind::DatatypeDefinition(d, _)
+                if d.as_str() == format!("http://example.org/{t}"))
+        })
+    };
+    assert!(defined("U"));
+    assert!(!defined("T"));
+}
