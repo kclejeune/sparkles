@@ -207,7 +207,7 @@ pub struct AskOptions {
     /// and draft again with what the exploration found, on by default
     pub explore: bool,
     /// repair once when a result's shape does not fit the form of the question, and
-    /// keep the first answer when the repair does not answer, on by default
+    /// keep the first answer when the repair does not answer
     pub shape_check: bool,
     /// the first drafts asked, whose results vote on the query, 1 to [`MAX_DRAFTS`]
     pub drafts: usize,
@@ -246,7 +246,7 @@ impl Default for AskOptions {
             reviewed_only: false,
             report_context: false,
             explore: true,
-            shape_check: true,
+            shape_check: false,
             drafts: 1,
             type_hints: false,
         }

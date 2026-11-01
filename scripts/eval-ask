@@ -114,7 +114,7 @@ def load_questions(args):
 
 
 # The pipeline options a run may pass to every Ask, besides --drafts=N.
-ASK_OPTIONS = ("--no-explore", "--no-shape-check", "--type-hints")
+ASK_OPTIONS = ("--no-explore", "--shape-check", "--type-hints")
 
 
 def validate_args(args):
@@ -1749,7 +1749,7 @@ def parse_args(argv=None):
         action="append",
         default=[],
         metavar="FLAG",
-        help="a pipeline option passed to every Ask: --no-explore, --no-shape-check, --type-hints or --drafts=N",
+        help="a pipeline option passed to every Ask: --no-explore, --shape-check, --type-hints or --drafts=N",
     )
     ap.add_argument("--self-test", action="store_true")
     return ap.parse_args(argv)
