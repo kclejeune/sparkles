@@ -192,8 +192,12 @@ Static nested guards remain supported.
 
 Protection-pattern planning remains explicitly unsupported on this bounded entry
 point. It cannot call the existing unbounded parser or planner and claim the result
-satisfies the cap. The remaining pattern and nested-provider accounting work and Phase 3 guarded Dataset
-and query adoption, C25 exact references and U02 readers remain under item 395. The physical
+satisfies the cap. C25's exact evidence references are the first production caller.
+Their resolver reads each referenced commit with `Store::snapshot_of_branch_limited`
+and prepares its mask with `masked_controlled` under one shared `Preparation`, and it
+reports an unsupported provider as incomplete rather than absent. The remaining pattern
+and nested-provider accounting work and Phase 3 guarded Dataset and query adoption and
+U02 readers remain under item 395. The physical
 history handles and controlled permission helper do not provide an end-to-end query
 preparation limit for those callers.
 
