@@ -1112,6 +1112,14 @@ to 4.1 GB, which include the mapped index pages. The `ASK` over `?cat skos:broad
 answers in 0.2 seconds, and the full closure fails with the timeout. The alternative with two unbound ends still builds its
 edge relation and fails the budget, which `why_empty` now reports as an unknown check.
 
+An alternative walked by lookups expands a wide frontier by one sweep per predicate, as
+a simple path does. On Namespace at 100,000 people, against the parent build, a closure
+over `foaf:knows|ex:advisor` from one person took 0.83 of the time of the edge relation
+plan, the same closure over `foaf:knows|^foaf:knows` 0.65, and one from three VALUES
+seeds 0.005. An alternative with two unbound ends took 1.028, which
+[roadmap](../ROADMAP.md) item NEW-ITEM-2 follows. The 30-query screen in 8 rounds had a geometric mean of 0.993 and no
+query 5% slower or more.
+
 ### Grant routing (2026-10-23)
 
 MCP tool calls and resource reads were not admitted, so their queries took an empty grant
