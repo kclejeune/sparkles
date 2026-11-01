@@ -1149,7 +1149,7 @@ the circuits.
   is checkpointed too. The fingerprint covers the compiler version, the id, the
   normalized query, the access, the sink and whether the default graph is the union of
   the named graphs, so a changed spec or setting builds the circuit again. View
-  checkpoints do not cover the union setting, which item NEW-ITEM-2 adds. A file of
+  checkpoints do not cover the union setting, which item 507 adds. A file of
   another format is left in place and the circuit is built from the data, which a test
   checks. A checkpoint is never written over a file of another format at the same
   commit, for views as well.
@@ -1219,7 +1219,7 @@ until items 421 and 420 add commit-time maintenance and graph views.
 item's code, both built on atlas, on 8-vCPU instances with 1.05M triples. The commit path
 and the query path did not change. The query screen of 30 queries in four rounds gave a
 geometric mean of 1.007. Its one flagged query, `two-hop-count`, took 1.048 times as
-long over 12 rounds with every round between 1.02 and 1.08, which item NEW-ITEM-1 checks
+long over 12 rounds with every round between 1.02 and 1.08, which item 506 checks
 on forge. Over six write rounds without views, `serial-literal` ran at 0.995 times the
 transactions per second with a p99 of 1.013, and `writers` at 0.992 with a p99 of 1.028.
 With four table views over the written predicate, four rounds gave 0.997 for
