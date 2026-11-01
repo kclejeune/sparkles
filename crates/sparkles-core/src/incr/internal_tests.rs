@@ -728,3 +728,35 @@ fn a_recovered_accumulator_keeps_its_new_budget() {
     rt.round(&s);
     assert_eq!(counts(&c, head), feed_counts(&s, head));
 }
+
+/// A circuit built at commit 0 of a new store is checkpointed at a clean close, so a
+/// reattach after later commits counts them from the change log.
+#[test]
+fn a_build_at_commit_zero_is_checkpointed() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = persistent(dir.path(), true);
+        assert_eq!(s.snapshot().commit, 0);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        let c = attach(&rt, &s, "facts", FACTS, "s");
+        assert_eq!(c.commit(), 0);
+        rt.close(&s);
+    }
+    {
+        let s = persistent(dir.path(), true);
+        load(&s);
+        for u in WORKLOAD {
+            upd(&s, u);
+        }
+    }
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    let c = attach(&rt, &s, "facts", FACTS, "s");
+    assert_eq!(
+        rt.stats(&s).loaded,
+        1,
+        "the build at commit 0 was checkpointed"
+    );
+    rt.round(&s);
+    assert_eq!(counts(&c, 0), feed_counts(&s, 0));
+}

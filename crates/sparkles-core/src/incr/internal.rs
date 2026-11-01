@@ -230,7 +230,7 @@ impl Tally {
     }
 
     pub(crate) fn bytes(&self) -> u64 {
-        self.entries.len() as u64 * ENTRY_BYTES
+        self.entries.capacity() as u64 * ENTRY_BYTES
             + self.key_bytes
             + self.unknown.len() as u64 * RANGE_BYTES
     }
@@ -294,6 +294,9 @@ impl Tally {
             self.entries.pop_front();
         }
         self.unknown.retain(|r| r.1 > commit);
+        if self.entries.capacity() > self.entries.len() + self.entries.len() / 4 + 64 {
+            self.entries.shrink_to_fit();
+        }
         self.compact_keys();
     }
 
@@ -320,12 +323,20 @@ impl Tally {
         for &(_, end) in &self.unknown {
             *freed_by.entry(end).or_insert(0) += RANGE_BYTES;
         }
-        let mut freed = 0;
+        // what stays once the discard has shrunk the storage to what it holds
+        let mut left = self.entries.len() as u64 * ENTRY_BYTES
+            + self.key_bytes
+            + self.unknown.len() as u64 * RANGE_BYTES;
+        if left <= bytes {
+            // only spare capacity passes the budget
+            self.entries.shrink_to_fit();
+            return false;
+        }
         let mut through = self.since;
         for (c, b) in freed_by {
-            freed += b;
+            left = left.saturating_sub(b);
             through = through.max(c);
-            if total - freed <= bytes {
+            if left <= bytes {
                 break;
             }
         }
@@ -557,6 +568,22 @@ mod tests {
         t.entries = [(4, 0, 2), (5, 1, 1), (7, 0, 1)].into_iter().collect();
         t.key_bytes = t.keys.iter().map(|k| key_bytes(k)).sum();
         t
+    }
+
+    #[test]
+    fn pruning_releases_the_counts_storage() {
+        let mut t = Tally::new(vec![0], 0);
+        for i in 0..100_000u64 {
+            let k = t.intern(vec![iri(&format!("k{i}"))]);
+            t.entries.push_back((1, k, 1));
+        }
+        let k = t.intern(vec![iri("last")]);
+        t.entries.push_back((2, k, 1));
+        assert!(t.bytes() > 3 << 20, "{}", t.bytes());
+        assert!(t.shrink_to(8 << 10));
+        assert!(t.entries.capacity() < 128, "{}", t.entries.capacity());
+        assert!(t.bytes() <= 8 << 10, "{}", t.bytes());
+        assert_eq!(t.since, 1);
     }
 
     #[test]

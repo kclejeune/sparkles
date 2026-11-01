@@ -393,6 +393,9 @@ impl Runtime {
         match st.circuit.build(snap.clone(), &self.control()) {
             Ok(()) => {
                 st.status = Status::Ready;
+                // a build's state is checkpointed even at the commit of the last one,
+                // such as commit 0 of a new store
+                st.dirty = true;
                 if !st.key_cols.is_empty() {
                     match st.tally.as_mut() {
                         // a rebuild: the commits since the last pass are not counted
