@@ -1134,22 +1134,25 @@ the circuits.
   evaluates the query once. An internal circuit's state over its budget fails the
   circuit with `over-budget`. An accumulator's counts that pass the rest of the budget
   drop the oldest commits' counts first, with the keys and unknown ranges only they
-  hold, which moves the commit the counts start after. The budget holds after each commit
-  of a run, and a drop goes a quarter below it, so counts at the budget are dropped in
-  batches. The counts' storage, unknown ranges included, is charged at its capacity and
-  shrinks after a drop. A recovered checkpoint is held to the
-  budget of the attach that loads it.
+  hold, which moves the commit the counts start after. The budget holds after each
+  commit of a run, and a drop goes a quarter below it, so counts at the budget are
+  dropped in batches. The counts' storage, unknown ranges included, is charged at its
+  capacity. Each fit of the storage leaves it room to grow to the budget, so the counts
+  that follow a drop are added without reallocation. A recovered checkpoint is held to
+  the budget of the attach that loads it.
 - Checkpoints are `circuits/{id}/main/state-{commit}.bin`
   (`formats::INTERNAL_CIRCUIT_STATE`, version 1), with the view checkpoint's header under
   the magic `SPKCIRC\0`. The body holds the circuit's state as a view checkpoint does,
   then the accumulator's starting commit, unknown ranges, keys as vocabulary keys and
-  counts. They are written with the views' checkpoints and when a circuit is
-  collected. A build always marks its state for the next one, so a build at commit 0
-  of a new store is checkpointed too. The fingerprint covers the compiler version, the id, the normalized query, the access
-  and the sink, so a changed spec builds the circuit again. A file of another format is
-  left in place and the circuit is built from the data, which a test checks. A
-  checkpoint is never written over a file of another format at the same commit, for
-  views as well.
+  counts. They are written with the views' checkpoints and when a circuit is collected.
+  A build always marks its state for the next one, so a build at commit 0 of a new store
+  is checkpointed too. The fingerprint covers the compiler version, the id, the
+  normalized query, the access, the sink and whether the default graph is the union of
+  the named graphs, so a changed spec or setting builds the circuit again. View
+  checkpoints do not cover the union setting, which item NEW-ITEM-2 adds. A file of
+  another format is left in place and the circuit is built from the data, which a test
+  checks. A checkpoint is never written over a file of another format at the same
+  commit, for views as well.
 - A circuit whose last handle is dropped stays registered while its final checkpoint is
   written, so an attach of the same id meanwhile joins it and keeps its counts.
 

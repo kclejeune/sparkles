@@ -303,6 +303,9 @@ impl Runtime {
             h.update([0]);
             h.update(access_fingerprint(graphs.as_ref()).to_le_bytes());
             h.update(whole.as_deref().unwrap_or("").as_bytes());
+            // whether the default graph is the union of the named graphs changes what
+            // the query reads, so a state of the other setting is not loaded
+            h.update([u8::from(store.snapshot().union_default_graph)]);
             h.update([0]);
             match &spec.sink {
                 Sink::Rows => h.update(b"rows"),

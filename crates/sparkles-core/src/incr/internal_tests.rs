@@ -792,3 +792,46 @@ fn a_long_run_keeps_to_the_budget_at_each_commit() {
     let n = c.counts(0).unwrap();
     assert!(n.unknown.is_some(), "the oldest counts were dropped");
 }
+
+/// A checkpoint written while the default graph was not the union of the named graphs
+/// is not loaded once it is, since the query then reads other quads.
+#[test]
+fn the_union_default_graph_setting_keeps_its_own_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |union: bool| {
+        Store::open(
+            dir.path(),
+            StoreOptions {
+                change_log: true,
+                union_default_graph: union,
+                ..Default::default()
+            },
+        )
+        .expect("open")
+    };
+    {
+        let s = open(false);
+        upd(&s, "INSERT DATA { GRAPH :g { :a :p 1 } }");
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        let c = rt
+            .attach_internal(
+                &s,
+                InternalSpec::rows("all", FACTS),
+                InternalAccess::everything(),
+            )
+            .unwrap();
+        assert!(c.rows().unwrap().rows.is_empty());
+        rt.close(&s);
+    }
+    let s = open(true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    let c = rt
+        .attach_internal(
+            &s,
+            InternalSpec::rows("all", FACTS),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    assert_eq!(rt.stats(&s).loaded, 0, "built again for the other setting");
+    assert_eq!(c.rows().unwrap().rows.len(), 1);
+}

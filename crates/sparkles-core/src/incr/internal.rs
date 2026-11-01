@@ -206,6 +206,9 @@ pub(crate) struct Tally {
     /// the drops that the budget made
     #[cfg(test)]
     pub(crate) drops: u64,
+    /// the times the budget fitted the storage
+    #[cfg(test)]
+    pub(crate) resizes: u64,
 }
 
 /// The approximate memory of one entry and of one unknown range.
@@ -319,29 +322,55 @@ impl Tally {
         if self.bytes() <= bytes {
             return false;
         }
-        // spare capacity alone may pass the budget
-        self.entries.shrink_to_fit();
-        self.unknown.shrink_to_fit();
-        if self.bytes() <= bytes {
-            return false;
+        let mut dropped = false;
+        // the counts may take seven eighths of the budget, and the rest is the storage's
+        // room to grow; a drop goes a quarter below the budget, so that counts at the
+        // budget are dropped in batches and not one commit after each commit
+        if self.used() > bytes - bytes / 8 {
+            let target = bytes - bytes / 4;
+            #[cfg(test)]
+            {
+                self.drops += 1;
+            }
+            loop {
+                let through = self.through_for(target);
+                if through <= self.since {
+                    break;
+                }
+                self.discard_through(through);
+                dropped = true;
+                if self.used() <= target {
+                    break;
+                }
+            }
         }
-        // a drop goes a quarter below the budget, so that counts at the budget are
-        // dropped in batches and not one commit after each commit
-        let target = bytes - bytes / 4;
+        self.fit(bytes);
+        dropped
+    }
+
+    /// The memory the counts hold, without the storage's spare capacity.
+    fn used(&self) -> u64 {
+        self.entries.len() as u64 * ENTRY_BYTES
+            + self.key_bytes
+            + self.unknown.len() as u64 * RANGE_BYTES
+    }
+
+    /// Fit the storage to `bytes`: the counts' storage keeps room to grow within it, an
+    /// eighth of it left for new keys, so that counts arriving after a drop need no
+    /// reallocation until the budget is reached again.
+    fn fit(&mut self, bytes: u64) {
         #[cfg(test)]
         {
-            self.drops += 1;
+            self.resizes += 1;
         }
-        loop {
-            let through = self.through_for(target);
-            if through <= self.since {
-                return true;
-            }
-            self.discard_through(through);
-            self.entries.shrink_to_fit();
-            self.unknown.shrink_to_fit();
-            if self.bytes() <= target {
-                return true;
+        self.unknown.shrink_to_fit();
+        self.entries.shrink_to_fit();
+        let fixed = self.key_bytes + self.unknown.capacity() as u64 * RANGE_BYTES;
+        let room = (bytes.saturating_sub(bytes / 8).saturating_sub(fixed) / ENTRY_BYTES) as usize;
+        if room > self.entries.len() {
+            self.entries.reserve_exact(room - self.entries.len());
+            if self.bytes() > bytes {
+                self.entries.shrink_to_fit();
             }
         }
     }
@@ -618,7 +647,11 @@ mod tests {
         t.entries.push_back((2, k, 1));
         assert!(t.bytes() > 3 << 20, "{}", t.bytes());
         assert!(t.shrink_to(8 << 10));
-        assert!(t.entries.capacity() < 128, "{}", t.entries.capacity());
+        assert!(
+            t.entries.capacity() as u64 * ENTRY_BYTES <= 8 << 10,
+            "{}",
+            t.entries.capacity()
+        );
         assert!(t.bytes() <= 8 << 10, "{}", t.bytes());
         assert_eq!(t.since, 1);
     }
@@ -635,6 +668,30 @@ mod tests {
         assert!(t.bytes() <= budget, "{} over {budget}", t.bytes());
         assert!(t.since >= 1);
         assert!(t.counts(t.since, 4).complete());
+    }
+
+    #[test]
+    fn counts_at_the_budget_reallocate_in_batches() {
+        // one key changed by every commit, held to the budget after each, as a run does
+        let budget = 1 << 20;
+        let mut t = Tally::new(vec![0], 0);
+        let k = t.intern(vec![iri("a")]);
+        for c in 1..=50_000 {
+            t.entries.push_back((c, k, 1));
+            t.shrink_to(budget);
+            assert!(t.bytes() <= budget, "{} at commit {c}", t.bytes());
+        }
+        assert!(t.drops >= 1);
+        assert!(t.resizes <= 10, "{} resizes", t.resizes);
+        // new keys after a drop fit the room left for them
+        let mut t = Tally::new(vec![0], 0);
+        for c in 1..=20_000u64 {
+            let k = t.intern(vec![iri(&format!("k{c}"))]);
+            t.entries.push_back((c, k, 1));
+            t.shrink_to(budget);
+            assert!(t.bytes() <= budget, "{} at commit {c}", t.bytes());
+        }
+        assert!(t.resizes <= 200, "{} resizes", t.resizes);
     }
 
     #[test]
