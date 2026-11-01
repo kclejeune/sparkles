@@ -53,6 +53,8 @@ mod counter {
 
     const PERF_TYPE_HARDWARE: u32 = 0;
     const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+    const FORMAT_TOTAL_TIME_ENABLED: u64 = 1;
+    const FORMAT_TOTAL_TIME_RUNNING: u64 = 2;
     const DISABLED: u64 = 1;
     const EXCLUDE_KERNEL: u64 = 1 << 5;
     const EXCLUDE_HV: u64 = 1 << 6;
@@ -88,6 +90,7 @@ mod counter {
                     kind: PERF_TYPE_HARDWARE,
                     size: std::mem::size_of::<Attr>() as u32,
                     config,
+                    read_format: FORMAT_TOTAL_TIME_ENABLED | FORMAT_TOTAL_TIME_RUNNING,
                     flags: DISABLED | EXCLUDE_KERNEL | EXCLUDE_HV,
                     ..Default::default()
                 };
@@ -122,21 +125,32 @@ mod counter {
             }
         }
 
-        /// The instructions `f` executed on this thread.
-        pub fn count<R>(&self, f: impl FnOnce() -> R) -> (u64, R) {
+        /// The instructions `f` executed on this thread, and the share of the time the
+        /// counters were enabled that one of them was counting. A thread runs on one
+        /// core type at a time, so the share is 1 unless the kernel multiplexed the
+        /// counters with other events and missed part of the work.
+        pub fn count<R>(&self, f: impl FnOnce() -> R) -> (u64, f64, R) {
             self.ioctl(IOC_RESET);
             self.ioctl(IOC_ENABLE);
             let r = std::hint::black_box(f());
             self.ioctl(IOC_DISABLE);
-            let mut total = 0;
+            let (mut total, mut enabled, mut running) = (0, 0, 0);
             for fd in &self.fds {
                 use std::io::Read as _;
-                let mut buf = [0u8; 8];
+                let mut buf = [0u8; 24];
                 let mut file = std::fs::File::from(fd.try_clone().unwrap());
                 file.read_exact(&mut buf).unwrap();
-                total += u64::from_ne_bytes(buf);
+                let word = |i: usize| u64::from_ne_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+                total += word(0);
+                enabled = enabled.max(word(1));
+                running += word(2);
             }
-            (total, r)
+            let coverage = if enabled == 0 {
+                1.0
+            } else {
+                running as f64 / enabled as f64
+            };
+            (total, coverage, r)
         }
     }
 }
@@ -210,7 +224,14 @@ impl Out {
         }
     }
 
-    fn case(&mut self, key: &str, mut counts: Vec<u64>, other_ticks: u64) {
+    fn check(&mut self, name: &str, ok: bool, detail: String) {
+        if !ok {
+            eprintln!("check failed: {name}: {detail}");
+        }
+        self.line(serde_json::json!({ "check": name, "ok": ok, "detail": detail }));
+    }
+
+    fn case(&mut self, key: &str, mut counts: Vec<u64>, other_ticks: u64, coverage: f64) {
         counts.sort_unstable();
         let median = counts[counts.len() / 2];
         let tick_ms = 1000 / clock_ticks();
@@ -224,10 +245,16 @@ impl Out {
             "key": key, "value": median, "unit": "instructions", "better": "lower",
             "samples": counts,
         }));
-        self.line(serde_json::json!({
-            "check": format!("{key}/single-thread"), "ok": other_ticks <= 2,
-            "detail": format!("{} ms of CPU time on other threads", other_ticks * tick_ms),
-        }));
+        self.check(
+            &format!("{key}/single-thread"),
+            other_ticks <= 2,
+            format!("{} ms of CPU time on other threads", other_ticks * tick_ms),
+        );
+        self.check(
+            &format!("{key}/counter-coverage"),
+            coverage >= 0.99,
+            format!("the counters ran for {coverage:.4} of the enabled time"),
+        );
     }
 }
 
@@ -256,19 +283,35 @@ fn other_thread_ticks() -> u64 {
     total
 }
 
-fn measure<R>(
+/// Count `f` `reps` times and check that every run returned `expected`, which the caller
+/// computed another way, so that a reader that breaks cannot pass as a cheaper one.
+fn measure<R: PartialEq + std::fmt::Debug>(
     out: &mut Out,
     c: &counter::Instructions,
     key: &str,
     reps: usize,
+    expected: R,
     mut f: impl FnMut() -> R,
 ) {
     let mut counts = Vec::with_capacity(reps);
+    let mut coverage = 1f64;
+    let mut wrong = None;
     let before = other_thread_ticks();
     for _ in 0..reps {
-        counts.push(c.count(&mut f).0);
+        let (n, share, r) = c.count(&mut f);
+        counts.push(n);
+        coverage = coverage.min(share);
+        if r != expected {
+            wrong = Some(r);
+        }
     }
-    out.case(key, counts, other_thread_ticks() - before);
+    let ticks = other_thread_ticks() - before;
+    let detail = match &wrong {
+        None => format!("{expected:?}"),
+        Some(r) => format!("{r:?}, expected {expected:?}"),
+    };
+    out.check(&format!("{key}/result"), wrong.is_none(), detail);
+    out.case(key, counts, ticks, coverage);
 }
 
 /// A deterministic sequence of ids below `n`.
@@ -302,19 +345,23 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
         drop(s);
         let fsst = codec == Some(VocabCodec::Fsst);
         let v = Vocab::open_codec(&gen_dir, fsst).unwrap();
-        assert_eq!(
-            v.is_fsst(),
-            fsst,
-            "{name}: the store was not built with its codec"
-        );
+        assert_eq!(v.is_fsst(), fsst, "{name}: not built with its codec");
         let n = v.len();
         assert!(n > items as u64, "{name}: {n} keys");
-        let mut keys = Vec::new();
-        v.for_each(|i, k| {
-            if i % 13 == 0 {
-                keys.push(k.to_vec());
-            }
-        });
+        // every key, read once by the scan and compared with lookups by id
+        let mut all: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
+        v.for_each(|_, k| all.push(k.to_vec()));
+        assert_eq!(all.len() as u64, n, "{name}: the scan missed keys");
+        for (i, k) in all.iter().enumerate().step_by(97) {
+            assert_eq!(
+                v.get(i as u64).as_deref(),
+                Some(k.as_slice()),
+                "{name}: key {i}"
+            );
+        }
+        assert!(all.is_sorted(), "{name}: the keys are not in order");
+        let lens: Vec<usize> = all.iter().map(Vec::len).collect();
+        let keys: Vec<Vec<u8>> = all.iter().step_by(13).cloned().collect();
         let missing: Vec<Vec<u8>> = keys
             .iter()
             .map(|k| {
@@ -328,44 +375,84 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
             .step_by(10)
             .map(|k| k[..k.len().min(12)].to_vec())
             .collect();
-        let mut sorted: Vec<u64> = (0..n).step_by(7).collect();
-        sorted.sort_unstable();
+        let sorted: Vec<u64> = (0..n).step_by(7).collect();
         let random = ids(n, 50_000);
+        // the expected results, from the scanned keys
+        let id_sum: u64 = (0..n).step_by(13).sum();
+        let prefix_total: u64 = prefixes
+            .iter()
+            .map(|p| {
+                let lo = all.partition_point(|k| k.as_slice() < p.as_slice());
+                all[lo..].iter().take_while(|k| k.starts_with(p)).count() as u64
+            })
+            .sum();
+        let sorted_bytes: usize = sorted.iter().map(|&i| lens[i as usize]).sum();
+        let random_bytes: usize = random.iter().map(|&i| lens[i as usize]).sum();
         let p = format!("vocab/{name}");
-        measure(out, c, &format!("{p}/open"), reps, || {
+        measure(out, c, &format!("{p}/open"), reps, n, || {
             Vocab::open_codec(&gen_dir, fsst).unwrap().len()
         });
-        measure(out, c, &format!("{p}/for-each"), reps, || {
-            let mut bytes = 0usize;
-            v.for_each(|_, k| bytes += k.len());
-            bytes
-        });
-        measure(out, c, &format!("{p}/get-sorted"), reps, || {
-            let mut bytes = 0usize;
-            v.get_sorted(&sorted, |_, k| bytes += k.len());
-            bytes
-        });
-        measure(out, c, &format!("{p}/get-random"), reps, || {
-            random
-                .iter()
-                .map(|&i| v.get(i).map_or(0, |k| k.len()))
-                .sum::<usize>()
-        });
-        measure(out, c, &format!("{p}/find-present"), reps, || {
-            keys.iter().filter(|k| v.find(k).is_ok()).count()
-        });
-        measure(out, c, &format!("{p}/find-missing"), reps, || {
-            missing.iter().filter(|k| v.find(k).is_ok()).count()
-        });
-        measure(out, c, &format!("{p}/prefix-range"), reps, || {
-            prefixes
-                .iter()
-                .map(|k| {
-                    let (lo, hi) = v.prefix_range(k);
-                    hi - lo
-                })
+        measure(
+            out,
+            c,
+            &format!("{p}/for-each"),
+            reps,
+            lens.iter().sum(),
+            || {
+                let mut bytes = 0usize;
+                v.for_each(|_, k| bytes += k.len());
+                bytes
+            },
+        );
+        measure(
+            out,
+            c,
+            &format!("{p}/get-sorted"),
+            reps,
+            sorted_bytes,
+            || {
+                let mut bytes = 0usize;
+                v.get_sorted(&sorted, |_, k| bytes += k.len());
+                bytes
+            },
+        );
+        measure(
+            out,
+            c,
+            &format!("{p}/get-random"),
+            reps,
+            random_bytes,
+            || {
+                random
+                    .iter()
+                    .map(|&i| v.get(i).map_or(0, |k| k.len()))
+                    .sum::<usize>()
+            },
+        );
+        measure(out, c, &format!("{p}/find-present"), reps, id_sum, || {
+            keys.iter()
+                .map(|k| v.find(k).unwrap_or(u64::MAX / 4))
                 .sum::<u64>()
         });
+        measure(out, c, &format!("{p}/find-missing"), reps, 0, || {
+            missing.iter().filter(|k| v.find(k).is_ok()).count()
+        });
+        measure(
+            out,
+            c,
+            &format!("{p}/prefix-range"),
+            reps,
+            prefix_total,
+            || {
+                prefixes
+                    .iter()
+                    .map(|k| {
+                        let (lo, hi) = v.prefix_range(k);
+                        hi - lo
+                    })
+                    .sum::<u64>()
+            },
+        );
     }
 }
 
@@ -395,26 +482,51 @@ fn wal_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// Open fresh copies of `src` and count each open.
-fn opens(c: &counter::Instructions, src: &Path, reps: usize, seq: u64) -> (Vec<u64>, u64) {
-    let mut counts = Vec::new();
-    let mut ticks = 0;
+/// A store's commit, its quads and a digest of the `ex:size`, `ex:link` and `ex:label`
+/// facts, which the screen's commits insert and delete.
+type Content = (u64, u64, String);
+
+fn content(s: &Store) -> Content {
+    let r = sparkles_core::sparql::query(
+        s.snapshot(),
+        "SELECT (COUNT(?v) AS ?n) (SUM(?v) AS ?t) (COUNT(?l) AS ?k) (COUNT(DISTINCT ?x) AS ?d) \
+         WHERE { { ?s <http://example.org/size> ?v } UNION { ?s <http://example.org/link> ?l } \
+         UNION { ?s <http://example.org/label> ?x } }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    (snap.commit, snap.len(), format!("{:?}", r.rows()))
+}
+
+/// The counts of opening fresh copies of a store, and whether each recovered it.
+struct Opens {
+    counts: Vec<u64>,
+    ticks: u64,
+    coverage: f64,
+    recovered: bool,
+}
+
+fn opens(c: &counter::Instructions, src: &Path, reps: usize, want: &Content) -> Opens {
+    let mut o = Opens {
+        counts: Vec::new(),
+        ticks: 0,
+        coverage: 1.0,
+        recovered: true,
+    };
     for _ in 0..reps {
         let scratch = tempfile::tempdir().unwrap();
         let dir: PathBuf = scratch.path().join("db");
         copy_dir(src, &dir);
         let before = other_thread_ticks();
-        let (n, s) = c.count(|| Store::open(&dir, StoreOptions::default()).unwrap());
-        ticks += other_thread_ticks() - before;
-        assert_eq!(
-            s.snapshot().commit,
-            seq,
-            "the copy opened at another commit"
-        );
-        counts.push(n);
+        let (n, share, s) = c.count(|| Store::open(&dir, StoreOptions::default()).unwrap());
+        o.ticks += other_thread_ticks() - before;
+        o.coverage = o.coverage.min(share);
+        o.recovered &= content(&s) == *want;
+        o.counts.push(n);
         drop(s);
     }
-    (counts, ticks)
+    o
 }
 
 fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize) {
@@ -429,7 +541,7 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
     )])
     .unwrap();
     s.compact().unwrap();
-    let seq0 = s.snapshot().commit;
+    let before = content(&s);
     drop(s);
     let empty_wal = wal_bytes(&base_dir);
     let changed = tempfile::tempdir().unwrap();
@@ -458,32 +570,50 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
         };
         update(&s, &u, &o).unwrap();
     }
-    let seq = s.snapshot().commit;
+    let after = content(&s);
     drop(s);
+    assert_ne!(before, after, "the commits changed nothing");
     let wal = wal_bytes(&changed_dir);
     assert!(
         wal > empty_wal + commits as u64 * 16,
         "the commits are not in the WAL ({empty_wal} bytes before, {wal} after)"
     );
-    out.line(serde_json::json!({
-        "check": "wal/replay/commits-in-wal", "ok": true,
-        "detail": format!("{commits} commits, {wal} WAL bytes against {empty_wal} without them"),
-    }));
-    let (empty, t0) = opens(c, &base_dir, reps, seq0);
-    let (replay, t1) = opens(c, &changed_dir, reps, seq);
-    let med = |v: &[u64]| {
-        let mut v = v.to_vec();
-        v.sort_unstable();
-        v[v.len() / 2]
-    };
+    out.check(
+        "wal/replay/commits-in-wal",
+        true,
+        format!("{commits} commits, {wal} WAL bytes against {empty_wal} without them"),
+    );
+    let empty = opens(c, &base_dir, reps, &before);
+    let replay = opens(c, &changed_dir, reps, &after);
+    let key = format!("wal/open-with-{commits}-commits");
+    out.check(
+        "wal/open-without-wal/recovered",
+        empty.recovered,
+        format!("{before:?}"),
+    );
+    out.check(
+        &format!("{key}/recovered"),
+        replay.recovered,
+        format!("{after:?}"),
+    );
+    let mut sorted = empty.counts.clone();
+    sorted.sort_unstable();
+    let empty_median = sorted[sorted.len() / 2];
     let diff: Vec<u64> = replay
+        .counts
         .iter()
-        .map(|r| r.saturating_sub(med(&empty)))
+        .map(|r| r.saturating_sub(empty_median))
         .collect();
-    out.case("wal/open-without-wal", empty, t0);
-    out.case(&format!("wal/open-with-{commits}-commits"), replay, t1);
+    out.case(
+        "wal/open-without-wal",
+        empty.counts,
+        empty.ticks,
+        empty.coverage,
+    );
+    out.case(&key, replay.counts, replay.ticks, replay.coverage);
     // the open of the same store without the log, subtracted
-    out.case(&format!("wal/replay-{commits}-commits"), diff, 0);
+    let coverage = empty.coverage.min(replay.coverage);
+    out.case(&format!("wal/replay-{commits}-commits"), diff, 0, coverage);
 }
 
 #[test]

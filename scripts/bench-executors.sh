@@ -91,12 +91,21 @@ for t in $THREADS; do
   [ "$t" -ge 1 ] && [ "$t" -lt "$NCPU" ] || die "--threads $t needs at least $((t + 1)) CPUs"
 done
 
+# The processes that launched this script, such as `mise run` and `mbx sparkles-task`,
+# which hold the managed target's lease, are not competing work.
+ancestors=" "
+pid=$$
+while [ "$pid" -gt 1 ] 2> /dev/null; do
+  ancestors+="$pid "
+  pid=$(ps -o ppid= -p "$pid" 2> /dev/null | tr -d ' ' || echo 1)
+done
 if [ -z "$FORCE" ]; then
   for p in rustc cargo mbx java qlever-server oxigraph fluree sparkles; do
-    if pgrep -x "$p" > /dev/null; then
+    for other in $(pgrep -x "$p" || true); do
+      [[ $ancestors == *" $other "* ]] && continue
       ps -eo pid,args --sort=-pcpu | head -8 >&2
-      die "$p is running; stop it or pass --force"
-    fi
+      die "$p (PID $other) is running; stop it or pass --force"
+    done
   done
 fi
 

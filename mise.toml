@@ -1280,7 +1280,8 @@ usage = '''
 flag "--out <dir>" help="results directory (default .artifacts/w3c-streaming/<UTC time>)"
 '''
 run = '''
-set -o pipefail
+#!/usr/bin/env bash
+set -euo pipefail
 out=$(realpath -m "${usage_out:-.artifacts/w3c-streaming/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$out"
 mbx test -p sparkles-core --test w3c -- --nocapture --test-threads=1 streaming_ 2>&1 | tee "$out/output.log"
@@ -1324,7 +1325,8 @@ flag "--people <n>" default="200000" help="people in the generated data (about 6
 flag "--out <dir>" help="results directory (default .artifacts/bench-incr/<UTC time>)"
 '''
 run = '''
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 out=$(realpath -m "${usage_out:-.artifacts/bench-incr/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$out"
 [ ! -e "$out/metrics.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
@@ -1349,7 +1351,8 @@ flag "--reps <n>" default="5" help="counted runs of each case"
 flag "--out <dir>" help="results directory (default .artifacts/bench-insn/<UTC time>)"
 '''
 run = '''
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 out=$(realpath -m "${usage_out:-.artifacts/bench-insn/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$out"
 [ ! -e "$out/metrics.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
@@ -1359,7 +1362,7 @@ INSN_SCREEN_ITEMS="$usage_items" INSN_SCREEN_COMMITS="$usage_commits" INSN_SCREE
   mbx test --release -p sparkles-core --test insn_screen -- --ignored --nocapture --test-threads 1 \
   | tee "$out/output.md"
 python3 scripts/bench-gate.py metrics "$out/metrics.jsonl" --gate insn-screen --suite insn-screen \
-  --scale "$usage_items items, $usage_commits commits" --threshold 0.01 --out "$out/record.json" \
+  --scale "$usage_items items, $usage_commits commits" --threshold 0 --out "$out/record.json" \
   --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
   --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" \
   --manifest rustc="$(rustc -V)" --setting items="$usage_items" --setting commits="$usage_commits" \
@@ -1376,7 +1379,8 @@ flag "--threads <n>" default="12" help="RAYON_NUM_THREADS"
 flag "--out <dir>" help="results directory (default .artifacts/bench-reasoning-latency/<UTC time>)"
 '''
 run = '''
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 out=$(realpath -m "${usage_out:-.artifacts/bench-reasoning-latency/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$out"
 [ ! -e "$out/metrics.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }

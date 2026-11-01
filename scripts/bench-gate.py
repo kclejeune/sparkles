@@ -17,7 +17,9 @@ A gate record is one JSON object:
     manifest     the binary or build, its commit and hash, the scripts' commit and the window
     settings     how the run was made, including "threshold", the default allowed slowdown
     metrics      list of {key, value, unit, better: lower | higher, samples?}
-    checks       list of {name, ok, detail}: answers and other conditions that must hold
+    checks       list of {name, ok, detail, fingerprint?}: answers and other conditions
+                 that must hold; a fingerprint, such as an answer's row count and hash,
+                 must also equal the baseline's
 
 `metrics` reads JSON lines of {key, value, unit, better, samples?} or {check, ok, detail}
 that a Rust harness wrote, such as `incr_bench.rs` with INCR_BENCH_JSON or the
@@ -30,9 +32,13 @@ direction is flagged.
 
 `compare` prints a Markdown table with each metric of the baseline, the candidate and
 their ratio, oriented so that a ratio above 1 is a slowdown or a loss. It exits with
-status 1 when a ratio reaches 1 + threshold, when the candidate lacks a metric of the
-baseline, or when a check of the candidate fails. The threshold comes from the
-baseline's settings unless --threshold is given. --floor V ignores metrics whose
+status 1 when a ratio above 1 reaches 1 + threshold, when the candidate lacks a metric of
+the baseline, when a check of the candidate fails or when a fingerprint differs from the
+baseline's. The threshold comes from the baseline's settings unless --threshold is
+given, and a baseline's `short_below` and `short_threshold` settings give timings below
+that many milliseconds their own threshold. It refuses two records whose suite, scale,
+workload settings, host or metric units differ, unless --allow-different is given; a
+record whose settings say `host_independent` may come from another host. --floor V ignores metrics whose
 baseline value is below V, for timings too short for the gate's host. A comparison
 across runs on different days carries the host's run-to-run noise, so a flagged metric
 is confirmed by an interleaved A/B of the two builds before it counts as a regression,
@@ -149,6 +155,11 @@ def executors(args):
     if not cells:
         fail(f"no cells with results/samples.tsv under {root}")
     metrics, checks, tables, env = [], [], [], {}
+    unordered = set()
+    for f in sorted((root / "queries").glob("*.rq")):
+        text = f.read_text().upper()
+        if re.search(r"\bLIMIT\b", text) and not re.search(r"\bORDER\s+BY\b", text):
+            unordered.add(f.stem)
     for d in cells:
         m = re.fullmatch(r"people-(\d+)-threads-(\d+)", d.name)
         if not m:
@@ -174,7 +185,10 @@ def executors(args):
         table = []
         for q in order:
             agree = len(set(answers[q].values())) == 1 and "error" not in str(answers[q])
-            checks.append({"name": f"{cell}/{q}/answers", "ok": agree,
+            eager = answers[q].get("A", ("error", "error"))
+            # LIMIT without ORDER BY may return other rows, so only the count is kept
+            fingerprint = eager[0] if q in unordered else f"{eager[0]} rows, {eager[1]}"
+            checks.append({"name": f"{cell}/{q}/answers", "ok": agree, "fingerprint": fingerprint,
                            "detail": {MODES[v]: list(a) for v, a in sorted(answers[q].items())}})
             for v in ("A", "B"):
                 if errors[(q, v)]:
@@ -208,7 +222,7 @@ def executors(args):
                      "started": manifest.get("started"), "ended": manifest.get("ended"),
                      "load_before": manifest.get("load before"), "load_after": manifest.get("load after"),
                      "cells": env},
-        "settings": {"threshold": 0.05,
+        "settings": {"threshold": 0.05, "short_below": 0.3, "short_threshold": 0.0,
                      "metric": "medians per request of the server's execMs (/exec) and of curl's time_total (/wall)",
                      "variants": manifest.get("variants"), "run": manifest.get("settings"),
                      "harness": "scripts/bench-executors.sh with scripts/nsc-bench-remote.sh"},
@@ -254,7 +268,10 @@ def metrics(args):
             continue
         row = json.loads(line)
         if "check" in row:
-            checks.append({"name": row["check"], "ok": row["ok"], "detail": row.get("detail")})
+            check = {"name": row["check"], "ok": row["ok"], "detail": row.get("detail")}
+            if "fingerprint" in row:
+                check["fingerprint"] = row["fingerprint"]
+            checks.append(check)
         else:
             for k in ("key", "value", "unit", "better"):
                 if k not in row:
@@ -289,7 +306,7 @@ def w3c(args):
     record = {"gate_record": VERSION, "gate": "w3c-streaming", "kind": "gate-record",
               "suite": "w3c-sparql", "scale": None, "host": host_info(),
               "manifest": parse_kv(args.manifest),
-              "settings": {"threshold": 0.0, "execution": "streaming", "batch_rows": 4096,
+              "settings": {"threshold": 0.0, "host_independent": True, "execution": "streaming", "batch_rows": 4096,
                            "harness": "crates/sparkles-core/tests/w3c.rs, the streaming_ tests"},
               "metrics": ms, "checks": checks}
     write_record(record, args.out)
@@ -298,11 +315,54 @@ def w3c(args):
 
 # ------------------------------------------------------------------------------ compare
 
+# Settings that describe a run's circumstances rather than its workload.
+VOLATILE_SETTINGS = {"threshold", "short_below", "short_threshold", "load", "host_independent"}
+
+
+def incompatibilities(base, cand):
+    """Why two records do not measure the same workload, as a list of reasons."""
+    out = []
+    for k in ("gate", "suite", "scale"):
+        if base.get(k) != cand.get(k):
+            out.append(f"{k}: {base.get(k)!r} against {cand.get(k)!r}")
+    bs = {k: v for k, v in base["settings"].items() if k not in VOLATILE_SETTINGS}
+    cs = {k: v for k, v in cand["settings"].items() if k not in VOLATILE_SETTINGS}
+    for k in sorted(set(bs) | set(cs)):
+        if bs.get(k) != cs.get(k):
+            out.append(f"setting {k}: {bs.get(k)!r} against {cs.get(k)!r}")
+    if not base["settings"].get("host_independent") and base["host"].get("name") != cand["host"].get("name"):
+        out.append(f"host: {base['host'].get('name')!r} against {cand['host'].get('name')!r}")
+    cm = {m["key"]: m for m in cand["metrics"]}
+    for m in base["metrics"]:
+        c = cm.get(m["key"])
+        if c and (c["unit"] != m["unit"] or c["better"] != m["better"]):
+            out.append(f"metric {m['key']}: {m['unit']}/{m['better']} against {c['unit']}/{c['better']}")
+    return out
+
+
+def loss_ratio(base, cand, better):
+    """The ratio of the two values, oriented so that above 1 is a loss."""
+    if base == cand:
+        return 1.0
+    worse = cand > base if better == "lower" else cand < base
+    if base == 0 or cand == 0:
+        return math.inf if worse else 0.0
+    return cand / base if better == "lower" else base / cand
+
+
 def compare(args):
     base, cand = read_record(args.baseline), read_record(args.candidate)
     if base["gate"] != cand["gate"]:
         fail(f"gates differ: {base['gate']} and {cand['gate']}")
-    threshold = args.threshold if args.threshold is not None else float(base["settings"].get("threshold", 0.05))
+    reasons = incompatibilities(base, cand)
+    if reasons and not args.allow_different:
+        fail("the records measure different workloads (--allow-different compares them anyway): "
+             + "; ".join(reasons))
+    settings = base["settings"]
+    threshold = args.threshold if args.threshold is not None else float(settings.get("threshold", 0.05))
+    # X14: a query under 0.3 ms on an Intel host may not be slower at all
+    short_below = settings.get("short_below")
+    short_threshold = float(settings.get("short_threshold", threshold))
     pattern = re.compile(args.keys) if args.keys else None
     cm = {m["key"]: m for m in cand["metrics"]}
     rows, bad = [], []
@@ -317,24 +377,36 @@ def compare(args):
             rows.append((key, m["value"], None, None, "missing"))
             bad.append(key)
             continue
-        if m["value"] == 0 or c["value"] == 0:
-            ratio = 1.0 if m["value"] == c["value"] else math.inf
-        elif m["better"] == "lower":
-            ratio = c["value"] / m["value"]
-        else:
-            ratio = m["value"] / c["value"]
-        flag = "slower" if ratio > 1 and ratio >= 1 + threshold else ""
+        ratio = loss_ratio(m["value"], c["value"], m["better"])
+        short = short_below is not None and m["unit"] == "ms" and m["value"] < float(short_below)
+        limit = short_threshold if short else threshold
+        flag = ("slower, short" if short else "slower") if ratio > 1 and ratio >= 1 + limit else ""
         if flag:
             bad.append(key)
         rows.append((key, m["value"], c["value"], ratio, flag))
     failed = [c for c in cand["checks"] if not c["ok"]]
+    # answers and other fingerprints must match the baseline's, whatever the candidate's
+    # own checks say
+    cc = {c["name"]: c for c in cand["checks"]}
+    changed = []
+    for c in base["checks"]:
+        if "fingerprint" not in c:
+            continue
+        if pattern and not pattern.search(c["name"]):
+            continue
+        other = cc.get(c["name"])
+        if other is None or other.get("fingerprint") != c["fingerprint"]:
+            changed.append((c["name"], c["fingerprint"], None if other is None else other.get("fingerprint")))
     print(f"# {base['gate']} gate: candidate against baseline")
     print()
     for label, r in (("baseline", base), ("candidate", cand)):
         mf = r.get("manifest", {})
         print(f"- {label}: host {r['host'].get('name')}, commit {mf.get('binary_commit') or mf.get('commit')}, "
               f"started {mf.get('started')}")
-    print(f"- threshold: {threshold:.1%} slower{f', floor {args.floor}' if args.floor is not None else ''}")
+    print(f"- threshold: {threshold:.1%} slower{f', floor {args.floor}' if args.floor is not None else ''}"
+          + (f", {short_threshold:.1%} below {short_below} ms" if short_below is not None else ""))
+    for r in reasons:
+        print(f"- compared although different: {r}")
     print()
     print("| metric | baseline | candidate | ratio | flag |")
     print("|---|--:|--:|--:|---|")
@@ -344,8 +416,11 @@ def compare(args):
     print()
     if failed:
         print("Failed candidate checks: " + ", ".join(c["name"] for c in failed) + ".")
-    print(f"{len(rows)} metrics compared, {len(bad)} flagged, {len(failed)} failed checks.")
-    sys.exit(1 if bad or failed else 0)
+    for name, b, c in changed:
+        print(f"Changed from the baseline: {name}, {b} against {c}.")
+    print(f"{len(rows)} metrics compared, {len(bad)} flagged, {len(failed)} failed checks, "
+          f"{len(changed)} changed fingerprints.")
+    sys.exit(1 if bad or failed or changed else 0)
 
 
 # ------------------------------------------------------------------------------ catalog
@@ -402,6 +477,7 @@ def main():
     p.add_argument("--threshold", type=float)
     p.add_argument("--floor", type=float)
     p.add_argument("--keys")
+    p.add_argument("--allow-different", action="store_true")
     p = sub.add_parser("catalog")
     p.add_argument("record")
     args = ap.parse_args()

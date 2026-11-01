@@ -19,12 +19,12 @@ def run(*args):
     return subprocess.run([sys.executable, str(GATE), *map(str, args)], capture_output=True, text=True)
 
 
-def metrics_record(d, name, rows, threshold=0.05):
+def metrics_record(d, name, rows, threshold=0.05, scale="1"):
     src = Path(d) / f"{name}.jsonl"
     src.write_text("".join(json.dumps(r) + "\n" for r in rows))
     out = Path(d) / f"{name}.json"
     r = run("metrics", src, "--gate", "insn-screen", "--out", out, "--threshold", threshold,
-            "--manifest", "commit=abc")
+            "--manifest", "commit=abc", "--scale", scale)
     assert r.returncode == 0, r.stderr
     return out
 
@@ -95,6 +95,27 @@ class GateTests(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("Failed candidate checks: answers.", r.stdout)
 
+    def test_short_queries_may_not_be_slower(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "run"
+            res = root / "people-100000-threads-12" / "results"
+            res.mkdir(parents=True)
+            (root / "queries").mkdir()
+            (root / "queries" / "q.rq").write_text("SELECT * WHERE { ?s ?p ?o }")
+            (root / "manifest.txt").write_text("host: forge\n")
+            res.joinpath("answers.tsv").write_text("A\tq\t1\tx\nB\tq\t1\tx\n")
+            def record(name, value):
+                rows = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+                rows += [f"1\t1\t{v}\tq\t1\t{value}\t{value}" for v in "AB"]
+                res.joinpath("samples.tsv").write_text("\n".join(rows) + "\n")
+                out = Path(d) / f"{name}.json"
+                self.assertEqual(run("executors", root, "--out", out).returncode, 0)
+                return out
+            base, cand = record("base", 0.100), record("cand", 0.104)
+            r = run("compare", base, cand)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("slower, short", r.stdout)
+
     def test_floor_skips_short_baselines(self):
         with tempfile.TemporaryDirectory() as d:
             base = metrics_record(d, "base", [{"key": "tiny", "value": 0.1, "unit": "ms", "better": "lower"}])
@@ -112,6 +133,44 @@ class GateTests(unittest.TestCase):
             r = run("compare", base, future)
             self.assertEqual(r.returncode, 2)
             self.assertIn("unknown gate record version 2", r.stderr)
+
+    def test_zero_is_an_improvement_in_the_better_direction(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = metrics_record(d, "base", [{"key": "fallbacks", "value": 30, "unit": "q", "better": "lower"},
+                                              {"key": "passed", "value": 0, "unit": "t", "better": "higher"}])
+            good = metrics_record(d, "good", [{"key": "fallbacks", "value": 0, "unit": "q", "better": "lower"},
+                                              {"key": "passed", "value": 5, "unit": "t", "better": "higher"}])
+            bad = metrics_record(d, "bad", [{"key": "fallbacks", "value": 31, "unit": "q", "better": "lower"},
+                                             {"key": "passed", "value": 0, "unit": "t", "better": "higher"}])
+            self.assertEqual(run("compare", base, good).returncode, 0)
+            zero = metrics_record(d, "zero", [{"key": "fallbacks", "value": 0, "unit": "q", "better": "lower"},
+                                              {"key": "passed", "value": 0, "unit": "t", "better": "higher"}])
+            self.assertEqual(run("compare", zero, bad).returncode, 1)
+            self.assertIn("inf | slower", run("compare", zero, bad).stdout)
+
+    def test_different_workloads_are_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = [{"key": "a", "value": 1, "unit": "ms", "better": "lower"}]
+            base = metrics_record(d, "base", m, scale="20000 items")
+            small = metrics_record(d, "small", m, scale="2000 items")
+            r = run("compare", base, small)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("scale", r.stderr)
+            self.assertEqual(run("compare", base, small, "--allow-different").returncode, 0)
+            units = metrics_record(d, "units", [{"key": "a", "value": 1, "unit": "s", "better": "lower"}],
+                                   scale="20000 items")
+            self.assertIn("metric a", run("compare", base, units).stderr)
+
+    def test_changed_fingerprints_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = {"key": "a", "value": 1, "unit": "ms", "better": "lower"}
+            base = metrics_record(d, "base", [m, {"check": "q/answer", "ok": True, "fingerprint": "1 rows, x"}])
+            same = metrics_record(d, "same", [m, {"check": "q/answer", "ok": True, "fingerprint": "1 rows, x"}])
+            wrong = metrics_record(d, "wrong", [m, {"check": "q/answer", "ok": True, "fingerprint": "0 rows, y"}])
+            self.assertEqual(run("compare", base, same).returncode, 0)
+            r = run("compare", base, wrong)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("Changed from the baseline: q/answer", r.stdout)
 
     def test_executors_reads_each_cell_and_checks_answers(self):
         with tempfile.TemporaryDirectory() as d:
@@ -136,6 +195,9 @@ class GateTests(unittest.TestCase):
             self.assertEqual(keys["1.05m-1t/streaming/count-all/wall"]["value"], 1.1)
             self.assertEqual(keys["1.05m-1t/eager/count-all/exec"]["value"], 1.0)
             self.assertEqual(len(keys["1.05m-1t/streaming/minus/exec"]["samples"]), 3)
+            self.assertEqual(rec["settings"]["short_below"], 0.3)
+            fps = {c["name"]: c.get("fingerprint") for c in rec["checks"]}
+            self.assertEqual(fps["1.05m-1t/count-all/answers"], "1 rows, x")
             checks = {c["name"]: c["ok"] for c in rec["checks"]}
             self.assertTrue(checks["1.05m-1t/count-all/answers"])
             self.assertFalse(checks["1.05m-1t/minus/answers"])

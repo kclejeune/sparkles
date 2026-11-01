@@ -75,9 +75,9 @@ fn store(universities: usize) -> Store {
     s
 }
 
-/// The row count and an order-independent digest of the rows.
+/// The row count and an order-independent digest of the rows, FNV-1a over the sorted rows,
+/// which stays the same across builds so that a gate can compare it with a baseline.
 fn answer(r: &QueryResult) -> (usize, u64) {
-    use std::hash::{Hash, Hasher};
     let mut rows: Vec<String> = r
         .rows()
         .into_iter()
@@ -89,9 +89,13 @@ fn answer(r: &QueryResult) -> (usize, u64) {
         })
         .collect();
     rows.sort_unstable();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    rows.hash(&mut h);
-    (rows.len(), h.finish())
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for row in &rows {
+        for b in row.bytes().chain(*b"\n") {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    (rows.len(), h)
 }
 
 struct Mode {
@@ -145,6 +149,11 @@ fn main() {
             "key": format!("{}/materialize", profile.name()),
             "value": t.elapsed().as_secs_f64() * 1e3, "unit": "ms", "better": "lower",
         }));
+        line(serde_json::json!({
+            "check": format!("{}/materialize/inferred", profile.name()), "ok": r.inferred > 0,
+            "detail": format!("{} inferred triples", r.inferred),
+            "fingerprint": r.inferred.to_string(),
+        }));
         stores.push(s);
     }
     let base = QueryOptions {
@@ -162,7 +171,7 @@ fn main() {
     ));
     let rdfs_demand = demand(Profile::Rdfs);
     let owl_demand = demand(Profile::OwlRl);
-    let modes = vec![
+    let modes = [
         Mode {
             profile: "rdfs",
             name: "materialized",
@@ -268,6 +277,7 @@ fn main() {
             line(serde_json::json!({
                 "check": format!("{}/{}/{q}/answer", m.profile, m.name), "ok": ok,
                 "detail": format!("{} rows, materialized {} rows", a.0, want.0),
+                "fingerprint": format!("{} rows, {:016x}", a.0, a.1),
             }));
         }
     }
