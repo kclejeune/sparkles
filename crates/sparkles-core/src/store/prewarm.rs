@@ -28,8 +28,9 @@ use std::time::Instant;
 pub const FILE: &str = "prewarm.json";
 /// The `format` field of a list.
 const FORMAT: &str = "sparkles-prewarm";
-/// The version of the list this build writes and reads. A reader refuses any other.
-pub const VERSION: u32 = 1;
+/// The version of the list this build writes and reads ([`crate::formats::PREWARM`]). A
+/// reader refuses any other.
+pub const VERSION: u32 = crate::formats::PREWARM.writes;
 /// The most bytes of file pages a list records. The pages past it are left out, in file
 /// order, so that a store much larger than memory does not make every start read
 /// gigabytes it would evict again.
@@ -89,6 +90,10 @@ impl Store {
         let Some(path) = self.prewarm_path() else {
             return Ok(None);
         };
+        // a periodic recording and the one at shutdown may overlap: one at a time, from
+        // the snapshot to the rename, so that the later one, of the newer generation,
+        // replaces the earlier one and their temporary files never mix
+        let _one = RECORDING.lock();
         let snap = self.snapshot();
         let generation = &snap.generation;
         let Some(dir) = generation.dir.as_deref() else {
@@ -133,9 +138,6 @@ impl Store {
             }
         }
         let bytes = serde_json::to_vec(&list).map_err(|e| Error::Invalid(e.to_string()))?;
-        // a periodic recording and the one at shutdown may overlap: one writer at a time
-        // keeps the temporary file and the rename of one from mixing with the other's
-        let _one = RECORDING.lock();
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, &path)?;
@@ -248,7 +250,7 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<List> {
         return Err(bad(path, "is not a Sparkles prewarm list".into()));
     }
     match v.get("version").and_then(|n| n.as_u64()) {
-        Some(n) if n == VERSION as u64 => {}
+        Some(n) if u32::try_from(n).is_ok_and(|n| crate::formats::PREWARM.reads(n)) => {}
         Some(n) => {
             return Err(Error::Unsupported(format!(
                 "{}: prewarm list version {n} is not one this build reads (it reads version {VERSION})",
