@@ -1425,6 +1425,8 @@ python3 scripts/bench-gate.py metrics "$OUT/metrics.jsonl" --gate reasoning-late
   --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
   --manifest build_config="$(python3 scripts/bench-gate.py build-config)" \
   --setting universities="$usage_universities" \
+  --setting queries_sha256="$(sha256sum scripts/bench-lubm/queries.txt | cut -d' ' -f1)" \
+  --setting generator_sha256="$(sha256sum crates/sparkles-reasoner/examples/common/lubm.rs | cut -d' ' -f1)" \
   --setting rounds="$usage_rounds" --setting reps="$usage_reps" --setting threads="$usage_threads" \
   --setting harness="crates/sparkles-reasoner/examples/reasoning_latency.rs"
 SPARKLES_TASK

@@ -164,6 +164,14 @@ def compilers(path):
     return None
 
 
+def runtime_env(environ=None):
+    """The SPARKLES_ environment variables that switch the engine's behaviour at run time,
+    such as SPARKLES_DISABLE_OPTIMIZATIONS, as a dict, which a record keeps in its settings
+    only when there are any."""
+    environ = os.environ if environ is None else environ
+    return {k: v for k, v in sorted(environ.items()) if k.startswith("SPARKLES_")}
+
+
 def parse_kv(pairs):
     out = {}
     for p in pairs or []:
@@ -236,6 +244,11 @@ def executors(args):
             # ORDER_DIGEST, a digest of the ORDER BY keys in the returned order
             v, q, n, h = row[:4]
             answers[q][v] = (n, h) + tuple(o for o in row[4:5] if o != "-")
+        # the timed format's answer after each server process's timed requests
+        warm = defaultdict(set)
+        for row in read_tsv(d / "results" / "warm-answers.tsv"):
+            _, v, q, digest = row[:4]
+            warm[q].add(digest.split(",")[0] if q in unordered else digest)
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the
@@ -248,6 +261,14 @@ def executors(args):
                 [f"{eager[0]} rows", eager[1]] + [f"order {o}" for o in eager[2:]])
             checks.append({"name": f"{cell}/{q}/answers", "ok": agree, "fingerprint": fingerprint,
                            "detail": {MODES[v]: list(a) for v, a in sorted(answers[q].items())}})
+            if warm:
+                digests = warm.get(q, set())
+                rows = answers[q].get("A", ("error",))[0]
+                one = next(iter(digests)) if len(digests) == 1 else ""
+                ok = len(digests) == 1 and (one.startswith("ask ") or one.split(" ")[0] == rows)
+                checks.append({"name": f"{cell}/{q}/timed-answers", "ok": ok,
+                               "fingerprint": next(iter(digests)) if len(digests) == 1 else None,
+                               "detail": sorted(digests)})
             for v in ("A", "B"):
                 if errors[(q, v)]:
                     checks.append({"name": f"{cell}/{q}/{MODES[v]}/errors", "ok": False,
@@ -292,6 +313,8 @@ def executors(args):
                      "queries_sha256": corpus_digest(root / "queries"),
                      "generator_sha256": manifest.get("generator sha256"),
                      "data_sha256": data_digests,
+                     **({"runtime_env": json.loads(manifest["runtime env"])}
+                        if manifest.get("runtime env", "{}") != "{}" else {}),
                      "metric": "medians per request of the server's execMs (/exec) and of curl's time_total (/wall)",
                      "variants": manifest.get("variants"), "run": manifest.get("settings"),
                      "harness": "scripts/bench-executors.sh with scripts/nsc-bench-remote.sh"},
@@ -424,6 +447,9 @@ def metrics(args):
         extra["compilers"] = comp
     settings = parse_kv(args.setting)
     settings["threshold"] = args.threshold
+    # the harness ran in this environment, as the gate tasks run it
+    if runtime_env():
+        settings["runtime_env"] = runtime_env()
     if len(runs) > 1:
         settings["processes"] = len(runs)
     record = {"gate_record": VERSION, "gate": args.gate, "kind": "gate-record",
@@ -460,7 +486,8 @@ def w3c(args):
               "suite": "w3c-sparql", "scale": None, "host": host_info(),
               "manifest": parse_kv(args.manifest),
               "settings": {"threshold": 0.0, "host_independent": True, "execution": "streaming", "batch_rows": 4096,
-                           "harness": "crates/sparkles-core/tests/w3c.rs, the streaming_ tests"},
+                           "harness": "crates/sparkles-core/tests/w3c.rs, the streaming_ tests",
+                           **({"runtime_env": runtime_env()} if runtime_env() else {})},
               "metrics": ms, "checks": checks}
     write_record(record, args.out)
     print(f"{len(ms)} metrics and {len(checks)} checks into {args.out}")
@@ -670,6 +697,44 @@ def build_config_cmd(args):
     print(json.dumps(out, sort_keys=True, separators=(",", ":")))
 
 
+def native_digest(args):
+    """A digest of an application/x-sparkles+json SELECT answer, for the matrix's check of
+    the timed format after the timed requests: "<rows> rows, <digest of the sorted rows>"
+    and, for a query with a top-level ORDER BY, the order digest of `order-digest` over the
+    rows as returned. Terms are written with their type, value, datatype and language."""
+    root = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location("bench_answers", root / "bench-answers.py")
+    ba = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ba)
+    query = Path(args.query).read_text()
+    try:
+        r = json.loads(Path(args.response).read_text())
+    except (OSError, ValueError):
+        print("unreadable")
+        return
+    def show(t):
+        if t is None:
+            return "-"
+        if t.get("type") == "triple":
+            v = t["value"]
+            return "<<" + " ".join(show(v[k]) for k in ("subject", "predicate", "object")) + ">>"
+        return "|".join(str(t.get(k, "")) for k in ("type", "value", "datatype", "xml:lang"))
+    names = r.get("vars") or []
+    if r.get("queryType") == "ASK":
+        print(f"ask {r.get('boolean')}")
+        return
+    rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
+    out = [f"{len(rows)} rows", hashlib.sha256("\n".join(sorted(rows)).encode()).hexdigest()[:16]]
+    if ba._after_order_by(query) is not None:
+        keys = ba.order_keys(query, set(names))
+        h = hashlib.sha256()
+        for row in r.get("rows") or []:
+            cells = [row[names.index(k)] for k in keys] if keys else row
+            h.update("\t".join(show(t) for t in cells).encode() + b"\n")
+        out.append(("keys:" if keys else "rows:") + h.hexdigest()[:16])
+    print(", ".join(out))
+
+
 def compilers_cmd(args):
     c = compilers(args.binary)
     if c is None:
@@ -740,12 +805,16 @@ def main():
     p.add_argument("tsv")
     p = sub.add_parser("compilers")
     p.add_argument("binary")
+    p = sub.add_parser("native-digest")
+    p.add_argument("query")
+    p.add_argument("response")
     p = sub.add_parser("build-config")
     p.add_argument("name", nargs="?", default="release", help="the Cargo profile")
     p.add_argument("--root", default=".")
     args = ap.parse_args()
     {"executors": executors, "metrics": metrics, "w3c": w3c, "compare": compare, "catalog": catalog,
-     "order-digest": order_digest, "compilers": compilers_cmd, "build-config": build_config_cmd}[args.cmd](args)
+     "order-digest": order_digest, "compilers": compilers_cmd, "build-config": build_config_cmd,
+     "native-digest": native_digest}[args.cmd](args)
 
 
 if __name__ == "__main__":

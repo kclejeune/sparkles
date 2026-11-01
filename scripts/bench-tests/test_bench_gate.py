@@ -429,6 +429,56 @@ class GateTests(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             self.assertIn("queries_sha256", r.stderr)
 
+    def test_timed_answers_must_agree_across_server_processes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "run"
+            res = root / "people-100000-threads-1" / "results"
+            res.mkdir(parents=True)
+            (root / "queries").mkdir()
+            q = root / "queries" / "sorted.rq"
+            q.write_text("SELECT ?p ?n WHERE { ?p <name> ?n } ORDER BY ?n")
+            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\nbuild config: {}\n")
+            res.joinpath("samples.tsv").write_text(
+                "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
+                "1\t1\tA\tsorted\t0\t1\t2\n1\t2\tB\tsorted\t0\t1\t2\n")
+            res.joinpath("answers.tsv").write_text("A\tsorted\t2\tx\tk\nB\tsorted\t2\tx\tk\n")
+            def native(rows):
+                f = Path(d) / "resp.json"
+                f.write_text(json.dumps({"queryType": "SELECT", "vars": ["p", "n"], "rows": [
+                    [{"type": "uri", "value": p}, {"type": "literal", "value": n}] for p, n in rows]}))
+                return run("native-digest", q, f).stdout.strip()
+            good = native([("a", "x"), ("b", "y")])
+            self.assertTrue(good.startswith("2 rows, "))
+            self.assertNotEqual(good, native([("b", "y"), ("a", "x")]))
+            out = Path(d) / "record.json"
+            res.joinpath("warm-answers.tsv").write_text(f"1\tA\tsorted\t{good}\n2\tB\tsorted\t{good}\n")
+            self.assertEqual(run("executors", root, "--out", out).returncode, 0)
+            checks = {c["name"]: c for c in json.loads(out.read_text())["checks"]}
+            self.assertTrue(checks["1.05m-1t/sorted/timed-answers"]["ok"])
+            res.joinpath("warm-answers.tsv").write_text(f"1\tA\tsorted\t{good}\n2\tB\tsorted\t0 rows, e\n")
+            self.assertEqual(run("executors", root, "--out", out).returncode, 0)
+            checks = {c["name"]: c for c in json.loads(out.read_text())["checks"]}
+            self.assertFalse(checks["1.05m-1t/sorted/timed-answers"]["ok"])
+
+    def test_runtime_switches_are_part_of_the_workload(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "m.jsonl"
+            src.write_text(json.dumps({"key": "a", "value": 1, "unit": "ms", "better": "lower"}) + "\n")
+            def record(name, **env):
+                out = Path(d) / f"{name}.json"
+                r = subprocess.run([sys.executable, str(GATE), "metrics", str(src), "--gate", "incr", "--out", str(out),
+                                    "--manifest", "compilers=c", "--manifest", "build_config={}"],
+                                   capture_output=True, text=True,
+                                   env={k: v for k, v in dict(os.environ, **env).items()})
+                self.assertEqual(r.returncode, 0, r.stderr)
+                return out
+            plain = record("plain")
+            switched = record("switched", SPARKLES_DISABLE_OPTIMIZATIONS="metadata_counts")
+            self.assertEqual(run("compare", plain, plain).returncode, 0)
+            r = run("compare", plain, switched)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("runtime_env", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

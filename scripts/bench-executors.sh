@@ -142,6 +142,8 @@ NQ=$(find "$OUT/queries" -name '*.rq' | wc -l)
   # the compilers, from the binary's .comment section, for compare's toolchain check
   echo "compilers: $(python3 "$ROOT/scripts/bench-gate.py" compilers "$BIN")"
   [ -z "$BUILD_CONFIG" ] || echo "build config: $BUILD_CONFIG"
+  # the servers inherit these, and compare requires them to match
+  echo "runtime env: $(python3 -c 'import json, os; print(json.dumps({k: v for k, v in sorted(os.environ.items()) if k.startswith("SPARKLES_")}))')"
   echo "scripts commit: $(git -C "$ROOT" rev-parse HEAD 2> /dev/null || echo unknown)"
   echo "scripts dirty: $(git -C "$ROOT" status --porcelain 2> /dev/null | grep -c . || true)"
   echo "host: $(hostname)"
@@ -191,6 +193,7 @@ PORT=$PORT
 EXECUTION=eager,streaming
 SHARE_STORE=1
 ORDER_DIGEST="python3 $ROOT/scripts/bench-gate.py order-digest"
+WARM_DIGEST="python3 $ROOT/scripts/bench-gate.py native-digest"
 ENV
     {
       sed -n '1,/^settings:/p' "$OUT/manifest.txt" | grep -v '^settings:'
