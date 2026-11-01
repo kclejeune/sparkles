@@ -140,9 +140,12 @@ column when another extra column holds values of the same kind as the gold colum
 Generated queries ran the `sparkles ask` process out of memory three times. A
 zero-or-more property path over redirects and disambiguations reached about 28 GB twice,
 and `skos:broader?/skos:broader?` from an unbound category reached a 12 GB cap. Ask's
-default query memory budget of 2048 MiB and 60-second timeout did not stop them. Ask
-needs an enforced default memory budget and timeout that cover property-path evaluation,
-which [ROADMAP](../../ROADMAP.md) item 505 tracks.
+default query memory budget of 2048 MiB and 60-second timeout did not stop them, because
+eager property path evaluation neither charged its closure state nor checked the
+deadline. Property path closures now run within both limits
+([X08](../../specs/X08-disk-spill-and-server-memory.md#property-path-closures-2026-10-31)),
+and the `why_empty` checks of the three queries finish in under 8 seconds on the same
+data. The runs recorded here predate that change.
 
 [ROADMAP](../../ROADMAP.md) item 263 holds the accuracy work. The
 [paid record](../2026-11-01-ask-model-baseline-paid.json) gives per-run and per-case
