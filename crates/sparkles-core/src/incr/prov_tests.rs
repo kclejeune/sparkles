@@ -1000,13 +1000,23 @@ fn resolving_keys_stops_and_cancels() {
         &format!("SELECT DISTINCT ?b WHERE {{ ?a <{NS}p0> ?b }}"),
         Provenance::Count,
     );
-    let k = FactKey::of_terms(&iri("m7".into()), &pred(0), &node(0), None);
-    let r = c.resolve_facts(&[k], &Control::none()).unwrap();
-    assert!(r[0].1.is_some());
+    // a key the scan meets first ends it
+    let (_, all) = c.resolve_counted(
+        &[FactKey::of_terms(&node(3), &pred(0), &node(0), None)],
+        &Control::none(),
+    );
+    assert!(all >= 3000, "a missing key scans every quad ({all})");
+    let k = FactKey::of_terms(&iri("m0".into()), &pred(0), &node(0), None);
+    let (r, early) = c.resolve_counted(&[k], &Control::none());
+    assert!(r.unwrap()[0].1.is_some());
+    assert!(early < 100, "the scan stops at the key ({early} quads)");
+    // cancellation stops the scan within one check
     let control = Control::none();
     control.cancel.cancel();
     let missing = FactKey::of_terms(&node(3), &pred(0), &node(0), None);
-    assert!(c.resolve_facts(&[missing], &control).is_err());
+    let (r, cancelled) = c.resolve_counted(&[missing], &control);
+    assert!(r.is_err());
+    assert!(cancelled <= 1024, "{cancelled} quads after cancellation");
 }
 
 /// An OPTIONAL's filter reads left variables beyond the shared ones, so two rows

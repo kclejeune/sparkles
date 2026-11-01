@@ -37,7 +37,8 @@
 //! not keep is taken from the unknown count. Two derivations with the same row and the
 //! same support are indistinguishable downstream, so the rules hold through every
 //! operator, and a row converges to exact supports once its unknown derivations are
-//! removed or the circuit is built again. A build keeps the smallest supports first.
+//! removed. A build is exact for a row whose supports fit the bound and whose atoms are
+//! known, and otherwise keeps the smallest supports.
 //!
 //! The reported witnesses ([`Ann::report`]) are the minimal kept supports, smallest
 //! first, and `truncated` is set exactly when the unknown count is not zero. Rows that a

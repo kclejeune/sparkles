@@ -420,6 +420,33 @@ impl Circuit {
         keys: &[FactKey],
         control: &Control,
     ) -> Result<Vec<(FactKey, Option<([Term; 3], Option<Term>)>)>> {
+        self.resolve_scan(keys, control, &mut 0)
+    }
+
+    /// [`resolve_facts`](Self::resolve_facts) with the number of quads its scans
+    /// visited, which tests read.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn resolve_counted(
+        &self,
+        keys: &[FactKey],
+        control: &Control,
+    ) -> (
+        Result<Vec<(FactKey, Option<([Term; 3], Option<Term>)>)>>,
+        u64,
+    ) {
+        let mut scanned = 0;
+        let r = self.resolve_scan(keys, control, &mut scanned);
+        (r, scanned)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_scan(
+        &self,
+        keys: &[FactKey],
+        control: &Control,
+        scanned: &mut u64,
+    ) -> Result<Vec<(FactKey, Option<([Term; 3], Option<Term>)>)>> {
         let mut found: FxHashMap<FactKey, [Id; 4]> = FxHashMap::default();
         let Some(snap) = self.snap.clone() else {
             return Ok(keys.iter().map(|k| (*k, None)).collect());
@@ -445,7 +472,7 @@ impl Circuit {
             if found.len() == wanted.len() {
                 break;
             }
-            b.visit(&p, super::pass::Which::New, &mut |q| {
+            let r = b.visit(&p, super::pass::Which::New, &mut |q| {
                 seen += 1;
                 if seen.is_multiple_of(1024) {
                     control.check()?;
@@ -455,8 +482,14 @@ impl Circuit {
                     found.insert(k, q);
                 }
                 Ok(found.len() < wanted.len())
-            })?;
+            });
+            #[cfg(test)]
+            {
+                *scanned = p.scanned.get();
+            }
+            r?;
         }
+        let _ = &scanned;
         drop(p);
         let term = |i: Id| self.terms.term(&snap, i);
         Ok(keys

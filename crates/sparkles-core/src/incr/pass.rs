@@ -144,6 +144,9 @@ pub struct Pass<'a> {
     pub prov: super::prov::Provenance,
     /// the keys of quads met so far, when the circuit keeps an annotation
     pub facts: Option<&'a mut super::prov::FactCache>,
+    /// the quads scans visited, for tests
+    #[cfg(test)]
+    pub scanned: std::cell::Cell<u64>,
     ctx: Option<Ctx>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
@@ -180,6 +183,8 @@ impl<'a> Pass<'a> {
             inference: None,
             prov: super::prov::Provenance::None,
             facts: None,
+            #[cfg(test)]
+            scanned: std::cell::Cell::new(0),
             ctx: None,
             union_changes: None,
             work: 0,
@@ -288,6 +293,8 @@ impl<'a> Pass<'a> {
         };
         let mut stop = false;
         let mut each = |q: [Id; 4]| -> Result<bool> {
+            #[cfg(test)]
+            self.scanned.set(self.scanned.get() + 1);
             if s.is_some_and(|x| x != q[0])
                 || p.is_some_and(|x| x != q[1])
                 || o.is_some_and(|x| x != q[2])

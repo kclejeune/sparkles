@@ -1271,7 +1271,8 @@ operator of the circuit. Internal circuits that keep rows take it through
   never more than the row's derivations with that support, and an unknown count of zero
   means the supports are exact. A reported witness is therefore always real, `truncated`
   is set exactly when the unknown count is not zero, and a row is exact again once its
-  unknown derivations are removed or the circuit is built again. A build keeps the
+  unknown derivations are removed. A build is exact for a row whose supports fit the
+  bound and whose atoms are known, and otherwise keeps the smallest supports. A build keeps the
   smallest supports first. A report lists the minimal kept supports, smallest first. This
   is the convergence rule that item 416 adopts for the reasoner.
 - **Where atoms are unknown.** The rows of a `recompute` node, including a whole query
