@@ -17,3 +17,7 @@ __pycache__/
 
 # Validation evidence and benchmark results are not compiler-cache contents.
 /.artifacts
+
+# Personal agent instructions (see AGENTS.md)
+/AGENTS.local.md
+/CLAUDE.local.md

@@ -8,11 +8,15 @@ style of QLever. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) covers the layout, t
 the mise tasks and the test suites. [docs/ROADMAP.md](docs/ROADMAP.md) sets the order of
 work, and each item links to its design spec in [docs/specs](docs/specs/README.md).
 
+A contributor can keep personal instructions in `AGENTS.local.md` at the repository root,
+which git ignores, for their own hosts, accounts and tools. Read it when it exists. It
+adds to this file and does not override it.
+
 ## Building and testing
 
 - Build with Mr. Boxington by running `mbx build`, `mbx check`, `mbx test` or
-  `mbx nextest run` in place of Cargo. Check that `mbx --version` matches `mise.toml` on each host, since
-  having `mbx` on PATH does not prove that plain Cargo uses it.
+  `mbx nextest run` in place of Cargo. Check that `mbx --version` matches `mise.toml` on
+  each host, since having `mbx` on PATH does not prove that plain Cargo uses it.
 - Keep Boxington's one shared cache per host and its managed `target` in each worktree.
   Do not set a private `MBX_CACHE_DIR`, `CARGO_TARGET_DIR` or `--target-dir` for
   ordinary builds, since these opt out of the shared cache or the managed target.
@@ -26,10 +30,28 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   workspace's Clippy and Rust tests. `scripts/ci.sh` runs every check, and the
   conformance suites run with `mise run test:w3c`, `test:shacl` and `test:shex`.
   [Merging and pushing](#merging-and-pushing) says which of these a lane and a batch run.
-- When the local machine is busy, build and test on another host (atlas or forge), or on an
+- When the local machine is busy, build and test on another build host or on an
   ephemeral Namespace instance created with `nsc create --bare --duration …` and always
-  destroyed afterwards. Before a benchmark runs on forge or atlas, move builds off that host
-  so the engine under test runs alone.
+  destroyed afterwards. The benchmark host, which `SPARKLES_BENCH_HOST` names, runs no
+  builds or gates, and a benchmark on any host starts only once other heavy work has left
+  it, so the engine under test runs alone.
+
+## Long-running and remote work
+
+- Run a long or remote command where it can be listed, read and stopped by name, such as
+  a persistent named terminal or a systemd unit. Wait for it with a command that returns
+  when it finishes or prints a ready line, not with a sleep loop.
+- Stop only processes you started, by their own identifier. Never use `pkill -f` or a
+  pattern that can match someone else's work. Before reporting, check that nothing you
+  started is still running unless the report says what keeps running and why.
+- Run heavy builds and tests in a memory-capped scope where systemd is available, such
+  as `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue`,
+  so that an out-of-memory kill ends that command and not the session or terminal around it.
+- Never run two `mise run bench:nsc` screens of the same commit at once, since they share
+  the commit's source directory.
+- Runs that call paid model APIs need the maintainer's approval and a spending cap first.
+  Inject their keys through the secret tool the environment provides, and never print or
+  write a key.
 
 ## Engineering rules
 
@@ -43,7 +65,7 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   Fluree's public documentation only, and never read Fluree's source code.
 - Performance claims need measurements. `mise run bench:nsc A B` gives a quick A/B on
   Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
-  need an Intel host, and published numbers come from forge. See
+  need an Intel host, and published numbers come from the benchmark host. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 - A measured slowdown that a gate accepts still gets a follow-up item in
   [docs/ROADMAP.md](docs/ROADMAP.md), added in the same change that accepts it. This holds
@@ -93,6 +115,12 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
 Large work is split into lanes, one agent per roadmap item or spec phase, each in its own
 git worktree and port range. An orchestrating session starts the lanes, merges them and
 keeps the handoff notes current.
+
+A delegated agent sees only its checkout, the tracked instructions and its host's own
+configuration. Its brief is therefore self-contained and written to a file in its
+worktree, such as `.artifacts/lanes/<name>/brief.md`. The agent reports results to its
+parent, writes long results to a file, and starts no agents of its own unless the brief
+assigns that.
 
 ### Models
 
@@ -151,9 +179,7 @@ or Opus. The final report lists each consult.
 
 ### Review before landing
 
-No lane lands without review:
-
-Each step picks its model from the table above.
+No lane lands without review, and each step picks its model from the table above.
 
 1. **An independent agent reviews.** `scripts/codex-review.sh NAME TIP BASE "CONTEXT"`
    runs `codex exec review` on `BASE..TIP` in a scratch worktree and writes `review.md`
@@ -187,13 +213,13 @@ since `--fast` runs none of them. Lanes do not run full gates of their own.
 Finished lanes merge into local `main` as they land, and several lanes may share one
 batch. One full gate runs on the batch: `scripts/ci.sh`, the conformance suites and a
 Namespace screen (`mise run bench:nsc origin/main HEAD`). `scripts/gate/gate.sh <rev>` runs
-the tests on wally and atlas, as the
+the tests on the configured gate hosts, as the
 [batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Push when the tests pass and the
 screen shows no query 10% or more slower after a rerun of the flagged queries with more
 rounds.
 
-Forge measurements do not hold up a feature lane or a push. A lane whose goal is
-performance measures on forge before it reports, and every other lane reports once its
-review and tests pass. Pinned forge checks of the screen's flags, including queries under
-0.3 ms, run after the push. A regression they confirm is bisected across the batch's merges
-and fixed forward in a follow-up commit.
+Benchmark-host measurements do not hold up a feature lane or a push. A lane whose goal
+is performance measures on the benchmark host before it reports, and every other lane
+reports once its review and tests pass. Pinned benchmark-host checks of the screen's
+flags, including queries under 0.3 ms, run after the push. A regression they confirm is
+bisected across the batch's merges and fixed forward in a follow-up commit.
