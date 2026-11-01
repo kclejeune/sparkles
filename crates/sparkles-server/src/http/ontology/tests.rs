@@ -1,0 +1,327 @@
+//! In-process tests of the ontology routes; the caller's grants are tested in
+//! `router_tests::auth::ontology`.
+
+use crate::http::router;
+use crate::state::{AppState, DbType};
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use serde_json::{Value as J, json};
+use sparkles::io::Source;
+use sparkles::store::StoreOptions;
+use std::sync::Arc;
+use std::time::Duration;
+use tower::ServiceExt;
+
+const DATA: &str = "@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology ; rdfs:label \"Teaching\" .
+:Professor a owl:Class . :Course a owl:Class . :Person a owl:Class .
+:teaches a owl:ObjectProperty .
+:Professor rdfs:subClassOf :Person ,
+    [ a owl:Restriction ; owl:onProperty :teaches ; owl:someValuesFrom :Course ] .
+:ada a :Professor ; :teaches :logic .
+";
+
+struct Server {
+    _dir: tempfile::TempDir,
+    _state: Arc<AppState>,
+    app: Router,
+}
+
+fn server() -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let ds = state.attach("t", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state.clone());
+    Server {
+        _dir: dir,
+        _state: state,
+        app,
+    }
+}
+
+struct Resp {
+    status: StatusCode,
+    headers: axum::http::HeaderMap,
+    body: Vec<u8>,
+}
+
+impl Resp {
+    fn json(&self) -> J {
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| panic!("{e}: {}", self.text()))
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+async fn send(app: &Router, method: &str, uri: &str, headers: &[(&str, &str)], body: &str) -> Resp {
+    let mut req = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let headers = res.headers().clone();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Resp {
+        status,
+        headers,
+        body,
+    }
+}
+
+async fn get(app: &Router, uri: &str) -> Resp {
+    send(app, "GET", uri, &[], "").await
+}
+
+async fn post(app: &Router, uri: &str, body: J) -> Resp {
+    send(
+        app,
+        "POST",
+        uri,
+        &[(header::CONTENT_TYPE.as_str(), "application/json")],
+        &body.to_string(),
+    )
+    .await
+}
+
+fn enc(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+fn sub(a: &str, b: J) -> J {
+    json!({"type": "SubClassOf", "subClass": a, "superClass": b})
+}
+
+#[tokio::test]
+async fn the_summary_counts_the_terminology() {
+    let s = server();
+    let r = get(&s.app, "/$/ontology/t").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["header"]["iri"], "http://ex.org/o");
+    assert_eq!(
+        j["header"]["annotations"][0],
+        "Annotation(rdfs:label \"Teaching\")"
+    );
+    assert_eq!(j["axioms"]["SubClassOf"], 2);
+    assert_eq!(j["entities"]["Class"], 3);
+    assert_eq!(j["unmapped"], 0);
+    assert_eq!(j["graphs"], json!(["default"]));
+    assert_eq!(j["mode"], "lenient");
+    let tag = r.headers[header::ETAG].to_str().unwrap();
+    assert!(tag.ends_with(":owl\""), "{tag}");
+    // a parameter that does not parse is a 400
+    let r = get(&s.app, "/$/ontology/t?mode=loose").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = get(&s.app, "/$/ontology/missing").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn axioms_page_and_filter() {
+    let s = server();
+    let r = get(&s.app, "/$/ontology/t/axioms?type=SubClassOf").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["total"], 2);
+    let ofn: Vec<&str> = j["axioms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["ofn"].as_str().unwrap())
+        .collect();
+    assert!(
+        ofn.contains(&"SubClassOf(:Professor ObjectSomeValuesFrom(:teaches :Course))"),
+        "{ofn:?}"
+    );
+    assert_eq!(j["axioms"][0]["graph"], "default");
+    // pages
+    let j = get(&s.app, "/$/ontology/t/axioms?limit=3").await.json();
+    assert_eq!(j["axioms"].as_array().unwrap().len(), 3);
+    assert_eq!(j["next"], 3);
+    let total = j["total"].as_u64().unwrap();
+    let j = get(
+        &s.app,
+        &format!("/$/ontology/t/axioms?limit=3&offset={}", total - 1),
+    )
+    .await
+    .json();
+    assert_eq!(j["axioms"].as_array().unwrap().len(), 1);
+    assert!(j["next"].is_null());
+    // about an entity, with the assertions the store holds
+    let about = enc("http://ex.org/ada");
+    let j = get(
+        &s.app,
+        &format!("/$/ontology/t/axioms?about={about}&assertions=true"),
+    )
+    .await
+    .json();
+    assert_eq!(j["total"], 2, "{j}");
+    let unknown = enc("http://ex.org/nobody");
+    let r = get(&s.app, &format!("/$/ontology/t/axioms?about={unknown}")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // the functional-style document
+    let r = get(&s.app, "/$/ontology/t/axioms?format=ofn&type=SubClassOf").await;
+    assert_eq!(r.status, StatusCode::OK);
+    let text = r.text();
+    assert!(text.contains("Ontology(<http://ex.org/o>"), "{text}");
+    assert!(text.contains("SubClassOf(:Professor :Person)"), "{text}");
+    assert!(get(&s.app, "/$/ontology/t/axioms?type=Nope").await.status == StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn checks_report_each_profile() {
+    let s = server();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/check",
+        json!({"profiles": ["el", "ql", "rl", "dl"]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let conforms: Vec<bool> = j["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["conforms"].as_bool().unwrap())
+        .collect();
+    assert_eq!(conforms, [true, true, false, true]);
+    assert_eq!(j["conforms"], false);
+    let rl = &j["reports"][2];
+    assert_eq!(rl["profile"], "rl");
+    assert!(
+        rl["violations"][0]["rule"]
+            .as_str()
+            .unwrap()
+            .contains("§4.2"),
+        "{rl}"
+    );
+    assert!(
+        rl["violations"][0]["axiom"]
+            .as_str()
+            .unwrap()
+            .starts_with("SubClassOf(")
+    );
+    // the default is DL; a strict read refuses the undeclared individuals' property
+    let r = post(&s.app, "/$/ontology/t/check", json!({"mode": "strict"})).await;
+    assert_eq!(r.json()["reports"].as_array().unwrap().len(), 1);
+    let r = post(&s.app, "/$/ontology/t/check", json!({"profiles": ["xl"]})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = post(&s.app, "/$/ontology/t/check", json!({"nonsense": 1})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn edits_add_and_remove_axioms() {
+    let s = server();
+    let added = sub("http://ex.org/Lecturer", json!("http://ex.org/Person"));
+    let r = post(&s.app, "/$/ontology/t/axioms", json!({"add": [added]})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["added"], 2, "{j}");
+    assert_eq!(j["declared"], json!(["Class(:Lecturer)"]));
+    assert!(r.headers.contains_key("sparkles-commit"), "{:?}", r.headers);
+    let j = get(&s.app, "/$/ontology/t/axioms?type=SubClassOf")
+        .await
+        .json();
+    assert_eq!(j["total"], 3);
+    // the restriction goes with its axiom
+    let restriction = sub(
+        "http://ex.org/Professor",
+        json!({"type": "ObjectSomeValuesFrom", "property": "http://ex.org/teaches", "class": "http://ex.org/Course"}),
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/axioms",
+        json!({"remove": [restriction, added]}),
+    )
+    .await;
+    let j = r.json();
+    assert_eq!(
+        (j["removed"].as_u64(), j["deleted"].as_u64()),
+        (Some(2), Some(5)),
+        "{j}"
+    );
+    let j = get(&s.app, "/$/ontology/t").await.json();
+    assert_eq!(j["axioms"]["SubClassOf"], 1);
+    assert_eq!(j["unmapped"], 0);
+    // removing what is not there is not an error
+    let r = post(
+        &s.app,
+        "/$/ontology/t/axioms",
+        json!({"remove": [sub("http://ex.org/A", json!("http://ex.org/B"))]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["absent"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn edits_refuse_bad_axioms_and_stale_tags() {
+    let s = server();
+    let bad = json!({"type": "DisjointClasses", "classes": ["http://ex.org/A"]});
+    let r = post(&s.app, "/$/ontology/t/axioms", json!({"add": [bad]})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["code"], "invalid-axiom");
+    let r = post(&s.app, "/$/ontology/t/axioms", json!({})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // If-Match names the summary's commit
+    let tag = get(&s.app, "/$/ontology/t").await.headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = json!({"add": [sub("http://ex.org/A", json!("http://ex.org/B"))]}).to_string();
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+}
+
+#[tokio::test]
+async fn a_dry_run_commits_nothing() {
+    let s = server();
+    let body = json!({"add": [sub("http://ex.org/A", json!("http://ex.org/B"))]});
+    let r = post(&s.app, "/$/ontology/t/axioms?dryRun=true", body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = get(&s.app, "/$/ontology/t/axioms?type=SubClassOf")
+        .await
+        .json();
+    assert_eq!(j["total"], 2);
+}

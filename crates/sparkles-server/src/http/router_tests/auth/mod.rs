@@ -28,6 +28,8 @@ mod limits;
 #[cfg(feature = "mcp")]
 mod mcp_oauth;
 mod oidc;
+#[cfg(feature = "ontology")]
+mod ontology;
 mod overview;
 mod paths;
 mod proxy;

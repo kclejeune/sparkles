@@ -68,6 +68,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/schema/{ds}/constraints", &["GET"]),
     ("/$/schema/{ds}/profiles", &["GET"]),
     ("/$/schema/{ds}/diff", &["GET"]),
+    ("/$/ontology/{ds}", &["GET"]),
+    ("/$/ontology/{ds}/axioms", &["GET", "POST"]),
+    ("/$/ontology/{ds}/check", &["POST"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
     // editing forms (U02): the check and the save check write on the branch they name
@@ -383,6 +386,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ingest/{ds}/{task}/confirm"
         | "/$/ingest/{ds}/{task}/approve" => Dataset(Read),
         "/$/assistant/{ds}" if get => Dataset(Read),
+        // the axioms of the ontology are read with read access and edited with write
+        "/$/ontology/{ds}/axioms" if get => Dataset(Read),
+        "/$/ontology/{ds}/axioms" => Dataset(Write),
         "/$/assistant/{ds}" => Dataset(Admin),
         "/$/graphrag/{ds}"
         | "/$/graphrag/{ds}/communities"
@@ -436,6 +442,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/constraints"
         | "/$/schema/{ds}/profiles"
         | "/$/schema/{ds}/diff"
+        | "/$/ontology/{ds}"
+        | "/$/ontology/{ds}/check"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/forms/{ds}"
@@ -608,6 +616,9 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/reason/{ds}/justify"
         | "/$/forms/{ds}" => Endpoint::Query,
         "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
+        "/$/ontology/{ds}" | "/$/ontology/{ds}/check" => Endpoint::Query,
+        "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
+        "/$/ontology/{ds}/axioms" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,

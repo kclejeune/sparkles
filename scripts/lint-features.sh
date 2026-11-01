@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 server=(
   ""
   reasoning
+  ontology
   shacl
   shex
   text
@@ -58,6 +59,7 @@ run "sparkles-core [no features]" -p sparkles-core --all-targets
 run "sparkles-core [mapping-sqlite]" -p sparkles-core --all-targets --features mapping-sqlite
 run "sparkles-core [mapping-parquet]" -p sparkles-core --all-targets --features mapping-parquet
 run "sparkles [no features]" -p sparkles --all-targets
+run "sparkles [ontology]" -p sparkles --all-targets --features ontology
 run "sparkles-fmt [no features]" -p sparkles-fmt --all-targets
 # the Rust client without its blocking facade
 run "sparkles-client [no features]" -p sparkles-client --all-targets

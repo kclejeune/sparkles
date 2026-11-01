@@ -516,6 +516,7 @@ pub(super) fn add_all(p: &mut Paths) {
     datasets(p);
     fuseki(p);
     schema(p);
+    ontology(p);
     forms(p);
     admin(p);
     queries(p);
@@ -535,6 +536,130 @@ pub(super) fn add_all(p: &mut Paths) {
 }
 
 /// Editing forms generated from SHACL shapes (U02).
+fn ontology(p: &mut Paths) {
+    let read = |o: Op| {
+        o.query(
+            "graph",
+            s(),
+            "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+        )
+        .query(
+            "imports",
+            boolean(),
+            "Follow `owl:imports` to graphs of the dataset (the default).",
+        )
+        .query(
+            "mode",
+            json!({ "type": "string", "enum": ["lenient", "strict"] }),
+            "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+        )
+    };
+    let object = json!({ "application/json": { "schema": { "type": "object" } } });
+    let selection = json!({
+        "graph": { "description": "A graph IRI or `default`, or a list of them." },
+        "imports": { "type": "boolean" },
+        "mode": { "type": "string", "enum": ["lenient", "strict"] },
+    });
+    p.add(
+        read(op(GET, "/$/ontology/{ds}", "getOntology", "Ontology", "Ontology summary"))
+            .doc("The ontology header, the counts of declared entities by kind and of axioms by type in the terminology, the graphs read with the imports that resolved, the triples read, the unmapped triples and the diagnostics of the read. The entity tag names the commit read, and an edit's `If-Match` can name it.")
+            .see("ontology")
+            .param("at")
+            .param("ifNoneMatch")
+            .resp("200", "The summary.", Some(object.clone()))
+            .resp("304", "The summary is still at the tagged commit.", None)
+            .errors(&[400, 404, 408]),
+    );
+    p.add(
+        read(op(GET, "/$/ontology/{ds}/axioms", "getOntologyAxioms", "Ontology", "Ontology axioms"))
+            .doc("The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.")
+            .see("ontology")
+            .param("at")
+            .query("type", s(), "Axiom types, comma separated, such as `SubClassOf,EquivalentClasses`.")
+            .query("about", s(), "An entity IRI the axioms mention.")
+            .query("assertions", boolean(), "Also list the assertions the store holds.")
+            .query("format", json!({ "type": "string", "enum": ["json", "ofn"] }), "`json` (the default) or `ofn`.")
+            .query("limit", int(), "The most axioms listed, from 1 to 10,000 (100 by default).")
+            .query("offset", int(), "The axioms skipped.")
+            .resp(
+                "200",
+                "One page of axioms.",
+                Some(json!({
+                    "application/json": { "schema": { "type": "object" } },
+                    "text/owl-functional": { "schema": { "type": "string" } }
+                })),
+            )
+            .errors(&[400, 404, 408]),
+    );
+    p.add(
+        op(POST, "/$/ontology/{ds}/check", "checkOntology", "Ontology", "Check OWL 2 profiles")
+            .doc("One report per profile in `profiles` (`el`, `ql`, `rl`, `dl` or `all`; `dl` by default), over the terminology and, unless `assertions` is false, the assertions the store holds. Each report lists the violations with the rule of the OWL 2 Profiles or the structural specification that each breaks. The EL, QL and RL reports also list the OWL 2 DL violations.")
+            .see("ontology")
+            .param("timeout")
+            .body(
+                false,
+                "The ontology and the profiles.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "profiles": { "type": "array", "items": { "type": "string", "enum": ["el", "ql", "rl", "dl", "all"] } },
+                        "assertions": { "type": "boolean", "description": "Check the assertions the store holds (the default)." },
+                        "maxViolations": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most violations each report lists (1,000 by default)." }
+                    }
+                } } }),
+            )
+            .resp("200", "The reports.", Some(object.clone()))
+            .errors(&[400, 404, 408]),
+    );
+    p.add(
+        write_params(op(POST, "/$/ontology/{ds}/axioms", "editOntology", "Ontology", "Add and remove axioms"))
+            .doc("Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.")
+            .see("ontology")
+            .param("ifMatch")
+            .body(
+                true,
+                "The axioms.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "add": { "type": "array", "items": { "type": "object" } },
+                        "remove": { "type": "array", "items": { "type": "object" } },
+                        "declare": { "type": "boolean" },
+                        "target": { "type": "string", "description": "The graph that takes the added axioms." },
+                        "message": { "type": "string" }
+                    }
+                } } }),
+            )
+            .resp(
+                "200",
+                "What the edit did, with the receipt when asked for.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "added": { "type": "integer" },
+                        "present": { "type": "integer" },
+                        "removed": { "type": "integer" },
+                        "absent": { "type": "array", "items": { "type": "string" } },
+                        "declared": { "type": "array", "items": { "type": "string" } },
+                        "inserted": { "type": "integer" },
+                        "deleted": { "type": "integer" },
+                        "kept": { "type": "integer" },
+                        "committed": { "type": "boolean" }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 412, 422, 507]),
+    );
+}
+
 fn forms(p: &mut Paths) {
     let term = json!({ "type": "object", "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`." });
     let change = json!({ "application/json": { "schema": {
