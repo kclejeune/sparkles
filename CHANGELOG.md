@@ -614,6 +614,37 @@ tokens. The DBpedia gold rewrites leave literals and comments alone, never reuse
 variable of the query and also rewrite `COUNT(*)`. A sampled LC-QuAD 2.0 set records how
 many questions it sampled.
 
+Ask grounding now reads from the data which predicates the linked entities use as
+subject and as object, and which a sample of 200 instances of the two classes that best
+match the question use, and lists them by namespace with their counts. The queries run
+as the caller, each within five seconds and the MCP limits, and search the readable
+named graphs only when the caller can read one. `link_entities` takes `popularity`,
+which orders label matches by how many triples name each one, counted up to 2000, and
+reports that count as `uses`. Ask asks for it, so a well-connected entity comes before
+a namesake that shares its label. Mention detection keeps a capitalized "The" inside a
+question and a number after a name. The draft prompt says that the context lists only
+part of the vocabulary and asks for one predicate per relation instead of a UNION or a
+`VALUES` list of candidates. A first-draft prompt grows by about 8%, and each Ask runs
+two to three more bounded queries per linked entity and one per matched class.
+
+The Ask evaluation scores every case under the guarded secondary policy
+`rdf-term-set-projected-guarded-lenient-v3` beside the strict score. It applies the gold
+errata `gold-errata-v1`, drops empty-string rows, compares numbers by value, matches an
+unambiguous label to the gold IRI it names, fails an answer with more than three extra
+columns and sets apart passes that rely on a predicate column or on rows the projection
+drops. An Ask child that SIGKILL or a failed allocation ends is the failed case `killed`
+instead of a harness fault. `scripts/qald9plus-convert --split train` converts the
+QALD-9-plus training split, and `eval_support/grounding_recall.py` measures from saved
+prompts whether each gold term reached the prompt. The dry-run fake provider reads
+prompts that arrive as cached text blocks.
+
+`scripts/eval-ask` and `scripts/eval-ask-anthropic` take `--jobs N` to ask N cases at
+once. Each case has its own gate token, the ledger holds its projected cost before it
+starts, and no request spends what another case in flight holds. The report, the case
+files and `replies.jsonl` keep question order. `--child-memory-max` runs each child in
+its own systemd scope with a memory limit and no swap, 4G by default above one job. A
+database directory admits one process, so `--jobs` above 1 needs a set's data file.
+
 The Ask evaluation scores under `rdf-term-set-projected-columns-v2`. An answer with more
 columns than the gold, such as a name beside each IRI, is projected onto the gold's
 columns and its rows compared as a set, where the first policy scored any extra column

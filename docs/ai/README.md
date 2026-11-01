@@ -89,6 +89,14 @@ build community reports.
   bounded search does not prove unique intent. The generic `link_entities` verdict is
   unchanged. If rich evidence exceeds the result-byte allowance, Ask retries ordinary
   linking once under the same deadline and permissions and keeps its display rule.
+* Ask also asks the data which predicates the linked entities use as subject and as
+  object, and which a sample of 200 instances of the two classes that best match the
+  question use. It lists them by namespace with their counts, ranked by the question's
+  words and then by use. Each query runs as the caller within five seconds and the MCP
+  limits, and a failed one only leaves its line out. Ask links with `popularity`, so
+  label matches are ordered by how many triples name each one. The draft rules tell the
+  model that the context is partial and to use one predicate per relation. This adds
+  about 8% to a first-draft prompt and two to three bounded queries per linked entity.
 * The extra kind preference recognizes the English words film, movie, book, novel,
   song, album, city, town, country, river and person through supported DBpedia,
   schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing
@@ -411,11 +419,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Ask has been evaluated with Anthropic models only, on the demo set, CK25, QALD-9-plus
   and 74 DBpedia-only questions
   ([C18](../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
-  [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-on-dbpedia)). On the 107
-  retained QALD-9-plus questions, which Ask grounding was tuned on, Opus answers 41, Sonnet
-  33 and Haiku 28 under projected-column scoring. On the 74 retained Text2SPARQL'25 DBpedia
-  questions they answer 33, 32 and 19. Missing predicates in the grounding
-  context and missed entity links cause most wrong answers. A generated query with a
+  [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)).
+  With predicate-use grounding, Haiku answers 77 and Sonnet 86 of 150 QALD-9-plus training
+  questions that no tuning step read, against 37 and 64 before, under projected-column
+  scoring. On the 107 retained QALD-9-plus test questions, which Ask grounding was tuned
+  on, Opus answers 57, Sonnet 48 and Haiku 42.0 over three runs. On the 74 retained
+  Text2SPARQL'25 DBpedia questions they answer 42, 41 and 31. A gold resource
+  missing from the prompt causes about half of the wrong answers, and wrong query shape
+  most of the rest. A generated query with a
   property path can exhaust memory under Ask, because the default query memory budget and
   timeout do not bound property-path evaluation, which roadmap item 505 tracks.
   Model-dependent

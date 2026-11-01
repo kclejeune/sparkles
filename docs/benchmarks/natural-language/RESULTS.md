@@ -164,6 +164,75 @@ The resource preference only orders offered choices. An ambiguous mention still 
 a clarification, since the displayed candidate, type and alternate-label lists can be
 truncated. The paid run does not isolate this ranking's contribution to answer accuracy.
 
+#### Ask grounding from predicate use
+
+Ask grounding lists the predicates that the question's linked entities and best-matching
+classes use in the data, links with popularity ordering and tells the model that the
+context is partial and to use one predicate per relation.
+[C18](../../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-from-predicate-use-item-263)
+describes the changes. The table compares it with the baseline on the same questions and
+settings. The QALD rows split into the 72 training questions that tuned the changes and
+the 35 validation questions. The fresh set is 150 questions from the QALD-9-plus training
+split that no tuning step read, chosen by the SHA-256 of a fixed seed and the question
+id after six duplicates of QALD test or db25 questions were dropped.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-01 on a development laptop that was running other work, with binaries built on atlas |
+| Builds | Commit 570d7062 for the changes, and 30b0a968 for two Haiku QALD runs, which builds the same prompts on this database. The Haiku baselines and the fresh baselines use commit 2d43aa5a, and the Sonnet and Opus QALD and db25 baselines are the 7b3b6df5 runs above. |
+| Settings | Effort `medium`, a 200,000-token context and answered clarifications, as above |
+| Cost | $26.74 in 3,696 requests under a cap of $50 |
+
+| Set and model | Baseline | With the changes |
+|---|---|---|
+| QALD-9-plus training, Haiku 5.5 | 18 and 15 [16 and 14 of 68] | 29, 30 and 28 [29, 29 and 30] |
+| QALD-9-plus training, Sonnet 5.5 | 23 and 23 [21 and 19 of 68] | 34 [34] |
+| QALD-9-plus training, Opus 5.5 | 26 [23 of 68] | 39 [39] |
+| QALD-9-plus validation, Haiku 5.5 | 8 and 7 [7 and 7 of 34] | 14, 12 and 13 [14, 12 and 13] |
+| QALD-9-plus validation, Sonnet 5.5 | 9 and 11 [7 and 7 of 34] | 14 [13] |
+| QALD-9-plus validation, Opus 5.5 | 15 [13 of 34] | 18 [18] |
+| QALD-9-plus, all 107, Haiku 5.5 | 26 and 22 [23 and 21 of 102] | 43, 42 and 41 [43, 41 and 43] |
+| QALD-9-plus, all 107, Sonnet 5.5 | 32 and 34 [28 and 26 of 102] | 48 [47] |
+| QALD-9-plus, all 107, Opus 5.5 | 41 [36 of 102] | 57 [57] |
+| db25, Haiku 5.5 | 21 [23 of 73] | 31 [33] |
+| db25, Sonnet 5.5 | 32 [31 of 73] | 41 [42] |
+| db25, Opus 5.5 | 33 [30 of 73] | 42 [43] |
+| Fresh, Haiku 5.5 | 37 [37 of 150] | 77 [75] |
+| Fresh, Sonnet 5.5 | 64 [59 of 150] | 86 [82] |
+| Cost per run, Haiku, Sonnet and Opus | | $0.15 to $0.28, $2.13 to $4.28 and $4.28 to $6.60 |
+
+Each cell gives the strict projected score of record. The secondary score in brackets is
+`rdf-term-set-projected-guarded-lenient-v3` over the questions its gold rules keep, with
+the passes that rely on a predicate column or on dropped rows left out. The paired gain
+on the fresh set is 26.7 points with a 95% half-width of 7.6 for Haiku, which gained 42 questions and lost
+2, and 14.7 points with a half-width of 7.5 for Sonnet, which gained 29 and lost 7. On
+db25 it is 13.5 points for Haiku against the same starting commit and 12.2 points for
+Sonnet and for Opus, each with a half-width of about 10, and on QALD it is 13 to 20
+points for every model.
+
+The gain is largest on the fresh set, so it does not come from tuning to the QALD and
+db25 questions. Predicate-use grounding alone took Haiku from 24.0 to 35.0 on
+QALD over two runs each, and the prompt rules added about 7 more, from 35.0 to 42.5. In
+dry runs with the fake provider, the share of training prompts that hold every gold term
+rose from 20 to 39 of 72 and of validation prompts from 8 to 14 of 35. The prompt rules
+cut Haiku's refusals on QALD from about 48 to 22 per run and its UNION or `VALUES`
+queries from about 12 to 2. Sonnet's UNION or `VALUES` queries fall from about 40 to 3,
+so its equal-width score rises from about 12 to 29. A first-draft prompt grows by about
+8%, from about 29,800 to 32,400 characters, and each Ask runs two to three more bounded
+queries per linked entity and one per matched class. A fresh-set run costs 5 to 8% more,
+and the median Ask time stays within about a second of the baseline on this loaded host.
+With the changes, a gold resource missing from the prompt causes about half of the wrong
+answers and wrong query shape most of the rest.
+
+Haiku at commit 2d43aa5a scored 26 and 22 on QALD, against a mean of 28.0 at 7b3b6df5,
+and 21 on db25 against 19. The difference is within the noise of so few runs, and it may
+come from the grounding reordered for prompt caching. [ROADMAP](../../ROADMAP.md) item NEW-ITEM-2 tracks it. A provider
+outage stopped the first Haiku fresh baseline after 42 of 150 questions, and the record
+keeps that attempt and its cost beside the full rerun. The
+[paid record](../2026-11-01-ask-hillclimb-paid.json) gives per-run and per-case results
+under both scores, every case the secondary score changes, costs, token counts and source
+digests.
+
 ### Global answering
 
 Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four
