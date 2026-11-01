@@ -233,7 +233,7 @@ fn absent(shared: &BTreeSet<String>, m: &Mapping) -> Poly {
 
 type Sols = Vec<(Mapping, i64, Poly)>;
 /// Operations of one request: insertions (`true`) or deletions of triples.
-type Ops = Vec<(bool, Vec<(u8, u8, u8)>)>;
+type Ops = Vec<(bool, Vec<Quad>)>;
 
 /// Solutions with each mapping once.
 fn consolidate(s: Sols) -> Sols {
@@ -251,14 +251,44 @@ fn consolidate(s: Sols) -> Sols {
 
 /// The pattern's solutions over `data`, by brute force, with bag weights and exact
 /// polynomials.
-fn eval(q: &Q, data: &BTreeSet<(u8, u8, u8)>) -> Sols {
+/// A stored quad: subject, predicate, object and graph, 0 for the default graph.
+type Quad = (u8, u8, u8, u8);
+
+fn graph(g: u8) -> Term {
+    iri(format!("g{g}"))
+}
+
+/// The triples a query reads with the key of the quad that each derivation uses: the
+/// default graph's quads, or over the union default graph the named graphs' triples,
+/// each represented by its quad with the smallest key.
+struct Data(Vec<((u8, u8, u8), FactKey)>);
+
+impl Data {
+    fn new(quads: &BTreeSet<Quad>, union: bool) -> Data {
+        let mut m: BTreeMap<(u8, u8, u8), FactKey> = BTreeMap::new();
+        for &(a, p, b, g) in quads {
+            if union != (g != 0) {
+                continue;
+            }
+            let gt = (g != 0).then(|| graph(g));
+            let k = FactKey::of_terms(&node(a), &pred(p), &node(b), gt.as_ref());
+            let e = m.entry((a, p, b)).or_insert(k);
+            if k < *e {
+                *e = k;
+            }
+        }
+        Data(m.into_iter().collect())
+    }
+}
+
+fn eval(q: &Q, data: &Data) -> Sols {
     match q {
         Q::Bgp(ps) => {
             let mut sols: Vec<(Mapping, Vec<Atom>)> = vec![(Mapping::new(), Vec::new())];
             for (s, p, o) in ps {
                 let mut next = Vec::new();
                 for (m, atoms) in &sols {
-                    for &(ds, dp, d_o) in data {
+                    for &((ds, dp, d_o), key) in &data.0 {
                         if dp != *p {
                             continue;
                         }
@@ -280,12 +310,7 @@ fn eval(q: &Q, data: &BTreeSet<(u8, u8, u8)>) -> Sols {
                         }
                         if ok {
                             let mut atoms = atoms.clone();
-                            atoms.push(Atom::Fact(FactKey::of_terms(
-                                &node(ds),
-                                &pred(dp),
-                                &node(d_o),
-                                None,
-                            )));
+                            atoms.push(Atom::Fact(key));
                             next.push((m, atoms));
                         }
                     }
@@ -431,9 +456,16 @@ fn strip(w: &Witness) -> Witness {
 }
 
 /// One request of operations in order, each an insertion (`true`) or a deletion of
-/// triples, committed together.
-fn request(s: &Store, ops: &Ops) {
-    let t = |&(a, p, b): &(u8, u8, u8)| format!("<{NS}n{a}> <{NS}p{p}> <{NS}n{b}> .");
+/// quads, committed together.
+fn request_quads(s: &Store, ops: &[(bool, Vec<Quad>)]) {
+    let t = |&(a, p, b, g): &Quad| {
+        let t = format!("<{NS}n{a}> <{NS}p{p}> <{NS}n{b}> .");
+        if g == 0 {
+            t
+        } else {
+            format!("GRAPH <{NS}g{g}> {{ {t} }}")
+        }
+    };
     let ops: Vec<String> = ops
         .iter()
         .filter(|(_, ts)| !ts.is_empty())
@@ -452,7 +484,8 @@ fn request(s: &Store, ops: &Ops) {
 }
 
 fn update(s: &Store, del: &[(u8, u8, u8)], ins: &[(u8, u8, u8)]) {
-    request(s, &vec![(false, del.to_vec()), (true, ins.to_vec())]);
+    let q = |ts: &[(u8, u8, u8)]| ts.iter().map(|&(a, p, b)| (a, p, b, 0)).collect();
+    request_quads(s, &[(false, q(del)), (true, q(ins))]);
 }
 
 /// Compare one circuit's rows and annotations with the brute-force solutions.
@@ -580,19 +613,25 @@ fn check(c: &Circuit, want: &Sols, mode: Provenance, what: &str) -> Result<(), S
 
 fn run(seed: u64, mode: Provenance) -> Result<bool, String> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let s = Store::in_memory(StoreOptions::default());
-    let mut data: BTreeSet<(u8, u8, u8)> = BTreeSet::new();
+    // every third case reads the union of two named graphs as its default graph
+    let union = seed % 3 == 2;
+    let s = Store::in_memory(StoreOptions {
+        union_default_graph: union,
+        ..Default::default()
+    });
+    let mut data: BTreeSet<Quad> = BTreeSet::new();
     let triple = |rng: &mut StdRng| {
         (
             rng.random_range(0..NODES),
             rng.random_range(0..PREDS),
             rng.random_range(0..NODES),
+            if union { rng.random_range(1..=2) } else { 0 },
         )
     };
-    let init: Vec<(u8, u8, u8)> = (0..rng.random_range(4..14))
+    let init: Vec<Quad> = (0..rng.random_range(4..14))
         .map(|_| triple(&mut rng))
         .collect();
-    update(&s, &[], &init);
+    request_quads(&s, &[(true, init.clone())]);
     data.extend(init);
     let mut counts = 0;
     let q = generate(&mut rng, 3, &mut counts);
@@ -608,12 +647,12 @@ fn run(seed: u64, mode: Provenance) -> Result<bool, String> {
         .map_err(|e| format!("{text}: build: {e}"))?;
     check(
         &c,
-        &eval(&q, &data),
+        &eval(&q, &Data::new(&data, union)),
         mode,
         &format!("{text}\nafter the build"),
     )?;
     for step in 0..24 {
-        let all: Vec<(u8, u8, u8)> = data.iter().copied().collect();
+        let all: Vec<Quad> = data.iter().copied().collect();
         let pick = |rng: &mut StdRng| all[rng.random_range(0..all.len())];
         let ops: Ops = match rng.random_range(0..6) {
             // a quad added and removed in one commit cancels within it
@@ -640,7 +679,7 @@ fn run(seed: u64, mode: Provenance) -> Result<bool, String> {
                     .collect(),
             )],
         };
-        request(&s, &ops);
+        request_quads(&s, &ops);
         for (ins, ts) in &ops {
             for t in ts {
                 if *ins {
@@ -664,7 +703,7 @@ fn run(seed: u64, mode: Provenance) -> Result<bool, String> {
             .map_err(|e| format!("{text}: advance: {e}"))?;
         check(
             &c,
-            &eval(&q, &data),
+            &eval(&q, &Data::new(&data, union)),
             mode,
             &format!("{text}\nmode {mode:?}, after step {step}"),
         )?;
@@ -881,9 +920,10 @@ fn sparql_update(s: &Store, u: &str) {
     sparql::update::update(s, u, &QueryOptions::default()).unwrap();
 }
 
-/// Over the union default graph, a triple's witnesses are the named-graph quads that
-/// hold it, they move when the triple moves between graphs, and they resolve to the
-/// stored quads.
+/// Over the union default graph, a triple's witness is the stored named-graph quad
+/// with the smallest key among those that hold it. It moves when that quad goes while
+/// the triple stays, it resolves to the stored quad, and many graphs do not multiply a
+/// row's supports.
 #[test]
 fn union_default_graph_witnesses_name_stored_quads() {
     let s = Store::in_memory(StoreOptions {
@@ -891,15 +931,13 @@ fn union_default_graph_witnesses_name_stored_quads() {
         ..Default::default()
     });
     let g = |i: u8| iri(format!("g{i}"));
-    sparql_update(
-        &s,
-        &format!("INSERT DATA {{ GRAPH <{NS}g1> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}"),
-    );
-    let mut c = built(
-        &s,
-        &format!("SELECT ?a WHERE {{ ?a <{NS}p0> ?b }}"),
-        Provenance::why(),
-    );
+    let ins =
+        |gi: u8| format!("INSERT DATA {{ GRAPH <{NS}g{gi}> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}");
+    let del =
+        |gi: u8| format!("DELETE DATA {{ GRAPH <{NS}g{gi}> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}");
+    sparql_update(&s, &ins(1));
+    let text = format!("SELECT ?a WHERE {{ ?a <{NS}p0> ?b }}");
+    let mut c = built(&s, &text, Provenance::why());
     let key = |gi: u8| FactKey::of_terms(&node(0), &pred(0), &node(1), Some(&g(gi)));
     let wit = |c: &Circuit| {
         let a = c.annotated_rows()[0].2.clone().unwrap();
@@ -907,37 +945,68 @@ fn union_default_graph_witnesses_name_stored_quads() {
     };
     let one = |gi: u8| Witness::new(vec![Atom::Fact(key(gi))]);
     assert_eq!(wit(&c), (1, vec![one(1)]));
-    // a second graph holds the triple: one row, two witnesses
-    sparql_update(
-        &s,
-        &format!("INSERT DATA {{ GRAPH <{NS}g2> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}"),
-    );
+    // a second graph holds the triple: the smaller key represents it
+    sparql_update(&s, &ins(2));
     pass(&s, &mut c);
-    assert_eq!(c.annotated_rows().len(), 1);
-    let (n, mut w) = wit(&c);
-    w.sort();
-    let mut both = vec![one(1), one(2)];
-    both.sort();
-    assert_eq!((n, w), (2, both));
-    // the triple leaves the first graph and stays in the union
-    sparql_update(
-        &s,
-        &format!("DELETE DATA {{ GRAPH <{NS}g1> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}"),
-    );
+    let (small, large) = if key(1) < key(2) { (1, 2) } else { (2, 1) };
+    assert_eq!(wit(&c), (1, vec![one(small)]));
+    // the representative's quad goes and the triple stays: the other quad represents it
+    sparql_update(&s, &del(small));
     pass(&s, &mut c);
-    assert_eq!(wit(&c), (1, vec![one(2)]));
+    assert_eq!(wit(&c), (1, vec![one(large)]));
     let r = c
-        .resolve_facts(&[key(2), key(1)], &Control::none())
+        .resolve_facts(&[key(large), key(small)], &Control::none())
         .unwrap();
-    assert_eq!(r[0].1.as_ref().and_then(|q| q.1.clone()), Some(g(2)));
+    assert_eq!(r[0].1.as_ref().and_then(|q| q.1.clone()), Some(g(large)));
     assert!(r[1].1.is_none(), "a removed quad does not resolve");
     // a rebuild agrees with the passes
-    let fresh = built(
-        &s,
-        &format!("SELECT ?a WHERE {{ ?a <{NS}p0> ?b }}"),
-        Provenance::why(),
+    assert_eq!(wit(&built(&s, &text, Provenance::why())), wit(&c));
+    sparql_update(&s, &del(large));
+    pass(&s, &mut c);
+    assert!(c.annotated_rows().is_empty());
+    // four patterns over forty graphs give one support, not 40^4
+    let mut u = String::from("INSERT DATA {");
+    for gi in 0..40 {
+        u.push_str(&format!(
+            " GRAPH <{NS}h{gi}> {{ <{NS}n0> <{NS}p0> <{NS}n1> . <{NS}n0> <{NS}p0> <{NS}n2> . \
+             <{NS}n0> <{NS}p0> <{NS}n3> . <{NS}n0> <{NS}p1> <{NS}n1> }}"
+        ));
+    }
+    u.push_str(" }");
+    sparql_update(&s, &u);
+    pass(&s, &mut c);
+    let q4 = format!(
+        "SELECT ?a WHERE {{ ?a <{NS}p0> <{NS}n1> . ?a <{NS}p0> <{NS}n2> . \
+         ?a <{NS}p0> <{NS}n3> . ?a <{NS}p1> <{NS}n1> }}"
     );
-    assert_eq!(wit(&fresh), wit(&c));
+    let c4 = built(&s, &q4, Provenance::Why { max_witnesses: 1 });
+    let a = c4.annotated_rows()[0].2.clone().unwrap();
+    assert_eq!((a.count, a.witnesses.len(), a.truncated), (1, 1, false));
+    assert_eq!(a.witnesses[0].len(), 4);
+}
+
+/// Resolving keys stops once they are found and honours cancellation.
+#[test]
+fn resolving_keys_stops_and_cancels() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut u = String::from("INSERT DATA {");
+    for i in 0..3000 {
+        u.push_str(&format!(" <{NS}m{i}> <{NS}p0> <{NS}n0> ."));
+    }
+    u.push_str(" }");
+    sparql_update(&s, &u);
+    let c = built(
+        &s,
+        &format!("SELECT DISTINCT ?b WHERE {{ ?a <{NS}p0> ?b }}"),
+        Provenance::Count,
+    );
+    let k = FactKey::of_terms(&iri("m7".into()), &pred(0), &node(0), None);
+    let r = c.resolve_facts(&[k], &Control::none()).unwrap();
+    assert!(r[0].1.is_some());
+    let control = Control::none();
+    control.cancel.cancel();
+    let missing = FactKey::of_terms(&node(3), &pred(0), &node(0), None);
+    assert!(c.resolve_facts(&[missing], &control).is_err());
 }
 
 /// An OPTIONAL's filter reads left variables beyond the shared ones, so two rows

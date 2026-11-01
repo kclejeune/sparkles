@@ -1247,9 +1247,12 @@ operator of the circuit. Internal circuits that keep rows take it through
   above `DISTINCT`, `EXISTS` and groups, and it is the weight elsewhere.
 - **Atoms.** A quad is named by its `FactKey`, the first 128 bits of SHA-256 over the
   vocabulary keys of its four terms, each framed by its length, with the default graph as
-  no key. A triple of the union default graph is the sum of the named-graph quads that
-  hold it, so its count is the number of those graphs and its witnesses name stored quads.
-  The triple's weight changes only when its presence in the union changes. Keys do not
+  no key. A triple of the union default graph is represented by the visible named-graph
+  quad with the smallest key among those that hold it, so its witnesses name a stored quad
+  and many graphs do not multiply a row's supports. When that quad goes while the triple
+  stays, the annotation moves to the next representative without a change of weight. The
+  lineage of such a triple therefore names one graph and not every graph that holds it.
+  Keys do not
   change at a generation switch, so the remap of a compaction leaves the annotations as
   they are. A key resolves back to its quad through the circuit's snapshot by matching
   the circuit's patterns (`resolve_facts`). A row that `MINUS`, `NOT EXISTS` or an
@@ -1300,17 +1303,19 @@ operator of the circuit. Internal circuits that keep rows take it through
 `MINUS`, `FILTER EXISTS` and `NOT EXISTS`, `DISTINCT`, projections and grouped and implicit
 `COUNT`, renders each as SPARQL and evaluates it by brute force with its exact `why`
 polynomial. It applies random histories with insertions, deletions, a quad added and
-removed in one commit, replacements, passes over several commits and compactions. After
+removed in one commit, replacements, passes over several commits and compactions, and a
+third of the cases read two named graphs as the union default graph. After
 every pass it compares weights, `count`, the exact `lineage` and the `why` supports with
 bounds of 8, 2 and 1, checking the two rules and, without truncation, the exact supports
-and the minimal report. The default run has 120 cases and a run of 1,500 cases passes.
+and the minimal report. The default run has 120 cases, and runs of 2,600 cases over the
+default graph and 600 cases with the union default graph pass.
 `SPARKLES_PROV_CASES` and `SPARKLES_PROV_SEED` select longer runs. Unit tests in
 `prov.rs` check the products, the bounded state against an exact one on random changes,
 and the keys. Other tests check truncation and convergence on one row, negative
 conditions, the state encoding of every mode, fact resolution, and a format 2 checkpoint
 across a restart. Regressions from the review cover witnesses over the union default
-graph, `OPTIONAL` filters, template blank nodes, and a circuit whose provenance is turned
-off.
+graph, many graphs holding one triple, `OPTIONAL` filters, template blank nodes, a
+circuit whose provenance is turned off, and cancelled fact resolution.
 
 ### Maintained assessments and conservative dependencies
 
