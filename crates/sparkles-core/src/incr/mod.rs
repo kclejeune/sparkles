@@ -29,6 +29,8 @@ pub mod zset;
 #[cfg(test)]
 mod definition_tests;
 #[cfg(test)]
+mod fixpoint_tests;
+#[cfg(test)]
 mod r#gen;
 #[cfg(test)]
 mod internal_tests;

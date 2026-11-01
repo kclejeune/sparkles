@@ -137,6 +137,17 @@ pub trait Program {
     /// Check the deadline and the cancel flag.
     fn tick(&mut self, cx: &mut Self::Cx<'_>) -> Result<()>;
 
+    /// Fact `f` is now in the state, as a held fact or, during maintenance, as a
+    /// candidate. A program that matches derived premises through an index of its own
+    /// keeps it here; `held` callbacks still decide which facts hold.
+    fn inserted(&mut self, _f: &Self::Fact) {}
+
+    /// Fact `f` left the state.
+    fn removed(&mut self, _f: &Self::Fact) {}
+
+    /// The state was emptied.
+    fn cleared(&mut self) {}
+
     /// Write one fact with its record.
     fn save(&self, w: &mut Writer, f: &Self::Fact, r: &Self::Record) -> Result<()>;
 
@@ -264,6 +275,7 @@ impl<P: Program> FixedPoint<P> {
         self.facts.clear();
         self.ann.clear();
         self.ann_bytes = 0;
+        self.program.cleared();
         let mut queue: VecDeque<P::Fact> = VecDeque::new();
         let mut found = Vec::new();
         self.program.axioms(cx, &mut found)?;
@@ -271,6 +283,7 @@ impl<P: Program> FixedPoint<P> {
         for (f, r) in found.drain(..) {
             if let std::collections::hash_map::Entry::Vacant(e) = self.facts.entry(f) {
                 e.insert(r);
+                self.program.inserted(&f);
                 queue.push_back(f);
                 order.push(f);
                 self.over(max_bytes)?;
@@ -289,6 +302,7 @@ impl<P: Program> FixedPoint<P> {
             for (g, r) in found.drain(..) {
                 if let std::collections::hash_map::Entry::Vacant(e) = self.facts.entry(g) {
                     e.insert(r);
+                    self.program.inserted(&g);
                     queue.push_back(g);
                     order.push(g);
                     self.over(max_bytes)?;
@@ -464,6 +478,7 @@ impl<P: Program> FixedPoint<P> {
                 queue.push_back(g);
             } else if let std::collections::hash_map::Entry::Vacant(e) = s.facts.entry(g) {
                 e.insert(r);
+                s.program.inserted(&g);
                 added.push(g);
                 queue.push_back(g);
                 s.over(max_bytes)?;
@@ -495,6 +510,7 @@ impl<P: Program> FixedPoint<P> {
         for f in &candidates {
             if pending.contains(f) {
                 self.facts.remove(f);
+                self.program.removed(f);
                 let ann = self.drop_ann(f).map(|a| a.scaled(-1));
                 out.push(Change {
                     fact: *f,
@@ -593,11 +609,13 @@ impl<P: Program> FixedPoint<P> {
         self.facts.clear();
         self.ann.clear();
         self.ann_bytes = 0;
+        self.program.cleared();
         let n = r.u64()?;
         let mut order = Vec::with_capacity(n.min(1 << 20) as usize);
         for _ in 0..n {
             let (f, rec) = self.program.load(r)?;
             self.facts.insert(f, rec);
+            self.program.inserted(&f);
             order.push(f);
         }
         if self.facts.len() != order.len() {

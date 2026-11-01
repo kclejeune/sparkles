@@ -689,22 +689,41 @@ impl PathOp {
         Ok(found)
     }
 
-    /// Whether the active graph `g` holds a quad at `w`: the default graph always does.
+    /// Whether the active graph `g` exists for the circuit's reader at `w`, as the query
+    /// engine decides it for a zero-length path from a constant end. A named graph
+    /// exists while it holds a quad and the reader may read it. The default graph exists
+    /// when the reader may read it, and the union default graph unless some named graph
+    /// holds a quad and the reader may read none of those that do.
     fn graph_exists(&self, p: &Pass, w: Which, g: Id) -> Result<bool> {
-        let sel = match self.scope() {
-            Scope::Default => return Ok(true),
-            Scope::Graph(t) => match p.constant(t) {
-                Some(id) => GraphSel::Exact(id),
-                None => return Ok(false),
-            },
-            Scope::Var(_) => GraphSel::Exact(g),
+        let snap = p.snap(w);
+        let access = p.access.as_ref().filter(|a| !a.reads_all());
+        let readable = |g: Id| access.is_none_or(|a| a.readable_id(snap, g));
+        let holds = |g: Id| -> Result<bool> {
+            let mut found = false;
+            snap.scan(crate::index::Perm::Gspo, &[g.0], |_| {
+                found = true;
+                Ok(false)
+            })?;
+            Ok(found)
         };
-        let mut found = false;
-        p.scan(w, None, None, None, sel, &mut |_| {
-            found = true;
-            Ok(false)
-        })?;
-        Ok(found)
+        match self.scope() {
+            Scope::Default => {
+                let Some(a) = access else {
+                    return Ok(true);
+                };
+                if !p.new.union_default_graph {
+                    return Ok(a.read.default_graph());
+                }
+                let graphs = snap.graph_ids()?;
+                let seen = graphs.iter().filter(|&&g| a.readable_id(snap, g)).count();
+                Ok(seen == graphs.len() || seen > 0)
+            }
+            Scope::Graph(t) => match p.constant(t) {
+                Some(id) => Ok(readable(id) && holds(id)?),
+                None => Ok(false),
+            },
+            Scope::Var(_) => Ok(readable(g) && holds(g)?),
+        }
     }
 
     /// The annotation of the zero-length row of node `n` in graph `g` at `w`: with a
@@ -802,7 +821,13 @@ impl PathOp {
     /// The active graphs with a quad at the new snapshot, for a constant end.
     fn graphs(&self, p: &Pass) -> Result<Vec<Id>> {
         Ok(match self.scope() {
-            Scope::Default => vec![Id::UNDEF],
+            Scope::Default => {
+                if self.graph_exists(p, Which::New, Id::UNDEF)? {
+                    vec![Id::UNDEF]
+                } else {
+                    vec![]
+                }
+            }
             Scope::Graph(_) => {
                 if self.graph_exists(p, Which::New, Id::UNDEF)? {
                     vec![Id::UNDEF]
@@ -824,15 +849,17 @@ impl PathOp {
 
     fn zero_delta(&self, p: &mut Pass, schema: &[u32], ends: &Ends) -> Result<AChanges> {
         let constant = self.fixed.program.start.is_some();
+        // the default graph's existence changes only with the named graphs of the union
+        if constant && matches!(self.scope(), Scope::Default) && !p.new.union_default_graph {
+            return Ok(AChanges::new());
+        }
         let mut keys: FxHashSet<(Id, Id)> = FxHashSet::default();
         for q in p.added.iter().chain(p.removed.iter()) {
             let Some(g) = self.in_scope(p, q) else {
                 continue;
             };
             if constant {
-                if !matches!(self.scope(), Scope::Default) {
-                    keys.insert((g, Id::UNDEF));
-                }
+                keys.insert((g, Id::UNDEF));
             } else {
                 keys.insert((g, q[0]));
                 keys.insert((g, q[2]));
