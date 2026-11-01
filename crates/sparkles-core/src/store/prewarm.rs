@@ -347,39 +347,75 @@ fn page_size() -> usize {
     if p > 0 { p as usize } else { 4096 }
 }
 
-/// Read `ranges` of `path` into the page cache: ask for all of them first, so that their
-/// reads overlap, then read them through to wait for them. Returns the bytes read, or
-/// `None` when `stop` said to stop. Ranges past the end of the file are cut off, since
-/// a list may be older than a file the store rewrote.
+/// How far the read-ahead hints run ahead of the reads. A bounded window keeps a stop from
+/// leaving a long queue of hinted reads behind it.
+const HINT_AHEAD: u64 = 64 << 20;
+
+/// Read `ranges` of `path` into the page cache: hint the ranges up to [`HINT_AHEAD`]
+/// bytes ahead, so that their reads overlap, and read them through to wait for them.
+/// Returns the bytes read, or `None` when `stop` said to stop. Ranges past the end of the
+/// file are cut off, since a list may be older than a file the store rewrote.
 fn read_ranges(path: &Path, ranges: &[[u64; 2]], stop: &dyn Fn() -> bool) -> Result<Option<u64>> {
+    read_ranges_with(path, ranges, stop, &mut will_need)
+}
+
+#[cfg(target_os = "linux")]
+fn will_need(f: &std::fs::File, off: u64, n: u64) {
+    use std::os::fd::AsRawFd;
+    // a hint only: a kernel that refuses it reads the ranges as before
+    // SAFETY: posix_fadvise reads no memory of this process
+    unsafe {
+        libc::posix_fadvise(
+            f.as_raw_fd(),
+            off as libc::off_t,
+            n as libc::off_t,
+            libc::POSIX_FADV_WILLNEED,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn will_need(_: &std::fs::File, _: u64, _: u64) {}
+
+fn read_ranges_with(
+    path: &Path,
+    ranges: &[[u64; 2]],
+    stop: &dyn Fn() -> bool,
+    hint: &mut dyn FnMut(&std::fs::File, u64, u64),
+) -> Result<Option<u64>> {
     let f = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(0)),
         Err(e) => return Err(e.into()),
     };
     let len = f.metadata()?.len();
-    let clip = |&[off, n]: &[u64; 2]| (off < len).then(|| (off, n.min(len - off)));
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        for (off, n) in ranges.iter().filter_map(clip) {
-            // a hint only: a kernel that refuses it reads the ranges below as before
-            // SAFETY: posix_fadvise reads no memory of this process
-            unsafe {
-                libc::posix_fadvise(
-                    f.as_raw_fd(),
-                    off as libc::off_t,
-                    n as libc::off_t,
-                    libc::POSIX_FADV_WILLNEED,
-                );
-            }
-        }
-    }
+    let clipped: Vec<(u64, u64)> = ranges
+        .iter()
+        .filter_map(|&[off, n]| (off < len).then(|| (off, n.min(len - off))))
+        .collect();
+    // the next hint starts at range `hi`, offset `hat` into it. `hinted` counts the bytes
+    // hinted so far, and `done` the length of the ranges read through, which a file that
+    // shrank since the open may have read less of
+    let (mut hi, mut hat, mut hinted, mut done) = (0usize, 0u64, 0u64, 0u64);
     let mut buf = vec![0u8; READ_CHUNK];
     let mut total = 0u64;
-    for (off, n) in ranges.iter().filter_map(clip) {
+    for &(off, n) in &clipped {
         let mut at = off;
         while at < off + n {
+            while hi < clipped.len() && hinted < done + (at - off) + HINT_AHEAD {
+                if stop() {
+                    return Ok(None);
+                }
+                let (ho, hn) = clipped[hi];
+                let step = (hn - hat).min(HINT_AHEAD);
+                hint(&f, ho + hat, step);
+                hinted += step;
+                hat += step;
+                if hat == hn {
+                    hi += 1;
+                    hat = 0;
+                }
+            }
             if stop() {
                 return Ok(None);
             }
@@ -391,6 +427,7 @@ fn read_ranges(path: &Path, ranges: &[[u64; 2]], stop: &dyn Fn() -> bool) -> Res
             at += got as u64;
             total += got as u64;
         }
+        done += n;
     }
     Ok(Some(total))
 }
@@ -540,5 +577,28 @@ mod tests {
         let done = store.prewarm(&|| true).unwrap();
         assert_eq!(done.parts, 0);
         assert_eq!(done.skipped.as_deref(), Some("stopped"));
+    }
+
+    #[test]
+    fn a_stopped_read_makes_no_hints_and_a_full_one_hints_each_range_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        std::fs::write(&path, vec![7u8; 100_000]).unwrap();
+        let ranges = [
+            [0, 4096],
+            [8192, 0],
+            [50_000, 10_000],
+            [99_000, 5_000],
+            [200_000, 10],
+        ];
+        let mut hints = Vec::new();
+        let got = read_ranges_with(&path, &ranges, &|| true, &mut |_, o, n| hints.push((o, n)));
+        assert_eq!(got.unwrap(), None);
+        assert!(hints.is_empty(), "{hints:?}");
+
+        let got = read_ranges_with(&path, &ranges, &|| false, &mut |_, o, n| hints.push((o, n)));
+        assert_eq!(got.unwrap(), Some(4096 + 10_000 + 1_000));
+        let hinted: Vec<_> = hints.into_iter().filter(|h| h.1 > 0).collect();
+        assert_eq!(hinted, [(0, 4096), (50_000, 10_000), (99_000, 1_000)]);
     }
 }
