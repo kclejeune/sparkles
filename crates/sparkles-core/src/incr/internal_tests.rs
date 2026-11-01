@@ -496,7 +496,7 @@ fn unknown_checkpoint_formats_are_refused() {
         },
         b"",
     );
-    bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(super::persist::INTERNAL_FORMAT + 1).to_le_bytes());
     let file = state.join(super::persist::file_name(s.snapshot().commit));
     std::fs::write(&file, &bytes).unwrap();
     let rt = runtime(&s, Some(dir.path().to_path_buf()));

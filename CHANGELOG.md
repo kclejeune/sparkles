@@ -119,6 +119,21 @@ at most 0.025 ms above the plain one for each benchmark view. `lineage` made a s
 to 80 times larger and `why` up to 8 times, and an annotated build of a three-pattern
 join took 2.2 seconds against 9 ms.
 
+Incremental views maintain property paths with `+` and `*` (spec F13 §4.3) instead of
+evaluating them again at each commit. A fixed-point operator keeps each reachable pair
+with the one derivation that first reached it, follows only the walks that reach a
+changed step, and deletes by backward and forward rederivation, so a pair that another
+path still reaches is never removed. The step can be any path of IRIs, inverses,
+sequences and alternatives, under `GRAPH` and inside `EXISTS`, `NOT EXISTS`, `MINUS` and
+`OPTIONAL`, and `*` adds its zero-length rows as the query engine does. Paths with `?`,
+negated property sets or nested closures are still evaluated again. The operator's state
+takes about 40 bytes for each reachable pair. The reasoner's forward rules plug into the
+same operator through `sparkles_reasoner::fixpoint::RuleProgram`. On an 8-vCPU
+Namespace instance at 200,000 people, a pass that changed a path took 0.02 to 0.24 ms at
+the 95th percentile, against 2.3 to 82 ms for evaluating the path again, and the state
+was up to 11% larger. Building a path view with a constant end took up to 3.3 times as
+long.
+
 Server code can attach internal circuits to a dataset's incremental views runtime
 (spec F13 §3.6) with `Runtime::attach_internal`, or `Dataset::attach_internal` in the
 library. Such a circuit keeps a query's rows, or counts the changed facts per key in each
@@ -1012,6 +1027,15 @@ loses the prewarm.
 after its state. A circuit with a provenance setting writes version 2 and one without
 writes version 1, and each reads only its own. A checkpoint of a version this release
 does not read is left in place while the circuit is built from the data.
+
+`view-state` version 2 holds the state of a view whose circuit has a fixed-point
+operator, after the other operators' states. A view with a property path that the
+operator maintains writes version 2, and other views keep writing version 1, so their
+checkpoints stay readable by older releases. Each view reads only its own version, and a
+checkpoint of a version this release does not read is left in place while the view is
+built from the data. `internal-circuit-state` versions 3 and 4 do the same for internal
+circuits without and with provenance annotations. The incremental compiler version
+changed, so views with property paths are built again once after the upgrade.
 
 The dataset reader capability 6 marks protected managed graphs. Enabling a profile
 owner raises `minimumReader` to 6 durably, writes the owner's settings file such as

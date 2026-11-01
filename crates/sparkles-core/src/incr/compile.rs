@@ -1027,6 +1027,104 @@ impl C {
         }
     }
 
+    /// A path `s step+ o` or `s step* o` whose step is a simple path, as a fixed-point
+    /// operator (spec F13 §4.3), or `None` when the path has another form. Its ends are
+    /// variables, IRIs or literals, and a variable end is not the graph's variable.
+    fn fixpoint(
+        &mut self,
+        s: &TermPattern,
+        path: &PPE,
+        o: &TermPattern,
+        scope: &Scope,
+    ) -> Option<Node> {
+        use super::ops::path::{Closure, End, PathOp, Scope as PScope, Step};
+        let (s, o, inner, zero) = match path {
+            PPE::OneOrMore(a) => (s, o, &**a, false),
+            PPE::ZeroOrMore(a) => (s, o, &**a, true),
+            PPE::Reverse(a) => return self.fixpoint(o, a, s, scope),
+            _ => return None,
+        };
+        let gvar = match scope {
+            Scope::Var(v) => Some(v.as_str().to_string()),
+            _ => None,
+        };
+        let end = |t: &TermPattern, c: &mut C| -> Option<End> {
+            match t {
+                TermPattern::Variable(v) if Some(v.as_str()) == gvar.as_deref() => None,
+                TermPattern::Variable(v) => Some(End::Var(c.var(v.as_str()))),
+                TermPattern::NamedNode(n) => Some(End::Const(Term::NamedNode(n.clone()))),
+                TermPattern::Literal(l) => Some(End::Const(Term::Literal(l.clone()))),
+                _ => None,
+            }
+        };
+        let subj = end(s, self)?;
+        let obj = end(o, self)?;
+        self.hidden += 1;
+        // `#` cannot occur in a SPARQL variable name, so these names never capture the
+        // query's variables; they appear only in the step's patterns, which are never
+        // written back as SPARQL
+        let xs = format!("#fp{}x", self.hidden);
+        let ys = format!("#fp{}y", self.hidden);
+        let (xv, yv) = (
+            TermPattern::Variable(Variable::new_unchecked(xs.clone())),
+            TermPattern::Variable(Variable::new_unchecked(ys.clone())),
+        );
+        let alts = self.expand_path(&xv, inner, &yv)?;
+        if alts.is_empty() {
+            return None;
+        }
+        let (xi, yi) = (self.var(&xs), self.var(&ys));
+        let gi = gvar.as_deref().map(|g| self.var(g));
+        let mut steps = Vec::new();
+        for alt in alts {
+            let node = self.bgp(alt.into_iter().map(|t| (t, scope.clone())).collect());
+            let Op::Bgp(bgp) = node.op else {
+                return None;
+            };
+            let pos = |v: u32| node.schema.iter().position(|&x| x == v);
+            let (x, y) = (pos(xi)?, pos(yi)?);
+            let g = match gi {
+                Some(g) => Some(pos(g)?),
+                None => None,
+            };
+            steps.push(Step {
+                bgp: *bgp,
+                schema: node.schema,
+                x,
+                y,
+                g,
+            });
+        }
+        let (start, forward) = match (&subj, &obj) {
+            (End::Const(t), _) => (Some(t.clone()), true),
+            (_, End::Const(t)) => (Some(t.clone()), false),
+            _ => (None, true),
+        };
+        let pscope = match scope {
+            Scope::Default => PScope::Default,
+            Scope::Graph(n) => PScope::Graph(Term::NamedNode(n.clone())),
+            Scope::Var(_) => PScope::Var(gi.expect("a graph variable")),
+        };
+        let mut schema = Vec::new();
+        for e in [&subj, &obj] {
+            if let End::Var(v) = e
+                && !schema.contains(v)
+            {
+                schema.push(*v);
+            }
+        }
+        if let Some(g) = gi {
+            schema.push(g);
+        }
+        let text = format!("{s} {} {o}", crate::sparql::exec::path_text(path));
+        let closure = Closure::new(steps, forward, start, pscope);
+        Some(Node {
+            op: Op::Path(Box::new(PathOp::new(closure, subj, obj, zero, text))),
+            certain: schema.clone(),
+            schema,
+        })
+    }
+
     /// The triple patterns of a subtree made only of joins of patterns (under `GRAPH`
     /// too, and with paths of one alternative), with their scopes.
     fn factors(&mut self, gp: &GP, scope: &Scope, out: &mut Vec<(TriplePattern, Scope)>) -> bool {
@@ -1228,7 +1326,15 @@ impl C {
                     let first = nodes.remove(0);
                     nodes.into_iter().fold(first, |l, r| self.union(l, r))
                 }
-                None => self.recompute(gp, scope, "a property path with *, + or ? (Phase 3)", None),
+                None => match self.fixpoint(subject, path, object, scope) {
+                    Some(n) => n,
+                    None => self.recompute(
+                        gp,
+                        scope,
+                        "a property path with ?, a negated property set or a nested * or +",
+                        None,
+                    ),
+                },
             },
             GP::Join { left, right } => {
                 let l = self.compile(left, scope);

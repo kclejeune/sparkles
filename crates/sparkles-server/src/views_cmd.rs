@@ -453,6 +453,16 @@ mod tests {
             StoreOptions::default(),
         )
         .unwrap();
+        assert!(j["plan"].to_string().contains("FixedPoint"), "{j}");
+        let j = local(
+            &db,
+            &args(ViewsCmd::Explain {
+                query: Some("SELECT * WHERE { ?s !<urn:p> ?o }".into()),
+                query_file: None,
+            }),
+            StoreOptions::default(),
+        )
+        .unwrap();
         assert!(j["plan"].to_string().contains("recompute"), "{j}");
         let j = local(
             &db,

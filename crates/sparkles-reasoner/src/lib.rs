@@ -27,6 +27,7 @@ mod engine;
 pub mod explain;
 pub mod extras;
 mod facts;
+pub mod fixpoint;
 mod graph;
 mod incremental;
 pub mod inputs;

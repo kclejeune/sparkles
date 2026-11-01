@@ -260,10 +260,7 @@ fn plans_mark_their_modes() {
         .collect();
     assert_eq!(
         recomputed,
-        vec![
-            "SELECT ?s ?o WHERE { ?s :knows+ ?o }",
-            "SELECT ?t ?n WHERE { ?p :memberOf ?t } ORDER BY ?t LIMIT 1",
-        ]
+        vec!["SELECT ?t ?n WHERE { ?p :memberOf ?t } ORDER BY ?t LIMIT 1"]
     );
 }
 
@@ -277,6 +274,14 @@ fn refused_and_recomputed_features() {
     .unwrap_err();
     assert!(e.to_string().contains("NOW"), "{e}");
     let c = compile(&parse("SELECT ?p ?q WHERE { ?p :knows+ ?q }"), None).unwrap();
+    assert!(!c.root.has_recompute() && c.root.has_fixpoint());
+    let c = compile(&parse("SELECT ?p ?q WHERE { ?p :knows? ?q }"), None).unwrap();
+    assert!(c.root.has_recompute());
+    let c = compile(
+        &parse("SELECT ?p ?q WHERE { ?p (:knows/:knows*)+ ?q }"),
+        None,
+    )
+    .unwrap();
     assert!(c.root.has_recompute());
     let c = compile(&parse(QUERIES[0]), None).unwrap();
     assert!(!c.root.has_recompute());

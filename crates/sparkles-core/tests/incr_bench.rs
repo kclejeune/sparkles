@@ -876,3 +876,162 @@ fn inferred_pass_against_query() {
         rt.close(&s);
     }
 }
+
+/// The views of `path_pass_against_recompute` (spec F13 §4.3): a closure from one person
+/// over the knows graph, which is one strongly connected component, the closure of a unit
+/// hierarchy, the units under its root, and a count of the people under each unit.
+const PATH_VIEWS: &[(&str, &str)] = &[
+    ("reach-one", "SELECT ?q WHERE { :p0 :knows+ ?q }"),
+    ("unit-ancestors", "SELECT ?u ?a WHERE { ?u :partOf+ ?a }"),
+    ("under-root", "SELECT ?u WHERE { ?u :partOf* :u0 }"),
+    (
+        "people-under",
+        "SELECT ?a (COUNT(?p) AS ?n) WHERE { ?p :inUnit ?u . ?u :partOf+ ?a } GROUP BY ?a",
+    ),
+];
+
+/// The path workload's version, as [`WORKLOAD`] is the other tests'.
+const PATH_WORKLOAD: &str = "incr_bench paths v1";
+
+/// The units of the path workload: a tree of fan-out 4 over a tenth of the people, each
+/// person in one unit.
+fn units(n: usize) -> usize {
+    (n / 10).max(16)
+}
+
+/// The people data with the unit tree and each person's unit.
+fn path_data(n: usize) -> String {
+    let mut s = data(n);
+    let u = units(n);
+    for i in 1..u {
+        s.push_str(&format!(
+            "<http://ex/u{i}> <http://ex/partOf> <http://ex/u{}> .\n",
+            (i - 1) / 4
+        ));
+    }
+    for i in 0..n {
+        s.push_str(&format!(
+            "<http://ex/p{i}> <http://ex/inUnit> <http://ex/u{}> .\n",
+            (i * 31) % u
+        ));
+    }
+    s
+}
+
+/// One commit of the path mix: a knows edge to a new person, the removal of a knows edge
+/// of the component, a unit moved under another unit of a lower number (so the hierarchy
+/// stays a tree), a new unit with a member, and an unrelated commit.
+fn path_mix(s: &Store, i: usize, n: usize) {
+    let f = fresh();
+    let who = (f * 7919) % n;
+    let u = units(n);
+    let k = 1 + (f * 104_729) % (u - 1);
+    let u = match i % 5 {
+        0 => format!("INSERT DATA {{ :p{who} :knows :x{f} }}"),
+        1 => format!("DELETE DATA {{ :p{who} :knows :p{} }}", (who * 7 + 1) % n),
+        2 => format!(
+            "DELETE WHERE {{ :u{k} :partOf ?x }} ; INSERT DATA {{ :u{k} :partOf :u{} }}",
+            (f * 13) % k
+        ),
+        3 => format!("INSERT DATA {{ :nu{f} :partOf :u{k} . :x{f} :inUnit :nu{f} }}"),
+        _ => format!("INSERT DATA {{ :new{f} :memberOf :t{} }}", who % 50),
+    };
+    upd(s, &u);
+}
+
+/// §4.3: each path view's pass against evaluating its query again, through 200 commits
+/// of the path mix. A build without the fixed-point operator evaluates the paths again in
+/// every pass that touches them, which `query ms` approximates.
+#[test]
+#[ignore]
+fn path_pass_against_recompute() {
+    let n = people();
+    let t0 = Instant::now();
+    let text = path_data(n);
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let views: Vec<&str> = PATH_VIEWS.iter().flat_map(|(n, q)| [*n, *q]).collect();
+    for p in [text.as_str(), &views.join("\n"), PATH_WORKLOAD] {
+        for b in p.bytes().chain([0]) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    check_with(
+        "paths/workload",
+        true,
+        format!("{n} people, {} units", units(n)),
+        Some(format!("{h:016x}")),
+    );
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        text.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    eprintln!(
+        "loaded {n} people and {} units in {:.1?}",
+        units(n),
+        t0.elapsed()
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    println!(
+        "| path view | build ms | query ms | pass median ms | pass p95 ms | query / pass | state MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    for (name, q) in PATH_VIEWS {
+        let text = format!("{PREFIX}{q}");
+        let t = Instant::now();
+        let mut def = ViewDef::table(text.clone());
+        def.memory_bytes = 4 << 30;
+        rt.put(&s, name, def).unwrap();
+        rt.round(&s);
+        let build = t.elapsed().as_secs_f64() * 1e3;
+        let mut query = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = sparql::query(
+                s.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            std::hint::black_box(r.len());
+            query.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut passes = Vec::new();
+        for i in 0..200 {
+            path_mix(&s, i, n);
+            let t = Instant::now();
+            rt.round(&s);
+            passes.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        check_view(
+            &rt,
+            &s,
+            &format!("paths/{name}"),
+            name,
+            &text,
+            QueryOptions::default(),
+        );
+        let info = rt.get(&s, name).unwrap();
+        let qm = pct(&mut query, 0.5);
+        let pm = pct(&mut passes, 0.5);
+        let p95 = pct(&mut passes, 0.95);
+        let state = info.state_bytes as f64 / (1 << 20) as f64;
+        println!(
+            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {:.0} | {state:.1} |",
+            qm / pm,
+        );
+        metric(&format!("paths/{name}/build"), build, "ms", "lower");
+        metric(&format!("paths/{name}/query"), qm, "ms", "lower");
+        metric(&format!("paths/{name}/pass-median"), pm, "ms", "lower");
+        metric(&format!("paths/{name}/pass-p95"), p95, "ms", "lower");
+        metric(&format!("paths/{name}/state"), state, "MiB", "lower");
+        rt.delete(name).unwrap();
+        rt.round(&s);
+    }
+}

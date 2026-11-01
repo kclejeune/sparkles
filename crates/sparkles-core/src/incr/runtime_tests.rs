@@ -241,6 +241,150 @@ fn a6_recovery_applies_the_commits_since_the_checkpoint() {
     );
 }
 
+const REACH: &str = "SELECT ?a ?b WHERE { ?a foaf:knows+ ?b }";
+const REACH_ZERO: &str = "SELECT ?b WHERE { :a foaf:knows* ?b }";
+
+/// The format of a view's only checkpoint.
+fn checkpoint_format(dir: &std::path::Path, name: &str) -> u32 {
+    let files = super::persist::list(&dir.join(format!("views/{name}/main")));
+    assert_eq!(files.len(), 1, "{name}: {files:?}");
+    let b = std::fs::read(&files[0].1).unwrap();
+    u32::from_le_bytes(b[8..12].try_into().unwrap())
+}
+
+/// A view with a fixed-point operator checkpoints in format 2 and a plain one keeps
+/// format 1. After a restart both load their checkpoints and apply the commits since,
+/// deletions that break a cycle among them.
+#[test]
+fn fixed_point_views_restart_from_format_2() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = persistent(dir.path(), true);
+        load(&s);
+        upd(
+            &s,
+            "INSERT DATA { :a foaf:knows :b . :b foaf:knows :c . :c foaf:knows :a . :c foaf:knows :d }",
+        );
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        for (name, query) in [
+            ("reach", REACH),
+            ("reach0", REACH_ZERO),
+            ("teams", TEAM_SIZES),
+        ] {
+            rt.put(&s, name, ViewDef::table(q(query))).unwrap();
+        }
+        rt.round(&s);
+        rt.close(&s);
+    }
+    assert_eq!(checkpoint_format(dir.path(), "reach"), 2);
+    assert_eq!(checkpoint_format(dir.path(), "reach0"), 2);
+    assert_eq!(checkpoint_format(dir.path(), "teams"), 1);
+    {
+        let s = persistent(dir.path(), true);
+        upd(&s, "DELETE DATA { :c foaf:knows :a }");
+        upd(&s, "INSERT DATA { :d foaf:knows :e . :e foaf:knows :e }");
+        upd(
+            &s,
+            "DELETE DATA { :b foaf:knows :c } ; INSERT DATA { :b foaf:knows :d }",
+        );
+    }
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    let st = rt.stats(&s);
+    assert_eq!(st.loaded, 3, "the checkpoints were loaded");
+    assert_eq!(st.resets, 0, "applied, not rebuilt");
+    for (name, query) in [
+        ("reach", REACH),
+        ("reach0", REACH_ZERO),
+        ("teams", TEAM_SIZES),
+    ] {
+        assert_eq!(
+            read(&rt, &s, name, None).unwrap(),
+            oracle(&s, query, None),
+            "{name}"
+        );
+    }
+    upd(&s, "DELETE DATA { :a foaf:knows :b }");
+    rt.round(&s);
+    for (name, query) in [("reach", REACH), ("reach0", REACH_ZERO)] {
+        assert_eq!(
+            read(&rt, &s, name, None).unwrap(),
+            oracle(&s, query, None),
+            "{name}"
+        );
+    }
+    rt.close(&s);
+    assert_eq!(checkpoint_format(dir.path(), "reach"), 2);
+}
+
+/// A checkpoint of the other known format, or of an unknown one, is not loaded into a
+/// view: the view is built from the data and the file is left until a checkpoint of the
+/// view's own format replaces a known one.
+#[test]
+fn a_fixed_point_view_refuses_other_formats() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = persistent(dir.path(), true);
+        load(&s);
+        upd(&s, "INSERT DATA { :a foaf:knows :b . :b foaf:knows :a }");
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "reach", ViewDef::table(q(REACH))).unwrap();
+        rt.put(&s, "teams", ViewDef::table(q(TEAM_SIZES))).unwrap();
+        rt.round(&s);
+        rt.close(&s);
+    }
+    // the path view's file says format 1 and the plain view's format 2, and a third
+    // run of each says a format no release writes
+    for (name, format) in [("reach", 1u32), ("teams", 2u32)] {
+        let files = super::persist::list(&dir.path().join(format!("views/{name}/main")));
+        let mut b = std::fs::read(&files[0].1).unwrap();
+        b[8..12].copy_from_slice(&format.to_le_bytes());
+        std::fs::write(&files[0].1, &b).unwrap();
+    }
+    {
+        let s = persistent(dir.path(), true);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert_eq!(
+            rt.stats(&s).loaded,
+            0,
+            "neither view loads the other format"
+        );
+        assert_eq!(
+            read(&rt, &s, "reach", None).unwrap(),
+            oracle(&s, REACH, None)
+        );
+        assert_eq!(
+            read(&rt, &s, "teams", None).unwrap(),
+            oracle(&s, TEAM_SIZES, None)
+        );
+        upd(&s, "INSERT DATA { :c foaf:knows :a }");
+        rt.round(&s);
+        rt.close(&s);
+    }
+    // a checkpoint of the view's own format replaced the file of the other
+    assert_eq!(checkpoint_format(dir.path(), "reach"), 2);
+    assert_eq!(checkpoint_format(dir.path(), "teams"), 1);
+    let files = super::persist::list(&dir.path().join("views/reach/main"));
+    let mut b = std::fs::read(&files[0].1).unwrap();
+    b[8..12].copy_from_slice(&3u32.to_le_bytes());
+    std::fs::write(&files[0].1, &b).unwrap();
+    assert!(matches!(
+        super::persist::decode_as(super::persist::VIEW_FIXPOINT, &b),
+        Err(crate::Error::Unsupported(_))
+    ));
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    assert_eq!(rt.stats(&s).loaded, 1, "only the plain view loads");
+    assert_eq!(
+        read(&rt, &s, "reach", None).unwrap(),
+        oracle(&s, REACH, None)
+    );
+    assert!(files[0].1.exists(), "the unknown file is left in place");
+}
+
 /// A7: with the change log off, the view is rebuilt after a restart.
 #[test]
 fn a7_without_the_change_log_the_view_is_rebuilt() {
@@ -423,9 +567,10 @@ fn apply(state: &mut Vec<String>, e: &LiveEvent) {
     }
 }
 
-/// A10: a path with `+` is a `recompute` node, and `NOW()` is refused.
+/// A10: a path with `+` is a fixed-point operator, a path with `?` a `recompute` node,
+/// and `NOW()` is refused.
 #[test]
-fn a10_paths_recompute_and_now_is_refused() {
+fn a10_paths_are_maintained_and_now_is_refused() {
     let s = Store::in_memory(StoreOptions::default());
     load(&s);
     let rt = runtime(&s, None);
@@ -434,6 +579,18 @@ fn a10_paths_recompute_and_now_is_refused() {
             &s,
             "reach",
             ViewDef::table(q("SELECT ?p ?q WHERE { ?p foaf:knows+ ?q }")),
+        )
+        .unwrap();
+    let plan = serde_json::to_string(&info.plan).unwrap();
+    assert!(
+        plan.contains("FixedPoint") && !plan.contains("recompute"),
+        "{plan}"
+    );
+    let info = rt
+        .put(
+            &s,
+            "maybe",
+            ViewDef::table(q("SELECT ?p ?q WHERE { ?p foaf:knows? ?q }")),
         )
         .unwrap();
     let plan = serde_json::to_string(&info.plan).unwrap();
