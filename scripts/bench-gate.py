@@ -260,6 +260,8 @@ def executors(args):
             # counts must agree
             got = dict(answers[q])
             agree = set(got) == {"A", "B"} and len(set(got.values())) == 1 and "error" not in str(answers[q])
+            # rows that are not triples of the input are wrong in any mode
+            agree = agree and not re.search(r"missing:(?!0\b)\d+", str(answers[q]))
             eager = answers[q].get("A", ("error", "error"))
             # LIMIT without ORDER BY may return other rows, so only the count is kept
             fingerprint = ", ".join([f"{eager[0]} rows"] + list(eager[1:])) if q in unordered else ", ".join(
@@ -270,7 +272,8 @@ def executors(args):
                 digests = warm.get(q, set())
                 rows = answers[q].get("A", ("error",))[0]
                 one = next(iter(digests)) if len(digests) == 1 else ""
-                ok = len(digests) == 1 and (one.startswith("ask ") or one.split(" ")[0] == rows)
+                ok = len(digests) == 1 and (one.startswith("ask ") or one.split(" ")[0] == rows) \
+                    and not re.search(r"missing (?!0\b)\d+", one)
                 checks.append({"name": f"{cell}/{q}/timed-answers", "ok": ok,
                                "fingerprint": next(iter(digests)) if len(digests) == 1 else None,
                                "detail": sorted(digests)})
@@ -553,6 +556,9 @@ def compare(args):
     base, cand = read_record(args.baseline), read_record(args.candidate)
     if base["gate"] != cand["gate"]:
         fail(f"gates differ: {base['gate']} and {cand['gate']}")
+    failed_base = [c["name"] for c in base["checks"] if not c["ok"]]
+    if failed_base:
+        fail(f"the baseline has failed checks and cannot be compared with: {', '.join(failed_base[:10])}")
     reasons = incompatibilities(base, cand)
     if reasons and not args.allow_different:
         fail("the records measure different workloads (--allow-different compares them anyway): "
@@ -631,6 +637,58 @@ def compare(args):
 
 # --------------------------------------------------------------------------- order-digest
 
+XSD_NS = "http://www.w3.org/2001/XMLSchema#"
+
+
+def nt_norm(term):
+    """An N-Triples term with the abbreviations of SPARQL TSV undone: a bare number or
+    boolean becomes its typed literal and an xsd:string literal a plain one."""
+    t = term.strip()
+    if re.fullmatch(r"[+-]?\d+", t):
+        return f'"{t}"^^<{XSD_NS}integer>'
+    if re.fullmatch(r"[+-]?\d*\.\d+", t):
+        return f'"{t}"^^<{XSD_NS}decimal>'
+    if re.fullmatch(r"[+-]?(\d+\.?\d*|\.\d+)[eE][+-]?\d+", t):
+        return f'"{t}"^^<{XSD_NS}double>'
+    if t in ("true", "false"):
+        return f'"{t}"^^<{XSD_NS}boolean>'
+    if t.endswith(f"^^<{XSD_NS}string>"):
+        return t[: -len(f"^^<{XSD_NS}string>")]
+    return t
+
+
+def missing_triples(rows, data):
+    """How many of `rows`, (s, p, o) N-Triples terms, are not triples of the N-Triples file
+    `data`, which is read once as a stream."""
+    want = {tuple(nt_norm(x) for x in r) for r in rows}
+    with open(data, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = re.match(r"\s*(\S+)\s+(\S+)\s+(.*?)\s*\.\s*$", line)
+            if m:
+                want.discard((nt_norm(m.group(1)), nt_norm(m.group(2)), nt_norm(m.group(3))))
+                if not want:
+                    break
+    return len(want)
+
+
+def native_nt(t):
+    """An x-sparkles+json term written as N-Triples, for `missing_triples`."""
+    if t is None:
+        return "-"
+    v = str(t.get("value", ""))
+    if t.get("type") == "uri":
+        return f"<{v}>"
+    if t.get("type") == "bnode":
+        return f"_:{v}"
+    if t.get("type") == "literal":
+        e = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+        if t.get("xml:lang"):
+            return f'"{e}"@{t["xml:lang"]}'
+        if t.get("datatype"):
+            return f'"{e}"^^<{t["datatype"]}>'
+        return f'"{e}"'
+    return json.dumps(t, sort_keys=True)
+
 def order_digest(args):
     """A digest of a TSV answer's order, or for a query without a top-level ORDER BY the
     number of its distinct rows (`distinct:N`).
@@ -649,8 +707,14 @@ def order_digest(args):
         names = [h.lstrip("?") for h in header]
         if ba._after_order_by(query) is None:
             # the number of distinct rows, so that a LIMIT without ORDER BY, whose rows may
-            # be any, still cannot repeat rows unnoticed
-            print(f"distinct:{len(set(f))}")
+            # be any, still cannot repeat rows unnoticed; with --data, a three-column answer
+            # also counts its rows that are not triples of the input
+            lines = [line.rstrip("\n") for line in f]
+            out = f"distinct:{len(set(lines))}"
+            if args.data and len(names) == 3:
+                rows = [line.split("\t") for line in lines]
+                out += f" missing:{missing_triples(rows, args.data)}"
+            print(out)
             return
         keys = ba.order_keys(query, set(names))
         cols = [names.index(k) for k in keys] if keys else None
@@ -678,7 +742,7 @@ def build_config_cmd(args):
     Run it in the environment of the build."""
     import tomllib
     root = Path(args.root).resolve()
-    out = {"profile": args.name}
+    out = {"profile": args.name, "cargo": args.cargo}
     cargo = tomllib.loads((root / "Cargo.toml").read_text()) if (root / "Cargo.toml").exists() else {}
     # the profile and the profiles it inherits from
     profiles, name = {}, args.name
@@ -736,10 +800,13 @@ def native_digest(args):
         print("rows wider or narrower than vars")
         return
     rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
+    missing = None
+    if args.data and len(names) == 3 and ba._after_order_by(query) is None:
+        missing = missing_triples([[native_nt(t) for t in row] for row in r.get("rows") or []], args.data)
     # the query type and the projected variables, in order, belong to the answer
     head = f"{r.get('queryType')} " + " ".join(names)
     out = [f"{len(rows)} rows", "schema " + hashlib.sha256(head.encode()).hexdigest()[:8],
-           f"distinct {len(set(rows))}",
+           f"distinct {len(set(rows))}" + ("" if missing is None else f" missing {missing}"),
            hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()[:16]]
     if ba._after_order_by(query) is not None:
         keys = ba.order_keys(query, set(names))
@@ -819,13 +886,17 @@ def main():
     p = sub.add_parser("order-digest")
     p.add_argument("query")
     p.add_argument("tsv")
+    p.add_argument("--data", help="the N-Triples input, to check three-column unordered answers against")
     p = sub.add_parser("compilers")
     p.add_argument("binary")
     p = sub.add_parser("native-digest")
     p.add_argument("query")
     p.add_argument("response")
+    p.add_argument("--data", help="the N-Triples input, to check three-column unordered answers against")
     p = sub.add_parser("build-config")
     p.add_argument("name", nargs="?", default="release", help="the Cargo profile")
+    p.add_argument("--cargo", required=True,
+                   help="the Cargo command and arguments of the build, such as its package and features")
     p.add_argument("--root", default=".")
     args = ap.parse_args()
     {"executors": executors, "metrics": metrics, "w3c": w3c, "compare": compare, "catalog": catalog,

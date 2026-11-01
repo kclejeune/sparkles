@@ -384,8 +384,8 @@ class GateTests(unittest.TestCase):
 
     def test_build_config_sees_profile_overrides(self):
         env = dict(os.environ, CARGO_PROFILE_RELEASE_LTO="off")
-        a = run("build-config", "--root", SCRIPTS.parent).stdout
-        b = subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent)],
+        a = run("build-config", "--root", SCRIPTS.parent, "--cargo", "build").stdout
+        b = subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent), "--cargo", "build"],
                            capture_output=True, text=True, env=env).stdout
         self.assertIn('"release"', a)
         self.assertNotEqual(a, b)
@@ -397,7 +397,7 @@ class GateTests(unittest.TestCase):
             (home / "config").write_text("[profile.release]\nopt-level = 0\n")
             env = dict(os.environ, CARGO_HOME=str(home))
             def config(**extra):
-                return subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent)],
+                return subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent), "--cargo", "build"],
                                       capture_output=True, text=True, env=dict(env, **extra)).stdout
             a = config()
             self.assertIn('"opt-level":0', a)
@@ -408,7 +408,7 @@ class GateTests(unittest.TestCase):
     @unittest.skipUnless(__import__("shutil").which("mbx"), "needs mbx")
     def test_build_config_holds_the_boxington_policy(self):
         def config(**extra):
-            return subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent)],
+            return subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent), "--cargo", "build"],
                                   capture_output=True, text=True, env=dict(os.environ, **extra)).stdout
         self.assertNotEqual(config(MBX_INCREMENTAL="off"), config(MBX_INCREMENTAL="on"))
 
@@ -418,9 +418,9 @@ class GateTests(unittest.TestCase):
             (Path(d) / ".cargo").mkdir()
             cfg = Path(d) / ".cargo" / "config.toml"
             cfg.write_text('[env]\nCFLAGS = { value = "-O0", force = true }\n')
-            a = run("build-config", "--root", d).stdout
+            a = run("build-config", "--root", d, "--cargo", "build").stdout
             cfg.write_text('[env]\nCFLAGS = { value = "-O3", force = true }\n')
-            self.assertNotEqual(a, run("build-config", "--root", d).stdout)
+            self.assertNotEqual(a, run("build-config", "--root", d, "--cargo", "build").stdout)
 
     def test_matrix_queries_must_match(self):
         with tempfile.TemporaryDirectory() as d:
@@ -510,6 +510,41 @@ class GateTests(unittest.TestCase):
             r = run("compare", plain, switched)
             self.assertEqual(r.returncode, 2)
             self.assertIn("runtime_env", r.stderr)
+
+    def test_build_config_holds_the_cargo_arguments(self):
+        a = run("build-config", "--root", SCRIPTS.parent, "--cargo", "build -p sparkles-server").stdout
+        b = run("build-config", "--root", SCRIPTS.parent, "--cargo",
+                "build -p sparkles-server --no-default-features --features fmt").stdout
+        self.assertNotEqual(a, b)
+
+    def test_a_baseline_with_failed_checks_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = {"key": "a", "value": 1, "unit": "ms", "better": "lower"}
+            bad = metrics_record(d, "bad", [m, {"check": "q/answers", "ok": False, "fingerprint": "1 rows, x"}])
+            good = metrics_record(d, "good", [m, {"check": "q/answers", "ok": True, "fingerprint": "1 rows, x"}])
+            r = run("compare", bad, good)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("baseline has failed checks", r.stderr)
+
+    def test_unordered_exports_must_be_triples_of_the_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d) / "data.nt"
+            data.write_text('<a> <p> "x"@en .\n<a> <q> "5"^^<http://www.w3.org/2001/XMLSchema#integer> .\n<b> <p> <c> .\n')
+            q = Path(d) / "q.rq"
+            q.write_text("SELECT * WHERE { ?s ?p ?o } LIMIT 3")
+            t = Path(d) / "a.tsv"
+            t.write_text('?s\t?p\t?o\n<a>\t<p>\t"x"@en\n<a>\t<q>\t5\n')
+            self.assertEqual(run("order-digest", q, t, "--data", data).stdout.strip(), "distinct:2 missing:0")
+            t.write_text('?s\t?p\t?o\n<z>\t<p>\t"x"@en\n<a>\t<q>\t5\n')
+            self.assertEqual(run("order-digest", q, t, "--data", data).stdout.strip(), "distinct:2 missing:1")
+            f = Path(d) / "resp.json"
+            def native(s_):
+                f.write_text(json.dumps({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [
+                    [{"type": "uri", "value": s_}, {"type": "uri", "value": "p"},
+                     {"type": "literal", "value": "x", "xml:lang": "en"}]]}))
+                return run("native-digest", q, f, "--data", data).stdout
+            self.assertIn("missing 0", native("a"))
+            self.assertIn("missing 1", native("z"))
 
 
 if __name__ == "__main__":

@@ -251,6 +251,17 @@ impl Out {
         self.line(serde_json::json!({ "check": name, "ok": ok, "detail": detail }));
     }
 
+    /// A check whose fingerprint, such as a digest of loaded or recovered contents, a
+    /// comparison requires to equal the baseline's.
+    fn check_fp(&mut self, name: &str, ok: bool, detail: String, fingerprint: String) {
+        if !ok {
+            eprintln!("check failed: {name}: {detail}");
+        }
+        self.line(serde_json::json!({
+            "check": name, "ok": ok, "detail": detail, "fingerprint": fingerprint,
+        }));
+    }
+
     fn case(&mut self, key: &str, mut counts: Vec<u64>, other_ticks: u64, coverage: f64) {
         counts.sort_unstable();
         let median = counts[counts.len() / 2];
@@ -382,6 +393,19 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
             );
         }
         assert!(all.is_sorted(), "{name}: the keys are not in order");
+        // the vocabulary's contents, which a comparison anchors to the baseline's
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for k in &all {
+            for &b in k.iter().chain(&[0]) {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        out.check_fp(
+            &format!("vocab/{name}/keys"),
+            true,
+            format!("{n} keys"),
+            format!("{n} keys, {h:016x}"),
+        );
         let lens: Vec<usize> = all.iter().map(Vec::len).collect();
         let keys: Vec<Vec<u8>> = all.iter().step_by(13).cloned().collect();
         let missing: Vec<Vec<u8>> = keys
@@ -664,14 +688,18 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
     let empty = opens(c, &base_dir, reps, &before);
     let replay = opens(c, &changed_dir, reps, &after);
     let key = format!("wal/open-with-{commits}-commits");
-    out.check(
+    // the contents before and after the commits, which a comparison anchors to the
+    // baseline's, so that a loader that loses facts in both stores alike fails
+    out.check_fp(
         "wal/open-without-wal/recovered",
         empty.recovered,
         format!("{before:?}"),
+        format!("{before:?}"),
     );
-    out.check(
+    out.check_fp(
         &format!("{key}/recovered"),
         replay.recovered,
+        format!("{after:?}"),
         format!("{after:?}"),
     );
     let mut sorted = empty.counts.clone();

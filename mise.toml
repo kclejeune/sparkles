@@ -1301,7 +1301,7 @@ flag "--rounds <n>" default="2" help="A,B,B,A rounds per cell"
 flag "--reps <n>" default="10" help="timed requests per query and server process"
 flag "--queries <list>" help="only these queries (default: all 31)"
 flag "--commit <rev>" help="the commit the binary was built from, for the record"
-flag "--build-config <json>" help="a prebuilt binary's build configuration, from scripts/bench-gate.py build-config in its build environment; compare refuses a record without one"
+flag "--build-config <json>" help="a prebuilt binary's build configuration, from scripts/bench-gate.py build-config --cargo '<its cargo arguments>' in its build environment; compare refuses a record without one"
 '''
 run = '''
 mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
@@ -1313,7 +1313,7 @@ if [ -z "$bin" ]; then
   mbx build --release -p sparkles-server --bin sparkles
   bin=target/release/sparkles
   commit=${commit:-$(git rev-parse HEAD)}
-  config=$(python3 scripts/bench-gate.py build-config)
+  config=$(python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-server --bin sparkles')
 fi
 scripts/bench-executors.sh --scales "$usage_scales" --threads "$usage_threads" \
   --rounds "$usage_rounds" --reps "$usage_reps" ${usage_queries:+--queries "$usage_queries"} \
@@ -1352,7 +1352,7 @@ python3 scripts/bench-gate.py metrics "${files[@]}" --gate incr --suite incremen
   --scale "$usage_people people" --threshold 0.10 --out "$OUT/record.json" --binary "$bin" \
   --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
   --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
-  --manifest build_config="$(python3 scripts/bench-gate.py build-config)" \
+  --manifest build_config="$(python3 scripts/bench-gate.py build-config --cargo 'test --release -p sparkles-core --test incr_bench')" \
   --setting people="$usage_people" --setting threads="$usage_threads" --setting harness="crates/sparkles-core/tests/incr_bench.rs" \
   --setting load="$(cut -d' ' -f1-3 /proc/loadavg)"
 SPARKLES_TASK
@@ -1390,7 +1390,7 @@ python3 scripts/bench-gate.py metrics "${files[@]}" --gate insn-screen --suite i
   --scale "$usage_items items, $usage_commits commits" --threshold 0 --out "$OUT/record.json" --binary "$bin" \
   --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
   --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
-  --manifest build_config="$(python3 scripts/bench-gate.py build-config)" \
+  --manifest build_config="$(python3 scripts/bench-gate.py build-config --cargo 'test --release -p sparkles-core --test insn_screen')" \
   --setting items="$usage_items" --setting commits="$usage_commits" \
   --setting reps="$usage_reps" --setting harness="crates/sparkles-core/tests/insn_screen.rs"
 SPARKLES_TASK
@@ -1423,7 +1423,7 @@ python3 scripts/bench-gate.py metrics "$OUT/metrics.jsonl" --gate reasoning-late
   --scale "$usage_universities universities" --threshold 0.10 --out "$OUT/record.json" --binary "$bin" \
   --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
   --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
-  --manifest build_config="$(python3 scripts/bench-gate.py build-config)" \
+  --manifest build_config="$(python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-reasoner --example reasoning_latency')" \
   --setting universities="$usage_universities" \
   --setting queries_sha256="$(sha256sum scripts/bench-lubm/queries.txt | cut -d' ' -f1)" \
   --setting generator_sha256="$(sha256sum crates/sparkles-reasoner/examples/common/lubm.rs | cut -d' ' -f1)" \

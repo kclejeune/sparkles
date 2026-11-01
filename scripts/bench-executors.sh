@@ -37,7 +37,7 @@
 #   --port P          server port (default 4181, below the ephemeral port range)
 #   --commit REV      the commit the binary was built from, for the record
 #   --build-config J  the binary's build configuration, the output of
-#                     `scripts/bench-gate.py build-config` in its build environment;
+#                     `scripts/bench-gate.py build-config --cargo ARGS` in its build environment;
 #                     compare refuses a record without one
 #   --force           start even when a compiler or another server is running
 set -euo pipefail
@@ -192,8 +192,8 @@ SPIN=$spin
 PORT=$PORT
 EXECUTION=eager,streaming
 SHARE_STORE=1
-ORDER_DIGEST="python3 $ROOT/scripts/bench-gate.py order-digest"
-WARM_DIGEST="python3 $ROOT/scripts/bench-gate.py native-digest"
+ORDER_DIGEST="python3 $ROOT/scripts/bench-gate.py order-digest --data data.nt"
+WARM_DIGEST="python3 $ROOT/scripts/bench-gate.py native-digest --data data.nt"
 ENV
     {
       sed -n '1,/^settings:/p' "$OUT/manifest.txt" | grep -v '^settings:'
