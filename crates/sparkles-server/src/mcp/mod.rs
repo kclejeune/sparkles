@@ -40,6 +40,8 @@ pub mod http;
 mod infer;
 pub(crate) mod memory;
 mod notify;
+#[cfg(feature = "ontology")]
+mod ontology;
 mod paths;
 mod pins;
 pub(crate) mod relevance;

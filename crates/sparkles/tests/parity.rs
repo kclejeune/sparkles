@@ -479,6 +479,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("ontology", "editOntology", "ontology.edit", |ds| {
             ds.ontology().edit(&any(), &any(), &any());
         }),
+        op_if!("ontology", "diffOntology", "ontology.diff", |ds| {
+            ds.ontology().diff(
+                &any(),
+                &sparkles::history::At::Commit(1),
+                &sparkles::history::At::Head,
+                true,
+                &any(),
+            );
+        }),
         // ------------------------------------------------------------------- schema
         op!("getSchema", "schema.report", |ds| {
             if let Ok(r) = ds.schema().report(&Default::default()) {

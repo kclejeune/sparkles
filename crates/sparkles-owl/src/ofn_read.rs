@@ -63,6 +63,34 @@ pub fn parse(text: &str) -> Result<Document, ParseError> {
     })
 }
 
+/// Read one axiom, such as `SubClassOf(ex:A ex:B)`, with `prefixes` and the predefined
+/// ones (a prefix of `prefixes` wins over a predefined one of the same name).
+pub fn parse_axiom(text: &str, prefixes: &[(String, String)]) -> Result<Axiom, ParseError> {
+    let mut r = Reader {
+        text,
+        pos: 0,
+        peeked: None,
+        last: 0,
+        names: crate::ofn::STANDARD_PREFIXES
+            .iter()
+            .map(|(p, n)| (p.to_string(), n.to_string()))
+            .chain(prefixes.iter().cloned())
+            .collect(),
+        prefixes: Vec::new(),
+        header: Header::default(),
+        depth: 0,
+        done: false,
+    };
+    let ax = r.axiom()?;
+    match Reader::take(&mut r)? {
+        Tok::End => Ok(ax),
+        t => Err(r.error(format!(
+            "expected the end of the axiom, found {}",
+            t.describe()
+        ))),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok<'a> {
     Open,

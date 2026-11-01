@@ -1320,3 +1320,16 @@ fn ofn_reader_streams_axioms() {
     assert!(r.next().unwrap().is_err());
     assert!(r.next().is_none());
 }
+
+#[test]
+fn ofn_reads_one_axiom_with_prefixes() {
+    use sparkles_owl::ofn_read::parse_axiom;
+    let p = vec![("ex".to_string(), ex(""))];
+    let ax = parse_axiom("SubClassOf(ex:A ObjectSomeValuesFrom(ex:p owl:Thing))", &p).unwrap();
+    assert_eq!(
+        ax,
+        Axiom::sub_class_of(class("A"), ClassExpression::some(op("p"), Class::thing()))
+    );
+    assert!(parse_axiom("SubClassOf(ex:A ex:B) SubClassOf(ex:B ex:C)", &p).is_err());
+    assert!(parse_axiom("SubClassOf(ex:A)", &p).is_err());
+}

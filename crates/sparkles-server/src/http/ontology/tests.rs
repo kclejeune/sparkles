@@ -325,3 +325,139 @@ async fn a_dry_run_commits_nothing() {
         .json();
     assert_eq!(j["total"], 2);
 }
+
+/// A server with a persistent dataset `h`, whose history a diff reads, loaded with
+/// [`DATA`].
+fn persistent() -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let ds = state.attach("h", DbType::Persistent, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state.clone());
+    Server {
+        _dir: dir,
+        _state: state,
+        app,
+    }
+}
+
+#[tokio::test]
+async fn diffs_the_axioms_of_two_commits() {
+    let s = persistent();
+    let start = s._state.get("h").unwrap().store.head_commit().seq;
+    let r = post(
+        &s.app,
+        "/$/ontology/h/axioms",
+        json!({
+            "add": [sub("http://ex.org/Course", json!("http://www.w3.org/2002/07/owl#Thing"))],
+            "remove": [sub("http://ex.org/Professor", json!("http://ex.org/Person"))],
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(&s.app, &format!("/$/ontology/h/diff?from={start}")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["from"], start);
+    assert_eq!(j["addedCount"], 1, "{j}");
+    assert_eq!(j["removedCount"], 1, "{j}");
+    assert!(
+        j["added"][0]["ofn"].as_str().unwrap().contains("Course"),
+        "{j}"
+    );
+    assert_eq!(j["added"][0]["type"], "SubClassOf");
+    assert_eq!(j["truncated"], false);
+    // as lines, in the other order
+    let head = s._state.get("h").unwrap().store.head_commit().seq;
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/h/diff?from={head}&to={start}&format=text"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let t = r.text();
+    assert!(
+        t.lines()
+            .any(|l| l.starts_with("- ") && l.contains("Course")),
+        "{t}"
+    );
+    assert!(
+        t.lines()
+            .any(|l| l.starts_with("+ ") && l.contains("Person")),
+        "{t}"
+    );
+    // assertions come from the changed triples
+    s._state
+        .get("h")
+        .unwrap()
+        .dataset
+        .update("INSERT DATA { <http://ex.org/bob> a <http://ex.org/Professor> }")
+        .unwrap();
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/h/diff?from={head}&assertions=true"),
+    )
+    .await;
+    let j = r.json();
+    assert_eq!(j["addedCount"], 1, "{j}");
+    assert_eq!(j["added"][0]["type"], "ClassAssertion", "{j}");
+    // from is required and at does not apply
+    assert_eq!(
+        get(&s.app, "/$/ontology/h/diff").await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        get(
+            &s.app,
+            &format!("/$/ontology/h/diff?from={start}&at={start}")
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn graph_store_writes_take_functional_syntax() {
+    let s = server();
+    let body = "Prefix(:=<http://ex.org/>)
+Ontology(<http://ex.org/g-onto>
+  Declaration(Class(:Lecture))
+  SubClassOf(:Lecture ObjectSomeValuesFrom(:teaches :Course))
+)";
+    let r = send(
+        &s.app,
+        "PUT",
+        "/t/data?graph=http%3A%2F%2Fex.org%2Fg",
+        &[(header::CONTENT_TYPE.as_str(), "text/owl-functional")],
+        body,
+    )
+    .await;
+    assert!(r.status.is_success(), "{} {}", r.status, r.text());
+    let r = get(
+        &s.app,
+        "/$/ontology/t/axioms?graph=http%3A%2F%2Fex.org%2Fg&type=SubClassOf",
+    )
+    .await;
+    let j = r.json();
+    assert_eq!(j["total"], 1, "{j}");
+    // a syntax error is a 400 that names the position
+    let r = send(
+        &s.app,
+        "PUT",
+        "/t/data?graph=http%3A%2F%2Fex.org%2Fh",
+        &[(header::CONTENT_TYPE.as_str(), "text/owl-functional")],
+        "Ontology(\n SubClassOf(:A))",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("line 2"), "{}", r.text());
+}

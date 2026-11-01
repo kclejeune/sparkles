@@ -853,3 +853,146 @@ fn an_imported_copy_survives_a_local_removal() {
         .unwrap();
     assert_eq!((e.removed, e.added, e.present), (1, 0, 1), "{e:?}");
 }
+
+/// A dataset on disk, whose history the store's diff reads, with `body` inserted.
+fn on_disk(body: &str) -> (tempfile::TempDir, Dataset) {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    if !body.is_empty() {
+        ds.update(&format!("{PREFIXES} INSERT DATA {{ {body} }}"))
+            .unwrap();
+    }
+    (dir, ds)
+}
+
+/// The head, with its state held: an in-memory dataset keeps the states its snapshots
+/// hold.
+fn head(ds: &Dataset) -> (At, Arc<Snapshot>) {
+    let s = ds.store().snapshot();
+    (At::Commit(s.commit), s)
+}
+
+fn rendered(changes: &[AxiomChange]) -> Vec<String> {
+    changes.iter().map(|c| c.axiom.to_string()).collect()
+}
+
+#[test]
+fn diffs_axioms_between_commits() {
+    let (_dir, ds) = on_disk(BASE);
+    let req = OntologyRequest::default();
+    let (c0, _c0) = head(&ds);
+    let new = Axiom::sub_class_of(class("C"), class("A"))
+        .annotated(sparkles_owl::Annotation::comment("why"));
+    ds.ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                add: vec![new.clone()],
+                remove: vec![some_ab()],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    let (c1, _c1) = head(&ds);
+    let d = ds.ontology().diff(&req, &c0, &c1, false, &opts()).unwrap();
+    assert_eq!(rendered(&d.added), [new.to_string()]);
+    assert_eq!(rendered(&d.removed), [some_ab().to_string()]);
+    assert_eq!(d.added[0].graph, "default");
+    assert!(d.changed_quads > 0);
+    // in the other order the sides swap
+    let back = ds.ontology().diff(&req, &c1, &c0, false, &opts()).unwrap();
+    assert_eq!(rendered(&back.removed), [new.to_string()]);
+    // spec F21 A3: adding then removing leaves no difference
+    ds.ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                add: vec![some_ab()],
+                remove: vec![new],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    let (h0, _h0) = head(&ds);
+    let d = ds.ontology().diff(&req, &c0, &h0, true, &opts()).unwrap();
+    assert!(d.added.is_empty() && d.removed.is_empty(), "{d:?}");
+    // a change in a graph the ontology does not read opens nothing
+    let (c2, _c2) = head(&ds);
+    ds.update(
+        "INSERT DATA { GRAPH <http://ex.org/other> { <http://ex.org/x> <http://ex.org/y> 1 } }",
+    )
+    .unwrap();
+    let (h1, _h1) = head(&ds);
+    let d = ds.ontology().diff(&req, &c2, &h1, true, &opts()).unwrap();
+    assert_eq!(d.changed_quads, 0);
+    assert!(d.added.is_empty() && d.removed.is_empty());
+}
+
+#[test]
+fn diffs_assertions_by_their_triples() {
+    let (_dir, ds) = on_disk(BASE);
+    let req = OntologyRequest::default();
+    let (c0, _c0) = head(&ds);
+    ds.update(&format!(
+        "{PREFIXES} DELETE DATA {{ :a :p :b }} ; INSERT DATA {{ :a :p :c }}"
+    ))
+    .unwrap();
+    let (c1, _c1) = head(&ds);
+    let d = ds.ontology().diff(&req, &c0, &c1, true, &opts()).unwrap();
+    assert_eq!(rendered(&d.added), [assertion("p", "a", "c").to_string()]);
+    assert_eq!(rendered(&d.removed), [assertion("p", "a", "b").to_string()]);
+    // without assertions only the terminology is compared
+    let d = ds.ontology().diff(&req, &c0, &c1, false, &opts()).unwrap();
+    assert!(d.added.is_empty() && d.removed.is_empty());
+    // an assertion that loses its annotation keeps its triple: the annotated axiom
+    // goes and the plain one comes
+    let noted = assertion("p", "a", "c").annotated(sparkles_owl::Annotation::comment("seen"));
+    ds.ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                add: vec![noted.clone()],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    let (c2, _c2) = head(&ds);
+    let d = ds.ontology().diff(&req, &c1, &c2, true, &opts()).unwrap();
+    assert_eq!(rendered(&d.added), [noted.to_string()]);
+    assert_eq!(rendered(&d.removed), [assertion("p", "a", "c").to_string()]);
+    let d = ds.ontology().diff(&req, &c2, &c1, true, &opts()).unwrap();
+    assert_eq!(rendered(&d.removed), [noted.to_string()]);
+    assert_eq!(rendered(&d.added), [assertion("p", "a", "c").to_string()]);
+}
+
+#[test]
+fn diffs_only_what_the_caller_reads() {
+    let (_dir, ds) = on_disk("");
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{ GRAPH :pub {{ :o a owl:Ontology . :A a owl:Class }} GRAPH :secret {{ :S a owl:Class }} }}"
+    ))
+    .unwrap();
+    let (c0, _c0) = head(&ds);
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{ GRAPH :pub {{ :B a owl:Class }} GRAPH :secret {{ :T a owl:Class }} }}"
+    ))
+    .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::Named(ex("pub")), GraphRef::Named(ex("secret"))],
+        ..Default::default()
+    };
+    let o = QueryOptions {
+        graphs: Some(only(&[&ex("pub")])),
+        ..Default::default()
+    };
+    let (h2, _h2) = head(&ds);
+    let d = ds.ontology().diff(&req, &c0, &h2, true, &o).unwrap();
+    assert_eq!(
+        rendered(&d.added),
+        ["Declaration(Class(<http://ex.org/B>))"]
+    );
+    assert!(d.removed.is_empty());
+}

@@ -1,6 +1,7 @@
 //! The OWL 2 ontology of a dataset over HTTP (spec F21 §2.4): the summary
 //! `GET /$/ontology/{ds}`, the axioms `GET /$/ontology/{ds}/axioms`, the profile checks
-//! `POST /$/ontology/{ds}/check` and edits `POST /$/ontology/{ds}/axioms`. The library
+//! `POST /$/ontology/{ds}/check`, edits `POST /$/ontology/{ds}/axioms` and the diff of
+//! the axioms of two commits `GET /$/ontology/{ds}/diff`. The library
 //! reads, checks and edits (`sparkles::handles::ontology`); these handlers parse the
 //! request and apply the caller's grants through [`CallerContext`].
 //!
@@ -657,6 +658,125 @@ pub(super) async fn edit(
     })
     .await
     .map_err(|e| with_timeout(e, timeout))
+}
+
+/// The JSON of one axiom of a listing or a diff.
+fn axiom_json(ax: &Axiom, graph: Option<&str>, r: &Renderer) -> J {
+    let mut j = json!({
+        "type": ax.axiom_type().name(),
+        "ofn": r.axiom(ax),
+        "axiom": owl::json::axiom(ax),
+    });
+    if let Some(g) = graph {
+        j["graph"] = g.into();
+    }
+    j
+}
+
+/// The JSON of an ontology diff, with at most `limit` axioms on each side.
+pub(crate) fn diff_body(
+    name: &str,
+    d: &onto::OntologyDiff,
+    req: &OntologyRequest,
+    assertions: bool,
+    limit: usize,
+    r: &Renderer,
+) -> J {
+    let side = |v: &[onto::AxiomChange]| -> J {
+        J::Array(
+            v.iter()
+                .take(limit)
+                .map(|c| axiom_json(&c.axiom, Some(&c.graph), r))
+                .collect(),
+        )
+    };
+    json!({
+        "dataset": name,
+        "from": d.from,
+        "to": d.to,
+        "graphs": req.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+        "mode": req.mode.as_str(),
+        "assertions": assertions,
+        "added": side(&d.added),
+        "removed": side(&d.removed),
+        "addedCount": d.added.len(),
+        "removedCount": d.removed.len(),
+        "truncated": d.added.len() > limit || d.removed.len() > limit,
+        "changedQuads": d.changed_quads,
+        "method": d.method.as_str(),
+    })
+}
+
+/// The diff as lines: `+ axiom` for each added axiom, then `- axiom` for each removed
+/// one, in functional-style syntax with the dataset's prefixes.
+pub(crate) fn diff_lines(d: &onto::OntologyDiff, limit: usize, r: &Renderer) -> String {
+    let mut s = String::new();
+    for c in d.added.iter().take(limit) {
+        s.push_str("+ ");
+        s.push_str(&r.axiom(&c.axiom));
+        s.push('\n');
+    }
+    for c in d.removed.iter().take(limit) {
+        s.push_str("- ");
+        s.push_str(&r.axiom(&c.axiom));
+        s.push('\n');
+    }
+    s
+}
+
+/// `GET /$/ontology/{ds}/diff?from=&to=`: the axioms that differ between two commits
+/// (`to` is the head by default), read as the summary reads the ontology, with the
+/// assertions that the changed triples carry when `assertions=true`. `format=text`
+/// answers `+ axiom` and `- axiom` lines. `limit` caps each side (1,000 by default).
+pub(super) async fn diff(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    if params.get("at").is_some() {
+        return Err(bad("a diff takes from and to, not at"));
+    }
+    let req = request_of(&params)?;
+    let from = super::diff::selector(&params, "from")?
+        .ok_or_else(|| bad("from names the earlier commit"))?;
+    let to = super::diff::selector(&params, "to")?.unwrap_or(sparkles::history::At::Head);
+    let assertions = params.get("assertions").is_some_and(truthy);
+    let text = match params.get("format") {
+        None | Some("json") => false,
+        Some("text") => true,
+        Some(f) => return Err(bad(format!("format must be json or text, not '{f}'"))),
+    };
+    let limit = match params.get("limit") {
+        None => 1000,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MAX_LIMIT).contains(n))
+            .ok_or_else(|| bad(format!("limit must be an integer from 1 to {MAX_LIMIT}")))?,
+    };
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Diff);
+    blocking(move || {
+        let d = ds
+            .dataset
+            .ontology()
+            .diff(&req, &from, &to, assertions, &opts)
+            .map_err(ontology_error)?;
+        let r = renderer(&ds);
+        let resp = if text {
+            (
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                diff_lines(&d, limit, &r),
+            )
+                .into_response()
+        } else {
+            Json(diff_body(&ds.name, &d, &req, assertions, limit, &r)).into_response()
+        };
+        Ok(with_commit(resp, &ds, d.to))
+    })
+    .await
 }
 
 #[cfg(test)]

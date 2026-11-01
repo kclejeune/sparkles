@@ -1200,6 +1200,231 @@ fn finish(
     ))
 }
 
+/// The most changed quads an ontology diff reads from the store's diff.
+pub const DIFF_MAX_QUADS: u64 = 10_000_000;
+
+/// One axiom of an ontology diff, with the graph it is in.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AxiomChange {
+    pub axiom: Axiom,
+    pub graph: String,
+}
+
+/// The axioms that differ between two states of an ontology (spec F21 Phase 3).
+#[derive(Clone, Debug)]
+pub struct OntologyDiff {
+    /// the commits of the two states
+    pub from: u64,
+    pub to: u64,
+    /// the axioms of `to` that `from` lacks, in order
+    pub added: Vec<AxiomChange>,
+    /// the axioms of `from` that `to` lacks, in order
+    pub removed: Vec<AxiomChange>,
+    /// the quads of the store's diff in the graphs the two reads cover
+    pub changed_quads: u64,
+    /// how the store's diff was computed
+    pub method: crate::store::DiffMethod,
+}
+
+impl Ontologies {
+    /// The axioms that differ between the states `from` and `to` of the ontology `req`
+    /// names (its `at` is ignored), as the caller of `opts` may read them. The
+    /// terminology of each state is read as [`open`](Self::open) reads it and the two
+    /// sets of axioms are compared. With `assertions`, the assertions that the store's
+    /// diff of triples ([`crate::store::Store::diff`]) adds or removes in the graphs read
+    /// are mapped one triple at a time, as [`Opened::assertions`] maps them, so an
+    /// assertion that no changed triple carries is not read. When nothing changed in the
+    /// graphs read, nothing is opened and the diff is empty.
+    pub fn diff(
+        &self,
+        req: &OntologyRequest,
+        from: &At,
+        to: &At,
+        assertions: bool,
+        opts: &QueryOptions,
+    ) -> Result<OntologyDiff> {
+        req.validate()?;
+        let opts = self.anchored(opts)?;
+        let store = self.ds.store();
+        let hist = HistoryOptions {
+            cancel: opts.cancel.clone(),
+            deadline: opts.deadline,
+        };
+        let (a, _) = store.snapshot_at(from, &hist)?;
+        let (b, _) = store.snapshot_at(to, &hist)?;
+        let triples = store.diff(
+            from,
+            to,
+            &crate::store::DiffOptions {
+                max_quads: DIFF_MAX_QUADS,
+                cancel: opts.cancel.clone(),
+                deadline: opts.deadline,
+                graphs: opts.graphs.clone(),
+                ..Default::default()
+            },
+        )?;
+        let mut req = req.clone();
+        req.at = None;
+        let mut out = OntologyDiff {
+            from: a.commit,
+            to: b.commit,
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed_quads: 0,
+            method: triples.method,
+        };
+        // the graphs a read of either state covers: the requested ones and their imports
+        let graphs_of =
+            |snap: &Arc<Snapshot>| -> Result<Opened> { self.open_at(snap, &req, &opts) };
+        let changed_in = |o: &Opened, g: &oxrdf::GraphName| {
+            o.graphs.iter().any(|r| match (r, g) {
+                (GraphRef::Default, oxrdf::GraphName::DefaultGraph) => true,
+                (GraphRef::Named(n), oxrdf::GraphName::NamedNode(m)) => n == m.as_str(),
+                _ => false,
+            })
+        };
+        if triples.is_empty() {
+            return Ok(out);
+        }
+        let oa = graphs_of(&a)?;
+        let ob = graphs_of(&b)?;
+        out.changed_quads = triples
+            .iter()
+            .filter(|(_, q)| changed_in(&oa, &q.graph_name) || changed_in(&ob, &q.graph_name))
+            .count() as u64;
+        if out.changed_quads == 0 {
+            return Ok(out);
+        }
+        check(&opts)?;
+        let graph = |o: &Opened, ax: &Axiom| -> String {
+            o.ontology
+                .axioms
+                .get(ax)
+                .and_then(|v| v.first())
+                .map_or_else(String::new, |x| o.graph_name(x.graph).to_string())
+        };
+        for ax in ob.ontology.axiom_set() {
+            if !oa.ontology.contains(ax) {
+                out.added.push(AxiomChange {
+                    axiom: ax.clone(),
+                    graph: graph(&ob, ax),
+                });
+            }
+        }
+        for ax in oa.ontology.axiom_set() {
+            if !ob.ontology.contains(ax) {
+                out.removed.push(AxiomChange {
+                    axiom: ax.clone(),
+                    graph: graph(&oa, ax),
+                });
+            }
+        }
+        if assertions {
+            let (ka, kb) = (annotated_kinds(&oa), annotated_kinds(&ob));
+            let mut added = BTreeSet::new();
+            let mut removed = BTreeSet::new();
+            for (op, q) in triples.iter() {
+                let (o, kinds, set) = match op {
+                    crate::store::DiffOp::Add => (&ob, &kb, &mut added),
+                    crate::store::DiffOp::Remove => (&oa, &ka, &mut removed),
+                };
+                if !changed_in(o, &q.graph_name) {
+                    continue;
+                }
+                let t = Triple::new(q.subject, q.predicate, q.object);
+                if let Some(ax) = assertion_of(o, kinds, &t) {
+                    let g = match &q.graph_name {
+                        oxrdf::GraphName::NamedNode(n) => n.as_str().to_string(),
+                        _ => "default".to_string(),
+                    };
+                    set.insert(AxiomChange {
+                        axiom: ax,
+                        graph: g,
+                    });
+                }
+            }
+            // an annotated assertion that lost or gained its annotations keeps its
+            // triple, which the store's diff then does not name: the plain assertion
+            // appears or disappears with them
+            for (ours, theirs, kinds, snap, set) in [
+                (&out.removed, &ob, &kb, &ob.snapshot, &mut added),
+                (&out.added, &oa, &ka, &oa.snapshot, &mut removed),
+            ] {
+                for c in ours {
+                    if c.axiom.annotations.is_empty() || !c.axiom.axiom_type().is_assertion() {
+                        continue;
+                    }
+                    let plain = c.axiom.without_annotations();
+                    if theirs.ontology.contains(&plain) || kinds.contains(&plain.kind) {
+                        continue;
+                    }
+                    if holds_main(snap, theirs, &plain) {
+                        set.insert(AxiomChange {
+                            axiom: plain,
+                            graph: c.graph.clone(),
+                        });
+                    }
+                }
+            }
+            out.added.extend(added);
+            out.removed.extend(removed);
+        }
+        Ok(out)
+    }
+}
+
+/// The kinds of the annotated assertions of the terminology, whose main triples a read
+/// of the assertions skips.
+fn annotated_kinds(o: &Opened) -> FxHashSet<sparkles_owl::AxiomKind> {
+    o.ontology
+        .axiom_set()
+        .filter(|a| !a.annotations.is_empty() && a.axiom_type().is_assertion())
+        .map(|a| a.kind.clone())
+        .collect()
+}
+
+/// The assertion a triple outside the terminology of `o` maps to, as
+/// [`Opened::assertions`] maps it.
+fn assertion_of(
+    o: &Opened,
+    annotated: &FxHashSet<sparkles_owl::AxiomKind>,
+    t: &Triple,
+) -> Option<Axiom> {
+    let annotation_property = |p: &str| {
+        o.ontology
+            .typing
+            .is_declared(p, EntityKind::AnnotationProperty)
+    };
+    if read::is_terminological(t, &annotation_property) {
+        return None;
+    }
+    let ax = o.ontology.map_assertion(t)?;
+    if annotated.contains(&ax.kind) {
+        return None;
+    }
+    Some(ax)
+}
+
+/// Whether the state holds the one triple of a plain assertion in a graph `o` reads.
+fn holds_main(snap: &Snapshot, o: &Opened, plain: &Axiom) -> bool {
+    let mut fresh = write::counter(FRESH);
+    let ts = write::axiom_triples(plain, &mut fresh);
+    let [t] = ts.as_slice() else { return false };
+    let ids = (
+        snap.lookup_term(&t.subject.clone().into()),
+        snap.lookup_term(&Term::NamedNode(t.predicate.clone())),
+        snap.lookup_term(&t.object),
+    );
+    let (Some(s), Some(p), Some(x)) = ids else {
+        return false;
+    };
+    o.inner
+        .graph_ids
+        .iter()
+        .flatten()
+        .any(|g| snap.contains(&[s, p, x, *g]).unwrap_or(false))
+}
+
 /// The profiles of a list such as `el,ql`.
 pub fn parse_profiles(s: &str) -> Result<Vec<Profile>> {
     s.split(',')

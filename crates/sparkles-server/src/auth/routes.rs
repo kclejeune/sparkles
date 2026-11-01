@@ -71,6 +71,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}", &["GET"]),
     ("/$/ontology/{ds}/axioms", &["GET", "POST"]),
     ("/$/ontology/{ds}/check", &["POST"]),
+    ("/$/ontology/{ds}/diff", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
     // editing forms (U02): the check and the save check write on the branch they name
@@ -471,6 +472,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/diff"
         | "/$/ontology/{ds}"
         | "/$/ontology/{ds}/check"
+        | "/$/ontology/{ds}/diff"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/forms/{ds}"
@@ -665,6 +667,8 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/shacl" => Endpoint::Shacl,
         "/{ds}/shex" => Endpoint::Shex,
         "/{ds}/diff" | "/{ds}/changes" | "/{ds}/history" => Endpoint::Diff,
+        // a diff of axioms reads the history, as the diff of triples does
+        "/$/ontology/{ds}/diff" => Endpoint::Diff,
         "/{ds}" => {
             let ct = media_type(headers);
             if has_param(uri, "update") || ct == "application/sparql-update" {
