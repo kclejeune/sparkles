@@ -11,7 +11,7 @@ use super::table::{Materialized, Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Block, ColMask, Key, O, P, Perm, S, pad};
+use crate::index::{Block, ColMask, Key, Perm, pad};
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2855,6 +2855,26 @@ fn run_limited(
                 None
             };
             finish(Materialized { table: out, lease }, infos, complete)
+        }
+        // A path without inputs is walked one start node at a time until it has the
+        // rows asked for, so that an ASK or a LIMIT over a closure with two unbound
+        // ends reads a few start nodes rather than every node of the graph.
+        Kind::Path {
+            spec,
+            bound_from_left: false,
+        } if n.children.is_empty() => {
+            let mut walk = PathWalk::new(ctx, spec, &n.vars)?;
+            let mut out = Table::new(n.vars.clone());
+            let mut complete = true;
+            while let Some(t) = walk.next(ctx)? {
+                out.append(t);
+                ctx.check_output(out.len(), out.width())?;
+                if out.len() >= want {
+                    complete = false;
+                    break;
+                }
+            }
+            finish(Materialized::plain(out), Vec::new(), complete)
         }
         Kind::Slice {
             offset,
@@ -7185,10 +7205,7 @@ impl Graph<'_> {
     /// merged with the frontier.
     fn expand(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
         let Some((p, rev)) = self.spec.simple else {
-            for &x in frontier {
-                out.extend(self.neighbours(x, forward)?);
-            }
-            return Ok(());
+            return self.expand_each(frontier, forward, out);
         };
         let perm = if forward != rev { Perm::Pso } else { Perm::Pos };
         let rows = self.ctx.snap.estimate(perm, &[p]);
@@ -7196,10 +7213,7 @@ impl Graph<'_> {
             || frontier.len() < 64
             || (frontier.len() as u64).saturating_mul(SWEEP_RATIO) < rows
         {
-            for &x in frontier {
-                out.extend(self.neighbours(x, forward)?);
-            }
-            return Ok(());
+            return self.expand_each(frontier, forward, out);
         }
         self.sweeps.set(self.sweeps.get() + 1);
         let gc = perm.col_of(crate::index::G);
@@ -7253,41 +7267,75 @@ impl Graph<'_> {
         Ok(())
     }
 
+    /// [`Graph::expand`] by one lookup per frontier node, checking the deadline and
+    /// the neighbour buffer's memory between lookups, since one level of a wide
+    /// closure may hold millions of nodes.
+    fn expand_each(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
+        let held = self.ctx.charge(0)?;
+        let mut charged = out.capacity();
+        for (i, &x) in frontier.iter().enumerate() {
+            out.extend(self.neighbours(x, forward)?);
+            if i % 1024 == 1023 {
+                self.ctx.check()?;
+                if out.capacity() > charged {
+                    held.add((out.capacity() - charged) as u64 * 8)?;
+                    charged = out.capacity();
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn neighbours(&self, x: u64, forward: bool) -> Result<Vec<u64>> {
         if let Some((p, rev)) = self.spec.simple {
-            let dir = forward != rev;
-            // forward: (x p ?o) via PSO; backward: (?s p x) via POS
-            let perm = if dir { Perm::Pso } else { Perm::Pos };
-            let gc = perm.col_of(crate::index::G);
+            return self.seek(p, rev, x, forward);
+        }
+        if let Some(preds) = &self.spec.preds {
+            // one lookup per predicate of the alternative, with a neighbour once per
+            // predicate that links to it, as the union of the edge plan has it
             let mut out = Vec::new();
-            let mask = if self.ctx.opt.selective_columns {
-                (1 << 2) | (1 << gc)
-            } else {
-                crate::index::ALL_COLS
-            };
-            let (lo, hi) = (pad(&[p, x], 0), pad(&[p, x], u64::MAX));
-            self.ctx.snap.scan_between_cols(perm, lo, hi, mask, |c| {
-                match c {
-                    Chunk::Block(b, s, e) => {
-                        for i in s..e {
-                            if self.graph.accepts(b.cols[gc][i]) {
-                                out.push(b.cols[2][i]);
-                            }
-                        }
-                    }
-                    Chunk::Row(k) => {
-                        if self.graph.accepts(k[gc]) {
-                            out.push(k[2]);
-                        }
-                    }
-                }
-                Ok(true)
-            })?;
-            out.dedup();
+            for &(p, rev) in preds {
+                out.extend(self.seek(p, rev, x, forward)?);
+            }
             return Ok(out);
         }
         let m = if forward { self.fwd } else { self.bwd };
         Ok(m.and_then(|m| m.get(&x)).cloned().unwrap_or_default())
+    }
+
+    /// The neighbours of `x` over predicate `p` (`rev`: its inverse), read by one
+    /// index lookup.
+    fn seek(&self, p: u64, rev: bool, x: u64, forward: bool) -> Result<Vec<u64>> {
+        let dir = forward != rev;
+        // forward: (x p ?o) via PSO; backward: (?s p x) via POS
+        let perm = if dir { Perm::Pso } else { Perm::Pos };
+        let gc = perm.col_of(crate::index::G);
+        let mut out = Vec::new();
+        let mask = if self.ctx.opt.selective_columns {
+            (1 << 2) | (1 << gc)
+        } else {
+            crate::index::ALL_COLS
+        };
+        let (lo, hi) = (pad(&[p, x], 0), pad(&[p, x], u64::MAX));
+        self.ctx.snap.scan_between_cols(perm, lo, hi, mask, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        if self.graph.accepts(b.cols[gc][i]) {
+                            out.push(b.cols[2][i]);
+                        }
+                    }
+                }
+                Chunk::Row(k) => {
+                    if self.graph.accepts(k[gc]) {
+                        out.push(k[2]);
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+        out.dedup();
+        Ok(out)
     }
 
     /// Nodes reachable from `start` according to min/max length (ARQ ranges: once per
@@ -7298,12 +7346,10 @@ impl Graph<'_> {
         }
         let mut out = Vec::new();
         let mut seen = FxHashSet::default();
-        // A cursor charges the visited set and the reached nodes as they grow.
-        let held = if self.ctx.is_cursor() {
-            Some(self.ctx.charge(64)?)
-        } else {
-            None
-        };
+        // The visited set, the reached nodes and the frontier are charged as they grow,
+        // in eager execution as in a cursor, so that a wide closure fails at the memory
+        // budget rather than growing without bound.
+        let held = self.ctx.charge(64)?;
         if self.spec.min == 0 {
             out.push(start);
             seen.insert(start);
@@ -7329,13 +7375,11 @@ impl Graph<'_> {
                     next.push(y);
                 }
             }
-            if let Some(held) = &held {
-                // the set entry, the reached node and the frontier node of each, and
-                // the growth of the neighbour buffer
-                let grown = found.capacity().saturating_sub(found_charged);
-                found_charged = found_charged.max(found.capacity());
-                held.add(next.len() as u64 * 48 + grown as u64 * 8)?;
-            }
+            // the set entry, the reached node and the frontier node of each, and the
+            // growth of the neighbour buffer
+            let grown = found.capacity().saturating_sub(found_charged);
+            found_charged = found_charged.max(found.capacity());
+            held.add(next.len() as u64 * 48 + grown as u64 * 8)?;
             if self.spec.max_one && depth >= 1 {
                 break;
             }
@@ -7505,35 +7549,35 @@ impl Graph<'_> {
         Ok(false)
     }
 
-    /// All start nodes when both ends are unbound.
-    fn all_nodes(&self) -> Result<Vec<u64>> {
-        let mut set = FxHashSet::default();
-        if self.spec.min > 0 {
-            if let Some((p, rev)) = self.spec.simple {
-                let perm = if rev { Perm::Pos } else { Perm::Pso };
-                let gc = perm.col_of(crate::index::G);
-                for k in self.ctx.snap.scan_keys(perm, &[p])? {
-                    if self.graph.accepts(k[gc]) {
-                        set.insert(k[1]);
-                    }
-                }
-            } else if let Some(f) = self.fwd {
-                set.extend(f.keys().copied());
+    /// Call `f` with every start node of a path with two unbound ends, in order: the
+    /// sources of the edge relation of a path over a sequence or alternative without a
+    /// zero-length match, otherwise the nodes that [`start_chunk`] reads chunk by chunk,
+    /// so that the start nodes are never all held at once.
+    fn each_start(&self, f: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        if self.spec.min > 0 && self.spec.simple.is_none() {
+            let held = self.ctx.charge(0)?;
+            let mut starts: Vec<u64> = self
+                .fwd
+                .map(|m| m.keys().copied().collect())
+                .unwrap_or_default();
+            held.add(starts.capacity() as u64 * 8)?;
+            starts.sort_unstable();
+            for x in starts {
+                f(x)?;
             }
-        } else {
-            // every subject and object of the active graph
-            let gc = Perm::Spo.col_of(crate::index::G);
-            for k in self.ctx.snap.scan_keys(Perm::Spo, &[])? {
-                if self.graph.accepts(k[gc]) {
-                    set.insert(k[S]);
-                    set.insert(k[Perm::Spo.col_of(O)]);
-                }
-            }
-            let _ = P;
+            return Ok(());
         }
-        let mut v: Vec<u64> = set.into_iter().collect();
-        v.sort_unstable();
-        Ok(v)
+        let mut after = None;
+        loop {
+            let (chunk, last) = start_chunk(self.ctx, self.spec, &self.graph, after)?;
+            for &x in &chunk {
+                f(x)?;
+            }
+            if last {
+                return Ok(());
+            }
+            after = chunk.last().copied();
+        }
     }
 }
 
@@ -7589,36 +7633,33 @@ fn path(
     let (sv, ov, pvars) = path_vars(spec);
     let mut out = Table::new(pvars.clone());
     let sweeps = std::cell::Cell::new(0);
+    // The edge relation of a path over a sequence or alternative, charged while the
+    // path is evaluated, as a cursor reads it.
+    let held = ctx.charge(0)?;
+    let edges = match (edges, spec.edge_vars) {
+        (Some(e), Some(_)) => {
+            let mut rel = PathEdges::default();
+            held.add(rel.bytes_with(e.len()))?;
+            rel.add(ctx, spec, &e)?;
+            drop(e);
+            Some(rel)
+        }
+        _ => None,
+    };
     for (gf, gid) in graphs {
-        let (fwd, bwd) = match (&edges, spec.edge_vars) {
-            (Some(e), Some((a, b))) => {
-                let (ac, bc) = (e.col_of(a).unwrap(), e.col_of(b).unwrap());
-                let gc = spec.graph_var.and_then(|g| e.col_of(g));
-                let mut f: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
-                let mut bw: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
-                for i in 0..e.len() {
-                    if let (Some(gc), Some(g)) = (gc, gid)
-                        && e.cols[gc][i] != g
-                    {
-                        continue;
-                    }
-                    let (x, y) = (e.cols[ac][i].0, e.cols[bc][i].0);
-                    if x == 0 || y == 0 {
-                        continue;
-                    }
-                    f.entry(x).or_default().push(y);
-                    bw.entry(y).or_default().push(x);
-                }
-                (Some(f), Some(bw))
+        let (fwd, bwd) = match &edges {
+            Some(rel) => {
+                let (f, b) = rel.maps(gid);
+                (Some(f), Some(b))
             }
-            _ => (None, None),
+            None => (None, None),
         };
         let g = Graph {
             ctx,
             spec,
             graph: gf,
-            fwd: fwd.as_ref(),
-            bwd: bwd.as_ref(),
+            fwd,
+            bwd,
             sweeps: &sweeps,
         };
         path_graph(&g, gid, left.as_ref(), (sv, ov, &pvars), &mut out)?;
@@ -7677,42 +7718,39 @@ fn path_graph(
             }
         }
         (PathEnd::Var(a), PathEnd::Var(b)) => {
-            let starts: Vec<u64> = match left {
-                Some(l) => {
-                    let (col, forward) = match (l.col_of(*a), l.col_of(*b)) {
-                        (Some(c), _) => (c, true),
-                        (None, Some(c)) => (c, false),
-                        _ => return Err(Error::invalid("path bound variable missing")),
-                    };
-                    let mut s: Vec<u64> = l.cols[col]
-                        .iter()
-                        .map(|x| x.0)
-                        .filter(|x| *x != 0)
-                        .collect();
-                    s.sort_unstable();
-                    s.dedup();
-                    for x in s {
-                        // variable–variable paths range over graph nodes only: a
-                        // zero-length match needs the start term to occur in the graph
-                        let in_graph = spec.min > 0 || g.is_node(x)?;
-                        for y in g.reach(x, forward)? {
-                            if y == x && spec.min == 0 && !in_graph {
-                                continue;
-                            }
-                            if forward {
-                                push(x, y, out)
-                            } else {
-                                push(y, x, out)
-                            }
-                        }
+            let Some(l) = left else {
+                return g.each_start(&mut |x| {
+                    for y in g.reach(x, true)? {
+                        push(x, y, out);
                     }
-                    return Ok(());
-                }
-                None => g.all_nodes()?,
+                    ctx.check_output(out.len(), out.width())
+                });
             };
-            for x in starts {
-                for y in g.reach(x, true)? {
-                    push(x, y, out);
+            let (col, forward) = match (l.col_of(*a), l.col_of(*b)) {
+                (Some(c), _) => (c, true),
+                (None, Some(c)) => (c, false),
+                _ => return Err(Error::invalid("path bound variable missing")),
+            };
+            let mut s: Vec<u64> = l.cols[col]
+                .iter()
+                .map(|x| x.0)
+                .filter(|x| *x != 0)
+                .collect();
+            s.sort_unstable();
+            s.dedup();
+            for x in s {
+                // variable–variable paths range over graph nodes only: a zero-length
+                // match needs the start term to occur in the graph
+                let in_graph = spec.min > 0 || g.is_node(x)?;
+                for y in g.reach(x, forward)? {
+                    if y == x && spec.min == 0 && !in_graph {
+                        continue;
+                    }
+                    if forward {
+                        push(x, y, out)
+                    } else {
+                        push(y, x, out)
+                    }
                 }
                 ctx.check_output(out.len(), out.width())?;
             }
@@ -7747,7 +7785,7 @@ impl PathEdges {
     }
 
     /// Add the edges of one batch of the edge plan.
-    pub(super) fn add(&mut self, spec: &PathSpec, e: &Table) -> Result<()> {
+    pub(super) fn add(&mut self, ctx: &Ctx, spec: &PathSpec, e: &Table) -> Result<()> {
         let Some((a, b)) = spec.edge_vars else {
             return Err(Error::invalid("a path without an edge plan"));
         };
@@ -7756,6 +7794,9 @@ impl PathEdges {
         };
         let gc = spec.graph_var.and_then(|g| e.col_of(g));
         for i in 0..e.len() {
+            if i % 65_536 == 65_535 {
+                ctx.check()?;
+            }
             let (x, y) = (e.cols[ac][i].0, e.cols[bc][i].0);
             if x == 0 || y == 0 {
                 continue;
@@ -7818,7 +7859,7 @@ pub(super) fn path_batch(
 }
 
 /// A transitive path without inputs, evaluated one start node at a time for cursors.
-/// Between calls it keeps the start nodes of the graph it is walking.
+/// Between calls it keeps a chunk of the start nodes of the graph it is walking.
 pub(super) struct PathWalk {
     spec: PathSpec,
     vars: Vec<VarId>,
@@ -7826,6 +7867,10 @@ pub(super) struct PathWalk {
     graph: usize,
     starts: Option<Vec<u64>>,
     start: usize,
+    /// The last start node read so far in the graph being walked, and whether no
+    /// start node follows the ones held.
+    after: Option<u64>,
+    last_chunk: bool,
     sweeps: std::cell::Cell<usize>,
     /// The edge relation of a path over a sequence or alternative.
     edges: Option<PathEdges>,
@@ -7842,6 +7887,8 @@ impl PathWalk {
             graph: 0,
             starts: None,
             start: 0,
+            after: None,
+            last_chunk: false,
             sweeps: std::cell::Cell::new(0),
         })
     }
@@ -7946,22 +7993,29 @@ impl PathWalk {
                 }
                 (PathEnd::Var(_), PathEnd::Var(_)) => {
                     if self.starts.is_none() {
-                        // As [`Graph::all_nodes`] finds them: the sources of the edge
-                        // relation when the path has no zero-length match.
-                        self.starts = Some(match g.fwd {
+                        // As [`Graph::each_start`] finds them: the sources of the edge
+                        // relation when the path has no zero-length match, otherwise
+                        // the nodes of the next chunk.
+                        let (starts, last) = match g.fwd {
                             Some(f) if spec.min > 0 => {
                                 let mut starts: Vec<u64> = f.keys().copied().collect();
                                 starts.sort_unstable();
-                                starts
+                                (starts, true)
                             }
-                            _ => walk_starts(ctx, spec, &g.graph)?,
-                        });
+                            _ => start_chunk(ctx, spec, &g.graph, self.after)?,
+                        };
+                        self.after = starts.last().copied();
+                        self.last_chunk = last;
+                        self.starts = Some(starts);
                         self.start = 0;
                     }
                     let starts = self.starts.as_ref().expect("start nodes");
                     let Some(&x) = starts.get(self.start) else {
                         self.starts = None;
-                        self.graph += 1;
+                        if self.last_chunk {
+                            self.after = None;
+                            self.graph += 1;
+                        }
                         continue;
                     };
                     self.start += 1;
@@ -7977,60 +8031,155 @@ impl PathWalk {
     }
 }
 
-/// The start nodes of a path with two variable ends, in order, as
-/// [`Graph::all_nodes`] finds them, read block by block under a charge rather than as
-/// a list of every key.
-fn walk_starts(ctx: &Ctx, spec: &PathSpec, graph: &GraphFilter) -> Result<Vec<u64>> {
-    let held = ctx.charge(0)?;
-    let mut set: FxHashSet<u64> = FxHashSet::default();
-    let mut charged = 0usize;
-    let mut grow = |set: &FxHashSet<u64>| -> Result<()> {
-        if set.len() >= charged + 1024 {
-            // a set entry and its share of a growing table
-            held.add((set.len() - charged) as u64 * 48)?;
-            charged = set.len();
-            ctx.check()?;
-        }
-        Ok(())
+/// The start nodes of a path with two variable ends that [`start_chunk`] reads at a
+/// time from each index it reads.
+const START_CHUNK: usize = 4096;
+
+/// The next start nodes of a path with two variable ends after `after`, in order, and
+/// whether they are the last: the subjects of a simple path's predicate when the path
+/// has no zero-length match, otherwise every subject and object of the active graph.
+/// Each call reads at most about [`START_CHUNK`] distinct nodes from each index, so a
+/// walk over every node of a large graph holds a few thousand of them at a time
+/// rather than a set of all of them.
+fn start_chunk(
+    ctx: &Ctx,
+    spec: &PathSpec,
+    graph: &GraphFilter,
+    after: Option<u64>,
+) -> Result<(Vec<u64>, bool)> {
+    let from = match after {
+        None => 0,
+        Some(u64::MAX) => return Ok((Vec::new(), true)),
+        Some(a) => a + 1,
     };
-    let (perm, prefix, columns): (Perm, Vec<u64>, Vec<usize>) = if spec.min > 0 {
+    if spec.min > 0 {
         let Some((p, rev)) = spec.simple else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), true));
         };
         let perm = if rev { Perm::Pos } else { Perm::Pso };
-        (perm, vec![p], vec![1])
-    } else {
-        // every subject and object of the active graph
-        (Perm::Spo, Vec::new(), vec![S, Perm::Spo.col_of(O)])
-    };
-    let gc = perm.col_of(crate::index::G);
-    ctx.snap.scan(perm, &prefix, |chunk| {
-        match chunk {
-            Chunk::Block(b, s, e) => {
-                for i in s..e {
-                    let k = b.key(i);
-                    if graph.accepts(k[gc]) {
-                        for &c in &columns {
-                            set.insert(k[c]);
-                        }
-                    }
-                    grow(&set)?;
-                }
-            }
-            Chunk::Row(k) => {
-                if graph.accepts(k[gc]) {
-                    for &c in &columns {
-                        set.insert(k[c]);
-                    }
-                }
-                grow(&set)?;
-            }
+        return distinct_from(ctx, perm, Some(p), from, graph);
+    }
+    let (subjects, s_last) = distinct_from(ctx, Perm::Spo, None, from, graph)?;
+    let (objects, o_last) = distinct_from(ctx, Perm::Osp, None, from, graph)?;
+    // Up to the smaller end of a list cut short, both lists hold every node.
+    let bound = match (s_last, o_last) {
+        (true, true) => u64::MAX,
+        (true, false) => *objects.last().expect("a list cut short is not empty"),
+        (false, true) => *subjects.last().expect("a list cut short is not empty"),
+        (false, false) => {
+            (*subjects.last().expect("cut short")).min(*objects.last().expect("cut short"))
         }
-        Ok(true)
-    })?;
-    let mut v: Vec<u64> = set.into_iter().collect();
-    v.sort_unstable();
-    Ok(v)
+    };
+    let mut out = Vec::with_capacity(subjects.len() + objects.len());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let x = match (subjects.get(i), objects.get(j)) {
+            (Some(&a), Some(&b)) if a == b => {
+                i += 1;
+                j += 1;
+                a
+            }
+            (Some(&a), Some(&b)) if a < b => {
+                i += 1;
+                a
+            }
+            (_, Some(&b)) => {
+                j += 1;
+                b
+            }
+            (Some(&a), None) => {
+                i += 1;
+                a
+            }
+            (None, None) => break,
+        };
+        if x > bound {
+            break;
+        }
+        out.push(x);
+    }
+    Ok((out, s_last && o_last))
+}
+
+/// The distinct values from `from` on of the key column after `prefix` in `perm`,
+/// in order, of the quads in `graph`: at most [`START_CHUNK`] of them, and whether
+/// the scan reached the end of the range. The rows of a value already taken are
+/// skipped by a new seek past them once they run long, so a value with millions of
+/// quads, such as a common class, costs a seek rather than a read of its rows. The
+/// deadline is checked as rows are read.
+fn distinct_from(
+    ctx: &Ctx,
+    perm: Perm,
+    prefix: Option<u64>,
+    mut from: u64,
+    graph: &GraphFilter,
+) -> Result<(Vec<u64>, bool)> {
+    /// Rows of a value already taken that are read before seeking past it.
+    const RUN: usize = 512;
+    let col = usize::from(prefix.is_some());
+    let gc = perm.col_of(crate::index::G);
+    let mask = if ctx.opt.selective_columns {
+        (1 << col) | (1 << gc)
+    } else {
+        crate::index::ALL_COLS
+    };
+    let mut out: Vec<u64> = Vec::with_capacity(START_CHUNK.min(1024));
+    let mut rows = 0usize;
+    loop {
+        let (lo, hi) = match prefix {
+            Some(p) => ([p, from, 0, 0], [p, u64::MAX, u64::MAX, u64::MAX]),
+            None => ([from, 0, 0, 0], [u64::MAX; 4]),
+        };
+        // `Some(v)`: seek to v, past a long run; `None` with `cut`: the chunk is full
+        let mut resume: Option<u64> = None;
+        let mut cut = false;
+        let mut run = 0usize;
+        let mut take = |v: u64, g: u64, out: &mut Vec<u64>| -> Result<bool> {
+            rows += 1;
+            if rows.is_multiple_of(65_536) {
+                ctx.check()?;
+            }
+            if out.last() == Some(&v) {
+                run += 1;
+                if run >= RUN && v < u64::MAX {
+                    resume = Some(v + 1);
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+            run = 0;
+            if graph.accepts(g) {
+                if out.len() == START_CHUNK {
+                    cut = true;
+                    return Ok(false);
+                }
+                out.push(v);
+            }
+            Ok(true)
+        };
+        ctx.snap.scan_between_cols(perm, lo, hi, mask, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    let vals = &b.cols[col][s..e];
+                    let gs = &b.cols[gc][s..e];
+                    let mut i = 0;
+                    while i < vals.len() {
+                        if !take(vals[i], gs[i], &mut out)? {
+                            return Ok(false);
+                        }
+                        i += 1;
+                    }
+                }
+                Chunk::Row(k) => return take(k[col], k[gc], &mut out),
+            }
+            Ok(true)
+        })?;
+        ctx.check()?;
+        match resume {
+            Some(next) if !cut => from = next,
+            _ => return Ok((out, !cut)),
+        }
+    }
 }
 
 // ----------------------------------------------------------------- vectors ------

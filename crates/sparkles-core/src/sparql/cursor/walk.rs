@@ -36,7 +36,7 @@ pub(super) fn read_edges(
     let mut charge = OwnedCharge::new(ctx, edges.bytes_with(0))?;
     while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
         charge.resize(edges.bytes_with(batch.table.len))?;
-        edges.add(spec, &batch.table)?;
+        edges.add(ctx, spec, &batch.table)?;
         charge.resize(edges.bytes_with(0))?;
     }
     Ok((edges, charge))
