@@ -1177,9 +1177,32 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
     def phase_left():
         return runner.deadline - time.monotonic()
 
+    expiring = False
+
     def phase_expired():
+        # The results the child printed before the deadline are kept for the caller,
+        # without starting more work.
+        nonlocal expiring
         batch.close(kill=True)
+        if not expiring:
+            expiring = True
+            with contextlib.suppress(Invalid):
+                drain()
         raise HarnessFault("phase deadline expired") from None
+
+    def drain():
+        """Take the results the reader queued for the lines in flight. The reader has
+        queued every line it read once close() has joined it."""
+        while flight:
+            try:
+                kind, raw = batch.lines.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "overlong":
+                raise HarnessFault("batch output too long")
+            if kind != "line":
+                return
+            receive(raw)
 
     def start():
         nonlocal batch, batches
@@ -1234,18 +1257,8 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
 
     def fail_flight(status):
         record = batch.close(kill=True)
-        # Results the child printed before it ended still count. The reader has
-        # queued every line it read once close() has joined it.
-        while flight:
-            try:
-                kind, raw = batch.lines.get_nowait()
-            except queue.Empty:
-                break
-            if kind == "overlong":
-                raise HarnessFault("batch output too long")
-            if kind != "line":
-                break
-            receive(raw)
+        # Results the child printed before it ended still count.
+        drain()
         while flight:
             c, rnd, _ = flight.popleft()
             code = "killed" if status == "killed" else "timeout"

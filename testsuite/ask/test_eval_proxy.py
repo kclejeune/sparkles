@@ -1266,6 +1266,22 @@ class OpenAI(Base):
         self.assertGreater(settle["cost"], px.openai_cost(SOL, usage) * px.UNKNOWN_PREMIUM - 1)
         self.assertGreater(settle["cost"], dearest // 2)
 
+    def test_mismatch_charges_keep_the_premium_and_the_tier(self):
+        tiny = {"prompt_tokens": 1, "completion_tokens": 1}
+        proxy = self.proxy(Upstream(self.reply(model="gpt-7", usage=tiny)))
+        proxy.handle(chat())
+        settle = [x for x in self.lines() if x.get("op") == "settle"][-1]
+        payload = json.dumps(proxy.prepare(chat()), separators=(",", ":"), ensure_ascii=False)
+        dearest = px.openai_bound(SOL, len(payload.encode()), 1024)
+        self.assertGreaterEqual(settle["cost"], dearest * px.UNKNOWN_PREMIUM)
+        usage = {"prompt_tokens": 1000, "completion_tokens": 1024,
+                 "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+        ledger = self.ledger(name="b.jsonl")
+        proxy = self.proxy(Upstream(self.reply(model=SOL, usage=usage, service_tier="priority")), ledger=ledger)
+        proxy.handle(chat())
+        settle = [x for x in self.lines("b.jsonl") if x.get("op") == "settle"][-1]
+        self.assertGreaterEqual(settle["cost"], px.openai_cost(SOL, usage) * px.UNKNOWN_PREMIUM)
+
     def test_inconsistent_cache_counts_keep_the_bound(self):
         for details in [{"cached_tokens": 2000}, {"cached_tokens": 600, "cache_write_tokens": 600}]:
             u = {"prompt_tokens": 1000, "completion_tokens": 0, "prompt_tokens_details": details}

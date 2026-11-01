@@ -1707,6 +1707,18 @@ class BatchCases(unittest.TestCase):
         ), self.assertRaises(eval_ask.HarnessFault):
             self.run_batch(self.runner("overlong-then-stop", deadline=0.5), qs, jobs=40)
 
+    def test_answers_queued_when_the_phase_deadline_passes_are_kept(self):
+        runner = self.runner("stop-reading-once", deadline=300)
+        runner.deadline = time.monotonic() + 1
+        qs = [dict(q, question="x" * 1990) for q in self.qs(40)]
+        results = []
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, None, "p", qs, 40, lambda pair, qs: True, self.report(),
+                lambda q, a: False, results,
+            )
+        self.assertEqual([q["id"] for q, _, _ in results], ["q0"])
+
     def test_an_eof_from_a_child_the_runner_had_to_kill_ends_the_run(self):
         qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(2))]
         with self.assertRaises(eval_ask.HarnessFault):
