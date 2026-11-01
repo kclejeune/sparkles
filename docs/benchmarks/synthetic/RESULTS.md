@@ -314,9 +314,9 @@ warm in this build than in the one before, although they run 1.4% and 2.1% fewer
 instructions per request. Neither reads through an index join, and a build with the first
 version of the lookahead ran them as fast as the base with it on and off. The cost
 therefore comes from where the compiler placed their code, and
-[roadmap item NEW-ITEM-1](../../ROADMAP.md#performance-follow-ups) follows it up. At 1.05M
+[roadmap item 515](../../ROADMAP.md#performance-follow-ups) follows it up. At 1.05M
 both are within 3%. Warm point lookups run 2% to 3% more instructions for the check of
-cold segments, which [item NEW-ITEM-2](../../ROADMAP.md#performance-follow-ups) covers.
+cold segments, which [item 516](../../ROADMAP.md#performance-follow-ups) covers.
 The [immutable run record](runs/2026-11-01-cold-lookups-forge/validation.json) holds the
 revisions, binary hashes, scripts, compressed samples and answer hashes of every step.
 

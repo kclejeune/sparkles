@@ -1083,8 +1083,8 @@ samples, and 14% and 21% slower warm. They run a merge join of two scans and a g
 read through no index join, and run 1.4% and 2.1% fewer instructions per request than
 main. A build with the first version of the lookahead ran them within 1% of main with the
 lookahead on and off. The difference therefore lies in code placement, and roadmap item
-NEW-ITEM-1 follows it up. The cold check before each fresh block's read accounts for the
-extra instructions of the warm point lookups, and item NEW-ITEM-2 moves it to the cache
+515 follows it up. The cold check before each fresh block's read accounts for the
+extra instructions of the warm point lookups, and item 516 moves it to the cache
 miss.
 
 The cold rows of `bench.sh` against Oxigraph, in two rounds of five restarts per engine on

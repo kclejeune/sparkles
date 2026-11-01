@@ -344,9 +344,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   scales. Dense reads on the 1.01B dataset are unmeasured. Roadmap item 4.
 * `group-avg` and `expr-agg-arg` at 10.5M run 8% and 11% slower cold, and 14% and 21%
   slower warm, in the build that added the join lookahead, while they run fewer
-  instructions per request. The cause is code placement, which roadmap item NEW-ITEM-1
+  instructions per request. The cause is code placement, which roadmap item 515
   follows up. Warm point lookups run 2% to 3% more instructions for the join's check of
-  cold segments, which item NEW-ITEM-2 covers.
+  cold segments, which item 516 covers.
 * The prewarm restores the block cache and the pages of the generation's files. It does
   not restore the result cache, and it reads data that the next queries may never touch.
   Its list holds at most 4 GiB of pages.
@@ -428,7 +428,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item 496](../ROADMAP.md), [item 497](../ROADMAP.md), [item 498](../ROADMAP.md), [item 501](../ROADMAP.md), [item 502](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md).
+The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item 496](../ROADMAP.md), [item 497](../ROADMAP.md), [item 498](../ROADMAP.md), [item 501](../ROADMAP.md), [item 502](../ROADMAP.md), [item 515](../ROADMAP.md), [item 516](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
