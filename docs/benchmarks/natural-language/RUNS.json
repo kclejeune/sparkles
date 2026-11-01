@@ -105,6 +105,83 @@
         }
       },
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-bd6c6834a171c2af71e6e1d6590e938608a20a1bed2c7c2b8d416bd0d4519017",
+      "path": "../2026-11-01-ask-model-baseline-paid.json",
+      "sha256": "bd6c6834a171c2af71e6e1d6590e938608a20a1bed2c7c2b8d416bd0d4519017",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "maxOutputTokens": 4096,
+          "requestTimeoutSecs": 120,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer",
+          "projectionMargin": 1.25
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "A development laptop with 16 cores and 30 GB of memory that was running other work, with load averages between 10 and 40. Wall times in this record come from that loaded host and are context, not latency measurements.",
+          "source": {
+            "commit": "7b3b6df5124a02f2e1cd0a0efdb252624b642bbe",
+            "binarySha256": "9bce795c06d756509fe8230fd919e431718ab1891e97e8692297abe825dcccf7",
+            "buildCommand": "mbx build --release --locked -p sparkles-server --bin sparkles",
+            "mbx": "1.28.0",
+            "features": [
+              "auth",
+              "backup",
+              "backup-encryption",
+              "default",
+              "embed-local",
+              "fmt",
+              "geo",
+              "geo-epsg",
+              "graphql",
+              "mapping-parquet",
+              "mapping-sqlite",
+              "mcp",
+              "memory",
+              "mimalloc",
+              "office",
+              "otel",
+              "pdf",
+              "pdf-ocr",
+              "reasoning",
+              "shacl",
+              "shex",
+              "text",
+              "text-cjk-dict",
+              "tls"
+            ],
+            "artifactProfile": {
+              "opt_level": "3",
+              "debuginfo": 1,
+              "debug_assertions": false,
+              "overflow_checks": false,
+              "test": false
+            },
+            "compilerComments": "\nString dump of section '.comment':\n  [     1]  GCC: (GNU) 16.2.0\n  [    13]  clang version 21.1.8\n  [    28]  rustc version 1.99.1 (58cf8f9c3 2026-10-13)\n  [    54]  Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145)\n\n",
+            "harnessSha256": {
+              "scripts/eval-ask": "0960a8ba0ded1b389b0e3a359caeaa2db0cc621fcde86bba6dbc309143b2bbe1",
+              "scripts/eval-ask-anthropic": "43238c2a75098f950ef1f14aa78a3b9967a1e2ebfa15416ec78a8ca302c71f86",
+              "testsuite/ask/eval_support/proxy.py": "48c1d71187190c9415b2c03565b99a82ae2230411fdfe202c7a9b0243ad25bea",
+              "testsuite/ask/eval_support/evaluator.py": "ae483f660ed11ad2f4d92ebcbcef98e02e3dccb62dbe9dde3fcacbe480ea3c74",
+              "scripts/text2sparql-convert": "274a8d7cb4db4f5b83a83445797265ccd582e1d9d3b2f7ef8f5df11e14f10791"
+            }
+          },
+          "measurement": "Ask accuracy baseline on DBpedia 2022.12.01 for Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5",
+          "scope": "QALD-9-plus with 107 retained questions and Text2SPARQL'25 db25 with 74 retained questions. Haiku ran QALD three times, Sonnet twice and Opus once, and each model ran db25 once where the cap allowed. The QALD questions were used while Ask grounding was tuned, so they are regression evidence. db25 was not used in that tuning.",
+          "schema": 1
+        }
+      },
+      "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
     }
   ]
 }
