@@ -528,7 +528,7 @@ class Errors(Base):
         self.assertTrue(caught.exception.sent)
 
     def test_missing_usage_settles_at_the_bound(self):
-        replies = ({"model": HAIKU}, {"usage": {"input_tokens": "x"}}, None)
+        replies = ({"model": HAIKU}, {"model": HAIKU, "usage": {"input_tokens": "x"}}, None)
         for n, reply in enumerate(replies):
             with self.subTest(reply=reply):
                 data = b"not json" if reply is None else json.dumps(reply).encode()
@@ -1250,6 +1250,31 @@ class OpenAI(Base):
         for served, ok in [(LUNA, True), (LUNA + "-2026-09-30", True),
                            (LUNA + "-mini", False), (LUNA + "-2026-09-30x", False)]:
             self.assertEqual(bool(px.OPENAI.served(LUNA, {"model": served})), ok, served)
+
+    def test_a_reply_of_another_model_is_priced_at_its_rates(self):
+        usage = {"prompt_tokens": 1000, "completion_tokens": 1024,
+                 "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+        proxy = self.proxy(Upstream(self.reply(model=SOL + "-2026-10-01", usage=usage)))
+        self.assertEqual(proxy.handle(chat())[0], 502)
+        settle = [x for x in self.lines() if x.get("op") == "settle"][-1]
+        self.assertGreaterEqual(settle["cost"], px.openai_cost(SOL, usage))
+        # a model the table does not know is charged past the dearest model's bound
+        proxy = self.proxy(Upstream(self.reply(model="gpt-7", usage=usage)), ledger=self.ledger(name="b.jsonl"))
+        self.assertEqual(proxy.handle(chat())[0], 502)
+        settle = [x for x in self.lines("b.jsonl") if x.get("op") == "settle"][-1]
+        dearest = px.openai_bound(SOL, len(json.dumps(json.loads(chat()), separators=(",", ":"))) + 50, 1024)
+        self.assertGreater(settle["cost"], px.openai_cost(SOL, usage) * px.UNKNOWN_PREMIUM - 1)
+        self.assertGreater(settle["cost"], dearest // 2)
+
+    def test_inconsistent_cache_counts_keep_the_bound(self):
+        for details in [{"cached_tokens": 2000}, {"cached_tokens": 600, "cache_write_tokens": 600}]:
+            u = {"prompt_tokens": 1000, "completion_tokens": 0, "prompt_tokens_details": details}
+            self.assertIsNone(px.openai_cost(LUNA, u), details)
+        proxy = self.proxy(Upstream(self.reply(usage={"prompt_tokens": 1000, "completion_tokens": 0,
+                                                      "prompt_tokens_details": {"cached_tokens": 2000}})))
+        self.assertEqual(proxy.handle(chat())[0], 200)
+        reserve, settle = [x for x in self.lines() if x.get("op") in ("reserve", "settle")]
+        self.assertEqual((settle["status"], settle["cost"]), ("usage-unknown", reserve["bound"]))
 
     def test_the_bound_covers_a_write_of_every_input_token(self):
         u = {"prompt_tokens": 2 * 500 + 8192, "completion_tokens": 1024,

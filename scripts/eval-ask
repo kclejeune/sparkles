@@ -1241,6 +1241,8 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
                 kind, raw = batch.lines.get_nowait()
             except queue.Empty:
                 break
+            if kind == "overlong":
+                raise HarnessFault("batch output too long")
             if kind != "line":
                 break
             receive(raw)

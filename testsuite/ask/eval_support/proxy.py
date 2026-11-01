@@ -311,7 +311,7 @@ def openai_cost(model, usage, limit=0, service_tier=None):
     except ValueError:
         return None
     plain = prompt - read - written
-    if plain < 0:
+    if read > prompt or written < 0 or plain < 0:
         return None
     rates = OPENAI_RATES[model][int(prompt > OPENAI_LONG_CONTEXT)]
     exact = plain * rates[0] + written * rates[1] + read * rates[3] + out * rates[4]
@@ -871,6 +871,14 @@ class AnthropicAPI:
     def served(self, model, reply):
         return reply.get("model") == model
 
+    def served_model(self, reply):
+        """The table's model that served a reply, or None for one it does not know."""
+        served = reply.get("model")
+        return served if served in RATES else None
+
+    def any_cost(self, model, usage):
+        return cost(model, usage)
+
     def provider(self, port, proxy):
         return {"kind": "anthropic", "endpoint": f"http://127.0.0.1:{port}"}
 
@@ -977,6 +985,13 @@ class OpenAIAPI:
         return isinstance(served, str) and (
             served == model or re.fullmatch(re.escape(model) + r"-\d{4}-\d{2}-\d{2}", served)
         )
+
+    def served_model(self, reply):
+        """The table's model that served a reply, or None for one it does not know."""
+        return next((m for m in OPENAI_RATES if self.served(m, reply)), None)
+
+    def any_cost(self, model, usage):
+        return openai_cost(model, usage)
 
     def provider(self, port, proxy):
         out = {"kind": "openai", "endpoint": f"http://127.0.0.1:{port}/v1"}
@@ -1257,7 +1272,7 @@ class Proxy:
         # bound and never reaches the child as an answer.
         mismatch = isinstance(reply, dict) and not self.api.served(model, reply)
         if mismatch:
-            charged, status_text = max(limit, amount or 0), "served-model-mismatch"
+            charged, status_text = self.mismatch_charge(reply, usage, limit, amount, payload), "served-model-mismatch"
         elif amount is None:
             charged, status_text = limit, "usage-unknown"
         else:
@@ -1278,6 +1293,20 @@ class Proxy:
             return 502, [], error_body("api_error", "another model served the request")
         clean, _ = redact(reply, self.key)
         return status, passed, json.dumps(clean, ensure_ascii=False).encode()
+
+    def mismatch_charge(self, reply, usage, limit, amount, payload):
+        """The charge of a reply that another model served: at least the request's
+        bound, its usage at the served model's rates, and for a model the table does
+        not know, the largest premium over the dearest model's bound and cost."""
+        served = self.api.served_model(reply)
+        priced = [m for m in self.api.rates] if served is None else [served]
+        costs = [self.api.any_cost(m, usage) for m in priced]
+        known = max((c for c in costs if c is not None), default=None)
+        body = strict_json(payload)
+        dearest = max(self.api.bound(m, len(payload), body) for m in self.api.rates)
+        if served is None or known is None:
+            return max(limit, amount or 0, dearest, (known or dearest) * UNKNOWN_PREMIUM)
+        return max(limit, amount or 0, known)
 
     def record(self, ident, case, model, payload, status, data, request_id):
         """Append the request and its reply to the replies file, key redacted.

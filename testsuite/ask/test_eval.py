@@ -1407,6 +1407,10 @@ for raw in sys.stdin:
         time.sleep(600)
     if mode == "no-read":
         time.sleep(600)
+    if mode == "overlong-then-stop":
+        sys.stdout.write("x" * (5 * 1024 * 1024) + "\n")
+        sys.stdout.flush()
+        time.sleep(600)
     if mode == "close-stdout-ignore-term":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         os.close(1)
@@ -1695,6 +1699,13 @@ class BatchCases(unittest.TestCase):
         self.assertIsNone(status[0])
         self.assertTrue(set(status) <= {None, "timeout"}, status)
         self.assertGreaterEqual(len(report["batches"]), 2)
+
+    def test_an_overlong_result_queued_before_a_write_times_out_ends_the_run(self):
+        qs = [dict(q, question="x" * 1990) for q in self.qs(40)]
+        with mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0), mock.patch.object(
+            eval_ask, "BATCH_SLACK_SECONDS", 0.5
+        ), self.assertRaises(eval_ask.HarnessFault):
+            self.run_batch(self.runner("overlong-then-stop", deadline=0.5), qs, jobs=40)
 
     def test_an_eof_from_a_child_the_runner_had_to_kill_ends_the_run(self):
         qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(2))]

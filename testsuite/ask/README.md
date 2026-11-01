@@ -311,8 +311,11 @@ reads and its output, reasoning included, at the rate above 272,000 prompt token
 the prompt passes that. A reply that does not report its writes is charged every
 uncached input token as a write. A reply from another tier than the default is charged
 at least its bound. OpenAI names the dated snapshot that served a model, so a reply
-must name the model asked for or that name followed by a date. A reply from any other
-model is charged its bound and fails as a provider error. The preflight sends one
+must name the model asked for or that name followed by a date. A reply from another
+model, for either provider, fails as a provider error and is charged at least its bound
+and its usage at the served model's rates. A model the rate table does not know is
+charged the largest premium over the dearest model's bound. Cache counts that pass the
+prompt leave the usage unknown, so the reply is charged its bound. The preflight sends one
 structured-output request to each model, since Chat Completions has no free token
 count.
 

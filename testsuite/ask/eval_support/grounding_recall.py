@@ -44,9 +44,15 @@ def is_resource(iri, namespaces):
     return any(iri.startswith(ns) for ns in namespaces)
 
 
+# Chat Completions carries its instructions as messages of these roles.
+SYSTEM_ROLES = ("system", "developer")
+
+
 def prompt_text(request):
     parts = []
     for m in request.get("messages") or []:
+        if not isinstance(m, dict) or (m.get("role") in SYSTEM_ROLES and "system" not in request):
+            continue
         c = m.get("content")
         if isinstance(c, str):
             parts.append(c)
@@ -56,6 +62,14 @@ def prompt_text(request):
 
 
 def system_text(request):
+    """The system prompt of a Messages request, or the system and developer messages of
+    a Chat Completions one."""
+    if "system" not in request:
+        return "".join(
+            m["content"]
+            for m in request.get("messages") or []
+            if isinstance(m, dict) and m.get("role") in SYSTEM_ROLES and isinstance(m.get("content"), str)
+        )
     s = request.get("system")
     if isinstance(s, list):
         return "".join(b.get("text", "") for b in s if isinstance(b, dict))
@@ -79,10 +93,16 @@ def drafts(replies_path):
             continue  # a repair quotes the failed query
         reply = r.get("reply")
         u = reply.get("usage") if r.get("status") == 200 and isinstance(reply, dict) else None
+        # An Anthropic answer reports its cache classes apart, and an OpenAI answer
+        # counts them inside prompt_tokens.
         tokens = (
-            sum(
-                u.get(k) or 0
-                for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+            (
+                u.get("prompt_tokens") or 0
+                if "prompt_tokens" in u
+                else sum(
+                    u.get(k) or 0
+                    for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                )
             )
             if isinstance(u, dict)
             else None

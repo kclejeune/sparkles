@@ -196,6 +196,28 @@ class GuardedScore(unittest.TestCase):
 
 
 class GroundingRecall(unittest.TestCase):
+    def test_chat_completions_prompts_count(self):
+        import json
+        import grounding_recall
+
+        qset = {"questions": [{"id": "a", "kind": "answerable", "question": "Q?",
+                               "gold": "SELECT ?x WHERE { ?x <http://ex.org/p> ?y }"}]}
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            request = {"model": "m", "messages": [
+                {"role": "system", "content": "You translate"},
+                {"role": "user", "content": "<http://ex.org/p> Question: Q?"}]}
+            reply = {"usage": {"prompt_tokens": 900, "completion_tokens": 5,
+                               "prompt_tokens_details": {"cached_tokens": 800}}}
+            (p / "replies.jsonl").write_text(json.dumps(
+                {"case": "c1", "status": 200, "request": request, "reply": reply}) + "\n")
+            (p / "s").mkdir()
+            (p / "s" / "report.json").write_text(json.dumps(
+                {"pairs": ["m"], "cases": [{"id": "a", "case": "c1", "pair": "m"}]}))
+            row = grounding_recall.recall(qset, p)["a"]
+            self.assertTrue(row["prompt"] and row["complete"])
+            self.assertEqual(row["promptTokens"], 900)
+
     def test_one_report_of_one_pair_per_set(self):
         import json
         import grounding_recall
