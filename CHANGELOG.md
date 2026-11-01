@@ -24,6 +24,15 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The reasoner can keep witnesses for each fact of a materialization, the sets of input
+quads from which the rules derive it, with the provenance algebra of incremental views.
+`ReasonOptions::witnesses` sets the bound per fact, and `Cache::witnesses` and
+`Cache::witness_dependents` read them from the closure kept in memory. Incremental runs
+maintain them, deletions included, and a fact whose minimal supports fit the bound keeps
+exactly those supports. They are off by default, and protections that show inferences
+by their support will turn them on (spec F18 §7.1). Keeping them costs memory and time,
+574 MiB and ten times the materialization time for LUBM with 10 universities under RDFS.
+
 The server keeps a resource catalog of versioned sources, vocabularies and datasets
 under `/$/resources`, for server administrators. A version never changes once it is
 added, and its imports and graph sources pin versions that exist. Licences are SPDX

@@ -138,6 +138,65 @@ slowdowns.
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.
 
+### Reasoner witnesses
+
+The witnesses of item 416 are off by default
+([F18](../../specs/F18-explanations-and-entailment-diffs.md#reasoner-witnesses-item-416)).
+These runs used `examples/lubm.rs` on an 8-core AMD EPYC Namespace instance with 16 GB of
+memory, which gives approximate numbers rather than published ones. The base build is
+0dc27215 and the witness build is 25f927df, with the same compiler. Each run materialized
+a fresh copy of the dataset with 8 threads, and the LUBM-style data comes from the
+generator of `examples/lubm.rs`. The first table gives the medians of ten interleaved
+rounds with witnesses off.
+
+| Run, witnesses off | Base | Witness build | Ratio | Derived triples |
+|---|---:|---:|---:|---:|
+| LUBM, 10 universities, `rdfs` | 1,574 ms | 1,594 ms | 1.013 | 565,906 |
+| LUBM, 10 universities, `owl-rl` | 1,286 ms | 1,350 ms | 1.050 | 1,233,449 |
+| OWL2Bench, 1 university, `owl-rl` | 866 ms | 927 ms | 1.070 | 1,400,688 |
+| OWL2Bench, 2 universities, `owl-rl` | 3,338 ms | 3,327 ms | 0.997 | 4,915,635 |
+
+Both builds derived the same facts with the same peak heap, 390, 268 and 992 MiB. The
+means of the same runs differ by 3% or less, and an earlier instance with five rounds
+measured 1.015, 1.064, 1.082 and 0.933. The path without witnesses only checks an
+option, so these differences are not explained by the work it does, and roadmap item
+NEW-ITEM-1 checks them on an Intel host.
+
+The second table gives single runs of the witness build with a bound of 8, each limited
+to 11 GB of address space.
+
+| Run, bound 8 | Run | Witnesses | Facts | Truncated | Kept witnesses | Witness heap | Peak heap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| LUBM, 1 university, `rdfs` | 1.2 s | 1.1 s | 74,203 | 28,429 | 246,063 | 58 MiB | 238 MiB |
+| LUBM, 1 university, `owl-rl` | 5.2 s | 5.0 s | 132,492 | 89,285 | 729,859 | 190 MiB | 458 MiB |
+| LUBM, 10 universities, `rdfs` | 15.9 s | 13.5 s | 677,738 | 248,201 | 2,139,973 | 574 MiB | 1,416 MiB |
+| LUBM, 10 universities, `owl-rl` | 51.1 s | 48.8 s | 1,233,449 | 828,320 | 6,763,141 | 1,753 MiB | 3,286 MiB |
+| OWL2Bench, 1 university, `owl-rl` | ran out of memory | | | | | | |
+
+The facts include the explicit facts that a rule can derive, which count as their own
+witness. Most of the time goes to finding each fact's rule instances and multiplying
+their witnesses, and many OWL 2 RL facts are truncated because one of their premises is.
+Roadmap item NEW-ITEM-2 covers the time and item NEW-ITEM-3 the memory.
+
+The incremental runs change 1,000 triples of the LUBM data with 10 universities under
+`rdfs`, undo the change and make it again, each time from the closure kept in memory.
+
+| Run, `rdfs` | Without witnesses | With witnesses, bound 8 |
+|---|---:|---:|
+| Full run | 1.5 s | 14.6 s |
+| Settle after reading the closure back | 0.23 s | 12.0 s |
+| Change | 12 ms | 5.3 s |
+| Undo | 10 ms | 4.5 s |
+| Change again | 8 ms | 6.6 s |
+| Kept closure | 83 MiB | 849 MiB |
+
+A change evaluated about 230,000 facts again, a third of the closure, because it reaches
+many truncated facts. Reading the closure back from the dataset builds the witnesses
+again, since they are not stored. The
+[run directory](runs/2026-11-01-witnesses-nsc/run.sh.txt) holds the commands, the
+[host](runs/2026-11-01-witnesses-nsc/env.txt) and every
+[output line](runs/2026-11-01-witnesses-nsc/mat.txt).
+
 ## Query-time reasoning latency
 
 `mise run bench:reasoning-latency` is the rewrite gate of derivation on demand and RDFS
