@@ -237,6 +237,32 @@ class GroundingRecall(unittest.TestCase):
         self.assertTrue(present("http://example.org/p", "ex:p, ex:q", pre))
         self.assertTrue(present("http://example.org/p", "<http://example.org/p>", pre))
         self.assertTrue(present("http://example.org/p", "see http://example.org/p.", pre))
+        self.assertTrue(present("http://example.org/p", "ex:p: a predicate", pre))
+        dbr = {"dbr": "http://dbpedia.org/resource/"}
+        self.assertFalse(present("http://dbpedia.org/resource/Star_Trek", "dbr:Star_Trek:_The_Next_Generation", dbr))
+        self.assertFalse(present("http://dbpedia.org/resource/Star_Trek", "http://dbpedia.org/resource/Star_Trek:_TNG", dbr))
+        # the empty prefix and dotted prefix names
+        text = ": <http://example.org/>\na.b: <http://example.org/b/>\nUse :p and a.b:q.\n: Thing 3, Other 1"
+        pre = grounding_recall.prompt_prefixes(text)
+        self.assertEqual(pre, {"": "http://example.org/", "a.b": "http://example.org/b/"})
+        self.assertTrue(present("http://example.org/p", text, pre))
+        self.assertTrue(present("http://example.org/b/q", text, pre))
+        self.assertIn("http://example.org/Thing", grounding_recall.grouped_terms(text))
+        self.assertFalse(present("http://example.org/q", text, pre))
+
+    def test_a_text_mode_first_draft_is_not_a_repair(self):
+        import json
+        import grounding_recall
+
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "replies.jsonl"
+            first = "Question: Q?\nAnswer with one fenced ```sparql block."
+            repair = "Question: Q?\nYour previous query was:\n```sparql\nASK {}\n```\nIt failed."
+            p.write_text("".join(json.dumps({"case": "c", "status": 200, "request": {
+                "system": "You translate", "messages": [{"content": t}]}}) + "\n" for t in (first, repair)))
+            got = grounding_recall.drafts(p)["c"]
+            self.assertEqual(len(got), 1)
+            self.assertIn("one fenced", got[0][0])
 
 
 class KilledChild(unittest.TestCase):

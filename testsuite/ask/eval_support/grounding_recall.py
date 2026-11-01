@@ -31,6 +31,10 @@ IGNORE = {
 }
 XSD = "http://www.w3.org/2001/XMLSchema#"
 DRAFT_SYSTEM = "You translate"
+# How Ask's repair_text opens a repair request.
+REPAIR = "Your previous query was:\n```sparql"
+# A prefix name as store::valid_prefix_name accepts it, including the empty one.
+PREFIX = r"(?:[A-Za-z](?:[\w.-]*[\w-])?)?"
 
 
 def is_resource(iri):
@@ -68,7 +72,7 @@ def drafts(replies_path):
         if not system_text(req).startswith(DRAFT_SYSTEM):
             continue
         text = prompt_text(req)
-        if "```sparql" in text.split("Question:", 1)[-1]:
+        if REPAIR in text.split("Question:", 1)[-1]:
             continue  # a repair quotes the failed query
         reply = r.get("reply")
         u = reply.get("usage") if r.get("status") == 200 and isinstance(reply, dict) else None
@@ -88,7 +92,9 @@ def grouped_terms(text):
     """IRIs listed under a namespace, as in `<http://x/> a 3, b 1; p: c 2`."""
     out = set()
     prefixes = prompt_prefixes(text)
-    for head, body in re.findall(r"(<[^<>\s]+[/#]>|[A-Za-z][\w-]*:) ((?:[\w-]+ \d+(?:, )?)+)", text):
+    for head, body in re.findall(
+        r"(<[^<>\s]+[/#]>|(?<![\w.:-])" + PREFIX + r":) ((?:[\w-]+ \d+(?:, )?)+)", text
+    ):
         ns = head[1:-1] if head.startswith("<") else prefixes.get(head[:-1])
         if ns:
             out |= {ns + local for local in re.findall(r"([\w-]+) \d+", body)}
@@ -96,9 +102,9 @@ def grouped_terms(text):
 
 
 # What may not follow a whole IRI or prefixed name: a character that would continue
-# it, or a dot followed by one, so that `ex:p` does not match `ex:p.x` or `ex:p/q`
-# and `http://x/p` does not match `http://x/p/q`.
-END = r"(?![\w%/#?=&~+-]|\.[\w%/#-])"
+# it, or a dot or colon followed by one, so that `ex:p` does not match `ex:p.x`,
+# `ex:p:x` or `ex:p/q` and `http://x/p` does not match `http://x/p/q`.
+END = r"(?![\w%/#?=&~+-]|[.:][\w%/#-])"
 
 
 def present(term, text, prefixes, grouped=frozenset()):
@@ -109,13 +115,13 @@ def present(term, text, prefixes, grouped=frozenset()):
     for p, ns in prefixes.items():
         if term.startswith(ns) and len(term) > len(ns):
             local = term[len(ns) :]
-            if re.search(r"(?<![\w-])" + re.escape(f"{p}:{local}") + END, text):
+            if re.search(r"(?<![\w.:-])" + re.escape(f"{p}:{local}") + END, text):
                 return True
     return False
 
 
 def prompt_prefixes(text):
-    return dict(re.findall(r"^([A-Za-z][\w-]*): <([^<>\s]+)>$", text, re.M))
+    return dict(re.findall(r"^(" + PREFIX + r"): <([^<>\s]+)>$", text, re.M))
 
 
 def recall(qset, run_dir):
