@@ -3829,6 +3829,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/claims/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Verify evidence references
+         * @description Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.
+         */
+        post: operations["resolveEvidence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/data": {
         parameters: {
             query?: never;
@@ -6299,6 +6319,104 @@ export interface components {
              * @description The hold's identity. A random one when absent.
              */
             id?: string;
+        };
+        /** @description Evidence references to verify at their exact retained views. */
+        EvidenceResolveRequest: {
+            /** @description The references, verified in order. Each names exactly one of `storedFact` and `record`. */
+            references: {
+                /** @description The caller's unique name of the reference, which an answer names. */
+                key: string;
+                record?: {
+                    /** @description The content digest the record must carry. */
+                    contentDigest?: string;
+                    /** @description The record's IRI. */
+                    iri: string;
+                    /** @description The kinds the record may have. Any profile kind when absent. */
+                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal")[];
+                };
+                storedFact?: {
+                    /**
+                     * Format: uuid
+                     * @description The branch by identity: the dataset's id for `main`.
+                     */
+                    branchId: string;
+                    /** @description The exact commit of the branch that the fact is read at. */
+                    commit: number;
+                    /**
+                     * Format: uuid
+                     * @description The dataset by identity, never by name.
+                     */
+                    datasetId: string;
+                    /** @description The named graph's IRI. Absent or `null` for the default graph. */
+                    graph?: string | null;
+                    /** @description A source import's blank-node mapping. Refused as `unanchored-evidence` by this release. */
+                    importMap?: string;
+                    /** @description A stable reifier IRI that reifies the triple in the graph at the commit. Required when the triple has blank nodes. */
+                    reifier?: string;
+                    /** @description The expected triple as one N-Triples 1.2 statement without its final `.`. */
+                    triple: string;
+                };
+            }[];
+        };
+        /** @description The verified evidence references. */
+        EvidenceResolveResult: {
+            /** @description Every reference, verified, in request order. */
+            resolved: {
+                key: string;
+                record?: {
+                    contentDigest: string | null;
+                    /** @description The protected evidence graph that holds the record. */
+                    graph: string;
+                    iri: string;
+                    /** @enum {string} */
+                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal";
+                    receipt: {
+                        /**
+                         * Format: uuid
+                         * @description The branch it was published on.
+                         */
+                        branchId: string;
+                        /** @description The commit that published it. */
+                        commit: number;
+                        /**
+                         * Format: uuid
+                         * @description The dataset the record was published in.
+                         */
+                        datasetId: string;
+                        iri: string;
+                    };
+                    span: {
+                        /** @description The code point after the selection. */
+                        end: number;
+                        rendition: string;
+                        /** @description The first selected code point. */
+                        start: number;
+                        /** @description The digest of the selected text. */
+                        textDigest: string;
+                    } | null;
+                };
+                storedFact?: {
+                    /**
+                     * Format: uuid
+                     * @description The branch the reference names.
+                     */
+                    branchId: string;
+                    /** @description The commit the fact was verified at. */
+                    commit: number;
+                    /**
+                     * Format: uuid
+                     * @description The dataset's identity.
+                     */
+                    datasetId: string;
+                    graph: string | null;
+                    reifier: string | null;
+                    /**
+                     * Format: uuid
+                     * @description The branch whose history served the commit: the named branch, or the upstream that serves a commit at or below its starting point.
+                     */
+                    servedBy: string;
+                };
+            }[];
         };
         /** @description The evidence settings of a dataset, as `evidence.json` format 1 holds them. */
         EvidenceSettings: {
@@ -13787,7 +13905,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The id of the task, token or lock. */
+                /** @description The id of the task, token, lock or catalog resource. */
                 id: components["parameters"]["id"];
             };
             cookie?: never;
@@ -21035,6 +21153,42 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveEvidence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Every reference, verified. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceResolveResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
             default: components["responses"]["Error"];
         };
     };

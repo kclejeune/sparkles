@@ -267,6 +267,22 @@ pub enum ManagedErrorKind {
     HoldsLimit,
     /// The dataset's `holds.json` cannot be read, so holds cannot change.
     HoldsUnavailable,
+    /// A reference or record cannot be read: it is missing, unretained, hidden from the
+    /// caller or not an authenticated profile record. The answer is the same in each
+    /// case, so it does not disclose which (see [`crate::evidence::resolve`]).
+    EvidenceUnavailable,
+    /// Resolution stopped within its preparation limit or before an access policy
+    /// could be prepared within it, so the references were not all verified.
+    IncompleteEvidence,
+    /// A stored fact with blank nodes has no stable reifier at the referenced view.
+    UnanchoredEvidence,
+    /// A passage selector or its text digest does not match the retained rendition.
+    SpanMismatch,
+    /// A record's publication receipt does not name this dataset's history.
+    OriginNotReproduced,
+    /// A record's immutable content differs from what the reference expects, or the
+    /// record is stored more than once.
+    ImmutableRecordConflict,
 }
 
 /// An error of the managed-graph boundary, with its stable code. Nothing was written.
@@ -274,7 +290,10 @@ pub enum ManagedErrorKind {
 pub struct ManagedError {
     pub kind: ManagedErrorKind,
     /// `profile-managed-graph`, `managed-unavailable`, `unsupported-profile`,
-    /// `hold-conflict`, `holds-limit` or `holds-unavailable`
+    /// `hold-conflict`, `holds-limit`, `holds-unavailable` or one of the evidence
+    /// resolution codes, `evidence-unavailable`, `incomplete-evidence`,
+    /// `unanchored-evidence`, `span-mismatch`, `origin-not-reproduced` and
+    /// `immutable-record-conflict`
     pub code: &'static str,
     pub message: String,
 }
@@ -289,6 +308,12 @@ impl ManagedError {
             ManagedErrorKind::HoldConflict => "hold-conflict",
             ManagedErrorKind::HoldsLimit => "holds-limit",
             ManagedErrorKind::HoldsUnavailable => "holds-unavailable",
+            ManagedErrorKind::EvidenceUnavailable => "evidence-unavailable",
+            ManagedErrorKind::IncompleteEvidence => "incomplete-evidence",
+            ManagedErrorKind::UnanchoredEvidence => "unanchored-evidence",
+            ManagedErrorKind::SpanMismatch => "span-mismatch",
+            ManagedErrorKind::OriginNotReproduced => "origin-not-reproduced",
+            ManagedErrorKind::ImmutableRecordConflict => "immutable-record-conflict",
         };
         Error::Managed(Box::new(ManagedError {
             kind,
@@ -306,6 +331,12 @@ impl ManagedError {
             ManagedErrorKind::HoldConflict => 409,
             ManagedErrorKind::HoldsLimit => 409,
             ManagedErrorKind::HoldsUnavailable => 503,
+            ManagedErrorKind::EvidenceUnavailable
+            | ManagedErrorKind::IncompleteEvidence
+            | ManagedErrorKind::UnanchoredEvidence
+            | ManagedErrorKind::SpanMismatch
+            | ManagedErrorKind::OriginNotReproduced => 422,
+            ManagedErrorKind::ImmutableRecordConflict => 409,
         }
     }
 }

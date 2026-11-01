@@ -2,6 +2,12 @@
 use super::*;
 use crate::history::{At, HistoryOptions, ReadLimit, Resolved};
 
+/// Where a pinned read starts: an open store, or a branch read without opening it.
+enum PinnedSource<'a> {
+    Resident(branching::BranchStore<'a>),
+    Cold(uuid::Uuid),
+}
+
 impl Store {
     pub(super) fn inherited_limited(
         &self,
@@ -512,6 +518,51 @@ impl Store {
         self.snapshot_pinned_limited(store, at, options, max_memory_bytes)
     }
 
+    /// The state of the branch whose identity is `branch` at `at`, within
+    /// `max_memory_bytes`, through this dataset's main store. `branch` is the dataset
+    /// id for `main` or the id of a listed branch, so a renamed branch keeps resolving
+    /// and a recreated name never does. A cold branch is read without opening its
+    /// store. A commit at or below the branch's starting point, or its starting commit
+    /// after the branch dropped its own copy, is read from the upstream that serves it,
+    /// and the returned id names that serving branch. The read follows the same exact
+    /// selector, origin and budget rules as
+    /// [`snapshot_at_with_branch_limited`](Self::snapshot_at_with_branch_limited).
+    /// A deleted, retired or unknown branch is `no-such-branch`. This grants no access:
+    /// callers apply their caller's graph policy to the returned physical snapshot.
+    pub fn snapshot_of_branch_limited(
+        &self,
+        branch: uuid::Uuid,
+        at: &At,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        let limit = ReadLimit {
+            options,
+            memory: Some(max_memory_bytes),
+            held: crate::history::READ_METADATA_BYTES,
+        };
+        limit.check(0)?;
+        if self.is_branch() {
+            return Err(crate::branch::invalid_branch(
+                "a branch is resolved through the dataset's main store",
+            ));
+        }
+        if branch == self.dataset_id {
+            return self.snapshot_from_limited(
+                PinnedSource::Resident(branching::BranchStore::Main(self)),
+                at,
+                options,
+                max_memory_bytes,
+            );
+        }
+        self.listed_limited(branch, &limit)?;
+        let read =
+            self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)?;
+        // A branch deleted while it was read no longer names this state.
+        self.listed_limited(branch, &limit)?;
+        Ok(read)
+    }
+
     fn snapshot_pinned_limited(
         &self,
         store: &Store,
@@ -519,10 +570,22 @@ impl Store {
         options: &HistoryOptions,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
-        enum Source<'a> {
-            Resident(branching::BranchStore<'a>),
-            Cold(uuid::Uuid),
-        }
+        self.snapshot_from_limited(
+            PinnedSource::Resident(branching::BranchStore::Main(store)),
+            at,
+            options,
+            memory,
+        )
+    }
+
+    fn snapshot_from_limited(
+        &self,
+        start: PinnedSource<'_>,
+        at: &At,
+        options: &HistoryOptions,
+        memory: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        use PinnedSource as Source;
         use branching::readonly::OriginRead;
         let capacity = self
             .opts
@@ -537,7 +600,7 @@ impl Store {
             memory: Some(memory),
             held: crate::history::READ_METADATA_BYTES,
         };
-        let mut selected = Source::Resident(branching::BranchStore::Main(store));
+        let mut selected = start;
         let mut inherited = None;
         let mut hops = 0usize;
         loop {
@@ -759,6 +822,14 @@ fn bounded_ranges(
 // predicate map as well. Leaves rebalance below 16 keys and branches below eight
 // children; 256 bytes per key plus 8 KiB per tree conservatively covers retained
 // node/vector capacity, Arc headers, and the per-predicate persistent map.
+impl Snapshot {
+    /// The conservative preparation bytes a bounded read charges for this state's
+    /// delta, which a caller that retains the snapshot keeps charged.
+    pub(crate) fn retained_preparation_bytes(&self) -> u64 {
+        preparation_delta_bytes(&self.delta)
+    }
+}
+
 pub(super) fn preparation_delta_bytes(delta: &Delta) -> u64 {
     let quads = delta.inserts().saturating_add(delta.deletes()) as u64;
     if quads == 0 {

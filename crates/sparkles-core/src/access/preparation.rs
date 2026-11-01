@@ -72,6 +72,11 @@ impl Preparation {
         self.inner.control.check()
     }
 
+    /// The cancellation, deadline and progress of this request.
+    pub fn control(&self) -> &Control {
+        &self.inner.control
+    }
+
     /// Report a preparation phase and recheck controls after the callback returns.
     /// Providers must call this outside their internal locks.
     pub fn checkpoint(&self, phase: &str) -> Result<()> {
@@ -280,9 +285,35 @@ impl Preparation {
         let mut key = Text::new(self)?;
         key.push_str("<")?;
         key.push_str(iri)?;
+        self.lookup_vocab_key(snap, key.value.as_bytes())
+    }
+
+    /// Resolve a ground term, an IRI, literal or triple term without blank nodes, with
+    /// the controls of [`lookup_iri`](Self::lookup_iri). A blank node or a triple term
+    /// containing one is refused, because a caller's blank-node label names no stored
+    /// node.
+    pub fn lookup_term(&self, snap: &Snapshot, term: &Term) -> Result<Option<Id>> {
+        self.check()?;
+        if !ground(term) {
+            return Err(Error::invalid(
+                "a blank node label does not identify a stored term",
+            ));
+        }
+        if let Some(id) = crate::id::inline_id(term) {
+            return Ok(Some(id));
+        }
+        if let Term::NamedNode(n) = term {
+            return self.lookup_iri(snap, n.as_str());
+        }
+        let _held = self.reserve(term_bytes(term).saturating_add(64))?;
+        let key = crate::id::term_key(term);
+        self.lookup_vocab_key(snap, &key)
+    }
+
+    fn lookup_vocab_key(&self, snap: &Snapshot, key: &[u8]) -> Result<Option<Id>> {
         let mut workspace = self.reserve(0)?;
         if let Ok(id) = snap.generation.vocab.find_with_controlled(
-            key.value.as_bytes(),
+            key,
             |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
             |phase| self.checkpoint(phase),
         )? {
@@ -291,7 +322,7 @@ impl Preparation {
         }
         let result = snap.generation.dvocab.with_prepared(self, |vocab| {
             Ok(vocab
-                .find_prepared(key.value.as_bytes(), snap.dvocab_len, |_| self.check())?
+                .find_prepared(key, snap.dvocab_len, |_| self.check())?
                 .map(Id::delta))
         })?;
         self.check()?;
@@ -334,6 +365,53 @@ impl Preparation {
             }
         };
         let result = each(decoded.as_ref().map(|(term, _)| term))?;
+        self.check()?;
+        Ok(result)
+    }
+
+    /// The lexical form of a stored simple literal, borrowed for `each` without decoding
+    /// it as a term. Only the key's own bytes and the reconstruction workspace are
+    /// charged, so a long retained text can be read within an allowance that would
+    /// not hold a decoded term of it. `None` for any other term.
+    pub fn with_simple_literal<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+            // `"`, the lexical form, and the separator with no language or datatype
+            // after it. UTF-8 text never holds the separator byte.
+            let lexical = match key {
+                [b'"', text @ .., crate::id::KEY_SEP] => std::str::from_utf8(text).ok(),
+                _ => None,
+            };
+            each(lexical)
+        };
+        let mut workspace = self.reserve(0)?;
+        let result = match id.tag() {
+            Tag::Vocab => snap.generation.vocab.get_with_controlled(
+                id.payload(),
+                |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
+                |phase| self.checkpoint(phase),
+                &mut call,
+            )?,
+            Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
+                if id.payload() >= snap.dvocab_len {
+                    return Ok(None);
+                }
+                Ok(vocab.get(id.payload()).map(&mut call))
+            })?,
+            _ => None,
+        };
+        let result = match result {
+            Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
         self.check()?;
         Ok(result)
     }
@@ -580,6 +658,35 @@ impl Preparation {
         self.check()?;
         self.inner.control.progress.report(0.0, stage);
         self.check()
+    }
+}
+
+/// Whether `term` contains no blank node.
+fn ground(term: &Term) -> bool {
+    match term {
+        Term::BlankNode(_) => false,
+        Term::Triple(t) => {
+            !matches!(t.subject, oxrdf::NamedOrBlankNode::BlankNode(_)) && ground(&t.object)
+        }
+        _ => true,
+    }
+}
+
+/// An upper bound of the vocabulary key bytes of `term`.
+fn term_bytes(term: &Term) -> u64 {
+    match term {
+        Term::NamedNode(n) => n.as_str().len() as u64 + 1,
+        Term::BlankNode(_) => 9,
+        Term::Literal(l) => {
+            let suffix = l
+                .language()
+                .map_or(l.datatype().as_str().len(), |tag| tag.len() + 8);
+            (l.value().len() + suffix) as u64 + 16
+        }
+        Term::Triple(t) => {
+            let subject: Term = t.subject.clone().into();
+            term_bytes(&subject) + t.predicate.as_str().len() as u64 + term_bytes(&t.object) + 40
+        }
     }
 }
 

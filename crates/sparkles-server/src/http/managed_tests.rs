@@ -494,3 +494,170 @@ async fn evidence_holds_are_acquired_listed_and_released_over_http() {
     let (status, _) = call(&app, "DELETE", "/$/evidence/d/holds/not-a-uuid", None, "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// `POST /{ds}/claims/resolve` verifies stored facts at their exact commits and
+/// authenticated records, answers the first reference that does not verify with its
+/// code, and refuses malformed references field by field.
+#[tokio::test]
+async fn evidence_references_are_resolved_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let ds = state.get("d").unwrap();
+    let id = ds.store.dataset_id();
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        r#"{"format":1,"profile":1,"enabled":true,"sourceRecords":["urn:ev:sources"],"proposals":["urn:ev:claims"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        "INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:p> \"v\"@en } }",
+    )
+    .await;
+    assert!(status.is_success());
+    let fact_commit = ds.store.head_commit().seq;
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        "DELETE DATA { GRAPH <urn:g> { <urn:a> <urn:p> \"v\"@en } }",
+    )
+    .await;
+    assert!(status.is_success());
+    // a typed record with its receipt
+    let mut t = ds.store.write();
+    t.set_managed(
+        ds.store
+            .managed_writer(OwnerKind::Evidence, uuid::Uuid::new_v4())
+            .unwrap(),
+    )
+    .unwrap();
+    let (seq, _) = t.managed_stamp().unwrap();
+    let trig = format!(
+        "PREFIX ev: <urn:x-sparkles:evidence:>
+         GRAPH <urn:ev:sources> {{
+           <urn:rev> a ev:SourceRevision ; ev:availabilityReceipt <urn:receipt> .
+           <urn:receipt> ev:datasetId \"{id}\" ; ev:branchId \"{id}\" ; ev:commit {seq} .
+         }}"
+    );
+    let mut labels = std::collections::HashMap::new();
+    for q in oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::TriG).for_slice(trig.as_bytes()) {
+        let q = t.encode_quad(&q.unwrap(), &mut labels).unwrap();
+        t.insert(q).unwrap();
+    }
+    t.commit().unwrap();
+    let fact = |commit: u64| {
+        json!({"key": "f", "storedFact": {
+            "datasetId": id, "branchId": id, "commit": commit,
+            "graph": "urn:g", "triple": "<urn:a> <urn:p> \"v\"@en",
+        }})
+    };
+    let record = |kinds: J| json!({"key": "rec", "record": {"iri": "urn:rev", "kinds": kinds}});
+    let resolve = |refs: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/d/claims/resolve",
+                Some("application/json"),
+                &json!({ "references": refs }).to_string(),
+            )
+            .await
+        }
+    };
+    let (status, body) = resolve(json!([
+        fact(fact_commit),
+        record(json!(["SourceRevision"]))
+    ]))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resolved"][0]["storedFact"]["servedBy"], json!(id));
+    assert_eq!(
+        body["resolved"][0]["storedFact"]["commit"],
+        json!(fact_commit)
+    );
+    assert_eq!(body["resolved"][1]["record"]["kind"], "SourceRevision");
+    assert_eq!(
+        body["resolved"][1]["record"]["receipt"]["commit"],
+        json!(seq)
+    );
+    // the fact is gone at a later commit, which is never replaced by another
+    let (status, body) = resolve(json!([fact(fact_commit + 1)])).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        (body["code"].as_str(), body["reference"].as_str()),
+        (Some("evidence-unavailable"), Some("f"))
+    );
+    // the first failing reference is answered; a kind conflict is a 409
+    let (status, body) = resolve(json!([fact(fact_commit), record(json!(["Claim"]))])).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        (body["code"].as_str(), body["reference"].as_str()),
+        (Some("immutable-record-conflict"), Some("rec"))
+    );
+    // a blank node without a reifier
+    let (status, body) = resolve(json!([{"key": "b", "storedFact": {
+        "datasetId": id, "branchId": id, "commit": fact_commit,
+        "triple": "_:x <urn:p> \"v\"",
+    }}]))
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("unanchored-evidence")
+        )
+    );
+    // malformed references are field-specific 400s
+    for (refs, field) in [
+        (json!([{"key": "x"}]), "references[0]"),
+        (
+            json!([{"key": "", "record": {"iri": "urn:rev"}}]),
+            "references[0].key",
+        ),
+        (
+            json!([{"key": "x", "record": {"iri": "urn:rev", "kinds": ["Nope"]}}]),
+            "references[0].record.kinds[0]",
+        ),
+        (
+            json!([{"key": "x", "record": {"iri": "not an iri"}}]),
+            "references[0].record.iri",
+        ),
+        (
+            json!([{"key": "x", "storedFact": {"datasetId": id, "branchId": id, "commit": 1, "triple": "<urn:a> <urn:p>"}}]),
+            "references[0].storedFact.triple",
+        ),
+        (
+            json!([{"key": "x", "record": {"iri": "urn:a"}}, {"key": "x", "record": {"iri": "urn:b"}}]),
+            "references[1].key",
+        ),
+    ] {
+        let (status, body) = resolve(refs).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().starts_with(field), "{body}");
+    }
+    // records of a branch resolve at the branch's state, where main's record is inherited
+    ds.store.create_branch("dev", &Default::default()).unwrap();
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/d/claims/resolve?branch=dev",
+        Some("application/json"),
+        &json!({ "references": [record(json!([]))] }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

@@ -159,6 +159,21 @@ needs `admin`, or `sparkles branch delete --release-holds` releases its holds fi
 `sparkles check` counts holds among retained generations. The Rust client's
 `BranchDeleteOptions::release_holds` sends the new parameter.
 
+`POST /{ds}/claims/resolve` verifies evidence references without writing. A stored fact
+names its dataset and branch by identity and is read at exactly its commit, through the
+caller's view of that dataset and branch, and a commit at or below a branch's starting
+point is read from the upstream that serves it. A record resolves only as an
+authenticated record of the dataset's protected evidence graphs, with a receipt that
+names this dataset and one of its branches, and a passage's selector is checked against
+its rendition's retained text. A missing, unretained and unreadable reference all answer
+`422 evidence-unavailable`. The other outcomes are `422 incomplete-evidence`,
+`unanchored-evidence`, `span-mismatch` and `origin-not-reproduced` and `409
+immutable-record-conflict`. One resolution shares a 64 MiB allowance with the request
+deadline and cancellation. Rust applications use `sparkles::evidence::resolve::Resolution`,
+and `Store::snapshot_of_branch_limited` reads a branch by identity at an exact commit
+within a cap without opening a cold branch store. `Store::listed_branch_name` names a
+listed branch by its identity.
+
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
 An operator condenses a relation's strongly connected components and computes each

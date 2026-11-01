@@ -32,51 +32,51 @@ pub struct Profile {
 
 const V1: Profile = Profile {
     version: 1,
-    vocabulary: include_str!("../resources/evidence/v1/vocabulary.ttl"),
-    manifest: include_str!("../resources/evidence/v1/manifest.ttl"),
-    shapes: include_str!("../resources/evidence/v1/shapes.ttl"),
+    vocabulary: include_str!("../../resources/evidence/v1/vocabulary.ttl"),
+    manifest: include_str!("../../resources/evidence/v1/manifest.ttl"),
+    shapes: include_str!("../../resources/evidence/v1/shapes.ttl"),
     competency_queries: &[
         QueryResource {
             name: "claim-occurrences.rq",
-            query: include_str!("../resources/evidence/v1/queries/claim-occurrences.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/claim-occurrences.rq"),
         },
         QueryResource {
             name: "assertion-status.rq",
-            query: include_str!("../resources/evidence/v1/queries/assertion-status.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/assertion-status.rq"),
         },
         QueryResource {
             name: "evidence-relations.rq",
-            query: include_str!("../resources/evidence/v1/queries/evidence-relations.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/evidence-relations.rq"),
         },
         QueryResource {
             name: "source-lineage.rq",
-            query: include_str!("../resources/evidence/v1/queries/source-lineage.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/source-lineage.rq"),
         },
         QueryResource {
             name: "passage-selectors.rq",
-            query: include_str!("../resources/evidence/v1/queries/passage-selectors.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/passage-selectors.rq"),
         },
         QueryResource {
             name: "stored-fact-references.rq",
-            query: include_str!("../resources/evidence/v1/queries/stored-fact-references.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/stored-fact-references.rq"),
         },
         QueryResource {
             name: "opposite-polarities.rq",
-            query: include_str!("../resources/evidence/v1/queries/opposite-polarities.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/opposite-polarities.rq"),
         },
         QueryResource {
             name: "unsupported-claims.rq",
-            query: include_str!("../resources/evidence/v1/queries/unsupported-claims.rq"),
+            query: include_str!("../../resources/evidence/v1/queries/unsupported-claims.rq"),
         },
     ],
     compatibility_queries: &[
         QueryResource {
             name: "legacy-assertions.rq",
-            query: include_str!("../resources/evidence/v1/compatibility/legacy-assertions.rq"),
+            query: include_str!("../../resources/evidence/v1/compatibility/legacy-assertions.rq"),
         },
         QueryResource {
             name: "legacy-source-spans.rq",
-            query: include_str!("../resources/evidence/v1/compatibility/legacy-source-spans.rq"),
+            query: include_str!("../../resources/evidence/v1/compatibility/legacy-source-spans.rq"),
         },
     ],
 };
@@ -89,9 +89,13 @@ pub fn profile(version: u32) -> Option<&'static Profile> {
     (version == V1.version).then_some(&V1)
 }
 
+pub mod resolve;
+
 // ------------------------------------------------------------ settings ------------
 
-pub use sparkles_core::evidence::{CanonicalSettings, ClaimKind, ConflictMode, Policy, Settings};
+pub use sparkles_core::evidence::{
+    CanonicalSettings, ClaimKind, ConflictMode, Policy, Settings, Sha256Digest,
+};
 
 use crate::managed::{OwnerEntry, OwnerKind};
 use crate::task::Control;

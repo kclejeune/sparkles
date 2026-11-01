@@ -65,6 +65,11 @@ impl Store {
         self.family.managed.load_full()
     }
 
+    /// The running registry state, shared and not copied, for controlled readers.
+    pub(crate) fn managed_state_shared(&self) -> Option<Arc<ManagedState>> {
+        self.managed_state()
+    }
+
     /// The managed graphs of this store's dataset, `None` when no owner manages any.
     /// Fails with `managed-unavailable` when the registry cannot be enforced.
     pub fn managed_graphs(&self) -> Result<Option<ManagedGraphs>> {

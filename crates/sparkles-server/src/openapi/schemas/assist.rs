@@ -151,7 +151,128 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             "evidence-settings",
         ),
     );
+    let kinds = || string_enum(&KINDS);
+    let digest = |d: &str| {
+        with_desc(
+            json!({ "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }),
+            d,
+        )
+    };
+    let commit = |d: &str| with_desc(json!({ "type": "integer", "minimum": 0 }), d);
+    put(
+        "EvidenceResolveRequest",
+        doc(
+            closed(
+                &["references"],
+                json!({
+                    "references": with_desc(json!({
+                        "type": "array",
+                        "maxItems": 10000,
+                        "items": closed(
+                            &["key"],
+                            json!({
+                                "key": with_desc(json!({ "type": "string", "minLength": 1, "maxLength": 256 }), "The caller's unique name of the reference, which an answer names."),
+                                "storedFact": closed(
+                                    &["datasetId", "branchId", "commit", "triple"],
+                                    json!({
+                                        "datasetId": uuid("The dataset by identity, never by name."),
+                                        "branchId": uuid("The branch by identity: the dataset's id for `main`."),
+                                        "commit": commit("The exact commit of the branch that the fact is read at."),
+                                        "graph": with_desc(or_null(string()), "The named graph's IRI. Absent or `null` for the default graph."),
+                                        "triple": with_desc(string(), "The expected triple as one N-Triples 1.2 statement without its final `.`."),
+                                        "reifier": with_desc(string(), "A stable reifier IRI that reifies the triple in the graph at the commit. Required when the triple has blank nodes."),
+                                        "importMap": with_desc(string(), "A source import's blank-node mapping. Refused as `unanchored-evidence` by this release."),
+                                    }),
+                                ),
+                                "record": closed(
+                                    &["iri"],
+                                    json!({
+                                        "iri": with_desc(string(), "The record's IRI."),
+                                        "kinds": with_desc(array(kinds()), "The kinds the record may have. Any profile kind when absent."),
+                                        "contentDigest": digest("The content digest the record must carry."),
+                                    }),
+                                ),
+                            }),
+                        ),
+                    }), "The references, verified in order. Each names exactly one of `storedFact` and `record`."),
+                }),
+            ),
+            "Evidence references to verify at their exact retained views.",
+            "evidence-resolution",
+        ),
+    );
+    put(
+        "EvidenceResolveResult",
+        doc(
+            closed(
+                &["resolved"],
+                json!({
+                    "resolved": with_desc(array(closed(
+                        &["key"],
+                        json!({
+                            "key": string(),
+                            "storedFact": closed(
+                                &["datasetId", "branchId", "commit", "servedBy", "graph", "reifier"],
+                                json!({
+                                    "datasetId": uuid("The dataset's identity."),
+                                    "branchId": uuid("The branch the reference names."),
+                                    "commit": commit("The commit the fact was verified at."),
+                                    "servedBy": uuid("The branch whose history served the commit: the named branch, or the upstream that serves a commit at or below its starting point."),
+                                    "graph": or_null(string()),
+                                    "reifier": or_null(string()),
+                                }),
+                            ),
+                            "record": closed(
+                                &["iri", "kind", "graph", "receipt", "contentDigest", "span"],
+                                json!({
+                                    "iri": string(),
+                                    "kind": kinds(),
+                                    "graph": with_desc(string(), "The protected evidence graph that holds the record."),
+                                    "receipt": closed(
+                                        &["iri", "datasetId", "branchId", "commit"],
+                                        json!({
+                                            "iri": string(),
+                                            "datasetId": uuid("The dataset the record was published in."),
+                                            "branchId": uuid("The branch it was published on."),
+                                            "commit": commit("The commit that published it."),
+                                        }),
+                                    ),
+                                    "contentDigest": or_null(digest("The record's content digest.")),
+                                    "span": or_null(closed(
+                                        &["rendition", "start", "end", "textDigest"],
+                                        json!({
+                                            "rendition": string(),
+                                            "start": commit("The first selected code point."),
+                                            "end": commit("The code point after the selection."),
+                                            "textDigest": digest("The digest of the selected text."),
+                                        }),
+                                    )),
+                                }),
+                            ),
+                        }),
+                    )), "Every reference, verified, in request order."),
+                }),
+            ),
+            "The verified evidence references.",
+            "evidence-resolution",
+        ),
+    );
 }
+
+const KINDS: [&str; 12] = [
+    "SourceRevision",
+    "Rendition",
+    "Passage",
+    "EvidenceRef",
+    "Claim",
+    "EvidenceLink",
+    "Assessment",
+    "Note",
+    "Decision",
+    "Task",
+    "ReviewDecision",
+    "IdentityProposal",
+];
 
 fn explaining(put: &mut dyn FnMut(&str, J)) {
     put(

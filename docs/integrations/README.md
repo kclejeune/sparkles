@@ -54,12 +54,12 @@ registered and closed, and the next catalog open reopens it. Restore publication
 verifies the restored identity separately from the original identity required for
 rollback.
 
-`sparkles::managed_source::ResidentSourceOwner` retains the catalog's actual Dataset and
-an exact resident branch Store. Core `ArcSourceOwner` supports direct Arc-backed callers.
-Their getters borrow existing openings and do not open cold branches. These leases provide
-lifetime and identity only. Read authorization, authenticated managed writes and durable
-source holds remain separate requirements. Runtime ownership checks do not authorize
-removal of source bytes required by a durable consumer.
+`sparkles::evidence::resolve::Resolution` finds a dataset among a catalog's registered
+datasets by its UUID and reads a branch by its UUID at an exact commit, without opening a
+cold branch store. The embedding decides the caller's access on the current names before
+anything is read. Durable source holds, not live openings, keep referenced commits
+readable. Runtime ownership checks do not authorize removal of source bytes required by a
+durable consumer.
 
 * The embedded Rust API is `sparkles::Dataset`, with a fluent query builder in
   `sparkles::querybuilder` ([USAGE.md](../USAGE.md#embedding-the-library),
