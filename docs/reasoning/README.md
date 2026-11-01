@@ -149,6 +149,41 @@ request or on every write, and the schema report counts what the data holds.
   `sparkles shex validate|parse` accepts Jena's flag names, and `parse --out shexr`
   writes Turtle.
 
+### OWL 2 ontologies
+
+* `sparkles-owl` holds the OWL 2 structural model of entities, class and property
+  expressions, data ranges, axioms, annotations and the ontology header. It reads the
+  model from triples by the reverse mapping of the OWL 2 Mapping to RDF Graphs and writes
+  it back by the forward mapping. Its functional-style writer renders axioms and
+  documents. The `ontology` cargo feature, which is on by default in the server, builds it
+  into the library and the server.
+* A read takes the graphs a caller names, the default graph unless told otherwise, and
+  follows `owl:imports` to graphs of the dataset that the caller can read. A strict read
+  keeps every triple the mapping does not cover as unmapped and refuses shared list
+  cells. A lenient read, the default, also types undeclared entities from their use and
+  records each guess as a diagnostic. Triples that map to no axiom are counted and
+  listed, never dropped silently.
+* The profile checks test the OWL 2 DL structural restrictions and the grammars of
+  OWL 2 EL, QL and RL. Each violation names its rule and section in the recommendations
+  and the axiom it concerns. A report on a profile also lists the DL violations, since
+  each profile is a subset of OWL 2 DL. The checks cover the assertions the store holds
+  unless the caller leaves them out.
+* An edit adds and removes axioms in one commit. Added axioms declare the entities they
+  use unless the caller turns this off. A removal deletes the axiom's triples and the
+  anonymous structures it alone uses, and keeps any structure that another axiom or
+  triple still refers to. A removal deletes only the declarations it names, and
+  `remove_entity` names an entity's declarations, its axioms and the assertions about it.
+* The Rust handle `ds.ontology()` opens a snapshot's ontology, checks it and edits it,
+  and keeps the last four reads of up to two million triples each, keyed by commit, for
+  callers who read every graph. `/$/ontology/{ds}` serves the summary, the axioms, the
+  checks and edits over HTTP with the caller's grants
+  ([API.md](../API.md#ontology)). `sparkles ontology summary|axioms|check|edit` does the
+  same for a database directory or a server, and `sparkles ontology check FILE` checks
+  an ontology file without a database. The check exits with status 1 when the ontology
+  is outside a profile it names.
+* The W3C OWL 2 test cases run as `mise run test:owl`, with the known differences and
+  their reasons in `crates/sparkles-owl/tests/w3c_owl_known.txt`.
+
 ### Write-time validation
 
 * SHACL and ShEx can validate the post-state of every commit before anything is written.
@@ -279,6 +314,18 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   validate in full. Roadmap item 54.
 * Validation endpoints refuse callers whose grants cover only some graphs or triples.
   Roadmap item 75.
+* The ontology API has no Python, Node.js or JVM surface, no views that include
+  materialized inferences and no warning when a reasoning run reads axioms outside RL.
+  Roadmap item NEW-ITEM-1.
+* The ontology API reads no functional-style syntax files, has no MCP tool and does not
+  diff axioms between commits. Roadmap item NEW-ITEM-2.
+* An ontology read has no size budget of its own beyond the query deadline, and its cost
+  on large ontologies is not measured. Roadmap item NEW-ITEM-3.
+* The Rust ontology handle has no entity accessors such as the superclasses of a class
+  and no edit builder. Callers filter axioms by type and entity instead. Roadmap item
+  NEW-ITEM-4.
+* The profile checks do not check the lexical forms of literals against their datatypes.
+  Roadmap item NEW-ITEM-5.
 
 ## Configuration and usage
 
@@ -293,12 +340,13 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 * Read [Minimal justifications](../API.md#minimal-justifications).
 * Read [SHACL Compact Syntax (SHACLC)](../API.md#shacl-compact-syntax-shaclc).
 * Read [ShEx validation](../API.md#shex-validation).
+* Read [Ontology](../API.md#ontology).
 * Read [Constraints layer](../API.md#constraints-layer).
 * Read [Schema reports from statistics](../API.md#schema-reports-from-statistics).
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md), [item NEW-ITEM-2](../ROADMAP.md), [item NEW-ITEM-3](../ROADMAP.md), [item NEW-ITEM-4](../ROADMAP.md), [item NEW-ITEM-5](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

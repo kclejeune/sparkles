@@ -41,6 +41,7 @@ work.
 | `crates/sparkles-alloc` | The mimalloc global allocator of the server, the bindings and the memory examples | — |
 | `crates/sparkles-reasoner` | RDFS, OWL 2 RL and Jena rules by semi-naive forward chaining | jena-core `reasoner` |
 | `crates/sparkles-shacl`, `crates/sparkles-shex` | SHACL and ShEx validation over store snapshots | jena-shacl, jena-shex |
+| `crates/sparkles-owl` | The OWL 2 axiom model, its mappings to and from RDF graphs, the functional-style writer and the OWL 2 DL, EL, QL and RL checks | jena-ontapi |
 | `crates/sparkles-backup` | Backup repositories on a file system or S3 | Fuseki `/$/backup` |
 | `crates/sparkles-graphql` | The read-only GraphQL adapter | — |
 | `crates/sparkles-fmt`, `crates/sparkles-fmt-wasm` | The formatter and linter, and their WebAssembly build | — |
@@ -206,6 +207,7 @@ mise run test:features # the stripped-server compatibility matrix (opt-in)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
+mise run test:owl      # W3C OWL 2 test cases: strict reads, round trips, DL, EL, QL and RL checks
 mise run test:csvw     # W3C CSV on the Web: the RDF tests, in minimal and standard mode
 mise run ui:e2e        # Playwright end-to-end tests against a real server
 mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
@@ -301,6 +303,16 @@ Sparkles passes all 425 syntax, 99 negative-syntax, 14 negative-structure and 41
 representation tests, and reads and writes all 418 ShExR schemas. Of the validation
 tests, 1,062 pass and one is a known failure. The 42 tests that check blank-node labels
 are skipped, because the store does not keep them.
+
+The OWL 2 test cases of the W3C OWL Working Group come from their approved export,
+`all.rdf`, which `scripts/fetch-test-suites.sh` downloads at a pinned checksum and
+`SPARKLES_OWL2_TESTS` names. `mise run test:owl` reads each of the 335 cases with an
+RDF/XML ontology. A case the suite places in OWL 2 DL must read strictly and pass the DL
+check, and a case outside OWL 2 DL must fail it. The EL, QL and RL checks must agree with
+the profiles each case lists, and every ontology in OWL 2 DL must round-trip through
+the forward and reverse mappings. `crates/sparkles-owl/tests/w3c_owl_known.txt` lists 31
+known differences with their reasons. Most are cases that type their entities in the
+OWL 1 way or use anonymous individuals in a profile whose grammar has none.
 
 ### Feature builds and cited paths
 

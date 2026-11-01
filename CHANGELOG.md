@@ -24,6 +24,17 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+An OWL 2 ontology API reads the axioms of a dataset's graphs through the OWL 2 Mapping to
+RDF Graphs, checks them against OWL 2 DL, EL, QL and RL, and edits them in one commit.
+The new `sparkles-owl` crate holds the axiom model, both mappings with lenient and strict
+reads, a functional-style writer and the profile checks. The library's `ontology`
+feature adds `Dataset::ontology()`, and the server, which builds it by default, serves
+`GET /$/ontology/{ds}`, `GET /$/ontology/{ds}/axioms`, `POST /$/ontology/{ds}/check` and
+`POST /$/ontology/{ds}/axioms` with the caller's grants. The CLI adds
+`sparkles ontology summary|axioms|check|edit` and `sparkles ontology check FILE`, which
+exits with status 1 when the ontology is outside a profile it names. `mise run test:owl`
+runs the W3C OWL 2 test cases.
+
 The library builds the options of a query with `sparkles::QueryRequest`, which applies a
 `sparkles::Budgets` of timeout, rows, memory, rows produced and spill bytes, a caller's
 lower budgets, an inference view and a cancellation flag. The server builds every query
