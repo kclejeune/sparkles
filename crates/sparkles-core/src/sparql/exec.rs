@@ -6505,7 +6505,7 @@ fn distinct(t: Table) -> Table {
 
 // ------------------------------------------------------------------ group ------
 
-fn group(
+pub(super) fn group(
     ctx: &Ctx,
     t: &Table,
     keys: &[VarId],

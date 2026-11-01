@@ -181,7 +181,10 @@ impl Table {
         self
     }
 
-    /// Sort rows by the given columns (raw id order, UNDEF first).
+    /// Sort rows by the given columns (raw id order, UNDEF first). Rows with equal
+    /// keys keep their order, which a grouping whose aggregates see a group's rows in
+    /// input order relies on. The row position breaks ties in the unstable sort, so the
+    /// sort stays in place.
     pub fn sort_by_vars(&mut self, vars: &[VarId]) {
         if self.sorted.starts_with(vars) || self.len <= 1 {
             self.sorted = vars.to_vec();
@@ -192,7 +195,7 @@ impl Table {
         use rayon::prelude::*;
         if cols.len() == 1 {
             let c = &self.cols[cols[0]];
-            idx.par_sort_unstable_by_key(|&i| c[i]);
+            idx.par_sort_unstable_by_key(|&i| (c[i], i));
         } else {
             idx.par_sort_unstable_by(|&a, &b| {
                 for &c in &cols {
@@ -201,7 +204,7 @@ impl Table {
                         o => return o,
                     }
                 }
-                std::cmp::Ordering::Equal
+                a.cmp(&b)
             });
         }
         let mut t = self.take_rows(&idx);

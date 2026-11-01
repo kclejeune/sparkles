@@ -30,6 +30,7 @@ mod joinspill;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
 mod ripple;
+mod runs;
 mod topk;
 mod walk;
 
@@ -2153,6 +2154,8 @@ enum State {
     Binary(Box<binary::Binary>),
     Ripple(Box<ripple::Ripple>),
     Group(Box<group::Group>),
+    /// A grouping over its input's key runs, for aggregates that need a group's rows.
+    RunGroup(Box<runs::RunGroup>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
     Walk(Box<walk::Walk>),
@@ -2532,6 +2535,8 @@ impl Operator {
         let exists_streams = !exists || exists_streams(ctx, &node.kind)?;
         let joins = exists_streams && binary::eligible(&node);
         let incremental_group = exists_streams && group::eligible(&node);
+        // FOLD and registered aggregates read each group's rows from key runs.
+        let run_group = exists_streams && runs::eligible(&node);
         let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
         // A pattern count over an input reads all of it, as a sort does, and then has one
@@ -2550,6 +2555,7 @@ impl Operator {
         let materializes = !(exists_streams && supported(&node.kind))
             && !joins
             && !incremental_group
+            && !run_group
             && !expanding
             && !walking
             && !index_topk
@@ -2667,6 +2673,24 @@ impl Operator {
             }
             children
         };
+        // A grouping over key runs needs its input ordered on the keys. When the input
+        // does not keep that order, a stable sort on the keys, which may spill, gives it.
+        let mut children = children;
+        if run_group {
+            let keys = runs::sort_keys(&node, &node.children[0].vars);
+            if !runs::grouped_by(&children[0].order, &keys) {
+                let child = children.pop().expect("a grouping's input");
+                let input = node.children.pop().expect("a grouping's input shape");
+                let mut shell =
+                    Node::leaf(Kind::Empty, input.vars.clone(), input.est, String::new());
+                shell.certain.clone_from(&input.certain);
+                shell.cost = input.cost;
+                let sorted = Self::sorted_on(ctx, child, input, keys)?;
+                shell.sorted.clone_from(&sorted.order);
+                node.children.push(shell);
+                children.push(sorted);
+            }
+        }
         // A merge join needs both inputs ordered on its key. When an input cannot
         // promise that order, the hash join takes its place.
         let incremental_merge = !materializes && merge::eligible(&node);
@@ -2685,6 +2709,7 @@ impl Operator {
             || incremental_merge
             || incremental_binary
             || incremental_group
+            || run_group
             || expanding
             || walking
             || exists;
@@ -2695,7 +2720,7 @@ impl Operator {
                 Role::Merge
             } else if incremental_binary {
                 Role::Binary
-            } else if incremental_group {
+            } else if incremental_group || run_group {
                 Role::Group
             } else if native_blocking {
                 Role::Blocking
@@ -2734,7 +2759,7 @@ impl Operator {
             );
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk).then(|| {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group).then(|| {
             if let Kind::OrderedTopK(spec) = &node.kind {
                 format!(
                     "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
@@ -2749,6 +2774,11 @@ impl Operator {
             } else if native_blocking {
                 format!(
                     "{} consumes all input under the memory budget before output",
+                    node.operator()
+                )
+            } else if run_group && !exists {
+                format!(
+                    "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
                     node.operator()
                 )
             } else if !materializes {
@@ -2771,6 +2801,8 @@ impl Operator {
             State::Ripple(Box::new(ripple))
         } else if let Some(group) = group {
             State::Group(Box::new(group))
+        } else if run_group {
+            State::RunGroup(Box::new(runs::RunGroup::new(&node, &children[0].vars)))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if index_topk {
@@ -2847,6 +2879,54 @@ impl Operator {
             growing,
             reason,
             bind_reuse,
+            released: false,
+            order,
+            #[cfg(debug_assertions)]
+            last: None,
+        })
+    }
+
+    /// A stable sort of `child`'s output on `keys`, for a parent that needs the rows of
+    /// each key together and in input order. `shape` is the child's plan shell. The
+    /// sort spills as other sorts do.
+    fn sorted_on(ctx: &Arc<Ctx>, child: Operator, shape: Node, keys: Vec<VarId>) -> Result<Self> {
+        let mut node = Node::leaf(
+            Kind::Sort(keys.clone()),
+            shape.vars.clone(),
+            shape.est,
+            "on the group keys, keeping input order within each group".into(),
+        );
+        node.certain.clone_from(&shape.certain);
+        node.cost = shape.cost + shape.est * shape.est.max(2.0).log2() * 0.5;
+        node.sorted.clone_from(&keys);
+        let mut shape = shape;
+        shape.sorted.clone_from(&child.order);
+        node.children = vec![shape];
+        let mut info = exec::describe_node(ctx, &node);
+        if ctx.graphs.is_some() {
+            info.redact();
+        }
+        info.actual_rows = 0;
+        let order = output_order(&node, std::slice::from_ref(&child), Role::Blocking);
+        Ok(Self {
+            vars: node.vars.clone(),
+            reason: Some(format!(
+                "{} consumes all input under the memory budget before output",
+                node.operator()
+            )),
+            state: State::Blocking {
+                node,
+                loaded: None,
+                at: 0,
+                external: None,
+            },
+            children: vec![child],
+            info,
+            rows: 0,
+            done: false,
+            materializes: false,
+            growing: true,
+            bind_reuse: None,
             released: false,
             order,
             #[cfg(debug_assertions)]
@@ -3273,6 +3353,11 @@ impl Operator {
                         counters.insert("spillPasses".into(), (group.passes + 1).into());
                         self.info.counters = Some(counters);
                     }
+                    batch
+                }
+                State::RunGroup(group) => {
+                    let batch = group.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
+                    self.done = group.done();
                     batch
                 }
                 State::Filter(filter) => {
