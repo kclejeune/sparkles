@@ -898,3 +898,28 @@ fn a_preview_asks_one_draft_and_runs_no_vote() {
     assert_eq!(votes, 0);
     assert_eq!(out["usage"]["modelCalls"], 1);
 }
+
+#[test]
+fn drafts_that_fail_the_check_do_not_vote() {
+    let s = server(ORG);
+    let valid = draft(&format!("{PREFIXES}ASK {{ res:acme a ex:Organization }}"));
+    let unknown = draft(&format!("{PREFIXES}ASK {{ res:acme a ex:Organisation }}"));
+    let mock = scripted(vec![valid, unknown.clone(), unknown], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        drafts: 3,
+        ..opts("Is Acme an organization?")
+    };
+    let mut votes = Vec::new();
+    let mut on = |e: &str, v: &Value| {
+        if e == "vote" {
+            votes.push(v.clone());
+        }
+    };
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert_eq!(out["result"]["attempt"], 1, "{out:#}");
+    assert_eq!(votes[0]["withRows"], 1);
+    assert_eq!(votes[0]["chosen"], 0);
+}

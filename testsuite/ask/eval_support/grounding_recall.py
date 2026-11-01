@@ -162,6 +162,11 @@ def recall(qset, run_dir, namespaces=None):
     if len(matching) != 1:
         raise ValueError(f"{run_dir}: {len(matching)} reports match the set; give a run of one set")
     report = matching[0]
+    # A case key is the pair and the question ID, so the replies of another set of the
+    # run with the same IDs could not be told apart from this set's.
+    keys = {c["case"] for c in report["cases"]}
+    if any(keys & {c["case"] for c in r["cases"]} for r in reports if r is not report):
+        raise ValueError(f"{run_dir}: another set of the run shares question IDs; give a run of one set")
     if len(report.get("pairs") or []) != 1:
         raise ValueError(f"{run_dir}: the run has several pairs; recall is per pair")
     by_case = drafts(run_dir / "replies.jsonl")

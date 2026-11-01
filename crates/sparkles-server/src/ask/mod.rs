@@ -1447,7 +1447,8 @@ impl Asking<'_, '_> {
 
     /// The first draft of several that their results vote for (`drafts`). Each
     /// further draft is asked with the same prompt while the ask has room, and each
-    /// query runs once. A first draft that asks for a clarification stands alone. The
+    /// query that passes the check runs once. A first draft that asks for a
+    /// clarification stands alone. The
     /// chosen draft keeps its own output level and pair, and its query's result, so
     /// the pipeline does not run it again.
     fn vote_drafts(
@@ -1473,6 +1474,19 @@ impl Asking<'_, '_> {
                 .then(|| self.parse(&d.query))
                 .flatten();
             if parsed.is_none() || has_service(parsed.as_ref()) {
+                signatures.push(None);
+                continue;
+            }
+            // a draft that fails the check, such as one with an unknown class, does not
+            // vote, since its result says nothing about the question
+            let checked = self
+                .tool(
+                    "check_query",
+                    json!({"query": d.query, "explain": true, "terms": true}),
+                    true,
+                )
+                .is_ok_and(|c| c["ok"] == Value::Bool(true));
+            if !checked {
                 signatures.push(None);
                 continue;
             }

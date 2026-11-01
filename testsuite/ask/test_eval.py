@@ -1835,7 +1835,49 @@ class BatchCases(unittest.TestCase):
             )
         self.assertEqual(len(Proxy.waits), 1)
         self.assertLessEqual(Proxy.waits[0], 2)
-        self.assertEqual(results, [])
+        # the answer stays, with its cost unknown
+        self.assertEqual([(q["id"], a["ledgerNanodollars"]) for q, _, a in results], [("q0", None)])
+
+    def test_an_answer_whose_request_is_unsettled_at_the_phase_deadline_is_kept(self):
+        runner = self.runner("normal", deadline=300)
+        runner.deadline = time.monotonic() + 1
+        first = eval_ask.case_of("p", {"id": "q0"})
+
+        class Proxy:
+            ledger = type("L", (), {"hold": lambda *a: True, "release": lambda *a: None})()
+            ordered_replies = False
+
+            def open_case(self, case):
+                return None
+
+            def close_case(self, token):
+                pass
+
+            def flush_replies(self, case):
+                pass
+
+            def wait_idle(self, timeout=None, case=None):
+                if case == first:
+                    time.sleep(max(0, runner.deadline - time.monotonic()) + 0.05)
+                    return False  # q0's last request is still running
+                return True
+
+            def case_cost(self, case):
+                assert case != first, "an unsettled case cost is read"
+                return 7
+
+            def refusals_for(self, case):
+                return 0
+
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]
+        results = []
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, Proxy(), "p", qs, 3, lambda pair, qs: True, self.report(),
+                lambda q, a: False, results,
+            )
+        got = {q["id"]: a["ledgerNanodollars"] for q, _, a in results}
+        self.assertEqual(got, {"q0": None, "q1": 7, "q2": 7})
 
     def test_a_broken_pipe_sends_the_line_to_a_new_child(self):
         qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]

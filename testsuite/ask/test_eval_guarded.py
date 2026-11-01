@@ -261,6 +261,11 @@ class GroundingRecall(unittest.TestCase):
             (p / "t" / "report.json").write_text(json.dumps(report))
             with self.assertRaises(ValueError):
                 grounding_recall.recall(qset, p)
+            # another set of the run with an ID of this set makes its replies ambiguous
+            (p / "t" / "report.json").write_text(json.dumps(
+                {"pairs": ["m"], "cases": [{"id": "a", "case": "c1", "pair": "m"}, {"id": "z", "case": "c9", "pair": "m"}]}))
+            with self.assertRaises(ValueError):
+                grounding_recall.recall(qset, p)
             (p / "t" / "report.json").unlink()
             (p / "s" / "report.json").write_text(json.dumps(dict(report, pairs=["m", "n"])))
             with self.assertRaises(ValueError):
