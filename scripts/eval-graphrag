@@ -1147,8 +1147,19 @@ def byte_bound_measure(replies):
         size = len(json.dumps(sent, separators=(",", ":"), ensure_ascii=False).encode())
         messages = len(req.get("messages") or [])
         bound = size + 16 * (messages + 1) + 1024
-        if type(usage.get("input_tokens")) is int:
-            rows.append((usage["input_tokens"], size, bound))
+        # the prompt's tokens: the uncached input and the cache's writes and reads
+        counts = [
+            usage.get(k, 0)
+            for k in (
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            )
+        ]
+        if type(usage.get("input_tokens")) is int and all(
+            type(n) is int for n in counts
+        ):
+            rows.append((sum(counts), size, bound))
     if not rows:
         return None
     return {

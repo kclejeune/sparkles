@@ -9,7 +9,7 @@
 //! member the model leaves out. Lengths are enforced after the answer is validated,
 //! because constrained decoders differ in which length keywords they honour.
 
-use crate::models::{OutputSchema, fenced};
+use crate::models::{OutputSchema, Part, fenced};
 use serde_json::{Value, json};
 
 pub const SYSTEM: &str = "You translate a person's question about one RDF dataset into one SPARQL 1.1 query. You have no tools. Answer with one JSON object in the required format and nothing else.
@@ -203,29 +203,55 @@ pub fn drop_markers(t: &str, rows: u64) -> String {
 
 /// A data block: the text between the markers, with any closing marker in it escaped.
 pub fn data_block(body: &str) -> String {
-    format!("<data>\n{}\n</data>", body.replace("</data>", "<\\/data>"))
+    format!("<data>\n{}\n</data>", escape_data(body))
 }
 
-/// The user message of a draft or a repair.
-pub fn draft_user(question: &str, context: &str, notes: &[String], repair: Option<&str>) -> String {
-    let mut u = format!(
-        "Question: {}\n\nContext from the dataset:\n{}\n",
-        question.trim(),
-        data_block(context)
+/// `body` with any closing data marker in it escaped.
+fn escape_data(body: &str) -> String {
+    body.replace("</data>", "<\\/data>")
+}
+
+/// The user message of a draft or a repair, in three parts (C18 §3.6). The first holds
+/// the context that every question of the dataset shares, and is marked for the
+/// provider's cache when there is any. The second holds the rest of the context, the
+/// question and the notes, marked so that a repair of the same question reads it from
+/// the cache. The third holds the repair and the format, and changes with each attempt.
+/// Each line of `stable` ends with a newline, so a closing marker cannot straddle the
+/// parts and the data block reads as one.
+pub fn draft_user(
+    question: &str,
+    stable: &str,
+    context: &str,
+    notes: &[String],
+    repair: Option<&str>,
+) -> Vec<Part> {
+    let head = format!("Context from the dataset:\n<data>\n{}", escape_data(stable));
+    let mut asked = format!(
+        "{}\n</data>\n\nQuestion: {}\n",
+        escape_data(context),
+        question.trim()
     );
     for n in notes {
-        u.push('\n');
-        u.push_str(n);
-        u.push('\n');
+        asked.push('\n');
+        asked.push_str(n);
+        asked.push('\n');
     }
+    let mut tail = String::new();
     if let Some(r) = repair {
-        u.push('\n');
-        u.push_str(r);
-        u.push('\n');
+        tail.push('\n');
+        tail.push_str(r);
+        tail.push('\n');
     }
-    u.push('\n');
-    u.push_str(DRAFT_FORMAT);
-    u
+    tail.push('\n');
+    tail.push_str(DRAFT_FORMAT);
+    vec![
+        Part {
+            text: head,
+            cache: !stable.is_empty(),
+        },
+        Part::cached(asked),
+        Part::text(tail),
+    ]
 }
 
 /// The user message of a summary.

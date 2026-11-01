@@ -143,7 +143,9 @@ pub struct TlsConfig {
     pub insecure_skip_verify: bool,
 }
 
-/// Prices per million tokens, for estimates only.
+/// Prices per million tokens, for estimates only. The cache prices default to
+/// Anthropic's standard multipliers of the input price: 1.25 times for a write with the
+/// 5-minute TTL, 2 times for one with the 1-hour TTL and 0.1 times for a read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Pricing {
@@ -151,6 +153,66 @@ pub struct Pricing {
     pub input_per_m_tok: f64,
     #[serde(default)]
     pub output_per_m_tok: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_m_tok: Option<f64>,
+    #[serde(
+        default,
+        rename = "cacheWrite1hPerMTok",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_write_1h_per_m_tok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_per_m_tok: Option<f64>,
+}
+
+impl Pricing {
+    /// The price of a million tokens written to the cache with the 5-minute TTL.
+    pub fn cache_write_5m(&self) -> f64 {
+        self.cache_write_per_m_tok
+            .unwrap_or(self.input_per_m_tok * 1.25)
+    }
+
+    /// The price of a million tokens written to the cache with the 1-hour TTL.
+    pub fn cache_write_1h(&self) -> f64 {
+        self.cache_write_1h_per_m_tok
+            .unwrap_or(self.input_per_m_tok * 2.0)
+    }
+
+    /// The price of a million tokens read from the cache.
+    pub fn cache_read(&self) -> f64 {
+        self.cache_read_per_m_tok
+            .unwrap_or(self.input_per_m_tok * 0.1)
+    }
+}
+
+/// How long a provider keeps a cached prompt prefix after its last use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheTtl {
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl CacheTtl {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+}
+
+/// Prompt caching of an anthropic provider (spec C18 §3.6): on unless `enabled` is
+/// false, with the 5-minute TTL unless `ttl` is `1h`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PromptCaching {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
 }
 
 /// Token caps per day.
@@ -251,6 +313,10 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     /// Anthropic: the `anthropic-version` header value
     pub version: Option<String>,
+    /// Anthropic: whether stable prompt prefixes are marked for the provider's cache,
+    /// and for how long; on with the 5-minute TTL when unset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_caching: Option<PromptCaching>,
     /// how the provider's certificate is checked (https endpoints only)
     pub tls: Option<TlsConfig>,
     /// the defaults of this provider's models
@@ -304,6 +370,18 @@ impl ProviderConfig {
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
             num_ctx: o.num_ctx,
         }
+    }
+
+    /// The TTL of the prompt prefixes this provider is asked to cache, or `None` when
+    /// it is asked to cache none: the anthropic kind caches unless
+    /// `promptCaching.enabled` is false, and the other kinds are never asked (the
+    /// OpenAI protocol's providers cache on their own).
+    pub fn cache_ttl(&self) -> Option<CacheTtl> {
+        if self.kind != Kind::Anthropic {
+            return None;
+        }
+        let c = self.prompt_caching.unwrap_or_default();
+        c.enabled.unwrap_or(true).then(|| c.ttl.unwrap_or_default())
     }
 
     /// Whether certificate checks are off for this provider.
@@ -424,6 +502,7 @@ pub const PROVIDER_MEMBERS: &[&str] = &[
     "keepAlive",
     "headers",
     "version",
+    "promptCaching",
     "tls",
     "contextTokens",
     "maxOutputTokens",
@@ -752,6 +831,12 @@ impl ModelsConfig {
                     "provider {name}: version applies to the anthropic kind only"
                 );
             }
+            if p.prompt_caching.is_some() && p.kind != Kind::Anthropic {
+                fail!(
+                    ["providers", name, "promptCaching"],
+                    "provider {name}: promptCaching applies to the anthropic kind only"
+                );
+            }
             if p.concurrency == Some(0) {
                 fail!(
                     ["providers", name, "concurrency"],
@@ -890,10 +975,16 @@ fn check_options(o: &ModelOptions) -> Result<()> {
         );
     }
     if let Some(p) = o.pricing
-        && !(p.input_per_m_tok.is_finite()
-            && p.input_per_m_tok >= 0.0
-            && p.output_per_m_tok.is_finite()
-            && p.output_per_m_tok >= 0.0)
+        && ![
+            Some(p.input_per_m_tok),
+            Some(p.output_per_m_tok),
+            p.cache_write_per_m_tok,
+            p.cache_write_1h_per_m_tok,
+            p.cache_read_per_m_tok,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|x| x.is_finite() && x >= 0.0)
     {
         fail!(["pricing"], "pricing must hold non-negative numbers");
     }

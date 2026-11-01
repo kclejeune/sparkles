@@ -104,6 +104,9 @@ describe('the form of the models kind', () => {
     expect(paths).toContain('providers.gw\\.internal.numCtx');
     expect(paths).not.toContain('providers.claude.numCtx');
     expect(paths).toContain('providers.claude.version');
+    expect(paths).toContain('providers.claude.promptCaching.enabled');
+    expect(paths).toContain('providers.claude.promptCaching.ttl');
+    expect(paths).not.toContain('providers.gw\\.internal.promptCaching.enabled');
     expect(paths).toContain('roles.draft');
     expect(paths).toContain('roles.community');
     expect(paths).toContain('routing.exampleScore');
@@ -150,6 +153,9 @@ describe('the form of the models kind', () => {
       'requestTimeoutSecs',
       'pricing.inputPerMTok',
       'pricing.outputPerMTok',
+      'pricing.cacheWritePerMTok',
+      'pricing.cacheWrite1hPerMTok',
+      'pricing.cacheReadPerMTok',
     ]);
     // a role entry picks among the providers that answer prompts
     expect(f['roles.draft'].entry!.find((e) => e.path === 'provider')).toMatchObject({

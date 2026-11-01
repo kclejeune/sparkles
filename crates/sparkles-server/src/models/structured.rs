@@ -11,7 +11,7 @@
 //! receives the schema without them, and the answer is still validated here against the
 //! whole schema.
 
-use super::client::{CallError, ChatResponse, Message};
+use super::client::{CallError, ChatResponse, Message, Part};
 use super::config::Level;
 use serde_json::{Value, json};
 
@@ -157,10 +157,11 @@ pub fn fenced<'a>(t: &'a str, langs: &[&str]) -> Option<&'a str> {
     None
 }
 
-/// The messages of a call at `level`: the user's text, with the schema as text at the
-/// `json-object` level and the text instruction at the `text` level.
-pub fn messages(user: &str, out: &OutputSchema, level: Level) -> Vec<Message> {
-    let mut u = user.to_string();
+/// The messages of a call at `level`: the user's parts, with the schema as text at the
+/// `json-object` level and the text instruction at the `text` level in a last part.
+pub fn messages(user: &[Part], out: &OutputSchema, level: Level) -> Vec<Message> {
+    let mut parts = user.to_vec();
+    let mut u = String::new();
     match level {
         Level::JsonObject => {
             u.push_str("\n\nAnswer with one JSON object that matches this JSON Schema, and nothing else:\n");
@@ -175,7 +176,10 @@ pub fn messages(user: &str, out: &OutputSchema, level: Level) -> Vec<Message> {
         }
         _ => {}
     }
-    vec![Message::user(u)]
+    if !u.is_empty() {
+        parts.push(Part::text(u));
+    }
+    vec![Message::user_parts(parts)]
 }
 
 /// The value of an answer at `level`, or the validation errors that a retry sends back.

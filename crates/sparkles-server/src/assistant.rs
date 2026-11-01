@@ -341,7 +341,9 @@ struct Counts {
     /// (bucket, outcome) → answers
     outcomes: BTreeMap<(String, String), u64>,
     /// (provider, model) → (input tokens, output tokens, estimated cost)
-    tokens: BTreeMap<(String, String), (u64, u64, f64)>,
+    /// (provider, model) → (tokens, estimated cost, budget tokens, each step's rounded
+    /// on its own)
+    tokens: BTreeMap<(String, String), (crate::models::admission::Usage, f64, u64)>,
     asks: u64,
 }
 
@@ -400,12 +402,7 @@ impl Runtime {
     /// in the usage counts under `role`. It is not counted as an ask.
     pub fn charge(&self, dataset: &str, principal: &str, role: &str, usage: &Value) {
         let steps = usage["steps"].as_array().cloned().unwrap_or_default();
-        let tokens: u64 = steps
-            .iter()
-            .map(|s| {
-                s["inputTokens"].as_u64().unwrap_or(0) + s["outputTokens"].as_u64().unwrap_or(0)
-            })
-            .sum();
+        let tokens: u64 = steps.iter().map(crate::models::budget_of).sum();
         self.add_tokens(dataset, principal, tokens);
         tracing::info!(
             target: "sparkles::models",
@@ -433,9 +430,9 @@ impl Runtime {
                         .or_default() += 1;
                 }
                 let t = c.tokens.entry(pair).or_default();
-                t.0 += s["inputTokens"].as_u64().unwrap_or(0);
-                t.1 += s["outputTokens"].as_u64().unwrap_or(0);
-                t.2 += s["estimatedCost"].as_f64().unwrap_or(0.0);
+                t.0 = t.0.plus(crate::models::usage_json(s));
+                t.1 += s["estimatedCost"].as_f64().unwrap_or(0.0);
+                t.2 += crate::models::budget_of(s);
             }
         };
         {
@@ -486,9 +483,9 @@ impl Runtime {
                         s["model"].as_str().unwrap_or("").to_string(),
                     ))
                     .or_default();
-                t.0 += s["inputTokens"].as_u64().unwrap_or(0);
-                t.1 += s["outputTokens"].as_u64().unwrap_or(0);
-                t.2 += s["estimatedCost"].as_f64().unwrap_or(0.0);
+                t.0 = t.0.plus(crate::models::usage_json(s));
+                t.1 += s["estimatedCost"].as_f64().unwrap_or(0.0);
+                t.2 += crate::models::budget_of(s);
             }
         };
         {
@@ -583,7 +580,7 @@ impl Runtime {
             }
             for (k, v) in &c.tokens {
                 let e = t.tokens.entry(k.clone()).or_default();
-                e.0 += v.0;
+                e.0 = e.0.plus(v.0);
                 e.1 += v.1;
                 e.2 += v.2;
             }
@@ -667,11 +664,20 @@ pub fn metrics(st: &AppState, o: &mut String) {
         o,
         "sparkles_ask_tokens_total",
         "counter",
-        "Model tokens of asks by dataset, provider, model and direction.",
+        "Model tokens of asks by dataset, provider, model and direction: uncached input, output, and input written to or read from the provider's prompt cache.",
     );
     for (ds, c) in &totals {
-        for ((p, m), (i, out, _)) in &c.tokens {
-            for (dir, n) in [("input", i), ("output", out)] {
+        for ((p, m), (u, _, _)) in &c.tokens {
+            let written = u.cache_write_5m + u.cache_write_1h;
+            for (dir, n) in [
+                ("input", u.input),
+                ("output", u.output),
+                ("cache_write", written),
+                ("cache_read", u.cache_read),
+            ] {
+                if n == 0 && dir.starts_with("cache") {
+                    continue;
+                }
                 let _ = writeln!(
                     o,
                     "sparkles_ask_tokens_total{{dataset=\"{}\",provider=\"{}\",model=\"{}\",direction=\"{dir}\"}} {n}",
@@ -689,7 +695,7 @@ pub fn metrics(st: &AppState, o: &mut String) {
         "Estimated cost of asks at the pairs' pricing, by dataset, provider and model.",
     );
     for (ds, c) in &totals {
-        for ((p, m), (_, _, cost)) in &c.tokens {
+        for ((p, m), (_, cost, _)) in &c.tokens {
             let _ = writeln!(
                 o,
                 "sparkles_ask_estimated_cost_total{{dataset=\"{}\",provider=\"{}\",model=\"{}\"}} {cost}",
@@ -707,7 +713,11 @@ fn counts_json(c: &Counts) -> Value {
         "answers": c.answers.iter().map(|((r, p, m, o), n)| json!({"role": r, "provider": p, "model": m, "outcome": o, "count": n})).collect::<Vec<_>>(),
         "escalations": c.escalations.iter().map(|((r, s), n)| json!({"role": r, "signal": s, "count": n})).collect::<Vec<_>>(),
         "outcomes": c.outcomes.iter().map(|((b, o), n)| json!({"bucket": b, "outcome": o, "count": n})).collect::<Vec<_>>(),
-        "tokens": c.tokens.iter().map(|((p, m), (i, o, cost))| json!({"provider": p, "model": m, "inputTokens": i, "outputTokens": o, "estimatedCost": cost})).collect::<Vec<_>>(),
+        "tokens": c.tokens.iter().map(|((p, m), (u, cost, budget))| {
+            let mut j = json!({"provider": p, "model": m, "inputTokens": u.input, "outputTokens": u.output, "estimatedCost": cost});
+            crate::models::cache_json(&mut j, u, *budget);
+            j
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -830,7 +840,7 @@ pub fn spawn_pruning(st: Arc<AppState>) {
 /// The record of a finished ask, from the pipeline's output.
 pub fn record_of(id: &str, principal: &str, out: &Value) -> AskRecord {
     let u = &out["usage"];
-    let routing = json!({
+    let mut routing = json!({
         "complexity": u["complexity"],
         "steps": u["steps"],
         "escalations": u["escalations"],
@@ -840,6 +850,16 @@ pub fn record_of(id: &str, principal: &str, out: &Value) -> AskRecord {
         "outputTokens": u["outputTokens"],
         "estimatedCost": u["estimatedCost"],
     });
+    for k in [
+        "cacheWriteInputTokens",
+        "cacheWrite1hInputTokens",
+        "cacheReadInputTokens",
+        "budgetTokens",
+    ] {
+        if !u[k].is_null() {
+            routing[k] = u[k].clone();
+        }
+    }
     AskRecord {
         id: id.to_string(),
         principal: principal.to_string(),
@@ -1133,4 +1153,30 @@ async fn usage(State(st): St, Query(q): Query<UsageParams>) -> ApiResult<Json<Va
         ));
     }
     Ok(Json(st.asks.usage_json(days)))
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    /// The usage counters add each step's own budget tokens, as the charges do, so two
+    /// steps that each read 513 cached tokens count 52 + 52 for the pair, over two
+    /// requests too, and never the 103 of their summed reads.
+    #[test]
+    fn usage_counters_keep_each_steps_budget() {
+        let rt = Runtime::default();
+        let step = json!({ "provider": "p", "model": "m", "outcome": "ok", "inputTokens": 0,
+            "outputTokens": 0, "cacheWriteInputTokens": 0, "cacheReadInputTokens": 513,
+            "budgetTokens": 52 });
+        let usage = json!({ "steps": [step.clone(), step.clone()] });
+        rt.charge("ds", "ana", "explain", &usage);
+        let t = &rt.usage_json(1)["datasets"][0]["tokens"][0];
+        assert_eq!(t["budgetTokens"], 104, "{t}");
+        assert_eq!(t["cacheReadInputTokens"], 1026);
+        rt.charge("ds", "ana", "explain", &json!({ "steps": [step] }));
+        assert_eq!(
+            rt.usage_json(1)["datasets"][0]["tokens"][0]["budgetTokens"],
+            156
+        );
+    }
 }

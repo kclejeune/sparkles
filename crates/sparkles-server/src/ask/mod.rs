@@ -38,7 +38,7 @@ pub use cli::{AskArgs, run_cli};
 use crate::auth::Principal;
 use crate::mcp::errors::ToolError;
 use crate::mcp::{Call, McpServer, Outcome};
-use crate::models::{Level, Models, Pair, Role, StepError, StepRecord};
+use crate::models::{Level, Models, Pair, Part, Prompt, Role, StepError, StepRecord};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -341,6 +341,10 @@ struct Asking<'a, 'e> {
 
 /// The grounding of §4.1 step 1.
 struct Ground {
+    /// the context that stays the same for every question of the dataset at this
+    /// context size: the common prefixes, classes and predicates
+    stable: String,
+    /// the context of this question, after `stable`
     context: String,
     /// a mention that links `ambiguous`, with its candidates
     ambiguous: Option<(String, Vec<Value>)>,
@@ -411,11 +415,9 @@ impl Asking<'_, '_> {
         true
     }
 
+    /// The tokens the ask counts against its budget, each class of input at its price.
     fn tokens(&self) -> u64 {
-        self.steps
-            .iter()
-            .map(|s| s.input_tokens + s.output_tokens)
-            .sum()
+        self.steps.iter().map(StepRecord::budget_tokens).sum()
     }
 
     fn push_step(&mut self, role: Role, rec: StepRecord) {
@@ -429,8 +431,7 @@ impl Asking<'_, '_> {
     fn call(
         &mut self,
         role: Role,
-        system: &str,
-        user: &str,
+        prompt: &Prompt,
         out: &crate::models::OutputSchema,
     ) -> Result<(Value, Level, Pair), (&'static str, String)> {
         loop {
@@ -445,7 +446,7 @@ impl Asking<'_, '_> {
             };
             match self
                 .models
-                .call(Some(role), &pair, system, user, out, self.deadline)
+                .call_prompt(Some(role), &pair, prompt, out, self.deadline, None)
             {
                 Ok(a) => {
                     self.push_step(role, a.record);
@@ -767,21 +768,41 @@ impl Asking<'_, '_> {
                 false,
             )
             .unwrap_or(Value::Null);
+        // The common vocabulary leads every question's context, so that it can stay in
+        // a provider's prompt cache (C18 §3.6): the common prefixes, then the common
+        // classes and predicates that `balanced_entries` puts first. The rest of each
+        // list follows in the question's part, under the same heading.
+        let common_prefixes = common["prefixes"].as_object().cloned().unwrap_or_default();
+        let extra_prefixes: serde_json::Map<String, Value> = schema["prefixes"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| !common_prefixes.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let mut prefixes = schema["prefixes"].as_object().cloned().unwrap_or_default();
-        if let Some(common_prefixes) = common["prefixes"].as_object() {
-            prefixes.extend(common_prefixes.clone());
-        }
+        prefixes.extend(common_prefixes.clone());
         if schema.is_null() {
             schema = json!({});
         }
         schema["prefixes"] = Value::Object(prefixes);
-        if let Some(p) = schema["prefixes"].as_object()
-            && !p.is_empty()
-        {
-            ctx.push_str("Prefixes:\n");
-            for (k, v) in p {
-                ctx.push_str(&format!("{k}: <{}>\n", v.as_str().unwrap_or("")));
-            }
+        let mut stable = String::new();
+        let prefix_lines = |p: &serde_json::Map<String, Value>| -> String {
+            p.iter()
+                .map(|(k, v)| format!("{k}: <{}>\n", v.as_str().unwrap_or("")))
+                .collect()
+        };
+        if !common_prefixes.is_empty() {
+            stable.push_str("Prefixes:\n");
+            stable.push_str(&prefix_lines(&common_prefixes));
+        }
+        if !extra_prefixes.is_empty() {
+            ctx.push_str(if stable.is_empty() {
+                "Prefixes:\n"
+            } else {
+                "\nPrefixes:\n"
+            });
+            ctx.push_str(&prefix_lines(&extra_prefixes));
         }
         let classes =
             grounding::balanced_entries(&common["classes"], &schema["classes"], max_classes);
@@ -790,34 +811,54 @@ impl Asking<'_, '_> {
             &schema["predicates"],
             max_predicates,
         );
-        if !classes.is_empty() {
-            ctx.push_str("\nClasses (IRI, label, instances):\n");
-            for c in &classes {
-                ctx.push_str(&format!(
-                    "{} {} {}\n",
-                    c["iri"].as_str().unwrap_or(""),
-                    label(c),
-                    c["instances"]
-                ));
-            }
+        let class_head = grounding::common_head(&common["classes"], &classes, max_classes);
+        let predicate_head =
+            grounding::common_head(&common["predicates"], &predicates, max_predicates);
+        let class_line = |c: &Value| {
+            format!(
+                "{} {} {}\n",
+                c["iri"].as_str().unwrap_or(""),
+                label(c),
+                c["instances"]
+            )
+        };
+        let predicate_line = |p: &Value| {
+            let objects: Vec<&str> = p["objects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            format!(
+                "{} {} {} {}\n",
+                p["iri"].as_str().unwrap_or(""),
+                label(p),
+                p["triples"],
+                objects.join(" ")
+            )
+        };
+        const CLASSES: &str = "\nClasses (IRI, label, instances):\n";
+        const PREDICATES: &str =
+            "\nPredicates (IRI, label, triples, kinds or classes of the values):\n";
+        // the stable part ends with every class and predicate of the head, and the
+        // question's part holds the rest of each list under its heading
+        let (stable_classes, rest_classes) = classes.split_at(class_head);
+        let (stable_predicates, rest_predicates) = predicates.split_at(predicate_head);
+        if !stable_classes.is_empty() {
+            stable.push_str(CLASSES);
+            stable.extend(stable_classes.iter().map(class_line));
         }
-        if !predicates.is_empty() {
-            ctx.push_str("\nPredicates (IRI, label, triples, kinds or classes of the values):\n");
-            for p in &predicates {
-                let objects: Vec<&str> = p["objects"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .collect();
-                ctx.push_str(&format!(
-                    "{} {} {} {}\n",
-                    p["iri"].as_str().unwrap_or(""),
-                    label(p),
-                    p["triples"],
-                    objects.join(" ")
-                ));
-            }
+        if !stable_predicates.is_empty() {
+            stable.push_str(PREDICATES);
+            stable.extend(stable_predicates.iter().map(predicate_line));
+        }
+        if !rest_classes.is_empty() {
+            ctx.push_str(CLASSES);
+            ctx.extend(rest_classes.iter().map(class_line));
+        }
+        if !rest_predicates.is_empty() {
+            ctx.push_str(PREDICATES);
+            ctx.extend(rest_predicates.iter().map(predicate_line));
         }
         ground_event["classes"] = classes.iter().map(|c| c["iri"].clone()).collect();
         ground_event["predicates"] = predicates.iter().map(|c| c["iri"].clone()).collect();
@@ -993,6 +1034,7 @@ impl Asking<'_, '_> {
         ground_event["trimmed"] = small.into();
         self.emit("ground", &ground_event);
         Ground {
+            stable,
             context: ctx,
             ambiguous,
             best_example,
@@ -1021,17 +1063,29 @@ impl Asking<'_, '_> {
             }
             // the first draft also classifies the question when reports could answer it
             let scoped = attempt == 1 && self.reports.is_some();
-            let mut user =
-                prompts::draft_user(&self.o.question, &ground.context, notes, repair.as_deref());
+            let mut user = prompts::draft_user(
+                &self.o.question,
+                &ground.stable,
+                &ground.context,
+                notes,
+                repair.as_deref(),
+            );
             if scoped {
-                user.push_str(prompts::SCOPE_FORMAT);
+                // the scoped schema differs from the repairs' schema, which changes the
+                // whole cached prompt, so no repair could read the question's part
+                user[1].cache = false;
+                user[2].text.push_str(prompts::SCOPE_FORMAT);
             }
             let schema = if scoped {
                 prompts::draft_scoped()
             } else {
                 prompts::draft()
             };
-            let (value, level, pair) = match self.call(role, prompts::SYSTEM, &user, &schema) {
+            let prompt = Prompt {
+                system: vec![Part::cached(prompts::SYSTEM)],
+                user,
+            };
+            let (value, level, pair) = match self.call(role, &prompt, &schema) {
                 Ok(x) => x,
                 Err((code, message)) => return self.error(code, message),
             };
@@ -1392,8 +1446,7 @@ impl Asking<'_, '_> {
         let user = prompts::summary_user(&self.o.question, query, &text, &total);
         match self.call(
             Role::Summarize,
-            prompts::SUMMARY_SYSTEM,
-            &user,
+            &Prompt::plain(prompts::SUMMARY_SYSTEM, &user),
             &prompts::summary(),
         ) {
             Err((_, message)) => {
@@ -1461,6 +1514,7 @@ impl Asking<'_, '_> {
             "draftPair": draft_pos,
             "tryHarder": self.o.query.is_none() && draft_pos + 1 < self.list(Role::Draft).len(),
         });
+        crate::models::steps_json(&mut u, &self.steps);
         if let Some(id) = &self.o.id {
             u["askId"] = id.clone().into();
         }

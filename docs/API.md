@@ -11855,8 +11855,8 @@ names an ordered list of provider and model pairs. A role without a list is turn
 except `repair`, which uses the `draft` list.
 
 A provider may also set `concurrency` (4 by default), `requestsPerMinute`,
-`allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind, and the
-defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
+`allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind,
+`version` and `promptCaching` for the `anthropic` kind, and the defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
 `temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs` and, for Ollama,
 `numCtx` per model. Headers that carry credentials are refused, and so are endpoints
 with credentials, a query or a fragment. Requests go through the server's outbound
@@ -11924,7 +11924,50 @@ time it is called. It tries the provider's JSON Schema mode first (`format` for 
 `response_format` with `json_schema` for the OpenAI protocol, `output_config.format` for
 Anthropic), then a plain JSON mode, then plain text with the answer in a fenced block.
 The detected level is remembered until the server restarts or the pair is tested again.
-An answer that does not match the schema is retried once with the errors.
+An answer that does not match the schema is retried once with the errors. The `tool`
+level of the `anthropic` kind offers one strict tool with `tool_choice` set to `auto`,
+because Claude Opus 5.5, Sonnet 5.5 and Fable 5.1 refuse a forced tool choice, and an
+answer the model writes as text instead is read and validated the same way.
+
+**Prompt caching.** An `anthropic` provider marks the stable start of each prompt for
+Anthropic's prompt cache, unless its `promptCaching` sets `enabled` to `false`. Every
+call marks its system text. Ask also marks the end of the grounding that every question
+of the dataset shares, which is its common prefixes, classes and predicates, and the
+end of the question with its own grounding, which a repair of the same question reads
+back. Ingestion marks the vocabulary that every chunk of a document shares. A prefix
+shorter than the model's minimum, which is 512 tokens on Claude Opus 5.5, Sonnet 5.5
+and Haiku 5.5 and up to 4,096 on older models, is not cached and costs nothing extra.
+`promptCaching.ttl` is `5m` by default, and `1h` keeps a prefix for an hour at twice
+the write price. The other kinds send their prompts as before, and the OpenAI protocol
+caches long prompts on its own.
+
+```json
+"claude": {
+  "kind": "anthropic", "endpoint": "https://api.anthropic.com",
+  "apiKey": { "secret": "anthropic" },
+  "promptCaching": { "enabled": true, "ttl": "5m" }
+}
+```
+
+Anthropic reports the input it wrote to its cache and the input it read from it apart
+from `input_tokens`. A step's record keeps `inputTokens` as the uncached input and adds
+`cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and
+`budgetTokens` when the cache was used. Every token budget counts a cache write as 1.25
+tokens, or 2 tokens with the 1-hour TTL, and a cache read as 0.1 token, which are
+Anthropic's standard prices relative to uncached input. `pricing` takes
+`cacheWritePerMTok`, `cacheWrite1hPerMTok` and `cacheReadPerMTok`, which default to
+those multiples of `inputPerMTok`. Claude Opus 5.5 and Sonnet 5.5 read at 0.05 times
+the input price and Claude Fable 5.1 at 0.025 times, so their estimates need an explicit
+`cacheReadPerMTok`, while their token budgets still count a read at the standard 0.1.
+A GraphRAG build reserves a cached attempt's input at the write price, so a cap holds
+however the provider splits the prompt between the classes.
+
+**Sampling parameters.** `temperature` is sent to an `anthropic` provider only when the
+configuration sets it. Claude Opus 5.5 refuses any `temperature` with `400`, Sonnet 5.5
+and Haiku 5.5 refuse a value other than the default, and API version `2026-10-21`
+refuses the parameter on every model, so leave it unset for current Claude models. The
+server sends `anthropic-version: 2023-06-01` unless the provider's `version` names
+another.
 
 **`GET /$/models`** (server admin) lists the providers of the effective configuration
 with their kind, endpoint, status and models, and the role lists. A provider's `status`

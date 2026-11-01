@@ -58,6 +58,23 @@ transactions/s with the drive in its slow state. In the drive's fast state, flus
 fences were faster than write-through ones in three of ten pairs, which roadmap item
 502 measures.
 
+`anthropic` model providers use Anthropic's prompt cache by default. Every call marks
+its system text for the cache, Ask also marks the grounding that every question of a
+dataset shares and the question with its own grounding, which repairs read back, and
+ingestion marks the vocabulary that every chunk shares. Ask's draft prompt now puts the
+dataset's common prefixes, classes and predicates first and the question after its
+grounding, and each list continues under its own heading in the question's part, so
+the model reads the same lines in a different order. `promptCaching: {"enabled":
+false}` turns caching off for a provider, and `promptCaching.ttl: "1h"` keeps prefixes
+for an hour. Token budgets, the daily provider budget, GraphRAG build ledgers and the
+evaluation proxy's cost cap price a cache write at 1.25 times uncached input, or 2
+times with the 1-hour TTL, and a cache read at 0.1 times. Step records and usage objects
+add `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and
+`budgetTokens` when a provider used its cache, `pricing` takes cache prices, and
+`sparkles_ask_tokens_total` adds the `cache_write` and `cache_read` directions. The
+`tool` structured-output level of the `anthropic` kind offers its strict tool with
+`tool_choice: auto`, since current Claude models refuse a forced tool choice.
+
 Change feeds, live queries and long polls end with `access-changed` when the session
 or token they were opened with expires, including a session's idle timeout. OIDC
 sign-ins decide admission and the session lifetime under the policy current after the

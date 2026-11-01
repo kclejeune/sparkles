@@ -124,6 +124,8 @@ choice identities and conservative ordering while retaining required clarificati
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
 and execution timings while the remaining accuracy and latency work stays open.
+Anthropic providers use [prompt caching](ai/README.md#questions-in-plain-language) for
+the stable start of each prompt, and budgets price cache writes and reads apart.
 
 <a id="web-ui"></a>
 <a id="query-page"></a>

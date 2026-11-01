@@ -1728,7 +1728,7 @@
           },
           "usage": {
             "additionalProperties": true,
-            "description": "`askId`, the tokens and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`.",
+            "description": "`askId`, the tokens (with the prompt cache's `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens` when the provider used it) and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`.",
             "type": "object"
           }
         },
@@ -7680,7 +7680,7 @@
           },
           "usage": {
             "additionalProperties": true,
-            "description": "The model calls: tokens, `modelCalls`, `failedCalls` and `steps`.",
+            "description": "The model calls: tokens, `modelCalls`, `failedCalls` and `steps`. A provider that used its prompt cache adds `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens`.",
             "type": "object"
           },
           "warnings": {
@@ -10041,7 +10041,7 @@
           },
           "usage": {
             "additionalProperties": true,
-            "description": "Model calls, tokens, estimated cost, escalations and the pair that answered each chunk.",
+            "description": "Model calls, tokens, estimated cost, escalations and the pair that answered each chunk. A provider that used its prompt cache adds `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens`.",
             "type": "object"
           }
         },
@@ -11799,16 +11799,37 @@
             "additionalProperties": false,
             "description": "Prices per million tokens, for cost estimates only.",
             "properties": {
+              "cacheReadPerMTok": {
+                "description": "The price of one million input tokens read from the prompt cache. Claude Opus 5.5 and Sonnet 5.5 read at 0.05 times the input price and Claude Fable 5.1 at 0.025 times.",
+                "minimum": 0.0,
+                "title": "Cache read price",
+                "type": "number",
+                "x-sparkles-unset": "0.1 times the input price"
+              },
+              "cacheWrite1hPerMTok": {
+                "description": "The price of one million input tokens written to the prompt cache with the 1-hour TTL.",
+                "minimum": 0.0,
+                "title": "1-hour cache write price",
+                "type": "number",
+                "x-sparkles-unset": "2 times the input price"
+              },
+              "cacheWritePerMTok": {
+                "description": "The price of one million input tokens written to the prompt cache with the 5-minute TTL.",
+                "minimum": 0.0,
+                "title": "Cache write price",
+                "type": "number",
+                "x-sparkles-unset": "1.25 times the input price"
+              },
               "inputPerMTok": {
                 "default": 0,
-                "description": "The price of one million input tokens. A model's prices replace both of the provider's prices.",
+                "description": "The price of one million input tokens. A model's prices replace all of the provider's prices.",
                 "minimum": 0.0,
                 "title": "Input price",
                 "type": "number"
               },
               "outputPerMTok": {
                 "default": 0,
-                "description": "The price of one million output tokens. A model's prices replace both of the provider's prices.",
+                "description": "The price of one million output tokens. A model's prices replace all of the provider's prices.",
                 "minimum": 0.0,
                 "title": "Output price",
                 "type": "number"
@@ -11818,7 +11839,10 @@
             "type": "object",
             "x-sparkles-order": [
               "inputPerMTok",
-              "outputPerMTok"
+              "outputPerMTok",
+              "cacheWritePerMTok",
+              "cacheWrite1hPerMTok",
+              "cacheReadPerMTok"
             ]
           },
           "queryPrefix": {
@@ -12159,16 +12183,37 @@
             "additionalProperties": false,
             "description": "Prices per million tokens, for cost estimates only.",
             "properties": {
+              "cacheReadPerMTok": {
+                "description": "The price of one million input tokens read from the prompt cache. Claude Opus 5.5 and Sonnet 5.5 read at 0.05 times the input price and Claude Fable 5.1 at 0.025 times.",
+                "minimum": 0.0,
+                "title": "Cache read price",
+                "type": "number",
+                "x-sparkles-unset": "0.1 times the input price"
+              },
+              "cacheWrite1hPerMTok": {
+                "description": "The price of one million input tokens written to the prompt cache with the 1-hour TTL.",
+                "minimum": 0.0,
+                "title": "1-hour cache write price",
+                "type": "number",
+                "x-sparkles-unset": "2 times the input price"
+              },
+              "cacheWritePerMTok": {
+                "description": "The price of one million input tokens written to the prompt cache with the 5-minute TTL.",
+                "minimum": 0.0,
+                "title": "Cache write price",
+                "type": "number",
+                "x-sparkles-unset": "1.25 times the input price"
+              },
               "inputPerMTok": {
                 "default": 0,
-                "description": "The price of one million input tokens. A model's prices replace both of the provider's prices.",
+                "description": "The price of one million input tokens. A model's prices replace all of the provider's prices.",
                 "minimum": 0.0,
                 "title": "Input price",
                 "type": "number"
               },
               "outputPerMTok": {
                 "default": 0,
-                "description": "The price of one million output tokens. A model's prices replace both of the provider's prices.",
+                "description": "The price of one million output tokens. A model's prices replace all of the provider's prices.",
                 "minimum": 0.0,
                 "title": "Output price",
                 "type": "number"
@@ -12178,9 +12223,43 @@
             "type": "object",
             "x-sparkles-order": [
               "inputPerMTok",
-              "outputPerMTok"
+              "outputPerMTok",
+              "cacheWritePerMTok",
+              "cacheWrite1hPerMTok",
+              "cacheReadPerMTok"
             ],
             "x-sparkles-section": "Model defaults"
+          },
+          "promptCaching": {
+            "additionalProperties": false,
+            "description": "Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.",
+            "properties": {
+              "enabled": {
+                "default": true,
+                "description": "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL.",
+                "title": "Prompt caching",
+                "type": "boolean"
+              },
+              "ttl": {
+                "default": "5m",
+                "description": "How long the provider keeps a cached prefix after its last use. The 1-hour TTL doubles the write price and pays when calls sharing a prefix come more than 5 minutes apart.",
+                "enum": [
+                  "5m",
+                  "1h"
+                ],
+                "title": "Cache lifetime",
+                "type": "string"
+              }
+            },
+            "title": "Prompt caching",
+            "type": "object",
+            "x-sparkles-kinds": [
+              "anthropic"
+            ],
+            "x-sparkles-order": [
+              "enabled",
+              "ttl"
+            ]
           },
           "queryPrefix": {
             "description": "Text added before each query, replacing the snapshot's query prompt.",
@@ -12346,6 +12425,7 @@
           "headers",
           "keepAlive",
           "version",
+          "promptCaching",
           "tls",
           "contextTokens",
           "maxOutputTokens",
@@ -12511,6 +12591,7 @@
                   "type": "object"
                 },
                 "budget": {
+                  "description": "`usedToday` counts input written to the prompt cache at 1.25 tokens, or 2 tokens with the 1-hour TTL, and input read from it at 0.1 token.",
                   "properties": {
                     "tokensPerDay": {
                       "type": "integer"
@@ -12573,6 +12654,15 @@
                       },
                       "pricing": {
                         "properties": {
+                          "cacheReadPerMTok": {
+                            "type": "number"
+                          },
+                          "cacheWrite1hPerMTok": {
+                            "type": "number"
+                          },
+                          "cacheWritePerMTok": {
+                            "type": "number"
+                          },
                           "inputPerMTok": {
                             "type": "number"
                           },
@@ -12638,6 +12728,25 @@
                 },
                 "name": {
                   "type": "string"
+                },
+                "promptCaching": {
+                  "description": "For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL.",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "ttl": {
+                      "enum": [
+                        "5m",
+                        "1h"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "enabled"
+                  ],
+                  "type": "object"
                 },
                 "requestsPerMinute": {
                   "type": "integer"
@@ -12957,6 +13066,22 @@
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
         },
         "properties": {
+          "budgetTokens": {
+            "description": "The tokens the call counts against a token budget: output, uncached input, cache writes at 1.25 tokens (2 with the 1-hour TTL) and cache reads at 0.1 token.",
+            "type": "integer"
+          },
+          "cacheReadInputTokens": {
+            "description": "Input tokens read from the provider's prompt cache.",
+            "type": "integer"
+          },
+          "cacheWrite1hInputTokens": {
+            "description": "Of those, the tokens written with the 1-hour TTL.",
+            "type": "integer"
+          },
+          "cacheWriteInputTokens": {
+            "description": "Input tokens written to the provider's prompt cache, present when the provider used its cache.",
+            "type": "integer"
+          },
           "error": {
             "properties": {
               "code": {
@@ -12973,6 +13098,7 @@
             "type": "object"
           },
           "inputTokens": {
+            "description": "Input tokens read without the provider's cache.",
             "type": "integer"
           },
           "latencyMs": {

@@ -674,13 +674,16 @@ fn question_predicate_beyond_largest_two_hundred_reaches_the_draft() {
         assert_eq!(out["outcome"], "answered", "{out:#}");
         let requests = mock.requests();
         let prompt = mock::prompt_of(&requests[0]);
-        let predicates = prompt.split("Predicates (").nth(1).unwrap();
+        // the common head and the question's part each have a predicate section
         assert!(
-            predicates
-                .lines()
+            prompt
+                .split("Predicates (")
                 .skip(1)
-                .take_while(|line| !line.trim().is_empty())
-                .any(|line| line.contains("urn:timeZone")),
+                .any(|predicates| predicates
+                    .lines()
+                    .skip(1)
+                    .take_while(|line| !line.trim().is_empty())
+                    .any(|line| line.contains("urn:timeZone"))),
             "{prompt}"
         );
     }

@@ -34,6 +34,7 @@ REPLY = {
 }
 BODY = json.dumps(REPLY).encode()
 HAIKU_COST = 10 * 100 + 2 * 500
+EPHEMERAL = {"type": "ephemeral"}
 
 
 def request(model=HAIKU, text="q", **extra):
@@ -680,6 +681,65 @@ class Cap(Base):
         self.assertLess(worst, 1.3 * 10**9)
         self.assertGreater(worst, 1.0 * 10**9)
 
+    def test_cached_requests_are_bounded_at_the_write_rate(self):
+        # Sparkles marks the system text and the dataset's grounding for the cache.
+        cached = {
+            "system": [{"type": "text", "text": "s", "cache_control": EPHEMERAL}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "dataset", "cache_control": EPHEMERAL},
+                        {"type": "text", "text": "question"},
+                    ],
+                }
+            ],
+        }
+        for model in px.MODELS:
+            with self.subTest(model=model):
+                plain = px.bound(model, 1000, 64)
+                five = px.bound(model, 1000, 64, "5m")
+                hour = px.bound(model, 1000, 64, "1h")
+                self.assertLess(plain, five)
+                self.assertLess(five, hour)
+                # a reply that wrote every input token of the bound at the hour rate
+                # costs no more than the bound
+                tokens = 2 * 1000 + 8192
+                usage = {
+                    "input_tokens": 0,
+                    "output_tokens": 64,
+                    "cache_creation_input_tokens": tokens,
+                    "cache_creation": {"ephemeral_1h_input_tokens": tokens},
+                }
+                self.assertLessEqual(px.cost(model, usage), hour)
+                usage = dict(
+                    usage, cache_creation={"ephemeral_5m_input_tokens": tokens}
+                )
+                self.assertLessEqual(px.cost(model, usage), five)
+        upstream = Upstream()
+        proxy = self.proxy(upstream)
+        status, _, _ = proxy.handle(raw(**cached))
+        self.assertEqual(status, 200)
+        sent = upstream.calls[0][1]
+        self.assertEqual(sent["system"], cached["system"])
+        self.assertEqual(sent["messages"], cached["messages"])
+        reserve = next(line for line in self.lines() if "bound" in line)
+        payload = json.dumps(sent, separators=(",", ":"), ensure_ascii=False).encode()
+        self.assertEqual(reserve["bound"], px.bound(HAIKU, len(payload), 1024, "5m"))
+        hour = dict(
+            cached,
+            system=[
+                {
+                    "type": "text",
+                    "text": "s",
+                    "cache_control": EPHEMERAL | {"ttl": "1h"},
+                }
+            ],
+        )
+        hour["messages"] = [{"role": "user", "content": "q"}]
+        self.assertEqual(px.cache_ttl(hour), "1h")
+        self.assertIsNone(px.cache_ttl(request()))
+
     def test_replay_counts_unsettled_reserves_and_carryover(self):
         carry = {"name": "pilot", "cost": 500}
         ledger = self.ledger(cap=10**9, carryover=carry)
@@ -866,7 +926,31 @@ class Requests(Base):
             raw(messages=[{"role": "user", "content": "q", "cache_control": {}}]),
             raw(service_tier="priority"),
             raw(messages=[{"role": "user", "content": [{"type": "image"}]}]),
-            raw(system=[{"type": "text", "text": "s"}]),
+            raw(system=[{"type": "text", "text": "s", "citations": []}]),
+            raw(system=[{"type": "text", "text": "s", "cache_control": {"type": "x"}}]),
+            raw(
+                system=[
+                    {
+                        "type": "text",
+                        "text": "s",
+                        "cache_control": EPHEMERAL | {"ttl": "2h"},
+                    }
+                ]
+            ),
+            raw(system=[{"type": "text", "text": "s", "cache_control": EPHEMERAL}] * 5),
+            raw(
+                system=[
+                    {
+                        "type": "text",
+                        "text": "s",
+                        "cache_control": EPHEMERAL | {"ttl": "1h"},
+                    },
+                    {"type": "text", "text": "t", "cache_control": EPHEMERAL},
+                ]
+            ),
+            raw(cache_control=EPHEMERAL),
+            raw(output_config={"format": {"cache_control": EPHEMERAL}}),
+            raw(messages=[{"role": "user", "content": []}]),
         ):
             with self.subTest(body=body[:60]):
                 self.assertEqual(proxy.handle(body)[0], 400)

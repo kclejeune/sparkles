@@ -537,3 +537,66 @@ fn an_outbound_refusal_keeps_the_reservation() {
     assert_eq!(f.error.code(), "outbound-refused", "{:?}", f.error);
     assert_eq!(l.build_used(), 100 + u64::from(MAX_OUT));
 }
+
+/// A prompt whose prefixes go to the provider's cache reserves its bound at the price of
+/// a cache write and settles each class of input at its price, so a write of the whole
+/// prompt is no anomaly, a read costs a tenth, and the cap holds before any request is
+/// sent. Counting only `input_tokens` would settle a 1000-token prompt at 10 tokens.
+#[test]
+fn cached_prompts_reserve_and_settle_at_cache_prices() {
+    let mock = MockModel::start(|r: &Received, n| {
+        if r.path.ends_with("/count_tokens") {
+            return (200, json!({ "input_tokens": 1000 }));
+        }
+        let (written, read) = if n <= 1 { (990, 0) } else { (0, 990) };
+        (
+            200,
+            json!({
+                "content": [{ "type": "text", "text": r#"{"query":"ASK {}"}"# }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 10, "output_tokens": 5,
+                    "cache_creation_input_tokens": written, "cache_read_input_tokens": read,
+                    "cache_creation": { "ephemeral_5m_input_tokens": written } }
+            }),
+        )
+    });
+    let m = models(json!({ "p": { "kind": "anthropic", "endpoint": mock.url() } }));
+    // the first write, the read, and less than one more reservation of 1250 + 100
+    let first = 10 + 1238 + 5;
+    let second = 10 + 99 + 5;
+    let l = ledger(first + second + 1349, 1_000_000);
+    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), &budget(true));
+    call(&m, "p", &a).unwrap();
+    assert_eq!(
+        l.anomaly(),
+        None,
+        "a whole-prompt cache write is within the reservation"
+    );
+    assert_eq!(l.build_used(), first);
+    call(&m, "p", &a).unwrap();
+    assert_eq!(l.build_used(), first + second);
+    let e = call(&m, "p", &a).unwrap_err();
+    assert_eq!(e.error.code(), "budget-exceeded");
+    assert!(e.error.message().contains("1350"), "{}", e.error.message());
+    // two counts and two calls; the refused attempt was counted but never sent
+    let sent = mock
+        .requests()
+        .iter()
+        .filter(|r| r.path == "/v1/messages")
+        .count();
+    assert_eq!(sent, 2);
+    // without caching the reservation is the bound and the output limit
+    let mock = MockModel::start(|r: &Received, _| {
+        if r.path.ends_with("/count_tokens") {
+            (200, json!({ "input_tokens": 1000 }))
+        } else {
+            (200, mock::anthropic(r#"{"query":"ASK {}"}"#))
+        }
+    });
+    let m = models(json!({ "p": { "kind": "anthropic", "endpoint": mock.url(),
+        "promptCaching": { "enabled": false } } }));
+    let l = ledger(1100, 1_000_000);
+    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), &budget(true));
+    call(&m, "p", &a).unwrap();
+    assert_eq!(l.build_used(), 15);
+}

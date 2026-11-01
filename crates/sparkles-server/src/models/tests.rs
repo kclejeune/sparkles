@@ -341,6 +341,188 @@ fn daily_budget_and_cost() {
     assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 30);
 }
 
+/// An Anthropic answer that reports cache writes and reads is charged each class at its
+/// price: in the step's record and cost, in the provider's daily budget, and in the
+/// budget tokens of its JSON. Counting only `input_tokens` would count 10 of the
+/// 4010 prompt tokens.
+#[test]
+fn cache_tokens_are_charged_at_their_prices() {
+    let mock = MockModel::start(|_, n| {
+        let (written, read) = if n == 0 { (4000, 0) } else { (0, 4000) };
+        (
+            200,
+            json!({
+                "content": [{ "type": "text", "text": r#"{"query":"ASK {}"}"# }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 10, "output_tokens": 5,
+                    "cache_creation_input_tokens": written, "cache_read_input_tokens": read,
+                    "cache_creation": { "ephemeral_5m_input_tokens": written, "ephemeral_1h_input_tokens": 0 } }
+            }),
+        )
+    });
+    let m = models(
+        json!({ "a": {
+            "kind": "anthropic", "endpoint": mock.url(), "budget": {"tokensPerDay": 5500},
+            "models": {"m1": {"pricing": {"inputPerMTok": 1.0, "outputPerMTok": 5.0}}}
+        } }),
+        &[],
+    );
+    let a = call(&m, "a").unwrap();
+    assert_eq!(a.record.cache_write_5m_tokens, 4000);
+    // 10 + 1.25 × 4000 input-token equivalents, and 5 output tokens
+    assert_eq!(a.record.budget_tokens(), 5015);
+    let cost = a.record.estimated_cost.unwrap();
+    assert!(
+        (cost - (10.0 + 5000.0 + 25.0) / 1e6).abs() < 1e-12,
+        "{cost}"
+    );
+    let j = a.record.json();
+    assert_eq!(
+        (
+            j["cacheWriteInputTokens"].clone(),
+            j["cacheReadInputTokens"].clone()
+        ),
+        (json!(4000), json!(0))
+    );
+    assert_eq!(j["budgetTokens"], 5015);
+    assert_eq!(usage_json(&j).budget(), 5015);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 5015);
+    // the read is a tenth of the price: 10 + 400 + 5
+    let b = call(&m, "a").unwrap();
+    assert_eq!(b.record.cache_read_tokens, 4000);
+    assert_eq!(b.record.budget_tokens(), 415);
+    assert!((b.record.estimated_cost.unwrap() - (10.0 + 400.0 + 25.0) / 1e6).abs() < 1e-12);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 5430);
+    // the cap holds: 5430 of 5500 leaves room for one more, and then none
+    assert!(call(&m, "a").is_ok());
+    assert_eq!(call(&m, "a").unwrap_err().error.code(), "budget-exceeded");
+    assert_eq!(mock.requests().len(), 3);
+    let p = &m.describe()["providers"][0];
+    assert_eq!(p["promptCaching"], json!({ "enabled": true, "ttl": "5m" }));
+    assert_eq!(p["models"][0]["pricing"]["cacheReadPerMTok"], json!(0.1));
+    // the request marked the system text for the cache
+    let r = &mock.requests()[0];
+    assert_eq!(
+        r.body["system"][0]["cache_control"],
+        json!({ "type": "ephemeral" })
+    );
+}
+
+/// The budget of several steps is the sum of each step's own, as the ask's budget
+/// counts it, not the budget of their summed usage: two reads of 513 tokens count 52
+/// each, 104 together, where their sum would count 103.
+#[test]
+fn step_budgets_are_rounded_per_step() {
+    let step = StepRecord {
+        cache_read_tokens: 513,
+        ..Default::default()
+    };
+    assert_eq!(step.budget_tokens(), 52);
+    let steps = [step.clone(), step];
+    let mut j = json!({ "inputTokens": 0, "outputTokens": 0 });
+    steps_json(&mut j, &steps);
+    assert_eq!(j["budgetTokens"], 104);
+    assert_eq!(j["cacheReadInputTokens"], 1026);
+    assert_eq!(budget_of(&j), 104);
+    assert_eq!(usage_total(&steps).budget(), 103);
+    // a usage without cache members counts its input and output
+    assert_eq!(
+        budget_of(&json!({ "inputTokens": 7, "outputTokens": 3 })),
+        10
+    );
+}
+
+/// A step retried after a cache-bearing answer charges the provider's budget what the
+/// step's budget grew by, so both round the step's cache reads once: two reads of 513
+/// tokens count 103, not 52 + 52.
+#[test]
+fn the_provider_budget_rounds_each_step_once() {
+    let mock = MockModel::start(|_, n| {
+        let text = if n == 0 {
+            r#"{"wrong":1}"#
+        } else {
+            r#"{"query":"ASK {}"}"#
+        };
+        (
+            200,
+            json!({
+                "content": [{ "type": "text", "text": text }], "stop_reason": "end_turn",
+                "usage": { "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 513 }
+            }),
+        )
+    });
+    let m = models(
+        json!({ "a": { "kind": "anthropic", "endpoint": mock.url(),
+            "structuredOutput": "json-schema", "budget": { "tokensPerDay": 1000 } } }),
+        &[],
+    );
+    let a = call(&m, "a").unwrap();
+    assert_eq!(a.record.requests, 2);
+    assert_eq!(a.record.budget_tokens(), 103);
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 103);
+}
+
+/// At the `tool` level the answer comes as the tool's input with no text. A retry for
+/// a bound the strict tool could not carry shows that input as the assistant's turn,
+/// since Anthropic refuses an empty assistant message.
+#[test]
+fn a_tool_answer_is_replayed_in_its_retry() {
+    for preamble in ["", "Here is the query."] {
+        let mock = MockModel::start(move |_, n| {
+            let q = if n == 0 {
+                "SELECT * WHERE { ?s ?p ?o }"
+            } else {
+                "ASK {}"
+            };
+            let mut content = vec![
+                json!({ "type": "tool_use", "id": "t", "name": "Draft", "input": { "query": q } }),
+            ];
+            if !preamble.is_empty() {
+                content.insert(0, json!({ "type": "text", "text": preamble }));
+            }
+            (
+                200,
+                json!({
+                    "content": content,
+                    "stop_reason": "tool_use", "usage": { "input_tokens": 10, "output_tokens": 5 }
+                }),
+            )
+        });
+        let m = models(
+            json!({ "a": { "kind": "anthropic", "endpoint": mock.url(), "structuredOutput": "tool" } }),
+            &[],
+        );
+        let mut out = draft_schema();
+        out.schema["properties"]["query"]["maxLength"] = json!(10);
+        let a = m
+            .call(
+                Some(Role::Draft),
+                &Pair::new("a", "m1"),
+                "system text",
+                "user text",
+                &out,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(a.value, json!({ "query": "ASK {}" }));
+        let r = mock.requests();
+        assert_eq!(r[0].body["tool_choice"], json!({ "type": "auto" }));
+        assert_eq!(
+            r[0].body["tools"][0]["input_schema"]["properties"]["query"],
+            json!({ "type": "string" })
+        );
+        let said = &r[1].body["messages"][1];
+        assert_eq!(said["role"], "assistant");
+        let input = r#"{"query":"SELECT * WHERE { ?s ?p ?o }"}"#;
+        let expected = if preamble.is_empty() {
+            input.to_string()
+        } else {
+            format!("{preamble}\n{input}")
+        };
+        assert_eq!(said["content"], expected.as_str());
+    }
+}
+
 #[test]
 fn a_reload_shares_the_token_count_with_requests_on_the_old_config() {
     let mock = MockModel::start(|_, _| (200, mock::ollama(r#"{"query":"ASK {}"}"#)));

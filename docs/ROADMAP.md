@@ -558,6 +558,7 @@ numbered item when it is ready to start.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
+| 503 | **Prompt caching measurements.** The hit rate of Anthropic's prompt cache on real Ask, ingestion and GraphRAG calls, and Ask's accuracy with the grounding reordered for caching, have not been measured against a provider. A paired evaluation run and a two-call check of `cacheReadInputTokens` close it. | [C18](specs/C18-natural-language-questions-and-ingest/SPEC.md#36-structured-output-by-kind-and-small-models) | S |
 | 6 | **Ask evaluation on public benchmarks.** Runs of local and OpenAI-compatible models and an evaluation with independent roles remain, and LC-QuAD 2.0 waits for a Wikidata load from the full dump. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 28 | **Query by example** and Bloom-style search phrases. | [U03](specs/U03-query-by-example.md) | M |
 | 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance. This item belongs to the additional query languages capability and is outside the completion path of paths and graph algorithms. | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL |

@@ -4314,7 +4314,7 @@ export interface components {
                 uncited?: boolean;
                 uncitedSentences?: string[];
             };
-            /** @description `askId`, the tokens and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`. */
+            /** @description `askId`, the tokens (with the prompt cache's `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens` when the provider used it) and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`. */
             usage: {
                 [key: string]: unknown;
             };
@@ -6020,7 +6020,7 @@ export interface components {
             stop?: {
                 [key: string]: unknown;
             };
-            /** @description The model calls: tokens, `modelCalls`, `failedCalls` and `steps`. */
+            /** @description The model calls: tokens, `modelCalls`, `failedCalls` and `steps`. A provider that used its prompt cache adds `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens`. */
             usage?: {
                 [key: string]: unknown;
             };
@@ -6680,7 +6680,7 @@ export interface components {
             /** @enum {string} */
             status: "queued" | "scanning" | "converting" | "registering" | "awaiting-confirmation" | "extracting" | "linking" | "writing" | "awaiting-approval" | "done" | "failed" | "cancelled";
             updatedAt: string;
-            /** @description Model calls, tokens, estimated cost, escalations and the pair that answered each chunk. */
+            /** @description Model calls, tokens, estimated cost, escalations and the pair that answered each chunk. A provider that used its prompt cache adds `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens`. */
             usage: {
                 [key: string]: unknown;
             };
@@ -7217,14 +7217,29 @@ export interface components {
              */
             pricing?: {
                 /**
+                 * Cache read price
+                 * @description The price of one million input tokens read from the prompt cache. Claude Opus 5.5 and Sonnet 5.5 read at 0.05 times the input price and Claude Fable 5.1 at 0.025 times.
+                 */
+                cacheReadPerMTok?: number;
+                /**
+                 * 1-hour cache write price
+                 * @description The price of one million input tokens written to the prompt cache with the 1-hour TTL.
+                 */
+                cacheWrite1hPerMTok?: number;
+                /**
+                 * Cache write price
+                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 */
+                cacheWritePerMTok?: number;
+                /**
                  * Input price
-                 * @description The price of one million input tokens. A model's prices replace both of the provider's prices.
+                 * @description The price of one million input tokens. A model's prices replace all of the provider's prices.
                  * @default 0
                  */
                 inputPerMTok: number;
                 /**
                  * Output price
-                 * @description The price of one million output tokens. A model's prices replace both of the provider's prices.
+                 * @description The price of one million output tokens. A model's prices replace all of the provider's prices.
                  * @default 0
                  */
                 outputPerMTok: number;
@@ -7394,17 +7409,51 @@ export interface components {
              */
             pricing?: {
                 /**
+                 * Cache read price
+                 * @description The price of one million input tokens read from the prompt cache. Claude Opus 5.5 and Sonnet 5.5 read at 0.05 times the input price and Claude Fable 5.1 at 0.025 times.
+                 */
+                cacheReadPerMTok?: number;
+                /**
+                 * 1-hour cache write price
+                 * @description The price of one million input tokens written to the prompt cache with the 1-hour TTL.
+                 */
+                cacheWrite1hPerMTok?: number;
+                /**
+                 * Cache write price
+                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 */
+                cacheWritePerMTok?: number;
+                /**
                  * Input price
-                 * @description The price of one million input tokens. A model's prices replace both of the provider's prices.
+                 * @description The price of one million input tokens. A model's prices replace all of the provider's prices.
                  * @default 0
                  */
                 inputPerMTok: number;
                 /**
                  * Output price
-                 * @description The price of one million output tokens. A model's prices replace both of the provider's prices.
+                 * @description The price of one million output tokens. A model's prices replace all of the provider's prices.
                  * @default 0
                  */
                 outputPerMTok: number;
+            };
+            /**
+             * Prompt caching
+             * @description Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache.
+             */
+            promptCaching?: {
+                /**
+                 * Prompt caching
+                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL.
+                 * @default true
+                 */
+                enabled: boolean;
+                /**
+                 * Cache lifetime
+                 * @description How long the provider keeps a cached prefix after its last use. The 1-hour TTL doubles the write price and pays when calls sharing a prefix come more than 5 minutes apart.
+                 * @default 5m
+                 * @enum {string}
+                 */
+                ttl: "5m" | "1h";
             };
             /**
              * Query prefix
@@ -7526,6 +7575,7 @@ export interface components {
                      */
                     source: "declared" | "runtime" | "missing";
                 };
+                /** @description `usedToday` counts input written to the prompt cache at 1.25 tokens, or 2 tokens with the 1-hour TTL, and input read from it at 0.1 token. */
                 budget?: {
                     tokensPerDay: number;
                     usedToday: number;
@@ -7541,6 +7591,9 @@ export interface components {
                     maxOutputTokens: number;
                     name: string;
                     pricing?: {
+                        cacheReadPerMTok?: number;
+                        cacheWrite1hPerMTok?: number;
+                        cacheWritePerMTok?: number;
                         inputPerMTok: number;
                         outputPerMTok: number;
                     };
@@ -7559,6 +7612,12 @@ export interface components {
                     structuredOutput: "auto" | "json-schema" | "json-object" | "tool" | "text";
                 }[];
                 name: string;
+                /** @description For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. */
+                promptCaching?: {
+                    enabled: boolean;
+                    /** @enum {string} */
+                    ttl?: "5m" | "1h";
+                };
                 requestsPerMinute?: number;
                 /**
                  * @description `secret-missing` when the named key cannot be read.
@@ -7667,10 +7726,19 @@ export interface components {
         };
         /** @description The outcome of a test call. */
         ModelTestResult: {
+            /** @description The tokens the call counts against a token budget: output, uncached input, cache writes at 1.25 tokens (2 with the 1-hour TTL) and cache reads at 0.1 token. */
+            budgetTokens?: number;
+            /** @description Input tokens read from the provider's prompt cache. */
+            cacheReadInputTokens?: number;
+            /** @description Of those, the tokens written with the 1-hour TTL. */
+            cacheWrite1hInputTokens?: number;
+            /** @description Input tokens written to the provider's prompt cache, present when the provider used its cache. */
+            cacheWriteInputTokens?: number;
             error?: {
                 code: string;
                 message: string;
             };
+            /** @description Input tokens read without the provider's cache. */
             inputTokens: number;
             latencyMs: number;
             level?: ("auto" | "json-schema" | "json-object" | "tool" | "text") | null;

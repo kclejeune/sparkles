@@ -33,10 +33,10 @@ mod structured;
 
 #[cfg(test)]
 pub use client::body_bytes;
-pub use client::{CallError, ChatRequest, Message};
+pub use client::{CallError, ChatRequest, Message, Part};
 pub use config::{
-    DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair, ProviderConfig,
-    Role, Routing, TLS_MEMBERS, check_secret_name, invalid_field,
+    CacheTtl, DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair,
+    ProviderConfig, Role, Routing, TLS_MEMBERS, check_secret_name, invalid_field,
 };
 #[cfg(test)]
 pub use structured::validate;
@@ -113,8 +113,15 @@ pub struct StepRecord {
     pub level: Option<Level>,
     /// requests sent, retries included
     pub requests: u32,
+    /// the input the provider read without its cache
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// input written to the provider's cache with the 5-minute TTL
+    pub cache_write_5m_tokens: u64,
+    /// input written to the provider's cache with the 1-hour TTL
+    pub cache_write_1h_tokens: u64,
+    /// input read from the provider's cache
+    pub cache_read_tokens: u64,
     pub latency: Duration,
     /// `ok`, or the code of the failure
     pub outcome: String,
@@ -125,6 +132,31 @@ pub struct StepRecord {
 }
 
 impl StepRecord {
+    /// The tokens of every request of the step.
+    pub fn usage(&self) -> admission::Usage {
+        admission::Usage {
+            input: self.input_tokens,
+            output: self.output_tokens,
+            cache_write_5m: self.cache_write_5m_tokens,
+            cache_write_1h: self.cache_write_1h_tokens,
+            cache_read: self.cache_read_tokens,
+        }
+    }
+
+    fn add(&mut self, u: admission::Usage) {
+        let t = self.usage().plus(u);
+        self.input_tokens = t.input;
+        self.output_tokens = t.output;
+        self.cache_write_5m_tokens = t.cache_write_5m;
+        self.cache_write_1h_tokens = t.cache_write_1h;
+        self.cache_read_tokens = t.cache_read;
+    }
+
+    /// The tokens the step counts against a token budget ([`admission::Usage::budget`]).
+    pub fn budget_tokens(&self) -> u64 {
+        self.usage().budget()
+    }
+
     pub fn json(&self) -> Value {
         let mut j = json!({
             "provider": self.provider,
@@ -135,6 +167,7 @@ impl StepRecord {
             "latencyMs": self.latency.as_millis() as u64,
             "outcome": self.outcome,
         });
+        cache_json(&mut j, &self.usage(), self.budget_tokens());
         if let Some(r) = self.role {
             j["role"] = r.as_str().into();
         }
@@ -148,6 +181,85 @@ impl StepRecord {
             j["stopReason"] = s.clone().into();
         }
         j
+    }
+}
+
+/// Add the cache members of `u` to a usage object `j` that has `inputTokens` and
+/// `outputTokens`, when the provider used its cache: `cacheWriteInputTokens` (of which
+/// `cacheWrite1hInputTokens` at the 1-hour TTL), `cacheReadInputTokens`, and
+/// `budgetTokens`, the tokens the usage counts against a token budget, which is
+/// `budget`. A usage without them used no cache, and its budget tokens are its input
+/// and output tokens.
+pub fn cache_json(j: &mut Value, u: &admission::Usage, budget: u64) {
+    let written = u.cache_write_5m.saturating_add(u.cache_write_1h);
+    if written == 0 && u.cache_read == 0 {
+        return;
+    }
+    j["cacheWriteInputTokens"] = written.into();
+    if u.cache_write_1h > 0 {
+        j["cacheWrite1hInputTokens"] = u.cache_write_1h.into();
+    }
+    j["cacheReadInputTokens"] = u.cache_read.into();
+    j["budgetTokens"] = budget.into();
+}
+
+/// [`cache_json`] for the usage of `steps` together. Its budget tokens are the sum of
+/// the steps' own, since each step's cache classes are rounded up on their own.
+pub fn steps_json<'a>(j: &mut Value, steps: impl IntoIterator<Item = &'a StepRecord> + Clone) {
+    let budget = steps
+        .clone()
+        .into_iter()
+        .map(StepRecord::budget_tokens)
+        .sum();
+    cache_json(j, &usage_total(steps), budget);
+}
+
+/// The tokens a usage object or a step record in JSON counts against a token budget:
+/// its `budgetTokens`, or its input and output tokens when it used no cache.
+pub fn budget_of(j: &Value) -> u64 {
+    j["budgetTokens"].as_u64().unwrap_or_else(|| {
+        let n = |k: &str| j[k].as_u64().unwrap_or(0);
+        n("inputTokens").saturating_add(n("outputTokens"))
+    })
+}
+
+/// The usage of a usage object or a step record in JSON, as [`cache_json`] writes it.
+pub fn usage_json(j: &Value) -> admission::Usage {
+    let n = |k: &str| j[k].as_u64().unwrap_or(0);
+    let written = n("cacheWriteInputTokens");
+    let hour = n("cacheWrite1hInputTokens").min(written);
+    admission::Usage {
+        input: n("inputTokens"),
+        output: n("outputTokens"),
+        cache_write_5m: written - hour,
+        cache_write_1h: hour,
+        cache_read: n("cacheReadInputTokens"),
+    }
+}
+
+/// The sum of the usage of `steps`.
+pub fn usage_total<'a>(steps: impl IntoIterator<Item = &'a StepRecord>) -> admission::Usage {
+    steps
+        .into_iter()
+        .fold(admission::Usage::default(), |t, s| t.plus(s.usage()))
+}
+
+/// A prompt in parts: the system text and the user message (spec C18 §3.6). A part
+/// marked [`Part::cached`] ends a prefix that a provider with prompt caching keeps, so
+/// the parts that stay the same across calls come first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prompt {
+    pub system: Vec<Part>,
+    pub user: Vec<Part>,
+}
+
+impl Prompt {
+    /// A fixed system text, cached on its own, and a user message.
+    pub fn plain(system: &str, user: &str) -> Prompt {
+        Prompt {
+            system: vec![Part::cached(system)],
+            user: vec![Part::text(user)],
+        }
     }
 }
 
@@ -536,7 +648,14 @@ impl Models {
         out: &OutputSchema,
         deadline: Instant,
     ) -> Result<Answer, Failure> {
-        self.call_admitted(role, pair, system, user, out, deadline, None)
+        self.call_prompt(
+            role,
+            pair,
+            &Prompt::plain(system, user),
+            out,
+            deadline,
+            None,
+        )
     }
 
     /// [`Models::call`] with an admission asked before every HTTP attempt it makes:
@@ -550,6 +669,21 @@ impl Models {
         pair: &Pair,
         system: &str,
         user: &str,
+        out: &OutputSchema,
+        deadline: Instant,
+        admission: Option<&dyn admission::Admission>,
+    ) -> Result<Answer, Failure> {
+        let prompt = Prompt::plain(system, user);
+        self.call_prompt(role, pair, &prompt, out, deadline, admission)
+    }
+
+    /// [`Models::call_admitted`] with a prompt in parts, whose marked parts end the
+    /// prefixes a provider with prompt caching keeps.
+    pub fn call_prompt(
+        &self,
+        role: Option<Role>,
+        pair: &Pair,
+        prompt: &Prompt,
         out: &OutputSchema,
         deadline: Instant,
         admission: Option<&dyn admission::Admission>,
@@ -617,7 +751,7 @@ impl Models {
         let mut last: Option<StepError> = None;
         for (i, &level) in levels.iter().enumerate() {
             let has_next = detecting && i + 1 < levels.len();
-            let mut messages = structured::messages(user, out, level);
+            let mut messages = structured::messages(&prompt.user, out, level);
             for attempt in 0..2 {
                 if let Some(cap) = p.budget.and_then(|b| b.tokens_per_day) {
                     let mut t = rt.tokens.lock();
@@ -645,7 +779,7 @@ impl Models {
                 }
                 let req = ChatRequest {
                     model: pair.model.clone(),
-                    system: system.to_string(),
+                    system: prompt.system.clone(),
                     messages: messages.clone(),
                     schema: Some((out.name.to_string(), out.schema.clone())),
                     level,
@@ -711,15 +845,18 @@ impl Models {
                         return fail(StepError::Call(e), rec);
                     }
                 };
-                rec.input_tokens += resp.input_tokens;
+                // the provider's budget counts what the step's budget grew by, so both
+                // round the step's cache classes once
+                let before = rec.budget_tokens();
+                rec.add(resp.usage);
                 rec.stop = resp.stop.clone();
-                rec.output_tokens += resp.output_tokens;
                 {
                     let mut t = rt.tokens.lock();
                     if t.0 != today() {
                         *t = (today(), 0);
                     }
-                    t.1 += resp.input_tokens + resp.output_tokens;
+                    t.1 =
+                        t.1.saturating_add(rec.budget_tokens().saturating_sub(before));
                 }
                 match structured::value_of(&resp, out, level) {
                     Ok(value) => {
@@ -730,11 +867,7 @@ impl Models {
                         }
                         rec.latency = started.elapsed();
                         rec.outcome = "ok".into();
-                        rec.estimated_cost = pricing.map(|pr| {
-                            (rec.input_tokens as f64 * pr.input_per_m_tok
-                                + rec.output_tokens as f64 * pr.output_per_m_tok)
-                                / 1e6
-                        });
+                        rec.estimated_cost = pricing.map(|pr| rec.usage().cost(&pr));
                         self.note(pair, true, None);
                         return Ok(Answer {
                             value,
@@ -745,7 +878,15 @@ impl Models {
                     Err(errors) => {
                         last = Some(StepError::InvalidOutput(errors.clone()));
                         if attempt == 0 {
-                            messages.push(Message::assistant(resp.text.clone()));
+                            // the retry shows the answer that was validated: a tool
+                            // answer's input, after any text the model wrote first,
+                            // since Anthropic refuses an empty assistant message
+                            let said = match &resp.tool_input {
+                                Some(v) if resp.text.trim().is_empty() => v.to_string(),
+                                Some(v) => format!("{}\n{v}", resp.text.trim_end()),
+                                None => resp.text.clone(),
+                            };
+                            messages.push(Message::assistant(said));
                             messages.push(structured::retry_message(&errors));
                         }
                     }
@@ -756,11 +897,7 @@ impl Models {
             }
         }
         rec.latency = started.elapsed();
-        rec.estimated_cost = pricing.map(|pr| {
-            (rec.input_tokens as f64 * pr.input_per_m_tok
-                + rec.output_tokens as f64 * pr.output_per_m_tok)
-                / 1e6
-        });
+        rec.estimated_cost = pricing.map(|pr| rec.usage().cost(&pr));
         let error = last.unwrap_or(StepError::InvalidOutput(vec!["no answer".into()]));
         self.note(pair, false, Some(error.message()));
         fail(error, rec)
@@ -816,31 +953,39 @@ impl Models {
             &out,
             Instant::now() + timeout,
         );
-        Ok(match r {
-            Ok(a) => json!({
-                "provider": provider,
-                "model": model,
-                "ok": true,
-                "level": a.level.as_str(),
-                "structuredOutput": a.level != Level::Text,
-                "latencyMs": a.record.latency.as_millis() as u64,
-                "inputTokens": a.record.input_tokens,
-                "outputTokens": a.record.output_tokens,
-                "requests": a.record.requests,
-            }),
-            Err(f) => json!({
-                "provider": provider,
-                "model": model,
-                "ok": false,
-                "level": f.record.level.map(Level::as_str),
-                "structuredOutput": false,
-                "latencyMs": f.record.latency.as_millis() as u64,
-                "inputTokens": f.record.input_tokens,
-                "outputTokens": f.record.output_tokens,
-                "requests": f.record.requests,
-                "error": { "code": f.error.code(), "message": f.error.message() },
-            }),
-        })
+        let (mut j, usage) = match r {
+            Ok(a) => (
+                json!({
+                    "provider": provider,
+                    "model": model,
+                    "ok": true,
+                    "level": a.level.as_str(),
+                    "structuredOutput": a.level != Level::Text,
+                    "latencyMs": a.record.latency.as_millis() as u64,
+                    "inputTokens": a.record.input_tokens,
+                    "outputTokens": a.record.output_tokens,
+                    "requests": a.record.requests,
+                }),
+                a.record.usage(),
+            ),
+            Err(f) => (
+                json!({
+                    "provider": provider,
+                    "model": model,
+                    "ok": false,
+                    "level": f.record.level.map(Level::as_str),
+                    "structuredOutput": false,
+                    "latencyMs": f.record.latency.as_millis() as u64,
+                    "inputTokens": f.record.input_tokens,
+                    "outputTokens": f.record.output_tokens,
+                    "requests": f.record.requests,
+                    "error": { "code": f.error.code(), "message": f.error.message() },
+                }),
+                f.record.usage(),
+            ),
+        };
+        cache_json(&mut j, &usage, usage.budget());
+        Ok(j)
     }
 
     /// The models of a provider: those the role lists name, then its `models` entries.
@@ -895,6 +1040,11 @@ impl Models {
                                 "inputPerMTok": number(pr.input_per_m_tok),
                                 "outputPerMTok": number(pr.output_per_m_tok),
                             });
+                            if p.cache_ttl().is_some() {
+                                j["pricing"]["cacheWritePerMTok"] = number(pr.cache_write_5m());
+                                j["pricing"]["cacheWrite1hPerMTok"] = number(pr.cache_write_1h());
+                                j["pricing"]["cacheReadPerMTok"] = number(pr.cache_read());
+                            }
                         }
                         j["status"] = match status.get(&(name.clone(), m.clone())) {
                             None => json!({ "state": "untested" }),
@@ -959,6 +1109,12 @@ impl Models {
                 }
                 if let Some(r) = p.requests_per_minute {
                     j["requestsPerMinute"] = r.into();
+                }
+                if p.kind == Kind::Anthropic {
+                    j["promptCaching"] = match p.cache_ttl() {
+                        Some(t) => json!({ "enabled": true, "ttl": t.as_str() }),
+                        None => json!({ "enabled": false }),
+                    };
                 }
                 if let Some(t) = p.budget.and_then(|b| b.tokens_per_day) {
                     let used = self.runtime.get(name).map_or(0, |rt| {
