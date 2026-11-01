@@ -2781,7 +2781,11 @@ impl Store {
                         _ => None,
                     };
                     if self.starts_at(seq) {
-                        Err(self.inherited(at, seq))
+                        if memory.is_some() {
+                            Err(self.inherited_limited(at, seq, &limit)?)
+                        } else {
+                            Err(self.inherited(at, seq))
+                        }
                     } else if memory.is_some() {
                         Err(self.mem_gone_limited(seq, r.head, name, Some(r.commit), &limit)?)
                     } else {
@@ -2812,9 +2816,15 @@ impl Store {
             h.owner(seq, current, r.head)
         };
         let Some(owner) = owner else {
-            return if self.starts_at(seq) {
-                Err(self.inherited(at, seq))
-            } else if memory.is_some() {
+            if self.starts_at(seq) {
+                drop(h);
+                return Err(if memory.is_some() {
+                    self.inherited_limited(at, seq, &limit)?
+                } else {
+                    self.inherited(at, seq)
+                });
+            }
+            return if memory.is_some() {
                 Err(self.history_gone_limited(
                     &h,
                     seq,
