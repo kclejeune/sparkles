@@ -734,3 +734,40 @@ builds switched between faster and slower writes within a process. Tracing chang
 timings, so these figures diagnose where the variation occurs rather than measure the
 inference change's cost. Item 265 requires a comparison with matched durable-write
 latency before attributing a difference to the engine.
+
+### Incremental view gate baseline
+
+`mise run bench:incr` is the rewrite gate of incremental view maintenance, as
+[BENCHMARKING.md](../../BENCHMARKING.md#incremental-view-maintenance) describes. Its
+baseline ran on forge alone at commit 64391e7f, whose engine code is that of 04d49b57,
+with 200,000 people and 12 Rayon threads in five processes. Every view's maintained rows
+matched its query evaluated again at the same commit, and every check of the record
+passed. Each figure is the median over the five processes, and the record keeps each
+process's value and their range.
+
+| View | Build ms | Query ms | Pass median ms | Pass p95 ms | Advance µs |
+|---|--:|--:|--:|--:|--:|
+| team-sizes | 50.3 | 0.389 | 0.013 | 0.023 | 4.28 |
+| team-ages | 62.2 | 4.76 | 0.024 | 0.036 | 7.09 |
+| colleagues-known | 13.2 | 9.53 | 0.196 | 0.285 | 192 |
+| labelled | 89.3 | 1.82 | 0.011 | 0.021 | 4.62 |
+| teams | 22.1 | 0.642 | 0.008 | 0.016 | 3.40 |
+
+A pass after one commit costs between 0.008 and 0.2 ms, against 0.4 to 9.5 ms for
+evaluating the query again. The rounds of views over inferred data took 17.5 ms for the
+RDFS team sizes, 6.3 ms for the RDFS agents and 2.1 ms for the materialized team sizes,
+about one evaluation of each query, and a commit outside a view's footprint cost 0.011 to
+0.041 ms.
+
+The commit timings are not a useful gate on forge. A commit's median latency was either
+about 0.25 ms or about 1.6 ms, and which one a test got changed between processes and
+between tests of one process, as item 265 found for the commit path. Four of the five
+processes ran most commit tests at the slower latency, so the median of the 0-view commit
+test is 1.60 ms with a range of 0.28 to 1.70 ms. Because a flagged metric needs the
+candidate's whole range on the losing side, these wide ranges flag only a slowdown that
+every process shows. Catching up 100 views after their commits took 2.0 to 4.8 s.
+
+The [run record](runs/2026-11-01-incr-gate-forge-64391e7f/record.json) holds every value,
+the answer fingerprints, the settings, the compilers and the build configuration, with
+the raw lines and logs of the five processes and the
+[commands](runs/2026-11-01-incr-gate-forge-64391e7f/run.sh.txt).

@@ -1837,6 +1837,16 @@ equality-stage fixtures. The
 [baseline](../benchmarks/reasoning/RESULTS.md#query-time-reasoning-latency) keeps every
 sample and answer fingerprint.
 
+Item 471 makes `crates/sparkles-core/tests/incr_bench.rs` the task `mise run bench:incr`,
+which runs every incremental-view benchmark in five processes and records each value's
+median and range. Outside the timed intervals it checks every view's rows against its
+query evaluated again, and the commit path against the writes it made. On forge a pass
+after one commit took 0.008 to 0.2 ms against 0.4 to 9.5 ms for the query. The commit
+timings switch between about 0.25 and 1.6 ms from test to test, as item 265 found, so they
+guard only against a slowdown that every process shows. The
+[baseline](../benchmarks/writes/RESULTS.md#incremental-view-gate-baseline) keeps every
+value and answer fingerprint.
+
 ### Scope changes
 
 **Further engines for comparison.** The second rule in §4 left commercial editions out of scope and did not run an engine whose terms forbid publishing results. Comparisons with Virtuoso Open Source and GraphDB Free, with Blazegraph at low priority, and with RDFox and Stardog after a check of their licenses for benchmark-publication clauses, are now planned under [ROADMAP](../ROADMAP.md) item 452 in this spec's Roadmap follow-ups. A measurement stays private when publication is forbidden.

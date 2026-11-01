@@ -39,6 +39,9 @@ materialized inferences on the 14 LUBM queries and checks every answer. Its forg
 baseline shows OWL RL derivation on demand taking about two seconds per query at 10
 universities.
 
+`mise run bench:incr` runs the incremental-view benchmarks in five processes, checks each
+view's rows against its query and records a forge baseline.
+
 ### Changed
 
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
