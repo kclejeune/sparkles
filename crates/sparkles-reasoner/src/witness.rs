@@ -1400,6 +1400,9 @@ impl Witnesses {
         let mut tmp = Held::new(cx.budget);
         let mut ticks = 0u32;
         while let Some(i) = queue.pop_front() {
+            // regression (fourth review of item 416): no evaluation leaves its supports
+            // charged here once they move into a node or are dropped
+            debug_assert_eq!(tmp.bytes(), 0);
             queued.remove(&i);
             ticks = ticks.wrapping_add(1);
             if ticks.is_multiple_of(256) && cancelled(cx) {
@@ -1475,6 +1478,8 @@ impl Witnesses {
                 trunc = false;
             }
             let trunc = trunc || local;
+            // the pool now either moves into the node, which charges it, or is dropped
+            tmp.set(0);
             let n = &self.nodes[i as usize];
             let same = n.w == pool && n.local == local && n.trunc == trunc;
             if cx.lists && !same && (t[1] == cx.first || t[1] == cx.rest) && !pass.complete {
