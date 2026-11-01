@@ -363,3 +363,29 @@ fn parses_lists() {
     assert_eq!(parse_axiom_types("SubClassOf").unwrap().len(), 1);
     assert!(parse_axiom_types("Nope").is_err());
 }
+
+#[test]
+fn removes_an_entity() {
+    let ds = dataset(BASE);
+    let req = OntologyRequest::default();
+    let e = ds
+        .ontology()
+        .remove_entity(&req, &ex("B"), &opts())
+        .unwrap();
+    // the declaration and the restriction axiom
+    assert_eq!(e.removed, 2, "{:?}", e.absent);
+    let o = ds.ontology().open(&req, &opts()).unwrap();
+    assert!(!o.ontology.axiom_set().any(|a| a.mentions(&ex("B"))));
+    assert!(o.ontology.unmapped.is_empty());
+    // an assertion about an individual goes too
+    let e = ds
+        .ontology()
+        .remove_entity(&req, &ex("a"), &opts())
+        .unwrap();
+    assert_eq!(e.removed, 3);
+    let none = ds
+        .ontology()
+        .remove_entity(&req, &ex("nobody"), &opts())
+        .unwrap();
+    assert_eq!(none.removed, 0);
+}

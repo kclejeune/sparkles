@@ -144,15 +144,48 @@ fn header_json(h: &owl::Header, r: &Renderer) -> J {
     })
 }
 
-fn opened_json(ds: &Dataset, o: &Opened, req: &OntologyRequest) -> J {
+fn opened_json(name: &str, o: &Opened, req: &OntologyRequest) -> J {
     json!({
-        "dataset": ds.name,
+        "dataset": name,
         "commit": o.snapshot.commit,
         "mode": req.mode.as_str(),
         "graphs": o.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
         "imports": o.imports.iter().map(|i| json!({"iri": i.iri, "graph": i.graph})).collect::<Vec<_>>(),
         "warnings": o.warnings,
     })
+}
+
+/// The JSON of the summary of an open ontology, as `GET /$/ontology/{ds}` answers it.
+pub(crate) fn summary_body(name: &str, o: &Opened, req: &OntologyRequest, r: &Renderer) -> J {
+    let s = o.summary();
+    let mut j = opened_json(name, o, req);
+    j["header"] = header_json(&s.header, r);
+    j["axioms"] = json!(
+        s.axioms
+            .iter()
+            .map(|(t, n)| (t.name().to_string(), json!(*n)))
+            .collect::<serde_json::Map<String, J>>()
+    );
+    j["axiomCount"] = json!(s.axioms.values().sum::<usize>());
+    j["entities"] = json!(
+        s.entities
+            .iter()
+            .map(|(k, n)| (k.name().to_string(), json!(*n)))
+            .collect::<serde_json::Map<String, J>>()
+    );
+    j["triples"] = json!(s.triples);
+    j["unmapped"] = json!(s.unmapped);
+    j["diagnostics"] = json!({
+        "warnings": s.warnings,
+        "errors": s.errors,
+        "list": o.ontology.diagnostics.iter().take(SUMMARY_DIAGNOSTICS).map(|d| json!({
+            "severity": d.severity.as_str(),
+            "code": d.code,
+            "message": d.message,
+        })).collect::<Vec<_>>(),
+    });
+    j["cached"] = json!(o.cached);
+    j
 }
 
 /// `GET /$/ontology/{ds}`: the header, the counts of entities and axioms, the graphs
@@ -174,35 +207,7 @@ pub(super) async fn summary(
             .ontology()
             .open(&req, &opts)
             .map_err(ontology_error)?;
-        let r = renderer(&ds);
-        let s = o.summary();
-        let mut j = opened_json(&ds, &o, &req);
-        j["header"] = header_json(&s.header, &r);
-        j["axioms"] = json!(
-            s.axioms
-                .iter()
-                .map(|(t, n)| (t.name().to_string(), json!(*n)))
-                .collect::<serde_json::Map<String, J>>()
-        );
-        j["axiomCount"] = json!(s.axioms.values().sum::<usize>());
-        j["entities"] = json!(
-            s.entities
-                .iter()
-                .map(|(k, n)| (k.name().to_string(), json!(*n)))
-                .collect::<serde_json::Map<String, J>>()
-        );
-        j["triples"] = json!(s.triples);
-        j["unmapped"] = json!(s.unmapped);
-        j["diagnostics"] = json!({
-            "warnings": s.warnings,
-            "errors": s.errors,
-            "list": o.ontology.diagnostics.iter().take(SUMMARY_DIAGNOSTICS).map(|d| json!({
-                "severity": d.severity.as_str(),
-                "code": d.code,
-                "message": d.message,
-            })).collect::<Vec<_>>(),
-        });
-        j["cached"] = json!(o.cached);
+        let j = summary_body(&ds.name, &o, &req, &renderer(&ds));
         let seq = o.snapshot.commit;
         let tag = conditional::etag(ds.store.dataset_id(), seq, "owl");
         let resp = match conditional::check_read(&headers, ds.store.dataset_id(), seq, &tag)? {
@@ -263,41 +268,16 @@ pub(super) async fn axioms(
             .ontology()
             .open(&req, &opts)
             .map_err(ontology_error)?;
-        let keep = |ax: &Axiom| {
-            types.as_ref().is_none_or(|t| t.contains(&ax.axiom_type()))
-                && about.as_deref().is_none_or(|a| ax.mentions(a))
+        let q = AxiomQuery {
+            types,
+            about,
+            assertions,
+            limit,
+            offset,
         };
-        let mut page: Vec<(Axiom, Option<u32>)> = Vec::new();
-        let mut total = 0usize;
-        for (ax, origins) in &o.ontology.axioms {
-            if keep(ax) {
-                if total >= offset && page.len() < limit {
-                    page.push((ax.clone(), origins.first().map(|x| x.graph)));
-                }
-                total += 1;
-            }
-        }
-        if assertions {
-            let wants_assertions = types
-                .as_ref()
-                .is_none_or(|t| t.iter().any(|t| t.is_assertion()));
-            if wants_assertions {
-                o.assertions(&opts, |ax, _, g| {
-                    if let Some(ax) = ax
-                        && keep(&ax)
-                    {
-                        if total >= offset && page.len() < limit {
-                            page.push((ax, Some(g)));
-                        }
-                        total += 1;
-                    }
-                    Ok(true)
-                })
-                .map_err(ontology_error)?;
-            }
-        }
-        if let Some(a) = &about
-            && total == 0
+        let page = axiom_page(&o, &q, &opts).map_err(ontology_error)?;
+        if let Some(a) = &q.about
+            && page.total == 0
             && !mentioned(&o, a)
         {
             return Err(err_code(
@@ -309,7 +289,7 @@ pub(super) async fn axioms(
         let r = renderer(&ds);
         let seq = o.snapshot.commit;
         if ofn {
-            let doc = owl::ofn::document(&r, &o.ontology.header, page.iter().map(|(a, _)| a));
+            let doc = owl::ofn::document(&r, &o.ontology.header, page.items.iter().map(|(a, _)| a));
             let resp = (
                 [(header::CONTENT_TYPE, "text/owl-functional; charset=utf-8")],
                 doc,
@@ -317,33 +297,144 @@ pub(super) async fn axioms(
                 .into_response();
             return Ok(with_commit(resp, &ds, seq));
         }
-        let next = offset + page.len();
-        let list: Vec<J> = page
-            .iter()
-            .map(|(ax, g)| {
-                let mut j = json!({
-                    "type": ax.axiom_type().name(),
-                    "ofn": r.axiom(ax),
-                    "axiom": owl::json::axiom(ax),
-                });
-                if let Some(g) = g {
-                    j["graph"] = o.graph_name(*g).into();
-                }
-                j
-            })
-            .collect();
-        let mut j = opened_json(&ds, &o, &req);
-        j["axioms"] = J::Array(list);
-        j["total"] = json!(total);
-        j["offset"] = json!(offset);
-        j["next"] = if next < total { json!(next) } else { J::Null };
+        let j = page_body(&ds.name, &o, &req, &r, &page);
         Ok(with_commit(Json(j).into_response(), &ds, seq))
     })
     .await
 }
 
+/// What a listing of axioms keeps.
+pub(crate) struct AxiomQuery {
+    pub types: Option<std::collections::BTreeSet<owl::AxiomType>>,
+    pub about: Option<String>,
+    pub assertions: bool,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+/// One page of axioms, with the graph each was read from, and the total.
+pub(crate) struct Page {
+    pub items: Vec<(Axiom, Option<u32>)>,
+    pub total: usize,
+    pub offset: usize,
+}
+
+/// The page `q` asks for: the terminology's axioms in order, then the assertions the
+/// store holds when `q.assertions` is set.
+pub(crate) fn axiom_page(
+    o: &Opened,
+    q: &AxiomQuery,
+    opts: &sparkles::sparql::QueryOptions,
+) -> sparkles::Result<Page> {
+    let keep = |ax: &Axiom| {
+        q.types
+            .as_ref()
+            .is_none_or(|t| t.contains(&ax.axiom_type()))
+            && q.about.as_deref().is_none_or(|a| ax.mentions(a))
+    };
+    let mut items: Vec<(Axiom, Option<u32>)> = Vec::new();
+    let mut total = 0usize;
+    for (ax, origins) in &o.ontology.axioms {
+        if keep(ax) {
+            if total >= q.offset && items.len() < q.limit {
+                items.push((ax.clone(), origins.first().map(|x| x.graph)));
+            }
+            total += 1;
+        }
+    }
+    let wants_assertions = q
+        .types
+        .as_ref()
+        .is_none_or(|t| t.iter().any(|t| t.is_assertion()));
+    if q.assertions && wants_assertions {
+        o.assertions(opts, |ax, _, g| {
+            if let Some(ax) = ax
+                && keep(&ax)
+            {
+                if total >= q.offset && items.len() < q.limit {
+                    items.push((ax, Some(g)));
+                }
+                total += 1;
+            }
+            Ok(true)
+        })?;
+    }
+    Ok(Page {
+        items,
+        total,
+        offset: q.offset,
+    })
+}
+
+/// The JSON of a page of axioms.
+pub(crate) fn page_body(
+    name: &str,
+    o: &Opened,
+    req: &OntologyRequest,
+    r: &Renderer,
+    page: &Page,
+) -> J {
+    let next = page.offset + page.items.len();
+    let list: Vec<J> = page
+        .items
+        .iter()
+        .map(|(ax, g)| {
+            let mut j = json!({
+                "type": ax.axiom_type().name(),
+                "ofn": r.axiom(ax),
+                "axiom": owl::json::axiom(ax),
+            });
+            if let Some(g) = g {
+                j["graph"] = o.graph_name(*g).into();
+            }
+            j
+        })
+        .collect();
+    let mut j = opened_json(name, o, req);
+    j["axioms"] = J::Array(list);
+    j["total"] = json!(page.total);
+    j["offset"] = json!(page.offset);
+    j["next"] = if next < page.total {
+        json!(next)
+    } else {
+        J::Null
+    };
+    j
+}
+
+/// The JSON of the reports of a check.
+pub(crate) fn check_body(
+    name: &str,
+    o: &Opened,
+    req: &OntologyRequest,
+    r: &Renderer,
+    reports: &[owl::profiles::Report],
+    assertions: bool,
+) -> J {
+    let mut j = opened_json(name, o, req);
+    j["conforms"] = json!(reports.iter().all(|r| r.conforms));
+    j["assertions"] = json!(assertions);
+    j["reports"] = J::Array(reports.iter().map(|x| onto::report_json(o, x, r)).collect());
+    j
+}
+
+/// The JSON of what an edit did.
+pub(crate) fn edit_body(e: &onto::EditOutcome, r: &Renderer) -> J {
+    json!({
+        "added": e.added,
+        "present": e.present,
+        "removed": e.removed,
+        "absent": e.absent.iter().map(|a| r.axiom(a)).collect::<Vec<_>>(),
+        "declared": e.declared.iter().map(|d| r.entity(d)).collect::<Vec<_>>(),
+        "inserted": e.inserted,
+        "deleted": e.deleted,
+        "kept": e.kept,
+        "committed": e.receipt.committed,
+    })
+}
+
 /// Whether the ontology's terminology declares or uses `iri`.
-fn mentioned(o: &Opened, iri: &str) -> bool {
+pub(crate) fn mentioned(o: &Opened, iri: &str) -> bool {
     o.ontology.axiom_set().any(|a| a.mentions(iri))
 }
 
@@ -417,15 +508,13 @@ pub(super) async fn check(
             .open(&req, &opts)
             .map_err(ontology_error)?;
         let reports = onto::check_opened(&o, &check, &opts).map_err(ontology_error)?;
-        let r = renderer(&ds);
-        let mut j = opened_json(&ds, &o, &req);
-        j["conforms"] = json!(reports.iter().all(|r| r.conforms));
-        j["assertions"] = json!(check.assertions);
-        j["reports"] = J::Array(
-            reports
-                .iter()
-                .map(|x| onto::report_json(&o, x, &r))
-                .collect(),
+        let j = check_body(
+            &ds.name,
+            &o,
+            &req,
+            &renderer(&ds),
+            &reports,
+            check.assertions,
         );
         Ok(with_commit(Json(j).into_response(), &ds, o.snapshot.commit))
     })
@@ -538,18 +627,7 @@ pub(super) async fn edit(
             (Err(e @ Error::Invalid(_)), _) => return Err(ontology_error(e)),
             (r, _) => r.map_err(|e| write_error(e, restricted))?,
         };
-        let r = renderer(&ds);
-        let body = json!({
-            "added": e.added,
-            "present": e.present,
-            "removed": e.removed,
-            "absent": e.absent.iter().map(|a| r.axiom(a)).collect::<Vec<_>>(),
-            "declared": e.declared.iter().map(|d| r.entity(d)).collect::<Vec<_>>(),
-            "inserted": e.inserted,
-            "deleted": e.deleted,
-            "kept": e.kept,
-            "committed": e.receipt.committed,
-        });
+        let body = edit_body(&e, &renderer(&ds));
         Ok(write_response(
             &ds,
             StatusCode::OK,

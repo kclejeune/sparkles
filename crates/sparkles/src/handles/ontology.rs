@@ -482,6 +482,38 @@ impl Ontologies {
         check_opened(&o, check, &opts)
     }
 
+    /// Remove an entity (spec F21 §5.3): its declarations, the axioms of the
+    /// terminology that mention it, and the assertions about it that the store holds, in
+    /// one commit. The answer lists them under `removed`; it is `0` for an IRI the
+    /// ontology does not mention.
+    pub fn remove_entity(
+        &self,
+        req: &OntologyRequest,
+        iri: &str,
+        opts: &QueryOptions,
+    ) -> Result<EditOutcome> {
+        let o = self.open(req, opts)?;
+        let mut remove: Vec<Axiom> = o
+            .ontology
+            .axiom_set()
+            .filter(|a| a.mentions(iri))
+            .cloned()
+            .collect();
+        o.assertions(opts, |ax, _, _| {
+            if let Some(ax) = ax
+                && ax.mentions(iri)
+            {
+                remove.push(ax);
+            }
+            Ok(true)
+        })?;
+        let edit = EditRequest {
+            remove,
+            ..Default::default()
+        };
+        self.edit(req, &edit, opts)
+    }
+
     /// Add and remove axioms in one commit. The ontology is read from the head the
     /// write starts from, under the writer lock, so no commit comes between the read
     /// and the write. An added axiom goes to `edit.graph` (the first graph of `req`),

@@ -56,7 +56,7 @@ pub(crate) mod lint;
 mod live;
 mod mappings;
 #[cfg(feature = "ontology")]
-mod ontology;
+pub(crate) mod ontology;
 #[cfg(not(feature = "ontology"))]
 mod ontology {
     use super::*;
