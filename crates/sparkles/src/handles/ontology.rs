@@ -740,12 +740,17 @@ impl Ontologies {
             // present after the removals above: a form this edit removed is not
             let mut present = true;
             for form in ax.normal_forms() {
-                let kept = if done.get(&form) == Some(&true) {
-                    false
-                } else {
-                    o.ontology.contains(&form)
-                        || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
-                };
+                let kept =
+                    if done.get(&form) == Some(&true) {
+                        // removed here, but it may still be read from a graph outside the
+                        // scope, or as an assertion this transaction left
+                        o.ontology.axioms.get(&form).is_some_and(|origins| {
+                            origins.iter().any(|x| !scope.contains(&x.graph))
+                        }) || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
+                    } else {
+                        o.ontology.contains(&form)
+                            || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
+                    };
                 if !kept {
                     present = false;
                     break;

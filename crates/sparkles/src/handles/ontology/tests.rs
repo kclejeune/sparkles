@@ -826,3 +826,30 @@ fn shared_forms_keep_their_own_results() {
         .unwrap();
     assert_eq!((e.removed, e.absent.len()), (0, 2), "{e:?}");
 }
+
+#[test]
+fn an_imported_copy_survives_a_local_removal() {
+    let (ds, req) = local_and_lib(
+        ":A a owl:Class . :B a owl:Class . :C a owl:Class .
+         :A owl:equivalentClass :B . :B owl:equivalentClass :C .",
+        ":A owl:equivalentClass :B .",
+    );
+    let abc: Axiom =
+        AxiomKind::EquivalentClasses([class("A"), class("B"), class("C")].into_iter().collect())
+            .into();
+    let ab: Axiom =
+        AxiomKind::EquivalentClasses([class("A"), class("B")].into_iter().collect()).into();
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                remove: vec![abc],
+                add: vec![ab],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!((e.removed, e.added, e.present), (1, 0, 1), "{e:?}");
+}
