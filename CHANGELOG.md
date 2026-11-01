@@ -24,6 +24,15 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+Sparkles reads the OWL 2 functional-style syntax. A `.ofn` file, or a body sent as
+`text/owl-functional`, loads as the triples its axioms map to, through `sparkles load`,
+`sparkles ontology check FILE`, the file loaders of the library and the bindings,
+SPARQL `LOAD`, Graph Store writes and uploads. `GET /$/ontology/{ds}/diff` lists the
+axioms that differ between two commits, with the assertions that the changed triples
+carry when asked. The MCP tool `ontology_axioms` lists axioms, and on a server that
+allows updates adds and removes them with previews, `ifHead` and PROV-O provenance
+written as axiom annotations (spec F21 Phase 3).
+
 The reasoner can keep witnesses for each fact of a materialization, the sets of input
 quads from which the rules derive it, with the provenance algebra of incremental views.
 `ReasonOptions::witnesses` sets the bound per fact, and `Cache::witnesses` and

@@ -2,19 +2,20 @@
 
 > **Status:** partially implemented
 >
-> **Phases:** Phase 1 is delivered. It provides the axiom model, reading and writing it
+> **Phases:** Phases 1 and 3 are delivered. Phase 1 provides the axiom model, reading and writing it
 > through the OWL 2 mapping to RDF graphs, the OWL 2 EL, QL and RL profile checks and the
 > OWL 2 DL structural restrictions, the Rust library API, `/$/ontology/{ds}` and
 > `sparkles ontology`. Phase 2 adds the Python and Node.js surfaces, the JVM entry point
 > that runs Jena's `jena-ontapi` over a Sparkles graph, entity views that include
-> materialized inferences, and the reasoner's use of the profile checks. Phase 3 adds the
-> functional-style syntax reader, an MCP tool and ontology diffs between commits.
+> materialized inferences, and the reasoner's use of the profile checks, and remains
+> planned. Phase 3 provides the functional-style syntax reader, an MCP tool and
+> ontology diffs between commits.
 >
 > **User docs:** [OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies) and
 > [API: Ontology](../API.md#ontology).
 >
 > The design below is the one written before implementation. The [Outcome](#outcome)
-> section records how Phase 1 landed and where it departs from the design.
+> section records how Phases 1 and 3 landed and where they depart from the design.
 
 This design was written from the W3C recommendations *OWL 2 Web Ontology Language
 Structural Specification and Functional-Style Syntax*, *OWL 2 Web Ontology Language
@@ -572,8 +573,8 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phase 1 is delivered as roadmap item 71. Phases 2 and 3 remain as roadmap items
-537 and 538.
+Phase 1 is delivered as roadmap item 71 and Phase 3 as roadmap item 538. Phase 2
+remains as roadmap item 537.
 
 ### Phase 1
 
@@ -596,6 +597,61 @@ round-trip. The 31 known differences in `crates/sparkles-owl/tests/w3c_owl_known
 are cases that type entities the OWL 1 way, use anonymous individuals in EL or QL, which
 their grammars do not allow, or omit the ontology header that the mapping requires.
 Property tests write random axioms to triples and read them back.
+
+### Phase 3
+
+**The functional-style reader.** `sparkles_owl::ofn_read` reads a functional-style
+document by the grammar of the structural specification. Its `Reader` reads the prefix
+declarations and the header first and then yields one axiom at a time, and
+`parse_axiom` reads one axiom with given prefixes. The prefixes `owl:`, `rdf:`, `rdfs:`
+and `xsd:` are predefined, a literal typed `rdf:PlainLiteral` is read as the literal it
+stands for, and every axiom is checked as an edit's axioms are. Expressions nest at most
+128 levels, as in the reverse mapping, and errors name a line and column.
+
+**Loading.** The loader's syntaxes gain `RdfSyntax::OwlFunctional`, selected by the
+`.ofn` extension, the name `ofn` and the media type `text/owl-functional`. A document is
+mapped to triples one axiom at a time by the forward mapping, so `sparkles load`,
+`sparkles ontology check FILE`, the library's and the bindings' file loaders, SPARQL
+`LOAD`, Graph Store writes and uploads read it. The decoded document is held in memory
+while it is read, as for the other whole-document syntaxes, and the triples count
+against the decompression limit as N-Quads lines, since a short axiom can map to many
+triples. No writer produces the syntax, and a dump in it is refused as unsupported.
+
+**The MCP tool.** `ontology_axioms` lists axioms and, on a server that allows updates,
+adds and removes them through the handle's edit, with `dryRun`, `changes`, `ifHead` and
+the commit message as `sparql_update` takes them. Provenance departs from C17 §3.2,
+whose reifiers are RDF 1.2 triple terms of single triples. An axiom can be many triples,
+so provenance is written the OWL 2 way, as annotations of each added axiom:
+`prov:wasGeneratedBy` a `urn:uuid:` activity, `prov:generatedAtTime` and
+`prov:wasDerivedFrom` the source. Its reifier is the blank `owl:Axiom` node of the
+mapping, and a later call removes the axiom by its annotated form, as listings show it.
+Annotation assertions on the activity give the principal, the start time, the message
+and the software agent. The activity is not typed `prov:Activity`, which would be a
+class assertion that reasoners materialize. The PROV-O properties are declared as
+annotation properties, and an ontology that types one of them as an object or data
+property, as PROV-O does, refuses provenance with `provenance-conflict` rather than
+leave OWL 2 DL. A removal is recorded only by the activity and the commit. Without
+`--allow-update` the tool is read-only and its schema lists no edit arguments.
+
+**Diffs.** `Ontologies::diff` and `GET /$/ontology/{ds}/diff` combine the two readings
+§10 allows. The terminology of each state is read as `open` reads it, through the
+caller's view and the cache, and the axiom sets are compared, since an axiom's identity
+is structural and blank node labels of expressions do not matter. The assertions, which
+are never read eagerly, come from F06's diff of triples: each changed triple outside the
+terminology in a graph read is mapped as the assertion stream maps it. An annotated
+assertion that gains or loses its annotations keeps its triple, so the diff adds the
+plain assertion on the other side when the store still holds it. When no triple of the
+graphs read changed, neither state is opened. The store's diff is bounded at ten
+million changed quads. An in-memory dataset keeps only the states its snapshots and
+retention hold, and a diff of a state it no longer keeps fails as `at` does.
+
+**Testing.** The 78 functional-style ontologies of the W3C OWL 2 test cases all parse
+and read back from the writer's output as the same document. Mapped to triples and read
+strictly, 52 give the axioms of the case's RDF/XML form of the same role, and five
+differ because of the cases' data, as `w3c_owl_known.txt` lists. The 20 premises that
+have no RDF/XML form meet the DL species their cases state. Four profile memberships
+differ where the cases disagree with the Profiles grammars, also listed. Property tests
+write random axioms with the writer and read them back.
 
 ### Decisions and departures from the design
 
@@ -635,8 +691,7 @@ item 540 adds both.
 
 **Imports.** A read follows `owl:imports` only to graphs of the dataset that the caller
 can read. Fetching is refused, because a read route would otherwise make outbound
-requests. Roadmap item 538 can add fetching through the outbound policy beside the
-syntax reader.
+requests. Roadmap item NEW-ITEM-1 adds fetching through the outbound policy.
 
 **Caching.** The handle keeps the last four reads of up to two million triples each. An
 entry is keyed by commit, graphs, imports and mode, so any commit replaces it, and only

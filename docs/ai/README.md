@@ -38,6 +38,11 @@ build community reports.
   callers that may write. Writes pass write-time validation and carry a commit message,
   `LOAD` is refused, `dryRun` previews, `ifHead` makes a write conditional, and `patch`
   applies an RDF Patch.
+* `ontology_axioms` lists the OWL 2 axioms of a dataset's graphs in functional-style
+  syntax. When updates are enabled it also adds and removes axioms in one commit, with
+  `dryRun`, `ifHead` and a commit message as `sparql_update` takes them, and annotates
+  each added axiom with PROV-O provenance that names the call's activity, its time and
+  its source ([OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies)).
 * Every tool that reads or writes takes `branch`, and `list_branches`, `create_branch`,
   `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
   need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle

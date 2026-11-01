@@ -1886,6 +1886,29 @@ write, such as a `DisjointClasses` of one class, is `400` with code `invalid-axi
 Writing needs write access to the target graph, and a removal needs it on the graphs the
 removed triples are in.
 
+`GET /$/ontology/{ds}/diff` lists the axioms that differ between the commits `from` and
+`to`, which take the forms of `at` and default to the head for `to`. The graphs, imports
+and mode are chosen as for the other routes. The terminology of each state is read as
+the summary reads it and the two sets of axioms are compared, so an axiom that moved
+between graphs read by both states is not listed. `assertions=true` also lists the
+assertions that the triples changed between the two commits carry, taken from the
+dataset's diff of triples. A diff whose graphs no triple changed in reads neither state.
+Each side lists at most `limit` axioms, 1,000 by default and at most 10,000, with
+`addedCount`, `removedCount` and `truncated`. `format=text` answers `+ axiom` and
+`- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs
+the `diff` endpoint. A commit that the dataset's history no longer keeps is `410`.
+
+```json
+{ "dataset": "uni", "from": 12, "to": 14, "graphs": ["default"], "mode": "lenient",
+  "assertions": false, "addedCount": 1, "removedCount": 0, "truncated": false,
+  "added": [{ "type": "SubClassOf", "ofn": "SubClassOf(:Lecture :Event)", "axiom": { "type": "SubClassOf", "subClass": "http://ex.org/Lecture", "superClass": "http://ex.org/Event" }, "graph": "default" }],
+  "removed": [], "changedQuads": 2, "method": "log" }
+```
+
+Graph Store writes and `/{ds}/upload` read an OWL 2 functional-style document sent as
+`text/owl-functional` or in a `.ofn` file. It is loaded as the triples its axioms map
+to by the OWL 2 Mapping to RDF Graphs.
+
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 
 | Method     | Path                  | Description |
