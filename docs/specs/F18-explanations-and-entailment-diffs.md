@@ -661,7 +661,10 @@ bounds of 256, 8, 2 and 1, and for histories of insertions and deletions. After 
 update they check that each kept witness derives its fact, that an exact fact keeps
 exactly its minimal supports, and that every fact a fresh build keeps exactly is kept
 exactly and identically. `tests/witnesses.rs` checks the library surface, the move of a
-witness between input graphs and the bounds.
+witness between input graphs and the bounds. The fixed-point operator of item 417 records
+one witness per fact for the same rules, and `fixpoint/tests.rs` checks that it names
+input quads with the same keys and holds one of the reasoner's witnesses whenever those
+are exact.
 
 The witnesses are charged to the run's memory budget as they grow, and a run past its
 `max_memory` stops with a memory error. The charge counts the nodes and supports that
