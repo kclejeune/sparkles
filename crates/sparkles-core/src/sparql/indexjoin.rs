@@ -1481,7 +1481,15 @@ fn read_ranges_gallop(
                 (Some((cb, cp, held)), _)
                     if *cb == x && *cp != 0 && lead_cmp(held, held.len() - 1, &lo, d).is_ge() =>
                 {
-                    *cp
+                    // a range that runs on into the next segment, which may be cold, has
+                    // the walk of `segment_part` before it reads any row
+                    let s = *cp - 1;
+                    if !idx.last_segment(x, s) && idx.segment_first(x, s + 1) <= hi {
+                        let span = Some((s, s + 2));
+                        segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)
+                    } else {
+                        *cp
+                    }
                 }
                 // another segment of the held block, whose columns the cache did not hold
                 // whole when it was read
@@ -2385,11 +2393,18 @@ mod dense_ahead_tests {
     /// A segmented generation with one predicate over 80,000 subjects, and a block of its
     /// PSO rows that holds many segments.
     fn store() -> (tempfile::TempDir, Store) {
+        store_of(1)
+    }
+
+    /// [`store`] with `rows` values per subject, so that subjects cross segment bounds.
+    fn store_of(rows: usize) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
         let mut nt = String::new();
         for i in 0..80_000u64 {
-            nt.push_str(&format!("<http://e/s{i:06}> <http://e/p> \"v{i}\" .\n"));
+            for v in 0..rows {
+                nt.push_str(&format!("<http://e/s{i:06}> <http://e/p> \"v{i}-{v}\" .\n"));
+            }
         }
         s.load(&[Source::from_bytes(
             nt.into_bytes(),
@@ -2507,5 +2522,57 @@ mod dense_ahead_tests {
                 "preseed {preseed}"
             );
         }
+    }
+
+    #[test]
+    fn a_range_that_runs_on_from_a_warm_segment_into_a_cold_one_has_the_walk() {
+        let (_dir, s) = store_of(3);
+        let snap = s.snapshot();
+        let idx = snap.perm(Perm::Pso);
+        let b = (0..idx.blocks.len())
+            .find(|&b| idx.segment_count(b).is_some_and(|n| n >= 8))
+            .expect("a block of 8 segments or more");
+        let blk = idx.decode_block(b).unwrap();
+        let p = blk.key(0)[0];
+        let n = idx.segment_count(b).unwrap();
+        let (_, end0) = idx.segment_rows(b, 0);
+        // the subject in the last row of segment 0 has rows in segment 1 too
+        let straddle = blk.key(end0 - 1)[1];
+        assert_eq!(blk.key(end0)[1], straddle, "a subject across the bound");
+        let mut keys = vec![blk.key(0)[1], straddle];
+        for t in 2..n {
+            let (r0, _) = idx.segment_rows(b, t);
+            keys.push(blk.key(r0 + 1)[1]);
+        }
+        keys.dedup();
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &keys,
+        };
+        let mask = 0b111;
+        snap.cache.get_segment(idx, b, 0, mask, false).unwrap();
+        let ctx = Ctx::new(snap.clone());
+        let rule = RowRule {
+            graph: &GraphFilter::All,
+            graph_col: Perm::Pso.col_of(G),
+            eqs: &[],
+            dedup: false,
+        };
+        let mut out = vec![Table::new(vec![0])];
+        let mut stats = Stats::default();
+        read_ranges_gallop(
+            &ctx,
+            Perm::Pso,
+            &ranges,
+            &[vec![2]],
+            &rule,
+            &mut out,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out[0].len(), keys.len() * 3);
+        assert!(snap.cache.has_cols(idx, b, mask));
+        // segment 1 was not decoded on its own before the block was read whole
+        assert_eq!(single_segments(&snap, b), 1);
     }
 }
