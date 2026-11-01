@@ -167,11 +167,7 @@ async fn a12_schema_only_streams_without_a_summary() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["status"]["ask"], true);
     assert_eq!(v["status"]["summary"], false);
-    let ev = ask_sse(
-        &app,
-        json!({ "question": "How many teams does Acme have?" }),
-    )
-    .await;
+    let ev = ask_sse(&app, json!({ "question": "Which teams does Acme have?" })).await;
     assert_eq!(
         names(&ev),
         ["ground", "draft", "check", "run", "result", "usage"],

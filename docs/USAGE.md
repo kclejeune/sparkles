@@ -4592,6 +4592,19 @@ invalid or fails gets its own error result while the rest go on. A line's
 for that question, and the question still counts against the provider's concurrency,
 request spacing and daily token limits that every other line shares.
 
+Two repair turns look at the data and the result after a draft. When a draft gives no
+query, or its query still returns no rows after the usual repairs, Ask explores the data
+once. It shows the model further link candidates for the question's mentions and the
+predicates those entities use in either direction, with counts and sample values, and
+drafts again. When a result does not fit the form of the question, such as several rows
+for "How many", a SELECT for a yes or no question or a count for "Which", Ask repairs
+once and keeps the first answer if the repair does not answer. `--no-explore` and
+`--no-shape-check` turn these off. Two more options are off by default because they
+did not raise accuracy in the [evaluation](benchmarks/natural-language/RESULTS.md).
+`--drafts N` asks N first drafts and keeps the one whose checked, complete result most
+drafts share, at the cost of N first-draft calls. `--type-hints` links each mention with
+the classes that the words around it name.
+
 Each query of an Ask runs under a memory budget of 2048 MiB, as in `sparkles mcp`, and
 `--query-memory-mb N` changes it, with `0` for no budget. On a database of more than ten
 million quads, the schema that grounds the question and checks the query comes from the

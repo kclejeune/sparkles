@@ -97,14 +97,16 @@ pub struct AskArgs {
     /// index statistics instead of scanning the indexes; `off` always scans
     #[arg(long, value_name = "QUADS", default_value_t = crate::state::StatisticsAbove::default())]
     pub schema_statistics_above: crate::state::StatisticsAbove,
-    /// Explore the data once when a draft gives no query or its query returns no rows:
-    /// further link candidates and the predicates the entities use, with samples
+    /// Do not explore the data when a draft gives no query or its query returns no
+    /// rows. By default Ask explores once, with further link candidates and the
+    /// predicates the entities use, and drafts again
     #[arg(long)]
-    pub explore: bool,
-    /// Repair once when the result's shape does not fit the question's form, such as
-    /// several rows for "How many", keeping the first answer if the repair fails
+    pub no_explore: bool,
+    /// Do not repair a result whose shape does not fit the question's form, such as
+    /// several rows for "How many". By default Ask repairs once and keeps the first
+    /// answer if the repair fails
     #[arg(long)]
-    pub shape_check: bool,
+    pub no_shape_check: bool,
     /// Ask this many first drafts and keep the one whose result most drafts share. A
     /// preview with --no-run asks one, since the vote runs each draft
     #[arg(long, value_name = "N", default_value_t = 1)]
@@ -321,8 +323,8 @@ fn options(
         mode: args.mode,
         reviewed_only: args.reviewed_only,
         report_context,
-        explore: args.explore,
-        shape_check: args.shape_check,
+        explore: !args.no_explore,
+        shape_check: !args.no_shape_check,
         drafts: args.drafts,
         type_hints: args.type_hints,
         complexity_threshold: routing

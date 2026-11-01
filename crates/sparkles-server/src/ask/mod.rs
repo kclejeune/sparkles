@@ -203,10 +203,10 @@ pub struct AskOptions {
     /// communities of the linked entities (C22 §7.3)
     pub report_context: bool,
     /// explore the data once when a draft gives no query or its query returns no rows,
-    /// and draft again with what the exploration found
+    /// and draft again with what the exploration found, on by default
     pub explore: bool,
     /// repair once when a result's shape does not fit the form of the question, and
-    /// keep the first answer when the repair does not answer
+    /// keep the first answer when the repair does not answer, on by default
     pub shape_check: bool,
     /// the first drafts asked, whose results vote on the query, 1 to [`MAX_DRAFTS`]
     pub drafts: usize,
@@ -244,8 +244,8 @@ impl Default for AskOptions {
             mode: AskMode::Auto,
             reviewed_only: false,
             report_context: false,
-            explore: false,
-            shape_check: false,
+            explore: true,
+            shape_check: true,
             drafts: 1,
             type_hints: false,
         }

@@ -177,11 +177,16 @@ fn scripted(drafts: Vec<String>, summary: Value) -> MockModel {
     })
 }
 
+/// The options of a test of the plain pipeline. The exploration and the shape check,
+/// which are on by default, would add turns to scripts written for a fixed number of
+/// model calls, so their own tests turn them on.
 pub(super) fn opts(question: &str) -> AskOptions {
     AskOptions {
         dataset: "org".into(),
         question: question.into(),
         deadline: Duration::from_secs(60),
+        explore: false,
+        shape_check: false,
         ..AskOptions::default()
     }
 }
@@ -922,4 +927,12 @@ fn drafts_that_fail_the_check_do_not_vote() {
     assert_eq!(out["result"]["attempt"], 1, "{out:#}");
     assert_eq!(votes[0]["withRows"], 1);
     assert_eq!(votes[0]["chosen"], 0);
+}
+
+#[test]
+fn the_exploration_and_the_shape_check_are_on_by_default() {
+    let o = AskOptions::default();
+    assert!(o.explore && o.shape_check);
+    assert!(!o.type_hints);
+    assert_eq!(o.drafts, 1);
 }
