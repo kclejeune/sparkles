@@ -279,10 +279,10 @@ fn date_time(field: &str, value: &str) -> Literal {
     Literal::new_typed_literal(value, NamedNode::new_unchecked(format!("{XSD}dateTime")))
 }
 
-fn content_of(
-    field: &str,
-    c: &ContentJson,
-) -> ApiResult<(Option<Vec<u8>>, Option<String>, Option<Sha256Digest>)> {
+/// Exactly one of a revision's retained bytes, retained text or metadata-only digest.
+type Content = (Option<Vec<u8>>, Option<String>, Option<Sha256Digest>);
+
+fn content_of(field: &str, c: &ContentJson) -> ApiResult<Content> {
     use base64::Engine as _;
     match (&c.text, &c.base64, &c.digest) {
         (Some(t), None, None) => Ok((None, Some(t.clone()), None)),
