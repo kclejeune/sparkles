@@ -780,5 +780,87 @@
     "digest": "30edba242522bc08"
    }
   ]
+ },
+ "development": {
+  "host": "wally, 20 threads, 32 GiB, shared with other jobs",
+  "build": "29f54c39",
+  "runs": [
+   {
+    "dataset": "owl2bench-10",
+    "profile": "owl-rl",
+    "limit": "MemoryMax=28G MemorySwapMax=0",
+    "result": "killed by the cgroup OOM killer after about 2 minutes at 28 GiB of anonymous RSS"
+   }
+  ]
+ },
+ "demand": {
+  "command": "sparkles query --loc <unmaterialized store> --reasoning demand --profile owl-rl --max-derived 0 --query <OWL2Bench query>, one process per query, one round, base then new",
+  "correctness": "output line counts equal between builds for every query",
+  "runs": [
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q2",
+    "exit": 0,
+    "wall_s": 231.171,
+    "output_lines": 7425
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q2",
+    "exit": 0,
+    "wall_s": 82.7857,
+    "output_lines": 7425
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q7",
+    "exit": 0,
+    "wall_s": 240.147,
+    "output_lines": 1688
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q7",
+    "exit": 0,
+    "wall_s": 84.4468,
+    "output_lines": 1688
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q12",
+    "exit": 0,
+    "wall_s": 236.289,
+    "output_lines": 2498
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q12",
+    "exit": 0,
+    "wall_s": 76.5373,
+    "output_lines": 2498
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q19",
+    "exit": 0,
+    "wall_s": 229.728,
+    "output_lines": 862
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q19",
+    "exit": 0,
+    "wall_s": 87.1726,
+    "output_lines": 862
+   }
+  ]
  }
 }
