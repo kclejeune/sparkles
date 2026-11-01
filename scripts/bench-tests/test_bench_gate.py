@@ -24,7 +24,7 @@ def metrics_record(d, name, rows, threshold=0.05, scale="1"):
     src.write_text("".join(json.dumps(r) + "\n" for r in rows))
     out = Path(d) / f"{name}.json"
     r = run("metrics", src, "--gate", "insn-screen", "--out", out, "--threshold", threshold,
-            "--manifest", "commit=abc", "--scale", scale)
+            "--manifest", "commit=abc", "--manifest", "compilers=rustc version 1", "--scale", scale)
     assert r.returncode == 0, r.stderr
     return out
 
@@ -102,7 +102,7 @@ class GateTests(unittest.TestCase):
             res.mkdir(parents=True)
             (root / "queries").mkdir()
             (root / "queries" / "q.rq").write_text("SELECT * WHERE { ?s ?p ?o }")
-            (root / "manifest.txt").write_text("host: forge\n")
+            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\n")
             res.joinpath("answers.tsv").write_text("A\tq\t1\tx\nB\tq\t1\tx\n")
             def record(name, value):
                 rows = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
@@ -126,7 +126,8 @@ class GateTests(unittest.TestCase):
                                  + json.dumps({"check": "x/result", "ok": True, "fingerprint": "7"}) + "\n")
                     files.append(f)
                 out = Path(d) / f"{name}.json"
-                r = run("metrics", *files, "--gate", "insn-screen", "--out", out, "--threshold", 0)
+                r = run("metrics", *files, "--gate", "insn-screen", "--out", out, "--threshold", 0,
+                        "--manifest", "compilers=rustc version 1")
                 self.assertEqual(r.returncode, 0, r.stderr)
                 return out
             base = runs("base", [100, 103, 101])
@@ -232,7 +233,7 @@ class GateTests(unittest.TestCase):
             res.mkdir(parents=True)
             (root / "queries").mkdir()
             (root / "queries" / "export.rq").write_text("SELECT * WHERE { ?s ?p ?o } LIMIT 5\n")
-            (root / "manifest.txt").write_text("host: forge\n")
+            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\n")
             res.joinpath("samples.tsv").write_text(
                 "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
                 "1\t1\tA\texport\t0\t1\t2\n1\t1\tB\texport\t0\t1\t2\n")
@@ -257,12 +258,17 @@ class GateTests(unittest.TestCase):
             m = [{"key": "a", "value": 1, "unit": "ms", "better": "lower"}]
             base = metrics_record(d, "base", m)
             rec = json.loads(base.read_text())
-            rec["manifest"]["rustc"] = "rustc 1.2.3"
+            rec["manifest"]["compilers"] = "GCC: (GNU) 16; rustc version 1"
             other = Path(d) / "other.json"
             other.write_text(json.dumps(rec))
             r = run("compare", base, other)
             self.assertEqual(r.returncode, 2)
-            self.assertIn("manifest rustc", r.stderr)
+            self.assertIn("manifest compilers", r.stderr)
+            del rec["manifest"]["compilers"]
+            other.write_text(json.dumps(rec))
+            r = run("compare", base, other)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("unknown in the candidate", r.stderr)
 
     def test_records_are_validated_when_read(self):
         with tempfile.TemporaryDirectory() as d:
@@ -306,6 +312,57 @@ class GateTests(unittest.TestCase):
             bad = Path(d) / "bad.json"
             run("w3c", log, "--out", bad)
             self.assertEqual(run("compare", out, bad).returncode, 1)
+
+    def test_keys_select_metrics_but_not_checks(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = {"key": "q1", "value": 1, "unit": "ms", "better": "lower"}
+            base = metrics_record(d, "base", [m, {"check": "q1/answer", "ok": True, "fingerprint": "1 rows, x"}])
+            wrong = metrics_record(d, "wrong", [m, {"check": "q1/answer", "ok": True, "fingerprint": "0 rows, y"}])
+            self.assertEqual(run("compare", base, wrong, "--keys", "^q1$").returncode, 1)
+
+    def test_a_malformed_process_check_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b = Path(d) / "a.jsonl", Path(d) / "b.jsonl"
+            a.write_text(json.dumps({"check": "c", "ok": True}) + "\n")
+            b.write_text(json.dumps({"check": "c", "ok": "false"}) + "\n")
+            r = run("metrics", a, b, "--gate", "incr", "--out", Path(d) / "r.json")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("ok must be", r.stderr)
+
+    def test_order_digests_respect_ties_and_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            q = Path(d) / "q.rq"
+            q.write_text("SELECT ?p ?n WHERE { ?p <name> ?n } ORDER BY ?n")
+            def digest(rows):
+                t = Path(d) / "a.tsv"
+                t.write_text("?p\t?n\n" + "".join(f"{p}\t{n}\n" for p, n in rows))
+                return run("order-digest", q, t).stdout.strip()
+            a = digest([("<a>", '"x"'), ("<b>", '"x"'), ("<c>", '"y"')])
+            self.assertEqual(a, digest([("<b>", '"x"'), ("<a>", '"x"'), ("<c>", '"y"')]))
+            self.assertNotEqual(a, digest([("<c>", '"y"'), ("<a>", '"x"'), ("<b>", '"x"')]))
+            q.write_text("SELECT ?p ?n WHERE { ?p <name> ?n } ORDER BY STRLEN(?n)")
+            self.assertEqual(digest([("<a>", '"x"')]), "-")
+
+    def test_executors_compares_the_order_of_ordered_answers(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "run"
+            res = root / "people-100000-threads-1" / "results"
+            res.mkdir(parents=True)
+            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\n")
+            res.joinpath("samples.tsv").write_text(
+                "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
+                "1\t1\tA\tsorted\t0\t1\t2\n1\t1\tB\tsorted\t0\t1\t2\n")
+            res.joinpath("answers.tsv").write_text("A\tsorted\t3\tx\to1\nB\tsorted\t3\tx\to2\n")
+            out = Path(d) / "record.json"
+            self.assertEqual(run("executors", root, "--out", out).returncode, 0)
+            rec = json.loads(out.read_text())
+            self.assertEqual([(c["ok"], c["fingerprint"]) for c in rec["checks"]], [(False, "3 rows, x, order o1")])
+
+    def test_compilers_come_from_the_elf_comment(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = Path(d) / "t.txt"
+            text.write_text("not ELF")
+            self.assertEqual(run("compilers", text).returncode, 2)
 
 
 if __name__ == "__main__":

@@ -139,6 +139,31 @@ def validate(record, where="record"):
             fail(f"{where}: check {c.get('name')}: ok must be true or false")
 
 
+def compilers(path):
+    """The compiler identities in an ELF binary's .comment section, such as rustc's and
+    GCC's for the C code it links, sorted and joined by "; ", or None."""
+    import struct
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        return None
+    end = "<" if data[5] == 1 else ">"
+    shoff, = struct.unpack_from(end + "Q", data, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from(end + "HHH", data, 0x3A)
+    def section(i):
+        name, _, _, _, off, size = struct.unpack_from(end + "IIQQQQ", data, shoff + i * shentsize)
+        return name, off, size
+    _, stroff, _ = section(shstrndx)
+    for i in range(shnum):
+        name, off, size = section(i)
+        if data[stroff + name:data.index(b"\0", stroff + name)] == b".comment":
+            parts = {p.decode(errors="replace").strip() for p in data[off:off + size].split(b"\0")}
+            return "; ".join(sorted(p for p in parts if p)) or None
+    return None
+
+
 def parse_kv(pairs):
     out = {}
     for p in pairs or []:
@@ -206,8 +231,11 @@ def executors(args):
                 continue
             samples[q][v].append((float(r[col["wall_ms"]]), float(r[col["exec_ms"]])))
         answers = defaultdict(dict)
-        for v, q, n, h in read_tsv(d / "results" / "answers.tsv"):
-            answers[q][v] = (n, h)
+        for row in read_tsv(d / "results" / "answers.tsv"):
+            # variant, query, rows, digest of the sorted rows and, when the run had
+            # ORDER_DIGEST, a digest of the ORDER BY keys in the returned order
+            v, q, n, h = row[:4]
+            answers[q][v] = (n, h) + tuple(o for o in row[4:5] if o != "-")
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the
@@ -216,7 +244,8 @@ def executors(args):
             agree = set(got) == {"A", "B"} and len(set(got.values())) == 1 and "error" not in str(answers[q])
             eager = answers[q].get("A", ("error", "error"))
             # LIMIT without ORDER BY may return other rows, so only the count is kept
-            fingerprint = eager[0] if q in unordered else f"{eager[0]} rows, {eager[1]}"
+            fingerprint = eager[0] if q in unordered else ", ".join(
+                [f"{eager[0]} rows", eager[1]] + [f"order {o}" for o in eager[2:]])
             checks.append({"name": f"{cell}/{q}/answers", "ok": agree, "fingerprint": fingerprint,
                            "detail": {MODES[v]: list(a) for v, a in sorted(answers[q].items())}})
             for v in ("A", "B"):
@@ -240,12 +269,13 @@ def executors(args):
         tables.append((cell, threads, table))
         env[cell] = (d / "results" / "env.txt").read_text().splitlines() if (d / "results" / "env.txt").exists() else []
     run_env = manifest_txt(root / "manifest.txt")
+    comp = manifest.get("compilers") or compilers(manifest.get("binary") or "")
     record = {
         "gate_record": VERSION, "gate": "executors", "kind": "gate-record",
         "suite": "synthetic", "scale": "1.05m and 10.5m",
         "host": host_info() | {"name": run_env.get("host", host_info()["name"])},
         "manifest": {"binary": manifest.get("binary"), "binary_sha256": manifest.get("binary sha256"),
-                     "rustc": manifest.get("rustc"),
+                     "rustc": manifest.get("rustc"), "compilers": comp,
                      "binary_commit": manifest.get("binary commit"), "version": manifest.get("version"),
                      "scripts_commit": manifest.get("scripts commit"),
                      "scripts_dirty_files": manifest.get("scripts dirty"),
@@ -297,8 +327,10 @@ def read_lines(path):
     for n, line in enumerate(Path(path).read_text().splitlines(), 1):
         if not line.strip():
             continue
-        row = json.loads(line)
+        row = json.loads(line, parse_constant=lambda c: fail(f"{path}:{n}: {c} is not a number"))
         if "check" in row:
+            if not isinstance(row.get("ok"), bool):
+                fail(f"{path}:{n}: a check's ok must be true or false")
             check = {"name": row["check"], "ok": row["ok"], "detail": row.get("detail")}
             if "fingerprint" in row:
                 check["fingerprint"] = row["fingerprint"]
@@ -307,6 +339,9 @@ def read_lines(path):
             for k in ("key", "value", "unit", "better"):
                 if k not in row:
                     fail(f"{path}:{n}: a metric needs {k}")
+            if row["better"] not in ("lower", "higher") or not finite(row["value"]) \
+                    or not all(map(finite, row.get("samples", []))):
+                fail(f"{path}:{n}: a metric needs a finite value and better lower or higher")
             ms.append(row)
     return ms, checks
 
@@ -358,6 +393,15 @@ def metrics(args):
     runs = [read_lines(f) for f in args.file]
     ms, checks = runs[0] if len(runs) == 1 else merge_processes(runs)
     extra = parse_kv(args.manifest)
+    for b in args.binary or []:
+        # the harness binaries' compilers, which compare requires to match
+        extra.setdefault("binary_sha256", hashlib.sha256(Path(b).read_bytes()).hexdigest())
+        comp = compilers(b)
+        if comp is None:
+            fail(f"{b}: no compiler identities in its .comment section")
+        if extra.get("compilers") not in (None, comp):
+            fail(f"the binaries were built by different compilers: {extra['compilers']} and {comp}")
+        extra["compilers"] = comp
     settings = parse_kv(args.setting)
     settings["threshold"] = args.threshold
     if len(runs) > 1:
@@ -408,7 +452,9 @@ def w3c(args):
 VOLATILE_SETTINGS = {"threshold", "short_below", "short_threshold", "load", "host_independent"}
 # Manifest fields of the build that must match, since another compiler or code generation
 # setting can hide or make a regression. The source revision may differ.
-TOOLCHAIN = ("rustc", "cc", "rustflags", "profile")
+# `compilers` comes from the binaries themselves and must be known in both records;
+# `rustflags` and `profile` must match when either record has them.
+TOOLCHAIN = ("compilers", "rustflags", "profile")
 
 
 def incompatibilities(base, cand):
@@ -426,6 +472,10 @@ def incompatibilities(base, cand):
         if base["host"].get("name") != cand["host"].get("name"):
             out.append(f"host: {base['host'].get('name')!r} against {cand['host'].get('name')!r}")
         bm, cmf = base.get("manifest", {}), cand.get("manifest", {})
+        if not bm.get("compilers") or not cmf.get("compilers"):
+            out.append("manifest compilers: unknown in "
+                       + " and ".join(n for n, m in (("the baseline", bm), ("the candidate", cmf))
+                                      if not m.get("compilers")))
         for k in TOOLCHAIN:
             if bm.get(k) != cmf.get(k):
                 out.append(f"manifest {k}: {bm.get(k)!r} against {cmf.get(k)!r}")
@@ -492,9 +542,8 @@ def compare(args):
     # answers must match the baseline's, whatever the candidate's own checks say
     cc = {c["name"]: c for c in cand["checks"]}
     changed, missing = [], []
+    # --keys selects metrics only, so every check of the baseline still counts
     for c in base["checks"]:
-        if pattern and not pattern.search(c["name"]):
-            continue
         other = cc.get(c["name"])
         if other is None:
             missing.append(c["name"])
@@ -526,6 +575,53 @@ def compare(args):
     print(f"{len(rows)} metrics compared, {len(bad)} flagged, {len(failed)} failed checks, "
           f"{len(missing)} missing checks, {len(changed)} changed fingerprints.")
     sys.exit(1 if bad or failed or changed or missing else 0)
+
+
+# --------------------------------------------------------------------------- order-digest
+
+def order_digest(args):
+    """A digest of the ORDER BY key columns of a TSV answer in the returned order, or "-"
+    when the query's ORDER BY is not a list of projected variables. Rows that tie on the
+    keys have the same key values, so a correct order gives one digest whatever it does
+    with ties. Uses bench-answers.py's ORDER BY parser."""
+    root = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location("bench_answers", root / "bench-answers.py")
+    ba = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ba)
+    query = Path(args.query).read_text()
+    with open(args.tsv, newline="") as f:
+        header = f.readline().rstrip("\n").split("\t")
+        names = [h.lstrip("?") for h in header]
+        keys = ba.order_keys(query, set(names))
+        if not keys:
+            print("-")
+            return
+        cols = [names.index(k) for k in keys]
+        h = hashlib.sha256()
+        for line in f:
+            row = line.rstrip("\n").split("\t")
+            h.update("\t".join(row[c] if c < len(row) else "" for c in cols).encode() + b"\n")
+    print(h.hexdigest()[:16])
+
+
+def profile_cmd(args):
+    """The workspace's settings of a Cargo profile, from Cargo.toml and .cargo/config.toml,
+    as one line of JSON, for the manifest's `profile`."""
+    import tomllib
+    root = Path(args.root)
+    out = {}
+    for f in (root / "Cargo.toml", root / ".cargo" / "config.toml"):
+        if f.exists():
+            prof = tomllib.loads(f.read_text()).get("profile", {})
+            out[str(f.relative_to(root))] = prof.get(args.name)
+    print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+
+
+def compilers_cmd(args):
+    c = compilers(args.binary)
+    if c is None:
+        fail(f"{args.binary}: no compiler identities in its .comment section")
+    print(c)
 
 
 # ------------------------------------------------------------------------------ catalog
@@ -572,6 +668,7 @@ def main():
     p.add_argument("--threshold", type=float, default=0.05)
     p.add_argument("--manifest", action="append", metavar="KEY=VALUE")
     p.add_argument("--setting", action="append", metavar="KEY=VALUE")
+    p.add_argument("--binary", action="append", help="a harness binary whose compilers go into the manifest")
     p = sub.add_parser("w3c")
     p.add_argument("log")
     p.add_argument("--out", required=True)
@@ -585,8 +682,17 @@ def main():
     p.add_argument("--allow-different", action="store_true")
     p = sub.add_parser("catalog")
     p.add_argument("record")
+    p = sub.add_parser("order-digest")
+    p.add_argument("query")
+    p.add_argument("tsv")
+    p = sub.add_parser("compilers")
+    p.add_argument("binary")
+    p = sub.add_parser("profile")
+    p.add_argument("name", nargs="?", default="release")
+    p.add_argument("--root", default=".")
     args = ap.parse_args()
-    {"executors": executors, "metrics": metrics, "w3c": w3c, "compare": compare, "catalog": catalog}[args.cmd](args)
+    {"executors": executors, "metrics": metrics, "w3c": w3c, "compare": compare, "catalog": catalog,
+     "order-digest": order_digest, "compilers": compilers_cmd, "profile": profile_cmd}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -283,8 +283,11 @@ fn main() {
     }
 
     let mut samples: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); qs.len()]; modes.len()];
+    // the timed runs whose answer differed from the materialized one, checked after the
+    // timer stopped, so that a cached path that goes wrong cannot pass as a faster one
+    let mut wrong: Vec<Vec<usize>> = vec![vec![0; qs.len()]; modes.len()];
     for round in 0..rounds {
-        for (qi, (_, text)) in qs.iter().enumerate() {
+        for (qi, (q, text)) in qs.iter().enumerate() {
             for k in 0..modes.len() {
                 let mi = (k + round + qi) % modes.len();
                 let m = &modes[mi];
@@ -296,6 +299,9 @@ fn main() {
                     let r = query(stores[m.store].snapshot(), text, &m.options).unwrap();
                     std::hint::black_box(r.len());
                     samples[mi][qi].push(t.elapsed().as_secs_f64() * 1e3);
+                    if answer(&r) != reference[&(m.profile, q.as_str())] {
+                        wrong[mi][qi] += 1;
+                    }
                 }
             }
         }
@@ -304,6 +310,20 @@ fn main() {
             "round {} of {rounds} done; derived-table cache: {tables} tables, {bytes} bytes, {hits} hits, {misses} misses",
             round + 1
         );
+    }
+
+    for (mi, m) in modes.iter().enumerate() {
+        for (qi, (q, _)) in qs.iter().enumerate() {
+            if failed.contains(&(mi, qi)) {
+                continue;
+            }
+            let n = samples[mi][qi].len();
+            line(serde_json::json!({
+                "check": format!("{}/{}/{q}/timed-answers", m.profile, m.name),
+                "ok": wrong[mi][qi] == 0,
+                "detail": format!("{} of {n} timed runs returned another answer", wrong[mi][qi]),
+            }));
+        }
     }
 
     let median = |v: &[f64]| {

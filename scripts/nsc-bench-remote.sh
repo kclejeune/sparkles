@@ -12,7 +12,9 @@
 # ones. results/samples.tsv gets one line per timed request with the server's execution time
 # (execMs of application/x-sparkles+json, unrounded) and curl's wall time. results/answers.tsv
 # gets a checksum of each variant's sorted TSV answer to each query, and results/load.tsv the
-# load times. Progress goes to results/progress.log and results/done marks the end.
+# load times. With ORDER_DIGEST set to a command, such as `python3 scripts/bench-gate.py
+# order-digest`, it is run with the query file and the TSV answer, and its output, a digest
+# of the ORDER BY keys in the returned order or "-", is a fifth column of answers.tsv. Progress goes to results/progress.log and results/done marks the end.
 #
 # With SPIN=1 (the default), a busy loop at the lowest priority (SCHED_IDLE) runs on the
 # server and client CPUs during the timed part. It keeps their vCPUs from halting between
@@ -190,7 +192,13 @@ for round in $(seq "$ROUNDS"); do
       for q in "${QUERIES[@]}"; do
         if curl -sS -f --max-time "$MAX_TIME" -o ans.tsv -H 'Accept: text/tab-separated-values' \
           --data-urlencode "query@queries/$q.rq" "${EXEC_FIELD[@]}" "$URL" 2> /dev/null; then
-          printf '%s\t%s\t%s\t%s\n' "$v" "$q" "$(($(wc -l < ans.tsv) - 1))" "$(sort ans.tsv | sha256sum | cut -c1-16)" >> "$R/answers.tsv"
+          odig=""
+          if [ -n "${ORDER_DIGEST:-}" ]; then
+            # shellcheck disable=SC2086
+            odig=$'\t'"$($ORDER_DIGEST "queries/$q.rq" ans.tsv)"
+          fi
+          printf '%s\t%s\t%s\t%s%s\n' "$v" "$q" "$(($(wc -l < ans.tsv) - 1))" "$(sort ans.tsv | sha256sum | cut -c1-16)" \
+            "$odig" >> "$R/answers.tsv"
         else
           printf '%s\t%s\terror\terror\n' "$v" "$q" >> "$R/answers.tsv"
         fi
