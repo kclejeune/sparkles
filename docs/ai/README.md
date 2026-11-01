@@ -421,7 +421,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   have not run. Roadmap item 6.
 * Prompt caching has not been measured against Anthropic. Neither the cache hit rate of
   real calls nor Ask's accuracy with its grounding reordered for the cache has run.
-  Roadmap item NEW-ITEM-1.
+  Roadmap item 503.
 * The UI's ingestion controls do not turn on assistant ingestion. Roadmap item 77.
 * An MCP tool operation that needs admin, such as deleting a protected branch, refuses an
   OAuth token without `sparkles:admin` as a tool error instead of a scope challenge.
@@ -479,7 +479,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 318](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md).
+The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 318](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item 503](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
