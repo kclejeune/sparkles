@@ -12028,6 +12028,7 @@ a term the caller cannot read.
 | `tryHarder` | The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it, and the earlier answer is marked `rejected`. |
 | `reviewedOnly` | `true` hides the agent memory graphs of the dataset's memory settings from every step, and a global answer then uses only reviewed community reports. |
 | `mode` | `auto` (the default) lets the draft classify the question, `local` always answers with a query, and `global` answers from the dataset's community reports. |
+| `explore`, `shapeCheck`, `drafts`, `typeHints` | The repair turns of this ask, over the dataset's `repairs`. `drafts` is 1 to 5. |
 | `query` | A query to check, run and summarize without a draft, for a query that the caller edited. |
 
 The answer is a stream of server-sent events. Each event's data is one JSON object.
@@ -12220,6 +12221,7 @@ in the shape of `GET`.
 | `deadlineSecs` | The time an ask may take, 120 seconds by default. |
 | `historyDays` | The days an asked question is kept. `0` keeps nothing. Without it, the server's `serve --ask-history-days` applies, 30 by default. |
 | `routing` | `complexityThreshold` and `exampleScore`, which override the server's routing settings. |
+| `repairs` | The repair turns of the dataset's asks, which a request may override. `explore` explores the data once after a draft without a query or with an empty result, `true` by default. `shapeCheck` repairs once when a result does not fit the question's form, `false` by default. `drafts` asks 1 to 5 first drafts whose results vote, 1 by default. `typeHints` links mentions with the classes the words around them name, `false` by default. |
 
 A `PUT` with an `endpoint` or an `apiKey` anywhere is a `400`, because only the server
 configuration names endpoints and keys. The `GET` answer adds `status`, which says

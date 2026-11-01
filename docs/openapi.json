@@ -1521,6 +1521,14 @@
             },
             "type": "array"
           },
+          "drafts": {
+            "description": "First drafts whose results vote on the query, 1 to 5. Over the dataset's `repairs.drafts`.",
+            "type": "integer"
+          },
+          "explore": {
+            "description": "Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`.",
+            "type": "boolean"
+          },
           "maxRows": {
             "description": "The rows returned in `result`, 1000 by default.",
             "type": "integer"
@@ -1553,6 +1561,10 @@
             "description": "Whether to run the checked query. `true` by default.",
             "type": "boolean"
           },
+          "shapeCheck": {
+            "description": "Repair once when the result does not fit the question's form. Over the dataset's `repairs.shapeCheck`.",
+            "type": "boolean"
+          },
           "summary": {
             "description": "Whether to summarize the rows. `true` by default when the dataset sends rows.",
             "type": "boolean"
@@ -1560,6 +1572,10 @@
           "tryHarder": {
             "description": "The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it.",
             "type": "string"
+          },
+          "typeHints": {
+            "description": "Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -2155,6 +2171,29 @@
           },
           "optimize": {
             "type": "boolean"
+          },
+          "repairs": {
+            "additionalProperties": false,
+            "description": "The repair turns of the dataset's asks, which a request may override.",
+            "properties": {
+              "drafts": {
+                "description": "First drafts whose results vote on the query, 1 to 5. 1 by default.",
+                "type": "integer"
+              },
+              "explore": {
+                "description": "Explore the data once after a draft without a query or with an empty result. `true` by default.",
+                "type": "boolean"
+              },
+              "shapeCheck": {
+                "description": "Repair once when the result does not fit the question's form. `false` by default.",
+                "type": "boolean"
+              },
+              "typeHints": {
+                "description": "Link mentions with the classes the words around them name. `false` by default.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
           },
           "roles": {
             "description": "Role lists that replace the server's for this dataset.",

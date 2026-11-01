@@ -1593,6 +1593,19 @@ class BatchCases(unittest.TestCase):
         self.assertEqual(report["unattemptedIds"]["p"], ["q4", "q5"])
         self.assertTrue(set(Ledger.holds) <= set(Ledger.released))
 
+    def test_every_repair_flag_passes_and_others_are_refused(self):
+        def refusal(flag):
+            args = eval_ask.parse_args(["--sparkles", "/bin/true", f"--ask-option={flag}"])
+            try:
+                eval_ask.validate_args(args)
+            except eval_ask.Invalid as e:
+                return str(e)  # the later checks of the binary refuse these args
+
+        for flag in eval_ask.ASK_OPTIONS + ("--drafts=3",):
+            self.assertNotEqual(refusal(flag), "unknown --ask-option", flag)
+        for flag in ("--drafts=6", "--model-config=x", "--bogus"):
+            self.assertEqual(refusal(flag), "unknown --ask-option", flag)
+
     def test_jobs_above_one_need_the_batch(self):
         args = eval_ask.parse_args(["--sparkles", "/bin/true", "--jobs", "2"])
         with self.assertRaises(eval_ask.Invalid):

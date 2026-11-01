@@ -237,6 +237,10 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "reviewedOnly": with_desc(boolean(), "Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports."),
                     "query": with_desc(string(), "A query to check, run and summarize without drafting, for **Summarize again** after an edit."),
                     "mode": with_desc(string_enum(&["auto", "local", "global"]), "Answer from the data (`local`), from the community reports (`global`), or as the draft classifies the question (`auto`, the default)."),
+                    "explore": with_desc(boolean(), "Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`."),
+                    "shapeCheck": with_desc(boolean(), "Repair once when the result does not fit the question's form. Over the dataset's `repairs.shapeCheck`."),
+                    "drafts": with_desc(int(), "First drafts whose results vote on the query, 1 to 5. Over the dataset's `repairs.drafts`."),
+                    "typeHints": with_desc(boolean(), "Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`."),
                 }),
             ),
             "A question for the dataset.",
@@ -299,6 +303,12 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "deadlineSecs": with_desc(num(), "The time an ask may take, 120 seconds by default."),
                     "historyDays": with_desc(int(), "The days an asked question is kept. 0 keeps nothing."),
                     "routing": any_object("`complexityThreshold` and `exampleScore` of the escalation rules."),
+                    "repairs": with_desc(closed(&[], json!({
+                        "explore": with_desc(boolean(), "Explore the data once after a draft without a query or with an empty result. `true` by default."),
+                        "shapeCheck": with_desc(boolean(), "Repair once when the result does not fit the question's form. `false` by default."),
+                        "drafts": with_desc(int(), "First drafts whose results vote on the query, 1 to 5. 1 by default."),
+                        "typeHints": with_desc(boolean(), "Link mentions with the classes the words around them name. `false` by default."),
+                    })), "The repair turns of the dataset's asks, which a request may override."),
                     "status": with_desc(obj(&["models", "historyDays", "ask"], json!({
                         "models": boolean(),
                         "historyDays": int(),

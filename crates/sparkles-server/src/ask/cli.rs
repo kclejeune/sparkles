@@ -97,23 +97,33 @@ pub struct AskArgs {
     /// index statistics instead of scanning the indexes; `off` always scans
     #[arg(long, value_name = "QUADS", default_value_t = crate::state::StatisticsAbove::default())]
     pub schema_statistics_above: crate::state::StatisticsAbove,
-    /// Do not explore the data when a draft gives no query or its query returns no
-    /// rows. By default Ask explores once, with further link candidates and the
-    /// predicates the entities use, and drafts again
-    #[arg(long)]
+    /// Explore the data once when a draft gives no query or its query returns no rows,
+    /// with further link candidates and the predicates the entities use, and draft
+    /// again. On by default
+    #[arg(long, overrides_with = "no_explore")]
+    pub explore: bool,
+    /// Do not explore the data after a failed draft
+    #[arg(long, overrides_with = "explore")]
     pub no_explore: bool,
     /// Repair once when the result's shape does not fit the question's form, such as
-    /// several rows for "How many", keeping the first answer if the repair fails
-    #[arg(long)]
+    /// several rows for "How many", keeping the first answer if the repair fails. Off
+    /// by default
+    #[arg(long, overrides_with = "no_shape_check")]
     pub shape_check: bool,
-    /// Ask this many first drafts and keep the one whose result most drafts share. A
-    /// preview with --no-run asks one, since the vote runs each draft
-    #[arg(long, value_name = "N", default_value_t = 1)]
-    pub drafts: usize,
+    /// Do not check the result's shape
+    #[arg(long, overrides_with = "shape_check")]
+    pub no_shape_check: bool,
+    /// Ask this many first drafts and keep the one whose result most drafts share, 1 by
+    /// default. A preview with --no-run asks one, since the vote runs each draft
+    #[arg(long, value_name = "N")]
+    pub drafts: Option<usize>,
     /// Link each mention with the classes the words around it name, and show how many
-    /// triples name each candidate
-    #[arg(long)]
+    /// triples name each candidate. Off by default
+    #[arg(long, overrides_with = "no_type_hints")]
     pub type_hints: bool,
+    /// Do not hint mention types
+    #[arg(long, overrides_with = "type_hints")]
+    pub no_type_hints: bool,
     /// Print the result as one JSON object
     #[arg(long, conflicts_with = "events")]
     pub json: bool,
@@ -156,7 +166,9 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
     if !(1..=64).contains(&args.jobs) {
         bail!("--jobs expects 1 to 64");
     }
-    if !(1..=super::MAX_DRAFTS).contains(&args.drafts) {
+    if let Some(n) = args.drafts
+        && !(1..=super::MAX_DRAFTS).contains(&n)
+    {
         bail!("--drafts expects 1 to {}", super::MAX_DRAFTS);
     }
     let pairs = parse_pairs(&args.pairs)?;
@@ -307,7 +319,7 @@ fn options(
     );
     let routing = settings.routing.clone().unwrap_or_default();
     let model_routing = models.config.routing.clone().unwrap_or_default();
-    AskOptions {
+    let mut o = AskOptions {
         dataset: args.dataset.clone(),
         question,
         pairs,
@@ -322,10 +334,6 @@ fn options(
         mode: args.mode,
         reviewed_only: args.reviewed_only,
         report_context,
-        explore: !args.no_explore,
-        shape_check: args.shape_check,
-        drafts: args.drafts,
-        type_hints: args.type_hints,
         complexity_threshold: routing
             .complexity_threshold
             .or(model_routing.complexity_threshold)
@@ -335,6 +343,20 @@ fn options(
             .or(model_routing.example_score)
             .unwrap_or(super::DEFAULT_EXAMPLE_SCORE),
         ..AskOptions::default()
+    };
+    settings.repairs.or(repairs_of(args)).apply(&mut o);
+    o
+}
+
+/// The repair flags that the command line sets, each unset when neither its flag nor
+/// its `--no-` flag is given.
+pub(super) fn repairs_of(args: &AskArgs) -> crate::assistant::AskRepairs {
+    let flag = |on: bool, off: bool| (on || off).then_some(on);
+    crate::assistant::AskRepairs {
+        explore: flag(args.explore, args.no_explore),
+        shape_check: flag(args.shape_check, args.no_shape_check),
+        drafts: args.drafts,
+        type_hints: flag(args.type_hints, args.no_type_hints),
     }
 }
 
@@ -592,6 +614,59 @@ fn print_human(out: &Value) {
 mod tests {
     use super::super::tests::{ORG, draft, is_summary, opts, server};
     use super::*;
+
+    #[derive(clap::Parser)]
+    struct Cmd {
+        #[command(flatten)]
+        ask: AskArgs,
+    }
+
+    fn repairs(flags: &[&str]) -> crate::assistant::AskRepairs {
+        use clap::Parser;
+        let mut argv = vec!["ask", "ds", "q"];
+        argv.extend(flags);
+        argv.extend(["--data", "x.ttl"]);
+        repairs_of(&Cmd::try_parse_from(argv).unwrap().ask)
+    }
+
+    #[test]
+    fn each_repair_flag_reaches_the_options() {
+        use crate::assistant::AskRepairs;
+        assert_eq!(repairs(&[]), AskRepairs::default());
+        let on = repairs(&[
+            "--explore",
+            "--shape-check",
+            "--drafts",
+            "3",
+            "--type-hints",
+        ]);
+        assert_eq!(
+            on,
+            AskRepairs {
+                explore: Some(true),
+                shape_check: Some(true),
+                drafts: Some(3),
+                type_hints: Some(true)
+            }
+        );
+        let off = repairs(&["--no-explore", "--no-shape-check", "--no-type-hints"]);
+        assert_eq!(
+            (off.explore, off.shape_check, off.type_hints),
+            (Some(false), Some(false), Some(false))
+        );
+        // the later of a flag and its --no- flag wins
+        assert_eq!(repairs(&["--explore", "--no-explore"]).explore, Some(false));
+        assert_eq!(repairs(&["--no-explore", "--explore"]).explore, Some(true));
+        // a command line flag wins over assistant.json, which wins over the default
+        let file = AskRepairs {
+            explore: Some(false),
+            shape_check: Some(true),
+            ..AskRepairs::default()
+        };
+        let mut o = AskOptions::default();
+        file.or(repairs(&["--explore"])).apply(&mut o);
+        assert!(o.explore && o.shape_check && !o.type_hints && o.drafts == 1);
+    }
     use crate::models::mock::{self, MockModel};
     use crate::models::{Models, ModelsConfig};
     use serde_json::json;

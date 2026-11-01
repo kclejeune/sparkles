@@ -82,6 +82,69 @@ fn yes() -> bool {
     true
 }
 
+/// The repair turns of an ask (C18 §4.2), each unset to keep Ask's default. A
+/// dataset's `assistant.json` sets them under `repairs`, a request or a command line
+/// overrides them, and [`AskRepairs::apply`] puts them into the options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AskRepairs {
+    /// explore the data once after a draft without a query or with an empty result
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore: Option<bool>,
+    /// repair once when a result's shape does not fit the question's form
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_check: Option<bool>,
+    /// the first drafts whose results vote, 1 to `MAX_DRAFTS`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drafts: Option<usize>,
+    /// link mentions with the classes the words around them name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_hints: Option<bool>,
+}
+
+impl AskRepairs {
+    fn is_default(&self) -> bool {
+        *self == AskRepairs::default()
+    }
+
+    /// The values of `over` where it sets them, else these.
+    pub fn or(self, over: AskRepairs) -> AskRepairs {
+        AskRepairs {
+            explore: over.explore.or(self.explore),
+            shape_check: over.shape_check.or(self.shape_check),
+            drafts: over.drafts.or(self.drafts),
+            type_hints: over.type_hints.or(self.type_hints),
+        }
+    }
+
+    /// Set the options that these name, keeping the others.
+    pub fn apply(self, o: &mut crate::ask::AskOptions) {
+        if let Some(v) = self.explore {
+            o.explore = v;
+        }
+        if let Some(v) = self.shape_check {
+            o.shape_check = v;
+        }
+        if let Some(v) = self.drafts {
+            o.drafts = v;
+        }
+        if let Some(v) = self.type_hints {
+            o.type_hints = v;
+        }
+    }
+
+    /// An error for a draft count out of range, naming the field as `prefix`.
+    pub fn check(&self, prefix: &str) -> Result<(), String> {
+        match self.drafts {
+            Some(n) if !(1..=crate::ask::MAX_DRAFTS).contains(&n) => Err(format!(
+                "{prefix}drafts must be from 1 to {}",
+                crate::ask::MAX_DRAFTS
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// `assistant.json` (§3.5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -115,6 +178,9 @@ pub struct AssistantSettings {
     pub history_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<crate::models::Routing>,
+    /// the repair turns of the dataset's asks
+    #[serde(default, skip_serializing_if = "AskRepairs::is_default")]
+    pub repairs: AskRepairs,
 }
 
 impl Default for AssistantSettings {
@@ -133,6 +199,7 @@ impl Default for AssistantSettings {
             deadline_secs: None,
             history_days: None,
             routing: None,
+            repairs: AskRepairs::default(),
         }
     }
 }
@@ -209,6 +276,7 @@ impl AssistantSettings {
         {
             return Err("historyDays must be at most 3650".into());
         }
+        self.repairs.check("repairs.")?;
         Ok(())
     }
 
@@ -1177,6 +1245,38 @@ mod usage_tests {
         assert_eq!(
             rt.usage_json(1)["datasets"][0]["tokens"][0]["budgetTokens"],
             156
+        );
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    #[test]
+    fn repairs_parse_merge_and_apply() {
+        let s: AssistantSettings = serde_json::from_str(
+            r#"{"repairs": {"explore": false, "shapeCheck": true, "drafts": 3, "typeHints": true}}"#,
+        )
+        .unwrap();
+        assert!(s.validate(crate::settings::Providers::Unchecked).is_ok());
+        let mut o = crate::ask::AskOptions::default();
+        s.repairs.apply(&mut o);
+        assert!(!o.explore && o.shape_check && o.drafts == 3 && o.type_hints);
+        let over = AskRepairs {
+            drafts: Some(1),
+            ..AskRepairs::default()
+        };
+        assert_eq!(s.repairs.or(over).drafts, Some(1));
+        assert_eq!(s.repairs.or(over).shape_check, Some(true));
+        let bad: AssistantSettings = serde_json::from_str(r#"{"repairs": {"drafts": 6}}"#).unwrap();
+        assert!(bad.validate(crate::settings::Providers::Unchecked).is_err());
+        assert!(serde_json::from_str::<AssistantSettings>(r#"{"repairs": {"vote": 2}}"#).is_err());
+        // unset repairs are left out of the file
+        assert!(
+            !serde_json::to_string(&AssistantSettings::default())
+                .unwrap()
+                .contains("repairs")
         );
     }
 }
