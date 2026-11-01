@@ -1577,6 +1577,7 @@ fn read_ranges_gallop(
 /// much of it ([`dense_ahead`]), instead of segment by segment until it turns dense,
 /// which a join of more ranges than its prefetch takes (`PREFETCH_RANGES`) would
 /// otherwise do in every block. `looked` keeps that walk to once per block.
+#[inline(always)]
 fn segment_part(
     ctx: &Ctx,
     idx: &crate::index::PermIndex,
@@ -1589,9 +1590,28 @@ fn segment_part(
     let Some((s0, s1)) = span else {
         return Ok(0);
     };
+    if *looked != x {
+        return first_look(ctx, idx, ranges, (r, x), mask, (s0, s1), looked);
+    }
+    Ok(s0 + 1)
+}
+
+/// The part of [`segment_part`] at a block's first range with a cold segment, kept out of
+/// line so that the code of the reader's loop does not grow with it.
+#[cold]
+#[inline(never)]
+fn first_look(
+    ctx: &Ctx,
+    idx: &crate::index::PermIndex,
+    ranges: &Ranges,
+    (r, x): (usize, usize),
+    mask: ColMask,
+    (s0, s1): (usize, usize),
+    looked: &mut usize,
+) -> Result<usize> {
     // a range's span starts at the segment before its first key's, which a reader of the
     // range before has often just read, so any cold segment of the span counts
-    if *looked != x && (s0..s1).any(|s| !ctx.snap.cache.has_segment(idx, x, s, mask)) {
+    if (s0..s1).any(|s| !ctx.snap.cache.has_segment(idx, x, s, mask)) {
         *looked = x;
         if dense_ahead(ctx, idx, ranges, r, x)? {
             idx.mark_dense(x);
@@ -1607,6 +1627,8 @@ fn segment_part(
 /// order, so the walk stops at the first range past the block, or as soon as the answer
 /// is known. Many ranges in a few segments make a long walk, which checks the request
 /// every `PREFETCH_CHECK_STEPS` ranges.
+#[cold]
+#[inline(never)]
 fn dense_ahead(
     ctx: &Ctx,
     idx: &crate::index::PermIndex,
