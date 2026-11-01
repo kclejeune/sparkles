@@ -271,3 +271,126 @@ fn witnesses_name_quads_of_the_input_graphs() {
     assert_eq!(got.annotation.witnesses, vec![Witness::new(want)]);
     assert!(!got.annotation.truncated);
 }
+
+fn run_with(
+    s: &Store,
+    profile: &Profile,
+    since: Option<u64>,
+    cache: &Cache,
+    opts: &ReasonOptions,
+) -> anyhow::Result<ReasonReport> {
+    materialize_incremental(
+        s,
+        profile,
+        &Extras::default(),
+        Incremental {
+            since,
+            cache: Some(cache),
+        },
+        opts,
+    )
+}
+
+/// Regression (review of item 416): an asserted fact that a head action also derives has
+/// supports that no instance shows, so its witnesses are truncated, as are those of every
+/// asserted fact under rules with head actions.
+#[test]
+fn head_actions_truncate_asserted_facts() {
+    let s = Store::in_memory(StoreOptions::default());
+    let first = format!("{RDF}first");
+    let rest = format!("{RDF}rest");
+    let nil = format!("{RDF}nil");
+    let facts = [
+        t("s", "list", "l"),
+        t("l", &first, "b"),
+        t("l", &rest, &nil),
+        t("s", "p", "b"),
+    ];
+    change(&s, None, &facts, &[]);
+    let rules = Profile::Rules(format!(
+        "[m: (?s <{EX}list> ?l) -> listMapAsObject(?s, <{EX}p>, ?l)]"
+    ));
+    let cache = Cache::default();
+    let r = run_with(&s, &rules, None, &cache, &with(8)).unwrap_or_else(|e| panic!("{e:#}"));
+    assert!(r.witnesses.is_some());
+    let got = cache.witnesses(&t("s", "p", "b")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+    assert!(
+        got.annotation
+            .witnesses
+            .contains(&witness(&[(&facts[3], None)]))
+    );
+}
+
+/// Regression (review of item 416): a run that does not keep witnesses, after one that
+/// did, was charged for the kept witnesses before it dropped them, and failed under a
+/// limit that the run without them fits.
+#[test]
+fn dropped_witnesses_are_not_charged() {
+    let classes = ["A", "B", "C", "D", "E"];
+    let mut facts: Vec<Triple> = (0..500).map(|i| t(&format!("i{i}"), &ty(), "A")).collect();
+    for w in classes.windows(2) {
+        facts.push(t(w[0], &sub(), w[1]));
+    }
+    // the peak of an incremental run without witnesses over a closure kept without them
+    let plain = {
+        let s = Store::in_memory(StoreOptions::default());
+        change(&s, None, &facts, &[]);
+        let cache = Cache::default();
+        let r = run(&s, None, &cache, &ReasonOptions::default());
+        change(&s, None, &[t("j", &ty(), "A")], &[]);
+        let r = run(
+            &s,
+            Some(r.receipt.unwrap().commit.seq),
+            &cache,
+            &ReasonOptions::default(),
+        );
+        assert_eq!(r.method, Method::Incremental);
+        r.peak_bytes as usize
+    };
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, None, &facts, &[]);
+    let cache = Cache::default();
+    let r = run(&s, None, &cache, &with(8));
+    let bytes = r.witnesses.unwrap().bytes as usize;
+    assert!(bytes > plain, "{bytes} {plain}");
+    change(&s, None, &[t("j", &ty(), "A")], &[]);
+    let limit = ReasonOptions {
+        max_memory: Some(plain + bytes / 2),
+        ..Default::default()
+    };
+    let r = run_with(
+        &s,
+        &Profile::RdfsSimple,
+        Some(r.receipt.unwrap().commit.seq),
+        &cache,
+        &limit,
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+    assert!(r.witnesses.is_none());
+}
+
+/// A run with witnesses under a limit that the run without them fits fails for their
+/// memory instead of passing it.
+#[test]
+fn witnesses_fail_within_the_memory_limit() {
+    let mut facts: Vec<Triple> = (0..500).map(|i| t(&format!("i{i}"), &ty(), "A")).collect();
+    for w in ["A", "B", "C", "D", "E"].windows(2) {
+        facts.push(t(w[0], &sub(), w[1]));
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, None, &facts, &[]);
+    let plain = run(&s, None, &Cache::default(), &ReasonOptions::default()).peak_bytes as usize;
+    let opts = ReasonOptions {
+        max_memory: Some(plain + plain / 4),
+        witnesses: Some(8),
+        ..Default::default()
+    };
+    let e = run_with(&s, &Profile::RdfsSimple, None, &Cache::default(), &opts).unwrap_err();
+    assert!(
+        e.downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>()
+            .is_some(),
+        "{e:#}"
+    );
+}

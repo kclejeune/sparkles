@@ -1422,9 +1422,10 @@ fn update_closure(
     // on the run's threads: this thread may stand in for a parked worker of the pool
     // that called, so its parallel work must not go to that pool
     let run_ids = resolved.ids(snap);
+    let wanted = wanted_witnesses(opts)?;
     let prev = exec.install(|| {
         maintain::previous(
-            store, snap, since, digest, &graphs, &run_ids, inc.cache, raw, &budget,
+            store, snap, since, digest, &graphs, &run_ids, inc.cache, raw, &budget, wanted,
         )
     })?;
     let mut closure = prev.closure;
@@ -1454,7 +1455,6 @@ fn update_closure(
     let ch = &ch;
     // the witnesses of the previous closure, when the run keeps witnesses with the same
     // bound; otherwise they are built again after the update
-    let wanted = wanted_witnesses(opts)?;
     let mut prior = match (wanted, prev.witnesses) {
         (Some(max), Some(w)) if w.max() == max => Some(w),
         _ => None,

@@ -191,6 +191,16 @@ impl Cache {
             *k = None;
             return Taken::InputsChanged;
         }
+        // witnesses the run will not update are dropped before the closure is charged, so
+        // that a run without them, or with another bound, is not refused for their memory
+        if kept.witnesses.as_ref().map(Witnesses::max) != want.witnesses
+            && let Some(kept) = k.as_mut()
+        {
+            kept.witnesses = None;
+        }
+        let Some(kept) = k.as_ref() else {
+            return Taken::None;
+        };
         let need = kept.heap_bytes();
         if let Err(e) = budget.try_charge(need) {
             return Taken::Refused(
@@ -229,6 +239,9 @@ struct Want<'a> {
     generation: &'a Arc<Generation>,
     digest: u64,
     inputs: &'a [GraphRef],
+    /// the bound of witnesses the run keeps: kept witnesses with another bound are of no
+    /// use to it
+    witnesses: Option<usize>,
 }
 
 /// What [`Cache::take_for`] found.
@@ -372,6 +385,7 @@ pub(crate) fn previous(
     cache: Option<&Cache>,
     raw: Result<RawChanges, String>,
     budget: &Arc<Budget>,
+    witnesses: Option<usize>,
 ) -> anyhow::Result<Previous> {
     let dataset_id = store.dataset_id();
     let rules_changed = || Fallback("the rules changed since the previous run".into());
@@ -383,6 +397,7 @@ pub(crate) fn previous(
         generation: &snap.generation,
         digest,
         inputs,
+        witnesses,
     };
     let kept = match cache.map_or(Taken::None, |c| c.take_for(budget, &want)) {
         Taken::None => None,

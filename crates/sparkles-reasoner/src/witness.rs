@@ -57,7 +57,7 @@
 //! fact one instance per intermediate node and many minimal supports, one per path, so
 //! such facts are often truncated.
 
-use crate::budget::{Budget, Held, MemoryExceeded, table_bytes};
+use crate::budget::{Budget, Held, MemoryExceeded, Meter, table_bytes};
 use crate::builtins::BuiltinKind;
 use crate::engine::{self, CHead, CRule, Eval, Limits, Mode, Slot};
 use crate::facts::Memo;
@@ -85,6 +85,14 @@ const MAX_CHANGES: u32 = 256;
 const MAX_LIST: usize = 1 << 16;
 
 /// The working bound of the products and sums of one fact's evaluation.
+/// The heap of one node with its index entry, and of one entry of the reverse index,
+/// as the witnesses charge them while they grow.
+const NODE_BYTES: usize = size_of::<Node>() + size_of::<(Triple, u32)>() + 8;
+const REV_ENTRY_BYTES: usize = 4 + size_of::<(FactKey, Vec<u32>)>() / 2;
+
+/// The most unions one premise of a rule instance adds to the product of the others.
+const MAX_UNIONS: usize = 1 << 14;
+
 fn pool_cap(max: usize) -> usize {
     (max * 4).max(64)
 }
@@ -164,6 +172,9 @@ pub struct Witnesses {
     /// per input quad: the nodes whose kept witnesses may contain it (a superset)
     rev: FxHashMap<FactKey, Vec<u32>>,
     rev_entries: usize,
+    /// the rules derive facts that their instances do not show, such as those of head
+    /// actions: every fact, asserted ones included, may have supports that are not kept
+    opaque: bool,
     /// the heap of the witnesses, charged to the run's budget
     held: Held,
     /// the last run's report
@@ -274,17 +285,36 @@ fn insert_min(a: &mut Vec<Witness>, x: Witness) -> bool {
 
 /// The minimal supports of an instance whose premises have the supports `ws`, and
 /// whether the working bound cut them.
-fn product(ws: &[&[Witness]], cap: usize) -> (Vec<Witness>, bool) {
+fn product(
+    ws: &[&[Witness]],
+    cap: usize,
+    stop: &dyn Fn() -> bool,
+) -> anyhow::Result<(Vec<Witness>, bool)> {
     let mut over = false;
     let mut r: Vec<Witness> = vec![Witness::default()];
     for p in ws {
         if p.is_empty() {
-            return (Vec::new(), over);
+            return Ok((Vec::new(), over));
         }
-        let mut next = Vec::with_capacity(r.len() * p.len());
-        for a in &r {
+        // the working antichain stays within twice the bound, and each step forms at most
+        // `MAX_UNIONS` unions, so one instance's work is bounded whatever its premises keep
+        let mut next = Vec::with_capacity((r.len() * p.len()).min(2 * cap + 1));
+        let mut unions = 0usize;
+        'step: for a in &r {
             for b in p.iter() {
+                if unions == MAX_UNIONS {
+                    over = true;
+                    break 'step;
+                }
+                unions += 1;
+                if unions.is_multiple_of(1024) && stop() {
+                    anyhow::bail!("reasoning cancelled");
+                }
                 insert_min(&mut next, a.union(b));
+                if next.len() > 2 * cap {
+                    next.truncate(cap);
+                    over = true;
+                }
             }
         }
         if next.len() > cap {
@@ -293,7 +323,16 @@ fn product(ws: &[&[Witness]], cap: usize) -> (Vec<Witness>, bool) {
         }
         r = next;
     }
-    (r, over)
+    Ok((r, over))
+}
+
+/// The heap of the instances found for one fact.
+fn found_bytes(f: &Found) -> usize {
+    size_of::<Found>()
+        + f.bodies
+            .iter()
+            .map(|b| b.len() * size_of::<Triple>() + 2 * size_of::<usize>())
+            .sum::<usize>()
 }
 
 fn bind_atom(a: &engine::Atom, t: &Triple, b: &mut [u64]) -> bool {
@@ -536,6 +575,8 @@ impl<'a> Cx<'a> {
 #[derive(Default)]
 struct Pass {
     ins: FxHashMap<u32, Ins>,
+    /// the heap of `ins`, charged as it grows
+    scratch: Option<Held>,
     users: FxHashMap<u32, Vec<u32>>,
     /// the users of every node are known from `ins` (a full build)
     complete: bool,
@@ -553,6 +594,7 @@ impl Witnesses {
             free: Vec::new(),
             rev: FxHashMap::default(),
             rev_entries: 0,
+            opaque: false,
             held: Held::new(budget),
             report: WitnessReport::default(),
         }
@@ -622,6 +664,7 @@ impl Witnesses {
             }
         };
         self.index.insert(t, i);
+        self.held.grow(NODE_BYTES);
         i
     }
 
@@ -631,7 +674,9 @@ impl Witnesses {
             return;
         }
         n.live = false;
+        let gone = n.bytes() - size_of::<Node>();
         n.w = Vec::new();
+        self.held.shrink(gone);
         let t = n.t;
         self.index.remove(&t);
         self.free.push(i);
@@ -651,11 +696,18 @@ impl Witnesses {
                 }
             }
         }
+        let before = n.bytes();
         n.w = w;
         n.local = local;
         n.trunc = trunc;
+        let after = n.bytes();
         added.sort_unstable();
         added.dedup();
+        // the heap is charged as it changes, so that a run past its limit stops at the
+        // next check of the budget; `settle_charge` sets the exact figure afterwards
+        self.held
+            .grow(added.len() * REV_ENTRY_BYTES + after.saturating_sub(before));
+        self.held.shrink(before.saturating_sub(after));
         for k in added {
             self.rev.entry(k).or_default().push(i);
             self.rev_entries += 1;
@@ -688,7 +740,7 @@ impl Witnesses {
             count: 1,
             lineage: Vec::new(),
             witnesses: vec![w],
-            truncated: false,
+            truncated: self.opaque,
         })
     }
 
@@ -743,6 +795,7 @@ impl Witnesses {
         let abort = AtomicBool::new(false);
         let cx = Cx::new(c, rules, &plans, &abort, limits);
         let mut w = Witnesses::empty(max, &limits.budget);
+        w.opaque = cx.opaque;
         // the facts that may be heads: every derived fact, and the base facts whose
         // predicate a head can have
         let mut heads: Vec<Triple> = c.live().map(|(t, _)| t).collect();
@@ -766,20 +819,42 @@ impl Witnesses {
         heads.sort_unstable();
         heads.dedup();
         let mut held = Held::try_new(&limits.budget, heads.capacity() * size_of::<Triple>())?;
-        let found: Vec<anyhow::Result<Vec<Found>>> = heads
+        // the instances are charged as each head's are found
+        let found: Vec<anyhow::Result<(Vec<Found>, usize)>> = heads
             .par_chunks(256)
             .map(|ch| {
                 let mut memo = Memo::default();
+                let mut meter = Meter::new(cx.budget, true);
                 let mut out = Vec::with_capacity(ch.len());
                 for &t in ch {
                     if cancelled(&cx) {
                         anyhow::bail!("reasoning cancelled");
                     }
-                    out.push(cx.instances(t, &mut memo)?);
+                    let f = cx.instances(t, &mut memo)?;
+                    meter.add(found_bytes(&f))?;
+                    out.push(f);
                 }
-                Ok(out)
+                Ok((out, meter.into_bytes()))
             })
             .collect();
+        let mut found_held = Held::new(&limits.budget);
+        let found: Vec<Vec<Found>> = {
+            let mut ok = Vec::with_capacity(found.len());
+            let mut err = None;
+            for f in found {
+                match f {
+                    Ok((f, n)) => {
+                        found_held.adopt(n);
+                        ok.push(f);
+                    }
+                    Err(e) => err = err.or(Some(e)),
+                }
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
+            ok
+        };
         let mut pass = Pass {
             complete: true,
             ..Pass::default()
@@ -791,7 +866,7 @@ impl Witnesses {
         }
         let mut bytes = 0usize;
         for (ch, f) in heads.chunks(256).zip(found) {
-            for (t, f) in ch.iter().zip(f?) {
+            for (t, f) in ch.iter().zip(f) {
                 let i = w.index[t];
                 let mut ins = Ins {
                     bodies: Vec::with_capacity(f.bodies.len()),
@@ -816,13 +891,19 @@ impl Witnesses {
             }
         }
         held.try_set(bytes + heads.capacity() * size_of::<Triple>())?;
+        drop(found_held);
         drop(heads);
         // the base facts that are premises only have their own quad
         for i in 0..w.nodes.len() as u32 {
             if !pass.ins.contains_key(&i)
                 && let Some(k) = w.nodes[i as usize].key
             {
-                w.set(i, vec![Witness::new(vec![Atom::Fact(k)])], false, false);
+                w.set(
+                    i,
+                    vec![Witness::new(vec![Atom::Fact(k)])],
+                    cx.opaque,
+                    cx.opaque,
+                );
             }
         }
         // users from the instances
@@ -1036,6 +1117,7 @@ impl Witnesses {
         let c = &*c;
         let abort = AtomicBool::new(false);
         let cx = Cx::new(c, rules, &plans, &abort, limits);
+        self.opaque = cx.opaque;
         let mut pass = Pass::default();
         self.settle(&cx, seeds, &mut pass)?;
         if pass.rebuild {
@@ -1122,6 +1204,8 @@ impl Witnesses {
                 unknown: f.unknown,
                 capped: f.capped,
             };
+            let held = pass.scratch.get_or_insert_with(|| Held::new(cx.budget));
+            held.try_grow(f.bodies.iter().map(|b| b.len() * 4 + 32).sum::<usize>() + 64)?;
             for body in f.bodies {
                 let ids: Box<[u32]> = body
                     .iter()
@@ -1132,7 +1216,8 @@ impl Witnesses {
                             let key = base.then(|| fact_key(cx.c, u));
                             let j = self.add_node(*u, key);
                             if let Some(k) = key {
-                                self.set(j, vec![Witness::new(vec![Atom::Fact(k)])], false, false);
+                                let o = cx.opaque;
+                                self.set(j, vec![Witness::new(vec![Atom::Fact(k)])], o, o);
                             }
                             if !base || cx.head_candidate(u) {
                                 queue.push(j);
@@ -1198,12 +1283,11 @@ impl Witnesses {
         while let Some(i) = queue.pop_front() {
             queued.remove(&i);
             ticks = ticks.wrapping_add(1);
-            if ticks.is_multiple_of(256) {
-                if cancelled(cx) {
-                    anyhow::bail!("reasoning cancelled");
-                }
-                cx.budget.check()?;
+            if ticks.is_multiple_of(256) && cancelled(cx) {
+                anyhow::bail!("reasoning cancelled");
             }
+            // the witnesses charge their growth as it happens
+            cx.budget.check()?;
             if !self.nodes[i as usize].live {
                 continue;
             }
@@ -1231,6 +1315,7 @@ impl Witnesses {
                 Kind::Base => {
                     let k = n.key.expect("the key was set above");
                     pool.push(Witness::new(vec![Atom::Fact(k)]));
+                    local |= cx.opaque;
                 }
                 Kind::Flagged => local = true,
                 Kind::Derived => local |= ins.bodies.is_empty() || cx.opaque,
@@ -1244,7 +1329,7 @@ impl Witnesses {
                     trunc |= pn.trunc;
                     ws.push(&pn.w);
                 }
-                let (prod, over) = product(&ws, cap);
+                let (prod, over) = product(&ws, cap, &|| cancelled(cx))?;
                 local |= over;
                 for x in prod {
                     insert_min(&mut pool, x);
@@ -1909,5 +1994,73 @@ mod tests {
         assert!(!kept(&c, &w, &[p1, ty, prop]).unwrap().1);
         let rules = compiled(text_rules, &c.terms);
         converged(&mut c, &rules, &w, "after the removal");
+    }
+
+    fn singleton(n: u64) -> Witness {
+        let k = FactKey::of_terms(
+            &oxrdf::NamedNode::new_unchecked(format!("http://ex.org/s{n}")).into(),
+            &oxrdf::NamedNode::new_unchecked("http://ex.org/p").into(),
+            &oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked("http://ex.org/o")),
+            None,
+        );
+        Witness::new(vec![Atom::Fact(k)])
+    }
+
+    /// Regression (review of item 416): at the largest bound, two premises of 256
+    /// incomparable supports each formed all 65,536 unions in one antichain before the
+    /// product was cut, billions of subset checks without a check for cancellation. The
+    /// working antichain and the unions per premise are bounded, and the cut says so.
+    #[test]
+    fn products_of_large_premises_are_bounded() {
+        let mut a: Vec<Witness> = (0..256).map(singleton).collect();
+        let mut b: Vec<Witness> = (256..512).map(singleton).collect();
+        a.sort();
+        b.sort();
+        let cap = pool_cap(MAX_WITNESSES_LIMIT);
+        let t0 = Instant::now();
+        let (r, over) = product(&[&a, &b], cap, &|| false).unwrap();
+        assert!(over);
+        assert!(r.len() <= cap, "{}", r.len());
+        assert!(r.iter().all(|x| x.len() == 2));
+        assert!(t0.elapsed().as_secs() < 20, "{:?}", t0.elapsed());
+        // a cancelled run stops inside the product
+        let e = product(&[&a, &b], cap, &|| true).unwrap_err();
+        assert!(e.to_string().contains("cancelled"), "{e:#}");
+        // small products are exact and unchanged
+        let (r, over) = product(&[&a[..4], &b[..4]], cap, &|| false).unwrap();
+        assert!(!over);
+        assert_eq!(r.len(), 16);
+    }
+
+    /// Regression (review of item 416): the witnesses were charged to the budget only
+    /// after a build or an update had allocated them. Each node and each change of kept
+    /// supports is now charged as it happens.
+    #[test]
+    fn witness_state_is_charged_as_it_grows() {
+        let budget = Budget::new(None);
+        let mut w = Witnesses::empty(8, &budget);
+        let before = budget.used();
+        let mut held = 0;
+        for n in 0..1000u64 {
+            let one = singleton(n);
+            let Atom::Fact(k) = &one.atoms()[0] else {
+                unreachable!()
+            };
+            let k = *k;
+            let i = w.add_node([n, 1, 2], Some(k));
+            let ws: Vec<Witness> = (0..8).map(|k| singleton(n * 8 + k)).collect();
+            w.set(i, ws, false, false);
+            held = w.held.bytes();
+        }
+        assert!(
+            held >= 1000 * (NODE_BYTES + 8 * size_of::<Witness>()),
+            "{held}"
+        );
+        assert!(budget.used() >= before + held, "{} {held}", budget.used());
+        for n in 0..1000u64 {
+            let i = w.node(&[n, 1, 2]).unwrap();
+            w.remove_node(i);
+        }
+        assert!(w.held.bytes() < held / 2, "{}", w.held.bytes());
     }
 }
