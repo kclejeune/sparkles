@@ -200,6 +200,9 @@ pub(crate) struct Tally {
     entries: VecDeque<(u64, u32, u64)>,
     /// the memory of `keys` and `index` together ([`key_bytes`])
     key_bytes: u64,
+    /// the most memory the counts took right after a commit was counted
+    #[cfg(test)]
+    pub(crate) peak: u64,
 }
 
 /// The approximate memory of one entry and of one unknown range.
@@ -267,6 +270,10 @@ impl Tally {
         for (k, n) in counted {
             self.entries.push_back((commit, k, n));
         }
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.bytes());
+        }
     }
 
     /// Record that the commits `first..=last` were not counted per key.
@@ -303,10 +310,30 @@ impl Tally {
     /// Drop the oldest commits' counts until the counts take at most `bytes`, keys and
     /// unknown ranges they alone hold included. Whether any were dropped.
     pub(crate) fn shrink_to(&mut self, bytes: u64) -> bool {
-        let total = self.bytes();
-        if total <= bytes {
+        if self.bytes() <= bytes {
             return false;
         }
+        // spare capacity alone may pass the budget
+        self.entries.shrink_to_fit();
+        if self.bytes() <= bytes {
+            return false;
+        }
+        loop {
+            let through = self.through_for(bytes);
+            if through <= self.since {
+                return true;
+            }
+            self.discard_through(through);
+            self.entries.shrink_to_fit();
+            if self.bytes() <= bytes {
+                return true;
+            }
+        }
+    }
+
+    /// The commit through which dropping the counts leaves at most `bytes`, keys and
+    /// unknown ranges that only those counts hold included.
+    fn through_for(&self, bytes: u64) -> u64 {
         // the commit of each key's latest count: dropping the counts through that
         // commit frees the key
         let mut last = vec![0u64; self.keys.len()];
@@ -327,11 +354,6 @@ impl Tally {
         let mut left = self.entries.len() as u64 * ENTRY_BYTES
             + self.key_bytes
             + self.unknown.len() as u64 * RANGE_BYTES;
-        if left <= bytes {
-            // only spare capacity passes the budget
-            self.entries.shrink_to_fit();
-            return false;
-        }
         let mut through = self.since;
         for (c, b) in freed_by {
             left = left.saturating_sub(b);
@@ -340,8 +362,7 @@ impl Tally {
                 break;
             }
         }
-        self.discard_through(through);
-        true
+        through
     }
 
     /// Forget the keys no entry names.
@@ -362,6 +383,7 @@ impl Tally {
             .map(|(i, k)| (k.clone(), i as u32))
             .collect();
         self.key_bytes = keys.iter().map(|k| key_bytes(k)).sum();
+        keys.shrink_to_fit();
         self.keys = keys;
     }
 
@@ -584,6 +606,20 @@ mod tests {
         assert!(t.entries.capacity() < 128, "{}", t.entries.capacity());
         assert!(t.bytes() <= 8 << 10, "{}", t.bytes());
         assert_eq!(t.since, 1);
+    }
+
+    #[test]
+    fn a_small_drop_meets_the_budget() {
+        let mut t = Tally::new(vec![0], 0);
+        let k = t.intern(vec![iri("a")]);
+        for c in 1..=4 {
+            t.entries.push_back((c, k, 1));
+        }
+        let budget = t.bytes() - ENTRY_BYTES;
+        assert!(t.shrink_to(budget));
+        assert!(t.bytes() <= budget, "{} over {budget}", t.bytes());
+        assert_eq!(t.since, 1);
+        assert_eq!(t.counts(1, 4).get(&[iri("a")]), 3);
     }
 
     #[test]

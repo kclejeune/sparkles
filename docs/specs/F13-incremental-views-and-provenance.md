@@ -1134,14 +1134,16 @@ the circuits.
   evaluates the query once. An internal circuit's state over its budget fails the
   circuit with `over-budget`. An accumulator's counts that pass the rest of the budget
   drop the oldest commits' counts first, with the keys and unknown ranges only they
-  hold, which moves the commit the counts start after. A recovered checkpoint is held to
-  the budget of the attach that loads it.
+  hold, which moves the commit the counts start after. The counts' storage is charged
+  at its capacity and shrinks after such a drop. A recovered checkpoint is held to the
+  budget of the attach that loads it.
 - Checkpoints are `circuits/{id}/main/state-{commit}.bin`
   (`formats::INTERNAL_CIRCUIT_STATE`, version 1), with the view checkpoint's header under
   the magic `SPKCIRC\0`. The body holds the circuit's state as a view checkpoint does,
   then the accumulator's starting commit, unknown ranges, keys as vocabulary keys and
-  counts. They are written with the views' checkpoints and when a circuit is collected.
-  The fingerprint covers the compiler version, the id, the normalized query, the access
+  counts. They are written with the views' checkpoints and when a circuit is
+  collected. A build always marks its state for the next one, so a build at commit 0
+  of a new store is checkpointed too. The fingerprint covers the compiler version, the id, the normalized query, the access
   and the sink, so a changed spec builds the circuit again. A file of another format is
   left in place and the circuit is built from the data, which a test checks. A
   checkpoint is never written over a file of another format at the same commit, for
@@ -1207,6 +1209,17 @@ that no module under `http`, `mcp` or `auth` names `InternalAccess`.
 defines views on every store before the writes. `async:N` defines N table views over the
 writers' literal predicate, each its own circuit. `commit:Q` and `graph:N` are refused
 until items 421 and 420 add commit-time maintenance and graph views.
+
+**Measurements.** Namespace screens compared release builds of 04d49b57 and of the
+item's code, both built on atlas, on 8-vCPU instances with 1.05M triples. The commit path
+and the query path did not change. The query screen of 30 queries in four rounds gave a
+geometric mean of 1.007. Its one flagged query, `two-hop-count`, took 1.048 times as
+long over 12 rounds with every round between 1.02 and 1.08, which item NEW-ITEM-1 checks
+on forge. Over six write rounds without views, `serial-literal` ran at 0.995 times the
+transactions per second with a p99 of 1.013, and `writers` at 0.992 with a p99 of 1.028.
+With four table views over the written predicate, four rounds gave 0.997 for
+`serial-literal` and 0.978 for `writers`, with ranges that overlap. The raw runs are kept
+under `.artifacts/nsc-bench` and `.artifacts/nsc-writes` of the lane's worktree.
 
 ### Maintained assessments and conservative dependencies
 

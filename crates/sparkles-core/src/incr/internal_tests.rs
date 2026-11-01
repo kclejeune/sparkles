@@ -760,3 +760,33 @@ fn a_build_at_commit_zero_is_checkpointed() {
     rt.round(&s);
     assert_eq!(counts(&c, 0), feed_counts(&s, 0));
 }
+
+/// A run of commits that the worker applies at once is held to the budget after each
+/// commit, so the counts never grow far past it before the run ends.
+#[test]
+fn a_long_run_keeps_to_the_budget_at_each_commit() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let budget = 16 << 10;
+    let c = rt
+        .attach_internal(
+            &s,
+            InternalSpec::accumulator("facts", FACTS, ["s"]).with_memory(budget),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    for i in 0..2000 {
+        upd(&s, &format!("INSERT DATA {{ :r{i} :age {i} }}"));
+    }
+    rt.round(&s);
+    assert_eq!(c.commit(), s.snapshot().commit);
+    assert!(c.bytes() <= budget, "{}", c.bytes());
+    let peak = c.tally_peak();
+    assert!(
+        peak <= budget + (4 << 10),
+        "the counts reached {peak} bytes"
+    );
+    let n = c.counts(0).unwrap();
+    assert!(n.unknown.is_some(), "the oldest counts were dropped");
+}

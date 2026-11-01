@@ -172,6 +172,12 @@ impl InternalCircuit {
         st.circuit.bytes() + st.tally.as_ref().map_or(0, Tally::bytes)
     }
 
+    /// The most memory the counts took right after a commit was counted.
+    #[cfg(test)]
+    pub(crate) fn tally_peak(&self) -> u64 {
+        self.cell.state.lock().tally.as_ref().map_or(0, |t| t.peak)
+    }
+
     /// Evaluate the circuit again from scratch on the next round, lifting a failure.
     /// An accumulator keeps its counts and records the commits since its last pass as
     /// unknown.
@@ -499,8 +505,14 @@ impl Runtime {
         from: u64,
         control: &Control,
     ) -> Result<()> {
-        let InternalSlot { circuit, tally, .. } = st;
+        let InternalSlot {
+            circuit,
+            tally,
+            dirty,
+            ..
+        } = st;
         let tally = tally.as_mut().expect("an accumulator");
+        let max = circuit.max_memory_bytes.unwrap_or(u64::MAX);
         let Some(mut steps) = DeltaSet::steps(store, from, control) else {
             let snap = store.snapshot();
             circuit.reset(&DeltaSet::at(snap.clone()), control)?;
@@ -516,6 +528,18 @@ impl Runtime {
                     let snap = d.snapshot.clone();
                     let terms = &circuit.terms;
                     tally.add(at, &c, |i| terms.term(&snap, i));
+                    // the budget holds after each commit of a run, not only at its end
+                    let state = circuit.bytes();
+                    if state > max {
+                        return Err(Error::BudgetExceeded(crate::error::Budget {
+                            kind: crate::error::BudgetKind::Memory,
+                            limit: max,
+                            requested: state,
+                        }));
+                    }
+                    if tally.shrink_to(max - state) {
+                        *dirty = true;
+                    }
                 }
                 Advance::Reset(_) => tally.lose(d.after + 1, at),
             }
