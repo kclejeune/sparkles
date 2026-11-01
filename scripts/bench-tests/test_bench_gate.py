@@ -556,6 +556,23 @@ class GateTests(unittest.TestCase):
                 return run("native-digest", q, f, "--data", data).stdout
             self.assertIn("missing 0", native("a"))
             self.assertIn("missing 1", native("z"))
+            # several answers in one call give a line each, in order, and the check against
+            # the input of a repeated answer still holds for a changed one between them
+            files = []
+            for i, s_ in enumerate(["a", "z", "a"]):
+                g = Path(d) / f"timed-{i}.json"
+                g.write_text(json.dumps({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [
+                    [{"type": "uri", "value": s_}, {"type": "uri", "value": "p"},
+                     {"type": "literal", "value": "x", "xml:lang": "en"}]],
+                    "meta": {"timing": {"execMs": i}}}))
+                files.append(g)
+            files.append(Path(d) / "absent.json")
+            lines = run("native-digest", q, *files, "--data", data).stdout.splitlines()
+            self.assertEqual(len(lines), 4)
+            self.assertEqual(lines[0], lines[2])
+            self.assertIn("missing 0", lines[0])
+            self.assertIn("missing 1", lines[1])
+            self.assertEqual(lines[3], "unreadable")
 
 
 if __name__ == "__main__":

@@ -781,20 +781,21 @@ def build_config_cmd(args):
 
 
 def native_digest(args):
-    """A digest of an application/x-sparkles+json SELECT answer, for the matrix's check of
-    the timed format after the timed requests: "<rows> rows, <digest of the sorted rows>"
-    and, for a query with a top-level ORDER BY, the order digest of `order-digest` over the
-    rows as returned. Terms are written with their type, value, datatype and language."""
+    """A digest of each application/x-sparkles+json SELECT answer in `args.responses`, one
+    line each in order, for the matrix's check of the timed format after the timed
+    requests: "<rows> rows, <digest of the sorted rows>" and, for a query with a top-level
+    ORDER BY, the order digest of `order-digest` over the rows as returned. Terms are
+    written with their type, value, datatype and language. The answers of one query share
+    one process, and the check against the input runs once for each distinct set of rows."""
     root = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location("bench_answers", root / "bench-answers.py")
     ba = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ba)
     query = Path(args.query).read_text()
-    try:
-        r = json.loads(Path(args.response).read_text())
-    except (OSError, ValueError):
-        print("unreadable")
-        return
+    ordered = ba._after_order_by(query) is not None
+    # the number of missing triples of each distinct sorted answer, which depends only on it
+    missing_of = {}
+
     def show(t):
         if t is None:
             return "-"
@@ -802,30 +803,41 @@ def native_digest(args):
             v = t["value"]
             return "<<" + " ".join(show(v[k]) for k in ("subject", "predicate", "object")) + ">>"
         return "|".join(str(t.get(k, "")) for k in ("type", "value", "datatype", "xml:lang"))
-    names = r.get("vars") or []
-    if r.get("queryType") == "ASK":
-        print(f"ask {r.get('boolean')}")
-        return
-    if any(len(row) != len(names) for row in r.get("rows") or []):
-        print("rows wider or narrower than vars")
-        return
-    rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
-    missing = None
-    if args.data and is_triple_export(query, names) and ba._after_order_by(query) is None:
-        missing = missing_triples([[native_nt(t) for t in row] for row in r.get("rows") or []], args.data)
-    # the query type and the projected variables, in order, belong to the answer
-    head = f"{r.get('queryType')} " + " ".join(names)
-    out = [f"{len(rows)} rows", "schema " + hashlib.sha256(head.encode()).hexdigest()[:8],
-           f"distinct {len(set(rows))}" + ("" if missing is None else f" missing {missing}"),
-           hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()[:16]]
-    if ba._after_order_by(query) is not None:
-        keys = ba.order_keys(query, set(names))
-        h = hashlib.sha256()
-        for row in r.get("rows") or []:
-            cells = [row[names.index(k)] for k in keys] if keys else row
-            h.update("\t".join(show(t) for t in cells).encode() + b"\n")
-        out.append(("keys:" if keys else "rows:") + h.hexdigest()[:16])
-    print(", ".join(out))
+
+    def digest(response):
+        try:
+            r = json.loads(Path(response).read_text())
+        except (OSError, ValueError):
+            return "unreadable"
+        names = r.get("vars") or []
+        if r.get("queryType") == "ASK":
+            return f"ask {r.get('boolean')}"
+        if any(len(row) != len(names) for row in r.get("rows") or []):
+            return "rows wider or narrower than vars"
+        rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
+        # the query type and the projected variables, in order, belong to the answer
+        head = f"{r.get('queryType')} " + " ".join(names)
+        sorted_hash = hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()
+        missing = None
+        if args.data and is_triple_export(query, names) and not ordered:
+            if sorted_hash not in missing_of:
+                missing_of[sorted_hash] = missing_triples(
+                    [[native_nt(t) for t in row] for row in r.get("rows") or []], args.data)
+            missing = missing_of[sorted_hash]
+        out = [f"{len(rows)} rows", "schema " + hashlib.sha256(head.encode()).hexdigest()[:8],
+               f"distinct {len(set(rows))}" + ("" if missing is None else f" missing {missing}"),
+               sorted_hash[:16]]
+        if ordered:
+            keys = ba.order_keys(query, set(names))
+            h = hashlib.sha256()
+            for row in r.get("rows") or []:
+                cells = [row[names.index(k)] for k in keys] if keys else row
+                h.update("\t".join(show(t) for t in cells).encode() + b"\n")
+            out.append(("keys:" if keys else "rows:") + h.hexdigest()[:16])
+        return ", ".join(out)
+
+    for response in args.responses:
+        print(digest(response), flush=True)
 
 
 def compilers_cmd(args):
@@ -901,7 +913,7 @@ def main():
     p.add_argument("binary")
     p = sub.add_parser("native-digest")
     p.add_argument("query")
-    p.add_argument("response")
+    p.add_argument("responses", nargs="+", help="the answers to the query, one output line each")
     p.add_argument("--data", help="the N-Triples input, to check three-column unordered answers against")
     p = sub.add_parser("build-config")
     p.add_argument("name", nargs="?", default="release", help="the Cargo profile")

@@ -16,10 +16,9 @@
 # order-digest`, it is run with the query file and the TSV answer, and its output, a digest
 # of the ORDER BY keys in the returned order or "-", is a fifth column of answers.tsv. With
 # WARM_DIGEST set to a command, such as `python3 scripts/bench-gate.py native-digest`, it is
-# run with the query file and every timed response, after each query's timed requests, and
-# results/warm-answers.tsv gets its output, so that the timed format's answers are checked
-# too. A response byte-identical to one already digested for the same query reuses that
-# digest. Progress goes to results/progress.log and results/done marks the end.
+# run with the query file and the query's timed responses, after its timed requests, and
+# prints a line for each; results/warm-answers.tsv gets them, so that the timed format's
+# answers are checked too. Progress goes to results/progress.log and results/done marks the end.
 #
 # With SPIN=1 (the default), a busy loop at the lowest priority (SCHED_IDLE) runs on the
 # server and client CPUs during the timed part. It keeps their vCPUs from halting between
@@ -60,8 +59,6 @@ trap 'fail "line $LINENO"' ERR
 # dynamically linked one (DYNAMIC_A, DYNAMIC_B) runs under this image's loader.
 # BIN[v] is the command that runs variant v.
 declare -A BIN
-# DIGESTS caches WARM_DIGEST output by query and response hash.
-declare -A DIGESTS=()
 for v in A B; do
   d=DYNAMIC_$v
   if [ "${!d:-1}" = 1 ]; then BIN[$v]="/lib64/ld-linux-x86-64.so.2 $v/sparkles"; else BIN[$v]=$v/sparkles; fi
@@ -226,19 +223,16 @@ for round in $(seq "$ROUNDS"); do
         [ -z "${WARM_DIGEST:-}" ] || mv -f resp.json "timed-$rep.json" 2> /dev/null || :
       done
       if [ -n "${WARM_DIGEST:-}" ]; then
+        # one process digests all of the query's timed answers, one line each in order, so
+        # that a large answer's check against the input runs once per distinct answer
+        files=()
+        for rep in $(seq "$REPS"); do files+=("timed-$rep.json"); done
+        # shellcheck disable=SC2086
+        mapfile -t digests < <($WARM_DIGEST "queries/$q.rq" "${files[@]}" || :)
         for rep in $(seq "$REPS"); do
-          # byte-identical responses to the same query have the same digest, so each
-          # distinct response is digested once per run of this script
-          key=missing
-          [ ! -f "timed-$rep.json" ] || key=$(sha256sum < "timed-$rep.json" | cut -c1-64)
-          key="$q/$key"
-          if [ -z "${DIGESTS[$key]+set}" ]; then
-            # shellcheck disable=SC2086
-            DIGESTS[$key]=$($WARM_DIGEST "queries/$q.rq" "timed-$rep.json")
-          fi
-          printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$v" "$q" "$rep" "${DIGESTS[$key]}" >> "$R/warm-answers.tsv"
-          rm -f "timed-$rep.json"
+          printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$v" "$q" "$rep" "${digests[$((rep - 1))]:-no digest}" >> "$R/warm-answers.tsv"
         done
+        rm -f "${files[@]}"
       fi
     done
     stop_server
