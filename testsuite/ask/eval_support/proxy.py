@@ -1,8 +1,8 @@
-"""A loopback proxy and a cost ledger for paid Anthropic evaluation runs.
+"""A loopback proxy and a cost ledger for paid Anthropic and OpenAI evaluation runs.
 
 The proxy alone holds the API key. Children of the evaluator hold a random token
-and reach this proxy, which forwards each request once to the Messages API over
-the standard library's HTTP client. Every upstream request first writes a reserve
+and reach this proxy, which forwards each request once to the provider's Messages
+or Chat Completions API over the standard library's HTTP client. Every upstream request first writes a reserve
 line to an append-only ledger, and the reply settles it. The ledger is the
 authority for the local cost cap, and a restart replays it, so a crash cannot
 lower the recorded liability.
@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import secrets
 import socket
 import ssl
@@ -24,12 +25,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from evaluator import Invalid, strict_json
 
-LEDGER_VERSION = 2
-# The most one ledger may hold, its cap and carryover together, in nanodollars. The
-# person who pays sets each campaign's total, and a campaign may use several ledgers,
-# each in its own directory. USD 25 bounded the first campaign of 2026-10-15 to
-# 2026-10-19. The campaign of 2026-10-24 has USD 90 over ledgers of USD 50 and 30.
-HARD_CAP = 50 * 10**9
+# Version 3 names the provider whose wallet the ledger holds. A version 2 ledger
+# predates OpenAI runs and is read as an Anthropic ledger.
+LEDGER_VERSION = 3
+# The most one ledger may hold, its cap and carryover together, in nanodollars, for
+# each provider's wallet. The person who pays sets each campaign's total, and a
+# campaign may use several ledgers, each in its own directory. USD 25 bounded the
+# first campaign of 2026-10-15 to 2026-10-19. The campaign of 2026-10-24 has USD 90
+# over ledgers of USD 50 and 30. The OpenAI wallet of 2026-11-01 is USD 40.
+HARD_CAPS = {"anthropic": 50 * 10**9, "openai": 40 * 10**9}
+HARD_CAP = HARD_CAPS["anthropic"]
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache
@@ -65,7 +70,37 @@ ALLOWED_FIELDS = {
     "metadata",
     "thinking",
 }
-REPLY_HEADERS = ("content-type", "retry-after", "request-id")
+REPLY_HEADERS = ("content-type", "retry-after", "request-id", "x-request-id")
+
+OPENAI_MODELS = ("gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol")
+# Integer USD nanodollars per token as input, 30 minute cache write, 12 hour cache
+# write, cache read and output. A second row applies above 272000 prompt tokens.
+# Source: OpenAI's API pricing page, https://developers.openai.com/api/docs/pricing,
+# standard tier, read on 2026-11-01, and its prompt caching guide,
+# https://developers.openai.com/api/docs/guides/prompt-caching, read the same day.
+# GPT-6 Luna is $0.10 input, $0.01 cached input and $0.50 output per million up to
+# 272K input tokens, and $0.20, $0.02 and $0.75 above. GPT-6.1 Terra is $1, $0.05 and
+# $5, and $2, $0.10 and $7.50 above. GPT-6.1 Sol is $2, $0.10 and $10, and $4, $0.20
+# and $15 above. A 30 minute cache write is 1.25 times input and a 12 hour one 2.5
+# times. Reasoning tokens are billed as output. A test pins this table.
+OPENAI_RATES = {
+    OPENAI_MODELS[0]: ((100, 125, 250, 10, 500), (200, 250, 500, 20, 750)),
+    OPENAI_MODELS[1]: ((1000, 1250, 2500, 50, 5000), (2000, 2500, 5000, 100, 7500)),
+    OPENAI_MODELS[2]: ((2000, 2500, 5000, 100, 10000), (4000, 5000, 10000, 200, 15000)),
+}
+OPENAI_LONG_CONTEXT = 272000
+OPENAI_FIELDS = {
+    "model",
+    "messages",
+    "max_completion_tokens",
+    "reasoning_effort",
+    "response_format",
+    "temperature",
+    "top_p",
+    "stream",
+    "service_tier",
+}
+OPENAI_ROLES = {"system", "developer", "user", "assistant"}
 
 
 class CapExceeded(Invalid):
@@ -236,6 +271,55 @@ def cost(model, usage, limit=0):
     return max(limit, exact * UNKNOWN_PREMIUM)
 
 
+def openai_bound(model, body_len, max_tokens):
+    """An upper bound on one Chat Completions request's cost from its size alone.
+
+    The input is bounded as for Anthropic. Any input token can be written to the
+    prompt cache, which OpenAI does by default with the 30 minute TTL, the only one
+    Chat Completions offers, so the input is bounded at that write rate. Reasoning
+    tokens count in `max_completion_tokens` and are billed as output.
+    """
+    rates = OPENAI_RATES[model]
+    input_rate = max(max(r[0], r[1]) for r in rates)
+    output_rate = max(r[4] for r in rates)
+    return (2 * body_len + 8192) * input_rate + max_tokens * output_rate
+
+
+def openai_cost(model, usage, limit=0, service_tier=None):
+    """The cost in nanodollars of one Chat Completions reply, or None when its usage
+    cannot be read.
+
+    `prompt_tokens` holds the cached reads and the cache writes that its
+    `prompt_tokens_details` reports. A reply that does not report its writes is
+    charged every uncached input token at the write rate. A reply served by another
+    tier than the default is charged at least `limit` and the largest premium.
+    """
+    if not isinstance(usage, dict) or model not in OPENAI_RATES:
+        return None
+    try:
+        prompt, out = count(usage.get("prompt_tokens")), count(usage.get("completion_tokens"))
+        details = usage.get("prompt_tokens_details")
+        if details is None:
+            details = {}
+        if not isinstance(details, dict):
+            return None
+        read = count(details.get("cached_tokens") or 0)
+        if details.get("cache_write_tokens") is None:
+            written = prompt - read
+        else:
+            written = count(details["cache_write_tokens"])
+    except ValueError:
+        return None
+    plain = prompt - read - written
+    if plain < 0:
+        return None
+    rates = OPENAI_RATES[model][int(prompt > OPENAI_LONG_CONTEXT)]
+    exact = plain * rates[0] + written * rates[1] + read * rates[3] + out * rates[4]
+    if service_tier in (None, "default"):
+        return exact
+    return max(limit, exact * UNKNOWN_PREMIUM)
+
+
 def has_key(value, name):
     if isinstance(value, dict):
         return name in value or any(has_key(v, name) for v in value.values())
@@ -274,9 +358,13 @@ class Ledger:
     and names the evidence for that amount.
     """
 
-    def __init__(self, path, cap, carryover=None):
+    def __init__(self, path, cap, carryover=None, provider="anthropic"):
         self.path = pathlib.Path(path)
         self.cap = cap
+        if provider not in HARD_CAPS:
+            raise Invalid("unknown provider")
+        self.provider, self.hard_cap = provider, HARD_CAPS[provider]
+        self.rates = RATES if provider == "anthropic" else OPENAI_RATES
         self.mutex = threading.Lock()
         self.reserved, self.settled, self.next_id = {}, 0, 1
         self.carryover = 0
@@ -292,7 +380,7 @@ class Ledger:
         self.holds = {}
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise Invalid("absolute ledger path required")
-        if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > HARD_CAP:
+        if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > self.hard_cap:
             raise Invalid("the cap and the carryover together pass the hard cap")
         self.lock = self.path.with_name(self.path.name + ".lock")
         self.lock_fd = self.acquire_lock()
@@ -302,7 +390,9 @@ class Ledger:
                 self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600
             )
             if fresh:
-                self.write({"ledger": LEDGER_VERSION, "capNanodollars": cap})
+                self.write(
+                    {"ledger": LEDGER_VERSION, "provider": provider, "capNanodollars": cap}
+                )
                 self.sync_directory()
                 if carryover:
                     self.write(
@@ -372,10 +462,21 @@ class Ledger:
 
     def apply(self, lines, carryover):
         head = strict_json(lines[0]) if lines else None
-        if not isinstance(head, dict) or head.get("ledger") != LEDGER_VERSION:
+        version = head.get("ledger") if isinstance(head, dict) else None
+        if version == 2 and head.keys() == {"ledger", "capNanodollars"}:
+            provider = "anthropic"
+        elif version == LEDGER_VERSION and head.keys() == {
+            "ledger",
+            "provider",
+            "capNanodollars",
+        }:
+            provider = head["provider"]
+        else:
             # Version 1 had no reconcile lines and no times, and no paid run wrote
             # one, so this reader refuses it like any other unknown version.
             raise Invalid("unknown ledger version")
+        if provider != self.provider:
+            raise Invalid("the ledger holds another provider's wallet")
         if head.get("capNanodollars") != self.cap:
             raise Invalid("the ledger has a different cap")
         seen = None
@@ -396,7 +497,7 @@ class Ledger:
             elif line.get("op") == "reserve":
                 ident = request_id(line["id"])
                 amount(line["bound"])
-                if line["model"] not in RATES:
+                if line["model"] not in self.rates:
                     raise Invalid("a reserve names an unknown model")
                 if ident in self.reserved or ident in self.charges:
                     raise Invalid("a reserve id repeats")
@@ -572,7 +673,7 @@ class Ledger:
             raise Invalid(
                 "the billed amount is above the held charge, see --allow-raise"
             )
-        if self.spent() + billed - previous > HARD_CAP:
+        if self.spent() + billed - previous > self.hard_cap:
             raise Invalid("the reconciled ledger would pass the hard cap")
         if target == "carryover":
             self.carryover += billed - previous
@@ -627,6 +728,7 @@ class Ledger:
             return {
                 "ledger": str(self.path),
                 "ledgerVersion": LEDGER_VERSION,
+                "provider": self.provider,
                 "capNanodollars": self.cap,
                 "carryoverNanodollars": self.carryover,
                 "settledNanodollars": self.settled,
@@ -678,7 +780,7 @@ def decode_body(headers, data):
         return data
 
 
-def clean_key(raw):
+def clean_key(raw, name="ANTHROPIC_API_KEY"):
     """Strip the key once at read time and refuse one that cannot be a header value.
 
     A secret manager can leave a trailing newline. A control character inside the key
@@ -687,18 +789,227 @@ def clean_key(raw):
     """
     key = (raw or "").strip()
     if not key:
-        raise Invalid("ANTHROPIC_API_KEY is not set")
+        raise Invalid(f"{name} is not set")
     if not key.isascii() or not key.isprintable() or any(c.isspace() for c in key):
-        raise Invalid("ANTHROPIC_API_KEY holds whitespace or control characters")
+        raise Invalid(f"{name} holds whitespace or control characters")
     return key
+
+
+def text_messages(body):
+    """Whether every message of an Anthropic body holds text alone."""
+    return text_content(body.get("system", "")) and not any(
+        not isinstance(m, dict)
+        or m.keys() - {"role", "content"}
+        or not text_content(m.get("content"))
+        for m in body.get("messages") or [None]
+    )
+
+
+class AnthropicAPI:
+    """The Messages API: its route, headers, request checks, bound and cost."""
+
+    name = "anthropic"
+    host = "api.anthropic.com"
+    path = "/v1/messages"
+    key_env = "ANTHROPIC_API_KEY"
+    models = MODELS
+    rates = RATES
+    dropped_headers = (
+        "anthropic-ratelimit",
+        "anthropic-organization",
+        "anthropic-workspace",
+        "request-id",
+        "x-api-key",
+        "set-cookie",
+    )
+
+    def headers(self, key):
+        return {
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "accept-encoding": "identity",
+            "x-api-key": key,
+        }
+
+    def child_token(self, headers):
+        return headers.get("x-api-key", "")
+
+    def prepare(self, body, proxy):
+        if body.keys() - ALLOWED_FIELDS:
+            raise Refused("unsupported request field, tools are not allowed")
+        max_tokens = body.get("max_tokens")
+        if body.get("model") not in proxy.models:
+            raise Refused("model not allowed")
+        if type(max_tokens) is not int or not 0 < max_tokens <= proxy.max_output_tokens:
+            raise Refused("max_tokens out of range")
+        if not text_messages(body):
+            # Only text bodies keep the byte-based bound valid. An image can cost
+            # more tokens than its bytes.
+            raise Refused("only text content is allowed")
+        # a cache breakpoint anywhere else, such as in the output schema, is refused
+        if has_key(
+            {k: v for k, v in body.items() if k not in ("system", "messages")},
+            "cache_control",
+        ):
+            raise Refused("unsupported cache control")
+        cache_ttl(body)
+        body["stream"] = False
+        if proxy.effort:
+            config = body.setdefault("output_config", {})
+            if not isinstance(config, dict):
+                raise Refused("output_config must be an object")
+            config.setdefault("effort", proxy.effort)
+        return body
+
+    def bound(self, model, payload_len, body):
+        return bound(model, payload_len, body["max_tokens"], cache_ttl(body))
+
+    def cost(self, model, reply, limit):
+        usage = reply.get("usage") if isinstance(reply, dict) else None
+        return cost(model, usage, limit), usage
+
+    def served(self, model, reply):
+        return reply.get("model") == model
+
+    def provider(self, port, proxy):
+        return {"kind": "anthropic", "endpoint": f"http://127.0.0.1:{port}"}
+
+    def preflight_request(self, name, proxy):
+        return {
+            "model": name,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Reply with ok true."}],
+            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
+        }
+
+    def reply_text(self, reply):
+        return "".join(
+            b.get("text", "") for b in reply["content"] if b.get("type") == "text"
+        )
+
+
+class OpenAIAPI:
+    """The Chat Completions API: its route, headers, request checks, bound and cost.
+
+    Requests carry text messages and a structured-output format, never tools or
+    explicit cache options, so OpenAI's default prompt caching with its 30 minute TTL
+    applies. Every request asks for the default service tier.
+    """
+
+    name = "openai"
+    host = "api.openai.com"
+    path = "/v1/chat/completions"
+    key_env = "OPENAI_API_KEY"
+    models = OPENAI_MODELS
+    rates = OPENAI_RATES
+    dropped_headers = (
+        "openai-organization",
+        "openai-project",
+        "x-ratelimit",
+        "x-request-id",
+        "authorization",
+        "set-cookie",
+    )
+
+    def headers(self, key):
+        return {
+            "content-type": "application/json",
+            "accept-encoding": "identity",
+            "authorization": "Bearer " + key,
+        }
+
+    def child_token(self, headers):
+        value = headers.get("authorization", "")
+        return value[len("Bearer ") :] if value.startswith("Bearer ") else ""
+
+    def prepare(self, body, proxy):
+        if body.keys() - OPENAI_FIELDS:
+            raise Refused("unsupported request field, tools are not allowed")
+        if body.get("model") not in proxy.models:
+            raise Refused("model not allowed")
+        max_tokens = body.get("max_completion_tokens")
+        if type(max_tokens) is not int or not 0 < max_tokens <= proxy.max_output_tokens:
+            raise Refused("max_completion_tokens out of range")
+        messages = body.get("messages")
+        if (
+            not isinstance(messages, list)
+            or not messages
+            or any(
+                not isinstance(m, dict)
+                or m.keys() != {"role", "content"}
+                or m["role"] not in OPENAI_ROLES
+                or not isinstance(m["content"], str)
+                for m in messages
+            )
+        ):
+            raise Refused("only text content is allowed")
+        fmt = body.get("response_format")
+        if fmt is not None and (
+            not isinstance(fmt, dict) or fmt.get("type") not in ("json_schema", "json_object")
+        ):
+            raise Refused("unsupported response format")
+        if body.get("service_tier", "default") != "default":
+            raise Refused("only the default service tier is allowed")
+        effort = body.get("reasoning_effort")
+        if effort is not None and not isinstance(effort, str):
+            raise Refused("reasoning_effort must be a string")
+        body["stream"] = False
+        body["service_tier"] = "default"
+        if proxy.effort:
+            body.setdefault("reasoning_effort", proxy.effort)
+        return body
+
+    def bound(self, model, payload_len, body):
+        return openai_bound(model, payload_len, body["max_completion_tokens"])
+
+    def cost(self, model, reply, limit):
+        if not isinstance(reply, dict):
+            return None, None
+        usage = reply.get("usage")
+        tier = reply.get("service_tier")
+        if tier is not None and not isinstance(tier, str):
+            tier = "unknown"
+        return openai_cost(model, usage, limit, tier), usage
+
+    def served(self, model, reply):
+        # OpenAI names the dated snapshot that served an alias.
+        served = reply.get("model")
+        return isinstance(served, str) and (
+            served == model or re.fullmatch(re.escape(model) + r"-\d{4}-\d{2}-\d{2}", served)
+        )
+
+    def provider(self, port, proxy):
+        out = {"kind": "openai", "endpoint": f"http://127.0.0.1:{port}/v1"}
+        if proxy.effort:
+            out["reasoningEffort"] = proxy.effort
+        return out
+
+    def preflight_request(self, name, proxy):
+        return {
+            "model": name,
+            "max_completion_tokens": min(2048, proxy.max_output_tokens),
+            "messages": [{"role": "user", "content": "Reply with ok true."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "Ping", "schema": SCHEMA, "strict": True},
+            },
+        }
+
+    def reply_text(self, reply):
+        return reply["choices"][0]["message"]["content"]
+
+
+ANTHROPIC, OPENAI = AnthropicAPI(), OpenAIAPI()
+APIS = {"anthropic": ANTHROPIC, "openai": OPENAI}
 
 
 class HTTPUpstream:
     """One standard-library request. It never retries, and http.client decodes the
     Content-Length, chunked and close-delimited framings alike."""
 
-    def __init__(self, key, host="api.anthropic.com", port=443, tls=True):
-        self.key, self.host, self.port, self.tls = key, host, port, tls
+    def __init__(self, key, host=None, port=443, tls=True, api=None):
+        self.api = api or ANTHROPIC
+        self.key, self.host, self.port, self.tls = key, host or self.api.host, port, tls
 
     def send(self, path, body, timeout):
         """Return (status, headers, body). Raise UpstreamFailure without a reply."""
@@ -732,12 +1043,7 @@ class HTTPUpstream:
                 "POST",
                 path,
                 body=body,
-                headers={
-                    "content-type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "accept-encoding": "identity",
-                    "x-api-key": self.key,
-                },
+                headers=self.api.headers(self.key),
             )
             reply = conn.getresponse()
             data = reply.read(RESPONSE_CAP + 1)
@@ -776,7 +1082,13 @@ class Proxy:
         effort="medium",
         timeout=120,
         replies=None,
+        api=None,
     ):
+        self.api = api or ANTHROPIC
+        if models is MODELS:
+            models = self.api.models
+        if set(models) - set(self.api.models) or ledger.provider != self.api.name:
+            raise Invalid("the models and the ledger must belong to the proxy's provider")
         self.ledger, self.upstream, self.key = ledger, upstream, key
         # A JSON-lines file of every forwarded request and its reply, with the key
         # redacted, so a run's answers can be diagnosed without calling a model again.
@@ -868,36 +1180,9 @@ class Proxy:
             body = strict_json(raw)
         except Invalid:
             raise Refused("request is not JSON") from None
-        if not isinstance(body, dict) or body.keys() - ALLOWED_FIELDS:
-            raise Refused("unsupported request field, tools are not allowed")
-        max_tokens = body.get("max_tokens")
-        if body.get("model") not in self.models:
-            raise Refused("model not allowed")
-        if type(max_tokens) is not int or not 0 < max_tokens <= self.max_output_tokens:
-            raise Refused("max_tokens out of range")
-        if not text_content(body.get("system", "")) or any(
-            not isinstance(m, dict)
-            or m.keys() - {"role", "content"}
-            or not text_content(m.get("content"))
-            for m in body.get("messages") or [None]
-        ):
-            # Only text bodies keep the byte-based bound valid. An image can cost
-            # more tokens than its bytes.
-            raise Refused("only text content is allowed")
-        # a cache breakpoint anywhere else, such as in the output schema, is refused
-        if has_key(
-            {k: v for k, v in body.items() if k not in ("system", "messages")},
-            "cache_control",
-        ):
-            raise Refused("unsupported cache control")
-        cache_ttl(body)
-        body["stream"] = False
-        if self.effort:
-            config = body.setdefault("output_config", {})
-            if not isinstance(config, dict):
-                raise Refused("output_config must be an object")
-            config.setdefault("effort", self.effort)
-        return body
+        if not isinstance(body, dict):
+            raise Refused("request is not an object")
+        return self.api.prepare(body, self)
 
     def handle(self, raw, case=None):
         """Forward one request. Return (status, headers, body) for the child."""
@@ -922,7 +1207,7 @@ class Proxy:
             return 400, [], error_body("invalid_request_error", str(refusal))
         model = body["model"]
         payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
-        limit = bound(model, len(payload), body["max_tokens"], cache_ttl(body))
+        limit = self.api.bound(model, len(payload), body)
         try:
             ident = self.ledger.reserve(model, limit, case)
         except CapExceeded:
@@ -937,7 +1222,7 @@ class Proxy:
     def forward(self, ident, model, limit, payload, case=None):
         try:
             status, headers, data = self.upstream.send(
-                "/v1/messages", payload, self.timeout
+                self.api.path, payload, self.timeout
             )
         except UpstreamFailure as failure:
             # A request that may have reached the server is charged at its bound.
@@ -951,7 +1236,9 @@ class Proxy:
             return 502, [], error_body("api_error", "the proxy failed")
         self.last_headers = headers
         passed = [(k, v) for k, v in headers if k.lower() in REPLY_HEADERS]
-        request_id = next((v for k, v in headers if k.lower() == "request-id"), None)
+        request_id = next(
+            (v for k, v in headers if k.lower() in ("request-id", "x-request-id")), None
+        )
         if not 200 <= status < 300:
             # The API does not bill an error reply, which is an assumption. A gateway
             # error after generation could be billed. The cap's margin absorbs it.
@@ -965,12 +1252,20 @@ class Proxy:
             reply = strict_json(data)
         except Invalid:
             reply = None
-        usage = reply.get("usage") if isinstance(reply, dict) else None
-        amount = cost(model, usage, limit)
+        amount, usage = self.api.cost(model, reply, limit)
+        # A reply from another model than the one asked for is charged at least its
+        # bound and never reaches the child as an answer.
+        mismatch = isinstance(reply, dict) and not self.api.served(model, reply)
+        if mismatch:
+            charged, status_text = max(limit, amount or 0), "served-model-mismatch"
+        elif amount is None:
+            charged, status_text = limit, "usage-unknown"
+        else:
+            charged, status_text = amount, "ok"
         self.ledger.settle(
             ident,
-            limit if amount is None else amount,
-            "ok" if amount is not None else "usage-unknown",
+            charged,
+            status_text,
             usage=usage if isinstance(usage, dict) else None,
             request_id=request_id,
         )
@@ -979,6 +1274,8 @@ class Proxy:
         )
         if reply is None:
             return 502, [], error_body("api_error", "the upstream reply is not JSON")
+        if mismatch:
+            return 502, [], error_body("api_error", "another model served the request")
         clean, _ = redact(reply, self.key)
         return status, passed, json.dumps(clean, ensure_ascii=False).encode()
 
@@ -1059,10 +1356,10 @@ class Proxy:
 
             def do_POST(self):
                 self.connection.settimeout(proxy.timeout + 30)
-                token = self.headers.get("x-api-key", "")
+                token = proxy.api.child_token(self.headers)
                 length = self.headers.get("Content-Length", "")
                 case = proxy.case_for(token) if token.isascii() else False
-                if self.path != "/v1/messages" or case is False:
+                if self.path != proxy.api.path or case is False:
                     return self.reply(
                         401, [], error_body("authentication_error", "bad route")
                     )
@@ -1097,8 +1394,7 @@ class Proxy:
         the first paid run did.
         """
         provider = {
-            "kind": "anthropic",
-            "endpoint": f"http://127.0.0.1:{self.server_port}",
+            **self.api.provider(self.server_port, self),
             "apiKey": {"secret": "evalgate"},
             "allowedModels": list(self.models),
             "models": {m: {} for m in self.models},
@@ -1131,55 +1427,41 @@ SCHEMA = {
 def preflight(proxy, upstream, timeout=30):
     """Check framing, authentication and every model before any evaluation spend.
 
-    Counting tokens costs nothing. Each configured model then gets one small request
-    with the same structured-output shape and effort that the run uses, through the
-    ledger like every other request. A model that the account cannot use, a parameter
-    it rejects or a reply that is not the requested JSON stops the run here, for a
-    fraction of a cent each. Returns the replies' status lines and header names and
-    values for the record, without the rate-limit, request and key-like headers.
+    For Anthropic, counting tokens costs nothing. Each configured model then gets one
+    small request with the same structured-output shape and effort that the run uses,
+    through the ledger like every other request. A model that the account cannot use,
+    a parameter it rejects or a reply that is not the requested JSON stops the run
+    here, for a fraction of a cent each. Returns the replies' status lines and header
+    names and values for the record, without the rate-limit, request and key-like
+    headers.
     """
-    model = proxy.models[0]
-    counted = upstream.send(
-        "/v1/messages/count_tokens",
-        json.dumps(
-            {"model": model, "messages": [{"role": "user", "content": "ping"}]}
-        ).encode(),
-        timeout,
-    )
-    if counted[0] != 200 or not isinstance(strict_json(counted[2]), dict):
-        raise Invalid("preflight token count failed")
+    api = proxy.api
 
     def keep(headers):
-        dropped = (
-            "anthropic-ratelimit",
-            "anthropic-organization",
-            "anthropic-workspace",
-            "request-id",
-            "x-api-key",
-            "set-cookie",
+        return [[k, v] for k, v in headers if not k.lower().startswith(api.dropped_headers)]
+
+    counted = None
+    if api is ANTHROPIC:
+        counted = upstream.send(
+            "/v1/messages/count_tokens",
+            json.dumps(
+                {"model": proxy.models[0], "messages": [{"role": "user", "content": "ping"}]}
+            ).encode(),
+            timeout,
         )
-        return [[k, v] for k, v in headers if not k.lower().startswith(dropped)]
+        if counted[0] != 200 or not isinstance(strict_json(counted[2]), dict):
+            raise Invalid("preflight token count failed")
 
     models = {}
     for name in proxy.models:
-        request = {
-            "model": name,
-            "max_tokens": 256,
-            "messages": [{"role": "user", "content": "Reply with ok true."}],
-            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
-        }
+        request = api.preflight_request(name, proxy)
         start = time.monotonic()
         status, _, body = proxy.handle(json.dumps(request).encode())
         if status != 200:
             raise Invalid(f"preflight failed for {name} with status {status}")
         try:
-            text = "".join(
-                b.get("text", "")
-                for b in strict_json(body)["content"]
-                if b.get("type") == "text"
-            )
-            valid = isinstance(strict_json(text), dict)
-        except (Invalid, KeyError, TypeError, AttributeError):
+            valid = isinstance(strict_json(api.reply_text(strict_json(body))), dict)
+        except (Invalid, KeyError, IndexError, TypeError, AttributeError):
             valid = False
         if not valid:
             raise Invalid(f"preflight reply of {name} is not the requested JSON")
@@ -1190,7 +1472,9 @@ def preflight(proxy, upstream, timeout=30):
         }
     first = models[proxy.models[0]]
     return {
-        "countTokens": {"status": counted[0], "headers": keep(counted[1])},
+        "countTokens": (
+            {"status": counted[0], "headers": keep(counted[1])} if counted else None
+        ),
         "message": first,
         "models": models,
     }

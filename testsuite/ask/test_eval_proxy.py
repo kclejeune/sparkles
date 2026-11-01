@@ -111,8 +111,14 @@ class Upstream:
         self.script, self.calls = list(script), []
 
     def send(self, path, body, timeout):
-        self.calls.append((path, json.loads(body)))
-        step = self.script.pop(0) if self.script else (200, [], BODY)
+        sent = json.loads(body)
+        self.calls.append((path, sent))
+        # By default the model asked for answers, as the API names it.
+        step = (
+            self.script.pop(0)
+            if self.script
+            else (200, [], json.dumps(dict(REPLY, model=sent.get("model"))).encode())
+        )
         if isinstance(step, Exception):
             raise step
         return step
@@ -1119,3 +1125,170 @@ class Requests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LUNA, TERRA, SOL = px.OPENAI_MODELS
+CHAT_REPLY = {
+    "id": "chatcmpl-x",
+    "object": "chat.completion",
+    "model": LUNA + "-2026-09-30",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": '{"ok":true}'},
+                 "finish_reason": "stop"}],
+    "usage": {
+        "prompt_tokens": 1000,
+        "completion_tokens": 40,
+        "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300},
+        "completion_tokens_details": {"reasoning_tokens": 30},
+    },
+    "service_tier": "default",
+}
+
+
+def chat(model=LUNA, **extra):
+    return json.dumps(
+        dict(
+            {
+                "model": model,
+                "messages": [{"role": "system", "content": "s"},
+                             {"role": "user", "content": "q"}],
+                "max_completion_tokens": 1024,
+                "response_format": {"type": "json_object"},
+            },
+            **extra,
+        )
+    ).encode()
+
+
+class OpenAI(Base):
+    def ledger(self, cap=10**10, carryover=None, name="ledger.jsonl"):
+        ledger = px.Ledger(self.root / name, cap, carryover, provider="openai")
+        self.addCleanup(ledger.close)
+        return ledger
+
+    def proxy(self, upstream, **kw):
+        ledger = kw.pop("ledger", None) or self.ledger()
+        return px.Proxy(ledger, upstream, KEY, px.OPENAI_MODELS, api=px.OPENAI, **kw)
+
+    def reply(self, **changes):
+        return (200, [("x-request-id", "req_1")], json.dumps(dict(CHAT_REPLY, **changes)).encode())
+
+    def test_the_rate_table_is_pinned(self):
+        # OpenAI's pricing page of 2026-11-01, standard tier, in nanodollars per token:
+        # input, 30 minute write, 12 hour write, cache read, output, up to 272K and above.
+        self.assertEqual(px.OPENAI_MODELS, ("gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol"))
+        self.assertEqual(px.OPENAI_LONG_CONTEXT, 272000)
+        self.assertEqual(
+            px.OPENAI_RATES,
+            {
+                LUNA: ((100, 125, 250, 10, 500), (200, 250, 500, 20, 750)),
+                TERRA: ((1000, 1250, 2500, 50, 5000), (2000, 2500, 5000, 100, 7500)),
+                SOL: ((2000, 2500, 5000, 100, 10000), (4000, 5000, 10000, 200, 15000)),
+            },
+        )
+        self.assertEqual(px.HARD_CAPS, {"anthropic": 50 * 10**9, "openai": 40 * 10**9})
+
+    def test_cost_splits_reads_writes_and_long_context(self):
+        u = CHAT_REPLY["usage"]
+        self.assertEqual(px.openai_cost(LUNA, u), 100 * 100 + 300 * 125 + 600 * 10 + 40 * 500)
+        self.assertEqual(px.openai_cost(SOL, u), 100 * 2000 + 300 * 2500 + 600 * 100 + 40 * 10000)
+        # unreported writes are all charged as writes
+        bare = {"prompt_tokens": 1000, "completion_tokens": 0}
+        self.assertEqual(px.openai_cost(TERRA, bare), 1000 * 1250)
+        long = {"prompt_tokens": 272001, "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
+        self.assertEqual(px.openai_cost(LUNA, long), 272001 * 200 + 750)
+        self.assertIsNone(px.openai_cost(LUNA, dict(u, prompt_tokens=10)))
+        self.assertIsNone(px.openai_cost(LUNA, dict(u, prompt_tokens_details=[])))
+        self.assertIsNone(px.openai_cost("claude-haiku-5-5", u))
+        # another tier is charged at least the bound and the largest premium
+        exact = px.openai_cost(LUNA, u)
+        self.assertEqual(px.openai_cost(LUNA, u, 10**9, "priority"), 10**9)
+        self.assertEqual(px.openai_cost(LUNA, u, 0, "flex"), exact * px.UNKNOWN_PREMIUM)
+
+    def test_a_request_is_checked_forwarded_and_settled(self):
+        upstream = Upstream(self.reply())
+        proxy = self.proxy(upstream, effort="medium")
+        status, headers, body = proxy.handle(chat())
+        self.assertEqual(status, 200)
+        path, sent = upstream.calls[0]
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertEqual((sent["reasoning_effort"], sent["service_tier"], sent["stream"]),
+                         ("medium", "default", False))
+        settle = [x for x in self.lines() if x.get("op") == "settle"][0]
+        self.assertEqual(settle["status"], "ok")
+        self.assertEqual(settle["cost"], px.openai_cost(LUNA, CHAT_REPLY["usage"]))
+        self.assertEqual(settle["requestId"], "req_1")
+        head = self.lines()[0]
+        self.assertEqual(head, {"ledger": 3, "provider": "openai", "capNanodollars": 10**10})
+
+    def test_refusals_cost_nothing(self):
+        upstream = Upstream()
+        proxy = self.proxy(upstream)
+        for raw in [
+            chat(model="gpt-4o"),
+            chat(max_completion_tokens=10**6),
+            chat(max_tokens=10),
+            chat(tools=[]),
+            chat(service_tier="priority"),
+            chat(prompt_cache_options={"mode": "explicit"}),
+            chat(messages=[{"role": "user", "content": [{"type": "image_url"}]}]),
+            chat(messages=[{"role": "tool", "content": "x"}]),
+            chat(response_format={"type": "text"}),
+        ]:
+            with self.subTest(raw=raw):
+                self.assertEqual(proxy.handle(raw)[0], 400)
+        self.assertEqual(upstream.calls, [])
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_another_served_model_is_charged_its_bound_and_refused(self):
+        proxy = self.proxy(Upstream(self.reply(model=TERRA)))
+        self.assertEqual(proxy.handle(chat())[0], 502)
+        settle = [x for x in self.lines() if x.get("op") == "settle"][0]
+        reserve = [x for x in self.lines() if x.get("op") == "reserve"][0]
+        self.assertEqual(settle["status"], "served-model-mismatch")
+        self.assertEqual(settle["cost"], reserve["bound"])
+        for served, ok in [(LUNA, True), (LUNA + "-2026-09-30", True),
+                           (LUNA + "-mini", False), (LUNA + "-2026-09-30x", False)]:
+            self.assertEqual(bool(px.OPENAI.served(LUNA, {"model": served})), ok, served)
+
+    def test_the_bound_covers_a_write_of_every_input_token(self):
+        u = {"prompt_tokens": 2 * 500 + 8192, "completion_tokens": 1024,
+             "prompt_tokens_details": {"cache_write_tokens": 2 * 500 + 8192}}
+        for model in px.OPENAI_MODELS:
+            self.assertGreaterEqual(px.openai_bound(model, 500, 1024), px.openai_cost(model, u))
+
+    def test_the_child_token_comes_from_the_bearer_header(self):
+        self.assertEqual(px.OPENAI.child_token({"authorization": "Bearer abc"}), "abc")
+        self.assertEqual(px.OPENAI.child_token({"x-api-key": "abc"}), "")
+        self.assertEqual(px.OPENAI.headers("k")["authorization"], "Bearer k")
+
+    def test_ledgers_keep_their_provider(self):
+        self.ledger().close()
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "ledger.jsonl", 10**10)  # read as an Anthropic ledger
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "other.jsonl", 40 * 10**9 + 1, provider="openai")
+        # a version 2 ledger is an Anthropic ledger
+        old = self.root / "old.jsonl"
+        old.write_text('{"ledger":2,"capNanodollars":5}\n')
+        px.Ledger(old, 5).close()
+        with self.assertRaises(Invalid):
+            px.Ledger(old, 5, provider="openai")
+        with self.assertRaises(Invalid):
+            px.Proxy(px.Ledger(self.root / "a.jsonl", 5), Upstream(), KEY, api=px.OPENAI)
+
+    def test_preflight_asks_each_model_for_the_schema(self):
+        upstream = Upstream(*[self.reply(model=m) for m in px.OPENAI_MODELS])
+        proxy = self.proxy(upstream, effort="medium")
+        result = px.preflight(proxy, upstream)
+        self.assertIsNone(result["countTokens"])
+        self.assertEqual([b["model"] for _, b in upstream.calls], list(px.OPENAI_MODELS))
+        self.assertTrue(all(b["response_format"]["json_schema"]["strict"] for _, b in upstream.calls))
+        self.assertNotIn("x-request-id", json.dumps(result))
+
+    def test_the_child_configuration_is_an_openai_reasoning_provider(self):
+        proxy = self.proxy(Upstream(), effort="medium")
+        proxy.server_port = 5
+        p = proxy.config(200000)["models"]["providers"]["evaluation"]
+        self.assertEqual((p["kind"], p["endpoint"], p["reasoningEffort"]),
+                         ("openai", "http://127.0.0.1:5/v1", "medium"))

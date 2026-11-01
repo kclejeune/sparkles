@@ -650,6 +650,17 @@ through one such child in a 16G systemd scope, holds each case's projected cost 
 its line is sent and keeps the outputs in question order. Caches stay warm across a
 phase's questions, which changes latency but not answers.
 
+`scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
+file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1
+Sol through the Chat Completions API under a USD 40 wallet of its own. The proxy prices
+OpenAI's cache reads and writes, checks the model that served each reply for both
+providers, and its ledger, now format version 3, names its provider. Model
+configurations take `reasoningEffort`, which an `openai` model sends as
+`reasoning_effort` with `max_completion_tokens` and an `anthropic` model as
+`output_config.effort`, and an OpenAI answer's cached and written prompt tokens count
+as cache reads and writes. Sonnet 5.5 cache reads cost $0.10 per million in the proxy,
+as the Console export billed them.
+
 The Ask evaluation scores under `rdf-term-set-projected-columns-v2`. An answer with more
 columns than the gold, such as a name beside each IRI, is projected onto the gold's
 columns and its rows compared as a set, where the first policy scored any extra column

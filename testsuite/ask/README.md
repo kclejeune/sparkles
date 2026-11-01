@@ -143,7 +143,7 @@ names its binary by absolute path and SHA256.
 ```
 python3 -I -B -m unittest discover -s testsuite/ask -p 'test_eval*.py'
 python3 -I -S -B scripts/eval-ask --self-test --sparkles /ABSOLUTE/sparkles
-scripts/eval-ask-anthropic --run RUN.json --dry-run
+scripts/eval-ask-paid --run RUN.json --dry-run
 ```
 
 `eval_support/grounding_recall.py SET RUN_DIR` measures grounding recall from a run's
@@ -174,7 +174,7 @@ own error result while the rest go on. A line's `modelSecrets` replace the
 the provider's concurrency, request spacing and daily token limits that every other
 line shares.
 
-`scripts/eval-ask-anthropic` asks each phase's cases through one such child, run in its
+`scripts/eval-ask-paid` asks each phase's cases through one such child, run in its
 own systemd user scope with 16G of memory and no swap. `--no-batch` asks each case in
 its own child as earlier runs did, and `scripts/eval-ask --batch` chooses the batch
 directly. Each case's line names its own gate token through a secret file, so the proxy
@@ -205,9 +205,11 @@ escapes it ends the whole batch child and fails the cases in flight with it.
 
 ## The cost cap
 
-`scripts/eval-ask-anthropic` starts a proxy on a loopback port and gives the children a
-random token in place of the key. Only the proxy reads `ANTHROPIC_API_KEY`. It sends
-each request once to `api.anthropic.com` with the standard library, so Content-Length,
+`scripts/eval-ask-paid` starts a proxy on a loopback port and gives the children a
+random token in place of the key. `scripts/eval-ask-anthropic` is the same command
+under its earlier name. Only the proxy reads `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`
+for a run file whose `provider` is `openai`, and neither key reaches a child. It sends
+each request once to `api.anthropic.com`, or to `api.openai.com` for OpenAI, with the standard library, so Content-Length,
 chunked and close-delimited replies all work. A reply that comes back gzip or deflate
 encoded, although the request asks for none, is decoded. It sets `stream` to false and
 the effort from the run file, and it refuses tools, cache control and any model outside
@@ -229,7 +231,9 @@ span several ledgers in separate directories. An error reply is free, a lost rep
 the bound, and any other fault of the request costs the bound. Replaying the ledger
 counts every unsettled reserve at its bound, and the pilot's unresolved $1.002560 is the
 carryover line. Reopening a ledger resumes it. Nothing resets it. The ledger's first line
-holds its format version, 2, and a reader refuses any other version.
+holds its format version, 3, and the provider whose wallet it holds. A reader reads a
+version 2 ledger, which predates OpenAI runs, as an Anthropic ledger, refuses a ledger
+of another provider than the run's and refuses any other version.
 
 Replay is strict. It refuses a cost or bound that is not a nonnegative integer, a request
 ID that is not a positive integer, a settle without its reserve, a repeated reserve, a
@@ -254,8 +258,8 @@ with its carryover when it does not exist yet. Both take the ledger's lock, so t
 cannot run while a paid run holds it.
 
 ```
-scripts/eval-ask-anthropic --run RUN.json --held
-scripts/eval-ask-anthropic --run RUN.json --reconcile carryover \
+scripts/eval-ask-paid --run RUN.json --held
+scripts/eval-ask-paid --run RUN.json --reconcile carryover \
   --billed-nanodollars 1600000 --evidence "Console cost of key K on 2026-10-15"
 ```
 
@@ -288,13 +292,37 @@ so it must not be kept for a private graph beyond the diagnosis and must never b
 copied into the repository as a fixture. The first paid run predates this file, so its empty drafts
 cannot be traced to the reply that produced them.
 
+## OpenAI runs
+
+A run file with `"provider": "openai"` asks `gpt-6-luna`, `gpt-6.1-terra` or
+`gpt-6.1-sol` through the Chat Completions API. The children get an `openai` provider
+with the run's effort as `reasoningEffort`, so their requests carry
+`reasoning_effort` and limit the output, reasoning included, with
+`max_completion_tokens`. The proxy accepts text messages and a JSON Schema or JSON
+object format and nothing else, so it refuses tools and explicit cache options. It asks
+for the default service tier and relies on OpenAI's default prompt caching, whose
+writes last 30 minutes. Ask's prompts keep the stable grounding before the question, so
+repairs read the prefix that the first draft wrote. One ledger holds at most USD 40 of
+the OpenAI wallet, apart from any Anthropic ledger.
+
+The rates come from OpenAI's pricing page and prompt caching guide of 2026-11-01. A
+reply is charged its uncached input, its cache writes at 1.25 times input, its cache
+reads and its output, reasoning included, at the rate above 272,000 prompt tokens when
+the prompt passes that. A reply that does not report its writes is charged every
+uncached input token as a write. A reply from another tier than the default is charged
+at least its bound. OpenAI names the dated snapshot that served a model, so a reply
+must name the model asked for or that name followed by a date. A reply from any other
+model is charged its bound and fails as a provider error. The preflight sends one
+structured-output request to each model, since Chat Completions has no free token
+count.
+
 ## A paid run
 
 `run.example.json` shows the run file. Copy it and set the paths. It holds the sets and
 the models of each set, the effort, `maxOutputTokens`, the request and Ask timeouts, the
 query timeout, the cap, the carryover, the ledger, the output directory and the binary
 with its SHA256. The carryover is required, zero for a fresh authorization, and the cap
-plus the carryover cannot pass USD 50. `clarifications` is `answer` unless the run file
+plus the carryover cannot pass USD 50, or USD 40 for an OpenAI run. `clarifications` is `answer` unless the run file
 sets `score`. `contextTokens` gives every model its context window. Without it the server
 assumes 8192 tokens, treats each model as a small one and trims the grounding to 30
 classes, 60 predicates, two examples and three candidates per mention, which is how the
@@ -317,7 +345,7 @@ A binary built from a named commit outside `docs/plans` is the one to use. After
 run passes, one command starts the run.
 
 ```
-fnox exec -- scripts/eval-ask-anthropic --run /ABSOLUTE/PATH/TO/run.json
+fnox exec -- scripts/eval-ask-paid --run /ABSOLUTE/PATH/TO/run.json
 ```
 
 A crash such as SIGKILL leaves `ledger.jsonl.lock` holding the owner's PID. The next start

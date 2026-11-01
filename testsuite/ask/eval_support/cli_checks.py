@@ -1,4 +1,4 @@
-"""Finite checks of the evaluator against a loopback Anthropic double.
+"""Finite checks of the evaluator against a loopback Anthropic or OpenAI double.
 
 The fake upstream deliberately supplies model text. These observations establish
 routing, accounting and failure handling, never real accuracy, spend, latency or
@@ -51,13 +51,18 @@ def need(value, message):
         raise Invalid(message)
 
 
+FAKE_CHAT_USAGE = {"prompt_tokens": 100, "completion_tokens": 40}
+
+
 class FakeAnthropic:
-    """A counted loopback stand-in for the Messages API.
+    """A counted loopback stand-in for the Messages API, or with `api="openai"` for
+    the Chat Completions API.
 
     `mode` picks the behavior. `framing` picks how a 200 reply is delimited.
     """
 
-    def __init__(self, qsets, framing="content-length"):
+    def __init__(self, qsets, framing="content-length", api="anthropic"):
+        self.api = px.APIS[api]
         self.questions = {}
         for qset in qsets:
             self.questions.update({q["question"]: q for q in qset["questions"]})
@@ -104,10 +109,25 @@ class FakeAnthropic:
             def do_POST(self):
                 size = int(self.headers.get("content-length", "0"))
                 raw = self.rfile.read(size)
-                need(self.headers.get("x-api-key") == FAKE_KEY, "upstream key")
-                if self.path == "/v1/messages/count_tokens":
+                chat = owner.api is px.OPENAI
+                need(owner.api.child_token(self.headers) == FAKE_KEY, "upstream key")
+                if self.path == "/v1/messages/count_tokens" and not chat:
                     return self.send_json(200, b'{"input_tokens": 8}')
+                need(self.path == owner.api.path, "upstream path")
                 body = strict_json(raw)
+                if chat:
+                    # The Chat Completions shape, read as the Messages one.
+                    msgs = body["messages"]
+                    system = "".join(m["content"] for m in msgs if m["role"] == "system")
+                    body = dict(
+                        body,
+                        system=system,
+                        messages=[m for m in msgs if m["role"] != "system"],
+                        output_config={
+                            **({"format": body["response_format"]} if "response_format" in body else {}),
+                            **({"effort": body["reasoning_effort"]} if "reasoning_effort" in body else {}),
+                        },
+                    )
                 output = body.get("output_config") or {}
                 owner.calls.append(
                     {
@@ -174,6 +194,25 @@ class FakeAnthropic:
                     if owner.mode == "structured" and owner.structured_failures == 0:
                         content = {}
                         owner.structured_failures += 1
+                if chat:
+                    out = json.dumps(
+                        {
+                            "id": "fake-chat",
+                            "object": "chat.completion",
+                            "model": body["model"],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": json.dumps(content)},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": FAKE_CHAT_USAGE,
+                            "service_tier": "default",
+                        }
+                    ).encode()
+                    owner.ok_models.append(body["model"])
+                    return self.send_json(200, out)
                 out = json.dumps(
                     {
                         "id": "fake-message",
@@ -194,7 +233,7 @@ class FakeAnthropic:
 
     def upstream(self):
         return px.HTTPUpstream(
-            FAKE_KEY, "127.0.0.1", self.server.server_port, tls=False
+            FAKE_KEY, "127.0.0.1", self.server.server_port, tls=False, api=self.api
         )
 
     def close(self):
