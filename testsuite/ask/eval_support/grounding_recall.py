@@ -1,6 +1,7 @@
 """Offline grounding recall of Ask prompts against gold queries.
 
 usage: grounding_recall.py SET_JSON RUN_DIR [RUN_DIR...] [--out OUT_JSON]
+       [--resource-namespace IRI ...]
 
 RUN_DIR is a run's output directory, which holds `replies.jsonl` and the set's
 `report.json` below it. For each answerable question it takes the last first-draft
@@ -11,8 +12,10 @@ namespace. The draft's own query and the
 repair prompts never count. No model is called. A dry run with the fake provider
 gives the same prompts as a paid run, so the metric can be computed for free.
 
-A resource is an IRI whose path holds `/resource/`, as DBpedia and Wikidata name
-entities, and every other IRI is a schema term. `rdf:type`, `rdfs:label`,
+A resource is an IRI under one of the namespaces that `--resource-namespace` or the
+set's `resourceNamespaces` names, such as `http://dbpedia.org/resource/` for DBpedia,
+and every other IRI is a schema term. Without any, the split is not reported and only
+whether every gold term reached the prompt is. `rdf:type`, `rdfs:label`,
 `foaf:name` and XSD datatypes are left out, since every prompt can use them.
 """
 
@@ -37,8 +40,8 @@ REPAIR = "Your previous query was:\n```sparql"
 PREFIX = r"(?:[A-Za-z](?:[\w.-]*[\w-])?)?"
 
 
-def is_resource(iri):
-    return "/resource/" in iri or iri.startswith("http://www.wikidata.org/entity/Q")
+def is_resource(iri, namespaces):
+    return any(iri.startswith(ns) for ns in namespaces)
 
 
 def prompt_text(request):
@@ -124,7 +127,7 @@ def prompt_prefixes(text):
     return dict(re.findall(r"^(" + PREFIX + r"): <([^<>\s]+)>$", text, re.M))
 
 
-def recall(qset, run_dir):
+def recall(qset, run_dir, namespaces=None):
     run_dir = pathlib.Path(run_dir)
     # The one report whose questions all belong to this set. A run of several sets
     # or several pairs is refused rather than mixed.
@@ -138,6 +141,7 @@ def recall(qset, run_dir):
         raise ValueError(f"{run_dir}: the run has several pairs; recall is per pair")
     by_case = drafts(run_dir / "replies.jsonl")
     header = prefix_header(qset.get("prefixes", {}))
+    namespaces = tuple(namespaces or qset.get("resourceNamespaces") or ())
     qs = {q["id"]: q for q in qset["questions"]}
     rows = {}
     for c in report["cases"]:
@@ -146,8 +150,8 @@ def recall(qset, run_dir):
             continue
         iris, _ = gold_terms(header + q["gold"])
         iris = {t for t in iris if t not in IGNORE and not t.startswith(XSD)}
-        schema = sorted(t for t in iris if not is_resource(t))
-        resources = sorted(t for t in iris if is_resource(t))
+        schema = sorted(t for t in iris if not is_resource(t, namespaces))
+        resources = sorted(t for t in iris if is_resource(t, namespaces))
         prompts = by_case.get(c["case"]) or []
         if not prompts:
             rows[c["id"]] = {"prompt": False, "schema": schema, "resources": resources}
@@ -165,8 +169,8 @@ def recall(qset, run_dir):
             "resources": resources,
             "missingSchema": miss_s,
             "missingResources": miss_r,
-            "schemaComplete": not miss_s,
-            "resourcesComplete": not miss_r,
+            "schemaComplete": not miss_s if namespaces else None,
+            "resourcesComplete": not miss_r if namespaces else None,
             "complete": not miss_s and not miss_r,
         }
     return rows
@@ -179,11 +183,12 @@ def summary(rows):
     terms_r = sum(len(r["resources"]) for r in have)
     chars = sorted(r["promptChars"] for r in have)
     toks = sorted(r["promptTokens"] for r in have if r["promptTokens"] is not None)
+    split = None if any(r["schemaComplete"] is None for r in have) else True
     return {
         "questions": n,
         "withPrompt": len(have),
-        "schemaComplete": sum(r["schemaComplete"] for r in have),
-        "resourcesComplete": sum(r["resourcesComplete"] for r in have),
+        "schemaComplete": split and sum(r["schemaComplete"] for r in have),
+        "resourcesComplete": split and sum(r["resourcesComplete"] for r in have),
         "complete": sum(r["complete"] for r in have),
         "schemaTermRecall": [terms_s - sum(len(r["missingSchema"]) for r in have), terms_s],
         "resourceRecall": [terms_r - sum(len(r["missingResources"]) for r in have), terms_r],
@@ -195,15 +200,19 @@ def summary(rows):
 
 
 def main(argv):
-    out = None
+    out, namespaces = None, []
     if "--out" in argv:
         i = argv.index("--out")
         out = argv[i + 1]
         argv = argv[:i] + argv[i + 2 :]
+    while "--resource-namespace" in argv:
+        i = argv.index("--resource-namespace")
+        namespaces.append(argv[i + 1])
+        argv = argv[:i] + argv[i + 2 :]
     qset = json.load(open(argv[0]))
     result = {}
     for d in argv[1:]:
-        rows = recall(qset, d)
+        rows = recall(qset, d, namespaces)
         result[str(d)] = {"summary": summary(rows), "questions": rows}
         print(d, json.dumps(result[str(d)]["summary"]))
     if out:

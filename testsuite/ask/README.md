@@ -151,7 +151,10 @@ saved prompts. For each answerable question it takes the last first-draft prompt
 any clarification, and checks whether every schema term and every resource of the gold
 query occurs in it, by full IRI or by a prefixed name under the prompt's own prefixes.
 A dry run gives the same prompts as a paid run, so the metric costs no provider call.
-It reports the questions whose prompt holds every gold term and the prompt size.
+It reports the questions whose prompt holds every gold term and the prompt size. With
+`--resource-namespace IRI`, such as `http://dbpedia.org/resource/`, or a set's
+`resourceNamespaces`, it also splits the gold terms into resources under those namespaces
+and schema terms, and reports each kind apart.
 
 The self-test drives the real CLI through the proxy against a local fake API. It covers
 chunked and close-delimited replies, structured-output retries, a downgrade, a

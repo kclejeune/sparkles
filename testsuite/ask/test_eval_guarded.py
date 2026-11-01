@@ -188,6 +188,11 @@ class GuardedScore(unittest.TestCase):
         # an entry for another gold text with the same id does not apply
         self.assertIsNone(guarded.errata_exclusion(dict(q, gold=q["gold"] + " "), gold, named))
         self.assertTrue(guarded.load_errata())
+        # a prefix named like a query form does not hide the outer SELECT *
+        star = {"id": "q2", "gold": "PREFIX ask: <urn:example:> BASE <urn:b> SELECT * WHERE { ?s ask:p ?o }"}
+        self.assertEqual(guarded.errata_exclusion(star, gold, {})["rule"], "select-star")
+        plain = {"id": "q3", "gold": "PREFIX select: <urn:x:> SELECT ?s WHERE { ?s select:p ?o }"}
+        self.assertIsNone(guarded.errata_exclusion(plain, gold, {}))
 
 
 class GroundingRecall(unittest.TestCase):
@@ -204,7 +209,7 @@ class GroundingRecall(unittest.TestCase):
             (p / "s").mkdir()
             report = {"pairs": ["m"], "cases": [{"id": "a", "case": "c1", "pair": "m"}]}
             (p / "s" / "report.json").write_text(json.dumps(report))
-            rows = grounding_recall.recall(qset, p)
+            rows = grounding_recall.recall(qset, p, ["http://ex.org/resource/"])
             self.assertEqual(rows["a"]["missingSchema"], [])
             self.assertEqual(rows["a"]["missingResources"], ["http://ex.org/resource/R"])
             (p / "t").mkdir()
@@ -227,6 +232,26 @@ class GroundingRecall(unittest.TestCase):
             (p / "replies.jsonl").write_text(json.dumps({"case": "c1", "status": 200, "reply": "not json", "request": {
                 "system": "You translate", "messages": [{"content": "<http://ex.org/p> Question: Q?"}]}}) + "\n")
             self.assertTrue(grounding_recall.recall(qset, p)["a"]["prompt"])
+
+    def test_resources_come_from_named_namespaces_only(self):
+        import json
+        import grounding_recall
+
+        qset = {"questions": [{"id": "a", "kind": "answerable", "question": "Q?",
+                               "gold": "SELECT ?x WHERE { <urn:person:Alice> <urn:vocab:knows> ?x }"}]}
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            (p / "replies.jsonl").write_text(json.dumps({"case": "c1", "status": 200, "request": {
+                "system": "You translate", "messages": [{"content": "<urn:vocab:knows> Question: Q?"}]}}) + "\n")
+            (p / "s").mkdir()
+            (p / "s" / "report.json").write_text(json.dumps({"pairs": ["m"], "cases": [{"id": "a", "case": "c1"}]}))
+            rows = grounding_recall.recall(qset, p, ["urn:person:"])
+            self.assertEqual(rows["a"]["missingResources"], ["urn:person:Alice"])
+            self.assertFalse(rows["a"]["resourcesComplete"])
+            rows = grounding_recall.recall(qset, p)
+            self.assertIsNone(rows["a"]["resourcesComplete"])
+            self.assertFalse(rows["a"]["complete"])
+            self.assertIsNone(grounding_recall.summary(rows)["resourcesComplete"])
 
     def test_a_term_matches_only_a_whole_name(self):
         import grounding_recall

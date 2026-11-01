@@ -54,6 +54,8 @@ NUMERIC = {
 ERRATA_FILE = pathlib.Path(__file__).resolve().parent.parent / "gold-errata-v1.json"
 SELECT_STAR = re.compile(r"\bSELECT\s+(?:DISTINCT\s+|REDUCED\s+)?\*", re.I)
 QUERY_FORM = re.compile(r"\b(SELECT|ASK|CONSTRUCT|DESCRIBE)\b", re.I)
+# The prologue's BASE and PREFIX declarations, whose names may be keywords.
+PROLOGUE = re.compile(r"\s*(?:(?:BASE\b|PREFIX\s+[^\s:]*:)\s*)*", re.I)
 
 
 def load_errata(path=ERRATA_FILE):
@@ -76,7 +78,9 @@ def errata_exclusion(question, gold, errata, release=None):
     if named is not None and release is not None and named.get("release") == release:
         return {"rule": "named", "reason": named["reason"]}
     text = strip_strings(question["gold"])
-    outer = QUERY_FORM.search(text)
+    # strip_strings turns each IRI into a space, so only the prologue's keywords and
+    # prefix names remain before the query form.
+    outer = QUERY_FORM.search(text, PROLOGUE.match(text).end())
     # Only the outer query form and projection decide the answer's columns. A
     # subquery's SELECT * inside it does not.
     if outer and SELECT_STAR.match(text, outer.start()):
