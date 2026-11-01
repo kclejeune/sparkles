@@ -89,17 +89,10 @@ if has jena; then
   JAVA=${JAVA:-${JDK:+$JDK/bin/}java}
 fi
 
-# merge <new.json> <dest.json>: replace/add hyperfine results by command name
+# merge <new.json> <dest.json>: replace/add hyperfine results by command name, in the
+# hyperfine 1 layout (scripts/bench_hyperfine.py)
 merge() {
-  python3 - "$1" "$2" << 'EOF'
-import json, os, sys
-new, dest = sys.argv[1], sys.argv[2]
-n = json.load(open(new))
-old = json.load(open(dest)) if os.path.exists(dest) else {"results": []}
-cmds = {r["command"] for r in n["results"]}
-old["results"] = [r for r in old["results"] if r["command"] not in cmds] + n["results"]
-json.dump(old, open(dest, "w"), indent=1)
-EOF
+  python3 "$ROOT/scripts/bench_hyperfine.py" merge "$1" "$2"
   rm -f "$1"
 }
 # setj <file> <engine>=<value>…: merge values into a JSON object
@@ -368,15 +361,16 @@ if [ -z "${ANSWERS_ONLY:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------- summary
-python3 - "$WORK/results" "$(wc -l < data.nt)" "${NAMES[@]}" << 'EOF'
+PYTHONPATH="$ROOT/scripts" python3 - "$WORK/results" "$(wc -l < data.nt)" "${NAMES[@]}" << 'EOF'
 import json, os, sys
+import bench_hyperfine
 d, triples, names = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 ORDER = ["sparkles", "jena-fuseki", "qlever"]
 def load(f):
     p = f"{d}/{f}"
     return json.load(open(p)) if os.path.exists(p) else {}
 def hf(f):
-    return {r["command"]: r for r in load(f).get("results", [])}
+    return bench_hyperfine.by_command(f"{d}/{f}")
 build, size, answers = hf("text-build.json"), load("text-size.json"), load("text-answers.json")
 hits = load("text-hits.json")
 seen = set(build) | set(size) | {e for v in answers.values() for e in v}

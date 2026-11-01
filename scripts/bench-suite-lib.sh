@@ -205,7 +205,7 @@ EOF
 
 suite_manifest() {
   local args=(--out "$RES/manifest.json" --suite "$SUITE" --sparkles "$SPARKLES" --workdir "$WORK"
-    --memory-limit "${SERVER_MEM_MAX:-}" --client-cpu "${CLIENT[2]:-}")
+    --memory-limit "${SERVER_MEM_MAX:-}" --client-cpu "${CLIENT[2]:-}" --hyperfine "$(command -v hyperfine || true)")
   local spec n
   has jena && args+=(--engine "jena=$FUSEKI")
   has qlever && args+=(--engine "qlever=$QSERVER")

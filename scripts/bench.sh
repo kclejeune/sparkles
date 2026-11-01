@@ -154,12 +154,7 @@ suite() {
     [ -f "$1" ] || return 1
     local names=() e
     for e in $ENGINES; do names+=("${NAME[$e]}"); done
-    python3 -I - "$1" "${names[@]}" << 'EOF'
-import json, sys
-with open(sys.argv[1]) as f:
-    have = {r.get("command") for r in json.load(f).get("results", [])}
-sys.exit(0 if set(sys.argv[2:]) <= have else 1)
-EOF
+    python3 -I "$ROOT/scripts/bench_hyperfine.py" has "$1" "${names[@]}"
   }
   for n in "${NAMES[@]}"; do
     selected "$n" || continue

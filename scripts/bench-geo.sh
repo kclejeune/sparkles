@@ -44,17 +44,10 @@ if [ ! -f geo.nt ]; then
 fi
 echo "dataset: $(wc -l < geo.nt) triples"
 
-# merge <new.json> <dest.json>: replace/add hyperfine results by command name
+# merge <new.json> <dest.json>: replace/add hyperfine results by command name, in the
+# hyperfine 1 layout (scripts/bench_hyperfine.py)
 merge() {
-  python3 - "$1" "$2" << 'EOF'
-import json, os, sys
-new, dest = sys.argv[1], sys.argv[2]
-n = json.load(open(new))
-old = json.load(open(dest)) if os.path.exists(dest) else {"results": []}
-cmds = {r["command"] for r in n["results"]}
-old["results"] = [r for r in old["results"] if r["command"] not in cmds] + n["results"]
-json.dump(old, open(dest, "w"), indent=1)
-EOF
+  python3 "$ROOT/scripts/bench_hyperfine.py" merge "$1" "$2"
   rm -f "$1"
 }
 
@@ -137,11 +130,12 @@ if [ -n "$PLAIN_QUERIES" ]; then
   QUERIES=$QUERIES_ALL
 fi
 
-python3 - "$WORK/results" "${NAMES[@]}" << 'EOF'
+PYTHONPATH="$ROOT/scripts" python3 - "$WORK/results" "${NAMES[@]}" << 'EOF'
 import json, os, sys
+import bench_hyperfine
 d, names = sys.argv[1], sys.argv[2:]
 def load(f):
-    return {r["command"]: r for r in json.load(open(f))["results"]} if os.path.exists(f) else {}
+    return bench_hyperfine.by_command(f)
 answers = json.load(open(f"{d}/geo-answers.json")) if os.path.exists(f"{d}/geo-answers.json") else {}
 def ms(r):
     if any(e != 0 for e in r.get("exit_codes", [])):

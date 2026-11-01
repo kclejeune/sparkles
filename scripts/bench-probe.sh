@@ -134,13 +134,7 @@ time_query() {
     if answering "$e"; then
       # A live server with a broken preparation command is a harness failure.
       [ "$rc" = 0 ] || return "$rc"
-      python3 - "$hf" "$new" << 'EOF'
-import json, os, sys
-hf, new = sys.argv[1:]
-d = json.load(open(new)) if os.path.exists(new) else {"results": []}
-d["results"] += json.load(open(hf))["results"]
-json.dump(d, open(new, "w"), indent=1)
-EOF
+      python3 "$ROOT/scripts/bench_hyperfine.py" merge "$hf" "$new"
       rm -f "$hf"
     else
       # --ignore-failure can exit zero after a server dies. Discard all of that

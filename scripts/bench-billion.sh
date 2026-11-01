@@ -445,16 +445,10 @@ q() { # q <url> <query name>: the timed request (fails on HTTP errors)
 }
 # LIMIT without ORDER BY may legitimately return different solutions: row counts only
 COUNT_ONLY="export-1m"
-merge() { # merge <new.json> <dest.json>: replace hyperfine results by command name
-  python3 - "$1" "$2" << 'EOF'
-import json, os, sys
-new, dest = sys.argv[1], sys.argv[2]
-n = json.load(open(new))
-old = json.load(open(dest)) if os.path.exists(dest) else {"results": []}
-cmds = {r["command"] for r in n["results"]}
-old["results"] = [r for r in old["results"] if r["command"] not in cmds] + n["results"]
-json.dump(old, open(dest, "w"), indent=1)
-EOF
+# merge <new.json> <dest.json>: replace hyperfine results by command name, in the
+# hyperfine 1 layout (scripts/bench_hyperfine.py)
+merge() {
+  python3 "$ROOT/scripts/bench_hyperfine.py" merge "$1" "$2"
   rm -f "$1"
 }
 setcold() { # setcold <engine> <query> <seconds|error>
