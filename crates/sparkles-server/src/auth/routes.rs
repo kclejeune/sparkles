@@ -95,6 +95,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // evidence-profile settings (C25 §7)
     ("/$/evidence/{ds}/settings", &["GET", "PUT"]),
     ("/$/evidence/{ds}/detach", &["POST"]),
+    ("/$/evidence/{ds}/holds", &["GET", "POST"]),
+    ("/$/evidence/{ds}/holds/{id}", &["DELETE"]),
     ("/$/queries/{ds}", &["GET"]),
     // suggested examples (C18 §4.6): readers suggest, admins list and remove
     ("/$/queries/{ds}/suggestions", &["GET", "POST", "DELETE"]),
@@ -509,6 +511,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the settings name the protected graphs and review policies
         | "/$/evidence/{ds}/settings"
         | "/$/evidence/{ds}/detach"
+        // holds name commits of any branch and decide retained history
+        | "/$/evidence/{ds}/holds"
+        | "/$/evidence/{ds}/holds/{id}"
         | "/$/vector/{ds}/{name}"
         | "/$/vector/{ds}/{name}/rebuild"
         | "/$/vector/{ds}/{name}/reembed"

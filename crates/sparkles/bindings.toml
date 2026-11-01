@@ -426,6 +426,11 @@ python = "Dataset.update"
 jvm = "Jena UpdateAction.parseExecute / UpdateExec.dataset(ds)"
 node = "Dataset.update"
 
+["evidence.acquire_hold"]
+python = "planned: evidence holds in the bindings with the typed evidence operations"
+jvm = "planned: evidence holds in the bindings with the typed evidence operations"
+node = "planned: evidence holds in the bindings with the typed evidence operations"
+
 ["evidence.configure"]
 python = "planned: evidence settings in the bindings with the typed evidence operations"
 jvm = "planned: evidence settings in the bindings with the typed evidence operations"
@@ -435,6 +440,16 @@ node = "planned: evidence settings in the bindings with the typed evidence opera
 python = "planned: evidence settings in the bindings with the typed evidence operations"
 jvm = "planned: evidence settings in the bindings with the typed evidence operations"
 node = "planned: evidence settings in the bindings with the typed evidence operations"
+
+["evidence.holds"]
+python = "planned: evidence holds in the bindings with the typed evidence operations"
+jvm = "planned: evidence holds in the bindings with the typed evidence operations"
+node = "planned: evidence holds in the bindings with the typed evidence operations"
+
+["evidence.release_hold"]
+python = "planned: evidence holds in the bindings with the typed evidence operations"
+jvm = "planned: evidence holds in the bindings with the typed evidence operations"
+node = "planned: evidence holds in the bindings with the typed evidence operations"
 
 ["evidence.settings"]
 python = "planned: evidence settings in the bindings with the typed evidence operations"

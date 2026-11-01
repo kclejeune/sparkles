@@ -1959,12 +1959,13 @@ fn branches(p: &mut Paths) {
     );
     p.add(
         op(DELETE, "/$/branches/{ds}/{name}", "deleteBranch", "Branches", "Delete a branch")
-            .doc("Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it.")
+            .doc("Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it. A branch that an evidence hold names is refused with `409 branch-held` unless `releaseHolds=true`, which needs `admin` and releases those holds first.")
             .see("branches-and-merges")
             .query("force", boolean(), "Delete a branch with unmerged commits.")
             .query("reparent", boolean(), "Delete a branch that other branches start from, and re-parent them.")
+            .query("releaseHolds", boolean(), "Release the source holds that name the branch, then delete it. Needs `admin`.")
             .resp("204", "Deleted.", None)
-            .errors(&[400, 403, 404, 409]),
+            .errors(&[400, 403, 404, 409, 503]),
     );
     p.add(
         op(POST, "/$/branches/{ds}/{name}/relink", "relinkBranch", "Branches", "Relink a branch to main's index")
@@ -2963,6 +2964,51 @@ fn assist(p: &mut Paths) {
         .json_body(true, "EvidenceDetach")
         .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
         .errors(&[400, 404, 409, 503]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/evidence/{ds}/holds",
+            "listEvidenceHolds",
+            "Datasets",
+            "List the evidence holds",
+        )
+        .doc("Needs `admin` on the dataset. Lists the durable source holds of the evidence profile by id, a page at a time.")
+        .see("evidence-holds")
+        .query("branch", s(), "Only holds that name this branch.")
+        .query("after", json!({ "type": "string", "format": "uuid" }), "Start after this hold id, the `next` of the previous page.")
+        .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 1000 }), "The most holds in the page, 1000 by default.")
+        .json("200", "A page of holds.", "EvidenceHoldList")
+        .paginated("cursor", &["after", "limit"], "next")
+        .errors(&[400, 404, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/holds",
+            "acquireEvidenceHold",
+            "Datasets",
+            "Acquire an evidence hold",
+        )
+        .doc("Needs `admin` on the dataset. Keeps the commits readable until the hold is released: history trimming, compaction and generation retirement keep them, and a branch the hold names is deleted only with `releaseHolds=true`. The hold is durable when the answer arrives. The same id with the same commits answers `200` with the existing hold. Another set of commits under that id is `409 hold-conflict`, more than 65,536 held commits in the dataset is `409 holds-limit`, and a commit that is no longer readable is `410 history-gone`.")
+        .see("evidence-holds")
+        .json_body(true, "EvidenceHoldRequest")
+        .json("201", "The new hold.", "EvidenceHold")
+        .json("200", "The existing hold of that id.", "EvidenceHold")
+        .errors(&[400, 404, 409, 410, 503]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/evidence/{ds}/holds/{id}",
+            "releaseEvidenceHold",
+            "Datasets",
+            "Release an evidence hold",
+        )
+        .doc("Needs `admin` on the dataset. The held commits can be collected once the release is durable.")
+        .see("evidence-holds")
+        .no_content("Released.")
+        .errors(&[400, 404, 503]),
     );
     p.add(
         op(
