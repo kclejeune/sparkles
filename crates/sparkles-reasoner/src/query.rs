@@ -465,6 +465,7 @@ impl Session {
             cancel: Some(flag.clone()),
             progress: None,
             budget: self.budget.clone(),
+            closures: false,
         };
         let terms = &self.terms;
         let ends = &mut self.compact_rounds;
@@ -768,7 +769,7 @@ impl Session {
         {
             return Ok(false);
         }
-        fn insert(ids: &mut [u64; 64], count: &mut usize, id: u64) -> bool {
+        fn insert(ids: &mut [u64; 128], count: &mut usize, id: u64) -> bool {
             if ids[..*count].contains(&id) {
                 return true;
             }
@@ -779,7 +780,7 @@ impl Session {
             *count += 1;
             true
         }
-        let mut ids = [0u64; 64];
+        let mut ids = [0u64; 128];
         let mut count = 0usize;
         for rule in &self.rules {
             (self.stop)()?;

@@ -337,6 +337,9 @@ fn class_supports_include_independent_probe_conflicts() {
         NamedNode::new("http://ex.org/C").unwrap(),
     ));
     request.max_checks = 3000;
+    // about 3,000 OWL 2 RL oracle runs take 7.5 s on an idle host, and the default
+    // timeout of 30 s ran out on a heavily loaded one
+    request.analysis.timeout = Some(std::time::Duration::from_secs(300));
     let report = dataset.reasoning().justify(&request).unwrap();
     assert!(report.complete);
     assert_eq!(

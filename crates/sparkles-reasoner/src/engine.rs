@@ -1317,6 +1317,9 @@ pub(crate) struct Limits {
     pub progress: Option<crate::ProgressFn>,
     /// the run's memory, against [`crate::ReasonOptions::max_memory`]
     pub budget: Arc<Budget>,
+    /// evaluate transitive and equivalence rules with closure operators
+    /// ([`crate::closure`]) when the program allows it
+    pub closures: bool,
 }
 
 pub(crate) struct Outcome {
@@ -1389,6 +1392,8 @@ const MAX_SPLIT_BINDINGS: usize = 1 << 16;
 
 /// The fewest bindings a work item of a split evaluates in turn.
 const MIN_BATCH: usize = 8;
+/// Atom steps a split tries, from the second on, to find one that gives enough items.
+const MAX_SPLIT_DEPTH: usize = 4;
 
 /// The work of a plan split at step `d` (an atom): the bindings of the steps before it,
 /// from the shares `first` of step 0, in the order a sequential evaluation visits them,
@@ -1778,6 +1783,16 @@ pub(crate) fn run_observed(
         anyhow::Error::new(e.with_context(format!(" (in iteration {})", iteration + 1)))
     };
     let index = RuleIndex::new(rules, &limits.budget).map_err(|e| memory(e, 0))?;
+    // an observer of merge boundaries needs every fact to follow from the facts before
+    // its boundary in one rule step, which a closure does not
+    let mut closures = (limits.closures && boundary.is_none())
+        .then(|| crate::closure::Closures::detect(rules, terms, start))
+        .flatten();
+    if let Some(c) = &closures {
+        tracing::debug!(operators = ?c.describe(rules), "closure operators");
+    }
+    // rules the ordinary evaluator takes back from an operator, with one full evaluation
+    let mut refresh: Vec<usize> = Vec::new();
     loop {
         terms.analysis_round(iteration);
         if cancelled() {
@@ -1812,14 +1827,30 @@ pub(crate) fn run_observed(
                 .candidates(g, ds, &limits.budget)
                 .map_err(|e| memory(e, iteration))?
         };
-        let tasks = plan_iteration(
-            g,
-            rules,
-            naive,
-            ds,
-            de,
-            candidates.as_ref().map(|(c, _)| c.as_slice()),
-        );
+        let mut tasks = match &closures {
+            None if refresh.is_empty() => plan_iteration(
+                g,
+                rules,
+                naive,
+                ds,
+                de,
+                candidates.as_ref().map(|(c, _)| c.as_slice()),
+            ),
+            _ => {
+                let keep = |ri: &usize| {
+                    !refresh.contains(ri) && !closures.as_ref().is_some_and(|c| c.replaces(*ri))
+                };
+                let list: Vec<usize> = match &candidates {
+                    Some((c, _)) => c.iter().copied().filter(keep).collect(),
+                    None => (0..rules.len()).filter(keep).collect(),
+                };
+                plan_iteration(g, rules, naive, ds, de, Some(&list))
+            }
+        };
+        if !refresh.is_empty() {
+            tasks.extend(plan_iteration(g, rules, true, ds, de, Some(&refresh)));
+            refresh.clear();
+        }
         for (ri, p) in &tasks {
             let (s, o) = index_needs(&rules[*ri], p);
             if s {
@@ -1855,13 +1886,32 @@ pub(crate) fn run_observed(
                 })
                 .flatten()
                 .map(|d| d + 1);
-            if let Some(d) = deeper {
-                let split = split_at(gr, terms, r, p, *ri, d, &first, &abort, limits, split_min)
-                    .map_err(|e| match e.downcast::<MemoryExceeded>() {
-                        Ok(m) => memory(m, iteration),
-                        Err(e) => e,
-                    })?;
-                if let Some((items, held)) = split {
+            if let Some(mut d) = deeper {
+                // a step that binds few rows splits no better than the first, so the
+                // split moves on to later atoms while it gives too few items
+                let mut best = None;
+                for _ in 0..MAX_SPLIT_DEPTH {
+                    let split =
+                        split_at(gr, terms, r, p, *ri, d, &first, &abort, limits, split_min)
+                            .map_err(|e| match e.downcast::<MemoryExceeded>() {
+                                Ok(m) => memory(m, iteration),
+                                Err(e) => e,
+                            })?;
+                    let Some((items, held)) = split else {
+                        break;
+                    };
+                    let enough = items.len() >= split_min;
+                    best = Some((items, held));
+                    let next = p
+                        .iter()
+                        .skip(d + 1)
+                        .position(|s| matches!(s, Step::Atom { .. }));
+                    match next {
+                        Some(n) if !enough => d += 1 + n,
+                        _ => break,
+                    }
+                }
+                if let Some((items, held)) = best {
                     work.extend(items);
                     split_held.absorb(held);
                     continue;
@@ -2028,8 +2078,33 @@ pub(crate) fn run_observed(
         if let Some(note) = boundary.as_mut() {
             note(g.len());
         }
+        let mut new = g.len() - before;
+        if let Some(c) = closures.as_mut() {
+            let t_close = std::time::Instant::now();
+            let closed = g.len();
+            let stepped = c
+                .step(
+                    g,
+                    terms,
+                    &limits.budget,
+                    limits.cancel.as_deref(),
+                    (max_out, limits.max_inferred),
+                    rules,
+                )
+                .map_err(|e| match e.downcast::<MemoryExceeded>() {
+                    Ok(m) => memory(m, iteration),
+                    Err(e) => e,
+                })?;
+            new += stepped.added as u32;
+            refresh = stepped.refresh;
+            tracing::debug!(
+                iteration = iteration + 1,
+                new = g.len() - closed,
+                close_ms = t_close.elapsed().as_millis() as u64,
+                "closure operators"
+            );
+        }
         iteration += 1;
-        let new = g.len() - before;
         tracing::debug!(
             iteration,
             new,
@@ -2050,7 +2125,7 @@ pub(crate) fn run_observed(
             .budget
             .check()
             .map_err(|e| memory(e.with_context(overflow.clone()), iteration - 1))?;
-        if new == 0 {
+        if new == 0 && refresh.is_empty() {
             break;
         }
         ds = de;

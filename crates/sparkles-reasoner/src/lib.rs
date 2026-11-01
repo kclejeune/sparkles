@@ -20,6 +20,7 @@ mod alloc_probe;
 pub mod analysis;
 mod budget;
 mod builtins;
+mod closure;
 mod demand;
 pub mod diagnostics;
 mod engine;
@@ -185,6 +186,11 @@ pub struct ReasonOptions {
     /// The reasoning pool runs evaluate on and are admitted to (the server's), see
     /// [`ReasoningPool`].
     pub pool: Option<Arc<ReasoningPool>>,
+    /// Evaluate transitive and equivalence rules with closure operators, which reach the
+    /// same closure in fewer iterations. `true` by default. `false` evaluates them as
+    /// ordinary rules, for differential tests and measurements.
+    #[doc(hidden)]
+    pub closure_operators: bool,
 }
 
 impl Default for ReasonOptions {
@@ -199,6 +205,7 @@ impl Default for ReasonOptions {
             max_memory: None,
             threads: None,
             pool: None,
+            closure_operators: true,
         }
     }
 }
@@ -214,6 +221,7 @@ impl fmt::Debug for ReasonOptions {
             .field("max_memory", &self.max_memory)
             .field("threads", &self.threads)
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
+            .field("closure_operators", &self.closure_operators)
             .finish()
     }
 }
@@ -381,15 +389,33 @@ fn derive_here(
     if let Some(context) = &opts.analysis {
         context.check()?;
     }
-    let limits = engine::Limits {
+    let mut limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
         budget: budget.clone(),
+        closures: opts.closure_operators && opts.analysis.is_none(),
     };
     progress(opts, 0.1, "reasoning");
-    let out = engine::run(&mut g, &compiled, &terms, &limits, None)?;
+    let out = loop {
+        match engine::run(&mut g, &compiled, &terms, &limits, None) {
+            Err(e) if limits.closures && e.is::<closure::Restart>() => {
+                // the run derived list structure that its rules read: it starts again
+                // with the rules evaluated as joins, so that their order of derivation
+                // decides what the list builtins see
+                tracing::debug!("{e}");
+                limits.closures = false;
+                drop(g);
+                g = graph::Graph::with_base(base.clone());
+                g.set_budget(&budget)?;
+                if let Some(d) = &defaults {
+                    g.try_add_batch(d.0.iter().copied())?;
+                }
+            }
+            r => break r?,
+        }
+    };
     budget.check_peak()?;
     Ok(Derivation {
         graph: g,
@@ -1352,6 +1378,7 @@ fn update_closure(
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
         budget: budget.clone(),
+        closures: false,
     };
     let ch = &ch;
     progress(opts, 0.1, "updating the closure");
@@ -1637,6 +1664,7 @@ pub fn dred_overdeletion(
         cancel: None,
         progress: None,
         budget: Budget::unlimited(),
+        closures: false,
     };
     let mut c = d.into_closure()?;
     Ok(incremental::dred_overdeletion(

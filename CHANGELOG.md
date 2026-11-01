@@ -52,6 +52,16 @@ registry only at an expected revision. `Store::managed_snapshot` returns the reg
 and its owners' settings from one load, and `Store::managed_settings` returns one
 owner's recorded settings.
 
+Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
+and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
+An operator condenses a relation's strongly connected components and computes each
+component's reachable set once, and `owl:sameAs` closes its classes with union-find.
+On forge, `sparkles infer` materializes OWL2Bench with 2 universities under OWL 2 RL in
+5.0 to 5.3 s instead of 53 s, and OWL2Bench with 5 universities in 44 s at 9.5 GiB of
+RSS, where it ran out of 14 GiB before. Programs with a rule that is not monotonic, programs that read lists and
+build them, incremental updates and query-time reasoning still evaluate these rules as
+joins.
+
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
 node in both shortest modes, run Dijkstra's algorithm from both ends. Weighted path
 searches add costs in double-double arithmetic everywhere, so paths whose weights have
@@ -791,6 +801,12 @@ keep it. The same applies to a dataset's `memory.scratchBranches.ttl`. A server 
 `--mcp-allow-update` never deletes a scratch branch, and one with `--read-only` never did.
 
 ### Behavior
+
+The `owl-rl` profile now has every rule of the OWL 2 RL/RDF tables except `eq-ref`,
+`dt-type2`, `dt-eq` and `dt-diff`, so OWL 2 RL materialization derives more facts. It
+adds `prp-key` for keys of 1 and 2 properties, `cls-maxqc4`, the `owl:equivalentClass`
+and `owl:Nothing` conclusions of `scm-cls`, `scm-op`, `scm-dp`, and the axioms of
+`prp-ap` and `dt-type1`. Property chains still stop at 3 properties.
 
 `sparkles ask` decides whether a draft calls SERVICE from the parsed query, including
 the patterns inside EXISTS and subqueries, instead of scanning its text. A query whose

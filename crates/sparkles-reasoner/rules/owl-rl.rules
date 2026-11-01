@@ -7,9 +7,15 @@
 # profile tables (https://www.w3.org/TR/owl2-profiles/#OWL_2_RL); Jena
 # names are given in comments where they differ.
 #
-# Not covered: validation / inconsistency detection (rb:violation,
-# owl:Nothing, disjointness), cardinality > 1, hasKey, datatype
-# reasoning, reflexive owl:sameAs for every individual.
+# Rules with the conclusion `false` (disjointness, owl:Nothing members,
+# cardinality zero, dt-not-type and the other inconsistencies) are not
+# materialization rules: the inconsistency checks of diagnostics.rs cover
+# them. Not covered: cardinality > 1, reflexive owl:sameAs for every
+# individual (eq-ref), dt-type2 and dt-eq for every literal, dt-diff for
+# every pair of literals with different values, property chains of more
+# than 3 properties and keys of more than 2. Each longer
+# chain or key rule adds thousands of rules to the demand programs of
+# query-time reasoning.
 #
 # Sparkles builtins used beyond Jena's: listMember(?list, ?x) enumerates
 # the members of an RDF list; listForAll(?list, ?s, ?p) holds when
@@ -64,14 +70,59 @@
 -> (owl:versionInfo rdf:type owl:AnnotationProperty).
 -> (rdfs:label rdf:type owl:AnnotationProperty).
 -> (rdfs:comment rdf:type owl:AnnotationProperty).
+# prp-ap: the other built-in annotation properties
+-> (rdfs:seeAlso rdf:type owl:AnnotationProperty).
+-> (rdfs:isDefinedBy rdf:type owl:AnnotationProperty).
+-> (owl:deprecated rdf:type owl:AnnotationProperty).
+-> (owl:priorVersion rdf:type owl:AnnotationProperty).
+-> (owl:backwardCompatibleWith rdf:type owl:AnnotationProperty).
+-> (owl:incompatibleWith rdf:type owl:AnnotationProperty).
 # (transitivity of sameAs / equivalentClass / equivalentProperty is handled by
-# dedicated rules that do not produce reflexive statements)
+# dedicated rules; only scm-cls, scm-op and scm-dp state the reflexive
+# equivalences of declared classes and properties)
 -> (owl:sameAs rdf:type owl:SymmetricProperty).
 -> (owl:differentFrom rdf:type owl:SymmetricProperty).
 -> (owl:disjointWith rdf:type owl:SymmetricProperty).
 -> (owl:inverseOf rdf:type owl:SymmetricProperty).
 -> (owl:equivalentClass rdf:type owl:SymmetricProperty).
 -> (owl:equivalentProperty rdf:type owl:SymmetricProperty).
+
+#------------------------------------------------------------------
+# dt-type1: the datatypes of the OWL 2 RL datatype map
+#------------------------------------------------------------------
+
+-> (rdf:PlainLiteral rdf:type rdfs:Datatype).
+-> (rdf:XMLLiteral rdf:type rdfs:Datatype).
+-> (rdfs:Literal rdf:type rdfs:Datatype).
+-> (xsd:decimal rdf:type rdfs:Datatype).
+-> (xsd:integer rdf:type rdfs:Datatype).
+-> (xsd:nonNegativeInteger rdf:type rdfs:Datatype).
+-> (xsd:nonPositiveInteger rdf:type rdfs:Datatype).
+-> (xsd:positiveInteger rdf:type rdfs:Datatype).
+-> (xsd:negativeInteger rdf:type rdfs:Datatype).
+-> (xsd:long rdf:type rdfs:Datatype).
+-> (xsd:int rdf:type rdfs:Datatype).
+-> (xsd:short rdf:type rdfs:Datatype).
+-> (xsd:byte rdf:type rdfs:Datatype).
+-> (xsd:unsignedLong rdf:type rdfs:Datatype).
+-> (xsd:unsignedInt rdf:type rdfs:Datatype).
+-> (xsd:unsignedShort rdf:type rdfs:Datatype).
+-> (xsd:unsignedByte rdf:type rdfs:Datatype).
+-> (xsd:float rdf:type rdfs:Datatype).
+-> (xsd:double rdf:type rdfs:Datatype).
+-> (xsd:string rdf:type rdfs:Datatype).
+-> (xsd:normalizedString rdf:type rdfs:Datatype).
+-> (xsd:token rdf:type rdfs:Datatype).
+-> (xsd:language rdf:type rdfs:Datatype).
+-> (xsd:Name rdf:type rdfs:Datatype).
+-> (xsd:NCName rdf:type rdfs:Datatype).
+-> (xsd:NMTOKEN rdf:type rdfs:Datatype).
+-> (xsd:boolean rdf:type rdfs:Datatype).
+-> (xsd:hexBinary rdf:type rdfs:Datatype).
+-> (xsd:base64Binary rdf:type rdfs:Datatype).
+-> (xsd:anyURI rdf:type rdfs:Datatype).
+-> (xsd:dateTime rdf:type rdfs:Datatype).
+-> (xsd:dateTimeStamp rdf:type rdfs:Datatype).
 
 #------------------------------------------------------------------
 # RDFS core (Jena mini: rdf4, rdfs2, rdfs3, rdfs5a, rdfs6, rdfs7, rdfs7b, rdfs9)
@@ -86,6 +137,10 @@
 [cax-sco:  (?x rdfs:subClassOf ?y), notEqual(?x, ?y), (?a rdf:type ?x) -> (?a rdf:type ?y)]
 [scm-cls:  (?c rdf:type rdfs:Class) -> (?c rdfs:subClassOf ?c), (?c rdfs:subClassOf rdfs:Resource)]
 [scm-owl-cls: (?c rdf:type owl:Class) -> (?c rdf:type rdfs:Class), (?c rdfs:subClassOf owl:Thing)]
+# the rest of OWL 2 RL's scm-cls, and scm-op and scm-dp
+[scm-cls-eq: (?c rdf:type owl:Class) -> (?c owl:equivalentClass ?c), (owl:Nothing rdfs:subClassOf ?c)]
+[scm-op: (?p rdf:type owl:ObjectProperty) -> (?p rdfs:subPropertyOf ?p), (?p owl:equivalentProperty ?p)]
+[scm-dp: (?p rdf:type owl:DatatypeProperty) -> (?p rdfs:subPropertyOf ?p), (?p owl:equivalentProperty ?p)]
 [scm-restriction: (?c rdf:type owl:Restriction) -> (?c rdf:type owl:Class)]
 [scm-int-cls: (?c owl:intersectionOf ?l) -> (?c rdf:type owl:Class)]
 
@@ -126,13 +181,20 @@
 [prp-fp-sub:  (?p rdf:type owl:FunctionalProperty), (?q rdfs:subPropertyOf ?p), notEqual(?p, ?q) -> (?q rdf:type owl:FunctionalProperty)]
 [prp-ifp-sub: (?p rdf:type owl:InverseFunctionalProperty), (?q rdfs:subPropertyOf ?p), notEqual(?p, ?q) -> (?q rdf:type owl:InverseFunctionalProperty)]
 
-# property chains of length 2 and 3
+# property chains (prp-spo2) of length 2 and 3
 [prp-spo2-2: (?p owl:propertyChainAxiom ?l), (?l rdf:first ?p1), (?l rdf:rest ?l2),
              (?l2 rdf:first ?p2), (?l2 rdf:rest rdf:nil),
              (?u ?p1 ?v), (?v ?p2 ?w) -> (?u ?p ?w)]
 [prp-spo2-3: (?p owl:propertyChainAxiom ?l), (?l rdf:first ?p1), (?l rdf:rest ?l2),
              (?l2 rdf:first ?p2), (?l2 rdf:rest ?l3), (?l3 rdf:first ?p3), (?l3 rdf:rest rdf:nil),
              (?u ?p1 ?v), (?v ?p2 ?w), (?w ?p3 ?z) -> (?u ?p ?z)]
+# keys (prp-key) of 1 and 2 properties, one rule per length; reflexive sameAs is left out
+[prp-key-1: (?c owl:hasKey ?l1), (?l1 rdf:first ?p1), (?l1 rdf:rest rdf:nil),
+           (?x rdf:type ?c), (?x ?p1 ?z1),
+           (?y rdf:type ?c), (?y ?p1 ?z1), notEqual(?x, ?y) -> (?x owl:sameAs ?y)]
+[prp-key-2: (?c owl:hasKey ?l1), (?l1 rdf:first ?p1), (?l1 rdf:rest ?l2), (?l2 rdf:first ?p2), (?l2 rdf:rest rdf:nil),
+           (?x rdf:type ?c), (?x ?p1 ?z1), (?x ?p2 ?z2),
+           (?y rdf:type ?c), (?y ?p1 ?z1), (?y ?p2 ?z2), notEqual(?x, ?y) -> (?x owl:sameAs ?y)]
 
 #------------------------------------------------------------------
 # Equality (owl:sameAs). Reflexive sameAs is not materialized; replacement
@@ -172,6 +234,10 @@
 [cls-maxqc3: (?x owl:maxQualifiedCardinality ?n), equal(?n, 1), (?x owl:onProperty ?p), (?x owl:onClass ?c),
              (?u rdf:type ?x), (?u ?p ?y1), (?y1 rdf:type ?c), (?u ?p ?y2), (?y2 rdf:type ?c),
              notEqual(?y1, ?y2) -> (?y1 owl:sameAs ?y2)]
+# cls-maxqc4: the qualifying class is owl:Thing, which untyped values belong to too
+[cls-maxqc4: (?x owl:maxQualifiedCardinality ?n), equal(?n, 1), (?x owl:onProperty ?p),
+             (?x owl:onClass owl:Thing), (?u rdf:type ?x), (?u ?p ?y1), notLiteral(?y1),
+             (?u ?p ?y2), notLiteral(?y2), notEqual(?y1, ?y2) -> (?y1 owl:sameAs ?y2)]
 
 # owl:intersectionOf
 [cls-int1: (?c owl:intersectionOf ?l), listMember(?l, ?ci), (?y rdf:type ?ci),

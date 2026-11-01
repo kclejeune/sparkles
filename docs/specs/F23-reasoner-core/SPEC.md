@@ -1,6 +1,7 @@
 # F23: Reasoner core
 
-> **Status:** planned.
+> **Status:** partially complete. The quick-fixes phase is built, and the
+> [Outcome](#outcome) records it.
 >
 > **Roadmap:** [item 456](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -116,4 +117,74 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 456](../../ROADMAP.md) tracks the work.
+The quick-fixes phase is built. Roadmap items 485 and 486 shipped and item 487 was
+measured and not adopted. The core and convergence phases remain under
+[item 456](../../ROADMAP.md).
+
+### Closure operators
+
+`crates/sparkles-reasoner/src/closure.rs` evaluates transitive rules, their guarded form
+`prp-trp`, and a symmetric rule paired with a transitive one, such as `eq-sym` with
+`eq-trans`, as closure operators. After each iteration's merge an operator condenses the
+relation with Tarjan's algorithm, computes each component's reachable set once in
+reverse topological order, and releases a set once every component that reads it is
+done. An equivalence closes its classes with union-find. With few new edges the operator
+reads only the nodes that reach them, through the indexes. The rules stay in the
+program, so explanations, incremental maintenance and query-time reasoning, which
+evaluate them as joins, still name them.
+
+The result equals the join evaluation. `tests/closure.rs` compares both on 300 random
+ontologies under three profiles, on late edges, on literals with equal values in
+filtered relations, on cliques and chains, and on programs whose result depends on the
+order of derivation. The operators give their rules back to the join evaluator when a
+filtered relation meets literals with equal values. A program with a rule that is not
+monotonic, or one that reads lists and builds them in a rule head, evaluates every rule
+as a join, and a run whose rules read lists and derive list facts through a property
+starts again without operators. The operators stop at the candidate limit as they emit,
+charge their buffers to the memory budget before they grow, and poll cancellation.
+
+On forge with 20 threads at `58f5d9a9`, `examples/lubm.rs` materialized OWL2Bench with 2 universities
+under OWL 2 RL in 1.43 s at a peak heap of 414 MiB, against 49.4 to 57.3 s and
+1,362 MiB with the rules evaluated as joins, and with 1 university in 340 to 372 ms
+against 4.7 to 5.0 s. Both runs derived the same facts. LUBM(100) took the same time
+both ways, 2.6 to 2.7 s for OWL 2 RL and 1.3 s for RDFS, because its transitive relations
+are small. With `sparkles infer`, OWL2Bench with 5 universities now completes in 44 s at 9.5 GiB
+of RSS, where the joins ran out of 14 GiB after 13 minutes, and with 2 universities it
+takes 5.0 to 5.3 s against 53 s. OWL2Bench with 10 universities exceeded the 14 GiB run limit with or without the
+operators, and with them a 28 GiB limit on a development host. Where that memory goes
+has not been profiled, and roadmap item 522 covers it.
+[The reasoning results](../../benchmarks/reasoning/RESULTS.md#owl2bench) give every run.
+
+### OWL 2 RL rules
+
+`rules/owl-rl.rules` gained `prp-key` for keys of 1 and 2 properties, `cls-maxqc4`,
+`scm-cls`'s `owl:equivalentClass` and `owl:Nothing` conclusions, `scm-op`, `scm-dp`, the
+annotation-property axioms of `prp-ap` and the `dt-type1` axioms for the RL datatypes.
+`tests/owl_rl_rules.rs` lists every rule of OWL 2 Profiles Tables 4 to 9 and checks each
+one through an entailment, or, for a rule whose conclusion is `false`, through the
+inconsistency check that reports it. The test cases follow the Profiles tables, because
+the OWL 2 test-case repository was not reachable, and roadmap item 520 vendors
+the official cases. `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff` stay out of the
+materialization, since each would derive a fact for every term or every pair of
+literals, and roadmap item 518 covers them with a value operator. Chains of more
+than 3 properties and keys of more than 2 would add thousands of rules to the demand
+programs of query-time reasoning, which have a cap of 50,000 rules, and roadmap item
+517 covers them in the n-ary core. The compact query session now admits 128
+distinct terms, because the new axioms' constants passed the previous 64. Query-time
+reasoning under OWL 2 RL is no slower for the larger demand programs. Four OWL2Bench
+queries over 1 university, each in its own process, took 77 to 87 s against 230 to 240 s
+before, and returned the same number of result lines. Entailment analysis evaluates the
+whole rule set in each oracle run, so a justification with about 3,000 checks became
+about 28% slower, a tradeoff that roadmap item 523 follows up. A work split
+tries up to four atom steps for one that gives enough items, which keeps `prp-key`'s
+first step from running on one thread.
+
+### Cost-based planning
+
+A planner that probed constant terms in the indexes, estimated subject stars from the
+characteristic sets, ordered bodies of up to six atoms by dynamic programming and
+replanned on factor-of-two changes was built in `58f5d9a9` and reverted in `17a67b5b`.
+It derived the same facts, was slower on OWL2Bench with 1 university and no faster
+elsewhere, and raised LUBM(100)'s peak heap by 50 MiB.
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records the
+measurement.

@@ -1,0 +1,931 @@
+{
+ "title": "Closure operators, OWL 2 RL rules and the cost-based planner (roadmap items 485 to 487)",
+ "host": "forge, Intel Core i5-13500, 20 threads, 16 GiB, each run alone under ~/lanes/.heavy.lock",
+ "builds": {
+  "base": "04d49b57",
+  "new": "29f54c39",
+  "planner": "58f5d9a9"
+ },
+ "infer": {
+  "command": "sparkles infer --loc <copy of a fresh store> --full --max-inferred 0 --profile P",
+  "limits": "systemd-run scope MemoryMax=14G MemorySwapMax=0, /usr/bin/time -v for max RSS",
+  "order": "three interleaved rounds per dataset (two for OWL2Bench 5 and 10), a failed run not repeated",
+  "data": "~/lanes/item1-bench/data/<dataset>/base.nt, loaded by each build into its own store",
+  "correctness": "derived counts equal between builds except the facts of the added OWL 2 RL rules (720 for OWL2Bench(1) and (2), 350 for LUBM(100) under OWL 2 RL); RDFS counts identical",
+  "runs": [
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 5.61,
+    "max_rss_kib": 787800,
+    "inferred": 1399968,
+    "rules": 108,
+    "reason_ms": 5500,
+    "iterations": 7
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 1.38,
+    "max_rss_kib": 726304,
+    "inferred": 1400688,
+    "rules": 152,
+    "reason_ms": 1312,
+    "iterations": 6
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 1.39,
+    "max_rss_kib": 691372,
+    "inferred": 1400688,
+    "rules": 152,
+    "reason_ms": 1294,
+    "iterations": 6
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 5.3,
+    "max_rss_kib": 784004,
+    "inferred": 1399968,
+    "rules": 108,
+    "reason_ms": 5205,
+    "iterations": 7
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 5.33,
+    "max_rss_kib": 807384,
+    "inferred": 1399968,
+    "rules": 108,
+    "reason_ms": 5247,
+    "iterations": 7
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 1.31,
+    "max_rss_kib": 715244,
+    "inferred": 1400688,
+    "rules": 152,
+    "reason_ms": 1231,
+    "iterations": 6
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 53.32,
+    "max_rss_kib": 1605468,
+    "inferred": 4914915,
+    "rules": 108,
+    "reason_ms": 53200,
+    "iterations": 7
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 5.09,
+    "max_rss_kib": 1326904,
+    "inferred": 4915635,
+    "rules": 152,
+    "reason_ms": 4979,
+    "iterations": 6
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 5.34,
+    "max_rss_kib": 1380588,
+    "inferred": 4915635,
+    "rules": 152,
+    "reason_ms": 5222,
+    "iterations": 6
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 53.22,
+    "max_rss_kib": 1562984,
+    "inferred": 4914915,
+    "rules": 108,
+    "reason_ms": 53097,
+    "iterations": 7
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 54.06,
+    "max_rss_kib": 1567316,
+    "inferred": 4914915,
+    "rules": 108,
+    "reason_ms": 53918,
+    "iterations": 7
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 5.01,
+    "max_rss_kib": 1429048,
+    "inferred": 4915635,
+    "rules": 152,
+    "reason_ms": 4918,
+    "iterations": 6
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-5",
+    "profile": "owl-rl",
+    "exit": 143,
+    "wall_s": 817.04,
+    "max_rss_kib": null,
+    "note": "killed by the cgroup OOM killer at MemoryMax=14G"
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-5",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 44.93,
+    "max_rss_kib": 9992628,
+    "inferred": 52966139,
+    "rules": 152,
+    "reason_ms": 44641,
+    "iterations": 6
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-5",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 43.8,
+    "max_rss_kib": 9427596,
+    "inferred": 52966139,
+    "rules": 152,
+    "reason_ms": 43639,
+    "iterations": 6
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-5",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 43.98,
+    "max_rss_kib": 9997520,
+    "inferred": 52966139,
+    "rules": 152,
+    "reason_ms": 43803,
+    "iterations": 6
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-10",
+    "profile": "owl-rl",
+    "exit": 143,
+    "wall_s": 34.15,
+    "max_rss_kib": null,
+    "note": "killed by the cgroup OOM killer at MemoryMax=14G"
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-10",
+    "profile": "owl-rl",
+    "exit": 143,
+    "wall_s": 14.84,
+    "max_rss_kib": null,
+    "note": "killed by the cgroup OOM killer at MemoryMax=14G"
+   },
+   {
+    "build": "base",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 16.09,
+    "max_rss_kib": 4274800,
+    "inferred": 10907029,
+    "rules": 108,
+    "reason_ms": 16000,
+    "iterations": 5
+   },
+   {
+    "build": "new",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 15.61,
+    "max_rss_kib": 4284484,
+    "inferred": 10907379,
+    "rules": 152,
+    "reason_ms": 15512,
+    "iterations": 5
+   },
+   {
+    "build": "new",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 15.48,
+    "max_rss_kib": 4258100,
+    "inferred": 10907379,
+    "rules": 152,
+    "reason_ms": 15406,
+    "iterations": 5
+   },
+   {
+    "build": "base",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 16.19,
+    "max_rss_kib": 4251840,
+    "inferred": 10907029,
+    "rules": 108,
+    "reason_ms": 16120,
+    "iterations": 5
+   },
+   {
+    "build": "base",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 16.07,
+    "max_rss_kib": 4278752,
+    "inferred": 10907029,
+    "rules": 108,
+    "reason_ms": 16000,
+    "iterations": 5
+   },
+   {
+    "build": "new",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "wall_s": 15.45,
+    "max_rss_kib": 4262932,
+    "inferred": 10907379,
+    "rules": 152,
+    "reason_ms": 15385,
+    "iterations": 5
+   },
+   {
+    "build": "base",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "wall_s": 12.07,
+    "max_rss_kib": 3212160
+   },
+   {
+    "build": "new",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "wall_s": 11.83,
+    "max_rss_kib": 3157224
+   },
+   {
+    "build": "new",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "wall_s": 12.06,
+    "max_rss_kib": 3194804
+   },
+   {
+    "build": "base",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "wall_s": 12.01,
+    "max_rss_kib": 3150104
+   },
+   {
+    "build": "base",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "wall_s": 11.94,
+    "max_rss_kib": 3157804
+   },
+   {
+    "build": "new",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "wall_s": 11.81,
+    "max_rss_kib": 3178032
+   }
+  ]
+ },
+ "toggles": {
+  "command": "examples/lubm.rs infer <store> P at 58f5d9a9; both = closure operators and cost-based planner, closures = operators with the greedy planner (SPARKLES_GREEDY_PLANS=1), generic = neither (also SPARKLES_GENERIC_CLOSURES=1)",
+  "correctness": "order-free digests equal across the three modes for every dataset",
+  "note": "OWL2Bench(5) and (10) exceeded the default limit of 50 million inferred triples in this harness, so they are omitted",
+  "runs": [
+   {
+    "mode": "both",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 169988,
+    "derived": 1400688,
+    "iterations": 6,
+    "reason_ms": 460,
+    "peak_heap_mib": 121.1,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "closures",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 160084,
+    "derived": 1400688,
+    "iterations": 6,
+    "reason_ms": 340,
+    "peak_heap_mib": 113.3,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "generic",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 424228,
+    "derived": 1400688,
+    "iterations": 7,
+    "reason_ms": 4732,
+    "peak_heap_mib": 388.7,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "both",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 170440,
+    "derived": 1400688,
+    "iterations": 6,
+    "reason_ms": 466,
+    "peak_heap_mib": 121.1,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "closures",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 159816,
+    "derived": 1400688,
+    "iterations": 6,
+    "reason_ms": 344,
+    "peak_heap_mib": 114.1,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "generic",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 423796,
+    "derived": 1400688,
+    "iterations": 7,
+    "reason_ms": 4803,
+    "peak_heap_mib": 388.9,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "both",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 169068,
+    "derived": 1400688,
+    "iterations": 6,
+    "reason_ms": 498,
+    "peak_heap_mib": 120.9,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "closures",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 160084,
+    "derived": 1400688,
+    "iterations": 6,
+    "reason_ms": 372,
+    "peak_heap_mib": 113.6,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "generic",
+    "dataset": "owl2bench-1",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 427636,
+    "derived": 1400688,
+    "iterations": 7,
+    "reason_ms": 4968,
+    "peak_heap_mib": 388.9,
+    "digest": "c843825754d367c0"
+   },
+   {
+    "mode": "both",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 519676,
+    "derived": 4915635,
+    "iterations": 6,
+    "reason_ms": 1434,
+    "peak_heap_mib": 414.0,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "closures",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 519180,
+    "derived": 4915635,
+    "iterations": 6,
+    "reason_ms": 1406,
+    "peak_heap_mib": 413.6,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "generic",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 1547456,
+    "derived": 4915635,
+    "iterations": 7,
+    "reason_ms": 49396,
+    "peak_heap_mib": 1365.7,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "both",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 517144,
+    "derived": 4915635,
+    "iterations": 6,
+    "reason_ms": 1440,
+    "peak_heap_mib": 413.7,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "closures",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 519716,
+    "derived": 4915635,
+    "iterations": 6,
+    "reason_ms": 1430,
+    "peak_heap_mib": 413.7,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "generic",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 1496120,
+    "derived": 4915635,
+    "iterations": 7,
+    "reason_ms": 51296,
+    "peak_heap_mib": 1361.9,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "both",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 517016,
+    "derived": 4915635,
+    "iterations": 6,
+    "reason_ms": 1428,
+    "peak_heap_mib": 413.7,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "closures",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 516500,
+    "derived": 4915635,
+    "iterations": 6,
+    "reason_ms": 1438,
+    "peak_heap_mib": 413.0,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "generic",
+    "dataset": "owl2bench-2",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 1506348,
+    "derived": 4915635,
+    "iterations": 7,
+    "reason_ms": 57313,
+    "peak_heap_mib": 1358.3,
+    "digest": "bd5052bb74c3a4b8"
+   },
+   {
+    "mode": "both",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2300440,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2690,
+    "peak_heap_mib": 1917.5,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "closures",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2254080,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2686,
+    "peak_heap_mib": 1865.0,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "generic",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2243940,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2705,
+    "peak_heap_mib": 1878.9,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "both",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2230012,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2703,
+    "peak_heap_mib": 1916.1,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "closures",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2207648,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2635,
+    "peak_heap_mib": 1865.9,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "generic",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2282576,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2703,
+    "peak_heap_mib": 1892.6,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "both",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2289016,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2680,
+    "peak_heap_mib": 1915.1,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "closures",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2234716,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2705,
+    "peak_heap_mib": 1866.7,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "generic",
+    "dataset": "lubm-100",
+    "profile": "owl-rl",
+    "exit": 0,
+    "max_rss_kib": 2213564,
+    "derived": 10907379,
+    "iterations": 5,
+    "reason_ms": 2712,
+    "peak_heap_mib": 1877.0,
+    "digest": "e528a7b8adf9f841"
+   },
+   {
+    "mode": "both",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1918556,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1321,
+    "peak_heap_mib": 1472.5,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "closures",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1933276,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1319,
+    "peak_heap_mib": 1469.0,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "generic",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1912652,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1322,
+    "peak_heap_mib": 1460.4,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "both",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1921796,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1334,
+    "peak_heap_mib": 1471.8,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "closures",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1935912,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1342,
+    "peak_heap_mib": 1465.8,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "generic",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1887952,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1335,
+    "peak_heap_mib": 1475.6,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "both",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1901044,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1325,
+    "peak_heap_mib": 1465.8,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "closures",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1925048,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1315,
+    "peak_heap_mib": 1462.6,
+    "digest": "30edba242522bc08"
+   },
+   {
+    "mode": "generic",
+    "dataset": "lubm-100",
+    "profile": "rdfs",
+    "exit": 0,
+    "max_rss_kib": 1909156,
+    "derived": 6649763,
+    "iterations": 5,
+    "reason_ms": 1337,
+    "peak_heap_mib": 1466.1,
+    "digest": "30edba242522bc08"
+   }
+  ]
+ },
+ "development": {
+  "host": "wally, 20 threads, 32 GiB, shared with other jobs",
+  "build": "29f54c39",
+  "runs": [
+   {
+    "dataset": "owl2bench-10",
+    "profile": "owl-rl",
+    "limit": "MemoryMax=28G MemorySwapMax=0",
+    "result": "killed by the cgroup OOM killer after about 2 minutes at 28 GiB of anonymous RSS"
+   }
+  ]
+ },
+ "demand": {
+  "command": "sparkles query --loc <unmaterialized store> --reasoning demand --profile owl-rl --max-derived 0 --query <OWL2Bench query>, one process per query, one round, base then new",
+  "correctness": "output line counts equal between builds for every query",
+  "runs": [
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q2",
+    "exit": 0,
+    "wall_s": 231.171,
+    "output_lines": 7425
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q2",
+    "exit": 0,
+    "wall_s": 82.7857,
+    "output_lines": 7425
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q7",
+    "exit": 0,
+    "wall_s": 240.147,
+    "output_lines": 1688
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q7",
+    "exit": 0,
+    "wall_s": 84.4468,
+    "output_lines": 1688
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q12",
+    "exit": 0,
+    "wall_s": 236.289,
+    "output_lines": 2498
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q12",
+    "exit": 0,
+    "wall_s": 76.5373,
+    "output_lines": 2498
+   },
+   {
+    "build": "base",
+    "dataset": "owl2bench-1",
+    "query": "q19",
+    "exit": 0,
+    "wall_s": 229.728,
+    "output_lines": 862
+   },
+   {
+    "build": "new",
+    "dataset": "owl2bench-1",
+    "query": "q19",
+    "exit": 0,
+    "wall_s": 87.1726,
+    "output_lines": 862
+   }
+  ]
+ },
+ "reasoner_bench": {
+  "command": "examples/reasoner-bench 1000000 P (mise run bench:reasoner), three interleaved rounds",
+  "runs": [
+   {
+    "build": "base",
+    "profile": "rdfs",
+    "reasoning_ms": [
+     1331,
+     1352,
+     1336
+    ],
+    "materialize_ms": [
+     2743,
+     2792,
+     2753
+    ],
+    "inferred": 2751996
+   },
+   {
+    "build": "new",
+    "profile": "rdfs",
+    "reasoning_ms": [
+     1324,
+     1288,
+     1313
+    ],
+    "materialize_ms": [
+     2706,
+     2719,
+     2693
+    ],
+    "inferred": 2751996
+   },
+   {
+    "build": "base",
+    "profile": "owl-rl",
+    "reasoning_ms": [
+     1331,
+     1334,
+     1330
+    ],
+    "materialize_ms": [
+     2720,
+     2711,
+     2702
+    ],
+    "inferred": 2752167
+   },
+   {
+    "build": "new",
+    "profile": "owl-rl",
+    "reasoning_ms": [
+     1294,
+     1314,
+     1445
+    ],
+    "materialize_ms": [
+     2784,
+     2711,
+     2712
+    ],
+    "inferred": 2752351
+   }
+  ]
+ }
+}

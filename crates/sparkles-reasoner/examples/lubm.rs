@@ -4,13 +4,15 @@
 //! ```sh
 //! cargo run --release -p sparkles-reasoner --example lubm -- gen 10 /tmp/lubm
 //! cargo run --release -p sparkles-reasoner --example lubm -- load /tmp/lubm 10 /tmp/lubm/db10
+//! cargo run --release -p sparkles-reasoner --example lubm -- loadfile /tmp/owl2bench/db2 owl2bench-2.nt
 //! cargo run --release -p sparkles-reasoner --example lubm -- infer /tmp/lubm/db10 rdfs
 //! cargo run --release -p sparkles-reasoner --example lubm -- materialize /tmp/lubm/db10 owl-rl
 //! cargo run --release -p sparkles-reasoner --example lubm -- keep /tmp/lubm/db10 rdfs 1000
 //! cargo run --release -p sparkles-reasoner --example lubm -- diag /tmp/lubm/db10
 //! ```
 //!
-//! `RAYON_NUM_THREADS` sets the number of threads. The peak heap counts every allocation
+//! `RAYON_NUM_THREADS` sets the number of threads, and `SPARKLES_GENERIC_CLOSURES=1` makes
+//! `infer` evaluate transitive and equivalence rules as ordinary rules. The peak heap counts every allocation
 //! of the process from the start of the run, so it includes the data the run returns.
 //!
 //! `keep` measures the closure kept for incremental runs, as a server keeps it: a full
@@ -156,6 +158,15 @@ fn change_sets(k: usize) -> (Vec<Triple>, Vec<Triple>) {
     (del, add)
 }
 
+/// The options of `infer`: `SPARKLES_GENERIC_CLOSURES=1` evaluates transitive and
+/// equivalence rules as ordinary rules, for a comparison with the closure operators.
+fn run_options() -> ReasonOptions {
+    ReasonOptions {
+        closure_operators: std::env::var("SPARKLES_GENERIC_CLOSURES").as_deref() != Ok("1"),
+        ..ReasonOptions::default()
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -200,6 +211,22 @@ fn main() {
                 t.elapsed().as_millis()
             );
         }
+        "loadfile" => {
+            let db = PathBuf::from(&args[2]);
+            let _ = std::fs::remove_dir_all(&db);
+            let store = Store::open(&db, StoreOptions::default()).unwrap();
+            let t = Instant::now();
+            let sources: Vec<Source> = args[3..]
+                .iter()
+                .map(|f| Source::from_path(Path::new(f), None).unwrap())
+                .collect();
+            store.load(&sources).unwrap();
+            println!(
+                "{} quads loaded in {} ms",
+                store.snapshot().len(),
+                t.elapsed().as_millis()
+            );
+        }
         "infer" | "materialize" => {
             let db = PathBuf::from(&args[2]);
             let profile: Profile = args[3].parse().expect("profile");
@@ -211,7 +238,7 @@ fn main() {
             if cmd == "infer" {
                 let done = std::sync::Mutex::new((0usize, 0u128));
                 let (derived, iterations, digest, order) =
-                    bench_derive(snap, &profile, &ReasonOptions::default(), &|| {
+                    bench_derive(snap, &profile, &run_options(), &|| {
                         *done.lock().unwrap() = (
                             PEAK.load(Ordering::Relaxed) - before,
                             t.elapsed().as_millis(),

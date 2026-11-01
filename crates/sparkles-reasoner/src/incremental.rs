@@ -1651,6 +1651,7 @@ mod tests {
             max_iterations: 10_000,
             max_inferred: 10_000_000,
             budget: Budget::unlimited(),
+            closures: false,
             cancel: None,
             progress: None,
         }
