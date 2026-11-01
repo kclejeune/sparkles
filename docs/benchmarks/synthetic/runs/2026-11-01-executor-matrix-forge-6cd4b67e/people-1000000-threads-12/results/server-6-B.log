@@ -1,0 +1,5 @@
+[2m2026-11-01T11:21:19.868354Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m memory profile default: block cache 1024 MiB, result cache 0 MiB, SERVICE cache 64 MiB, history cache 512 MiB, query budget 8192 MiB, query pool 7010 MiB
+[2m2026-11-01T11:21:19.876921Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m spill directory /home/kclejeune/lanes/ws1a-gates-469-473/runs-r9/executors/people-1000000-threads-12/srv/.spill/890faff8382545f29098db509101231a-772326-f6d1664a4abc6538, 13372 MiB for all queries
+[2m2026-11-01T11:21:19.881095Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m Sparkles 0.1.0 listening on http://127.0.0.1:4181/ (UI at /ui/), opening 0 datasets
+[2m2026-11-01T11:21:19.883434Z[0m [32m INFO[0m [2msparkles::startup[0m[2m:[0m datasets opened in 2.3ms: status ready, ready true
+[2m2026-11-01T11:29:25.916827Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m shutting down: finishing requests in flight (up to 20s)

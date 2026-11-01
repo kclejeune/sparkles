@@ -1809,10 +1809,11 @@ Item 469 adds `mise run bench:executors`, which runs the 31 queries of `scripts/
 with eager and streaming execution at 1.05M and 10.5M triples, with 12 threads and with
 one, on one host and one shared store, and checks that both modes return the same
 answers. The roadmap item named 33 queries, and the suite holds 31. On forge both modes
-agreed on every query. With 12 threads streaming execution was slower end to end by a
-geometric mean of 22% at 1.05M triples and 17% at 10.5M, mostly from a fixed cost of
-about 0.3 ms per streamed response and from writing large answers, which item NEW-ITEM-3
-investigates. The
+agreed on every query, and every timed answer was checked. With 12 threads streaming
+execution was slower end to end by a geometric mean of 23% at 1.05M triples and 15% at
+10.5M, while the execution times of the two modes were within a few percent. The
+difference comes mostly from a fixed cost of about 0.3 ms per streamed response and from
+writing large answers, which item NEW-ITEM-3 investigates. The
 [baseline](../benchmarks/synthetic/RESULTS.md#eager-against-cursor-matrix) is the oracle
 of item 453, which takes the faster mode of each query.
 

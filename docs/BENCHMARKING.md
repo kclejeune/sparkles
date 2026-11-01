@@ -804,7 +804,7 @@ and their range. The record has a version, and the tool refuses a version it doe
 know.
 
 ```sh
-scripts/bench-gate.py compare docs/benchmarks/synthetic/runs/2026-11-01-executor-matrix-forge/record.json \
+scripts/bench-gate.py compare docs/benchmarks/synthetic/runs/2026-11-01-executor-matrix-forge-6cd4b67e/record.json \
     .artifacts/bench-executors/<time>/record.json
 ```
 
@@ -895,9 +895,9 @@ of curl's wall time, under keys that end in `/wall`, for each mode. A streamed a
 making batches and leaves out the time spent writing them, so the wall time is the
 end-to-end measure for large answers such as `export-500k`. The one-thread cells have a
 wall-time floor of about 2 ms from the pinned server's own threads sharing one CPU, so
-their execution time is the measure for short queries. A run takes NEW-MATRIX-TIME on
-forge. The script refuses to start while a compiler or a server runs, so take the host's
-locks first. The task also accepts a prebuilt binary, whose record then needs
+their execution time is the measure for short queries. A run takes about two and a half
+hours on forge, most of it spent digesting the large timed answers. The script refuses to
+start while a compiler or a server runs, so take the host's locks first. The task also accepts a prebuilt binary, whose record then needs
 `--build-config` with the output of `scripts/bench-gate.py build-config` from that
 binary's build environment, since a record without a build configuration cannot be
 compared.
