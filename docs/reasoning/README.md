@@ -16,6 +16,22 @@ request or on every write, and the schema report counts what the data holds.
   compressed indexes, so a run's memory follows the facts it derives. LUBM(1000) under
   RDFS, 138 million triples, materializes in 91 s at 15.2 GiB of RSS on 16 cores
   ([F16](../specs/F16-materialization-at-scale.md#outcome), [BENCHMARKS.md](../BENCHMARKS.md)).
+* The `owl-rl` profile covers the rules of the OWL 2 RL/RDF tables of OWL 2 Profiles
+  §4.3, and a test checks each one ([F23](../specs/F23-reasoner-core/SPEC.md#outcome)).
+  Rules whose conclusion is `false` are reported by the inconsistency checks below
+  rather than materialized. The profile leaves out three rules. `eq-ref` would make every
+  term `owl:sameAs` itself, `dt-type2` would type every literal, and `dt-eq` would relate
+  literals with equal values. Literal types are read where a rule needs them, as
+  `owl:someValuesFrom` with a datatype does. Property chains have rules for 2 and 3
+  properties and keys for 1 and 2, because each longer rule adds thousands of rules to
+  the demand programs of query-time reasoning.
+* Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
+  and `owl:sameAs` with closure operators instead of joins. An operator condenses the
+  relation's strongly connected components and works out each component's reachable
+  set once, and `owl:sameAs` closes its classes with union-find. The rules stay in the
+  program, so explanations and incremental maintenance still name them, and a run
+  derives the same facts as one that evaluates them as joins. A program with a rule that
+  is not monotonic evaluates every rule as a join.
 * Each iteration merges its results in parallel on a reasoning pool, half the cores by
   default with `serve --reason-threads`, that admits runs in arrival order. A run stops at
   50 million derived triples by default, and `sparkles infer --max-inferred`,

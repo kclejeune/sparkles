@@ -1392,6 +1392,8 @@ const MAX_SPLIT_BINDINGS: usize = 1 << 16;
 
 /// The fewest bindings a work item of a split evaluates in turn.
 const MIN_BATCH: usize = 8;
+/// Atom steps a split tries, from the second on, to find one that gives enough items.
+const MAX_SPLIT_DEPTH: usize = 4;
 
 /// The work of a plan split at step `d` (an atom): the bindings of the steps before it,
 /// from the shares `first` of step 0, in the order a sequential evaluation visits them,
@@ -1884,13 +1886,32 @@ pub(crate) fn run_observed(
                 })
                 .flatten()
                 .map(|d| d + 1);
-            if let Some(d) = deeper {
-                let split = split_at(gr, terms, r, p, *ri, d, &first, &abort, limits, split_min)
-                    .map_err(|e| match e.downcast::<MemoryExceeded>() {
-                        Ok(m) => memory(m, iteration),
-                        Err(e) => e,
-                    })?;
-                if let Some((items, held)) = split {
+            if let Some(mut d) = deeper {
+                // a step that binds few rows splits no better than the first, so the
+                // split moves on to later atoms while it gives too few items
+                let mut best = None;
+                for _ in 0..MAX_SPLIT_DEPTH {
+                    let split =
+                        split_at(gr, terms, r, p, *ri, d, &first, &abort, limits, split_min)
+                            .map_err(|e| match e.downcast::<MemoryExceeded>() {
+                                Ok(m) => memory(m, iteration),
+                                Err(e) => e,
+                            })?;
+                    let Some((items, held)) = split else {
+                        break;
+                    };
+                    let enough = items.len() >= split_min;
+                    best = Some((items, held));
+                    let next = p
+                        .iter()
+                        .skip(d + 1)
+                        .position(|s| matches!(s, Step::Atom { .. }));
+                    match next {
+                        Some(n) if !enough => d += 1 + n,
+                        _ => break,
+                    }
+                }
+                if let Some((items, held)) = best {
                     work.extend(items);
                     split_held.absorb(held);
                     continue;
