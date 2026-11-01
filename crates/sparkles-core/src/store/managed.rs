@@ -118,6 +118,45 @@ impl Store {
         entry: OwnerEntry,
         settings: &[u8],
     ) -> Result<ManagedGraphs> {
+        self.enable_managed_checked(owner, entry, settings, None)
+    }
+
+    /// [`enable_managed`](Self::enable_managed) only while the registry's revision is
+    /// still `expected`, which is 0 when no registry is installed. Under the writer lock
+    /// of main, any other revision refuses with a conflict and writes nothing, so a
+    /// caller that derived `entry` from the registry it read cannot overwrite a change
+    /// made since.
+    pub fn enable_managed_at(
+        &self,
+        owner: OwnerKind,
+        entry: OwnerEntry,
+        settings: &[u8],
+        expected: u64,
+    ) -> Result<ManagedGraphs> {
+        self.enable_managed_checked(owner, entry, settings, Some(expected))
+    }
+
+    /// The bytes of `owner`'s settings file as the installed registry records them,
+    /// `None` when the owner is not enabled. Fails with `managed-unavailable` when the
+    /// registry cannot be enforced.
+    pub fn managed_settings(&self, owner: OwnerKind) -> Result<Option<Arc<[u8]>>> {
+        match self.managed_state().as_deref() {
+            None => Ok(None),
+            Some(ManagedState::Installed(i)) => Ok(i.settings.get(&owner).cloned()),
+            Some(ManagedState::Unavailable { reason, .. }) => Err(ManagedError::error(
+                ManagedErrorKind::Unavailable,
+                reason.clone(),
+            )),
+        }
+    }
+
+    fn enable_managed_checked(
+        &self,
+        owner: OwnerKind,
+        entry: OwnerEntry,
+        settings: &[u8],
+        expected: Option<u64>,
+    ) -> Result<ManagedGraphs> {
         if !owner.supports_profile(entry.profile) {
             return Err(ManagedError::error(
                 ManagedErrorKind::UnsupportedProfile,
@@ -155,6 +194,14 @@ impl Store {
             )));
         }
         self.change_managed(|current| {
+            let revision = current.map_or(0, |i| i.graphs.revision);
+            if let Some(expected) = expected
+                && expected != revision
+            {
+                return Err(Error::Conflict(format!(
+                    "the managed-graph registry is at revision {revision}, not {expected}; read it again"
+                )));
+            }
             let mut graphs = current.map_or_else(
                 || ManagedGraphs {
                     revision: 0,
