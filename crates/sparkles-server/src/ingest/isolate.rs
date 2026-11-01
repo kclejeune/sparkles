@@ -49,6 +49,24 @@ pub const MAGIC: &[u8; 4] = b"SPKC";
 const EXIT_INPUT: i32 = 2;
 const EXIT_LIMITS: i32 = 3;
 const EXIT_PROTOCOL: i32 = 4;
+const EXIT_THREADS: i32 = 5;
+
+/// The most threads of the child's rayon pool, which the PDF parser's parallel loops use.
+/// Without a bound the pool starts a thread per core, and each thread reserves its stack
+/// out of the address-space limit.
+const CHILD_THREADS: usize = 4;
+
+/// The most malloc arenas glibc makes in the child. Every new thread calls
+/// `pthread_getattr_np` when Rust's standard library installs its stack-overflow handler,
+/// which allocates with glibc's malloc, and glibc then reserves an arena of 64 MiB of
+/// address space for that thread. On a host with 20 cores that took 1.3 GiB of a 1 GiB
+/// limit before the converter read a byte. The child's own allocations go through
+/// mimalloc, so few arenas cost it nothing.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const CHILD_MALLOC_ARENAS: libc::c_int = 2;
+
+/// How many bytes of the child's standard error a refusal quotes.
+const STDERR_QUOTE: usize = 400;
 
 /// The variables a child keeps from the server's environment. Everything else, provider
 /// keys and tokens included, is left out.
@@ -264,16 +282,12 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
     let wait_until = o.deadline + GRACE;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut killed = false;
-    let mut err_text = Vec::new();
+    let mut err_text = (Vec::new(), Vec::new());
     let outcome = std::thread::scope(|s| {
-        // the first 2 KiB of the child's errors are kept for the log, and the rest is
-        // drained so that the child never blocks on a full pipe
-        let err_reader = s.spawn(move || {
-            let mut head = Vec::new();
-            let _ = (&mut stderr).take(2048).read_to_end(&mut head);
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-            head
-        });
+        // the first 2 KiB of the child's errors are kept for the log and its last bytes
+        // for the refusal, and the rest is drained so that the child never blocks on a
+        // full pipe
+        let err_reader = s.spawn(move || read_stderr(&mut stderr));
         // the input is written and the output read on threads of their own, so that a
         // child that writes before it has read everything cannot block the parent
         s.spawn(move || {
@@ -318,23 +332,26 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
         (got, status)
     });
     let (got, status) = outcome;
-    let failure = |what: &str| {
+    // a refusal for a child that failed quotes the end of what it wrote to its standard
+    // error, such as a panic's message, and the log keeps all of the first 2 KiB
+    let failure = |what: &str, r: Refusal| {
         tracing::warn!(
             status = ?status,
-            stderr = %String::from_utf8_lossy(&err_text),
+            stderr = %String::from_utf8_lossy(&err_text.0),
             "a conversion child {what}"
         );
+        with_stderr(r, &err_text.1)
     };
     match got {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Some(timeout())),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            failure("could not be read");
-            Err(Some(Refusal::new(
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Some(failure(
+            "could not be read",
+            Refusal::new(
                 "conversion-failed",
                 500,
                 "the conversion child's output could not be read",
-            )))
-        }
+            ),
+        ))),
         Ok(Err(e)) => Err(Some(failed(format!(
             "the conversion's output could not be read: {e}"
         )))),
@@ -345,22 +362,22 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
         ))),
         Ok(Ok(out)) => {
             if out.is_empty() {
-                failure("ended without a result");
-                return Err(Some(ended(status, killed, iso.memory)));
+                let r = ended(status, killed, iso.memory);
+                if r.code == "conversion-timeout" {
+                    return Err(Some(r));
+                }
+                return Err(Some(failure("ended without a result", r)));
             }
             if out.len() < 8 || &out[..4] != MAGIC || out[4..8] != PROTOCOL.to_le_bytes() {
-                failure("answered in another protocol");
-                return Err(Some(mismatch()));
+                return Err(Some(failure("answered in another protocol", mismatch())));
             }
             match decode(&out[8..]) {
                 Some(Ok(r)) => Ok(r),
                 Some(Err(r)) => Err(Some(r)),
-                None => {
-                    failure("wrote a damaged reply");
-                    Err(Some(failed(
-                        "the document could not be read: the converter's reply was damaged",
-                    )))
-                }
+                None => Err(Some(failure(
+                    "wrote a damaged reply",
+                    failed("the document could not be read: the converter's reply was damaged"),
+                ))),
             }
         }
     }
@@ -383,6 +400,62 @@ pub fn probe(iso: &Isolation) -> Result<(), String> {
         Err(Some(r)) => Err(r.message),
         Err(None) => Err(format!("{} could not be started", iso.exe.display())),
     }
+}
+
+/// How many bytes of the start of the child's standard error the log keeps, and of its end
+/// the parent keeps for [`with_stderr`], which quotes less than that once it has left out
+/// Rust's backtrace hint.
+const STDERR_HEAD: usize = 2048;
+const STDERR_TAIL: usize = 1024;
+
+/// Read the child's standard error to its end, and return its first [`STDERR_HEAD`] and
+/// last [`STDERR_TAIL`] bytes.
+fn read_stderr(r: &mut impl Read) -> (Vec<u8>, Vec<u8>) {
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let chunk = &buf[..n];
+        let room = STDERR_HEAD.saturating_sub(head.len());
+        head.extend_from_slice(&chunk[..room.min(n)]);
+        tail.extend_from_slice(chunk);
+        if tail.len() > STDERR_TAIL {
+            tail.drain(..tail.len() - STDERR_TAIL);
+        }
+    }
+    (head, tail)
+}
+
+/// `r` with the end of the child's standard error `err` quoted, when it wrote any. Rust's
+/// hint to set `RUST_BACKTRACE` is left out, and the lines are joined into one.
+fn with_stderr(mut r: Refusal, err: &[u8]) -> Refusal {
+    let text = String::from_utf8_lossy(err);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("note: run with `RUST_BACKTRACE"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if line.is_empty() {
+        return r;
+    }
+    let mut start = line.len().saturating_sub(STDERR_QUOTE);
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = if start > 0 { "..." } else { "" };
+    r.message = format!("{}; the child reported: {cut}{}", r.message, &line[start..]);
+    r
 }
 
 fn mismatch() -> Refusal {
@@ -420,6 +493,17 @@ fn ended(status: Option<std::process::ExitStatus>, killed: bool, memory: u64) ->
             return unsafe_start("it could not set its resource limits");
         }
         Some(EXIT_PROTOCOL) => return mismatch(),
+        Some(EXIT_THREADS) => {
+            return Refusal::new(
+                "conversion-failed",
+                500,
+                format!(
+                    "the conversion child could not start its threads under its memory limit \
+                     of {} MiB: raise --convert-memory",
+                    memory >> 20
+                ),
+            );
+        }
         Some(EXIT_INPUT) => return unsafe_start("it could not read the document"),
         _ => {}
     }
@@ -557,6 +641,14 @@ pub fn child_main(args: Vec<OsString>) -> i32 {
     if num("protocol") != PROTOCOL as usize {
         return EXIT_PROTOCOL;
     }
+    // the threads start under the limits, so that a probe finds a limit they do not fit
+    if let Err(e) = start_threads() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "the conversion child could not start its threads: {e}"
+        );
+        return EXIT_THREADS;
+    }
     let millis = num("millis") as u64;
     let deadline = started + Duration::from_millis(millis);
     let max_input = num("max_input");
@@ -608,6 +700,22 @@ pub fn child_main(args: Vec<OsString>) -> i32 {
     0
 }
 
+/// Bound the threads of the child before it starts any: glibc's malloc arenas, and the
+/// global rayon pool, which would otherwise start at its first parallel loop with a thread
+/// per core, or as many as `RAYON_NUM_THREADS` asks for, and panic when they do not fit.
+fn start_threads() -> Result<(), rayon::ThreadPoolBuildError> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only sets a parameter of glibc's malloc, and no thread is running
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, CHILD_MALLOC_ARENAS);
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cores.min(CHILD_THREADS))
+        .thread_name(|i| format!("convert-{i}"))
+        .build_global()
+}
+
 fn convert_here(
     job: &str,
     format: Option<Format>,
@@ -650,6 +758,26 @@ fn convert_here(
                 get(libc::RLIMIT_AS),
                 get(libc::RLIMIT_FSIZE),
                 get(libc::RLIMIT_CORE)
+            )))
+        }
+        // the tests start threads in the child to find what each one costs it
+        #[cfg(debug_assertions)]
+        ("threads", _) => {
+            let n = o.max_text;
+            let started: Vec<_> = (0..n)
+                .map(|_| {
+                    std::thread::Builder::new().spawn(|| {
+                        std::thread::sleep(Duration::from_millis(200));
+                    })
+                })
+                .collect();
+            let ok = started
+                .into_iter()
+                .filter_map(Result::ok)
+                .fold(0, |n, h| n + usize::from(h.join().is_ok()));
+            Err(failed(format!(
+                "started={ok} pool={}",
+                rayon::current_num_threads()
             )))
         }
         _ => Err(failed("the conversion child was asked for an unknown job")),
@@ -1021,6 +1149,31 @@ mod tests {
         assert!(e.message.contains("memory limit"), "{}", e.message);
         let r = run(&shell("exit 101"), JOB, b"x", &o);
         assert_eq!(r.unwrap_err().unwrap().code, "conversion-failed");
+        // the refusal quotes the end of the child's errors, without Rust's backtrace hint
+        let script = "printf 'thread panicked at x.rs:1:2:\\nno pool\\n\
+                      note: run with `RUST_BACKTRACE=1` to display a backtrace\\n' >&2; exit 101";
+        let e = run(&shell(script), JOB, b"x", &o).unwrap_err().unwrap();
+        assert!(
+            e.message
+                .ends_with("the child reported: thread panicked at x.rs:1:2: no pool"),
+            "{}",
+            e.message
+        );
+        // a panic after more than the log's 2 KiB of other errors is still quoted, and a
+        // long message only by its end
+        let long = format!(
+            "printf '%s\\n' {} >&2; printf 'last words\\n' >&2; exit 101",
+            "y".repeat(5000)
+        );
+        let e = run(&shell(&long), JOB, b"x", &o).unwrap_err().unwrap();
+        let quote = format!("{} last words", "y".repeat(STDERR_QUOTE - 11));
+        assert!(
+            e.message.ends_with(&format!("reported: ...{quote}")),
+            "{}",
+            e.message
+        );
+        let r = run(&shell("exit 5"), JOB, b"x", &o).unwrap_err().unwrap();
+        assert!(r.message.contains("--convert-memory"), "{}", r.message);
         // a child that could not set its limits, or speaks another protocol, is named
         let r = run(&shell("exit 3"), JOB, b"x", &o).unwrap_err().unwrap();
         assert_eq!(r.status, 500);
@@ -1050,14 +1203,33 @@ mod tests {
 
     /// The reply of a child of the real binary started with `args`, without its header.
     fn child_reply(args: &[String], env: Vec<(OsString, OsString)>) -> std::process::Output {
-        Command::new(binary())
+        child_reply_to(args, env, b"")
+    }
+
+    /// The reply of a child of the real binary started with `args` and `input`.
+    fn child_reply_to(
+        args: &[String],
+        env: Vec<(OsString, OsString)>,
+        input: &[u8],
+    ) -> std::process::Output {
+        let mut child = Command::new(binary())
             .arg(CHILD_ARG)
             .args(args)
             .env_clear()
             .envs(env)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        out
     }
 
     fn refusal_of(out: &std::process::Output) -> Refusal {
@@ -1123,6 +1295,54 @@ mod tests {
         assert!(names.contains(&"MIMALLOC_ARENA_RESERVE"), "{names:?}");
         assert!(!names.contains(&"SPARKLES_TEST_SECRET"), "{names:?}");
         assert!(!names.contains(&"ANTHROPIC_API_KEY"), "{names:?}");
+    }
+
+    // Threads cost the child their stacks and no malloc arena of 64 MiB each, so 64 of
+    // them fit under 1 GiB, and its rayon pool stays small whatever the cores or
+    // `RAYON_NUM_THREADS` ask for.
+    #[test]
+    fn the_child_bounds_what_its_threads_reserve() {
+        let mut args = limit_args(1 << 30, Duration::from_secs(5), true);
+        args.extend([
+            "max_input=10".into(),
+            "max_text=64".into(),
+            "millis=5000".into(),
+            format!("protocol={PROTOCOL}"),
+            "job=threads".into(),
+        ]);
+        let mut env = child_env([]);
+        env.push(("RAYON_NUM_THREADS".into(), "64".into()));
+        let out = child_reply(&args, env);
+        let f = refusal_of(&out);
+        let pool: usize = f.message.rsplit('=').next().unwrap().parse().unwrap();
+        assert!(f.message.starts_with("started=64 "), "{}", f.message);
+        assert!((1..=CHILD_THREADS).contains(&pool), "{}", f.message);
+    }
+
+    // A PDF converts in a child under 1 GiB however many threads rayon would start on
+    // its own. With a thread per core, each thread's malloc arena filled the limit on a
+    // host with 20 cores, and the child panicked when the parser started the pool.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn a_pdf_converts_in_a_child_on_a_host_with_many_cores() {
+        let mut args = limit_args(1 << 30, Duration::from_secs(30), true);
+        let pdf = super::super::fixtures::report();
+        args.extend([
+            format!("max_input={}", pdf.len()),
+            "max_text=1048576".into(),
+            "millis=30000".into(),
+            format!("protocol={PROTOCOL}"),
+            "job=pdf".into(),
+            "partial=0".into(),
+        ]);
+        let mut env = child_env([]);
+        env.push(("RAYON_NUM_THREADS".into(), "64".into()));
+        let out = child_reply_to(&args, env, &pdf);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let here_rt = std::sync::Arc::new(super::super::PdfRuntime::new(1, None));
+        let here = super::super::pdf::inspect(&pdf, false, &here_rt).map(Reply::Text);
+        assert!(out.stdout.starts_with(MAGIC), "{out:?}");
+        assert_eq!(decode(&out.stdout[8..]), Some(here));
     }
 
     // The startup probe passes for the real binary and names the reason for another.
