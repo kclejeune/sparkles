@@ -79,7 +79,7 @@ const EXPLORE_OUT: usize = 40;
 const EXPLORE_IN: usize = 20;
 const EXPLORE_CANDIDATES: usize = 5;
 /// The most first drafts that vote on an answer.
-pub const MAX_DRAFTS: usize = 5;
+pub use crate::assistant::MAX_DRAFTS;
 /// The most earlier turns a follow-up question carries (§5.1).
 pub const MAX_CONTEXT: usize = 5;
 /// Below this context window the grounding is trimmed (§3.6).

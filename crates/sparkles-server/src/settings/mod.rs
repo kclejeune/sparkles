@@ -124,6 +124,7 @@ pub static ASSISTANT: Kind = Kind {
         "deadlineSecs",
         "historyDays",
         "routing",
+        "repairs",
     ],
     removable: &[],
     shared: false,

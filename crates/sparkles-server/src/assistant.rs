@@ -82,6 +82,9 @@ fn yes() -> bool {
     true
 }
 
+/// The most first drafts that an ask's vote takes.
+pub const MAX_DRAFTS: usize = 5;
+
 /// The repair turns of an ask (C18 §4.2), each unset to keep Ask's default. A
 /// dataset's `assistant.json` sets them under `repairs`, a request or a command line
 /// overrides them, and [`AskRepairs::apply`] puts them into the options.
@@ -118,6 +121,7 @@ impl AskRepairs {
     }
 
     /// Set the options that these name, keeping the others.
+    #[cfg(feature = "mcp")]
     pub fn apply(self, o: &mut crate::ask::AskOptions) {
         if let Some(v) = self.explore {
             o.explore = v;
@@ -136,10 +140,9 @@ impl AskRepairs {
     /// An error for a draft count out of range, naming the field as `prefix`.
     pub fn check(&self, prefix: &str) -> Result<(), String> {
         match self.drafts {
-            Some(n) if !(1..=crate::ask::MAX_DRAFTS).contains(&n) => Err(format!(
-                "{prefix}drafts must be from 1 to {}",
-                crate::ask::MAX_DRAFTS
-            )),
+            Some(n) if !(1..=MAX_DRAFTS).contains(&n) => {
+                Err(format!("{prefix}drafts must be from 1 to {MAX_DRAFTS}"))
+            }
             _ => Ok(()),
         }
     }
@@ -1249,7 +1252,7 @@ mod usage_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mcp"))]
 mod repair_tests {
     use super::*;
 
