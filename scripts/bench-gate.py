@@ -784,8 +784,8 @@ def native_digest(args):
     """A digest of each application/x-sparkles+json SELECT answer in `args.responses`, one
     line each in order, for the matrix's check of the timed format after the timed
     requests: "<rows> rows, <digest of the sorted rows>" and, for a query with a top-level
-    ORDER BY, the order digest of `order-digest` over the rows as returned. Terms are
-    written with their type, value, datatype and language. The answers of one query share
+    ORDER BY, the order digest of `order-digest` over the rows as returned. Rows are
+    written as JSON lists of their terms' type, value, datatype and language. The answers of one query share
     one process, and the check against the input runs once for each distinct set of rows."""
     root = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location("bench_answers", root / "bench-answers.py")
@@ -793,16 +793,20 @@ def native_digest(args):
     spec.loader.exec_module(ba)
     query = Path(args.query).read_text()
     ordered = ba._after_order_by(query) is not None
-    # the number of missing triples of each distinct sorted answer, which depends only on it
+    # the number of missing triples of each distinct answer, which depends only on its rows
     missing_of = {}
 
-    def show(t):
+    def term(t):
         if t is None:
-            return "-"
+            return None
         if t.get("type") == "triple":
             v = t["value"]
-            return "<<" + " ".join(show(v[k]) for k in ("subject", "predicate", "object")) + ">>"
-        return "|".join(str(t.get(k, "")) for k in ("type", "value", "datatype", "xml:lang"))
+            return ["triple"] + [term(v[k]) for k in ("subject", "predicate", "object")]
+        return [str(t.get(k, "")) for k in ("type", "value", "datatype", "xml:lang")]
+
+    def show(cells):
+        # JSON, so that no value can pass for a delimiter between terms or rows
+        return json.dumps([term(t) for t in cells], ensure_ascii=True)
 
     def digest(response):
         try:
@@ -814,7 +818,7 @@ def native_digest(args):
             return f"ask {r.get('boolean')}"
         if any(len(row) != len(names) for row in r.get("rows") or []):
             return "rows wider or narrower than vars"
-        rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
+        rows = [show(row) for row in r.get("rows") or []]
         # the query type and the projected variables, in order, belong to the answer
         head = f"{r.get('queryType')} " + " ".join(names)
         sorted_hash = hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()
@@ -832,7 +836,7 @@ def native_digest(args):
             h = hashlib.sha256()
             for row in r.get("rows") or []:
                 cells = [row[names.index(k)] for k in keys] if keys else row
-                h.update("\t".join(show(t) for t in cells).encode() + b"\n")
+                h.update(show(cells).encode() + b"\n")
             out.append(("keys:" if keys else "rows:") + h.hexdigest()[:16])
         return ", ".join(out)
 

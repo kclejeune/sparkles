@@ -573,6 +573,21 @@ class GateTests(unittest.TestCase):
             self.assertIn("missing 0", lines[0])
             self.assertIn("missing 1", lines[1])
             self.assertEqual(lines[3], "unreadable")
+            # values that hold the delimiters of a tab-joined encoding cannot make another
+            # answer's rows look alike, nor share its check against the input
+            u = lambda v: {"type": "uri", "value": v}
+            lit = lambda v: {"type": "literal", "value": v}
+            rows_a = [[u("a"), u("p"), lit("x")], [u("b"), u("p"), lit("y||\nuri|c||\turi|p||\tliteral|z")]]
+            rows_b = [[u("a"), u("p"), lit("x||\nuri|b||\turi|p||\tliteral|y")], [u("c"), u("p"), lit("z")]]
+            pair = []
+            for name, rows in (("ca", rows_a), ("cb", rows_b)):
+                g = Path(d) / f"{name}.json"
+                g.write_text(json.dumps({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": rows}))
+                pair.append(g)
+            alone = [run("native-digest", q, g, "--data", data).stdout.strip() for g in pair]
+            both = run("native-digest", q, *pair, "--data", data).stdout.splitlines()
+            self.assertEqual(both, alone)
+            self.assertNotEqual(alone[0].split(", ")[-1], alone[1].split(", ")[-1])
 
 
 if __name__ == "__main__":
