@@ -436,10 +436,33 @@ impl RowCharge {
 
 /// Consume SELECT batches directly, applying writer backpressure before requesting
 /// the next batch. A later error leaves partial bytes and no success terminator.
+/// A writer that a serializer writes to while the code around it keeps a way to flush
+/// it, which the cursor writers use after their first batch.
+struct Shared<'a, W>(&'a std::cell::RefCell<W>);
+
+impl<W: Write> Write for Shared<'_, W> {
+    #[inline]
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().write(b)
+    }
+
+    #[inline]
+    fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.0.borrow_mut().write_all(b)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+/// Write a cursor's solutions in `fmt`. The writer is flushed once, after the rows of
+/// the first batch, so that a writer which commits a response on a flush sends them
+/// while the cursor computes the next batch. Later batches are not flushed.
 pub fn write_cursor_solutions(
     cursor: &mut super::QueryCursor,
     fmt: SolutionsFormat,
-    mut writer: impl Write,
+    writer: impl Write,
     send: Option<usize>,
 ) -> Result<super::CursorStats> {
     let format = match fmt {
@@ -454,13 +477,16 @@ pub fn write_cursor_solutions(
         .iter()
         .map(Variable::new_unchecked)
         .collect();
+    let shared = std::cell::RefCell::new(writer);
+    let mut out = Shared(&shared);
     let result = (|| {
         cursor.check()?;
         let mut serializer = QueryResultsSerializer::from_format(format)
-            .serialize_solutions_to_writer(&mut writer, variables.clone())
+            .serialize_solutions_to_writer(&mut out, variables.clone())
             .map_err(io)?;
         let mut left = send.unwrap_or(usize::MAX);
         let mut row_charge = RowCharge::default();
+        let mut first = true;
         let remaining = cursor.for_each_decoded(send, |cursor, batch, decoded| {
             let _row_storage = cursor.charge(
                 batch.width() as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64 + 128,
@@ -490,6 +516,9 @@ pub fn write_cursor_solutions(
                 // keep only the adapter capacity for the next row.
                 terms.clear();
                 left -= 1;
+            }
+            if std::mem::take(&mut first) {
+                shared.borrow_mut().flush().map_err(io)?;
             }
             Ok(())
         })?;
@@ -986,6 +1015,7 @@ pub fn write_cursor_native_json(
         let mut left = send.unwrap_or(usize::MAX);
         let mut sent = 0u64;
         let mut row_charge = RowCharge::default();
+        let mut first = true;
         let remaining = cursor.for_each_decoded(send, |cursor, batch, decoded| {
             for row in 0..batch.len().min(left) {
                 if row.is_multiple_of(1024) {
@@ -1014,6 +1044,10 @@ pub fn write_cursor_native_json(
                 writer.write_all(b"]")?;
                 sent += 1;
                 left -= 1;
+            }
+            // the first batch's rows reach a writer that commits on a flush
+            if std::mem::take(&mut first) {
+                writer.flush()?;
             }
             Ok(())
         })?;
@@ -1070,6 +1104,7 @@ pub fn write_cursor_graph_native_json(
         serde_json::to_writer(&mut writer, &cursor.kind()).map_err(|e| Error::Io(e.into()))?;
         writer.write_all(b",\"triples\":[],\"quads\":[")?;
         let mut sent = 0usize;
+        let mut first = true;
         while send.is_none_or(|max| sent < max) {
             let Some(batch) = cursor.next_at_most(send.map_or(usize::MAX, |max| max - sent))?
             else {
@@ -1086,6 +1121,10 @@ pub fn write_cursor_graph_native_json(
                 serde_json::to_writer(&mut writer, &NativeQuad(quad))
                     .map_err(|e| Error::Io(e.into()))?;
                 sent += 1;
+            }
+            // the first batch's quads reach a writer that commits on a flush
+            if std::mem::take(&mut first) {
+                writer.flush()?;
             }
         }
         if send.is_some_and(|max| sent >= max) {
