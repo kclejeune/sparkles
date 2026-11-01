@@ -331,6 +331,86 @@
         "durability_classes": []
       },
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-370d4bb5495c5099d5c23e89a666bbdc646e4165518a9d4096dcc6215006aa87",
+      "path": "runs/2026-11-01-reasoning-latency-forge/record.json",
+      "sha256": "370d4bb5495c5099d5c23e89a666bbdc646e4165518a9d4096dcc6215006aa87",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "lubm-style",
+        "scale": "10 universities",
+        "manifest": {
+          "binary_sha256": "2ba12b514ee33773f444c0bbcdffc5fa642888b8d47f71ebc011b1b5150810ea",
+          "commit": "3428e3877dacc7e51d768f56ada12f802a23f190",
+          "dirty_files": "0",
+          "ended": "2026-11-01T04:47:15Z",
+          "host_load_before": "3.14 4.82 3.95",
+          "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+          "started": "2026-11-01T04:30:24Z"
+        },
+        "settings": {
+          "harness": "crates/sparkles-reasoner/examples/reasoning_latency.rs",
+          "reps": "3",
+          "rounds": "5",
+          "threads": "12",
+          "threshold": 0.1,
+          "universities": "10"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "kernel": "7.2.9",
+            "name": "forge"
+          },
+          "kind": "gate-record"
+        }
+      },
+      "metadata_note": "A gate record of scripts/bench-gate.py. Read the record for its manifest, settings, metrics and checks."
+    },
+    {
+      "run_id": "sha256-e82d659d8c20ea65ecfe36fccf8fdf81c671829db7f41b2f6ab8005c1f99db0e",
+      "path": "runs/2026-11-01-reasoning-latency-forge-53220ef6/record.json",
+      "sha256": "e82d659d8c20ea65ecfe36fccf8fdf81c671829db7f41b2f6ab8005c1f99db0e",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "lubm-style",
+        "scale": "10 universities",
+        "manifest": {
+          "binary_sha256": "184c6864f08b6ac5c461f6d6faa426c2cdcecde6f9b6e18b49e885636c54e1eb",
+          "build_config": "{\"Cargo.toml\":{\"release\":{\"codegen-units\":4,\"debug\":1,\"lto\":\"thin\",\"package\":{\"sparkles-core\":{\"codegen-units\":1}}}},\"cargo\":\"build --release -p sparkles-reasoner --example reasoning_latency\",\"env\":{\"CARGO_INCREMENTAL\":\"0\"},\"mbx_policy\":\"d8bf0b48d620f6bf62929d3db32bd253653505cdb33a5bd1efed1e79aaca05b4\",\"profile\":\"release\"}",
+          "commit": "53220ef637afe6b71feb4812d86f19e7a1124154",
+          "compilers": "GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+          "dirty_files": "0",
+          "ended": "2026-11-01T08:12:32Z",
+          "host_load_before": "1.67 2.26 4.40",
+          "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+          "started": "2026-11-01T07:55:54Z"
+        },
+        "settings": {
+          "generator_sha256": "5d2833474a1944c7ad35ee185bb01d4fc69b64723c724e8ccadc6acaa37a0bd7",
+          "harness": "crates/sparkles-reasoner/examples/reasoning_latency.rs",
+          "queries_sha256": "5bbe1a3c24262f3590463e5798d5df8a414dc016a3bb88e3cb35dcc02ed1de3e",
+          "reps": "3",
+          "rounds": "5",
+          "threads": "12",
+          "threshold": 0.1,
+          "universities": "10"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "kernel": "7.2.9",
+            "name": "forge"
+          },
+          "kind": "gate-record"
+        }
+      },
+      "metadata_note": "A gate record of scripts/bench-gate.py. Read the record for its manifest, settings, metrics and checks."
     }
   ]
 }

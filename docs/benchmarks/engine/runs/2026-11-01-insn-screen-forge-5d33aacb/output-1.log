@@ -1,0 +1,26 @@
+
+running 1 test
+test instruction_counts ... counting instructions:u on ["cpu_core", "cpu_atom"]
+| case | instructions (median) | min | max | other threads ms |
+|---|--:|--:|--:|--:|
+| vocab/front-coded/open | 21796 | 21789 | 22267 | 0.0 |
+| vocab/front-coded/for-each | 8535784 | 8535784 | 8536453 | 0.0 |
+| vocab/front-coded/get-sorted | 7191525 | 7191313 | 7191756 | 0.0 |
+| vocab/front-coded/get-random | 60908283 | 60908283 | 60968746 | 0.0 |
+| vocab/front-coded/find-present | 11146629 | 11146629 | 11146630 | 0.0 |
+| vocab/front-coded/find-missing | 12175211 | 12175209 | 12175211 | 0.0 |
+| vocab/front-coded/prefix-range | 1877678 | 1877678 | 1877679 | 0.0 |
+| vocab/fsst/open | 29648 | 29335 | 30119 | 0.0 |
+| vocab/fsst/for-each | 13235609 | 13235607 | 13235609 | 0.0 |
+| vocab/fsst/get-sorted | 8642303 | 8642303 | 8642304 | 0.0 |
+| vocab/fsst/get-random | 57289681 | 57289681 | 57289691 | 0.0 |
+| vocab/fsst/find-present | 14566444 | 14566443 | 14566445 | 0.0 |
+| vocab/fsst/find-missing | 15507940 | 15507939 | 15507941 | 0.0 |
+| vocab/fsst/prefix-range | 1975336 | 1975336 | 1975337 | 0.0 |
+| wal/open-without-wal | 330060548 | 330058652 | 330069356 | 0.0 |
+| wal/open-with-2000-commits | 394099730 | 394090975 | 394118732 | 0.0 |
+| wal/replay-2000-commits | 64039182 | 64030427 | 64058184 | 0.0 |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 7.67s
+

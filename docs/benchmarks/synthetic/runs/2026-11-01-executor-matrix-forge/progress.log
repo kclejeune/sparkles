@@ -1,0 +1,12 @@
+04:47:16 matrix of 31 queries into /home/kclejeune/lanes/ws1a-gates-469-473/runs/executors
+04:47:16 generating 100000 people
+04:47:18 people-100000-threads-12: start, load 2.26 2.11 2.51
+04:57:13 people-100000-threads-12: done
+04:57:13 people-100000-threads-1: start, load 1.07 1.24 1.83
+05:04:03 people-100000-threads-1: done
+05:04:03 generating 1000000 people
+05:04:14 people-1000000-threads-12: start, load 3.19 2.82 2.40
+05:29:08 people-1000000-threads-12: done
+05:29:08 people-1000000-threads-1: start, load 1.07 1.22 1.48
+05:47:10 people-1000000-threads-1: done
+05:47:11 finished: /home/kclejeune/lanes/ws1a-gates-469-473/runs/executors/summary.md and /home/kclejeune/lanes/ws1a-gates-469-473/runs/executors/record.json

@@ -1269,3 +1269,166 @@ scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$
   ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
 SPARKLES_TASK
 '''
+
+# ----------------------------------------------------------------- engine rewrite gates ----
+# The gates of ROADMAP items 469 to 473. Each writes a gate record that
+# `scripts/bench-gate.py compare BASELINE CANDIDATE` checks against the recorded baseline;
+# docs/BENCHMARKING.md#rewrite-gates says how a lane uses them.
+
+[tasks."test:w3c:streaming"]
+description = "The W3C SPARQL 1.0, 1.1 and 1.2 query evaluation tests and Jena's CDT and property function tests with execution=streaming, with per-suite summaries and eager fallback counts (item 470). `mise run test` also runs them, with Oxigraph's GeoSPARQL tests"
+usage = '''
+flag "--out <dir>" help="results directory (default .artifacts/w3c-streaming/<UTC time>)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+out=$(realpath -m "${usage_out:-.artifacts/w3c-streaming/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+mbx test -p sparkles-core --test w3c -- --nocapture --test-threads=1 streaming_ 2>&1 | tee "$out/output.log"
+python3 scripts/bench-gate.py w3c "$out/output.log" --out "$out/record.json" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)"
+'''
+
+[tasks."bench:executors"]
+description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; writes a gate record"
+usage = '''
+arg "[binary]" help="a built sparkles binary (default: build this checkout's release binary)"
+flag "--out <dir>" help="results directory (default .artifacts/bench-executors/<UTC time>)"
+flag "--scales <list>" default="100000 1000000" help="dataset sizes in people (~10.5 triples each)"
+flag "--threads <list>" default="12 1" help="Rayon thread counts"
+flag "--rounds <n>" default="2" help="A,B,B,A rounds per cell"
+flag "--reps <n>" default="10" help="timed requests per query and server process"
+flag "--queries <list>" help="only these queries (default: all 31)"
+flag "--commit <rev>" help="the commit the binary was built from, for the record"
+flag "--build-config <json>" help="a prebuilt binary's build configuration, from scripts/bench-gate.py build-config --cargo '<its cargo arguments>' in its build environment; compare refuses a record without one"
+'''
+run = '''
+mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
+bin=${usage_binary:-}
+commit=${usage_commit:-}
+config=${usage_build_config:-}
+if [ -z "$bin" ]; then
+  # Built again inside this lease, so collection cannot remove the binary before it runs.
+  mbx build --release -p sparkles-server --bin sparkles
+  bin=target/release/sparkles
+  commit=${commit:-$(git rev-parse HEAD)}
+  config=$(python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-server --bin sparkles')
+fi
+scripts/bench-executors.sh --scales "$usage_scales" --threads "$usage_threads" \
+  --rounds "$usage_rounds" --reps "$usage_reps" ${usage_queries:+--queries "$usage_queries"} \
+  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} ${config:+--build-config "$config"} "$bin"
+SPARKLES_TASK
+'''
+
+[tasks."bench:incr"]
+description = "Incremental view maintenance (item 471): every test of crates/sparkles-core/tests/incr_bench.rs in release mode, alone, in several processes, into a gate record"
+usage = '''
+flag "--people <n>" default="200000" help="people in the generated data (about 6 quads each)"
+flag "--processes <n>" default="5" help="processes, whose values give each measurement's range"
+flag "--threads <n>" default="12" help="RAYON_NUM_THREADS of every process"
+flag "--out <dir>" help="results directory (default .artifacts/bench-incr/<UTC time>)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+out=$(realpath -m "${usage_out:-.artifacts/bench-incr/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+[ ! -e "$out/metrics-1.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
+# One Boxington lease covers the build and every process, so the test binary that runs is
+# the one whose compilers the record names.
+OUT=$out mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
+started=$(date -u +%FT%TZ)
+bin=$(mbx test --release -p sparkles-core --test incr_bench --no-run 2>&1 | tee /dev/stderr \
+  | sed -n 's/.*Executable tests\/incr_bench.rs (\(.*\))$/\1/p')
+[ -x "$bin" ] || { echo "no incr_bench binary" >&2; exit 1; }
+files=()
+for i in $(seq "$usage_processes"); do
+  RAYON_NUM_THREADS="$usage_threads" INCR_BENCH_PEOPLE="$usage_people" INCR_BENCH_JSON="$OUT/metrics-$i.jsonl" \
+    "$bin" --ignored --nocapture --test-threads 1 | tee "$OUT/output-$i.md"
+  files+=("$OUT/metrics-$i.jsonl")
+done
+python3 scripts/bench-gate.py metrics "${files[@]}" --gate incr --suite incremental-views \
+  --scale "$usage_people people" --threshold 0.10 --out "$OUT/record.json" --binary "$bin" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
+  --manifest build_config="$(python3 scripts/bench-gate.py build-config --cargo 'test --release -p sparkles-core --test incr_bench')" \
+  --setting people="$usage_people" --setting threads="$usage_threads" --setting harness="crates/sparkles-core/tests/incr_bench.rs" \
+  --setting load="$(cut -d' ' -f1-3 /proc/loadavg)"
+SPARKLES_TASK
+'''
+
+[tasks."bench:insn"]
+description = "The instruction-count screen (item 473): user-space instructions of vocabulary scans and WAL replay (crates/sparkles-core/tests/insn_screen.rs, Linux) in several processes, into a gate record"
+usage = '''
+flag "--items <n>" default="20000" help="generated items (about 8 triples each)"
+flag "--commits <n>" default="2000" help="commits that WAL replay reads"
+flag "--reps <n>" default="5" help="counted runs of each case in a process"
+flag "--processes <n>" default="5" help="processes, whose medians give each case's range"
+flag "--out <dir>" help="results directory (default .artifacts/bench-insn/<UTC time>)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+out=$(realpath -m "${usage_out:-.artifacts/bench-insn/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+[ ! -e "$out/metrics-1.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
+# One Boxington lease covers the build and every process, so the test binary that runs is
+# the one whose compilers the record names.
+OUT=$out mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
+started=$(date -u +%FT%TZ)
+bin=$(mbx test --release -p sparkles-core --test insn_screen --no-run 2>&1 | tee /dev/stderr \
+  | sed -n 's/.*Executable tests\/insn_screen.rs (\(.*\))$/\1/p')
+[ -x "$bin" ] || { echo "no insn_screen binary" >&2; exit 1; }
+files=()
+for i in $(seq "$usage_processes"); do
+  INSN_SCREEN_ITEMS="$usage_items" INSN_SCREEN_COMMITS="$usage_commits" INSN_SCREEN_REPS="$usage_reps" \
+    INSN_SCREEN_JSON="$OUT/metrics-$i.jsonl" "$bin" --ignored --nocapture --test-threads 1 | tee "$OUT/output-$i.md"
+  files+=("$OUT/metrics-$i.jsonl")
+done
+python3 scripts/bench-gate.py metrics "${files[@]}" --gate insn-screen --suite insn-screen \
+  --scale "$usage_items items, $usage_commits commits" --threshold 0 --out "$OUT/record.json" --binary "$bin" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
+  --manifest build_config="$(python3 scripts/bench-gate.py build-config --cargo 'test --release -p sparkles-core --test insn_screen')" \
+  --setting items="$usage_items" --setting commits="$usage_commits" \
+  --setting reps="$usage_reps" --setting harness="crates/sparkles-core/tests/insn_screen.rs"
+SPARKLES_TASK
+'''
+
+[tasks."bench:reasoning-latency"]
+description = "Derivation on demand and RDFS on read against materialized inferences (item 472): the 14 LUBM queries on LUBM-style data, interleaved rounds, into a gate record"
+usage = '''
+flag "--universities <n>" default="10" help="LUBM-style universities (about 125,000 triples each)"
+flag "--rounds <n>" default="5" help="rounds over every query and mode"
+flag "--reps <n>" default="3" help="timed runs of each query and mode per round"
+flag "--threads <n>" default="12" help="RAYON_NUM_THREADS"
+flag "--out <dir>" help="results directory (default .artifacts/bench-reasoning-latency/<UTC time>)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+out=$(realpath -m "${usage_out:-.artifacts/bench-reasoning-latency/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+[ ! -e "$out/metrics.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
+# One Boxington lease covers the build and the run, so the binary that runs is the one
+# whose compilers the record names.
+OUT=$out mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
+started=$(date -u +%FT%TZ)
+mbx build --release -p sparkles-reasoner --example reasoning_latency
+bin=target/release/examples/reasoning_latency
+RAYON_NUM_THREADS="$usage_threads" "$bin" "$usage_universities" "$usage_rounds" "$usage_reps" \
+  "$OUT/metrics.jsonl" | tee "$OUT/output.md"
+python3 scripts/bench-gate.py metrics "$OUT/metrics.jsonl" --gate reasoning-latency --suite lubm-style \
+  --scale "$usage_universities universities" --threshold 0.10 --out "$OUT/record.json" --binary "$bin" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
+  --manifest build_config="$(python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-reasoner --example reasoning_latency')" \
+  --setting universities="$usage_universities" \
+  --setting queries_sha256="$(sha256sum scripts/bench-lubm/queries.txt | cut -d' ' -f1)" \
+  --setting generator_sha256="$(sha256sum crates/sparkles-reasoner/examples/common/lubm.rs | cut -d' ' -f1)" \
+  --setting rounds="$usage_rounds" --setting reps="$usage_reps" --setting threads="$usage_threads" \
+  --setting harness="crates/sparkles-reasoner/examples/reasoning_latency.rs"
+SPARKLES_TASK
+'''

@@ -1,0 +1,21 @@
+
+running 4 tests
+test streaming_arq_property_functions ... 
+ARQ property functions (Jena, streaming): 48 passed, 0 failed, 0 skipped (48 tests)
+ARQ property functions (Jena, streaming): 24 queries needed eager fallback
+ok
+test streaming_sparql10_and_11 ... 
+SPARQL 1.0 and 1.1 query (streaming): 508 passed, 0 failed, 103 skipped (611 tests)
+SPARQL 1.0 and 1.1 query (streaming): 0 queries needed eager fallback
+ok
+test streaming_sparql12 ... 
+SPARQL 1.2 (streaming): 63 passed, 0 failed, 206 skipped (269 tests)
+SPARQL 1.2 (streaming): 0 queries needed eager fallback
+ok
+test streaming_sparql_cdts ... 
+SPARQL CDTs (Jena, streaming): 655 passed, 0 failed, 0 skipped (655 tests)
+SPARQL CDTs (Jena, streaming): 30 queries needed eager fallback
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 22.75s
+

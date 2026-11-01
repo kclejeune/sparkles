@@ -1,0 +1,43 @@
+
+running 6 tests
+test commit_latency_with_views ... | views | commit median ms | commit p99 ms | commits/s | catch-up ms |
+|---|---|---|---|---|
+| 0 | 1.699 | 3.375 | 624 | 0 |
+| 10 | 1.606 | 2.945 | 604 | 1 |
+| 100 | 1.594 | 3.234 | 601 | 2343 |
+ok
+test commit_path_without_views ... no views, round 0: median 1.603 ms, p99 1.961 ms, 749 commits/s
+no views, round 1: median 1.596 ms, p99 1.809 ms, 761 commits/s
+no views, round 2: median 1.603 ms, p99 1.849 ms, 761 commits/s
+ring filled, round 0: median 1.591 ms, p99 1.755 ms, 888 commits/s
+ring filled, round 1: median 0.284 ms, p99 0.375 ms, 3481 commits/s
+ring filled, round 2: median 0.287 ms, p99 1.847 ms, 1895 commits/s
+ok
+test inferred_pass_against_query ... | view | query ms | round median ms | round p95 ms | round / query | unrelated commit median ms | passes | skipped |
+|---|---|---|---|---|---|---|---|
+| rdfs team-sizes | 18.1 | 17.5 | 17.8 | 0.97 | 0.032 | 101 | 100 |
+| rdfs agents | 6.2 | 6.2 | 6.4 | 1.00 | 0.041 | 101 | 100 |
+| materialized agents | 3.7 | 0.0 | 3.8 | 0.00 | 0.011 | 35 | 166 |
+| materialized team-sizes | 2.0 | 2.1 | 2.1 | 1.06 | 0.011 | 101 | 100 |
+ok
+test pass_against_recompute ... loaded 200000 people in 488.2ms
+| view | build ms | query ms | pass median ms | pass p95 ms | query / pass | state MiB |
+|---|---|---|---|---|---|---|
+| team-sizes | 50.1 | 0.4 | 0.013 | 0.021 | 30 | 0.2 |
+| team-ages | 60.9 | 4.8 | 0.024 | 0.037 | 203 | 0.4 |
+| colleagues-known | 16.1 | 12.6 | 0.192 | 0.329 | 66 | 0.0 |
+| labelled | 82.0 | 1.8 | 0.011 | 0.021 | 165 | 22.9 |
+| teams | 22.6 | 0.6 | 0.008 | 0.016 | 83 | 0.1 |
+ok
+test pass_breakdown ... | view | read µs | old µs | advance µs |
+|---|---|---|---|
+| team-sizes | 0.5 | 5.6 | 4.2 |
+| team-ages | 0.6 | 5.6 | 7.0 |
+| colleagues-known | 1.0 | 7.1 | 195.6 |
+| labelled | 0.7 | 6.1 | 4.5 |
+| teams | 0.8 | 6.6 | 3.4 |
+ok
+test workload ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 40.04s
+

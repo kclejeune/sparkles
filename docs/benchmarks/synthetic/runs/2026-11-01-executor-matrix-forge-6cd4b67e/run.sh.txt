@@ -1,0 +1,11 @@
+# Run on forge alone under ~/lanes/.bench.lock and ~/lanes/.heavy.lock, with the scripts of
+# commit 6cd4b67e copied from a clean export, so the manifest says "scripts commit: unknown".
+# The binary is a release build of 04d49b57 made on forge inside `nix develop`, and its build
+# configuration was printed in that environment:
+#   nix develop -c mbx sparkles-task -- mbx build --release -p sparkles-server --bin sparkles
+#   python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-server --bin sparkles'
+# `mise run bench:executors` builds and records the same configuration itself.
+  executors)
+    "$S/scripts/bench-executors.sh" --out "$R/executors" --commit 04d49b57 --data-dir "$L/data" \
+      --build-config "$(cat "$L/bin/sparkles-04d49b57.build-config.json")" "$L/bin/sparkles-04d49b57"
+    ;;

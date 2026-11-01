@@ -1797,6 +1797,70 @@ comparison with that change measured `optional-count` at +1.9%, about 10 µs, an
 `subquery-agg` at −7.9%, and every other query within 2.2%. A follow-up item records
 the remaining `optional-count` cost.
 
+### Rewrite gates
+
+Roadmap items 469 to 473 add the performance gates that the engine rewrites of items 453
+and 455 must pass, as the first phase of item 452's workstream.
+[BENCHMARKING.md](../BENCHMARKING.md#rewrite-gates) describes each gate's task, host and
+threshold, and `scripts/bench-gate.py compare` checks a candidate's gate record against
+the recorded baseline.
+
+Item 469 adds `mise run bench:executors`, which runs the 31 queries of `scripts/bench.sh`
+with eager and streaming execution at 1.05M and 10.5M triples, with 12 threads and with
+one, on one host and one shared store, and checks that both modes return the same
+answers. The roadmap item named 33 queries, and the suite holds 31. On forge both modes
+agreed on every query, and every timed answer was checked. With 12 threads streaming
+execution was slower end to end by a geometric mean of 23% at 1.05M triples and 15% at
+10.5M, while the execution times of the two modes were within a few percent. The
+difference comes mostly from a fixed cost of about 0.3 ms per streamed response and from
+writing large answers, which item 534 investigates. The
+[baseline](../benchmarks/synthetic/RESULTS.md#eager-against-cursor-matrix) is the oracle
+of item 453, which takes the faster mode of each query.
+
+Item 470 runs the W3C query evaluation suites with `execution=streaming`. All SPARQL
+1.0, 1.1 and 1.2 query evaluation tests, Jena's CDT tests and ARQ's property function
+tests pass in that mode with the default run's known-failure lists. The SPARQL suites
+need no eager fallback, while 30 CDT queries and 24 property function queries hold an
+operator that runs eagerly on first demand. The tests run in CI as part of `mise run
+test` and cost about ten seconds more than the cursor pass at the same batch size that
+they replace. The [baseline](../benchmarks/engine/RESULTS.md#w3c-suites-under-streaming-execution)
+keeps the counts.
+
+Item 472 adds `mise run bench:reasoning-latency`, which times the 14 LUBM queries on 10
+LUBM-style universities over materialized rdfs and owl-rl inferences, derivation on
+demand with and without cached tables, and RDFS on read, after it checks every mode's
+answers against the materialized ones. On forge every answer matched. Derivation on
+demand with the rdfs profile took about 44 ms per query without cached tables, and RDFS
+on read stayed within a few milliseconds except on broad classes. Under owl-rl every
+query took about two seconds on demand, cached or not, which is far above F17's earlier
+measurement and which item 532 investigates. Item 533 adds item 190's
+equality-stage fixtures. The
+[baseline](../benchmarks/reasoning/RESULTS.md#query-time-reasoning-latency) keeps every
+sample and answer fingerprint.
+
+Item 471 makes `crates/sparkles-core/tests/incr_bench.rs` the task `mise run bench:incr`,
+which runs every incremental-view benchmark in five processes and records each value's
+median and range. Outside the timed intervals it checks every view's rows against its
+query evaluated again, and the commit path against the writes it made. On forge a pass
+after one commit took 0.008 to 0.2 ms against 0.4 to 9.5 ms for the query. The commit
+timings switch between about 0.25 and 1.6 ms from test to test, as item 265 found, so they
+guard only against a slowdown that every process shows. The
+[baseline](../benchmarks/writes/RESULTS.md#incremental-view-gate-baseline) keeps every
+value and answer fingerprint.
+
+Item 473 adds `mise run bench:insn`, which counts the user-space instructions of the
+front-coded and FSST vocabulary readers and of opening a store with and without 2,000
+commits in its WAL, so that the reader changes of item 455 can be checked below timing
+noise. Each case checks its result against one computed another way and fails when other
+threads of the process use more than 20 ms of CPU time while it runs, since moved work
+would otherwise look like a saving. On forge the counts of one process repeated to within a
+tenth of a percent except for the small vocabulary opens, which varied by up to 5%, and
+the full front-coded scan moved by up to 11% between processes, so the gate compares
+ranges over five processes. Replay cost about 32,000
+instructions per commit. The
+[baseline](../benchmarks/engine/RESULTS.md#instruction-counts-of-vocabulary-scans-and-wal-replay)
+keeps every count.
+
 ### Scope changes
 
 **Further engines for comparison.** The second rule in §4 left commercial editions out of scope and did not run an engine whose terms forbid publishing results. Comparisons with Virtuoso Open Source and GraphDB Free, with Blazegraph at low priority, and with RDFox and Stardog after a check of their licenses for benchmark-publication clauses, are now planned under [ROADMAP](../ROADMAP.md) item 452 in this spec's Roadmap follow-ups. A measurement stays private when publication is forbidden.

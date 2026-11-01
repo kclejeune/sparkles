@@ -134,7 +134,7 @@ text, with each licence, its attribution, its URL and the graphs it covers.
 The gate is `serve --license-policy`, which is `warn` by default. Under `warn`, a version
 that is not redistributable gets the verdict `warn`. Only `enforce`, which the operator
 sets explicitly, gives the verdict `refuse`. A restricted resource without acceptance is
-always reported. The export and publication surfaces apply this verdict in 525,
+always reported. The export and publication surfaces apply this verdict in item 525,
 since the dump, Graph Store downloads, shared backups, git export in item 460 and
 linked-data publication in item 461 each need their own refusal.
 
@@ -154,7 +154,7 @@ version, linked with `dct:hasPart` and naming its graph with `dct:identifier`, s
 versions that reuse a graph IRI keep their own sources. A
 namespace is `vann:preferredNamespacePrefix` and `vann:preferredNamespaceUri`, and a
 vocabulary's graph location is a `void:Dataset` with `void:inDataset`. The Croissant
-export for ML consumers is 526.
+export for ML consumers is item 526.
 
 ### Vocabulary header and prefix bundles
 
@@ -211,7 +211,7 @@ the file is unchanged. The OpenAPI description, the generated client types and
 
 The phase meets the third acceptance gate for the verdict. Licence verdicts warn by
 default and refuse only under `--license-policy enforce`, and the surfaces that act on
-the verdict are 525. The first two gates need the source store and stay open.
+the verdict are item 525. The first two gates need the source store and stay open.
 
 ## Dependencies
 
@@ -274,8 +274,8 @@ small for an administrative catalog of at most 4,096 resources.
 A version of a dataset resource records its graphs and their sources by hand in this
 phase. Recording them when data is loaded, and reloading from sources, belong to the load
 manifest phase, which needs the source store for reload. The licence gate reports its
-verdict, and the export and publication routes apply it under 525. The Croissant
-export is 526. Only server administrators read the catalog, and a filtered read
+verdict, and the export and publication routes apply it under item 525. The Croissant
+export is item 526. Only server administrators read the catalog, and a filtered read
 for dataset administrators belongs to the dataset manager phase.
 
 The catalog is per server, as the non-goals require. A vocabulary resource names the

@@ -1,0 +1,71 @@
+{"check":"workload","detail":"20000 items, 2000 commits","fingerprint":"4c054a9f71ae73a3","ok":true}
+{"check":"vocab/front-coded/keys","detail":"80206 keys","fingerprint":"80206 keys, bda3cb309180f577","ok":true}
+{"check":"vocab/front-coded/open/result","detail":"80206","ok":true}
+{"better":"lower","key":"vocab/front-coded/open","samples":[21789,21789,21796,22169,22267],"unit":"instructions","value":21796}
+{"check":"vocab/front-coded/open/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/front-coded/open/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/front-coded/for-each/result","detail":"3545523","ok":true}
+{"better":"lower","key":"vocab/front-coded/for-each","samples":[8535784,8535784,8535784,8535784,8536453],"unit":"instructions","value":8535784}
+{"check":"vocab/front-coded/for-each/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/front-coded/for-each/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/front-coded/get-sorted/result","detail":"506495","ok":true}
+{"better":"lower","key":"vocab/front-coded/get-sorted","samples":[7191313,7191525,7191525,7191704,7191756],"unit":"instructions","value":7191525}
+{"check":"vocab/front-coded/get-sorted/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/front-coded/get-sorted/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/front-coded/get-random/result","detail":"2209550","ok":true}
+{"better":"lower","key":"vocab/front-coded/get-random","samples":[60908283,60908283,60908283,60908284,60968746],"unit":"instructions","value":60908283}
+{"check":"vocab/front-coded/get-random/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/front-coded/get-random/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/front-coded/find-present/result","detail":"247407745","ok":true}
+{"better":"lower","key":"vocab/front-coded/find-present","samples":[11146629,11146629,11146629,11146629,11146630],"unit":"instructions","value":11146629}
+{"check":"vocab/front-coded/find-present/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/front-coded/find-present/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/front-coded/find-missing/result","detail":"0","ok":true}
+{"better":"lower","key":"vocab/front-coded/find-missing","samples":[12175209,12175210,12175211,12175211,12175211],"unit":"instructions","value":12175211}
+{"check":"vocab/front-coded/find-missing/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/front-coded/find-missing/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/front-coded/prefix-range/result","detail":"12301108","ok":true}
+{"better":"lower","key":"vocab/front-coded/prefix-range","samples":[1877678,1877678,1877678,1877678,1877679],"unit":"instructions","value":1877678}
+{"check":"vocab/front-coded/prefix-range/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/front-coded/prefix-range/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/fsst/keys","detail":"80206 keys","fingerprint":"80206 keys, bda3cb309180f577","ok":true}
+{"check":"vocab/fsst/open/result","detail":"80206","ok":true}
+{"better":"lower","key":"vocab/fsst/open","samples":[29335,29577,29648,29741,30119],"unit":"instructions","value":29648}
+{"check":"vocab/fsst/open/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/fsst/open/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/fsst/for-each/result","detail":"3545523","ok":true}
+{"better":"lower","key":"vocab/fsst/for-each","samples":[13235607,13235608,13235609,13235609,13235609],"unit":"instructions","value":13235609}
+{"check":"vocab/fsst/for-each/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/fsst/for-each/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/fsst/get-sorted/result","detail":"506495","ok":true}
+{"better":"lower","key":"vocab/fsst/get-sorted","samples":[8642303,8642303,8642303,8642304,8642304],"unit":"instructions","value":8642303}
+{"check":"vocab/fsst/get-sorted/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/fsst/get-sorted/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/fsst/get-random/result","detail":"2209550","ok":true}
+{"better":"lower","key":"vocab/fsst/get-random","samples":[57289681,57289681,57289681,57289685,57289691],"unit":"instructions","value":57289681}
+{"check":"vocab/fsst/get-random/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/fsst/get-random/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/fsst/find-present/result","detail":"247407745","ok":true}
+{"better":"lower","key":"vocab/fsst/find-present","samples":[14566443,14566444,14566444,14566445,14566445],"unit":"instructions","value":14566444}
+{"check":"vocab/fsst/find-present/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/fsst/find-present/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/fsst/find-missing/result","detail":"0","ok":true}
+{"better":"lower","key":"vocab/fsst/find-missing","samples":[15507939,15507940,15507940,15507940,15507941],"unit":"instructions","value":15507940}
+{"check":"vocab/fsst/find-missing/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/fsst/find-missing/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"vocab/fsst/prefix-range/result","detail":"12301108","ok":true}
+{"better":"lower","key":"vocab/fsst/prefix-range","samples":[1975336,1975336,1975336,1975337,1975337],"unit":"instructions","value":1975336}
+{"check":"vocab/fsst/prefix-range/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"vocab/fsst/prefix-range/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"check":"wal/replay/commits-in-wal","detail":"2000 commits, 165033 WAL bytes against 33 without them","ok":true}
+{"check":"wal/open-without-wal/recovered","detail":"(1, 120200, 3510170385648862026)","fingerprint":"(1, 120200, 3510170385648862026)","ok":true}
+{"check":"wal/open-with-2000-commits/recovered","detail":"(2001, 122200, 5225943398070010606)","fingerprint":"(2001, 122200, 5225943398070010606)","ok":true}
+{"better":"lower","key":"wal/open-without-wal","samples":[330058652,330058735,330060548,330062277,330069356],"unit":"instructions","value":330060548}
+{"check":"wal/open-without-wal/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"wal/open-without-wal/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"better":"lower","key":"wal/open-with-2000-commits","samples":[394090975,394094257,394099730,394108855,394118732],"unit":"instructions","value":394099730}
+{"check":"wal/open-with-2000-commits/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"wal/open-with-2000-commits/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}
+{"better":"lower","key":"wal/replay-2000-commits","samples":[64030427,64033709,64039182,64048307,64058184],"unit":"instructions","value":64039182}
+{"check":"wal/replay-2000-commits/single-thread","detail":"0.0 ms of CPU time on other threads","ok":true}
+{"check":"wal/replay-2000-commits/counter-coverage","detail":"the counters ran for 1.0000 of the enabled time","ok":true}

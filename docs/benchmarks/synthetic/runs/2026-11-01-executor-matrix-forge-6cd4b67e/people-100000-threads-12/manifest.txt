@@ -1,0 +1,15 @@
+binary: /home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57
+binary sha256: 34aa23f8e08949fd166863059128e1afa3108501fb171b65d75494b0ba09e0fd
+binary commit: 04d49b57
+version: sparkles 0.1.0
+compilers: GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 23.1.0git; rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+build config: {"Cargo.toml":{"release":{"codegen-units":4,"debug":1,"lto":"thin","package":{"sparkles-core":{"codegen-units":1}}}},"cargo":"build --release -p sparkles-server --bin sparkles","env":{"CARGO_INCREMENTAL":"0"},"mbx_policy":"d8bf0b48d620f6bf62929d3db32bd253653505cdb33a5bd1efed1e79aaca05b4","profile":"release"}
+runtime env: clean
+scripts commit: unknown
+scripts dirty: 0
+host: forge
+started: 2026-11-01T10:02:19Z
+settings: 31 queries, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server process, RAYON_NUM_THREADS=12, server CPU 0-11, client CPU 12, spinners off, execution eager,streaming
+A: /home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57
+B: /home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57
+data sha256: c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8

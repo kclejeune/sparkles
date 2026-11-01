@@ -1,0 +1,17 @@
+# Run on forge alone under ~/lanes/.bench.lock and ~/lanes/.heavy.lock. S is a clean export
+# of commit 64391e7f and B holds the test binary built from it on forge inside `nix develop`:
+#   nix develop -c mbx sparkles-task -- mbx test --release -p sparkles-core --test incr_bench --no-run
+#   python3 scripts/bench-gate.py build-config --cargo 'test --release -p sparkles-core --test incr_bench'
+# common holds --manifest commit=64391e7f, dirty_files=0 and the rustc version.
+# `mise run bench:incr` runs the same processes and record step.
+  incr)
+    out=$R/incr; mkdir -p "$out"; started=$(date -u +%FT%TZ); files=()
+    for i in 1 2 3 4 5; do
+      RAYON_NUM_THREADS=12 INCR_BENCH_PEOPLE=200000 INCR_BENCH_JSON=$out/metrics-$i.jsonl "$B/incr_bench" --ignored --nocapture --test-threads 1 > "$out/output-$i.md" 2>&1
+      files+=("$out/metrics-$i.jsonl")
+    done
+    python3 "$S/scripts/bench-gate.py" metrics "${files[@]}" --gate incr --suite incremental-views \
+      --scale "200000 people" --threshold 0.10 --out "$out/record.json" --binary "$B/incr_bench" "${common[@]}" --manifest build_config="$(cat "$B/build-config-incr.json")" \
+      --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest host_load_before="$load" \
+      --setting people=200000 --setting threads=12 --setting harness=crates/sparkles-core/tests/incr_bench.rs --setting load="$load"
+    ;;

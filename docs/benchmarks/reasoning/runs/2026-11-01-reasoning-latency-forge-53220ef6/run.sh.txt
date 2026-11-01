@@ -1,0 +1,16 @@
+# Run on forge alone under ~/lanes/.bench.lock and ~/lanes/.heavy.lock. S is a clean export
+# of commit 53220ef6 and B holds the binaries built from it on forge inside `nix develop`:
+#   nix develop -c mbx sparkles-task -- mbx build --release -p sparkles-reasoner --example reasoning_latency
+#   python3 scripts/bench-gate.py build-config --cargo 'build --release -p sparkles-reasoner --example reasoning_latency'
+# common holds --manifest commit=53220ef6..., dirty_files=0 and the rustc version.
+  reasoning)
+    out=$R/reasoning; mkdir -p "$out"; started=$(date -u +%FT%TZ)
+    RAYON_NUM_THREADS=12 "$B/reasoning_latency" 10 5 3 "$out/metrics.jsonl" > "$out/output.md" 2>&1
+    python3 "$S/scripts/bench-gate.py" metrics "$out/metrics.jsonl" --gate reasoning-latency --suite lubm-style \
+      --scale "10 universities" --threshold 0.10 --out "$out/record.json" --binary "$B/reasoning_latency" "${common[@]}" --manifest build_config="$(cat "$B/build-config-reasoning.json")" \
+      --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest host_load_before="$load" \
+      --setting universities=10 --setting rounds=5 --setting reps=3 --setting threads=12 \
+      --setting queries_sha256="$(sha256sum "$S/scripts/bench-lubm/queries.txt" | cut -d" " -f1)" \
+      --setting generator_sha256="$(sha256sum "$S/crates/sparkles-reasoner/examples/common/lubm.rs" | cut -d" " -f1)" \
+      --setting harness=crates/sparkles-reasoner/examples/reasoning_latency.rs
+    ;;

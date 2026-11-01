@@ -36,6 +36,29 @@ vocabulary owns its namespaces, its header can be compared with the catalog, and
 DCAT 3 with PROV-O, SPDX, VANN and VoID. Nothing is fetched, and the source store,
 loading and mirrors remain under item 458.
 
+### Performance gates
+
+The W3C SPARQL 1.0, 1.1 and 1.2 query evaluation suites, Jena's CDT and property
+function tests and Oxigraph's GeoSPARQL tests run with `execution=streaming` in
+`mise run test` and alone in `mise run test:w3c:streaming`, which reports the queries
+that fall back to eager execution. `scripts/bench-gate.py` writes versioned gate records
+and compares a candidate's record with a recorded baseline.
+
+`mise run bench:executors` runs the 31 synthetic queries with eager and streaming
+execution at 1.05M and 10.5M triples, with 12 threads and with one, checks that both
+modes agree and records a forge baseline for the unified executor.
+
+`mise run bench:reasoning-latency` times derivation on demand and RDFS on read against
+materialized inferences on the 14 LUBM queries and checks every answer. Its forge
+baseline shows OWL RL derivation on demand taking about two seconds per query at 10
+universities.
+
+`mise run bench:incr` runs the incremental-view benchmarks in five processes, checks each
+view's rows against its query and records a forge baseline.
+
+`mise run bench:insn` counts the instructions of vocabulary scans and WAL replay with the
+CPU's performance counters, checks every result and records a forge baseline.
+
 ### Changed
 
 The library builds the options of a query with `sparkles::QueryRequest`, which applies a

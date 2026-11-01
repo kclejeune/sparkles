@@ -1510,6 +1510,177 @@
         "durability_classes": []
       },
       "metadata_note": "Completed targeted profile. Typed/source correctness, native serialization and timing disposition remain separate; failed or answer-only rows are not warm latency measurements."
+    },
+    {
+      "run_id": "sha256-6e8ba383a7b79beaf01a4ee312ffc1fa50f1fbd4591b306de5562514af7bd15e",
+      "path": "runs/2026-11-01-executor-matrix-forge/record.json",
+      "sha256": "6e8ba383a7b79beaf01a4ee312ffc1fa50f1fbd4591b306de5562514af7bd15e",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "synthetic",
+        "scale": "1.05m and 10.5m",
+        "manifest": {
+          "binary": "/home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57",
+          "binary_commit": "04d49b57",
+          "binary_sha256": "34aa23f8e08949fd166863059128e1afa3108501fb171b65d75494b0ba09e0fd",
+          "cells": {
+            "1.05m-12t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ],
+            "1.05m-1t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ],
+            "10.5m-12t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ],
+            "10.5m-1t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ]
+          },
+          "ended": "2026-11-01T05:47:10Z",
+          "load_after": "3.14 3.28 2.83 1/599 124238",
+          "load_before": "2.37 2.13 2.52 1/584 18581",
+          "rustc": "rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+          "scripts_commit": "unknown",
+          "scripts_dirty_files": "0",
+          "started": "2026-11-01T04:47:16Z",
+          "version": "sparkles 0.1.0"
+        },
+        "settings": {
+          "harness": "scripts/bench-executors.sh with scripts/nsc-bench-remote.sh",
+          "metric": "medians per request of the server's execMs (/exec) and of curl's time_total (/wall)",
+          "run": "31 queries, scales 100000 1000000 people, threads 12 1, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server",
+          "short_below": 0.3,
+          "short_threshold": 0.0,
+          "threshold": 0.05,
+          "variants": "A execution=eager, B execution=streaming, one binary and one shared store"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "kernel": "7.2.9",
+            "name": "forge"
+          },
+          "kind": "gate-record"
+        }
+      },
+      "metadata_note": "A gate record of scripts/bench-gate.py. Read the record for its manifest, settings, metrics and checks."
+    },
+    {
+      "run_id": "sha256-1c5ead5540795e2bffed80bf7dfd1c8612a68bb147a85e50c68a08ab9dcd69c8",
+      "path": "runs/2026-11-01-executor-matrix-forge-6cd4b67e/record.json",
+      "sha256": "1c5ead5540795e2bffed80bf7dfd1c8612a68bb147a85e50c68a08ab9dcd69c8",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "synthetic",
+        "scale": "1.05m and 10.5m",
+        "manifest": {
+          "binary": "/home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57",
+          "binary_commit": "04d49b57",
+          "binary_sha256": "34aa23f8e08949fd166863059128e1afa3108501fb171b65d75494b0ba09e0fd",
+          "build_config": "{\"Cargo.toml\":{\"release\":{\"codegen-units\":4,\"debug\":1,\"lto\":\"thin\",\"package\":{\"sparkles-core\":{\"codegen-units\":1}}}},\"cargo\":\"build --release -p sparkles-server --bin sparkles\",\"env\":{\"CARGO_INCREMENTAL\":\"0\"},\"mbx_policy\":\"d8bf0b48d620f6bf62929d3db32bd253653505cdb33a5bd1efed1e79aaca05b4\",\"profile\":\"release\"}",
+          "cells": {
+            "1.05m-12t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ],
+            "1.05m-1t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ],
+            "10.5m-12t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ],
+            "10.5m-1t": [
+              "kernel: 7.2.9",
+              "cpu: 13th Gen Intel(R) Core(TM) i5-13500",
+              "cpus: 20",
+              "memory: 15620 MiB",
+              "smt siblings: 0-1 10-11 12 13 14 15 16 17 18 19 2-3 4-5 6-7 8-9 ",
+              "loader: ld.so (GNU libc) stable release version 2.44.",
+              "steal during the timed part: 0.00%"
+            ]
+          },
+          "compilers": "GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 23.1.0git; rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+          "ended": "2026-11-01T12:27:47Z",
+          "load_after": "3.22 3.11 3.02 1/577 817759",
+          "load_before": "0.12 0.21 0.64 1/575 684893",
+          "rustc": null,
+          "scripts_commit": "unknown",
+          "scripts_dirty_files": "0",
+          "started": "2026-11-01T10:02:19Z",
+          "version": "sparkles 0.1.0"
+        },
+        "settings": {
+          "data_sha256": {
+            "people-100000": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+            "people-1000000": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8"
+          },
+          "generator_sha256": "c04719e3cb2b687c0d0575e290cc42cec74314ff1ab815a75063e1a85159923c",
+          "harness": "scripts/bench-executors.sh with scripts/nsc-bench-remote.sh",
+          "metric": "medians per request of the server's execMs (/exec) and of curl's time_total (/wall)",
+          "queries_sha256": "16993e64770f3c344bf4cf4219dd076675abc7ca533eb97136bc18c55d488d13",
+          "run": "31 queries, scales 100000 1000000 people, threads 12 1, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server",
+          "runtime_env": "clean",
+          "short_below": 0.3,
+          "short_threshold": 0.0,
+          "threshold": 0.05,
+          "variants": "A execution=eager, B execution=streaming, one binary and one shared store"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "kernel": "7.2.9",
+            "name": "forge"
+          },
+          "kind": "gate-record"
+        }
+      },
+      "metadata_note": "A gate record of scripts/bench-gate.py. Read the record for its manifest, settings, metrics and checks."
     }
   ]
 }

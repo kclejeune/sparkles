@@ -1,0 +1,9 @@
+# How this record was made on forge, alone, under ~/lanes/.bench.lock and ~/lanes/.heavy.lock.
+# The scripts came from a git archive of 3428e387 (so the manifest says "scripts commit:
+# unknown"); the binary is a release build of 04d49b57 made on forge in `nix develop`.
+scripts/bench-executors.sh --out runs/executors --commit 04d49b57 --data-dir data bin/sparkles-04d49b57
+# Afterwards the manifest got the binary's compiler from its .comment section, and the
+# record and summary were written again with scripts/bench-gate.py of 40c51be5, which
+# compares answers of LIMIT queries without ORDER BY by their counts and records rustc:
+sed -i "/^version:/a rustc: rustc version 1.99.1 (58cf8f9c3 2026-10-13)" manifest.txt
+python3 scripts/bench-gate.py executors runs/executors --out record.json > summary.md

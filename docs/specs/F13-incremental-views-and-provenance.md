@@ -1281,7 +1281,7 @@ operator of the circuit. Internal circuits that keep rows take it through
   `truncated` with no witnesses or lineage. A template mints nodes per occurrence of a
   solution, so its first occurrence's triples carry the derivations beyond one per
   occurrence, and the triples of all occurrences together count the solution's
-  derivations. 528 tracks witnesses through them.
+  derivations. Item 528 tracks witnesses through them.
 - **State.** Each stateful operator keeps the annotations beside its weights, in a map
   from row to annotation that exists only when the circuit has a provenance setting. A
   pattern's matches are probed from the store with the quads they matched. A circuit

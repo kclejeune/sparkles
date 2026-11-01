@@ -1,0 +1,116 @@
+{"check":"commits/0-views/caught-up","detail":"the views caught up in 0 ms","ok":true}
+{"better":"lower","key":"commits/0-views/median","unit":"ms","value":1.591671}
+{"better":"lower","key":"commits/0-views/p99","unit":"ms","value":1.873692}
+{"better":"higher","key":"commits/0-views/rate","unit":"commits/s","value":887.502217557416}
+{"better":"lower","key":"commits/0-views/catch-up","unit":"ms","value":0.000834}
+{"check":"commits/10-views/caught-up","detail":"the views caught up in 1 ms","ok":true}
+{"check":"commits/10-views/v0/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, d850a0e551fad23a","ok":true}
+{"check":"commits/10-views/v7/answer","detail":"0 maintained rows, 0 evaluated rows","fingerprint":"0 rows, 37295c0f2b0cfa2a","ok":true}
+{"better":"lower","key":"commits/10-views/median","unit":"ms","value":0.233026}
+{"better":"lower","key":"commits/10-views/p99","unit":"ms","value":1.9071470000000001}
+{"better":"higher","key":"commits/10-views/rate","unit":"commits/s","value":1599.145585468899}
+{"better":"lower","key":"commits/10-views/catch-up","unit":"ms","value":1.0470110000000001}
+{"check":"commits/100-views/caught-up","detail":"the views caught up in 2634 ms","ok":true}
+{"check":"commits/100-views/v0/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, d850a0e551fad23a","ok":true}
+{"check":"commits/100-views/v7/answer","detail":"0 maintained rows, 0 evaluated rows","fingerprint":"0 rows, 37295c0f2b0cfa2a","ok":true}
+{"check":"commits/100-views/v14/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, 217ef31b05205cf4","ok":true}
+{"check":"commits/100-views/v21/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, 69b8cbe10bec516b","ok":true}
+{"check":"commits/100-views/v28/answer","detail":"52000 maintained rows, 52000 evaluated rows","fingerprint":"52000 rows, f59fc343a28741d9","ok":true}
+{"check":"commits/100-views/v35/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, d850a0e551fad23a","ok":true}
+{"check":"commits/100-views/v42/answer","detail":"0 maintained rows, 0 evaluated rows","fingerprint":"0 rows, 37295c0f2b0cfa2a","ok":true}
+{"check":"commits/100-views/v49/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, 217ef31b05205cf4","ok":true}
+{"check":"commits/100-views/v56/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, 69b8cbe10bec516b","ok":true}
+{"check":"commits/100-views/v63/answer","detail":"52000 maintained rows, 52000 evaluated rows","fingerprint":"52000 rows, f59fc343a28741d9","ok":true}
+{"check":"commits/100-views/v70/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, d850a0e551fad23a","ok":true}
+{"check":"commits/100-views/v77/answer","detail":"0 maintained rows, 0 evaluated rows","fingerprint":"0 rows, 37295c0f2b0cfa2a","ok":true}
+{"check":"commits/100-views/v84/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, 217ef31b05205cf4","ok":true}
+{"check":"commits/100-views/v91/answer","detail":"250 maintained rows, 250 evaluated rows","fingerprint":"250 rows, 69b8cbe10bec516b","ok":true}
+{"check":"commits/100-views/v98/answer","detail":"52000 maintained rows, 52000 evaluated rows","fingerprint":"52000 rows, f59fc343a28741d9","ok":true}
+{"better":"lower","key":"commits/100-views/median","unit":"ms","value":1.5653119999999998}
+{"better":"lower","key":"commits/100-views/p99","unit":"ms","value":1.8112169999999999}
+{"better":"higher","key":"commits/100-views/rate","unit":"commits/s","value":779.7745948856054}
+{"better":"lower","key":"commits/100-views/catch-up","unit":"ms","value":2634.3799099999997}
+{"better":"lower","key":"commit-path/no-views/median","unit":"ms","value":1.59556}
+{"better":"lower","key":"commit-path/no-views/p99","unit":"ms","value":1.83002}
+{"better":"higher","key":"commit-path/no-views/rate","unit":"commits/s","value":761.9734743988575}
+{"better":"lower","key":"commit-path/live-query/median","unit":"ms","value":0.30257100000000003}
+{"better":"lower","key":"commit-path/live-query/p99","unit":"ms","value":1.77329}
+{"better":"higher","key":"commit-path/live-query/rate","unit":"commits/s","value":1087.1511552770294}
+{"check":"commit-path/commits","detail":"18000 commits from 1","ok":true}
+{"check":"commit-path/written","detail":"36000 quads added, 18000 subjects with a team and an age","fingerprint":"18000 rows, f9fd4bcb02c78c7a","ok":true}
+{"check":"inferred/rdfs-team-sizes/answer","detail":"1000 maintained rows, 1000 evaluated rows","fingerprint":"1000 rows, ebac45f95fd79653","ok":true}
+{"better":"lower","key":"inferred/rdfs-team-sizes/query","unit":"ms","value":18.176012}
+{"better":"lower","key":"inferred/rdfs-team-sizes/round-median","unit":"ms","value":17.08622}
+{"better":"lower","key":"inferred/rdfs-team-sizes/round-p95","unit":"ms","value":17.31983}
+{"better":"lower","key":"inferred/rdfs-team-sizes/unrelated-commit","unit":"ms","value":0.031673}
+{"check":"inferred/rdfs-agents/answer","detail":"1 maintained rows, 1 evaluated rows","fingerprint":"1 rows, b589da8ba8768414","ok":true}
+{"better":"lower","key":"inferred/rdfs-agents/query","unit":"ms","value":6.2757000000000005}
+{"better":"lower","key":"inferred/rdfs-agents/round-median","unit":"ms","value":6.384571}
+{"better":"lower","key":"inferred/rdfs-agents/round-p95","unit":"ms","value":6.509229}
+{"better":"lower","key":"inferred/rdfs-agents/unrelated-commit","unit":"ms","value":0.040655000000000004}
+{"check":"inferred/materialized-agents/answer","detail":"1 maintained rows, 1 evaluated rows","fingerprint":"1 rows, 9dd4293fb1e59b7b","ok":true}
+{"better":"lower","key":"inferred/materialized-agents/query","unit":"ms","value":3.863406}
+{"better":"lower","key":"inferred/materialized-agents/round-median","unit":"ms","value":0.005490999999999999}
+{"better":"lower","key":"inferred/materialized-agents/round-p95","unit":"ms","value":3.81791}
+{"better":"lower","key":"inferred/materialized-agents/unrelated-commit","unit":"ms","value":0.01097}
+{"check":"inferred/materialized-team-sizes/answer","detail":"1000 maintained rows, 1000 evaluated rows","fingerprint":"1000 rows, 1ec2c8871f8297d3","ok":true}
+{"better":"lower","key":"inferred/materialized-team-sizes/query","unit":"ms","value":1.96042}
+{"better":"lower","key":"inferred/materialized-team-sizes/round-median","unit":"ms","value":2.0967249999999997}
+{"better":"lower","key":"inferred/materialized-team-sizes/round-p95","unit":"ms","value":2.1305}
+{"better":"lower","key":"inferred/materialized-team-sizes/unrelated-commit","unit":"ms","value":0.010749}
+{"check":"pass/team-sizes/answer","detail":"1000 maintained rows, 1000 evaluated rows","fingerprint":"1000 rows, 1a7a411e11d6b169","ok":true}
+{"better":"lower","key":"pass/team-sizes/build","unit":"ms","value":50.381840999999994}
+{"better":"lower","key":"pass/team-sizes/query","unit":"ms","value":0.247425}
+{"better":"lower","key":"pass/team-sizes/pass-median","unit":"ms","value":0.012931}
+{"better":"lower","key":"pass/team-sizes/pass-p95","unit":"ms","value":0.020613}
+{"better":"lower","key":"pass/team-sizes/state","unit":"MiB","value":0.1678466796875}
+{"check":"pass/team-ages/answer","detail":"1000 maintained rows, 1000 evaluated rows","fingerprint":"1000 rows, 15cdb2498b2815ee","ok":true}
+{"better":"lower","key":"pass/team-ages/build","unit":"ms","value":60.836957}
+{"better":"lower","key":"pass/team-ages/query","unit":"ms","value":4.757199}
+{"better":"lower","key":"pass/team-ages/pass-median","unit":"ms","value":0.023443}
+{"better":"lower","key":"pass/team-ages/pass-p95","unit":"ms","value":0.036067}
+{"better":"lower","key":"pass/team-ages/state","unit":"MiB","value":0.3787841796875}
+{"check":"pass/colleagues-known/answer","detail":"0 maintained rows, 0 evaluated rows","fingerprint":"0 rows, 37295c0f2b0cfa2a","ok":true}
+{"better":"lower","key":"pass/colleagues-known/build","unit":"ms","value":12.717111}
+{"better":"lower","key":"pass/colleagues-known/query","unit":"ms","value":9.514051}
+{"better":"lower","key":"pass/colleagues-known/pass-median","unit":"ms","value":0.198117}
+{"better":"lower","key":"pass/colleagues-known/pass-p95","unit":"ms","value":0.284727}
+{"better":"lower","key":"pass/colleagues-known/state","unit":"MiB","value":0.0}
+{"check":"pass/labelled/answer","detail":"200000 maintained rows, 200000 evaluated rows","fingerprint":"200000 rows, c5b77eb66ff69f76","ok":true}
+{"better":"lower","key":"pass/labelled/build","unit":"ms","value":92.596216}
+{"better":"lower","key":"pass/labelled/query","unit":"ms","value":1.879631}
+{"better":"lower","key":"pass/labelled/pass-median","unit":"ms","value":0.011365}
+{"better":"lower","key":"pass/labelled/pass-p95","unit":"ms","value":0.020897}
+{"better":"lower","key":"pass/labelled/state","unit":"MiB","value":22.9339599609375}
+{"check":"pass/teams/answer","detail":"1000 maintained rows, 1000 evaluated rows","fingerprint":"1000 rows, 9b10de43a256240b","ok":true}
+{"better":"lower","key":"pass/teams/build","unit":"ms","value":20.598444}
+{"better":"lower","key":"pass/teams/query","unit":"ms","value":0.6471969999999999}
+{"better":"lower","key":"pass/teams/pass-median","unit":"ms","value":0.007606}
+{"better":"lower","key":"pass/teams/pass-p95","unit":"ms","value":0.016055}
+{"better":"lower","key":"pass/teams/state","unit":"MiB","value":0.091552734375}
+{"check":"breakdown/team-sizes/applied","detail":"the circuit applied commit 201 of 201","ok":true}
+{"check":"breakdown/team-sizes/answer","detail":"columns [\"t\", \"n\"] against [\"t\", \"n\"], 1000 rows against 1000","fingerprint":"1000 rows, c6fc40075570f6a8","ok":true}
+{"better":"lower","key":"breakdown/team-sizes/read","unit":"µs","value":0.45499999999999996}
+{"better":"lower","key":"breakdown/team-sizes/old","unit":"µs","value":5.442}
+{"better":"lower","key":"breakdown/team-sizes/advance","unit":"µs","value":4.284}
+{"check":"breakdown/team-ages/applied","detail":"the circuit applied commit 401 of 401","ok":true}
+{"check":"breakdown/team-ages/answer","detail":"columns [\"t\", \"s\", \"m\"] against [\"t\", \"s\", \"m\"], 1000 rows against 1000","fingerprint":"1000 rows, a81d431ca18e9d1e","ok":true}
+{"better":"lower","key":"breakdown/team-ages/read","unit":"µs","value":0.5489999999999999}
+{"better":"lower","key":"breakdown/team-ages/old","unit":"µs","value":5.527}
+{"better":"lower","key":"breakdown/team-ages/advance","unit":"µs","value":7.085}
+{"check":"breakdown/colleagues-known/applied","detail":"the circuit applied commit 601 of 601","ok":true}
+{"check":"breakdown/colleagues-known/answer","detail":"columns [\"p\", \"q\"] against [\"p\", \"q\"], 0 rows against 0","fingerprint":"0 rows, 37295c0f2b0cfa2a","ok":true}
+{"better":"lower","key":"breakdown/colleagues-known/read","unit":"µs","value":0.882}
+{"better":"lower","key":"breakdown/colleagues-known/old","unit":"µs","value":6.9079999999999995}
+{"better":"lower","key":"breakdown/colleagues-known/advance","unit":"µs","value":192.788}
+{"check":"breakdown/labelled/applied","detail":"the circuit applied commit 801 of 801","ok":true}
+{"check":"breakdown/labelled/answer","detail":"columns [\"p\", \"l\"] against [\"p\", \"l\"], 200004 rows against 200004","fingerprint":"200004 rows, 1e3dadab70ee1137","ok":true}
+{"better":"lower","key":"breakdown/labelled/read","unit":"µs","value":0.692}
+{"better":"lower","key":"breakdown/labelled/old","unit":"µs","value":6.7410000000000005}
+{"better":"lower","key":"breakdown/labelled/advance","unit":"µs","value":4.458}
+{"check":"breakdown/teams/applied","detail":"the circuit applied commit 1001 of 1001","ok":true}
+{"check":"breakdown/teams/answer","detail":"columns [\"t\"] against [\"t\"], 1000 rows against 1000","fingerprint":"1000 rows, 9b10de43a256240b","ok":true}
+{"better":"lower","key":"breakdown/teams/read","unit":"µs","value":0.756}
+{"better":"lower","key":"breakdown/teams/old","unit":"µs","value":6.313000000000001}
+{"better":"lower","key":"breakdown/teams/advance","unit":"µs","value":3.3009999999999997}
+{"check":"workload","detail":"200000 people","fingerprint":"4734e739ca501272","ok":true}

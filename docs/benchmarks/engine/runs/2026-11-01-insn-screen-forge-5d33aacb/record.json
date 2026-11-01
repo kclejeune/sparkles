@@ -1,0 +1,940 @@
+{
+ "checks": [
+  {
+   "detail": "20000 items, 2000 commits",
+   "fingerprint": "4c054a9f71ae73a3",
+   "name": "workload",
+   "ok": true
+  },
+  {
+   "detail": "80206 keys",
+   "fingerprint": "80206 keys, bda3cb309180f577",
+   "name": "vocab/front-coded/keys",
+   "ok": true
+  },
+  {
+   "detail": "80206",
+   "name": "vocab/front-coded/open/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/front-coded/open/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/front-coded/open/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "3545523",
+   "name": "vocab/front-coded/for-each/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/front-coded/for-each/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/front-coded/for-each/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "506495",
+   "name": "vocab/front-coded/get-sorted/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/front-coded/get-sorted/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/front-coded/get-sorted/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "2209550",
+   "name": "vocab/front-coded/get-random/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/front-coded/get-random/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/front-coded/get-random/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "247407745",
+   "name": "vocab/front-coded/find-present/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/front-coded/find-present/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/front-coded/find-present/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "0",
+   "name": "vocab/front-coded/find-missing/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/front-coded/find-missing/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/front-coded/find-missing/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "12301108",
+   "name": "vocab/front-coded/prefix-range/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/front-coded/prefix-range/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/front-coded/prefix-range/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "80206 keys",
+   "fingerprint": "80206 keys, bda3cb309180f577",
+   "name": "vocab/fsst/keys",
+   "ok": true
+  },
+  {
+   "detail": "80206",
+   "name": "vocab/fsst/open/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/fsst/open/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/fsst/open/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "3545523",
+   "name": "vocab/fsst/for-each/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/fsst/for-each/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/fsst/for-each/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "506495",
+   "name": "vocab/fsst/get-sorted/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/fsst/get-sorted/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/fsst/get-sorted/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "2209550",
+   "name": "vocab/fsst/get-random/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/fsst/get-random/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/fsst/get-random/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "247407745",
+   "name": "vocab/fsst/find-present/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/fsst/find-present/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/fsst/find-present/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "0",
+   "name": "vocab/fsst/find-missing/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/fsst/find-missing/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/fsst/find-missing/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "12301108",
+   "name": "vocab/fsst/prefix-range/result",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "vocab/fsst/prefix-range/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "vocab/fsst/prefix-range/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "2000 commits, 165033 WAL bytes against 33 without them",
+   "name": "wal/replay/commits-in-wal",
+   "ok": true
+  },
+  {
+   "detail": "(1, 120200, 3510170385648862026)",
+   "fingerprint": "(1, 120200, 3510170385648862026)",
+   "name": "wal/open-without-wal/recovered",
+   "ok": true
+  },
+  {
+   "detail": "(2001, 122200, 5225943398070010606)",
+   "fingerprint": "(2001, 122200, 5225943398070010606)",
+   "name": "wal/open-with-2000-commits/recovered",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "wal/open-without-wal/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "wal/open-without-wal/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "wal/open-with-2000-commits/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "wal/open-with-2000-commits/counter-coverage",
+   "ok": true
+  },
+  {
+   "detail": "0.0 ms of CPU time on other threads",
+   "name": "wal/replay-2000-commits/single-thread",
+   "ok": true
+  },
+  {
+   "detail": "the counters ran for 1.0000 of the enabled time",
+   "name": "wal/replay-2000-commits/counter-coverage",
+   "ok": true
+  }
+ ],
+ "gate": "insn-screen",
+ "gate_record": 1,
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "forge"
+ },
+ "kind": "gate-record",
+ "manifest": {
+  "binary_sha256": "293c21c0071f5dd29def8716239f0a91b2449078f0c84d72f253397a5949aeb1",
+  "build_config": "{\"Cargo.toml\":{\"release\":{\"codegen-units\":4,\"debug\":1,\"lto\":\"thin\",\"package\":{\"sparkles-core\":{\"codegen-units\":1}}}},\"cargo\":\"test --release -p sparkles-core --test insn_screen\",\"env\":{\"CARGO_INCREMENTAL\":\"0\"},\"mbx_policy\":\"d8bf0b48d620f6bf62929d3db32bd253653505cdb33a5bd1efed1e79aaca05b4\",\"profile\":\"release\"}",
+  "commit": "5d33aacb",
+  "compilers": "GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+  "dirty_files": "0",
+  "ended": "2026-11-01T09:05:07Z",
+  "host_load_before": "1.08 1.30 1.65",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "started": "2026-11-01T09:04:36Z"
+ },
+ "metrics": [
+  {
+   "better": "lower",
+   "key": "vocab/front-coded/open",
+   "range": [
+    21078,
+    21810
+   ],
+   "samples": [
+    21789,
+    21789,
+    21796,
+    22169,
+    22267,
+    21415,
+    21447,
+    21726,
+    21737,
+    22167,
+    20823,
+    21078,
+    21078,
+    21132,
+    21147,
+    21779,
+    21779,
+    21786,
+    22167,
+    22258,
+    21803,
+    21803,
+    21810,
+    22152,
+    22269
+   ],
+   "unit": "instructions",
+   "value": 21786
+  },
+  {
+   "better": "lower",
+   "key": "vocab/front-coded/for-each",
+   "range": [
+    8535784,
+    9436303
+   ],
+   "samples": [
+    8535784,
+    8535784,
+    8535784,
+    8535784,
+    8536453,
+    9436213,
+    9436303,
+    9436303,
+    9436303,
+    9436304,
+    9012206,
+    9012484,
+    9012484,
+    9012649,
+    9012650,
+    8535783,
+    8535784,
+    8535784,
+    8535785,
+    8536454,
+    8535784,
+    8535784,
+    8535784,
+    8535785,
+    8536453
+   ],
+   "unit": "instructions",
+   "value": 8535784
+  },
+  {
+   "better": "lower",
+   "key": "vocab/front-coded/get-sorted",
+   "range": [
+    7191525,
+    7192077
+   ],
+   "samples": [
+    7191313,
+    7191525,
+    7191525,
+    7191704,
+    7191756,
+    7191568,
+    7191793,
+    7192077,
+    7192078,
+    7192141,
+    7191820,
+    7191826,
+    7191827,
+    7191979,
+    7191980,
+    7191313,
+    7191526,
+    7191526,
+    7191747,
+    7191756,
+    7191313,
+    7191525,
+    7191526,
+    7191705,
+    7191757
+   ],
+   "unit": "instructions",
+   "value": 7191526
+  },
+  {
+   "better": "lower",
+   "key": "vocab/front-coded/get-random",
+   "range": [
+    60908283,
+    62325401
+   ],
+   "samples": [
+    60908283,
+    60908283,
+    60908283,
+    60908284,
+    60968746,
+    62325322,
+    62325401,
+    62325401,
+    62325401,
+    62325405,
+    61239751,
+    61239752,
+    61239763,
+    61239916,
+    61239919,
+    60908283,
+    60908283,
+    60908283,
+    60908284,
+    60968709,
+    60908283,
+    60908283,
+    60908283,
+    60908286,
+    60968755
+   ],
+   "unit": "instructions",
+   "value": 60908283
+  },
+  {
+   "better": "lower",
+   "key": "vocab/front-coded/find-present",
+   "range": [
+    11146629,
+    11162209
+   ],
+   "samples": [
+    11146629,
+    11146629,
+    11146629,
+    11146629,
+    11146630,
+    11162208,
+    11162209,
+    11162209,
+    11162210,
+    11162210,
+    11150659,
+    11150659,
+    11150660,
+    11150660,
+    11150660,
+    11147266,
+    11147266,
+    11147267,
+    11147267,
+    11147268,
+    11147739,
+    11147739,
+    11147739,
+    11147739,
+    11147739
+   ],
+   "unit": "instructions",
+   "value": 11147739
+  },
+  {
+   "better": "lower",
+   "key": "vocab/front-coded/find-missing",
+   "range": [
+    12175211,
+    12197300
+   ],
+   "samples": [
+    12175209,
+    12175210,
+    12175211,
+    12175211,
+    12175211,
+    12197299,
+    12197299,
+    12197300,
+    12197300,
+    12197300,
+    12178240,
+    12178241,
+    12178242,
+    12178242,
+    12178243,
+    12176520,
+    12176520,
+    12176520,
+    12176520,
+    12176521,
+    12182367,
+    12182368,
+    12182369,
+    12182369,
+    12182369
+   ],
+   "unit": "instructions",
+   "value": 12178242
+  },
+  {
+   "better": "lower",
+   "key": "vocab/front-coded/prefix-range",
+   "range": [
+    1877214,
+    1878995
+   ],
+   "samples": [
+    1877678,
+    1877678,
+    1877678,
+    1877678,
+    1877679,
+    1877732,
+    1877732,
+    1877732,
+    1877733,
+    1877733,
+    1877214,
+    1877214,
+    1877214,
+    1877215,
+    1877215,
+    1877634,
+    1877634,
+    1877634,
+    1877635,
+    1877635,
+    1878994,
+    1878994,
+    1878995,
+    1878995,
+    1878995
+   ],
+   "unit": "instructions",
+   "value": 1877678
+  },
+  {
+   "better": "lower",
+   "key": "vocab/fsst/open",
+   "range": [
+    28551,
+    29648
+   ],
+   "samples": [
+    29335,
+    29577,
+    29648,
+    29741,
+    30119,
+    28343,
+    28400,
+    28551,
+    28679,
+    29817,
+    29096,
+    29184,
+    29226,
+    29314,
+    30292,
+    29137,
+    29224,
+    29309,
+    29354,
+    30439,
+    29128,
+    29216,
+    29285,
+    29346,
+    30415
+   ],
+   "unit": "instructions",
+   "value": 29285
+  },
+  {
+   "better": "lower",
+   "key": "vocab/fsst/for-each",
+   "range": [
+    13235608,
+    13235609
+   ],
+   "samples": [
+    13235607,
+    13235608,
+    13235609,
+    13235609,
+    13235609,
+    13235607,
+    13235608,
+    13235608,
+    13235609,
+    13235610,
+    13235608,
+    13235608,
+    13235608,
+    13235609,
+    13235609,
+    13235607,
+    13235608,
+    13235608,
+    13235609,
+    13235610,
+    13235608,
+    13235608,
+    13235609,
+    13235609,
+    13235609
+   ],
+   "unit": "instructions",
+   "value": 13235608
+  },
+  {
+   "better": "lower",
+   "key": "vocab/fsst/get-sorted",
+   "range": [
+    8642303,
+    8642304
+   ],
+   "samples": [
+    8642303,
+    8642303,
+    8642303,
+    8642304,
+    8642304,
+    8642303,
+    8642304,
+    8642304,
+    8642304,
+    8642305,
+    8642303,
+    8642304,
+    8642304,
+    8642304,
+    8642305,
+    8642304,
+    8642304,
+    8642304,
+    8642304,
+    8642305,
+    8642303,
+    8642303,
+    8642304,
+    8642304,
+    8642304
+   ],
+   "unit": "instructions",
+   "value": 8642304
+  },
+  {
+   "better": "lower",
+   "key": "vocab/fsst/get-random",
+   "range": [
+    57289681,
+    57289683
+   ],
+   "samples": [
+    57289681,
+    57289681,
+    57289681,
+    57289685,
+    57289691,
+    57289681,
+    57289681,
+    57289681,
+    57289684,
+    57289692,
+    57289681,
+    57289681,
+    57289681,
+    57289681,
+    57289686,
+    57289681,
+    57289681,
+    57289681,
+    57289685,
+    57289689,
+    57289680,
+    57289682,
+    57289683,
+    57289684,
+    57289689
+   ],
+   "unit": "instructions",
+   "value": 57289681
+  },
+  {
+   "better": "lower",
+   "key": "vocab/fsst/find-present",
+   "range": [
+    14536664,
+    14566444
+   ],
+   "samples": [
+    14566443,
+    14566444,
+    14566444,
+    14566445,
+    14566445,
+    14539084,
+    14539085,
+    14539085,
+    14539085,
+    14539086,
+    14544661,
+    14544662,
+    14544662,
+    14544662,
+    14544662,
+    14536664,
+    14536664,
+    14536664,
+    14536665,
+    14536665,
+    14541326,
+    14541327,
+    14541328,
+    14541328,
+    14541328
+   ],
+   "unit": "instructions",
+   "value": 14541328
+  },
+  {
+   "better": "lower",
+   "key": "vocab/fsst/find-missing",
+   "range": [
+    15499312,
+    15511024
+   ],
+   "samples": [
+    15507939,
+    15507940,
+    15507940,
+    15507940,
+    15507941,
+    15507744,
+    15507744,
+    15507745,
+    15507745,
+    15507745,
+    15511023,
+    15511024,
+    15511024,
+    15511025,
+    15511025,
+    15501707,
+    15501707,
+    15501707,
+    15501707,
+    15501708,
+    15499310,
+    15499311,
+    15499312,
+    15499312,
+    15499312
+   ],
+   "unit": "instructions",
+   "value": 15507745
+  },
+  {
+   "better": "lower",
+   "key": "vocab/fsst/prefix-range",
+   "range": [
+    1975336,
+    1978471
+   ],
+   "samples": [
+    1975336,
+    1975336,
+    1975336,
+    1975337,
+    1975337,
+    1977206,
+    1977206,
+    1977206,
+    1977207,
+    1977207,
+    1975437,
+    1975437,
+    1975437,
+    1975437,
+    1975438,
+    1978470,
+    1978470,
+    1978471,
+    1978471,
+    1978471,
+    1978354,
+    1978354,
+    1978354,
+    1978355,
+    1978355
+   ],
+   "unit": "instructions",
+   "value": 1977206
+  },
+  {
+   "better": "lower",
+   "key": "wal/open-without-wal",
+   "range": [
+    330057645,
+    330060944
+   ],
+   "samples": [
+    330058652,
+    330058735,
+    330060548,
+    330062277,
+    330069356,
+    330056085,
+    330057566,
+    330057645,
+    330059996,
+    330067131,
+    330030439,
+    330057687,
+    330060056,
+    330061954,
+    330070536,
+    330058763,
+    330060666,
+    330060698,
+    330063032,
+    330070241,
+    330060225,
+    330060787,
+    330060944,
+    330062088,
+    330075616
+   ],
+   "unit": "instructions",
+   "value": 330060548
+  },
+  {
+   "better": "lower",
+   "key": "wal/open-with-2000-commits",
+   "range": [
+    394093307,
+    394105567
+   ],
+   "samples": [
+    394090975,
+    394094257,
+    394099730,
+    394108855,
+    394118732,
+    394092635,
+    394096677,
+    394103083,
+    394103169,
+    394108138,
+    394091620,
+    394095101,
+    394095350,
+    394101259,
+    394102123,
+    394083131,
+    394090778,
+    394093307,
+    394105132,
+    394111654,
+    394095208,
+    394101111,
+    394105567,
+    394108394,
+    394113469
+   ],
+   "unit": "instructions",
+   "value": 394099730
+  },
+  {
+   "better": "lower",
+   "key": "wal/replay-2000-commits",
+   "range": [
+    64032609,
+    64045438
+   ],
+   "samples": [
+    64030427,
+    64033709,
+    64039182,
+    64048307,
+    64058184,
+    64034990,
+    64039032,
+    64045438,
+    64045524,
+    64050493,
+    64031564,
+    64035045,
+    64035294,
+    64041203,
+    64042067,
+    64022433,
+    64030080,
+    64032609,
+    64044434,
+    64050956,
+    64034264,
+    64040167,
+    64044623,
+    64047450,
+    64052525
+   ],
+   "unit": "instructions",
+   "value": 64039182
+  }
+ ],
+ "scale": "20000 items, 2000 commits",
+ "settings": {
+  "commits": "2000",
+  "harness": "crates/sparkles-core/tests/insn_screen.rs",
+  "items": "20000",
+  "processes": 5,
+  "reps": "5",
+  "threshold": 0.0
+ },
+ "suite": "insn-screen"
+}

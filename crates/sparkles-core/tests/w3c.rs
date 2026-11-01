@@ -12,7 +12,9 @@
 //!
 //! The query evaluation tests also run through streaming cursors at several batch
 //! sizes, compared with the expected results in the same way, and eagerly with an
-//! empty extension registry installed. A cursor pass first opens each query with the
+//! empty extension registry installed. The `streaming_` tests run every query
+//! evaluation suite as `execution=streaming` runs a query, through cursors of the
+//! server's default 4,096 rows (`mise run test:w3c:streaming`, ROADMAP item 470). A cursor pass first opens each query with the
 //! policy that refuses eager fallback. A query that needs fallback is counted in the
 //! pass's summary and then runs with fallback allowed, so it is still checked.
 //! `SPARKLES_W3C_SPILL=plain` or `encrypted` gives cursor query passes a 1 MiB
@@ -547,6 +549,15 @@ impl Mode {
     fn eager() -> Mode {
         Mode::default()
     }
+
+    /// `execution=streaming`: cursors with the default options of
+    /// [`CursorOptions`], which the server uses for a streamed query.
+    fn streaming() -> Mode {
+        Mode {
+            cursor: Some(CursorOptions::default().batch_rows),
+            ..Mode::default()
+        }
+    }
 }
 
 thread_local! {
@@ -944,6 +955,12 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
             "{name}: {} queries needed eager fallback",
             FALLBACKS.with(|n| n.get())
         );
+        // for the gate record, which fails on unexpected failures only
+        eprintln!(
+            "{name}: {} known failures, {} unexpected failures",
+            fail - new_failures.len(),
+            new_failures.len()
+        );
     }
     if !fixed.is_empty() {
         eprintln!("now passing (remove from known failures): {fixed:?}");
@@ -983,10 +1000,10 @@ fn sparql10() {
 }
 
 /// The query evaluation tests through streaming cursors, at batch sizes that put
-/// boundaries everywhere and at the default size.
+/// boundaries everywhere. [`streaming_sparql10_and_11`] runs the default size.
 #[test]
 fn sparql_query_cursors() {
-    for batch_rows in [1, 2, 3, 4096] {
+    for batch_rows in [1, 2, 3] {
         run_suite_mode(
             &format!("SPARQL 1.0 and 1.1 query (cursor, {batch_rows} rows)"),
             &[
@@ -999,6 +1016,69 @@ fn sparql_query_cursors() {
             },
         );
     }
+}
+
+/// SPARQL 1.0 and 1.1 query evaluation with `execution=streaming` (item 470).
+#[test]
+fn streaming_sparql10_and_11() {
+    run_suite_mode(
+        "SPARQL 1.0 and 1.1 query (streaming)",
+        &[
+            "sparql10/manifest-evaluation.ttl",
+            "sparql11/manifest-sparql11-query.ttl",
+        ],
+        Mode::streaming(),
+    );
+}
+
+/// SPARQL 1.2 query evaluation with `execution=streaming` (item 470).
+#[test]
+fn streaming_sparql12() {
+    run_suite_mode(
+        "SPARQL 1.2 (streaming)",
+        &["sparql12/manifest.ttl"],
+        Mode::streaming(),
+    );
+}
+
+/// Jena's CDT, FOLD and UNFOLD tests with `execution=streaming` (item 470).
+#[test]
+fn streaming_sparql_cdts() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/jena-arq");
+    run_suite_in(
+        "SPARQL CDTs (Jena, streaming)",
+        &dir,
+        &["SPARQL-CDTs/manifest-all.ttl"],
+        &dir.join("expected-failures.txt"),
+        Mode::streaming(),
+    );
+}
+
+/// Jena's ARQ property function tests with `execution=streaming` (item 470).
+#[test]
+fn streaming_arq_property_functions() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/jena-arq");
+    run_suite_in(
+        "ARQ property functions (Jena, streaming)",
+        &dir,
+        &["ARQ/PropertyFunctions/manifest.ttl"],
+        &dir.join("expected-failures.txt"),
+        Mode::streaming(),
+    );
+}
+
+/// Oxigraph's GeoSPARQL function tests with `execution=streaming` (item 470).
+#[cfg(feature = "geo")]
+#[test]
+fn streaming_geosparql_oxigraph() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/geosparql/oxigraph");
+    run_suite_in(
+        "GeoSPARQL (Oxigraph, streaming)",
+        &dir,
+        &["manifest.ttl"],
+        &dir.join("expected-failures.txt"),
+        Mode::streaming(),
+    );
 }
 
 /// P03 A9: an installed registry that no query references changes no answer.

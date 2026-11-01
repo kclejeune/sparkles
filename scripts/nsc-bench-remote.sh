@@ -12,7 +12,13 @@
 # ones. results/samples.tsv gets one line per timed request with the server's execution time
 # (execMs of application/x-sparkles+json, unrounded) and curl's wall time. results/answers.tsv
 # gets a checksum of each variant's sorted TSV answer to each query, and results/load.tsv the
-# load times. Progress goes to results/progress.log and results/done marks the end.
+# load times. With ORDER_DIGEST set to a command, such as `python3 scripts/bench-gate.py
+# order-digest`, it is run with the query file and the TSV answer, and its output, a digest
+# of the ORDER BY keys in the returned order or "-", is a fifth column of answers.tsv. With
+# WARM_DIGEST set to a command, such as `python3 scripts/bench-gate.py native-digest`, it is
+# run with the query file and the query's timed responses, after its timed requests, and
+# prints a line for each; results/warm-answers.tsv gets them, so that the timed format's
+# answers are checked too. Progress goes to results/progress.log and results/done marks the end.
 #
 # With SPIN=1 (the default), a busy loop at the lowest priority (SCHED_IDLE) runs on the
 # server and client CPUs during the timed part. It keeps their vCPUs from halting between
@@ -160,6 +166,7 @@ SPINNERS=()
 
 request() { # <query> -> "execMs wallSeconds", or "error"
   local w e
+  rm -f resp.json
   if ! w=$(curl -sS -f --max-time "$MAX_TIME" -o resp.json -w '%{time_total}' -H 'Accept: application/x-sparkles+json' \
     --data-urlencode "query@queries/$1.rq" "${EXEC_FIELD[@]}" "$URL" 2> /dev/null); then
     echo error
@@ -178,6 +185,7 @@ if [ "$SPIN" = 1 ]; then
 fi
 printf 'round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n' > "$R/samples.tsv"
 : > "$R/answers.tsv"
+: > "$R/warm-answers.tsv"
 read -r steal0 total0 < <(stat_cpu)
 epoch=0
 checked=" "
@@ -190,7 +198,13 @@ for round in $(seq "$ROUNDS"); do
       for q in "${QUERIES[@]}"; do
         if curl -sS -f --max-time "$MAX_TIME" -o ans.tsv -H 'Accept: text/tab-separated-values' \
           --data-urlencode "query@queries/$q.rq" "${EXEC_FIELD[@]}" "$URL" 2> /dev/null; then
-          printf '%s\t%s\t%s\t%s\n' "$v" "$q" "$(($(wc -l < ans.tsv) - 1))" "$(sort ans.tsv | sha256sum | cut -c1-16)" >> "$R/answers.tsv"
+          odig=""
+          if [ -n "${ORDER_DIGEST:-}" ]; then
+            # shellcheck disable=SC2086
+            odig=$'\t'"$($ORDER_DIGEST "queries/$q.rq" ans.tsv)"
+          fi
+          printf '%s\t%s\t%s\t%s%s\n' "$v" "$q" "$(($(wc -l < ans.tsv) - 1))" "$(sort ans.tsv | sha256sum | cut -c1-16)" \
+            "$odig" >> "$R/answers.tsv"
         else
           printf '%s\t%s\terror\terror\n' "$v" "$q" >> "$R/answers.tsv"
         fi
@@ -205,7 +219,21 @@ for round in $(seq "$ROUNDS"); do
         else
           printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$round" "$epoch" "$v" "$q" "$rep" "$e" "$(awk "BEGIN {print $w * 1000}")" >> "$R/samples.tsv"
         fi
+        # every timed answer is kept and digested after the timed loop
+        [ -z "${WARM_DIGEST:-}" ] || mv -f resp.json "timed-$rep.json" 2> /dev/null || :
       done
+      if [ -n "${WARM_DIGEST:-}" ]; then
+        # one process digests all of the query's timed answers, one line each in order, so
+        # that a large answer's check against the input runs once per distinct answer
+        files=()
+        for rep in $(seq "$REPS"); do files+=("timed-$rep.json"); done
+        # shellcheck disable=SC2086
+        mapfile -t digests < <($WARM_DIGEST "queries/$q.rq" "${files[@]}" || :)
+        for rep in $(seq "$REPS"); do
+          printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$v" "$q" "$rep" "${digests[$((rep - 1))]:-no digest}" >> "$R/warm-answers.tsv"
+        done
+        rm -f "${files[@]}"
+      fi
     done
     stop_server
     log "round $round epoch $epoch ($v) done"

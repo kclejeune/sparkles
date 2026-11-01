@@ -302,3 +302,79 @@ slower with FSST, DBpedia's `abstract-contains` and `label-regex` 12% slower, an
 `entity-summary-1` on DBpedia takes 1.17 times as long. [Roadmap](../../ROADMAP.md) item 160
 follows up `star-join` and `entity-summary-1`, and item 241 follows up three warm DBpedia
 queries that run 1.4% to 4.2% slower with front coding since item 108.
+
+## Rewrite gate baselines
+
+These baselines belong to the rewrite gates of [BENCHMARKING.md](../../BENCHMARKING.md#rewrite-gates).
+A change that a gate covers compares its own gate record with them using
+`scripts/bench-gate.py compare`.
+
+### W3C suites under streaming execution
+
+`mise run test:w3c:streaming` ran the query evaluation suites with `execution=streaming`
+at commit fcff390a, whose engine code is that of 04d49b57. The suites came from the
+Apache Jena checkout that the tests read by default. Every suite passed with no new
+failures, and the debug test binary took 23 seconds on a busy development laptop.
+
+| Suite | Passed | Failed | Skipped | Queries with eager fallback |
+|---|--:|--:|--:|--:|
+| SPARQL 1.0 and 1.1 query | 508 | 0 | 103 | 0 |
+| SPARQL 1.2 | 63 | 0 | 206 | 0 |
+| Jena's CDT, FOLD and UNFOLD tests | 655 | 0 | 0 | 30 |
+| ARQ property functions | 48 | 0 | 0 | 24 |
+
+The skipped tests are syntax and update tests, which do not depend on the execution mode
+and run in the default pass. The fallback counts are the queries whose plans hold an
+operator that the cursors do not stream, which then runs eagerly on first demand. These
+counts are the measure that the executor merge drives to zero. The
+[run record](runs/2026-11-01-w3c-streaming-stanley/record.json) and its
+[log](runs/2026-11-01-w3c-streaming-stanley/output.log) hold the counts. `mise run test`
+runs the same tests in CI with Oxigraph's GeoSPARQL tests added. A separate run with the
+`geo` feature gave 37 passes and the 7 listed failures of those tests in both modes, with
+no eager fallback. The streaming tests
+replace the cursor pass at 4,096 rows that `sparql_query_cursors` used to run, so CI
+runs about 10 seconds more of these tests than before.
+
+### Instruction counts of vocabulary scans and WAL replay
+
+`mise run bench:insn` counted the user-space instructions of the vocabulary readers and
+of WAL replay on forge alone at commit 5d33aacb, whose engine code is that of 04d49b57.
+The store held 20,000 items, and the WAL case replayed 2,000 commits. Each figure is the
+median of five processes, each of which reports the median of five runs. Every result
+check passed, and no case saw other threads use measurable CPU time.
+
+| Case | Median | Lowest process | Highest process |
+|---|--:|--:|--:|
+| `vocab/front-coded/open` | 21,786 | 21,078 | 21,810 |
+| `vocab/front-coded/for-each` | 8,535,784 | 8,535,784 | 9,436,303 |
+| `vocab/front-coded/get-sorted` | 7,191,526 | 7,191,525 | 7,192,077 |
+| `vocab/front-coded/get-random` | 60,908,283 | 60,908,283 | 62,325,401 |
+| `vocab/front-coded/find-present` | 11,147,739 | 11,146,629 | 11,162,209 |
+| `vocab/front-coded/find-missing` | 12,178,242 | 12,175,211 | 12,197,300 |
+| `vocab/front-coded/prefix-range` | 1,877,678 | 1,877,214 | 1,878,995 |
+| `vocab/fsst/open` | 29,285 | 28,551 | 29,648 |
+| `vocab/fsst/for-each` | 13,235,608 | 13,235,608 | 13,235,609 |
+| `vocab/fsst/get-sorted` | 8,642,304 | 8,642,303 | 8,642,304 |
+| `vocab/fsst/get-random` | 57,289,681 | 57,289,681 | 57,289,683 |
+| `vocab/fsst/find-present` | 14,541,328 | 14,536,664 | 14,566,444 |
+| `vocab/fsst/find-missing` | 15,507,745 | 15,499,312 | 15,511,024 |
+| `vocab/fsst/prefix-range` | 1,977,206 | 1,975,336 | 1,978,471 |
+| `wal/open-without-wal` | 330,060,548 | 330,057,645 | 330,060,944 |
+| `wal/open-with-2000-commits` | 394,099,730 | 394,093,307 | 394,105,567 |
+| `wal/replay-2000-commits` | 64,039,182 | 64,032,609 | 64,045,438 |
+
+Within one process the scans, lookups and store opens repeat to within a tenth of a
+percent. The vocabulary opens count only 20,000 to 30,000 instructions and vary by up to
+3.5% for front coding and 5.2% for FSST within a process. Between processes the full
+front-coded scan moved by 10.5%, between 8,535,784 and 9,436,303 instructions, and its
+random lookups and both vocabulary opens by 2% to 4%, as the addresses their data lands at
+change. The other cases moved by 0.2% or less. The gate
+flags a case only when a candidate's whole range lies above the baseline's, so these
+cases catch a change larger than their spread. Replaying 2,000 commits cost 64.0 million
+instructions, about 32,000 per commit.
+
+The [run record](runs/2026-11-01-insn-screen-forge-5d33aacb/record.json) holds every
+count, the result checks, the workload fingerprint, the compilers and the build
+configuration, with the raw lines and logs of the five processes and the
+[commands](runs/2026-11-01-insn-screen-forge-5d33aacb/run.sh.txt). The screen took
+33 seconds on forge after its build.

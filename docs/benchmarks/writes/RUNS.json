@@ -774,6 +774,46 @@
         }
       },
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
+    },
+    {
+      "run_id": "sha256-e4413d537bd84a223e5ac241227fba31c04eea821611adab706ec9a74be12582",
+      "path": "runs/2026-11-01-incr-gate-forge-64391e7f/record.json",
+      "sha256": "e4413d537bd84a223e5ac241227fba31c04eea821611adab706ec9a74be12582",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "incremental-views",
+        "scale": "200000 people",
+        "manifest": {
+          "binary_sha256": "33656d5f23f25bd2e096b9c7defb8b61b0e768ec6b5a40f74e11d8d9439a8385",
+          "build_config": "{\"Cargo.toml\":{\"release\":{\"codegen-units\":4,\"debug\":1,\"lto\":\"thin\",\"package\":{\"sparkles-core\":{\"codegen-units\":1}}}},\"cargo\":\"test --release -p sparkles-core --test incr_bench\",\"env\":{\"CARGO_INCREMENTAL\":\"0\"},\"mbx_policy\":\"d8bf0b48d620f6bf62929d3db32bd253653505cdb33a5bd1efed1e79aaca05b4\",\"profile\":\"release\"}",
+          "commit": "64391e7f",
+          "compilers": "GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+          "dirty_files": "0",
+          "ended": "2026-11-01T08:56:14Z",
+          "host_load_before": "0.64 1.53 2.09",
+          "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+          "started": "2026-11-01T08:53:00Z"
+        },
+        "settings": {
+          "harness": "crates/sparkles-core/tests/incr_bench.rs",
+          "load": "0.64 1.53 2.09",
+          "people": "200000",
+          "processes": 5,
+          "threads": "12",
+          "threshold": 0.1
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "cpus": 20,
+            "kernel": "7.2.9",
+            "name": "forge"
+          },
+          "kind": "gate-record"
+        }
+      },
+      "metadata_note": "A gate record of scripts/bench-gate.py. Read the record for its manifest, settings, metrics and checks."
     }
   ]
 }

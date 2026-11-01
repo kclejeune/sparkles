@@ -137,3 +137,52 @@ slowdowns.
 
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.
+
+## Query-time reasoning latency
+
+`mise run bench:reasoning-latency` is the rewrite gate of derivation on demand and RDFS
+on read, as [BENCHMARKING.md](../../BENCHMARKING.md#derivation-on-demand-and-rdfs-on-read)
+describes. Its baseline ran on forge alone at commit 53220ef6, whose engine code is that
+of 04d49b57, with 12 Rayon threads. The data was 10 LUBM-style universities, about 1.3
+million asserted triples. The rdfs profile inferred 565,906 triples in 2.3 s and owl-rl
+1,233,089 in 1.7 s. Every timed run of every mode returned the materialized answer of its
+profile to all 14 queries. Each figure is the median of 15 timed runs in milliseconds, from five rounds that
+visit the modes in a rotated order.
+
+| Query | rdfs materialized | rdfs demand | rdfs demand, cached | RDFS on read | owl-rl materialized | owl-rl demand | owl-rl demand, cached |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| q1 | 0.064 | 42.6 | 0.331 | 0.380 | 0.042 | 2,017 | 1,517 |
+| q2 | 0.633 | 49.5 | 3.87 | 14.4 | 3.01 | 2,212 | 2,989 |
+| q3 | 0.060 | 43.7 | 0.394 | 2.50 | 0.053 | 1,995 | 1,535 |
+| q4 | 0.164 | 44.1 | 1.35 | 0.653 | 0.139 | 2,060 | 2,549 |
+| q5 | 0.142 | 48.6 | 1.42 | 9.09 | 0.130 | 2,058 | 1,556 |
+| q6 | 0.915 | 106 | 51.5 | 1.63 | 1.19 | 2,344 | 1,204 |
+| q7 | 0.116 | 44.3 | 0.644 | 2.63 | 0.093 | 2,012 | 2,173 |
+| q8 | 2.67 | 127 | 76.9 | 12.2 | 2.96 | 2,043 | 2,599 |
+| q9 | 7.84 | 96.4 | 49.6 | 7.28 | 8.60 | 2,565 | 2,986 |
+| q10 | 0.063 | 42.1 | 0.424 | 1.70 | 0.058 | 2,029 | 1,537 |
+| q11 | 0.061 | 43.3 | 0.360 | 0.109 | 0.098 | 2,005 | 1,544 |
+| q12 | 0.059 | 43.6 | 0.740 | 0.167 | 0.168 | 2,049 | 2,247 |
+| q13 | 0.039 | 41.1 | 0.300 | 0.109 | 0.081 | 2,025 | 1,549 |
+| q14 | 0.929 | 41.6 | 0.456 | 1.34 | 0.905 | 2,244 | 1,203 |
+
+Derivation on demand with the rdfs profile costs about 44 ms per query when it makes its
+tables again, and a few tenths of a millisecond to tens of milliseconds with them cached.
+RDFS on read stays within a few milliseconds except on the queries that read broad
+classes, `q2`, `q5` and `q8`. Under owl-rl every query takes about two seconds on demand,
+including `q1`, which needs no inference. The cached mode does not help. The
+process-wide table cache, whose default capacity is 256 MiB, filled to 266 MB at this
+size, and it missed about 85 times in every round, so tables were evicted between
+queries. These times are far
+above the 2.5 ms that spec F17 recorded for `q1` at the same size on an nsc instance at
+d80c0ce7, before the schema-completeness changes. [Roadmap](../../ROADMAP.md) item
+Item 532 investigates the per-query cost. A server answering `reasoning=demand` on a
+smaller copy of this data took more than a second for `q1` as well, so the cost is not an
+artifact of the harness.
+
+The [run record](runs/2026-11-01-reasoning-latency-forge-53220ef6/record.json) holds every sample,
+the answer fingerprints, the settings, the compilers and the build configuration, with the
+[raw lines](runs/2026-11-01-reasoning-latency-forge-53220ef6/metrics.jsonl), the
+[log](runs/2026-11-01-reasoning-latency-forge-53220ef6/output.log) and the
+[commands](runs/2026-11-01-reasoning-latency-forge-53220ef6/run.sh.txt). Item 190's
+equality-stage fixtures are not part of this benchmark, and item 533 adds them.

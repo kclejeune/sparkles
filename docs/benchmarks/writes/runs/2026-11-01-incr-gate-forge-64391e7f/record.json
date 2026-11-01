@@ -1,0 +1,1537 @@
+{
+ "checks": [
+  {
+   "detail": "the views caught up in 0 ms",
+   "name": "commits/0-views/caught-up",
+   "ok": true
+  },
+  {
+   "detail": "the views caught up in 115 ms",
+   "name": "commits/10-views/caught-up",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, d850a0e551fad23a",
+   "name": "commits/10-views/v0/answer",
+   "ok": true
+  },
+  {
+   "detail": "0 maintained rows, 0 evaluated rows",
+   "fingerprint": "0 rows, 37295c0f2b0cfa2a",
+   "name": "commits/10-views/v7/answer",
+   "ok": true
+  },
+  {
+   "detail": "the views caught up in 4814 ms",
+   "name": "commits/100-views/caught-up",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, d850a0e551fad23a",
+   "name": "commits/100-views/v0/answer",
+   "ok": true
+  },
+  {
+   "detail": "0 maintained rows, 0 evaluated rows",
+   "fingerprint": "0 rows, 37295c0f2b0cfa2a",
+   "name": "commits/100-views/v7/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, 217ef31b05205cf4",
+   "name": "commits/100-views/v14/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, 69b8cbe10bec516b",
+   "name": "commits/100-views/v21/answer",
+   "ok": true
+  },
+  {
+   "detail": "52000 maintained rows, 52000 evaluated rows",
+   "fingerprint": "52000 rows, f59fc343a28741d9",
+   "name": "commits/100-views/v28/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, d850a0e551fad23a",
+   "name": "commits/100-views/v35/answer",
+   "ok": true
+  },
+  {
+   "detail": "0 maintained rows, 0 evaluated rows",
+   "fingerprint": "0 rows, 37295c0f2b0cfa2a",
+   "name": "commits/100-views/v42/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, 217ef31b05205cf4",
+   "name": "commits/100-views/v49/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, 69b8cbe10bec516b",
+   "name": "commits/100-views/v56/answer",
+   "ok": true
+  },
+  {
+   "detail": "52000 maintained rows, 52000 evaluated rows",
+   "fingerprint": "52000 rows, f59fc343a28741d9",
+   "name": "commits/100-views/v63/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, d850a0e551fad23a",
+   "name": "commits/100-views/v70/answer",
+   "ok": true
+  },
+  {
+   "detail": "0 maintained rows, 0 evaluated rows",
+   "fingerprint": "0 rows, 37295c0f2b0cfa2a",
+   "name": "commits/100-views/v77/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, 217ef31b05205cf4",
+   "name": "commits/100-views/v84/answer",
+   "ok": true
+  },
+  {
+   "detail": "250 maintained rows, 250 evaluated rows",
+   "fingerprint": "250 rows, 69b8cbe10bec516b",
+   "name": "commits/100-views/v91/answer",
+   "ok": true
+  },
+  {
+   "detail": "52000 maintained rows, 52000 evaluated rows",
+   "fingerprint": "52000 rows, f59fc343a28741d9",
+   "name": "commits/100-views/v98/answer",
+   "ok": true
+  },
+  {
+   "detail": "18000 commits from 1",
+   "name": "commit-path/commits",
+   "ok": true
+  },
+  {
+   "detail": "36000 quads added, 18000 subjects with a team and an age",
+   "fingerprint": "18000 rows, f9fd4bcb02c78c7a",
+   "name": "commit-path/written",
+   "ok": true
+  },
+  {
+   "detail": "1000 maintained rows, 1000 evaluated rows",
+   "fingerprint": "1000 rows, ebac45f95fd79653",
+   "name": "inferred/rdfs-team-sizes/answer",
+   "ok": true
+  },
+  {
+   "detail": "1 maintained rows, 1 evaluated rows",
+   "fingerprint": "1 rows, b589da8ba8768414",
+   "name": "inferred/rdfs-agents/answer",
+   "ok": true
+  },
+  {
+   "detail": "1 maintained rows, 1 evaluated rows",
+   "fingerprint": "1 rows, 9dd4293fb1e59b7b",
+   "name": "inferred/materialized-agents/answer",
+   "ok": true
+  },
+  {
+   "detail": "1000 maintained rows, 1000 evaluated rows",
+   "fingerprint": "1000 rows, 1ec2c8871f8297d3",
+   "name": "inferred/materialized-team-sizes/answer",
+   "ok": true
+  },
+  {
+   "detail": "1000 maintained rows, 1000 evaluated rows",
+   "fingerprint": "1000 rows, 1a7a411e11d6b169",
+   "name": "pass/team-sizes/answer",
+   "ok": true
+  },
+  {
+   "detail": "1000 maintained rows, 1000 evaluated rows",
+   "fingerprint": "1000 rows, 15cdb2498b2815ee",
+   "name": "pass/team-ages/answer",
+   "ok": true
+  },
+  {
+   "detail": "0 maintained rows, 0 evaluated rows",
+   "fingerprint": "0 rows, 37295c0f2b0cfa2a",
+   "name": "pass/colleagues-known/answer",
+   "ok": true
+  },
+  {
+   "detail": "200000 maintained rows, 200000 evaluated rows",
+   "fingerprint": "200000 rows, c5b77eb66ff69f76",
+   "name": "pass/labelled/answer",
+   "ok": true
+  },
+  {
+   "detail": "1000 maintained rows, 1000 evaluated rows",
+   "fingerprint": "1000 rows, 9b10de43a256240b",
+   "name": "pass/teams/answer",
+   "ok": true
+  },
+  {
+   "detail": "the circuit applied commit 201 of 201",
+   "name": "breakdown/team-sizes/applied",
+   "ok": true
+  },
+  {
+   "detail": "columns [\"t\", \"n\"] against [\"t\", \"n\"], 1000 rows against 1000",
+   "fingerprint": "1000 rows, c6fc40075570f6a8",
+   "name": "breakdown/team-sizes/answer",
+   "ok": true
+  },
+  {
+   "detail": "the circuit applied commit 401 of 401",
+   "name": "breakdown/team-ages/applied",
+   "ok": true
+  },
+  {
+   "detail": "columns [\"t\", \"s\", \"m\"] against [\"t\", \"s\", \"m\"], 1000 rows against 1000",
+   "fingerprint": "1000 rows, a81d431ca18e9d1e",
+   "name": "breakdown/team-ages/answer",
+   "ok": true
+  },
+  {
+   "detail": "the circuit applied commit 601 of 601",
+   "name": "breakdown/colleagues-known/applied",
+   "ok": true
+  },
+  {
+   "detail": "columns [\"p\", \"q\"] against [\"p\", \"q\"], 0 rows against 0",
+   "fingerprint": "0 rows, 37295c0f2b0cfa2a",
+   "name": "breakdown/colleagues-known/answer",
+   "ok": true
+  },
+  {
+   "detail": "the circuit applied commit 801 of 801",
+   "name": "breakdown/labelled/applied",
+   "ok": true
+  },
+  {
+   "detail": "columns [\"p\", \"l\"] against [\"p\", \"l\"], 200004 rows against 200004",
+   "fingerprint": "200004 rows, 1e3dadab70ee1137",
+   "name": "breakdown/labelled/answer",
+   "ok": true
+  },
+  {
+   "detail": "the circuit applied commit 1001 of 1001",
+   "name": "breakdown/teams/applied",
+   "ok": true
+  },
+  {
+   "detail": "columns [\"t\"] against [\"t\"], 1000 rows against 1000",
+   "fingerprint": "1000 rows, 9b10de43a256240b",
+   "name": "breakdown/teams/answer",
+   "ok": true
+  },
+  {
+   "detail": "200000 people",
+   "fingerprint": "4734e739ca501272",
+   "name": "workload",
+   "ok": true
+  }
+ ],
+ "gate": "incr",
+ "gate_record": 1,
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "forge"
+ },
+ "kind": "gate-record",
+ "manifest": {
+  "binary_sha256": "33656d5f23f25bd2e096b9c7defb8b61b0e768ec6b5a40f74e11d8d9439a8385",
+  "build_config": "{\"Cargo.toml\":{\"release\":{\"codegen-units\":4,\"debug\":1,\"lto\":\"thin\",\"package\":{\"sparkles-core\":{\"codegen-units\":1}}}},\"cargo\":\"test --release -p sparkles-core --test incr_bench\",\"env\":{\"CARGO_INCREMENTAL\":\"0\"},\"mbx_policy\":\"d8bf0b48d620f6bf62929d3db32bd253653505cdb33a5bd1efed1e79aaca05b4\",\"profile\":\"release\"}",
+  "commit": "64391e7f",
+  "compilers": "GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+  "dirty_files": "0",
+  "ended": "2026-11-01T08:56:14Z",
+  "host_load_before": "0.64 1.53 2.09",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "started": "2026-11-01T08:53:00Z"
+ },
+ "metrics": [
+  {
+   "better": "lower",
+   "key": "commits/0-views/median",
+   "range": [
+    0.27983,
+    1.698661
+   ],
+   "samples": [
+    0.27983,
+    1.602996,
+    1.591671,
+    1.698661,
+    1.600082
+   ],
+   "unit": "ms",
+   "value": 1.600082
+  },
+  {
+   "better": "lower",
+   "key": "commits/0-views/p99",
+   "range": [
+    0.43071800000000005,
+    3.3752259999999996
+   ],
+   "samples": [
+    0.43071800000000005,
+    1.819552,
+    1.873692,
+    3.3752259999999996,
+    1.771366
+   ],
+   "unit": "ms",
+   "value": 1.819552
+  },
+  {
+   "better": "higher",
+   "key": "commits/0-views/rate",
+   "range": [
+    623.7799731169857,
+    3451.14675800214
+   ],
+   "samples": [
+    3451.14675800214,
+    743.042830534281,
+    887.502217557416,
+    623.7799731169857,
+    752.3468967717142
+   ],
+   "unit": "commits/s",
+   "value": 752.3468967717142
+  },
+  {
+   "better": "lower",
+   "key": "commits/0-views/catch-up",
+   "range": [
+    0.000808,
+    0.001135
+   ],
+   "samples": [
+    0.001054,
+    0.0009080000000000001,
+    0.000834,
+    0.001135,
+    0.000808
+   ],
+   "unit": "ms",
+   "value": 0.0009080000000000001
+  },
+  {
+   "better": "lower",
+   "key": "commits/10-views/median",
+   "range": [
+    0.231244,
+    1.606469
+   ],
+   "samples": [
+    0.231244,
+    1.5992009999999999,
+    0.233026,
+    1.606469,
+    1.593737
+   ],
+   "unit": "ms",
+   "value": 1.593737
+  },
+  {
+   "better": "lower",
+   "key": "commits/10-views/p99",
+   "range": [
+    0.314556,
+    2.945462
+   ],
+   "samples": [
+    0.314556,
+    1.828594,
+    1.9071470000000001,
+    2.945462,
+    1.870219
+   ],
+   "unit": "ms",
+   "value": 1.870219
+  },
+  {
+   "better": "higher",
+   "key": "commits/10-views/rate",
+   "range": [
+    603.5593516732148,
+    4189.454155180231
+   ],
+   "samples": [
+    4189.454155180231,
+    718.9581604617159,
+    1599.145585468899,
+    603.5593516732148,
+    709.9760367645614
+   ],
+   "unit": "commits/s",
+   "value": 718.9581604617159
+  },
+  {
+   "better": "lower",
+   "key": "commits/10-views/catch-up",
+   "range": [
+    1.0470110000000001,
+    115.064855
+   ],
+   "samples": [
+    115.064855,
+    1.0688920000000002,
+    1.0470110000000001,
+    1.0588170000000001,
+    1.068853
+   ],
+   "unit": "ms",
+   "value": 1.068853
+  },
+  {
+   "better": "lower",
+   "key": "commits/100-views/median",
+   "range": [
+    0.22961499999999999,
+    1.6356199999999999
+   ],
+   "samples": [
+    0.22961499999999999,
+    1.6356199999999999,
+    1.5653119999999998,
+    1.59436,
+    1.58216
+   ],
+   "unit": "ms",
+   "value": 1.58216
+  },
+  {
+   "better": "lower",
+   "key": "commits/100-views/p99",
+   "range": [
+    0.408907,
+    3.233558
+   ],
+   "samples": [
+    0.408907,
+    1.891102,
+    1.8112169999999999,
+    3.233558,
+    1.8783910000000001
+   ],
+   "unit": "ms",
+   "value": 1.8783910000000001
+  },
+  {
+   "better": "higher",
+   "key": "commits/100-views/rate",
+   "range": [
+    597.4110192221142,
+    3987.076449878422
+   ],
+   "samples": [
+    3987.076449878422,
+    597.4110192221142,
+    779.7745948856054,
+    601.3321552971825,
+    730.532636718499
+   ],
+   "unit": "commits/s",
+   "value": 730.532636718499
+  },
+  {
+   "better": "lower",
+   "key": "commits/100-views/catch-up",
+   "range": [
+    2007.318091,
+    4813.788449000001
+   ],
+   "samples": [
+    4813.788449000001,
+    2007.318091,
+    2634.3799099999997,
+    2342.8988139999997,
+    2498.9395139999997
+   ],
+   "unit": "ms",
+   "value": 2498.9395139999997
+  },
+  {
+   "better": "lower",
+   "key": "commit-path/no-views/median",
+   "range": [
+    0.27808299999999997,
+    1.631265
+   ],
+   "samples": [
+    0.27808299999999997,
+    1.631265,
+    1.59556,
+    1.6025939999999999,
+    1.591808
+   ],
+   "unit": "ms",
+   "value": 1.59556
+  },
+  {
+   "better": "lower",
+   "key": "commit-path/no-views/p99",
+   "range": [
+    0.39252200000000004,
+    2.027035
+   ],
+   "samples": [
+    0.39252200000000004,
+    2.027035,
+    1.83002,
+    1.849187,
+    1.873695
+   ],
+   "unit": "ms",
+   "value": 1.849187
+  },
+  {
+   "better": "higher",
+   "key": "commit-path/no-views/rate",
+   "range": [
+    578.4785892739982,
+    3522.610188770234
+   ],
+   "samples": [
+    3522.610188770234,
+    578.4785892739982,
+    761.9734743988575,
+    760.5863579383629,
+    761.649603194495
+   ],
+   "unit": "commits/s",
+   "value": 761.649603194495
+  },
+  {
+   "better": "lower",
+   "key": "commit-path/live-query/median",
+   "range": [
+    0.28593599999999997,
+    1.613845
+   ],
+   "samples": [
+    0.28593599999999997,
+    1.613845,
+    0.30257100000000003,
+    0.28673000000000004,
+    1.6128939999999998
+   ],
+   "unit": "ms",
+   "value": 0.30257100000000003
+  },
+  {
+   "better": "lower",
+   "key": "commit-path/live-query/p99",
+   "range": [
+    0.431523,
+    1.870937
+   ],
+   "samples": [
+    0.431523,
+    1.870937,
+    1.77329,
+    1.7548279999999998,
+    1.850722
+   ],
+   "unit": "ms",
+   "value": 1.77329
+  },
+  {
+   "better": "higher",
+   "key": "commit-path/live-query/rate",
+   "range": [
+    613.966795779702,
+    3389.833063297913
+   ],
+   "samples": [
+    3389.833063297913,
+    613.966795779702,
+    1087.1511552770294,
+    1894.8031263076807,
+    749.0509892873341
+   ],
+   "unit": "commits/s",
+   "value": 1087.1511552770294
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-team-sizes/query",
+   "range": [
+    17.669501,
+    18.176012
+   ],
+   "samples": [
+    17.790654999999997,
+    17.669501,
+    18.176012,
+    18.068132000000002,
+    17.886871
+   ],
+   "unit": "ms",
+   "value": 17.886871
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-team-sizes/round-median",
+   "range": [
+    17.08622,
+    17.501861
+   ],
+   "samples": [
+    17.14355,
+    17.452853,
+    17.08622,
+    17.495687,
+    17.501861
+   ],
+   "unit": "ms",
+   "value": 17.452853
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-team-sizes/round-p95",
+   "range": [
+    17.31983,
+    18.080746
+   ],
+   "samples": [
+    17.52992,
+    17.614521,
+    17.31983,
+    17.753579,
+    18.080746
+   ],
+   "unit": "ms",
+   "value": 17.614521
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-team-sizes/unrelated-commit",
+   "range": [
+    0.030802,
+    0.031673
+   ],
+   "samples": [
+    0.031191,
+    0.031627,
+    0.031673,
+    0.031552,
+    0.030802
+   ],
+   "unit": "ms",
+   "value": 0.031552
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-agents/query",
+   "range": [
+    6.208829,
+    6.392968
+   ],
+   "samples": [
+    6.392968,
+    6.248373,
+    6.2757000000000005,
+    6.230215,
+    6.208829
+   ],
+   "unit": "ms",
+   "value": 6.248373
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-agents/round-median",
+   "range": [
+    6.204519,
+    6.384571
+   ],
+   "samples": [
+    6.360616,
+    6.204519,
+    6.384571,
+    6.233099,
+    6.299278999999999
+   ],
+   "unit": "ms",
+   "value": 6.299278999999999
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-agents/round-p95",
+   "range": [
+    6.3351809999999995,
+    6.509229
+   ],
+   "samples": [
+    6.494111999999999,
+    6.3351809999999995,
+    6.509229,
+    6.372627,
+    6.400779
+   ],
+   "unit": "ms",
+   "value": 6.400779
+  },
+  {
+   "better": "lower",
+   "key": "inferred/rdfs-agents/unrelated-commit",
+   "range": [
+    0.039964,
+    0.041086
+   ],
+   "samples": [
+    0.041086,
+    0.039964,
+    0.040655000000000004,
+    0.040587000000000005,
+    0.04009
+   ],
+   "unit": "ms",
+   "value": 0.040587000000000005
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-agents/query",
+   "range": [
+    3.7297480000000003,
+    3.868712
+   ],
+   "samples": [
+    3.868712,
+    3.7297480000000003,
+    3.863406,
+    3.7489120000000002,
+    3.823939
+   ],
+   "unit": "ms",
+   "value": 3.823939
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-agents/round-median",
+   "range": [
+    0.005469,
+    0.005621
+   ],
+   "samples": [
+    0.005469,
+    0.005563,
+    0.005490999999999999,
+    0.005588,
+    0.005621
+   ],
+   "unit": "ms",
+   "value": 0.005563
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-agents/round-p95",
+   "range": [
+    3.799718,
+    3.896643
+   ],
+   "samples": [
+    3.799718,
+    3.833832,
+    3.81791,
+    3.799741,
+    3.896643
+   ],
+   "unit": "ms",
+   "value": 3.81791
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-agents/unrelated-commit",
+   "range": [
+    0.010876,
+    0.0112
+   ],
+   "samples": [
+    0.0112,
+    0.011177,
+    0.01097,
+    0.010876,
+    0.011035
+   ],
+   "unit": "ms",
+   "value": 0.011035
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-team-sizes/query",
+   "range": [
+    1.9552850000000002,
+    1.9622789999999999
+   ],
+   "samples": [
+    1.9552850000000002,
+    1.956195,
+    1.96042,
+    1.9622789999999999,
+    1.9599729999999997
+   ],
+   "unit": "ms",
+   "value": 1.9599729999999997
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-team-sizes/round-median",
+   "range": [
+    2.084743,
+    2.0967249999999997
+   ],
+   "samples": [
+    2.084743,
+    2.088454,
+    2.0967249999999997,
+    2.089319,
+    2.0890169999999997
+   ],
+   "unit": "ms",
+   "value": 2.0890169999999997
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-team-sizes/round-p95",
+   "range": [
+    2.106179,
+    2.1305
+   ],
+   "samples": [
+    2.106179,
+    2.107882,
+    2.1305,
+    2.113017,
+    2.110302
+   ],
+   "unit": "ms",
+   "value": 2.110302
+  },
+  {
+   "better": "lower",
+   "key": "inferred/materialized-team-sizes/unrelated-commit",
+   "range": [
+    0.010714,
+    0.010936
+   ],
+   "samples": [
+    0.010714,
+    0.010888,
+    0.010749,
+    0.010936,
+    0.010921
+   ],
+   "unit": "ms",
+   "value": 0.010888
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-sizes/build",
+   "range": [
+    50.123497,
+    50.381840999999994
+   ],
+   "samples": [
+    50.272287999999996,
+    50.271095,
+    50.381840999999994,
+    50.123497,
+    50.317514
+   ],
+   "unit": "ms",
+   "value": 50.272287999999996
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-sizes/query",
+   "range": [
+    0.247425,
+    0.6446740000000001
+   ],
+   "samples": [
+    0.350945,
+    0.49422,
+    0.247425,
+    0.389058,
+    0.6446740000000001
+   ],
+   "unit": "ms",
+   "value": 0.389058
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-sizes/pass-median",
+   "range": [
+    0.012931,
+    0.022909
+   ],
+   "samples": [
+    0.012955999999999999,
+    0.02285,
+    0.012931,
+    0.013043,
+    0.022909
+   ],
+   "unit": "ms",
+   "value": 0.013043
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-sizes/pass-p95",
+   "range": [
+    0.020558,
+    0.034217000000000004
+   ],
+   "samples": [
+    0.022758,
+    0.034217000000000004,
+    0.020613,
+    0.020558,
+    0.033772
+   ],
+   "unit": "ms",
+   "value": 0.022758
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-sizes/state",
+   "range": [
+    0.1678466796875,
+    0.1678466796875
+   ],
+   "samples": [
+    0.1678466796875,
+    0.1678466796875,
+    0.1678466796875,
+    0.1678466796875,
+    0.1678466796875
+   ],
+   "unit": "MiB",
+   "value": 0.1678466796875
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-ages/build",
+   "range": [
+    60.836957,
+    67.866708
+   ],
+   "samples": [
+    67.18423,
+    67.866708,
+    60.836957,
+    60.875048,
+    62.221498
+   ],
+   "unit": "ms",
+   "value": 62.221498
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-ages/query",
+   "range": [
+    4.626974,
+    4.787565
+   ],
+   "samples": [
+    4.787565,
+    4.626974,
+    4.757199,
+    4.782273,
+    4.6565199999999995
+   ],
+   "unit": "ms",
+   "value": 4.757199
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-ages/pass-median",
+   "range": [
+    0.022934,
+    0.023777999999999997
+   ],
+   "samples": [
+    0.022934,
+    0.023777999999999997,
+    0.023443,
+    0.023542,
+    0.023693000000000002
+   ],
+   "unit": "ms",
+   "value": 0.023542
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-ages/pass-p95",
+   "range": [
+    0.035686999999999997,
+    0.036552
+   ],
+   "samples": [
+    0.035906,
+    0.035805000000000003,
+    0.036067,
+    0.036552,
+    0.035686999999999997
+   ],
+   "unit": "ms",
+   "value": 0.035906
+  },
+  {
+   "better": "lower",
+   "key": "pass/team-ages/state",
+   "range": [
+    0.3787841796875,
+    0.3787841796875
+   ],
+   "samples": [
+    0.3787841796875,
+    0.3787841796875,
+    0.3787841796875,
+    0.3787841796875,
+    0.3787841796875
+   ],
+   "unit": "MiB",
+   "value": 0.3787841796875
+  },
+  {
+   "better": "lower",
+   "key": "pass/colleagues-known/build",
+   "range": [
+    12.309254000000001,
+    16.068651
+   ],
+   "samples": [
+    13.223027,
+    12.309254000000001,
+    12.717111,
+    16.068651,
+    15.776074000000001
+   ],
+   "unit": "ms",
+   "value": 13.223027
+  },
+  {
+   "better": "lower",
+   "key": "pass/colleagues-known/query",
+   "range": [
+    9.446893,
+    12.584089
+   ],
+   "samples": [
+    9.446893,
+    9.526094,
+    9.514051,
+    12.584089,
+    11.042926
+   ],
+   "unit": "ms",
+   "value": 9.526094
+  },
+  {
+   "better": "lower",
+   "key": "pass/colleagues-known/pass-median",
+   "range": [
+    0.192003,
+    0.21075
+   ],
+   "samples": [
+    0.19505799999999998,
+    0.21075,
+    0.198117,
+    0.192003,
+    0.196099
+   ],
+   "unit": "ms",
+   "value": 0.196099
+  },
+  {
+   "better": "lower",
+   "key": "pass/colleagues-known/pass-p95",
+   "range": [
+    0.278279,
+    0.328886
+   ],
+   "samples": [
+    0.278279,
+    0.295778,
+    0.284727,
+    0.328886,
+    0.2821
+   ],
+   "unit": "ms",
+   "value": 0.284727
+  },
+  {
+   "better": "lower",
+   "key": "pass/colleagues-known/state",
+   "range": [
+    0.0,
+    0.0
+   ],
+   "samples": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "unit": "MiB",
+   "value": 0.0
+  },
+  {
+   "better": "lower",
+   "key": "pass/labelled/build",
+   "range": [
+    67.581812,
+    97.812042
+   ],
+   "samples": [
+    67.581812,
+    89.286606,
+    92.596216,
+    82.026664,
+    97.812042
+   ],
+   "unit": "ms",
+   "value": 89.286606
+  },
+  {
+   "better": "lower",
+   "key": "pass/labelled/query",
+   "range": [
+    1.759678,
+    1.935908
+   ],
+   "samples": [
+    1.759678,
+    1.935908,
+    1.879631,
+    1.777052,
+    1.819223
+   ],
+   "unit": "ms",
+   "value": 1.819223
+  },
+  {
+   "better": "lower",
+   "key": "pass/labelled/pass-median",
+   "range": [
+    0.010633,
+    0.011973000000000001
+   ],
+   "samples": [
+    0.010633,
+    0.010738,
+    0.011365,
+    0.010787,
+    0.011973000000000001
+   ],
+   "unit": "ms",
+   "value": 0.010787
+  },
+  {
+   "better": "lower",
+   "key": "pass/labelled/pass-p95",
+   "range": [
+    0.018414999999999997,
+    0.023946000000000002
+   ],
+   "samples": [
+    0.018414999999999997,
+    0.022178,
+    0.020897,
+    0.021475,
+    0.023946000000000002
+   ],
+   "unit": "ms",
+   "value": 0.021475
+  },
+  {
+   "better": "lower",
+   "key": "pass/labelled/state",
+   "range": [
+    22.9339599609375,
+    22.9339599609375
+   ],
+   "samples": [
+    22.9339599609375,
+    22.9339599609375,
+    22.9339599609375,
+    22.9339599609375,
+    22.9339599609375
+   ],
+   "unit": "MiB",
+   "value": 22.9339599609375
+  },
+  {
+   "better": "lower",
+   "key": "pass/teams/build",
+   "range": [
+    20.598444,
+    22.627778000000003
+   ],
+   "samples": [
+    20.764943000000002,
+    22.113889,
+    20.598444,
+    22.627778000000003,
+    22.334633999999998
+   ],
+   "unit": "ms",
+   "value": 22.113889
+  },
+  {
+   "better": "lower",
+   "key": "pass/teams/query",
+   "range": [
+    0.640531,
+    0.653752
+   ],
+   "samples": [
+    0.640531,
+    0.642031,
+    0.6471969999999999,
+    0.642097,
+    0.653752
+   ],
+   "unit": "ms",
+   "value": 0.642097
+  },
+  {
+   "better": "lower",
+   "key": "pass/teams/pass-median",
+   "range": [
+    0.007491,
+    0.007757
+   ],
+   "samples": [
+    0.007696000000000001,
+    0.007535,
+    0.007606,
+    0.007757,
+    0.007491
+   ],
+   "unit": "ms",
+   "value": 0.007606
+  },
+  {
+   "better": "lower",
+   "key": "pass/teams/pass-p95",
+   "range": [
+    0.015875999999999998,
+    0.016333
+   ],
+   "samples": [
+    0.015875999999999998,
+    0.016333,
+    0.016055,
+    0.016022,
+    0.015931
+   ],
+   "unit": "ms",
+   "value": 0.016022
+  },
+  {
+   "better": "lower",
+   "key": "pass/teams/state",
+   "range": [
+    0.091552734375,
+    0.091552734375
+   ],
+   "samples": [
+    0.091552734375,
+    0.091552734375,
+    0.091552734375,
+    0.091552734375,
+    0.091552734375
+   ],
+   "unit": "MiB",
+   "value": 0.091552734375
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/team-sizes/read",
+   "range": [
+    0.446,
+    0.45699999999999996
+   ],
+   "samples": [
+    0.45699999999999996,
+    0.446,
+    0.45499999999999996,
+    0.452,
+    0.448
+   ],
+   "unit": "\u00b5s",
+   "value": 0.452
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/team-sizes/old",
+   "range": [
+    5.251,
+    5.57
+   ],
+   "samples": [
+    5.55,
+    5.359,
+    5.442,
+    5.57,
+    5.251
+   ],
+   "unit": "\u00b5s",
+   "value": 5.442
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/team-sizes/advance",
+   "range": [
+    4.109,
+    4.423
+   ],
+   "samples": [
+    4.423,
+    4.109,
+    4.284,
+    4.2379999999999995,
+    4.402
+   ],
+   "unit": "\u00b5s",
+   "value": 4.284
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/team-ages/read",
+   "range": [
+    0.5489999999999999,
+    0.56
+   ],
+   "samples": [
+    0.557,
+    0.56,
+    0.5489999999999999,
+    0.557,
+    0.551
+   ],
+   "unit": "\u00b5s",
+   "value": 0.557
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/team-ages/old",
+   "range": [
+    5.442,
+    5.773
+   ],
+   "samples": [
+    5.718999999999999,
+    5.442,
+    5.527,
+    5.602,
+    5.773
+   ],
+   "unit": "\u00b5s",
+   "value": 5.602
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/team-ages/advance",
+   "range": [
+    6.968999999999999,
+    7.174
+   ],
+   "samples": [
+    7.174,
+    7.107,
+    7.085,
+    7.029999999999999,
+    6.968999999999999
+   ],
+   "unit": "\u00b5s",
+   "value": 7.085
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/colleagues-known/read",
+   "range": [
+    0.882,
+    0.984
+   ],
+   "samples": [
+    0.916,
+    0.9730000000000001,
+    0.882,
+    0.984,
+    0.904
+   ],
+   "unit": "\u00b5s",
+   "value": 0.916
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/colleagues-known/old",
+   "range": [
+    6.888,
+    7.119
+   ],
+   "samples": [
+    6.888,
+    7.119,
+    6.9079999999999995,
+    7.085,
+    6.9
+   ],
+   "unit": "\u00b5s",
+   "value": 6.9079999999999995
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/colleagues-known/advance",
+   "range": [
+    190.709,
+    195.56799999999998
+   ],
+   "samples": [
+    192.28900000000002,
+    192.361,
+    192.788,
+    195.56799999999998,
+    190.709
+   ],
+   "unit": "\u00b5s",
+   "value": 192.361
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/labelled/read",
+   "range": [
+    0.664,
+    0.7180000000000001
+   ],
+   "samples": [
+    0.703,
+    0.664,
+    0.692,
+    0.7180000000000001,
+    0.684
+   ],
+   "unit": "\u00b5s",
+   "value": 0.692
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/labelled/old",
+   "range": [
+    6.008,
+    6.7410000000000005
+   ],
+   "samples": [
+    6.019,
+    6.01,
+    6.7410000000000005,
+    6.115,
+    6.008
+   ],
+   "unit": "\u00b5s",
+   "value": 6.019
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/labelled/advance",
+   "range": [
+    4.458,
+    4.695
+   ],
+   "samples": [
+    4.695,
+    4.648000000000001,
+    4.458,
+    4.541,
+    4.615
+   ],
+   "unit": "\u00b5s",
+   "value": 4.615
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/teams/read",
+   "range": [
+    0.756,
+    0.7759999999999999
+   ],
+   "samples": [
+    0.76,
+    0.773,
+    0.756,
+    0.77,
+    0.7759999999999999
+   ],
+   "unit": "\u00b5s",
+   "value": 0.77
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/teams/old",
+   "range": [
+    6.313000000000001,
+    6.869
+   ],
+   "samples": [
+    6.696999999999999,
+    6.869,
+    6.313000000000001,
+    6.606999999999999,
+    6.769
+   ],
+   "unit": "\u00b5s",
+   "value": 6.696999999999999
+  },
+  {
+   "better": "lower",
+   "key": "breakdown/teams/advance",
+   "range": [
+    3.3009999999999997,
+    3.455
+   ],
+   "samples": [
+    3.3770000000000002,
+    3.455,
+    3.3009999999999997,
+    3.4,
+    3.395
+   ],
+   "unit": "\u00b5s",
+   "value": 3.395
+  }
+ ],
+ "scale": "200000 people",
+ "settings": {
+  "harness": "crates/sparkles-core/tests/incr_bench.rs",
+  "load": "0.64 1.53 2.09",
+  "people": "200000",
+  "processes": 5,
+  "threads": "12",
+  "threshold": 0.1
+ },
+ "suite": "incremental-views"
+}

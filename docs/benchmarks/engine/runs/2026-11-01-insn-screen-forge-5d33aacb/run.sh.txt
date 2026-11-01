@@ -1,0 +1,17 @@
+# Run on forge alone under ~/lanes/.bench.lock and ~/lanes/.heavy.lock. S is a clean export
+# of commit 5d33aacb and B holds the test binary built from it on forge inside `nix develop`:
+#   nix develop -c mbx sparkles-task -- mbx test --release -p sparkles-core --test insn_screen --no-run
+#   python3 scripts/bench-gate.py build-config --cargo 'test --release -p sparkles-core --test insn_screen'
+# common holds --manifest commit=5d33aacb, dirty_files=0 and the rustc version.
+# `mise run bench:insn` runs the same processes and record step.
+  insn)
+    out=$R/insn; mkdir -p "$out"; started=$(date -u +%FT%TZ); files=()
+    for i in 1 2 3 4 5; do
+      INSN_SCREEN_JSON=$out/metrics-$i.jsonl "$B/insn_screen" --ignored --nocapture --test-threads 1 > "$out/output-$i.md" 2>&1
+      files+=("$out/metrics-$i.jsonl")
+    done
+    python3 "$S/scripts/bench-gate.py" metrics "${files[@]}" --gate insn-screen --suite insn-screen \
+      --scale "20000 items, 2000 commits" --threshold 0 --out "$out/record.json" --binary "$B/insn_screen" "${common[@]}" --manifest build_config="$(cat "$B/build-config-insn.json")" \
+      --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest host_load_before="$load" \
+      --setting items=20000 --setting commits=2000 --setting reps=5 --setting harness=crates/sparkles-core/tests/insn_screen.rs
+    ;;

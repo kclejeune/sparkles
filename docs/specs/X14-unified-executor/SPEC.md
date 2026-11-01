@@ -148,7 +148,7 @@ The short-term half of the shared commit publish tail belongs to this stage as i
   0.3 ms is slower on an Intel host. This is the decision gate of the executor merge, and
   every stage that changes an executor path meets it.
 * The eager-against-cursor differential tests pass before either copy of a kernel is
-  deleted, and the forge-pinned matrix of item 469 shows no regression for the 33
+  deleted, and the forge-pinned matrix of item 469 shows no regression for the 31
   synthetic queries at 1.05M and 10.5M triples with 12 threads and with one.
 * The W3C suites pass with `execution=streaming` as well as with the default, which item
   470 makes part of the gate.
@@ -413,6 +413,6 @@ of server time was 0.984 of the base, and no query of 0.3 ms or more was 5% or m
 `distinct-obj`, which runs in about 0.008 ms, read 1.130, and a rerun of it with
 `count-all` and `path-plus` in 12 rounds read 1.155, 1.059 and 1.037. Server time covers
 the execution of the plan, which none of the items changes for these queries, so item
-524 measures `distinct-obj` on an Intel host. Building the options of a request
+Item 524 measures `distinct-obj` on an Intel host. Building the options of a request
 through the caller context and the query request builder adds a few moves of the options
 and one reference count, outside the measured time.
