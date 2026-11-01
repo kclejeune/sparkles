@@ -192,6 +192,37 @@ const VIEWS: &[(&str, &str)] = &[
     ("teams", "SELECT DISTINCT ?t WHERE { ?p :memberOf ?t }"),
 ];
 
+/// The workload's version, which a change to the commits a test makes bumps, so that a
+/// comparison with an older baseline fails.
+const WORKLOAD: &str = "incr_bench v1";
+
+/// A check whose fingerprint covers the data, the views and the workload's version, so
+/// that a comparison with a baseline of another workload fails even when every view
+/// matches its query.
+#[test]
+#[ignore]
+fn workload() {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let views: Vec<&str> = VIEWS.iter().flat_map(|(n, q)| [*n, *q]).collect();
+    for p in [data(people()).as_str(), &views.join("\n"), WORKLOAD] {
+        for b in p.bytes().chain([0]) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let Some(path) = std::env::var_os("INCR_BENCH_JSON") else {
+        return;
+    };
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    let line = serde_json::json!({ "check": "workload", "ok": true,
+        "fingerprint": format!("{h:016x}"), "detail": format!("{} people", people()) });
+    writeln!(f, "{line}").unwrap();
+}
+
 /// §11: a one- or two-quad commit's pass against evaluating the query again.
 #[test]
 #[ignore]

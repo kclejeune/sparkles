@@ -723,8 +723,13 @@ def native_digest(args):
     if r.get("queryType") == "ASK":
         print(f"ask {r.get('boolean')}")
         return
+    if any(len(row) != len(names) for row in r.get("rows") or []):
+        print("rows wider or narrower than vars")
+        return
     rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
-    out = [f"{len(rows)} rows", hashlib.sha256("\n".join(sorted(rows)).encode()).hexdigest()[:16]]
+    # the query type and the projected variables, in order, belong to the answer
+    head = f"{r.get('queryType')} " + " ".join(names)
+    out = [f"{len(rows)} rows", hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()[:16]]
     if ba._after_order_by(query) is not None:
         keys = ba.order_keys(query, set(names))
         h = hashlib.sha256()

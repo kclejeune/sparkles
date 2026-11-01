@@ -283,24 +283,18 @@ fn clock_ticks() -> u64 {
     (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64
 }
 
-/// User and system clock ticks of this process's threads other than the calling one.
+/// User and system clock ticks of this process's threads other than the calling one,
+/// including threads that have exited: the process's total, which keeps the time of
+/// joined threads, less the calling thread's own.
 fn other_thread_ticks() -> u64 {
-    // SAFETY: gettid has no preconditions.
-    let me = unsafe { libc::gettid() }.to_string();
-    let mut total = 0;
-    for e in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
-        if e.file_name().to_string_lossy() == me {
-            continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
-            continue;
-        };
+    fn ticks(path: &str) -> u64 {
+        let stat = std::fs::read_to_string(path).unwrap();
         // the fields after the command, which is in parentheses
         let rest = &stat[stat.rfind(')').unwrap() + 2..];
         let f: Vec<&str> = rest.split(' ').collect();
-        total += f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap();
+        f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
     }
-    total
+    ticks("/proc/self/stat") - ticks("/proc/thread-self/stat")
 }
 
 /// Count `f` `reps` times and check that every run returned `expected`, which the caller
@@ -587,6 +581,42 @@ fn opens(c: &counter::Instructions, src: &Path, reps: usize, want: &Content) -> 
     o
 }
 
+/// The `i`th of the commits that WAL replay reads.
+fn commit(i: usize, items: usize) -> String {
+    let p = "PREFIX ex: <http://example.org/> ";
+    match i % 4 {
+        // new terms
+        0 | 1 => format!("{p}INSERT DATA {{ ex:new{i} ex:label \"new item {i}\" ; ex:size {i} }}"),
+        // known terms
+        2 => format!(
+            "{p}INSERT DATA {{ ex:item{} ex:link ex:item{} }}",
+            i % items,
+            (i * 7) % items
+        ),
+        _ => format!(
+            "{p}DELETE DATA {{ ex:item{} ex:size {} }}",
+            i % items,
+            (i % items) * 7
+        ),
+    }
+}
+
+/// FNV-1a over `parts`, each followed by a zero byte.
+fn fnv(parts: &[&str]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for p in parts {
+        for b in p.bytes().chain([0]) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The cases' parameters beyond the data and the commits, which a change to the screen
+/// bumps so that a comparison with an older baseline fails.
+const CASES: &str = "vocab: open, for-each, get-sorted every 7th, get-random 50000, find every 13th, \
+                     missing, prefix 12 bytes of every 130th; wal: open, open with commits, replay; v1";
+
 fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize) {
     let commits = env("INSN_SCREEN_COMMITS", 2000);
     let base = tempfile::tempdir().unwrap();
@@ -607,26 +637,8 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
     copy_dir(&base_dir, &changed_dir);
     let s = Store::open(&changed_dir, StoreOptions::default()).unwrap();
     let o = QueryOptions::default();
-    let p = "PREFIX ex: <http://example.org/> ";
     for i in 0..commits {
-        let u = match i % 4 {
-            // new terms
-            0 | 1 => {
-                format!("{p}INSERT DATA {{ ex:new{i} ex:label \"new item {i}\" ; ex:size {i} }}")
-            }
-            // known terms
-            2 => format!(
-                "{p}INSERT DATA {{ ex:item{} ex:link ex:item{} }}",
-                i % items,
-                (i * 7) % items
-            ),
-            _ => format!(
-                "{p}DELETE DATA {{ ex:item{} ex:size {} }}",
-                i % items,
-                (i % items) * 7
-            ),
-        };
-        update(&s, &u, &o).unwrap();
+        update(&s, &commit(i, items), &o).unwrap();
     }
     let after = content(&s);
     drop(s);
@@ -674,6 +686,23 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
     out.case(&format!("wal/replay-{commits}-commits"), diff, 0, coverage);
 }
 
+/// The other-thread guard sees a worker that ran and was joined while a case ran.
+#[test]
+fn joined_threads_count_as_other_threads() {
+    let before = other_thread_ticks();
+    std::thread::spawn(|| {
+        let t = std::time::Instant::now();
+        let mut x = 0u64;
+        while t.elapsed() < std::time::Duration::from_millis(300) {
+            x = std::hint::black_box(x.wrapping_add(1));
+        }
+    })
+    .join()
+    .unwrap();
+    let ticks = other_thread_ticks() - before;
+    assert!(ticks * 1000 / clock_ticks() >= 100, "{ticks} ticks");
+}
+
 #[test]
 #[ignore]
 fn instruction_counts() {
@@ -686,6 +715,15 @@ fn instruction_counts() {
     let reps = env("INSN_SCREEN_REPS", 5);
     let items = env("INSN_SCREEN_ITEMS", 20_000);
     let mut out = Out::new();
+    // the workload, so that a comparison with a baseline of other data, commits or cases
+    // fails even when every result check holds
+    let commits = env("INSN_SCREEN_COMMITS", 2000);
+    let all: String = (0..commits).map(|i| commit(i, items)).collect();
+    let digest = fnv(&[&data(items), &all, CASES]);
+    out.line(serde_json::json!({
+        "check": "workload", "ok": true, "fingerprint": format!("{digest:016x}"),
+        "detail": format!("{items} items, {commits} commits"),
+    }));
     vocab_cases(&mut out, &c, reps, items);
     wal_cases(&mut out, &c, reps, items);
 }

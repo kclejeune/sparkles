@@ -450,6 +450,14 @@ class GateTests(unittest.TestCase):
             good = native([("a", "x"), ("b", "y")])
             self.assertTrue(good.startswith("2 rows, "))
             self.assertNotEqual(good, native([("b", "y"), ("a", "x")]))
+            f = Path(d) / "resp.json"
+            body = json.loads(f.read_text())
+            body["vars"] = ["p", "other"]
+            f.write_text(json.dumps(body))
+            self.assertNotEqual(run("native-digest", q, f).stdout.split(", ")[1], good.split(", ")[1])
+            body["vars"] = ["p"]
+            f.write_text(json.dumps(body))
+            self.assertFalse(run("native-digest", q, f).stdout.startswith("2 rows"))
             out = Path(d) / "record.json"
             res.joinpath("warm-answers.tsv").write_text(f"1\tA\tsorted\t{good}\n2\tB\tsorted\t{good}\n")
             self.assertEqual(run("executors", root, "--out", out).returncode, 0)
