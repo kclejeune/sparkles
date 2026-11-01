@@ -629,14 +629,22 @@ never stops protecting a graph. A graph leaves protection only through
 `sparkles::evidence::detach` or `POST /$/evidence/{ds}/detach`, which keeps it in its
 role, and the next configuration protects it again. The registry change uses
 `Store::enable_managed_at`, which refuses a revision other than the one the
-configuration read, so concurrent configurations and detaches never undo each other.
+configuration read, and a detach uses `Store::detach_managed_at` in the same way, so
+concurrent configurations and detaches never undo each other. Status and mutation
+answers come from one `Store::managed_snapshot` or from the registry the mutation
+committed. A detach first checks that this build reads the recorded settings and
+otherwise changes nothing. A configuration interrupted between `evidence.json` and
+`managed.json` refuses every write until the next configuration, which is checked
+against the protection `managed.json` records and repairs the registry.
 All three routes need `admin`. A `format` or `profile` other than 1 answers
 `409 unsupported-profile`.
 
 Tests cover canonical goldens computed independently, policy reference and dedication
 rules, duplicate policy names, refusal of weakening, detach and protection again,
 stale revisions, persistent reopen, a later settings profile that refuses every write,
-concurrent configuration and detach, and the HTTP routes.
+unreadable recorded settings, repair after an interrupted configuration, concurrent
+configuration and detach, coherent status reads during configuration, and the HTTP
+routes.
 
 #### Settings decisions
 

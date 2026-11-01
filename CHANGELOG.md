@@ -31,8 +31,10 @@ Administrators record a dataset's evidence settings with `GET` and `PUT
 `projections` roles and named review `policies` to `sourceRecords` and `proposals`.
 Enabled settings make every role graph a managed graph of the evidence owner, so
 ordinary writes to it are refused, and a configuration never stops protecting a graph.
-`Store::enable_managed_at` changes the managed-graph registry only at an expected
-revision, and `Store::managed_settings` returns an owner's recorded settings.
+`Store::enable_managed_at` and `Store::detach_managed_at` change the managed-graph
+registry only at an expected revision. `Store::managed_snapshot` returns the registry
+and its owners' settings from one load, and `Store::managed_settings` returns one
+owner's recorded settings.
 
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
 node in both shortest modes, run Dijkstra's algorithm from both ends. Weighted path

@@ -11853,7 +11853,10 @@ dataset reader to 6, and the file holds the canonical bytes with sorted sets and
 A configuration never weakens protection. Settings that would leave a protected graph
 without a role, or disable the profile while it protects a graph, are a `409` that
 writes nothing. A configuration that races with another change of the registry is also
-a `409` that writes nothing, and the client reads the settings again. Disabled settings
+a `409` that writes nothing, and the client reads the settings again. A configuration
+interrupted between `evidence.json` and `managed.json` leaves every write refused with
+`503 managed-unavailable`, and the next `PUT` repairs it after checking its body against
+the protection that `managed.json` records. Disabled settings
 of a dataset that was never configured are a `400` unless they equal the defaults,
 which write nothing.
 
@@ -11861,7 +11864,8 @@ which write nothing.
 one graph, which ordinary writes can then change. The settings keep the graph in its
 roles, and the next `PUT` protects it again. Protecting a graph does not authenticate
 what it already holds or what was written while it was detached. A graph that the
-profile does not protect is a `404`. A registry that this build cannot enforce answers
+profile does not protect is a `404`. A detach refuses with `503 managed-unavailable`
+and changes nothing when this build cannot read the recorded settings. A registry that this build cannot enforce answers
 `503 managed-unavailable` on all three routes.
 
 ### Suggested examples
