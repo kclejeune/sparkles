@@ -4589,7 +4589,8 @@ open once, so caches stay warm across the questions as they do in a running serv
 and each keeps its own deadline, token budget and query memory budget. A line that is
 invalid or fails gets its own error result while the rest go on. A line's
 `modelSecrets`, as `NAME=SOURCE` strings, replace the `--model-secret` of the same name
-for that question.
+for that question. The question still counts against the provider's concurrency,
+request spacing and daily token limits that every other line shares.
 
 Each query of an Ask runs under a memory budget of 2048 MiB, as in `sparkles mcp`, and
 `--query-memory-mb N` changes it, with `0` for no budget. On a database of more than ten

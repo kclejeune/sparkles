@@ -341,6 +341,62 @@ fn daily_budget_and_cost() {
     assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 30);
 }
 
+/// A view with other secrets shares the provider's daily budget and concurrency slots,
+/// so a request through either counts against the same limits.
+#[test]
+fn a_secret_view_shares_provider_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::write(&a, "key-a").unwrap();
+    std::fs::write(&b, "key-b").unwrap();
+    let mock = MockModel::start(|r, _| {
+        if r.header("authorization") == Some("Bearer key-b") {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        (200, mock::openai(r#"{"query":"ASK {}"}"#))
+    });
+    let fa = format!("file:{}", a.display());
+    let m = models(
+        json!({ "o": {
+            "kind": "openai", "endpoint": mock.url(), "apiKey": {"secret": "k"},
+            "concurrency": 1, "budget": {"tokensPerDay": 60}
+        } }),
+        &[("k", fa.as_str())],
+    );
+    let view = m.with_secrets(
+        [(
+            "k".to_string(),
+            format!("file:{}", b.display()).parse().unwrap(),
+        )]
+        .into(),
+    );
+    // the view's slow request holds the one slot, so a request through the base
+    // waits for it instead of running beside it
+    std::thread::scope(|s| {
+        let slow = s.spawn(|| call(&view, "o"));
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        assert!(call(&m, "o").is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(slow.join().unwrap().is_ok());
+    });
+    // each of the two answers counts 15 tokens in the one shared count
+    assert_eq!(m.describe()["providers"][0]["budget"]["usedToday"], 30);
+    assert_eq!(view.describe()["providers"][0]["budget"]["usedToday"], 30);
+    let keys: Vec<_> = mock
+        .requests()
+        .iter()
+        .filter_map(|r| r.header("authorization").map(str::to_string))
+        .collect();
+    assert!(
+        keys.contains(&"Bearer key-a".to_string()) && keys.contains(&"Bearer key-b".to_string())
+    );
+    // the budget both spent stops further requests through either
+    let more = (0..10).take_while(|_| call(&view, "o").is_ok()).count();
+    assert!(more < 10);
+    assert_eq!(call(&m, "o").unwrap_err().error.code(), "budget-exceeded");
+}
+
 /// An Anthropic answer that reports cache writes and reads is charged each class at its
 /// price: in the step's record and cost, in the provider's daily budget, and in the
 /// budget tokens of its JSON. Counting only `input_tokens` would count 10 of the

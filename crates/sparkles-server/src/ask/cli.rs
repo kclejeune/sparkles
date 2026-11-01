@@ -167,15 +167,7 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
                     .with_context(|| format!("--questions {}", file.display()))?,
             ))
         };
-        let policy = args.outbound.local_policy()?;
-        // a line's own secrets give it its own models, read from the same file
-        let line_models = |own: &[String]| -> Result<Arc<crate::models::Models>> {
-            let margs = crate::models::ModelArgs {
-                model_config: args.models.model_config.clone(),
-                model_secret: merged_secrets(&args.models.model_secret, own),
-            };
-            margs.load(policy.clone())?.context("no --model-config")
-        };
+        let line_models = |own: &[String]| line_view(&models, &args.models.model_secret, own);
         let mut stdout = std::io::stdout();
         return batch(
             input,
@@ -345,6 +337,19 @@ fn line_error(id: Value, code: &str, message: String) -> Value {
 }
 
 /// `base` with each NAME=SOURCE of `own` in place of the one with the same NAME.
+/// The models of a batch line that names its own secrets: a view of `models` with
+/// those secrets in place of the `--model-secret` flags of the same names. The view
+/// shares the providers' state, so the line's requests count against the same
+/// concurrency, spacing and daily token limits as every other line.
+fn line_view(
+    models: &crate::models::Models,
+    flags: &[String],
+    own: &[String],
+) -> Result<Arc<crate::models::Models>> {
+    let secrets = crate::models::parse_secrets(&merged_secrets(flags, own))?;
+    Ok(Arc::new(models.with_secrets(secrets)))
+}
+
 fn merged_secrets(base: &[String], own: &[String]) -> Vec<String> {
     let name = |s: &String| s.split_once('=').map_or(s.clone(), |(n, _)| n.to_string());
     let mut out: Vec<String> = base
@@ -589,9 +594,7 @@ mod tests {
         let s = server(ORG);
         let base_secret = vec![format!("k=file:{}", key.display())];
         let m = models(&mock.url(), &base_secret);
-        let line_models = |own: &[String]| -> Result<Arc<Models>> {
-            Ok(models(&mock.url(), &merged_secrets(&base_secret, own)))
-        };
+        let line_models = |own: &[String]| line_view(&m, &base_secret, own);
         let base = |_: &Models, q: String| opts(&q);
         let mut out = Vec::new();
         batch(

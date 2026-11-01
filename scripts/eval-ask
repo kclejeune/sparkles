@@ -18,6 +18,7 @@ import sys
 import collections
 import contextlib
 import queue
+import select
 import shutil
 import subprocess
 import tempfile
@@ -1034,12 +1035,19 @@ class Batch:
             stdout=subprocess.PIPE,
             stderr=self.stderr,
             start_new_session=True,
+            bufsize=0,
         )
+        # Lines are written unbuffered and without blocking, so a child that stops
+        # reading can neither stall a write past its deadline nor a close on a flush.
+        os.set_blocking(self.proc.stdin.fileno(), False)
         self.lines = queue.Queue()
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
         self.record = {"schema": 1, "argv": runner.wrap + argv, "pid": self.proc.pid}
         self.closed = False
+        # Set once the child can take no more lines: its input broke or it ended.
+        self.broken = False
+        self.taken = 0  # the lines it took
 
     def read(self):
         try:
@@ -1055,21 +1063,37 @@ class Batch:
             pass
         self.lines.put(("eof", None))
 
-    def send(self, obj):
-        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
-        self.proc.stdin.write(data)
-        self.proc.stdin.flush()
+    def send(self, obj, until):
+        """Write one line by monotonic time `until`. Raises BrokenPipeError when the
+        child's input is closed and TimeoutError when the child does not take the line
+        in time. A line cut off by either may have reached the child in part, so the
+        child is then no longer usable."""
+        data = memoryview((json.dumps(obj, ensure_ascii=False) + "\n").encode())
+        fd = self.proc.stdin.fileno()
+        while data:
+            try:
+                n = os.write(fd, data)
+            except BlockingIOError:
+                left = until - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("batch child does not read its input") from None
+                select.select([], [fd], [], left)
+                continue
+            data = data[n:]
+        self.taken += 1
 
-    def close(self, kill=False):
-        """End the child and its group, and return its record."""
+    def close(self, kill=False, wait=30):
+        """End the child and its group, and return its record. Without `kill` the
+        child gets up to `wait` seconds to exit after its input closes."""
         if self.closed:
             return self.record
         self.closed = True
+        self.broken = True
         with contextlib.suppress(OSError, ValueError):
             self.proc.stdin.close()
         if not kill:
             with contextlib.suppress(subprocess.TimeoutExpired):
-                self.proc.wait(timeout=30)
+                self.proc.wait(timeout=max(0, wait))
         for sig in (signal.SIGTERM, signal.SIGKILL):
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(self.proc.pid, sig)
@@ -1120,11 +1144,18 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
     ledger holds the case's projected cost before its line is sent. A case whose hold
     does not fit waits for the lines in flight and, with none, ends the run as the cap
     would. Reply lines are held per case and appended in question order. A clarified
-    case sends a second line with the chosen answer. When the child dies or a line
-    passes its deadline, the cases in flight fail as `killed` or `timeout` and a new
-    child asks the rest. `watch(q, answer)` sees each case in question order and
-    returns True to stop the run. The finished cases also go to `results` as they
-    finish, so a caller keeps them when the run ends with an error.
+    case sends a second line with the chosen answer.
+
+    A line the child's input does not take, because the input broke or the child
+    stopped reading, goes to the next child, while the lines the child did take are
+    still read to its end. When the child ends or the oldest line passes its deadline,
+    the lines in flight that got no result fail as `killed` or `timeout`, and a new
+    child asks the rest. Every wait, write and proxy drain is bounded by the phase
+    deadline, and passing it ends the run with a HarnessFault. `watch(q, answer)` sees
+    each case in question order and returns True to stop the run. The finished cases
+    also go to `results` as they finish, and when the run ends with an error every
+    case that finished out of order is appended as well, so a caller keeps every paid
+    answer.
     """
     results = [] if results is None else results
     bound = getattr(admit, "case_bound", None)
@@ -1135,9 +1166,17 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
     tokens.mkdir(mode=0o700, exist_ok=True)
     cases = []  # dicts in question order, for the cases that were sent
     flight = collections.deque()  # (case dict, round, sent at) in the order sent
-    stopped, finished, batch, batches = False, 0, None, 0
+    pending = collections.deque()  # (case dict, round, clarification) not yet taken
+    stopped, finished, batch, batches, restarts = False, 0, None, 0, 0
     limit = runner.args.deadline + QUERY_GRACE_SECONDS + BATCH_SLACK_SECONDS
     i = 0
+
+    def phase_left():
+        return runner.deadline - time.monotonic()
+
+    def phase_expired():
+        batch.close(kill=True)
+        raise HarnessFault("phase deadline expired") from None
 
     def start():
         nonlocal batch, batches
@@ -1149,32 +1188,44 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
         report.setdefault("batches", []).append(batch.record)
 
     def send(c, rnd, clarification=None):
+        if batch.broken:
+            pending.append((c, rnd, clarification))
+            return
         line = {"id": f"{c['case']}#{rnd}", "question": c["q"]["question"]}
         if clarification is not None:
             line["clarification"] = clarification
         if c["token"]:
             line["modelSecrets"] = [f"evalgate=file:{c['tokenFile']}"]
-        for attempt in (1, 2):
-            try:
-                batch.send(line)
-                break
-            except OSError:
-                # The child ended before this line reached it: the lines in flight
-                # fail as a dead child's do, and a new child gets this one.
-                fail_flight("killed")
-                finalize()
-                if attempt == 2:
-                    raise HarnessFault("batch child ended twice in a row") from None
-                start()
-        flight.append((c, rnd, time.monotonic()))
+        now = time.monotonic()
+        until = min(flight[0][2] + limit if flight else now + limit, runner.deadline)
+        try:
+            batch.send(line, until)
+        except TimeoutError:
+            if phase_left() <= 0:
+                phase_expired()
+            # The child stopped reading, so it can take no line: this one goes to the
+            # next child and the lines in flight time out.
+            pending.append((c, rnd, clarification))
+            fail_flight("timeout")
+            return
+        except OSError:
+            # The child's input closed before this line reached it: the next child
+            # gets it, and this child's results for the lines it took are still read.
+            batch.broken = True
+            pending.append((c, rnd, clarification))
+            return
+        flight.append((c, rnd, now))
 
     def done(c, answer):
-        c["answer"] = answer
         if proxy:
-            proxy.wait_idle(case=c["case"])
+            # A request the line left running settles before the case's cost is read,
+            # within the time the phase has left.
+            if not proxy.wait_idle(timeout=max(0, phase_left()), case=c["case"]):
+                phase_expired()
             answer["ledgerNanodollars"] = proxy.case_cost(c["case"])
             proxy.close_case(c["token"])
             ledger.release(c["case"])
+        c["answer"] = answer
         with contextlib.suppress(OSError):
             c["tokenFile"].unlink()
 
@@ -1193,6 +1244,7 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
             out["evalFailure"] = "budget_refused" if refused else status
             out["wallSeconds"] = wall
             done(c, out)
+        finalize()
 
     def finalize():
         nonlocal finished, stopped
@@ -1205,11 +1257,26 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
                 stopped = True
             finished += 1
 
+    def restart():
+        # A new child for the lines a broken one did not take and the cases left. A
+        # child that takes no line before it breaks again ends the run.
+        nonlocal restarts
+        restarts = 0 if batch.taken else restarts + 1
+        if restarts >= 2:
+            raise HarnessFault("batch child ended twice in a row")
+        batch.close(kill=True)
+        start()
+        for _ in range(len(pending)):
+            send(*pending.popleft())
+
     try:
         start()
         while True:
             runner.check()
-            while not stopped and i < len(qs) and len(flight) < jobs:
+            if batch.broken and not flight and (pending or (i < len(qs) and not stopped)):
+                restart()
+                continue
+            while not stopped and not batch.broken and i < len(qs) and len(flight) < jobs:
                 q = qs[i]
                 case_id = case_of(pair, q)
                 held = True
@@ -1232,28 +1299,24 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
                 report["attemptedCases"].append(
                     {"case": case_id, "pair": pair, "id": q["id"]}
                 )
-                send(c, 1)
                 i += 1
+                send(c, 1)
             if not flight:
+                if batch.broken and (pending or (i < len(qs) and not stopped)):
+                    continue
                 break
-            head_sent = flight[0][2]
-            until = min(head_sent + limit, runner.deadline)
+            until = min(flight[0][2] + limit, runner.deadline)
             try:
                 kind, raw = batch.lines.get(timeout=max(0.1, until - time.monotonic()))
             except queue.Empty:
-                if time.monotonic() >= runner.deadline:
-                    batch.close(kill=True)
-                    raise HarnessFault("phase deadline expired") from None
+                if phase_left() <= 0:
+                    phase_expired()
                 fail_flight("timeout")
-                finalize()
-                if i < len(qs) and not stopped:
-                    start()
                 continue
             if kind != "line":
+                # The reader queues every result line before the end, so the lines
+                # still in flight got none.
                 fail_flight("killed")
-                finalize()
-                if i < len(qs) and not stopped:
-                    start()
                 continue
             c, rnd, sent = flight.popleft()
             try:
@@ -1297,7 +1360,7 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
             )
             done(c, out)
             finalize()
-        record = batch.close()
+        record = batch.close(wait=min(30, phase_left()))
         if record["returncode"] != 0 and not cases[finished:]:
             # Every line was answered, so a failed exit after them is reported only.
             report.setdefault("batchExitStatus", []).append(record["returncode"])
@@ -1310,6 +1373,8 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
     except BaseException:
         if batch:
             batch.close(kill=True)
+        # The cases that finished behind one still in flight go to the caller too.
+        results.extend((c["q"], c["case"], c["answer"]) for c in cases[finished:] if "answer" in c)
         raise
     finally:
         if proxy:

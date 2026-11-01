@@ -170,7 +170,8 @@ line, in input order. `--jobs N` runs up to N questions at once on the shared st
 Every other flag applies to each question, and each question keeps its own deadline,
 token budget and query memory budget. A line that is invalid, fails or panics gets its
 own error result while the rest go on. A line's `modelSecrets` replace the
-`--model-secret` of the same name for that question.
+`--model-secret` of the same name for that question. The question still counts against the provider's concurrency,
+request spacing and daily token limits that every other line shares.
 
 `scripts/eval-ask-anthropic` asks each phase's cases through one such child, run in its
 own systemd user scope with 16G of memory and no swap. `--no-batch` asks each case in

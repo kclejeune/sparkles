@@ -1366,6 +1366,8 @@ for raw in sys.stdin:
         os.kill(os.getpid(), signal.SIGKILL)
     if mode == f"hang-at:{n}":
         time.sleep(600)
+    if mode == "no-read":
+        time.sleep(600)
     token = None
     for s in line.get("modelSecrets", []):
         name, src = s.split("=", 1)
@@ -1378,6 +1380,16 @@ for raw in sys.stdin:
     else:
         out.update(outcome="answered", result={"query": "ASK {}", "explanation": json.dumps(
             [line.get("clarification"), token])})
+    if mode == "take-two-then-close" and n == 2:
+        # Both results stay queued for the runner after the input is gone.
+        os.close(0)
+        print(json.dumps(first), flush=True)
+        print(json.dumps(out), flush=True)
+        time.sleep(0.3)
+        sys.exit(0)
+    if mode == "take-two-then-close" and n == 1:
+        first = out
+        continue
     if mode == "close-before-answer":
         os.close(0)  # the runner's next write then fails with a broken pipe
         print(json.dumps(out), flush=True)
@@ -1592,6 +1604,74 @@ class BatchCases(unittest.TestCase):
             )
         self.assertLess(time.monotonic() - started, 30)
         self.assertEqual([q["id"] for q, _, _ in results], ["q0"])
+
+    def test_cases_finished_behind_a_pending_clarification_are_kept(self):
+        runner = self.runner("hang-at:4", deadline=300)
+        runner.deadline = time.monotonic() + 1.5
+        qs = self.qs(3)  # q1 clarifies, so its second line is line 4 and hangs
+        results = []
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, None, "p", qs, 3, lambda pair, qs: True, self.report(),
+                lambda q, a: False, results,
+            )
+        self.assertEqual(sorted(q["id"] for q, _, _ in results), ["q0", "q2"])
+
+    def test_results_a_dead_child_queued_are_read_before_its_lines_fail(self):
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(4))]
+        out, report = self.run_batch(self.runner("take-two-then-close"), qs, jobs=2)
+        self.assertEqual([q["id"] for q, _, _ in out], [q["id"] for q in qs])
+        self.assertEqual([a.get("evalFailure") for _, _, a in out], [None] * 4)
+        self.assertEqual(len(report["batches"]), 2)
+
+    def test_writes_to_a_child_that_does_not_read_end_at_the_phase_deadline(self):
+        runner = self.runner("no-read", deadline=300)
+        runner.deadline = time.monotonic() + 1
+        qs = [dict(q, question="x" * 1990) for q in self.qs(64)]
+        started = time.monotonic()
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, None, "p", qs, 64, lambda pair, qs: True, self.report(),
+                lambda q, a: False, [],
+            )
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_proxy_draining_is_bounded_by_the_phase_deadline(self):
+        class Proxy:
+            ledger = type("L", (), {"hold": lambda *a: True, "release": lambda *a: None})()
+            ordered_replies = False
+            waits = []
+
+            def open_case(self, case):
+                return None
+
+            def close_case(self, token):
+                pass
+
+            def flush_replies(self, case):
+                pass
+
+            def wait_idle(self, timeout=None, case=None):
+                self.waits.append(timeout)
+                return False  # a request of the case is still running
+
+            def case_cost(self, case):
+                raise AssertionError("an unsettled case cost is read")
+
+            def refusals_for(self, case):
+                return 0
+
+        runner = self.runner("normal", deadline=300)
+        runner.deadline = time.monotonic() + 2
+        results = []
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, Proxy(), "p", self.qs(1), 1, lambda pair, qs: True, self.report(),
+                lambda q, a: False, results,
+            )
+        self.assertEqual(len(Proxy.waits), 1)
+        self.assertLessEqual(Proxy.waits[0], 2)
+        self.assertEqual(results, [])
 
     def test_a_broken_pipe_sends_the_line_to_a_new_child(self):
         qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]
