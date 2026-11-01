@@ -215,3 +215,63 @@ fn edits_are_offered_with_updates_only() {
         assert!(edit.input["properties"].get(k).is_some(), "{k}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provenance_refuses_a_conflicting_declaration_of_the_same_edit() {
+    let server = writable(McpConfig {
+        allow_update: true,
+        ..McpConfig::default()
+    });
+    let mut c = Client::start(server);
+    let (_, e) = c
+        .error(
+            "ontology_axioms",
+            json!({"add": ["Declaration(ObjectProperty(<http://www.w3.org/ns/prov#wasGeneratedBy>))"]}),
+        )
+        .await;
+    assert_eq!(e["code"], "provenance-conflict", "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listings_keep_to_the_byte_budget() {
+    let long = "x".repeat(3000);
+    let data = format!(
+        "{ONTO}\nex:Professor rdfs:comment \"{long}\" .\nex:Course rdfs:comment \"{long}\" ."
+    );
+    let cfg = McpConfig {
+        max_bytes: 4096,
+        ..McpConfig::default()
+    };
+    let mut c = Client::start(server_with(&[("t", &[data.as_str()])], cfg));
+    let out = c
+        .structured("ontology_axioms", json!({"type": "AnnotationAssertion"}))
+        .await;
+    assert_eq!(out["total"], 2, "{out}");
+    assert_eq!(out["axioms"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["next"], 1, "{out}");
+    let cfg = McpConfig {
+        max_bytes: 1024,
+        ..McpConfig::default()
+    };
+    let mut c = Client::start(server_with(&[("t", &[data.as_str()])], cfg));
+    let (_, e) = c
+        .error("ontology_axioms", json!({"type": "AnnotationAssertion"}))
+        .await;
+    assert_eq!(e["code"], "budget-result-bytes", "{e}");
+}
+
+#[test]
+fn edits_are_admitted_as_writes() {
+    use super::super::branches::call_writes;
+    assert!(call_writes("ontology_axioms", Some(&json!({"add": ["x"]}))));
+    assert!(call_writes(
+        "ontology_axioms",
+        Some(&json!({"remove": ["x"]}))
+    ));
+    assert!(!call_writes(
+        "ontology_axioms",
+        Some(&json!({"add": [], "type": "SubClassOf"}))
+    ));
+    assert!(!call_writes("ontology_axioms", None));
+    assert!(call_writes("sparql_update", None));
+}

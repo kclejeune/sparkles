@@ -1227,6 +1227,30 @@ pub struct OntologyDiff {
 }
 
 impl Ontologies {
+    /// The graphs a read of `req` at `snap` covers through the caller's view: the
+    /// requested graphs and the imports that resolve to graphs it may read, without
+    /// reading their terminology.
+    fn graphs_at(
+        &self,
+        snap: &Arc<Snapshot>,
+        req: &OntologyRequest,
+        opts: &QueryOptions,
+    ) -> Result<Vec<GraphRef>> {
+        let access = opts.graphs.as_ref().map(|a| a.bound(snap));
+        let view = match &access {
+            Some(a) => a.masked(snap)?,
+            None => snap.clone(),
+        };
+        let readable = |g: Id| access.as_ref().is_none_or(|a| a.readable_id(snap, g));
+        let inputs = Inputs {
+            data_graphs: req.graphs(),
+            ontology_graphs: Vec::new(),
+            imports: req.imports,
+            location_mapping: Default::default(),
+        };
+        Ok(sparkles_reasoner::inputs::resolve_readable(&view, &inputs, &readable).graphs)
+    }
+
     /// The axioms that differ between the states `from` and `to` of the ontology `req`
     /// names (its `at` is ignored), as the caller of `opts` may read them. The
     /// terminology of each state is read as [`open`](Self::open) reads it and the two
@@ -1250,21 +1274,37 @@ impl Ontologies {
             cancel: opts.cancel.clone(),
             deadline: opts.deadline,
         };
+        // both selectors resolve once, and the triple diff reads those two commits, so a
+        // commit that lands meanwhile does not mix into the answer
         let (a, _) = store.snapshot_at(from, &hist)?;
         let (b, _) = store.snapshot_at(to, &hist)?;
+        let mut req = req.clone();
+        req.at = None;
+        // the graphs a read of either state covers: the requested ones and their imports
+        let mut covered: Vec<GraphRef> = self.graphs_at(&a, &req, &opts)?;
+        for g in self.graphs_at(&b, &req, &opts)? {
+            if !covered.contains(&g) {
+                covered.push(g);
+            }
+        }
+        let graph_name = |g: &GraphRef| match g {
+            GraphRef::Default => oxrdf::GraphName::DefaultGraph,
+            GraphRef::Named(n) => oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(n)),
+        };
         let triples = store.diff(
-            from,
-            to,
+            &At::Commit(a.commit),
+            &At::Commit(b.commit),
             &crate::store::DiffOptions {
                 max_quads: DIFF_MAX_QUADS,
                 cancel: opts.cancel.clone(),
                 deadline: opts.deadline,
                 graphs: opts.graphs.clone(),
+                // one graph is selected in the store's diff, which then holds only its
+                // changes; several are filtered below
+                graph: (covered.len() == 1).then(|| graph_name(&covered[0])),
                 ..Default::default()
             },
         )?;
-        let mut req = req.clone();
-        req.at = None;
         let mut out = OntologyDiff {
             from: a.commit,
             to: b.commit,
@@ -1273,7 +1313,6 @@ impl Ontologies {
             changed_quads: 0,
             method: triples.method,
         };
-        // the graphs a read of either state covers: the requested ones and their imports
         let graphs_of =
             |snap: &Arc<Snapshot>| -> Result<Opened> { self.open_at(snap, &req, &opts) };
         let changed_in = |o: &Opened, g: &oxrdf::GraphName| {
@@ -1283,18 +1322,17 @@ impl Ontologies {
                 _ => false,
             })
         };
-        if triples.is_empty() {
+        let names: Vec<oxrdf::GraphName> = covered.iter().map(graph_name).collect();
+        out.changed_quads = triples
+            .iter()
+            .filter(|(_, q)| names.contains(&q.graph_name))
+            .count() as u64;
+        // nothing changed in the graphs read: neither state is opened
+        if out.changed_quads == 0 {
             return Ok(out);
         }
         let oa = graphs_of(&a)?;
         let ob = graphs_of(&b)?;
-        out.changed_quads = triples
-            .iter()
-            .filter(|(_, q)| changed_in(&oa, &q.graph_name) || changed_in(&ob, &q.graph_name))
-            .count() as u64;
-        if out.changed_quads == 0 {
-            return Ok(out);
-        }
         check(&opts)?;
         let graph = |o: &Opened, ax: &Axiom| -> String {
             o.ontology
@@ -1418,11 +1456,16 @@ fn holds_main(snap: &Snapshot, o: &Opened, plain: &Axiom) -> bool {
     let (Some(s), Some(p), Some(x)) = ids else {
         return false;
     };
-    o.inner
-        .graph_ids
-        .iter()
-        .flatten()
-        .any(|g| snap.contains(&[s, p, x, *g]).unwrap_or(false))
+    // an equality or inequality of two individuals is either triple's axiom
+    let symmetric = matches!(
+        plain.kind,
+        sparkles_owl::AxiomKind::SameIndividual(_)
+            | sparkles_owl::AxiomKind::DifferentIndividuals(_)
+    );
+    o.inner.graph_ids.iter().flatten().any(|g| {
+        snap.contains(&[s, p, x, *g]).unwrap_or(false)
+            || symmetric && snap.contains(&[x, p, s, *g]).unwrap_or(false)
+    })
 }
 
 /// The profiles of a list such as `el,ql`.

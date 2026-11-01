@@ -629,8 +629,11 @@ Annotation assertions on the activity give the principal, the start time, the me
 and the software agent. The activity is not typed `prov:Activity`, which would be a
 class assertion that reasoners materialize. The PROV-O properties are declared as
 annotation properties, and an ontology that types one of them as an object or data
-property, as PROV-O does, refuses provenance with `provenance-conflict` rather than
-leave OWL 2 DL. A removal is recorded only by the activity and the commit. Without
+property, as PROV-O does, or an edit that declares one so, refuses provenance with
+`provenance-conflict` rather than leave OWL 2 DL. The check reads the head before the
+edit takes the writer lock, so a declaration committed in between is not seen, and
+`ifHead` closes that gap. An edit is charged and scoped as a write when MCP admits it,
+and a listing stops at the result byte budget with `next` naming where to resume. A removal is recorded only by the activity and the commit. Without
 `--allow-update` the tool is read-only and its schema lists no edit arguments.
 
 **Diffs.** `Ontologies::diff` and `GET /$/ontology/{ds}/diff` combine the two readings
@@ -640,9 +643,12 @@ is structural and blank node labels of expressions do not matter. The assertions
 are never read eagerly, come from F06's diff of triples: each changed triple outside the
 terminology in a graph read is mapped as the assertion stream maps it. An annotated
 assertion that gains or loses its annotations keeps its triple, so the diff adds the
-plain assertion on the other side when the store still holds it. When no triple of the
-graphs read changed, neither state is opened. The store's diff is bounded at ten
-million changed quads. An in-memory dataset keeps only the states its snapshots and
+plain assertion on the other side when the store still holds it. Both selectors are
+resolved once, and the triple diff compares those two commits. The graphs each state
+covers are resolved first, without reading their terminology, and when no triple of
+them changed neither state is opened. The store's diff is bounded at ten million
+changed quads, counted in the one graph read when a diff reads one graph and in every
+readable graph otherwise. An in-memory dataset keeps only the states its snapshots and
 retention hold, and a diff of a state it no longer keeps fails as `at` does.
 
 **Testing.** The 78 functional-style ontologies of the W3C OWL 2 test cases all parse

@@ -267,11 +267,18 @@ impl Tools<'_> {
                 "startedAtTime",
                 "actedOnBehalfOf",
             ];
-            if let Some(clash) = used.iter().map(|l| prov(l)).find(|i| {
+            // the ontology's declarations and those the edit itself adds
+            let typed_otherwise = |i: &str| {
                 [EntityKind::ObjectProperty, EntityKind::DataProperty]
                     .iter()
                     .any(|k| o.ontology.typing.is_declared(i, *k))
-            }) {
+                    || add.iter().any(|ax| {
+                        matches!(&ax.kind, AxiomKind::Declaration(e)
+                            if e.iri().as_str() == i
+                                && matches!(e.kind(), EntityKind::ObjectProperty | EntityKind::DataProperty))
+                    })
+            };
+            if let Some(clash) = used.iter().map(|l| prov(l)).find(|i| typed_otherwise(i)) {
                 return Err(ToolError::new(
                     "provenance-conflict",
                     409,
@@ -392,6 +399,14 @@ impl Tools<'_> {
             Err(sparkles::Error::Invalid(m)) => {
                 return Err(ToolError::new("invalid-axiom", 400, m));
             }
+            // a caller limited to some graphs learns that the guard refused, not its results
+            Err(sparkles::Error::Rejected(_)) if restricted => {
+                return Err(ToolError::new(
+                    "validation-failed",
+                    422,
+                    "the edit does not conform to the dataset's validation guard; nothing was written",
+                ));
+            }
             Err(e) => return Err(ctx.engine(e)),
             Ok(e) => e,
         };
@@ -456,18 +471,38 @@ impl Tools<'_> {
             offset: a.offset.unwrap_or(0),
         };
         let page = axiom_page(&o, &q, &opts).map_err(|e| ctx.engine(e))?;
-        let next = page.offset + page.items.len();
-        let axioms: Vec<Value> = page
-            .items
-            .iter()
-            .map(|(ax, g)| {
-                let mut j = json!({ "type": ax.axiom_type().name(), "ofn": renderer.axiom(ax) });
-                if let Some(g) = g {
-                    j["graph"] = json!(o.graph_name(*g));
-                }
-                j
-            })
+        // the page stops before the axiom that would pass the result byte budget, and
+        // `next` resumes there; an axiom that alone passes it is a budget error
+        let budget = self.cfg().max_bytes;
+        let prefixes: Map<String, Value> = renderer
+            .prefixes()
+            .into_iter()
+            .map(|(p, n)| (p.to_string(), json!(n)))
             .collect();
+        let mut used = 512 + serde_json::to_vec(&prefixes).map_or(0, |v| v.len());
+        let mut axioms: Vec<Value> = Vec::with_capacity(page.items.len());
+        for (ax, g) in &page.items {
+            let mut j = json!({ "type": ax.axiom_type().name(), "ofn": renderer.axiom(ax) });
+            if let Some(g) = g {
+                j["graph"] = json!(o.graph_name(*g));
+            }
+            let size = serde_json::to_vec(&j).map_or(0, |v| v.len()) + 1;
+            if used + size > budget {
+                if axioms.is_empty() {
+                    return Err(ctx.engine(sparkles::Error::BudgetExceeded(
+                        sparkles::error::Budget {
+                            kind: sparkles::error::BudgetKind::ResultBytes,
+                            limit: budget as u64,
+                            requested: (used + size) as u64,
+                        },
+                    )));
+                }
+                break;
+            }
+            used += size;
+            axioms.push(j);
+        }
+        let next = page.offset + axioms.len();
         Ok(Outcome::Structured(json!({
             "dataset": ds.name,
             "commit": o.snapshot.commit,
@@ -476,7 +511,7 @@ impl Tools<'_> {
             "total": page.total,
             "offset": page.offset,
             "next": if next < page.total { json!(next) } else { Value::Null },
-            "prefixes": renderer.prefixes().into_iter().map(|(p, n)| (p.to_string(), json!(n))).collect::<Map<String, Value>>(),
+            "prefixes": prefixes,
         })))
     }
 }

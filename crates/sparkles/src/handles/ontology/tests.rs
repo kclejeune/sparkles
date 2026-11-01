@@ -996,3 +996,30 @@ fn diffs_only_what_the_caller_reads() {
     );
     assert!(d.removed.is_empty());
 }
+
+#[test]
+fn diffs_annotations_of_reversed_equalities() {
+    let (_dir, ds) = on_disk(&format!("{BASE} :b owl:sameAs :a ."));
+    let req = OntologyRequest::default();
+    let (c0, _k0) = head(&ds);
+    let plain: Axiom =
+        AxiomKind::SameIndividual([Individual::named(ex("a")), Individual::named(ex("b"))].into())
+            .into();
+    let noted = plain
+        .clone()
+        .annotated(sparkles_owl::Annotation::comment("same"));
+    ds.ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                add: vec![noted.clone()],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    let (c1, _k1) = head(&ds);
+    let d = ds.ontology().diff(&req, &c0, &c1, true, &opts()).unwrap();
+    assert_eq!(rendered(&d.added), [noted.to_string()], "{d:?}");
+    assert_eq!(rendered(&d.removed), [plain.to_string()], "{d:?}");
+}
