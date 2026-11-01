@@ -59,6 +59,18 @@ pub const DEFAULT_COMPLEXITY_THRESHOLD: u32 = 8;
 pub const DEFAULT_EXAMPLE_SCORE: f64 = 0.8;
 /// The most communities a local question's grounding names (C22 §7.3).
 const MAX_COMMUNITIES: usize = 3;
+/// The linked entities and matched classes whose predicate use grounding reads.
+const MAX_USAGE_ENTITIES: usize = 3;
+const MAX_USAGE_CLASSES: usize = 2;
+/// The predicates listed for an entity as subject and as object, and for a class.
+const USAGE_OUT: usize = 60;
+const USAGE_IN: usize = 20;
+const USAGE_CLASS: usize = 30;
+/// The incoming triples of an entity and the instances of a class that are sampled.
+const USAGE_SAMPLE_TRIPLES: usize = 5000;
+const USAGE_SAMPLE_INSTANCES: usize = 200;
+/// The longest one predicate-use query may run.
+const USAGE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most earlier turns a follow-up question carries (§5.1).
 pub const MAX_CONTEXT: usize = 5;
 /// Below this context window the grounding is trimmed (§3.6).
@@ -905,13 +917,14 @@ impl Asking<'_, '_> {
         let mut exact = false;
         let mentions = mentions(&self.o.question);
         let mut entities = Vec::new();
+        let mut link_prefixes = Value::Null;
         if !mentions.is_empty() {
             let list: Vec<Value> = mentions.iter().map(|m| json!({ "text": m })).collect();
             if let Ok(v) = self
                 .ground_tool(
                     profile::Stage::Linker,
                     "link_entities",
-                    json!({"mentions": list, "k": candidates_k, "evidence": true}),
+                    json!({"mentions": list, "k": candidates_k, "evidence": true, "popularity": true}),
                     true,
                 )
                 .or_else(|error| {
@@ -919,7 +932,7 @@ impl Asking<'_, '_> {
                         self.ground_tool(
                             profile::Stage::Linker,
                             "link_entities",
-                            json!({"mentions": list, "k": candidates_k}),
+                            json!({"mentions": list, "k": candidates_k, "popularity": true}),
                             true,
                         )
                     } else {
@@ -927,6 +940,7 @@ impl Asking<'_, '_> {
                     }
                 })
             {
+                link_prefixes = v["prefixes"].clone();
                 let ms = v["mentions"].as_array().cloned().unwrap_or_default();
                 let mut lines = String::new();
                 for m in &ms {
@@ -982,6 +996,43 @@ impl Asking<'_, '_> {
                     ctx.push_str("\nEntities that the question may name:\n");
                     ctx.push_str(&lines);
                 }
+            }
+        }
+        // The predicates that the linked entities and the instances of the question's
+        // classes use, from the data itself, so that a relation the question names in
+        // other words than the schema's labels still reaches the context.
+        if !small {
+            let words = crate::mcp::relevance::words(&self.o.question);
+            let mut iris: Vec<String> = Vec::new();
+            if let Some(a) = self
+                .o
+                .clarification
+                .as_deref()
+                .and_then(|a| grounding::answered_iri(a, &link_prefixes))
+            {
+                iris.push(a);
+            }
+            for e in &entities {
+                if matches!(e["verdict"].as_str(), Some("exact" | "ambiguous"))
+                    && let Some(i) = e["candidates"][0]["iri"].as_str()
+                {
+                    iris.push(grounding::expanded(i, &link_prefixes));
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            iris.retain(|i| seen.insert(i.clone()));
+            iris.truncate(MAX_USAGE_ENTITIES);
+            let classes = grounding::matched_classes(
+                &classes,
+                &words,
+                &schema["prefixes"],
+                MAX_USAGE_CLASSES,
+            );
+            let prefixes = schema["prefixes"].as_object().cloned().unwrap_or_default();
+            let section = self.predicate_use(&iris, &classes, &words, &prefixes);
+            if !section.is_empty() {
+                ctx.push_str(&section);
+                ground_event["predicateUse"] = json!({ "entities": iris, "classes": classes });
             }
         }
         // C22 §7.3: the communities of the linked entities, at most three
@@ -1040,6 +1091,85 @@ impl Asking<'_, '_> {
             best_example,
             exact,
         }
+    }
+
+    /// Lines naming the predicates each of `entities` uses as subject and as object, and
+    /// that a sample of the instances of each of `classes` uses, with their counts.
+    /// Each query is bounded, and one that fails or times out only leaves its line out.
+    fn predicate_use(
+        &self,
+        entities: &[String],
+        classes: &[String],
+        words: &std::collections::BTreeSet<String>,
+        prefixes: &Map<String, Value>,
+    ) -> String {
+        const SKIP: [&str; 5] = [
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://www.w3.org/2000/01/rdf-schema#label",
+            "http://www.w3.org/2002/07/owl#sameAs",
+            "http://www.w3.org/2004/02/skos/core#prefLabel",
+            "http://www.w3.org/2004/02/skos/core#altLabel",
+        ];
+        let run = |q: String| -> Option<Value> {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            let secs = left.min(USAGE_QUERY_TIMEOUT).as_secs_f64();
+            if secs < 0.5 {
+                return None;
+            }
+            self.ground_tool(
+                profile::Stage::PredicateUse,
+                "sparql_query",
+                json!({"query": q, "format": "json", "maxRows": 200, "timeoutSeconds": secs}),
+                false,
+            )
+            .ok()
+        };
+        let line = |subject: String, rows: &Value, max: usize| -> Option<String> {
+            let ranked = grounding::ranked_usage(rows, words, &SKIP, max);
+            (!ranked.is_empty())
+                .then(|| format!("{subject}: {}\n", grounding::grouped(&ranked, prefixes)))
+        };
+        let mut lines = String::new();
+        for e in entities {
+            let name = grounding::compact(e, prefixes);
+            let outgoing = format!(
+                "SELECT ?p (COUNT(*) AS ?n) WHERE {{ <{e}> ?p ?o }} GROUP BY ?p ORDER BY DESC(?n) LIMIT 200"
+            );
+            let incoming = format!(
+                "SELECT ?p (COUNT(*) AS ?n) WHERE {{ {{ SELECT ?p WHERE {{ ?s ?p <{e}> }} LIMIT {USAGE_SAMPLE_TRIPLES} }} }} GROUP BY ?p ORDER BY DESC(?n) LIMIT 200"
+            );
+            if let Some(l) =
+                run(outgoing).and_then(|v| line(format!("{name} as subject"), &v, USAGE_OUT))
+            {
+                lines.push_str(&l);
+            }
+            if let Some(l) =
+                run(incoming).and_then(|v| line(format!("{name} as object"), &v, USAGE_IN))
+            {
+                lines.push_str(&l);
+            }
+        }
+        for c in classes {
+            let name = grounding::compact(c, prefixes);
+            let q = format!(
+                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {{ SELECT ?s WHERE {{ ?s a <{c}> }} LIMIT {USAGE_SAMPLE_INSTANCES} }} ?s ?p ?o }} GROUP BY ?p ORDER BY DESC(?n) LIMIT 200"
+            );
+            if let Some(l) = run(q).and_then(|v| {
+                line(
+                    format!("Instances of {name}, a sample of up to {USAGE_SAMPLE_INSTANCES}, as subject"),
+                    &v,
+                    USAGE_CLASS,
+                )
+            }) {
+                lines.push_str(&l);
+            }
+        }
+        if lines.is_empty() {
+            return lines;
+        }
+        format!(
+            "\nPredicates that these entities and a sample of these classes' instances use, grouped by namespace, with how many triples or instances use each:\n{lines}"
+        )
     }
 
     /// Steps 3 to 7: draft, check, run, repair at most twice, then summarize, moving
@@ -1903,7 +2033,15 @@ fn mentions(q: &str) -> Vec<String> {
     let mut i = 0;
     while i < tokens.len() {
         let t = clean(tokens[i]);
-        if !capital(&t) || OPENERS.contains(&t.to_lowercase().as_str()) {
+        // A capitalized article inside the question starts a title, as in "Which
+        // museum exhibits The Scream?", so the mention keeps it.
+        let article = i > 0
+            && t == "The"
+            && tokens.get(i + 1).is_some_and(|n| {
+                let n = clean(n);
+                capital(&n) && !OPENERS.contains(&n.to_lowercase().as_str())
+            });
+        if !article && (!capital(&t) || OPENERS.contains(&t.to_lowercase().as_str())) {
             i += 1;
             continue;
         }
@@ -1913,7 +2051,9 @@ fn mentions(q: &str) -> Vec<String> {
         while j < tokens.len() && !ends(tokens[j - 1]) {
             let n = clean(tokens[j]);
             let lower = n.to_lowercase();
-            let name = capital(&n) && !OPENERS.contains(&lower.as_str());
+            // a number continues a name, as in "Apollo 11"
+            let name = (capital(&n) && !OPENERS.contains(&lower.as_str()))
+                || (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
             // a linking word joins two capitalized words, as in "Guido van Rossum"
             let link = LINKS.contains(&lower.as_str())
                 && j + 1 < tokens.len()

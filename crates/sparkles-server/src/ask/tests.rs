@@ -518,6 +518,13 @@ fn mentions_and_words() {
         ["Query Engine team", "Members of Query Engine", "Berlin"]
     );
     assert!(mentions("how many people are there?").is_empty());
+    assert_eq!(
+        mentions("Which museum exhibits The Scream by Munch?"),
+        ["The Scream", "Munch"]
+    );
+    assert_eq!(mentions("The Storage team?"), ["Storage"]);
+    assert_eq!(mentions("Who was on the Apollo 11 mission?"), ["Apollo 11"]);
+    assert_eq!(mentions("Who wrote the Storage guide?"), ["Storage"]);
     assert!(words("startDate of Teams").contains("team"));
     assert!(words("startDate").contains("date"));
 }

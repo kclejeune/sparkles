@@ -6,7 +6,8 @@ RUN_DIR is a run's output directory, which holds `replies.jsonl` and the set's
 `report.json` below it. For each answerable question it takes the last first-draft
 prompt Ask sent, after any clarification, and checks whether every schema term and
 every resource that the gold query names occurs in that prompt, by full IRI or by a
-prefixed name under the prompt's own prefix lines. The draft's own query and the
+prefixed name under the prompt's own prefix lines, or as a local name listed under its
+namespace. The draft's own query and the
 repair prompts never count. No model is called. A dry run with the fake provider
 gives the same prompts as a paid run, so the metric can be computed for free.
 
@@ -76,7 +77,20 @@ def drafts(replies_path):
     return out
 
 
-def present(term, text, prefixes):
+def grouped_terms(text):
+    """IRIs listed under a namespace, as in `<http://x/> a 3, b 1; p: c 2`."""
+    out = set()
+    prefixes = prompt_prefixes(text)
+    for head, body in re.findall(r"(<[^<>\s]+[/#]>|[A-Za-z][\w-]*:) ((?:[\w-]+ \d+(?:, )?)+)", text):
+        ns = head[1:-1] if head.startswith("<") else prefixes.get(head[:-1])
+        if ns:
+            out |= {ns + local for local in re.findall(r"([\w-]+) \d+", body)}
+    return out
+
+
+def present(term, text, prefixes, grouped=frozenset()):
+    if term in grouped:
+        return True
     if f"<{term}>" in text or re.search(r"(?<![\w:/])" + re.escape(term) + r"(?![\w%-])", text):
         return True
     for p, ns in prefixes.items():
@@ -113,8 +127,9 @@ def recall(qset, run_dir):
             continue
         text, tokens = prompts[-1]
         pre = prompt_prefixes(text)
-        miss_s = [t for t in schema if not present(t, text, pre)]
-        miss_r = [t for t in resources if not present(t, text, pre)]
+        grouped = grouped_terms(text)
+        miss_s = [t for t in schema if not present(t, text, pre, grouped)]
+        miss_r = [t for t in resources if not present(t, text, pre, grouped)]
         rows[c["id"]] = {
             "prompt": True,
             "promptChars": len(text),

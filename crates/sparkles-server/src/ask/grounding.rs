@@ -62,7 +62,7 @@ fn folded(text: &str) -> String {
         .to_lowercase()
 }
 
-fn expanded(iri: &str, prefixes: &Value) -> String {
+pub(super) fn expanded(iri: &str, prefixes: &Value) -> String {
     let iri = iri.trim_matches(['<', '>']);
     if let Some((prefix, local)) = iri.split_once(':')
         && let Some(namespace) = prefixes[prefix].as_str()
@@ -256,6 +256,177 @@ pub(super) fn preferred_display_candidate(
         }
     }
     Some(*index)
+}
+
+/// The compact form of `iri` under the longest matching namespace of `prefixes`, when
+/// its local part is a plain name, else the IRI in angle brackets.
+pub(super) fn compact(iri: &str, prefixes: &serde_json::Map<String, Value>) -> String {
+    let iri = iri.trim_matches(['<', '>']);
+    let best = prefixes
+        .iter()
+        .filter_map(|(p, ns)| Some((p, ns.as_str()?)))
+        .filter(|(_, ns)| !ns.is_empty() && iri.starts_with(ns) && iri.len() > ns.len())
+        .max_by_key(|(_, ns)| ns.len());
+    if let Some((p, ns)) = best {
+        let local = &iri[ns.len()..];
+        let plain = local
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            && local
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if plain {
+            return format!("{p}:{local}");
+        }
+    }
+    format!("<{iri}>")
+}
+
+/// `ranked` predicates with their counts, grouped by namespace in order of first
+/// appearance, as `<ns> local n, local n; prefix: local n`. A predicate whose local
+/// part is not a plain name keeps its full IRI in a group of its own.
+pub(super) fn grouped(
+    ranked: &[(String, u64)],
+    prefixes: &serde_json::Map<String, Value>,
+) -> String {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (iri, n) in ranked {
+        let short = compact(iri, prefixes);
+        let (head, item) = if let Some((p, local)) = short.split_once(':')
+            && !short.starts_with('<')
+        {
+            (format!("{p}:"), format!("{local} {n}"))
+        } else {
+            let cut = iri.rfind(['/', '#']).map_or(0, |i| i + 1);
+            let local = &iri[cut..];
+            let plain = !local.is_empty()
+                && local
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+            if plain && cut > 0 {
+                (format!("<{}>", &iri[..cut]), format!("{local} {n}"))
+            } else {
+                (String::new(), format!("<{iri}> {n}"))
+            }
+        };
+        match groups.iter_mut().find(|(h, _)| *h == head) {
+            Some((_, items)) => items.push(item),
+            None => groups.push((head, vec![item])),
+        }
+    }
+    groups
+        .iter()
+        .map(|(h, items)| {
+            if h.is_empty() {
+                items.join(", ")
+            } else {
+                format!("{h} {}", items.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// An IRI from a term string of a compact query result, such as `<http://x>` or a
+/// prefixed name under the result's `prefixes`.
+pub(super) fn result_iri(cell: &Value, prefixes: &Value) -> Option<String> {
+    let s = cell.as_str()?;
+    if let Some(inner) = s.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+        return (!inner.is_empty()).then(|| inner.to_string());
+    }
+    let (p, local) = s.split_once(':')?;
+    let ns = prefixes[p].as_str()?;
+    (!s.starts_with('"')).then(|| format!("{ns}{local}"))
+}
+
+/// An integer from a term string of a compact query result, such as `"12"^^xsd:integer`.
+pub(super) fn result_count(cell: &Value) -> Option<u64> {
+    let s = cell.as_str()?;
+    let lexical = s
+        .strip_prefix('"')
+        .and_then(|t| t.split_once('"').map(|(v, _)| v))
+        .unwrap_or(s);
+    lexical.parse().ok()
+}
+
+/// The predicates of one usage query result, as `(predicate IRI, count)`, ranked by
+/// how many question words their local name shares and then by count, without the ones
+/// every context lists anyway, at most `max`.
+pub(super) fn ranked_usage(
+    result: &Value,
+    question: &std::collections::BTreeSet<String>,
+    skip: &[&str],
+    max: usize,
+) -> Vec<(String, u64)> {
+    let mut found: Vec<(usize, u64, String)> = result["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let iri = result_iri(row.get(0)?, &result["prefixes"])?;
+            let n = result_count(row.get(1)?)?;
+            (!skip.contains(&iri.as_str())).then(|| {
+                let score = crate::mcp::relevance::entry_score(&iri, std::iter::empty(), question);
+                (score, n, iri)
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    found
+        .into_iter()
+        .take(max)
+        .map(|(_, n, iri)| (iri, n))
+        .collect()
+}
+
+/// The classes of `classes` whose name or label shares a word with the question, best
+/// first, at most `max`.
+pub(super) fn matched_classes(
+    classes: &[Value],
+    question: &std::collections::BTreeSet<String>,
+    prefixes: &Value,
+    max: usize,
+) -> Vec<String> {
+    let mut scored: Vec<(usize, u64, String)> = classes
+        .iter()
+        .filter_map(|c| {
+            let iri = expanded(c["iri"].as_str()?, prefixes);
+            let label = c["label"].as_str();
+            let score = crate::mcp::relevance::entry_score(&iri, label.into_iter(), question);
+            (score > 0).then(|| (score, c["instances"].as_u64().unwrap_or(0), iri))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(_, _, iri)| iri)
+        .collect()
+}
+
+/// An absolute IRI that a clarification answer names, in angle brackets or under one
+/// of `prefixes`.
+pub(super) fn answered_iri(answer: &str, prefixes: &Value) -> Option<String> {
+    let a = answer.trim();
+    let iri = if a.starts_with('<') && a.ends_with('>') {
+        a.trim_matches(['<', '>']).to_string()
+    } else {
+        let e = expanded(a, prefixes);
+        if e == a {
+            return None;
+        }
+        e
+    };
+    let scheme = iri.split_once(':').map(|(s, _)| s)?;
+    (!scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+        && !iri
+            .chars()
+            .any(|c| c.is_whitespace() || "<>\"{}|^`\\".contains(c)))
+    .then_some(iri)
 }
 
 #[cfg(test)]
@@ -462,6 +633,88 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn usage_lines_rank_question_words_then_counts_and_compact_iris() {
+        let prefixes = json!({"ex": "http://example.org/", "exv": "http://example.org/v/"});
+        let p = prefixes.as_object().unwrap();
+        assert_eq!(
+            compact("http://example.org/v/elevation", p),
+            "exv:elevation"
+        );
+        assert_eq!(
+            compact("<http://example.org/a(b)>", p),
+            "<http://example.org/a(b)>"
+        );
+        assert_eq!(compact("http://other.org/x", p), "<http://other.org/x>");
+        let rows = json!({"prefixes": {"ex2": "http://example.org/"}, "rows": [
+            ["ex2:wikiLink", "\"900\"^^xsd:integer"],
+            ["<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>", "\"40\"^^xsd:integer"],
+            ["<http://example.org/elevation>", "\"3\"^^xsd:integer"],
+            ["<http://example.org/name>", "12"],
+            ["\"not an iri\"", "1"],
+            ["unknown:x", "1"],
+        ]});
+        let words = crate::mcp::relevance::words("How high is the elevation of Mont Blanc?");
+        let ranked = ranked_usage(
+            &rows,
+            &words,
+            &["http://www.w3.org/1999/02/22-rdf-syntax-ns#type"],
+            3,
+        );
+        assert_eq!(
+            ranked,
+            [
+                ("http://example.org/elevation".to_string(), 3),
+                ("http://example.org/wikiLink".to_string(), 900),
+                ("http://example.org/name".to_string(), 12)
+            ]
+        );
+    }
+
+    #[test]
+    fn usage_groups_by_namespace() {
+        let prefixes = json!({"ex": "http://example.org/"});
+        let p = prefixes.as_object().unwrap();
+        let ranked = [
+            ("http://dbpedia.org/property/satellites".to_string(), 1),
+            ("http://example.org/name".to_string(), 3),
+            ("http://dbpedia.org/property/mass".to_string(), 2),
+            ("http://dbpedia.org/property/a(b)".to_string(), 4),
+        ];
+        assert_eq!(
+            grouped(&ranked, p),
+            "<http://dbpedia.org/property/> satellites 1, mass 2; ex: name 3; <http://dbpedia.org/property/a(b)> 4"
+        );
+    }
+
+    #[test]
+    fn matched_classes_and_clarification_iris() {
+        let prefixes = json!({"ex": "http://example.org/"});
+        let classes = vec![
+            json!({"iri": "ex:Mountain", "label": "mountain", "instances": 10}),
+            json!({"iri": "ex:Person", "label": "person", "instances": 99}),
+            json!({"iri": "ex:MountainRange", "instances": 5}),
+        ];
+        let words = crate::mcp::relevance::words("What is the highest mountain in Germany?");
+        assert_eq!(
+            matched_classes(&classes, &words, &prefixes, 2),
+            [
+                "http://example.org/Mountain",
+                "http://example.org/MountainRange"
+            ]
+        );
+        assert_eq!(
+            answered_iri("<http://example.org/Mars>", &prefixes).as_deref(),
+            Some("http://example.org/Mars")
+        );
+        assert_eq!(
+            answered_iri("ex:Mars", &prefixes).as_deref(),
+            Some("http://example.org/Mars")
+        );
+        assert_eq!(answered_iri("the planet", &prefixes), None);
+        assert_eq!(answered_iri("<http://example.org/a b>", &prefixes), None);
     }
 
     #[test]

@@ -87,6 +87,7 @@ pub(crate) enum Stage {
     ExampleQueryEmbedding,
     ExampleDocumentEmbedding,
     LinkerVectorSearch,
+    PredicateUse,
 }
 
 impl Stage {
@@ -103,6 +104,7 @@ impl Stage {
             Self::ExampleQueryEmbedding => "example_query_embedding",
             Self::ExampleDocumentEmbedding => "example_document_embedding",
             Self::LinkerVectorSearch => "linker_vector_search",
+            Self::PredicateUse => "predicate_use",
         }
     }
 }
