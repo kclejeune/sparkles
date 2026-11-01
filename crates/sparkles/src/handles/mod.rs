@@ -47,6 +47,7 @@ pub use graphql::GraphQl;
 pub use history::{CommitDetail, CommitRef, History, Snapshots};
 pub use indexes::{
     GeoIndex, Indexes, RecallOptions, TextHit, TextHits, TextIndex, TextSearch, VectorIndexes,
+    text_call,
 };
 pub use mappings::{MappingRun, StoredMappings};
 pub use queries::StoredQueries;

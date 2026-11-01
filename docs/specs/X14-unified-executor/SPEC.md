@@ -339,6 +339,28 @@ names only `materialized` or `demand`. Behaviour is unchanged. The new CLI test 
 `--reasoning false`, `true`, `materialized` and `demand` with and without a profile and
 with an unlimited limit, and the library tests cover each view.
 
+### Shared rank fusion and text hits
+
+Item 483 shipped. `sparkles::rank` holds the reciprocal rank fusion. `fuse_rrf` sums
+`weight / (k + rank)` over weighted ranked lists in list order and returns each key once,
+best first, with ties broken by key. `rrf_score` gives one key's score from its ranks, and
+`competition_ranks` ranks keys by their best score, so that tied keys share a rank.
+`spk:hybridSearch` ranks and fuses its two lists with them, and the MCP memory layer's
+`recall`, `community_reports`, `link_entities` and `similar_queries` fuse with them where
+each had its own loop. `link_entities` keeps its tiers before the score, and
+`similar_queries` keeps its ties broken by query name. The server's two rankers of memory
+hits keep their own handling of a NaN score, which ranks first there.
+
+`sparkles::handles::text_call` writes the one `text:query` call, and `TextIndex::hits`
+reads its hits from a given snapshot, as `search` reads them from the current state. The
+MCP `search_text` tool reads its hits through `hits` with its caller's options and commit,
+and the memory layer's text hits build their call with `text_call` inside their graph
+pattern. A search without highlighting now returns a literal as stored, where the search
+of the library and `GET /{ds}/text` used to remove the private-use characters that mark a
+match from it even when no match was marked. Results and their order are otherwise
+unchanged, and the hybrid search, MCP search and memory tests cover them, with unit tests
+of the fusion's sums, weights and ties.
+
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries

@@ -24,6 +24,14 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+`spk:hybridSearch` and the MCP memory tools fuse ranked lists with one library function,
+`sparkles::rank::fuse_rrf`, and read full-text hits through one `text:query` call,
+`sparkles::handles::text_call`, and one reader, `TextIndex::hits`, which reads a given
+snapshot. Their results and order are unchanged. A text search without highlighting, in
+the library and over `GET /{ds}/text?highlight=false`, now returns a matching literal as
+stored. It used to lose the private-use characters U+E000 and U+E001, which mark a
+highlighted match, from the literal.
+
 The library names the reasoning of a query with `sparkles::reasoning::ReasoningMode`
 and selects its inferred data with one `InferenceView` from `Dataset::inference_view`.
 The view gives the query options, the input of incremental views and the source of an

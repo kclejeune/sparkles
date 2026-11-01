@@ -158,28 +158,29 @@ impl Tools<'_> {
                 &BTreeMap::new(),
             )
             .map_err(|e| ctx.engine(e))?;
-        // the query string and options become literals serialized by oxrdf (escaped),
-        // the predicates validated IRIs
-        let mut call_args: Vec<String> = preds.iter().map(NamedNode::to_string).collect();
-        call_args.push(Literal::new_simple_literal(a.query.as_str()).to_string());
-        call_args.push(limit.to_string());
-        if let Some(l) = &a.lang {
-            call_args.push(Literal::new_simple_literal(format!("lang:{l}")).to_string());
-        }
-        let q = format!(
-            "SELECT ?s ?score ?lit ?p WHERE {{ (?s ?score ?lit ?g ?p) <http://jena.apache.org/text#query> ({}) }} ORDER BY DESC(?score)",
-            call_args.join(" ")
-        );
-        let rows = sparql::query(snap.clone(), &q, &opts)
+        let search = sparkles::handles::TextSearch {
+            query: a.query.clone(),
+            predicates: preds,
+            lang: a.lang.clone(),
+            graph: None,
+            limit: limit as usize,
+            highlight: false,
+            options: opts.clone(),
+        };
+        let found = ds
+            .dataset
+            .indexes()
+            .text()
+            .hits(snap.clone(), &search)
             .map_err(|e| match e {
                 Error::Invalid(m) => ToolError::bad_argument(m),
                 e => ctx.engine(e),
             })?
-            .rows();
-        let subjects: Vec<&NamedNode> = rows
+            .hits;
+        let subjects: Vec<&NamedNode> = found
             .iter()
-            .filter_map(|r| match r.first() {
-                Some(Some(Term::NamedNode(n))) => Some(n),
+            .filter_map(|h| match &h.subject {
+                Some(Term::NamedNode(n)) => Some(n),
                 _ => None,
             })
             .collect();
@@ -190,15 +191,16 @@ impl Tools<'_> {
             HashMap::new()
         };
         let mut terms = Terms::new(&prefixes, 500);
-        let hits: Vec<Value> = rows
+        let hits: Vec<Value> = found
             .iter()
-            .filter_map(|r| {
-                let s = r.first()?.as_ref()?;
-                let mut h = json!({ "s": terms.term(s), "score": score_json(score_of(r.get(1)?.as_ref())) });
-                if let Some(Some(Term::Literal(l))) = r.get(2) {
+            .filter_map(|hit| {
+                let s = hit.subject.as_ref()?;
+                let mut h =
+                    json!({ "s": terms.term(s), "score": score_json(hit.score.unwrap_or(0.0)) });
+                if let Some(l) = &hit.literal {
                     h["text"] = cut_text(l.value()).into();
                 }
-                if let Some(Some(Term::NamedNode(p))) = r.get(3) {
+                if let Some(Term::NamedNode(p)) = &hit.predicate {
                     h["p"] = terms.iri(p.as_str()).into();
                 }
                 if let Some(l) = label_of(&labels, s, "en") {

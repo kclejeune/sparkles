@@ -55,7 +55,7 @@ pub(crate) const SPK: &str = "urn:x-sparkles:";
 pub(crate) const DEFAULT_GRAPH: &str = "urn:x-arq:DefaultGraph";
 
 /// The reciprocal rank fusion constant (Cormack et al.), as `spk:hybridSearch` uses.
-pub(crate) const RRF_K: f64 = 60.0;
+pub(crate) const RRF_K: f64 = sparkles::rank::RRF_K;
 
 /// One snapshot read as the caller: the call's query options (the caller's view, its
 /// budgets and deadline) and whether the materialized inferences take part.

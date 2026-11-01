@@ -39,7 +39,7 @@ pub const DEFAULT_DEPTH: usize = 100;
 /// The rows a call returns without a limit.
 pub const DEFAULT_LIMIT: usize = 10;
 /// The constant of reciprocal rank fusion without an `rrf:` option (Cormack et al.).
-pub const DEFAULT_RRF_K: f64 = 60.0;
+pub const DEFAULT_RRF_K: f64 = crate::rank::RRF_K;
 
 fn bad(m: impl std::fmt::Display) -> Error {
     Error::invalid(format!("spk:hybridSearch: {m}"))
@@ -407,7 +407,7 @@ fn ranks(
     };
     let cg = graph.and_then(|g| t.col_of(g));
     let mut values: FxHashMap<Id, f64> = FxHashMap::default();
-    let mut best: FxHashMap<Key, f64> = FxHashMap::default();
+    let mut hits: Vec<(Key, f64)> = Vec::with_capacity(t.len());
     for r in 0..t.len() {
         if r % 4096 == 4095 {
             ctx.check()?;
@@ -418,37 +418,9 @@ fn ranks(
             Some(Value::Double(d)) => f64::from(d),
             _ => f64::NAN,
         });
-        if v.is_nan() {
-            continue;
-        }
-        let key = (t.get(r, cs), cg.map_or(Id::UNDEF, |c| t.get(r, c)));
-        let better = |a: f64, b: f64| if lower_better { a < b } else { a > b };
-        best.entry(key)
-            .and_modify(|b| {
-                if better(v, *b) {
-                    *b = v
-                }
-            })
-            .or_insert(v);
+        hits.push(((t.get(r, cs), cg.map_or(Id::UNDEF, |c| t.get(r, c))), v));
     }
-    let mut order: Vec<(Key, f64)> = best.into_iter().collect();
-    order.sort_by(|a, b| {
-        let by = if lower_better {
-            a.1.total_cmp(&b.1)
-        } else {
-            b.1.total_cmp(&a.1)
-        };
-        by.then(a.0.cmp(&b.0))
-    });
-    let mut out = FxHashMap::default();
-    let mut rank = 0;
-    for (i, (key, v)) in order.iter().enumerate() {
-        if i == 0 || *v != order[i - 1].1 {
-            rank = i + 1;
-        }
-        out.insert(*key, rank);
-    }
-    Ok(out)
+    Ok(crate::rank::competition_ranks(hits, lower_better))
 }
 
 type Counters = serde_json::Map<String, serde_json::Value>;
@@ -668,23 +640,25 @@ fn fuse(
     counters: &mut Counters,
 ) -> Result<Table> {
     let [wt, wv] = spec.weights;
-    let rrf = |w: f64, r: Option<&usize>| r.map_or(0.0, |&r| w / (spec.rrf_k + r as f64));
-    let mut fused: Vec<(Key, f64, Option<usize>, Option<usize>)> = text
-        .keys()
-        .chain(vector.keys().filter(|k| !text.contains_key(k)))
-        .filter(|k| match spec.subject {
-            PathEnd::Const(s) => k.0 == s,
-            PathEnd::Var(_) => true,
-        })
-        .map(|k| {
-            let (rt, rv) = (text.get(k), vector.get(k));
-            (*k, rrf(wt, rt) + rrf(wv, rv), rt.copied(), rv.copied())
-        })
-        .collect();
-    add_count(counters, "fused", fused.len());
+    let subject = |k: &Key| match spec.subject {
+        PathEnd::Const(s) => k.0 == s,
+        PathEnd::Var(_) => true,
+    };
+    let list = |ranks: &FxHashMap<Key, usize>| {
+        ranks
+            .iter()
+            .filter(|(k, _)| subject(k))
+            .map(|(k, r)| (*k, *r))
+            .collect::<Vec<_>>()
+    };
     // best first; ties break by term id, as in spk:vectorSearch
-    fused.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    fused.truncate(spec.limit);
+    let fused = crate::rank::fuse_rrf([(wt, list(text)), (wv, list(vector))], spec.rrf_k);
+    add_count(counters, "fused", fused.len());
+    let fused: Vec<(Key, f64, Option<usize>, Option<usize>)> = fused
+        .into_iter()
+        .take(spec.limit)
+        .map(|(k, score)| (k, score, text.get(&k).copied(), vector.get(&k).copied()))
+        .collect();
     ctx.check_output(fused.len(), vars.len())?;
     let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
     let cs = match spec.subject {
