@@ -434,7 +434,8 @@ class Ledger:
         )
 
     def case_spent(self, case):
-        """Settled and reserved nanodollars of one case. The caller holds the mutex."""
+        """Settled and reserved nanodollars of one case over the whole ledger. The
+        caller holds the mutex."""
         settled = sum(c["cost"] for c in self.charges.values() if c["case"] == case)
         return settled + sum(
             r["bound"] for r in self.reserved.values() if r.get("case") == case
@@ -444,8 +445,8 @@ class Ledger:
         """What the holds of the cases in flight still cover beyond what they spent.
         The caller holds the mutex."""
         return sum(
-            max(0, amount - self.case_spent(case))
-            for case, amount in self.holds.items()
+            max(0, amount - (self.case_spent(case) - since))
+            for case, (amount, since) in self.holds.items()
             if case != but
         )
 
@@ -457,7 +458,9 @@ class Ledger:
                 raise Invalid("case already held")
             if self.spent() + self.outstanding() + amount > self.cap:
                 return False
-            self.holds[case] = amount
+            # A case id can recur in a ledger that an earlier run used, so the hold
+            # covers only what the case spends from now on.
+            self.holds[case] = (amount, self.case_spent(case))
             return True
 
     def release(self, case):

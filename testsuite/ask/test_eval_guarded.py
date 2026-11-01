@@ -67,6 +67,10 @@ class GuardedScore(unittest.TestCase):
         self.assertFalse(lenient(gold, rel(["c"], [lit("34317")]), {}))
         self.assertFalse(lenient(gold, rel(["c"], [lit("34318", "int")]), {}))
         self.assertFalse(lenient(gold, rel(["c"], [lit("34317/1", "integer")]), {}))
+        # past Python's digit limit for integer conversion, a value is simply unknown
+        self.assertIsNone(guarded.numeric_value(("literal", "9" * 5000, XSD + "integer")))
+        self.assertIsNone(guarded.numeric_value(("literal", "9" * 5000 + ".5", XSD + "decimal")))
+        self.assertFalse(lenient(gold, rel(["c"], [lit("9" * 5000, "integer")]), {}))
         big = rel(["n"], [lit("9007199254740993", "integer")])
         self.assertFalse(lenient(big, rel(["c"], [lit("9007199254740993", "double")]), {}))
         self.assertTrue(lenient(rel(["n"], [lit("0.5", "decimal")]), rel(["c"], [lit("5E-1", "float")]), {}))

@@ -1355,11 +1355,13 @@ if __name__ == "__main__":
 class ParallelCases(unittest.TestCase):
     """run_parallel with stand-ins for the runner and the proxy."""
 
-    def setup(self, holds=None, fail=None):
+    def setup(self, holds=None, fail=None, refuse=None):
         import threading
 
         lock = threading.Lock()
         state = {"now": 0, "most": 0, "held": 0}
+
+        state["live"] = set()
 
         class Ledger:
             def hold(self, case, amount):
@@ -1367,10 +1369,12 @@ class ParallelCases(unittest.TestCase):
                     if holds is not None and state["held"] >= holds:
                         return False
                     state["held"] += 1
+                    state["live"].add(case)
                     return True
 
             def release(self, case):
-                pass
+                with lock:
+                    state["live"].discard(case)
 
         class Proxy:
             ledger = Ledger()
@@ -1394,6 +1398,7 @@ class ParallelCases(unittest.TestCase):
 
         class Runner:
             tl = threading.local()
+            out = pathlib.Path(tempfile.mkdtemp(prefix="ask-parallel-"))
 
             def check(self):
                 pass
@@ -1414,6 +1419,8 @@ class ParallelCases(unittest.TestCase):
                     state["now"] += 1
                     state["most"] = max(state["most"], state["now"])
                 time.sleep(0.05 * (5 - int(q["id"][1:]) % 5))  # later cases end first
+                if q["id"] == refuse:
+                    return {"outcome": "error", "evalFailure": "budget_refused"}
                 with lock:
                     state["now"] -= 1
                 self.last_record = {"pid": 1}
@@ -1479,3 +1486,45 @@ class ParallelCases(unittest.TestCase):
         args = eval_ask.parse_args(["--sparkles", "/bin/true", "--jobs", "2", "--loc", "/x"])
         with self.assertRaises(eval_ask.Invalid):
             eval_ask.validate_args(args)
+
+    def test_a_stop_takes_no_hold_for_unstarted_cases(self):
+        runner, proxy, report, state = self.setup(refuse="q0")
+        qs = [{"id": f"q{i}"} for i in range(8)]
+        admit = lambda pair, qs: True  # noqa: E731
+        admit.case_bound = lambda pair: 5
+        eval_ask.run_parallel(
+            runner, proxy, "p", qs, 2, admit, report,
+            lambda q, case, answer: answer.get("evalFailure") == "budget_refused",
+        )
+        self.assertEqual(state["live"], set())
+        self.assertEqual(state["held"], 2)  # q0 and q1, which was already in flight
+        self.assertEqual(report["unattemptedIds"]["p"], [f"q{i}" for i in range(2, 8)])
+
+    def test_peers_in_flight_at_an_error_are_counted_and_kept(self):
+        runner, proxy, report, state = self.setup(fail="q0")
+        qs = [{"id": "q0"}, {"id": "q1"}]
+        admit = lambda pair, qs: True  # noqa: E731
+        admit.case_bound = lambda pair: 5
+        with self.assertRaises(eval_ask.Invalid):
+            eval_ask.run_parallel(
+                runner, proxy, "p", qs, 2, admit, report, lambda q, c, a: False
+            )
+        self.assertEqual((report["attempted"], report["executed"]), (2, 2))
+        self.assertEqual(report["drainedCases"][0]["id"], "q1")
+        self.assertTrue(report["drainedCases"][0]["started"])
+        kept = json.loads((runner.out / (eval_ask.case_of("p", qs[1]) + ".json")).read_text())
+        self.assertIsNone(kept["score"])
+
+    @unittest.skipUnless(
+        __import__("shutil").which("systemd-run") and __import__("os").environ.get("XDG_RUNTIME_DIR"),
+        "needs a systemd user session",
+    )
+    def test_the_memory_wrapper_passes_arguments_unchanged(self):
+        import shutil
+        import subprocess
+
+        argv = eval_ask.memory_wrapper("256M") + [
+            shutil.which("python3"), "-c", "import sys; print(sys.argv[1:])", "${PATH}", "$$", "$HOME"
+        ]
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.stdout.strip(), str(["${PATH}", "$$", "$HOME"]))

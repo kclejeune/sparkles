@@ -152,11 +152,14 @@ def numeric_value(cell):
             except OverflowError:
                 return None
         return fractions.Fraction(value) if math.isfinite(value) else None
-    if datatype == XSD + "decimal":
-        return fractions.Fraction(text) if DECIMAL.fullmatch(text) else None
-    if not INTEGER.fullmatch(text):
-        return None
-    value = int(text)
+    try:
+        if datatype == XSD + "decimal":
+            return fractions.Fraction(text) if DECIMAL.fullmatch(text) else None
+        if not INTEGER.fullmatch(text):
+            return None
+        value = int(text)
+    except ValueError:
+        return None  # past Python's limit on digits converted to an integer
     low, high = INTEGER_RANGES.get(datatype, (None, None))
     if (low is not None and value < low) or (high is not None and value > high):
         return None

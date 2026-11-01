@@ -883,6 +883,18 @@ class ConcurrentCases(Base):
         with self.assertRaises(Invalid):
             ledger.hold("c", 1)
 
+    def test_a_hold_covers_only_what_its_case_spends_after_it(self):
+        ledger = self.ledger(cap=1600)
+        ident = ledger.reserve(HAIKU, 600, "a")  # an earlier run of the same case
+        ledger.settle(ident, 600, "ok")
+        self.assertTrue(ledger.hold("a", 600))
+        self.assertTrue(ledger.hold("b", 400))
+        with self.assertRaises(px.CapExceeded):
+            ledger.reserve(HAIKU, 401, "b")
+        ident = ledger.reserve(HAIKU, 600, "a")
+        ledger.settle(ident, 600, "ok")
+        self.assertLessEqual(ledger.spent(), 1600)
+
     def test_case_tokens_route_requests_and_replies_flush_in_order(self):
         proxy = self.proxy(Upstream(), replies=self.root / "replies.jsonl")
         proxy.ordered_replies = True

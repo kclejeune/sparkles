@@ -226,6 +226,7 @@ def memory_wrapper(limit):
         "MemorySwapMax=0",
         "-p",
         "OOMPolicy=continue",
+        "--expand-environment=no",  # a question or query can hold "${PATH}"
         "--",
         env,
         "-u",
@@ -1061,12 +1062,15 @@ def run_parallel(runner, proxy, pair, qs, jobs, admit, report, finish_case):
                 while len(pending) >= jobs:
                     settle_first()
                 case_id = case_of(pair, q)
-                held = True
-                if proxy and bound:
+                held = not stopped
+                if held and proxy and bound:
                     held = ledger.hold(case_id, bound(pair))
-                    while not held and pending:
+                    while not held and pending and not stopped:
                         settle_first()
                         held = ledger.hold(case_id, bound(pair))
+                    if held and stopped:
+                        ledger.release(case_id)  # an earlier case stopped the run
+                        held = False
                 if stopped or not held:
                     stopped = True
                     report["budgetStopped"] = True
@@ -1081,14 +1085,37 @@ def run_parallel(runner, proxy, pair, qs, jobs, admit, report, finish_case):
             while pending:
                 settle_first()
         except BaseException:
+            # The run ends at the first error in question order. Peers already in
+            # flight still ran, so their children are counted and their answers are
+            # kept unscored beside the report.
             for q, case_id, token, future in pending:
                 future.cancel()
+            drained = report.setdefault("drainedCases", [])
             for q, case_id, token, future in pending:
-                if not future.cancelled():
+                entry = {"case": case_id, "pair": pair, "id": q["id"]}
+                if future.cancelled():
+                    entry["started"] = False
+                    report["attempted"] -= 1
+                    report["attemptedCases"] = [
+                        c for c in report["attemptedCases"] if c["case"] != case_id
+                    ]
+                else:
+                    entry["started"] = True
                     try:
-                        future.result()  # Wait for its child to end.
-                    except BaseException:  # noqa: BLE001, S110 -- the first error wins
-                        pass
+                        answer, error, record = future.result()
+                    except BaseException as e:  # noqa: BLE001 -- the first error wins
+                        answer, error, record = None, e, None
+                    if record and "pid" in record:
+                        report["executed"] += 1
+                    entry["error"] = type(error).__name__ if error else None
+                    if answer is not None:
+                        with (runner.out / (case_id + ".json")).open("x") as f:
+                            json.dump(
+                                {"id": q["id"], "answer": answer, "score": None},
+                                f,
+                                indent=2,
+                            )
+                drained.append(entry)
                 if proxy:
                     proxy.close_case(token)
                     ledger.release(case_id)
