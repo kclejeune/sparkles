@@ -1852,9 +1852,10 @@ front-coded and FSST vocabulary readers and of opening a store with and without 
 commits in its WAL, so that the reader changes of item 455 can be checked below timing
 noise. Each case checks its result against one computed another way and fails when other
 threads of the process use more than 20 ms of CPU time while it runs, since moved work
-would otherwise look like a saving. On forge the counts of one process repeated to a few
-hundredths of a percent, and the full front-coded scan moved by up to 11% between
-processes, so the gate compares ranges over five processes. Replay cost about 32,000
+would otherwise look like a saving. On forge the counts of one process repeated to within a
+tenth of a percent except for the small vocabulary opens, which varied by up to 5%, and
+the full front-coded scan moved by up to 11% between processes, so the gate compares
+ranges over five processes. Replay cost about 32,000
 instructions per commit. The
 [baseline](../benchmarks/engine/RESULTS.md#instruction-counts-of-vocabulary-scans-and-wal-replay)
 keeps every count.

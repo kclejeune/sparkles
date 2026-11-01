@@ -361,10 +361,12 @@ check passed, and no case saw other threads use measurable CPU time.
 | `wal/open-with-2000-commits` | 394,099,730 | 394,093,307 | 394,105,567 |
 | `wal/replay-2000-commits` | 64,039,182 | 64,032,609 | 64,045,438 |
 
-The counts of one process repeat to within a few hundredths of a percent. Between
-processes the full front-coded scan moved by 10.5%, between 8,535,784 and 9,436,303
-instructions, and its random lookups and both vocabulary opens by 2% to 4%, as the
-addresses their data lands at change. The other cases moved by 0.2% or less. The gate
+Within one process the scans, lookups and store opens repeat to within a tenth of a
+percent. The vocabulary opens count only 20,000 to 30,000 instructions and vary by up to
+3.5% for front coding and 5.2% for FSST within a process. Between processes the full
+front-coded scan moved by 10.5%, between 8,535,784 and 9,436,303 instructions, and its
+random lookups and both vocabulary opens by 2% to 4%, as the addresses their data lands at
+change. The other cases moved by 0.2% or less. The gate
 flags a case only when a candidate's whole range lies above the baseline's, so these
 cases catch a change larger than their spread. Replaying 2,000 commits cost 64.0 million
 instructions, about 32,000 per commit.
