@@ -904,6 +904,8 @@ impl Witnesses {
         let t0 = Instant::now();
         Self::check_max(max)?;
         let plans = Plans::new(&mut c.graph, rules)?;
+        // the plans are charged while the pass reads them, as the update charges its own
+        let _plans_held = Held::try_new(&limits.budget, plans.bytes)?;
         let c = &*c;
         let abort = AtomicBool::new(false);
         let cx = Cx::new(c, rules, &plans, &abort, limits);
@@ -1135,6 +1137,8 @@ impl Witnesses {
         }
         let lost = self.lost(&p.dead, &mut reached)?;
         let plans = Plans::new(&mut c.graph, rules)?;
+        // the plans are charged while the pass reads them, as the update charges its own
+        let _plans_held = Held::try_new(&limits.budget, plans.bytes)?;
         let abort = AtomicBool::new(false);
         let cx = Cx::new(c, rules, &plans, &abort, limits);
         let mut seen: FxHashSet<u32> = FxHashSet::default();
@@ -1296,6 +1300,8 @@ impl Witnesses {
         seeds.sort_unstable();
         seeds.dedup();
         let plans = Plans::new(&mut c.graph, rules)?;
+        // the plans are charged while the pass reads them, as the update charges its own
+        let _plans_held = Held::try_new(&limits.budget, plans.bytes)?;
         let c = &*c;
         let abort = AtomicBool::new(false);
         let cx = Cx::new(c, rules, &plans, &abort, limits);
@@ -2525,6 +2531,35 @@ mod tests {
         };
         assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
         assert!(budget.peak() <= 4 * one, "{}", budget.peak());
+        assert_eq!(budget.used(), 0);
+        // the collection stopped after the facts that fit: the others keep their keys
+        let taken = removed
+            .iter()
+            .filter(|t| w.node(t).is_some_and(|i| w.nodes[i as usize].key.is_none()))
+            .count();
+        assert!(taken <= 4, "{taken} of {}", removed.len());
+        // and so does a batch of facts that move to another graph's quad: each changed
+        // key is charged before it is taken
+        let mut w = Witnesses::build(&mut c, &rules, 8, &limits()).unwrap();
+        let fake = |t: &Triple| FactKey::of_keys(&t[0].to_le_bytes(), b"moved", b"", None);
+        for t in &removed {
+            let i = w.node(t).unwrap();
+            w.nodes[i as usize].key = Some(fake(t));
+        }
+        let budget = Budget::new(Some(4 * one));
+        let l = Limits {
+            budget: budget.clone(),
+            ..limits()
+        };
+        let Err(e) = w.prepare(&mut c, &rules, &l, &[], &removed) else {
+            panic!("the batch passed the limit");
+        };
+        assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
+        let rekeyed = removed
+            .iter()
+            .filter(|t| w.nodes[w.node(t).unwrap() as usize].key != Some(fake(t)))
+            .count();
+        assert!(rekeyed <= 4, "{rekeyed} of {}", removed.len());
         assert_eq!(budget.used(), 0);
     }
 }
