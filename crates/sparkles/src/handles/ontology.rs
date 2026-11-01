@@ -112,12 +112,18 @@ impl OntologyRequest {
         Ok(())
     }
 
+    /// The graphs named, each once, in the order first named.
     fn graphs(&self) -> Vec<GraphRef> {
         if self.graphs.is_empty() {
-            vec![GraphRef::Default]
-        } else {
-            self.graphs.clone()
+            return vec![GraphRef::Default];
         }
+        let mut out: Vec<GraphRef> = Vec::new();
+        for g in &self.graphs {
+            if !out.contains(g) {
+                out.push(g.clone());
+            }
+        }
+        out
     }
 
     fn key(&self, commit: u64) -> String {
@@ -582,12 +588,26 @@ impl Ontologies {
         // removals edit the graphs the request names and the target it names (§5.4):
         // an axiom read from an imported graph is removed there only when the edit
         // names that graph
-        let mut scope: BTreeSet<u32> = (0..o.requested.min(o.graphs.len()) as u32).collect();
-        if let Some(g) = &edit.graph
-            && let Some(n) = o.graphs.iter().position(|x| x == g)
-        {
-            scope.insert(n as u32);
-        }
+        let named = req.graphs();
+        let scope: BTreeSet<u32> = o
+            .graphs
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| named.contains(g) || edit.graph.as_ref() == Some(*g))
+            .map(|(n, _)| n as u32)
+            .collect();
+        let scope_ids: FxHashSet<Id> = scope
+            .iter()
+            .filter_map(|n| o.inner.graph_ids.get(*n as usize).copied().flatten())
+            .collect();
+        let all_graphs: BTreeSet<u32> = (0..o.graphs.len() as u32).collect();
+        let imported = |g: u32| {
+            Error::invalid(format!(
+                "the axiom is read from the imported graph {}: name that graph as the edit's \
+                 graph to change it there",
+                o.graph_name(g)
+            ))
+        };
         let mut removal: Vec<Axiom> = edit.remove.clone();
         if let Some(iri) = entity {
             removal.extend(
@@ -622,15 +642,16 @@ impl Ontologies {
         let removing: BTreeSet<&Axiom> = removal.iter().collect();
         let mut drop: BTreeSet<usize> = BTreeSet::new();
         let mut mains: FxHashSet<usize> = FxHashSet::default();
-        let mut done: BTreeSet<Axiom> = BTreeSet::new();
+        // each normal form once, with whether it was found
+        let mut done: BTreeMap<Axiom, bool> = BTreeMap::new();
         for ax in &removing {
             let mut found = false;
             for form in ax.normal_forms() {
-                if !done.insert(form.clone()) {
-                    found = true;
+                if let Some(hit) = done.get(&form) {
+                    found |= *hit;
                     continue;
                 }
-                match o.ontology.axioms.get(&form) {
+                let hit = match o.ontology.axioms.get(&form) {
                     Some(origins) => {
                         let mut here = false;
                         for origin in origins.iter().filter(|x| scope.contains(&x.graph)) {
@@ -644,27 +665,34 @@ impl Ontologies {
                                 }
                             }
                         }
-                        if !here {
-                            if entity.is_some() {
-                                continue;
-                            }
-                            let g = origins.first().map_or(0, |x| x.graph);
-                            return Err(Error::invalid(format!(
-                                "{} is read from the imported graph {}: name that graph as \
-                                 the edit's graph to remove it there",
-                                form,
-                                o.graph_name(g)
-                            )));
+                        if !here && entity.is_none() {
+                            return Err(imported(origins.first().map_or(0, |x| x.graph)));
                         }
-                        found = true;
+                        here
                     }
-                    None => {
-                        if let Some(qs) = assertion_quads(&o, &form, &txn, &scope)? {
-                            found = true;
+                    None => match assertion_quads(&o, &form, &txn, &scope)? {
+                        Some(qs) => {
                             deleted.extend(qs);
+                            true
                         }
-                    }
-                }
+                        None => {
+                            if entity.is_none()
+                                && let Some(qs) = assertion_quads(&o, &form, &txn, &all_graphs)?
+                            {
+                                let g = o
+                                    .inner
+                                    .graph_ids
+                                    .iter()
+                                    .position(|id| *id == Some(qs[0][3]))
+                                    .unwrap_or(0);
+                                return Err(imported(g as u32));
+                            }
+                            false
+                        }
+                    },
+                };
+                done.insert(form, hit);
+                found |= hit;
             }
             if found {
                 outcome.removed += 1;
@@ -681,6 +709,17 @@ impl Ontologies {
                 outcome.kept += 1;
                 continue;
             }
+            // an axiom encoded partly in an imported graph changes there only when the
+            // edit names that graph
+            if !scope_ids.contains(&q[3]) {
+                let g = o
+                    .inner
+                    .graph_ids
+                    .iter()
+                    .position(|id| *id == Some(q[3]))
+                    .unwrap_or(0);
+                return Err(imported(g as u32));
+            }
             deleted.push(q);
         }
         let mut count_deleted = 0;
@@ -692,23 +731,27 @@ impl Ontologies {
         }
         // additions
         let declare = edit.declare.unwrap_or(true);
-        let all_graphs: BTreeSet<u32> = (0..o.graphs.len() as u32).collect();
         let mut adding: Vec<Axiom> = Vec::new();
         let mut seen: BTreeSet<&Axiom> = BTreeSet::new();
         for ax in &edit.add {
             if !seen.insert(ax) {
                 continue;
             }
+            // present after the removals above: a form this edit removed is not
             let mut present = true;
             for form in ax.normal_forms() {
-                if !(o.ontology.contains(&form)
-                    || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some())
-                {
+                let kept = if done.get(&form) == Some(&true) {
+                    false
+                } else {
+                    o.ontology.contains(&form)
+                        || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
+                };
+                if !kept {
                     present = false;
                     break;
                 }
             }
-            if present && !removing.contains(ax) {
+            if present {
                 outcome.present += 1;
                 continue;
             }

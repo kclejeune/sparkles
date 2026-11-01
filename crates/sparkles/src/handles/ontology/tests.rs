@@ -701,3 +701,128 @@ fn a_stopped_stream_stops() {
     .unwrap();
     assert_eq!(n, 1);
 }
+
+fn local_and_lib(local: &str, lib: &str) -> (Dataset, OntologyRequest) {
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{
+            GRAPH :local {{ :o a owl:Ontology ; owl:imports :lib . {local} }}
+            GRAPH :lib {{ :lib a owl:Ontology . {lib} }}
+        }}"
+    ))
+    .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::Named(ex("local"))],
+        ..Default::default()
+    };
+    (ds, req)
+}
+
+fn remove_one(ds: &Dataset, req: &OntologyRequest, ax: Axiom) -> Result<EditOutcome> {
+    ds.ontology().edit(
+        req,
+        &EditRequest {
+            remove: vec![ax],
+            ..Default::default()
+        },
+        &opts(),
+    )
+}
+
+#[test]
+fn a_repeated_graph_does_not_widen_the_removal_scope() {
+    let (ds, mut req) = local_and_lib(
+        ":A a owl:Class .",
+        ":B a owl:Class . :A rdfs:subClassOf :B .",
+    );
+    req.graphs = vec![GraphRef::Named(ex("local")), GraphRef::Named(ex("local"))];
+    let r = remove_one(&ds, &req, Axiom::sub_class_of(class("A"), class("B")));
+    assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+}
+
+#[test]
+fn a_reification_in_an_imported_graph_is_refused() {
+    let (ds, req) = local_and_lib(
+        ":p a owl:ObjectProperty . :a :p :b .",
+        "[] a owl:Axiom ; owl:annotatedSource :a ; owl:annotatedProperty :p ;
+            owl:annotatedTarget :b ; rdfs:comment \"from lib\" .",
+    );
+    let before = total(&ds);
+    let o = ds.ontology().open(&req, &opts()).unwrap();
+    let annotated = o
+        .ontology
+        .axiom_set()
+        .find(|a| a.axiom_type() == AxiomType::ObjectPropertyAssertion)
+        .cloned()
+        .expect("the annotated assertion");
+    let r = remove_one(&ds, &req, annotated);
+    assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    assert_eq!(total(&ds), before);
+}
+
+#[test]
+fn imported_assertions_are_refused_not_absent() {
+    let (ds, req) = local_and_lib(
+        ":p a owl:ObjectProperty . :A a owl:Class .",
+        ":a :p :b . :a a :A .",
+    );
+    for ax in [
+        assertion("p", "a", "b"),
+        AxiomKind::ClassAssertion(class("A"), Individual::named(ex("a"))).into(),
+    ] {
+        let r = remove_one(&ds, &req, ax);
+        assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    }
+}
+
+#[test]
+fn additions_see_the_removals_of_the_same_edit() {
+    let ds = dataset(
+        ":o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class .
+         :A owl:equivalentClass :B . :B owl:equivalentClass :C .",
+    );
+    let req = OntologyRequest::default();
+    let abc: Axiom =
+        AxiomKind::EquivalentClasses([class("A"), class("B"), class("C")].into_iter().collect())
+            .into();
+    let ab: Axiom =
+        AxiomKind::EquivalentClasses([class("A"), class("B")].into_iter().collect()).into();
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                remove: vec![abc],
+                add: vec![ab.clone()],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!((e.removed, e.added, e.present), (1, 1, 0), "{e:?}");
+    let o = ds.ontology().open(&req, &opts()).unwrap();
+    assert!(o.ontology.contains(&ab));
+}
+
+#[test]
+fn shared_forms_keep_their_own_results() {
+    let ds = dataset(BASE);
+    let req = OntologyRequest::default();
+    let ab: Axiom =
+        AxiomKind::EquivalentClasses([class("A"), class("B")].into_iter().collect()).into();
+    let abc: Axiom =
+        AxiomKind::EquivalentClasses([class("A"), class("B"), class("C")].into_iter().collect())
+            .into();
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                remove: vec![ab, abc],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!((e.removed, e.absent.len()), (0, 2), "{e:?}");
+}
