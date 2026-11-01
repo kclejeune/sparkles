@@ -645,6 +645,24 @@ line and uploads do not expose the mode.
 
 ### Fixed
 
+Zero-or-more, one-or-more and zero-or-one property paths stay within the query memory
+budget and the timeout in eager execution. A path with two unbound ends, such as
+`?cat skos:broader* ?c`, listed its start nodes by copying every quad of the active
+graph into memory, with no budget charge and no deadline check. A sequence or
+alternative path built its edge relation the same way, and the visited set and frontier
+of each closure were charged only in a cursor. On DBpedia 2022.12.01, the `ASK` that
+`why_empty` runs for such a pattern alone grew one `sparkles ask` process past 28 GB
+under a 2 GiB budget and a 6 s timeout. Start nodes are now read a few thousand at a
+time from the indexes, skipping past the quads of a node already taken. The visited set,
+the frontier and the edge relation count against the budget in both executors, which
+check the deadline while they scan and between index lookups. An `ASK` or a `LIMIT`
+over such a path walks one start node at a time and stops once it has its rows, so the
+DBpedia `ASK` answers in under a second. A closure over an alternative of predicates and
+inverse predicates, such as `(dbo:wikiPageRedirects|dbo:wikiPageDisambiguates)*`, walks
+from a bound or constant end by index lookups instead of first reading every edge of
+the alternative. `why_empty` reports a check that exceeds the memory or row budget as
+unknown, as it does a check past its time, instead of failing the whole diagnosis.
+
 A PDF converted in a child process no longer fails with "the converter stopped on it"
 on a host with many cores. The PDF parser's first parallel loop started rayon's global
 pool with a thread per core, and each new thread made glibc reserve a malloc arena of

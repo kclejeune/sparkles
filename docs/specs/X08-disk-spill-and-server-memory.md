@@ -1086,6 +1086,32 @@ latency gates, and roadmap item 1 ran the 10.5M and DBpedia profile runs on 2026
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
 
+### Property path closures (2026-10-31)
+
+Eager property path evaluation did not report its state to the ledger. With two unbound
+ends it listed its start nodes by copying every quad of the active graph, a sequence or
+alternative path built its adjacency lists from the edge plan, and the visited set and
+frontier of each closure were charged only in a cursor. None of these loops checked the
+deadline. On DBpedia 2022.12.01 (1.01 billion quads), the `why_empty` checks of three
+generated Ask queries, `?cat skos:broader* ?c`,
+`?seed (dbo:wikiPageRedirects|dbo:wikiPageDisambiguates)* ?taxon` and
+`?cat skos:broader?/skos:broader? <Category:Columbus>`, each passed an 8 GB scope cap
+within 20 seconds under a 2048 MiB budget and a 6-second check timeout, and the
+unconfined runs reached 12 to 28 GB.
+
+Start nodes now come from the indexes in chunks of at most 4,096 distinct nodes per
+index, and a run of more than 512 quads of a node already taken is skipped by a new
+seek. The closure's visited set, frontier and neighbour buffer, and the adjacency lists
+of an edge relation, are charged in both executors, and the walk checks the deadline
+every 1,024 lookups and every 65,536 scanned quads. A path without inputs under a
+`LIMIT` or `ASK` is walked one start node at a time in eager execution, as a cursor
+walks it. An alternative of predicates and inverse predicates with a bound or constant
+end is walked by one index lookup per predicate instead of an edge plan. On the same
+data the three `why_empty` calls finish in 0.5 to 7.2 seconds with peaks of 1.4 to
+3.7 GB, the `ASK` over `?cat skos:broader* ?c` answers in 0.6 seconds, and the full
+closure fails with the timeout. The alternative with two unbound ends still builds its
+edge relation and fails the budget, which `why_empty` now reports as an unknown check.
+
 ### Grant routing (2026-10-23)
 
 MCP tool calls and resource reads were not admitted, so their queries took an empty grant

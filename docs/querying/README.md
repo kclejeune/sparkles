@@ -164,6 +164,16 @@ check them against the W3C suites and Jena's own answers.
   in parallel, and a range top-k ranks its range a part at a time. A full sort and the
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
+* Property path closures run within the query's memory budget and timeout in both
+  executors. The visited set, the frontier and the edge relation of a sequence or
+  alternative path count against the budget, and the walk checks the deadline while it
+  scans and between index lookups. A path with two unbound ends reads its start nodes a
+  few thousand at a time from the indexes, and under an `ASK` or a `LIMIT` it stops once
+  it has the rows it needs. A closure over an alternative of predicates and inverse
+  predicates, such as `(ex:p|^ex:q)*`, walks from a bound or constant end by index
+  lookups. With two unbound ends, such an alternative still reads its whole edge relation
+  first, and the full closure of a large graph exceeds the budget or the timeout with the
+  usual error rather than finishing.
 * Disk spill lets large queries finish within their memory budget
   ([X08](../specs/X08-disk-spill-and-server-memory.md)). `serve` spills by default,
   `--spill off` turns it off, and `--spill encrypted` encrypts the files. An embedded
