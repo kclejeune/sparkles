@@ -983,7 +983,7 @@ impl BranchSet {
     }
 
     /// The branch table, locked, once every one of `ids` is `main` or a listed branch.
-    /// Lock order: the table, then the family's holds.
+    /// The family's holds are locked before the table.
     pub(super) fn lock_listed(
         &self,
         ids: impl Iterator<Item = uuid::Uuid>,
@@ -2400,11 +2400,13 @@ impl Store {
             }
         }
         let retire = !children.is_empty();
+        // The source holds that name the branch go first, durably, when the caller
+        // releases them. A failure after that leaves the branch without its holds. The
+        // holds' lock comes before the table, which a collection takes under its
+        // history lock while an acquisition holds the holds' lock.
+        let mut holds = self.family.holds.state.lock();
         // the commit point: the table without the name
         let mut t = set.table.lock();
-        // The source holds that name the branch go first, durably, when the caller
-        // releases them. A failure after that leaves the branch without its holds.
-        let mut holds = self.family.holds.state.lock();
         let records = match &*holds {
             crate::holds::HoldsState::Ready(r) => r,
             crate::holds::HoldsState::Unavailable(reason) => {
@@ -2428,17 +2430,16 @@ impl Store {
                     ),
                 ));
             }
+            let released: Vec<&crate::holds::Record> =
+                held.iter().filter_map(|id| records.get(id)).collect();
+            let touched = Store::serving(&released);
             let mut kept = records.clone();
             for id in &held {
                 kept.remove(id);
             }
             self.persist_holds(&kept)?;
             self.failpoint("branch-delete-holds-released");
-            self.family
-                .holds
-                .index
-                .store(Arc::new(crate::holds::HeldIndex::of(kept.values())));
-            *holds = crate::holds::HoldsState::Ready(kept);
+            self.install_holds(&mut *holds, kept, &touched);
         }
         let mut next = t.clone();
         next.branches.retain(|b| b.id != e.id);
@@ -2455,8 +2456,8 @@ impl Store {
         let pruned = next.prune_retired();
         set.save(&next)?;
         *t = next;
-        drop(holds);
         drop(t);
+        drop(holds);
         self.failpoint("branch-delete-committed");
         if retire {
             // its store stays for the branches created from it, read-only

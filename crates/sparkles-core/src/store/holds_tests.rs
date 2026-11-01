@@ -6,7 +6,7 @@ use super::*;
 use crate::branch::{BranchOptions, CommitRef, DeleteOptions};
 use crate::history::{At, Hold, Retention};
 use crate::managed::OwnerKind;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
 const EV: OwnerKind = OwnerKind::Evidence;
 
@@ -621,4 +621,224 @@ fn concurrent_holds_and_collections_never_lose_a_held_commit() {
     assert_eq!(lost.load(Ordering::SeqCst), 0);
     assert!(held_ok.load(Ordering::SeqCst) > 10);
     assert!(s.source_holds().unwrap().is_empty());
+}
+
+/// Review findings of the first round, each with its regression.
+#[test]
+fn a_collection_waiting_for_the_branch_table_does_not_deadlock_acquisitions() {
+    let (_dir, _root, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let s = Arc::new(s);
+    // A collection holds main's history lock and will take the branch table.
+    let history = s.history.as_ref().unwrap().clone();
+    let guard = history.lock();
+    // One acquisition takes the holds' lock and waits for that history lock, and a
+    // second one and a branch deletion wait for the holds' lock.
+    let spawn = |f: Box<dyn FnOnce(&Store) + Send>| {
+        let s = s.clone();
+        std::thread::spawn(move || f(&s))
+    };
+    let a = spawn(Box::new(|s| {
+        s.acquire_hold(EV, id(1), &[at(s, 1)]).unwrap();
+    }));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let b = spawn(Box::new(|s| {
+        s.acquire_hold(EV, id(2), &[at(s, 2)]).unwrap();
+    }));
+    let c = spawn(Box::new(|s| {
+        let _ = s.delete_branch("dev", true);
+    }));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // the collection can still take the table
+    let (tx, rx) = std::sync::mpsc::channel();
+    let set = s.branch_set().unwrap();
+    let id_main = s.dataset_id();
+    let probe = std::thread::spawn(move || {
+        let _ = set.holds_on(id_main);
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+        "the branch table is held by a waiter of the holds' lock"
+    );
+    drop(guard);
+    for t in [a, b, c, probe] {
+        t.join().unwrap();
+    }
+    assert_eq!(s.source_holds().unwrap().len(), 2);
+}
+
+#[test]
+fn a_hold_whose_file_is_replaced_stays_protected_in_the_running_store() {
+    let (_dir, root, s) = setup();
+    s.set_failpoint("holds-renamed", Some(Arc::new(|_| panic!("sync failed"))));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.acquire_hold(EV, id(1), &[at(&s, 1)])
+    }));
+    assert!(r.is_err());
+    s.set_failpoint("holds-renamed", None);
+    assert!(s.family.holds.index.load().holds(s.dataset_id(), 1));
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+    s.compact().unwrap();
+    bump(&s, 2);
+    s.compact().unwrap();
+    assert!(readable(&s, 1));
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+    assert!(readable(&s, 1));
+}
+
+#[test]
+fn reconciliation_does_not_release_a_hold_acquired_again_while_it_asks() {
+    let (_dir, _root, s) = setup();
+    s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    let released = s
+        .reconcile_holds(EV, 0, &mut |h| {
+            // a retry of the operation acquires the same hold again meanwhile
+            let again = s.acquire_hold(EV, h.id, &h.commits).unwrap();
+            assert!(!again.created);
+            Ok(false)
+        })
+        .unwrap();
+    assert!(released.is_empty());
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+    assert_eq!(
+        s.reconcile_holds(EV, 0, &mut |_| Ok(false)).unwrap(),
+        [id(1)]
+    );
+}
+
+#[test]
+fn held_memory_states_keep_their_commit_metadata_past_the_ring() {
+    let s = Store::in_memory(StoreOptions {
+        memory_commit_ring: 2,
+        ..Default::default()
+    });
+    bump(&s, 1);
+    s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    bump(&s, 4);
+    assert!(readable(&s, 1));
+    let limited = s.snapshot_at_limited(&At::Commit(1), &Default::default(), 64 << 20);
+    assert!(limited.is_ok(), "{:?}", limited.err());
+    s.release_holds(EV, &[id(1)]).unwrap();
+    assert!(!readable(&s, 1));
+}
+
+#[test]
+fn a_branch_deletion_drops_the_memory_states_it_released() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.set_retention(Retention {
+        keep_commits: Some(2),
+        keep_age_ms: None,
+        max_bytes: None,
+    })
+    .unwrap();
+    bump(&s, 2);
+    let dev = s.create_branch("dev", &BranchOptions::default()).unwrap();
+    // commit 1 of dev is main's, held in main's memory
+    s.acquire_hold(
+        EV,
+        id(1),
+        &[CommitRef {
+            branch_id: dev.id,
+            seq: 1,
+        }],
+    )
+    .unwrap();
+    assert_eq!(s.mem_history.as_ref().unwrap().lock().held.len(), 1);
+    bump(&s, 3);
+    s.delete_branch_with(
+        "dev",
+        &DeleteOptions {
+            release_holds: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(s.mem_history.as_ref().unwrap().lock().held.is_empty());
+    assert!(!readable(&s, 1));
+}
+
+#[test]
+fn damaged_holds_files_open_and_fail_closed() {
+    let (_dir, root, s) = setup();
+    s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    drop(s);
+    // a version member that is not a version
+    let path = root.join(crate::holds::FILE);
+    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, br#"{"format":"one"}"#).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(code(s.source_holds()), "holds-unavailable");
+    bump(&s, 1);
+    drop(s);
+    // a file the process cannot read
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, &good).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_err() {
+            let s = Store::open(&root, StoreOptions::default()).unwrap();
+            assert_eq!(code(s.source_holds()), "holds-unavailable");
+            drop(s);
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    std::fs::write(&path, &good).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+}
+
+/// The concurrency test of an in-memory dataset: releases settle held states against
+/// the holds acquired since.
+#[test]
+fn concurrent_memory_holds_never_lose_a_held_state() {
+    let s = Arc::new(Store::in_memory(StoreOptions::default()));
+    s.set_retention(Retention {
+        keep_commits: Some(2),
+        keep_age_ms: None,
+        max_bytes: None,
+    })
+    .unwrap();
+    bump(&s, 3);
+    let stop = Arc::new(AtomicBool::new(false));
+    let lost = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let (s, stop) = (s.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                bump(&s, 1);
+            }
+        })
+    };
+    let holders: Vec<_> = (0..3)
+        .map(|t| {
+            let (s, stop, lost) = (s.clone(), stop.clone(), lost.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u128;
+                while !stop.load(Ordering::SeqCst) {
+                    n += 1;
+                    let hold = id(((t as u128) << 64) | n);
+                    let seq = s.head_commit().seq;
+                    if s.acquire_hold(EV, hold, &[at(&s, seq)]).is_ok() {
+                        std::thread::yield_now();
+                        if !readable(&s, seq) {
+                            lost.fetch_add(1, Ordering::SeqCst);
+                        }
+                        s.release_holds(EV, &[hold]).unwrap();
+                    }
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    for h in holders {
+        h.join().unwrap();
+    }
+    assert_eq!(lost.load(Ordering::SeqCst), 0);
+    assert!(s.mem_history.as_ref().unwrap().lock().held.is_empty());
 }

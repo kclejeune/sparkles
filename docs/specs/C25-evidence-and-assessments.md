@@ -716,8 +716,9 @@ first. Releasing holds through a branch deletion needs `admin`. Holds of a retir
 upstream stay, since only a branch that started from it can name them.
 
 The ordering argument is as follows. An acquisition resolves the commits under the
-branch table, opens the stores that serve them, and then takes the table and the holds'
-lock, so that no named branch is deleted meanwhile. It publishes the new index first and
+branch table, opens the stores that serve them, takes the holds' lock and checks again
+that every named branch is listed. A branch deletion takes the holds' lock before its
+commit point, so no named branch is deleted meanwhile. It publishes the new index first and
 then checks, under each serving store's history lock, that every commit is still
 readable. A collection decides what to remove and removes it from the generation table
 under the same history lock, reading the index there. Either the collection decided
@@ -731,8 +732,9 @@ a crash after it leaves the complete hold. A release replaces `holds.json` witho
 hold before it narrows the index, so a crash leaves either the hold in force or the
 hold gone. A branch deletion that releases holds makes the release durable before the
 branch table's commit point, so a crash in between leaves the branch without its holds.
-The lock order is a branch table, then the holds' lock, then a store's history.
-Acquisitions never take a writer lock, and collectors never take the holds' lock.
+The holds' lock comes before a branch table and a store's history, because a
+collection takes the table under its history lock. Acquisitions never take a writer
+lock, and collectors never take the holds' lock.
 
 An owner acquires its holds before the commit that refers to them. When that commit
 never publishes, the hold is an orphan. `Store::reconcile_holds` asks the owner about

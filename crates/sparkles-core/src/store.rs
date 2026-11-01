@@ -2627,7 +2627,7 @@ impl Store {
         let meta = meta.or_else(|| {
             self.mem_history
                 .as_ref()
-                .and_then(|m| m.lock().branch_bases.get(&seq).map(|(c, _)| *c))
+                .and_then(|m| m.lock().kept_commit(seq))
         });
         let Some(commit) = meta else {
             let snapshot = match at {

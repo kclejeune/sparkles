@@ -76,6 +76,10 @@ pub struct SourceHold {
 pub(crate) struct Record {
     pub hold: SourceHold,
     pub stores: Vec<uuid::Uuid>,
+    /// Raised by every acquisition of the hold, the repeated ones too, so that a
+    /// reconciliation releases only a hold nobody acquired since it looked. In memory
+    /// only.
+    pub touch: u64,
 }
 
 /// The holds of a dataset family, or why they cannot be read.
@@ -175,9 +179,11 @@ impl HeldIndex {
 /// collectors read.
 pub(crate) struct FamilyHolds {
     /// Held by every acquisition, release and branch deletion that changes the holds.
-    /// Lock order: a branch table, then this, then a store's history.
+    /// Lock order: this before a branch table or a store's history.
     pub state: parking_lot::Mutex<HoldsState>,
     pub index: Arc<arc_swap::ArcSwap<HeldIndex>>,
+    /// the last [`Record::touch`] given out
+    pub touches: std::sync::atomic::AtomicU64,
 }
 
 impl Default for FamilyHolds {
@@ -185,6 +191,7 @@ impl Default for FamilyHolds {
         FamilyHolds {
             state: parking_lot::Mutex::new(HoldsState::default()),
             index: Arc::new(arc_swap::ArcSwap::from_pointee(HeldIndex::default())),
+            touches: Default::default(),
         }
     }
 }
@@ -351,6 +358,7 @@ pub(crate) fn decode(bytes: &[u8], dataset_id: uuid::Uuid) -> Result<BTreeMap<uu
                 commits,
             },
             stores,
+            touch: 0,
         };
         if out.insert(h.id, record).is_some() {
             return Err(corrupt(format!("hold {} is listed twice", h.id)));
@@ -422,6 +430,7 @@ mod tests {
                 .iter()
                 .map(|(_, _, s)| uuid::Uuid::from_u128(*s))
                 .collect(),
+            touch: 0,
         }
     }
 

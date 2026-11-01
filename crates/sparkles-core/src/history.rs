@@ -929,8 +929,9 @@ impl HistoryState {
 pub(crate) struct MemHistory {
     pub branch_bases: BTreeMap<u64, (crate::commit::CommitInfo, Arc<Snapshot>)>,
     pub pins: BTreeMap<String, (Pin, Arc<Snapshot>)>,
-    /// the states durable source holds keep (see [`crate::holds`]), by commit
-    pub held: BTreeMap<u64, Arc<Snapshot>>,
+    /// the states durable source holds keep (see [`crate::holds`]) with their commit
+    /// metadata, which the commit ring may have dropped, by commit
+    pub held: BTreeMap<u64, (CommitInfo, Arc<Snapshot>)>,
     pub retention: Retention,
     /// past states kept by the window, oldest first (never the head)
     pub window: std::collections::VecDeque<Arc<Snapshot>>,
@@ -948,7 +949,7 @@ impl MemHistory {
         if let Some((_, snapshot)) = self.branch_bases.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
-        if let Some(snapshot) = self.held.get(&seq) {
+        if let Some((_, snapshot)) = self.held.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
         for snapshot in self.window.iter().chain(self.pins.values().map(|(_, s)| s)) {
@@ -965,7 +966,7 @@ impl MemHistory {
         self.branch_bases
             .get(&seq)
             .map(|(_, s)| s.clone())
-            .or_else(|| self.held.get(&seq).cloned())
+            .or_else(|| self.held.get(&seq).map(|(_, s)| s.clone()))
             .or_else(|| {
                 self.window
                     .iter()
@@ -973,6 +974,15 @@ impl MemHistory {
                     .or_else(|| self.pins.values().map(|p| &p.1).find(|s| s.commit == seq))
                     .cloned()
             })
+    }
+
+    /// The metadata of commit `seq` that a branch base or a source hold keeps beside its
+    /// state.
+    pub(crate) fn kept_commit(&self, seq: u64) -> Option<CommitInfo> {
+        self.branch_bases
+            .get(&seq)
+            .map(|(c, _)| *c)
+            .or_else(|| self.held.get(&seq).map(|(c, _)| *c))
     }
 
     /// The readable commits, the head included, as ascending disjoint ranges.

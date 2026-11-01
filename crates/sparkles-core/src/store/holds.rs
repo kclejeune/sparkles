@@ -13,9 +13,10 @@
 //! protection and keeps the commit. A release makes `holds.json` durable without the
 //! hold before it removes the protection, so a crash leaves the hold in place.
 //!
-//! Lock order: a branch table, then the family's holds, then a store's history. An
-//! acquisition never takes a writer lock, and a collection reads the protection without
-//! taking the holds' lock.
+//! Lock order: the family's holds before a branch table or a store's history, since a
+//! collection can take the table under its history lock. Nothing that holds a table or a
+//! history lock waits for the holds' lock. An acquisition never takes a writer lock, and
+//! a collection reads the protection without taking the holds' lock.
 
 use super::{Store, write_atomic};
 use crate::branch::CommitRef;
@@ -24,6 +25,7 @@ use crate::holds::{self, HeldIndex, HoldsState, Record, SourceHold};
 use crate::managed::OwnerKind;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// The outcome of [`Store::acquire_hold`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,8 +45,8 @@ struct Unpublished<'a> {
 impl Drop for Unpublished<'_> {
     fn drop(&mut self) {
         if let Some(previous) = self.previous.take() {
-            self.store.family.holds.index.store(previous.clone());
-            self.store.settle_members(&self.touched, &previous);
+            self.store.family.holds.index.store(previous);
+            self.store.settle_members(&self.touched);
         }
     }
 }
@@ -127,20 +129,21 @@ impl Store {
                 members.insert(*s, Some(set.open_store(*s)?));
             }
         }
-        // 3. under the table, so that no named branch is deleted meanwhile, and the
-        // holds' lock
-        let table = match &set {
-            Some(set) => Some(set.lock_listed(commits.iter().map(|c| c.branch_id))?),
-            None => None,
-        };
+        // 3. under the holds' lock, which a branch deletion takes before its commit
+        // point, the named branches must still be listed
         let mut state = self.family.holds.state.lock();
-        drop(table);
-        let records = match &*state {
+        if let Some(set) = &set {
+            drop(set.lock_listed(commits.iter().map(|c| c.branch_id))?);
+        }
+        let records = match &mut *state {
             HoldsState::Ready(r) => r,
             HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
         };
-        if let Some(existing) = records.get(&id) {
+        let touch = self.family.holds.touches.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(existing) = records.get_mut(&id) {
             if existing.hold.owner == owner && existing.hold.commits == commits {
+                // a reconciliation that looked before this no longer releases it
+                existing.touch = touch;
                 return Ok(Acquired {
                     hold: existing.hold.clone(),
                     created: false,
@@ -166,6 +169,7 @@ impl Store {
             Record {
                 hold: hold.clone(),
                 stores: stores.clone(),
+                touch,
             },
         );
         // 4. the protection first: a collection that decides from here keeps them
@@ -187,19 +191,23 @@ impl Store {
             }
         }
         self.failpoint("holds-verified");
-        // 6. the commit point, `holds.json` replaced and synced with its directory
+        // 6. the commit point: `holds.json` replaced. From the rename on, the hold stays
+        // installed even if syncing the directory fails, so that the running store
+        // never protects less than the file may record.
         let root = self.managed_root();
         if let Some(root) = &root {
             crate::commit::require_reader(root, holds::READER)?;
             self.failpoint("holds-reader-raised");
-            write_atomic(
-                &root.join(holds::FILE),
-                &holds::encode(self.owner_dataset_id(), &next),
-            )?;
+            let path = root.join(holds::FILE);
+            let tmp = path.with_extension("tmp");
+            super::write_synced(&tmp, &holds::encode(self.owner_dataset_id(), &next))?;
+            std::fs::rename(&tmp, &path)?;
         }
         undo.previous = None;
         *state = HoldsState::Ready(next);
-        if root.is_some() {
+        if let Some(root) = &root {
+            self.failpoint("holds-renamed");
+            super::sync_dir(root)?;
             self.failpoint("holds-published");
         }
         Ok(Acquired {
@@ -221,7 +229,8 @@ impl Store {
     /// Release the holds of `owner` acquired at least `grace_ms` milliseconds ago that
     /// `keep` does not keep, as after an operation that acquired them never published
     /// the commit that refers to them. `keep` is asked outside every lock, and a hold
-    /// acquired again in the meantime is not released. Returns the released ids.
+    /// acquired again in the meantime, even with the same commits, is not released.
+    /// Returns the released ids.
     pub fn reconcile_holds(
         &self,
         owner: OwnerKind,
@@ -230,15 +239,18 @@ impl Store {
     ) -> Result<Vec<uuid::Uuid>> {
         self.holds_main()?;
         let cutoff = self.now_ms().saturating_sub(grace_ms.max(0));
-        let candidates: Vec<SourceHold> = self
-            .source_holds()?
-            .into_iter()
-            .filter(|h| h.owner == owner && h.created_ms <= cutoff)
-            .collect();
-        let mut orphans: Vec<(uuid::Uuid, i64)> = Vec::new();
-        for h in &candidates {
+        let candidates: Vec<(SourceHold, u64)> = match &*self.family.holds.state.lock() {
+            HoldsState::Ready(r) => r
+                .values()
+                .filter(|r| r.hold.owner == owner && r.hold.created_ms <= cutoff)
+                .map(|r| (r.hold.clone(), r.touch))
+                .collect(),
+            HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
+        };
+        let mut orphans: Vec<(uuid::Uuid, u64)> = Vec::new();
+        for (h, touch) in &candidates {
             if !keep(h)? {
-                orphans.push((h.id, h.created_ms));
+                orphans.push((h.id, *touch));
             }
         }
         if orphans.is_empty() {
@@ -248,7 +260,7 @@ impl Store {
         self.release_where(|r| {
             orphans
                 .iter()
-                .any(|(id, created)| r.hold.id == *id && r.hold.created_ms == *created)
+                .any(|(id, touch)| r.hold.id == *id && r.touch == *touch)
         })
     }
 
@@ -264,22 +276,41 @@ impl Store {
             return Ok(Vec::new());
         }
         let ids: Vec<uuid::Uuid> = gone.iter().map(|r| r.hold.id).collect();
-        let mut touched: Vec<uuid::Uuid> = gone.iter().flat_map(|r| r.stores.clone()).collect();
-        touched.sort_unstable();
-        touched.dedup();
+        let touched = Self::serving(&gone);
         let mut next = records.clone();
         for id in &ids {
             next.remove(id);
         }
         self.persist_holds(&next)?;
         self.failpoint("holds-release-published");
-        let index = Arc::new(HeldIndex::of(next.values()));
-        self.family.holds.index.store(index.clone());
-        *state = HoldsState::Ready(next);
+        self.install_holds(&mut *state, next, &touched);
         drop(state);
-        self.settle_members(&touched, &index);
         self.collect_members(&touched);
         Ok(ids)
+    }
+
+    /// The stores that serve the commits of `records`.
+    pub(super) fn serving(records: &[&Record]) -> Vec<uuid::Uuid> {
+        let mut out: Vec<uuid::Uuid> = records.iter().flat_map(|r| r.stores.clone()).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Install `next` as the holds, under their lock `state`, and drop the held
+    /// in-memory states of stores `touched` that nothing holds any more.
+    pub(super) fn install_holds(
+        &self,
+        state: &mut HoldsState,
+        next: BTreeMap<uuid::Uuid, Record>,
+        touched: &[uuid::Uuid],
+    ) {
+        self.family
+            .holds
+            .index
+            .store(Arc::new(HeldIndex::of(next.values())));
+        *state = HoldsState::Ready(next);
+        self.settle_members(touched);
     }
 
     /// Write `holds.json` for `records` durably (nothing for an in-memory store).
@@ -319,24 +350,28 @@ impl Store {
                 return Ok(());
             }
             let state = if live.commit == seq {
-                Arc::new(super::mem_history::past(&live))
+                Some(Arc::new(super::mem_history::past(&live)))
             } else {
-                match m.get(seq) {
-                    Some(s) => s,
-                    None => {
-                        drop(m);
-                        let metadata = self.catalog.lock().get(seq);
-                        return Err(self.mem_gone(seq, live.commit, None, metadata));
-                    }
-                }
+                m.get(seq)
             };
-            m.held.insert(seq, state);
+            let metadata = m.kept_commit(seq).or_else(|| self.catalog.lock().get(seq));
+            match (state, metadata) {
+                (Some(state), Some(commit)) => {
+                    m.held.insert(seq, (commit, state));
+                }
+                (_, metadata) => {
+                    drop(m);
+                    return Err(self.mem_gone(seq, live.commit, None, metadata));
+                }
+            }
         }
         Ok(())
     }
 
-    /// Drop the held in-memory states of stores `ids` that `index` no longer holds.
-    fn settle_members(&self, ids: &[uuid::Uuid], index: &HeldIndex) {
+    /// Drop the held in-memory states of stores `ids` that the published index no
+    /// longer holds. Called under the holds' lock, so no acquisition runs meanwhile.
+    fn settle_members(&self, ids: &[uuid::Uuid]) {
+        let index = self.family.holds.index.load_full();
         self.each_member(ids, |m| {
             if let Some(mem) = &m.mem_history {
                 mem.lock()

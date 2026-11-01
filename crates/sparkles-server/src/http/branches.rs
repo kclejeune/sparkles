@@ -910,9 +910,12 @@ async fn delete_branch_inner(
         release_holds: flag("releaseHolds"),
     };
     check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
-    // releasing source holds gives up retained evidence, a retention decision
+    // Releasing source holds gives up retained evidence, a retention decision for the
+    // whole dataset: a hold that names this branch can also hold main's commits, so it
+    // takes what the hold routes take.
     if o.release_holds {
-        check(&p, &name, &branch, Level::Admin, None)?;
+        check(&p, &name, MAIN, Level::Admin, None)?;
+        whole(&p, &name, MAIN)?;
     }
     if branch != MAIN {
         let info = ds.store.branch_info(&branch).ok();

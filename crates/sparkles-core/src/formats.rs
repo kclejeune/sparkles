@@ -721,6 +721,11 @@ pub fn informational(name: &str) -> bool {
 /// [`crate::managed`]).
 pub const WRITE_FENCED_SETTINGS: &[&str] = &["managed.json", "evidence.json"];
 
+/// Dataset settings files that refuse the open only when they are of a newer version.
+/// Any other damage keeps the dataset open and makes the file's owner fail closed:
+/// `holds.json` then keeps every past state (see [`crate::holds`]).
+pub const RETENTION_FENCED_SETTINGS: &[&str] = &["holds.json"];
+
 /// Unpublished branch scratch that existing startup recovery removes by name.
 pub(crate) fn transient_branch_directory(name: &str) -> bool {
     name.starts_with(".create-") || name.ends_with(".deleting")
@@ -777,9 +782,11 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
             && !informational(s.name)
             && !WRITE_FENCED_SETTINGS.contains(&s.name)
     }) {
+        let fenced = RETENTION_FENCED_SETTINGS.contains(&s.name);
         let bytes = match std::fs::read(dir.join(s.name)) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) if fenced => continue,
             Err(e) => {
                 out.push(Error::Io(e));
                 continue;
@@ -790,6 +797,10 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         };
         match check_settings(s.name, &v) {
             Ok(_) => {}
+            Err(Error::Unsupported(m)) if fenced => {
+                out.push(Error::Unsupported(format!("{}: {m}", dir.display())))
+            }
+            Err(_) if fenced => {}
             Err(Error::Unsupported(m)) => {
                 out.push(Error::Unsupported(format!("{}: {m}", dir.display())))
             }

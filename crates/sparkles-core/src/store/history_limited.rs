@@ -43,6 +43,7 @@ impl Store {
                             .map(|(commit, _)| (commit.seq, commit.seq)),
                     )
                     .chain(history.branch_bases.keys().map(|&seq| (seq, seq)))
+                    .chain(history.held.keys().map(|&seq| (seq, seq)))
                     .chain(std::iter::once((head, head))),
                 limit,
             )?
@@ -174,7 +175,7 @@ impl Store {
         }
         let metadata = limit.lock(&self.catalog)?.get(seq);
         let metadata = match (metadata, &self.mem_history) {
-            (None, Some(history)) => limit.lock(history)?.branch_bases.get(&seq).map(|(c, _)| *c),
+            (None, Some(history)) => limit.lock(history)?.kept_commit(seq),
             (metadata, _) => metadata,
         };
         let Some(commit) = metadata else {
@@ -326,6 +327,7 @@ impl Store {
                         .map(|s| s.commit)
                         .chain(history.pins.values().map(|p| p.1.commit))
                         .chain(history.branch_bases.keys().copied())
+                        .chain(history.held.keys().copied())
                         .chain(std::iter::once(head))
                         .map(|seq| (seq, seq)),
                     limit,

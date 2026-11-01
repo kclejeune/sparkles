@@ -608,6 +608,10 @@ pub(crate) fn with_reader(bytes: &[u8], reader: u32) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn require_reader(root: &Path, reader: u32) -> Result<()> {
+    // Callers under different locks, such as a managed-graph enablement under the
+    // writer lock and a source hold under the holds' lock, share `dataset.tmp`.
+    static RAISING: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+    let _raising = RAISING.lock();
     let Some(mut ds) = read_dataset(root)? else {
         return Ok(());
     };
