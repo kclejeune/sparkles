@@ -643,6 +643,12 @@ CSVW's processing rules, which warn about a problem and use the default and keep
 that fails its datatype as a plain string. The default stays strict, and the command
 line and uploads do not expose the mode.
 
+A bulk commit and a compaction switch to a new generation through one shared function,
+and the compaction's last catch-up sync uses the store writer's vocabulary-sync worker
+instead of starting a thread for each sync. A bulk commit reads the size of its new
+log before it switches `CURRENT`, so a failed read no longer leaves the writer on the
+old log after the switch (X14, item 474).
+
 ### Fixed
 
 A PDF converted in a child process no longer fails with "the converter stopped on it"

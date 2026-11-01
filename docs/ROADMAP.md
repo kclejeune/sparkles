@@ -483,7 +483,6 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 
 | # | Item | Spec | Size | Workstream |
 |---|---|---|---|---|
-| 474 | **Dead compaction arm and one generation switch.** `rebuild_locked` takes a plain bulk commit and loses its unreachable compaction arm, `build_generation` splits from a shared `switch_generation`, and the lazy sync worker replaces the thread-per-call `sync_commit`. Behaviour does not change. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
 | 475 | **One join-order planner.** Keep `joinorder.rs` only, lift its 128-variable fallback, and delete the old DP and greedy planners with the `pruned_join_order` toggle, so that item 84 lands on one planner. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
 | 476 | **Superseded replacement toggles.** Remove the off paths of about 15 toggles whose replacements shipped, keep the algorithm toggles used for diagnosis and move reference evaluation into a test-only evaluator. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
 | 477 | **Shared format registry and small helpers.** One registry of format names, extensions and media types, one inferred-graph constant, one duration parser and one durable atomic-write helper replace their copies, and the draft mapping writer escapes Turtle strings as the main writer does. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | S | 453 |
@@ -747,6 +746,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **474.** The dead compaction arm of `rebuild_locked` and one shared generation switch for bulk commits and compactions. [X14](specs/X14-unified-executor/SPEC.md#dead-compaction-arm-and-one-generation-switch)
 - **413.** Load-time checks of view definitions, the `COMPILER` version test and the views runtime split into modules. [F13](specs/F13-incremental-views-and-provenance.md#outcome)
 - **2.** Server-wide cache sizing and query memory pool. [X08](specs/X08-disk-spill-and-server-memory.md) Phase 1
 - **3.** Group commit as the default. [X09](specs/X09-group-commit-by-default.md)

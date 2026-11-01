@@ -1454,6 +1454,52 @@ struct BulkCommit {
     default_graph: bool,
 }
 
+/// What [`Store::build_generation`] builds a bulk commit's generation from.
+struct GenerationInput<'a> {
+    extra: &'a [Source],
+    extra_quads: &'a [[Id; 4]],
+    drop_graphs: &'a [Id],
+    /// the managed graphs the sources may not write
+    fence: Option<crate::managed::GraphFence>,
+    /// the most changed quads the build collects for the change log
+    change_cap: Option<u64>,
+    opts: &'a crate::guard::WriteOptions,
+    /// a dry run, which records a refused storage check instead of failing
+    dry: bool,
+}
+
+/// A bulk commit's generation, built and not yet published.
+struct BuiltGeneration {
+    dir: PathBuf,
+    name: String,
+    /// the temporary directory of an in-memory store's generation
+    tmp: Option<tempfile::TempDir>,
+    meta: IndexMeta,
+    storage: crate::preview::StorageCheck,
+    /// the quads the sources gave, when the change tap collected them all
+    sourced: Option<Vec<QuadKey>>,
+    /// the quads of the dropped graphs, unless there were more than the change cap
+    dropped: Option<Vec<[Id; 4]>>,
+}
+
+/// A failed switch of `CURRENT` (see [`Store::switch_generation`]).
+struct SwitchFailed {
+    error: Error,
+    /// `CURRENT` may name the new generation, and the writer took no more writes
+    maybe_switched: bool,
+}
+
+/// The log of a generation that `CURRENT` now names, which the writer moves onto (see
+/// [`Store::adopt_generation_log`]).
+struct NextLog {
+    wal: BufWriter<File>,
+    tail: Arc<wal::Tail>,
+    len: u64,
+    index: wal::WalIndex,
+    /// the space the new generation's delta vocabulary has preallocated
+    vocab_preallocated: u64,
+}
+
 /// Counts a writer waiting for the writer lock while it lives.
 struct Waiting<'a>(&'a AtomicUsize);
 
@@ -4878,9 +4924,9 @@ impl Store {
                 start_len: snap.len(),
                 default_graph: sources_reach_default_graph(sources),
             };
-            let check = Some((crate::guard::Changes::Unknown, o));
+            let check = (crate::guard::Changes::Unknown, o);
             Ok(self
-                .rebuild_locked(&mut w, &snap, sources, &[], &[], Some(bulk), check)?
+                .rebuild_locked(&mut w, &snap, sources, &[], &[], bulk, check)?
                 .1)
         } else {
             let mut txn = self.try_write_with(kind, o.clone())?;
@@ -5093,9 +5139,8 @@ impl Store {
             default_graph: graphs.contains(&Id::DEFAULT_GRAPH)
                 || sources_reach_default_graph(sources),
         };
-        let check = Some((crate::guard::Changes::Unknown, o));
-        let (_, r) =
-            self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, Some(bulk), check)?;
+        let check = (crate::guard::Changes::Unknown, o);
+        let (_, r) = self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, bulk, check)?;
         // the quads the replacement holds: what is left, less what was kept
         Ok(((r.commit.quads + dropped).saturating_sub(start_len), r))
     }
@@ -5108,9 +5153,11 @@ impl Store {
         Ok(())
     }
 
-    /// Rebuild with the writer lock held: a new generation from `snap` plus `extra`
-    /// sources and `extra_quads` (encoded store ids from a bulk write transaction).
-    /// With `bulk`, the rebuild is a new commit; without it (compaction), the head stays.
+    /// Rebuild with the writer lock held: a bulk commit of a new generation built from
+    /// `snap` plus `extra` sources and `extra_quads` (encoded store ids from a bulk write
+    /// transaction), less the graphs in `drop_graphs`. A compaction keeps the head and
+    /// builds and catches up on its own (see [`compact_with`](Self::compact_with)); both
+    /// publish through [`switch_generation`](Self::switch_generation).
     /// Returns the number of new quads and the receipt.
     #[allow(clippy::too_many_arguments)]
     fn rebuild_locked(
@@ -5120,44 +5167,33 @@ impl Store {
         extra: &[Source],
         extra_quads: &[[Id; 4]],
         drop_graphs: &[Id],
-        bulk: Option<BulkCommit>,
-        check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
+        bulk: BulkCommit,
+        check: (crate::guard::Changes<'_>, &crate::guard::WriteOptions),
     ) -> Result<(u64, Receipt)> {
-        // A bulk commit's graphs: those it drops are checked here, and its sources
-        // are checked quad by quad while the build reads them.
-        let fence = match &bulk {
-            Some(b) => {
-                self.check_protected(b.kind)?;
-                self.admit_managed_ids(snap, drop_graphs.iter().copied(), None)?;
-                if extra.is_empty() {
-                    None
-                } else {
-                    self.managed_fence()?
-                }
-            }
-            None => None,
+        let (changes, o) = check;
+        // The graphs it drops are checked here, and its sources are checked quad by quad
+        // while the build reads them.
+        self.check_protected(bulk.kind)?;
+        self.admit_managed_ids(snap, drop_graphs.iter().copied(), None)?;
+        let fence = if extra.is_empty() {
+            None
+        } else {
+            self.managed_fence()?
         };
         let started = std::time::Instant::now();
         let before = snap.len();
-        // the head state before a bulk commit, whose changes the change log records
+        // the head state before the bulk commit, whose changes the change log records
         let prior = self.snapshot();
         // a running compaction gives up: this rebuild makes a new generation itself
         w.tap = None;
-        if bulk.is_some() {
-            self.compaction.rebuilding.store(true, Ordering::Relaxed);
-        }
-        let _rebuilding = bulk
-            .is_some()
-            .then(|| compaction::Rebuilding(&self.compaction.rebuilding));
-        let message = match (&bulk, check.as_ref().and_then(|(_, o)| o.message.as_ref())) {
-            (Some(_), Some(m)) => crate::annotations::validate_message(m)?,
-            _ => None,
+        self.compaction.rebuilding.store(true, Ordering::Relaxed);
+        let _rebuilding = compaction::Rebuilding(&self.compaction.rebuilding);
+        let message = match o.message.as_ref() {
+            Some(m) => crate::annotations::validate_message(m)?,
+            None => None,
         };
         // a dry run builds and checks the generation, then removes it (see `preview`)
-        let dry = match (&bulk, &check) {
-            (Some(_), Some((_, o))) => o.dry_run.clone(),
-            _ => None,
-        };
+        let dry = o.dry_run.clone();
         if dry.is_none() {
             // the old generation's WAL is the only other copy of the recent commits' ids:
             // the catalog must be durable before it is discarded
@@ -5178,110 +5214,35 @@ impl Store {
                 ti.checkpoint()?;
             }
         }
-        let (dir, name, tmp) = match &self.root {
-            Some(root) => {
-                // above a number a background compaction is building in
-                let n: u32 = snap
-                    .generation
-                    .name
-                    .strip_prefix("gen-")
-                    .and_then(|x| x.parse().ok())
-                    .unwrap_or(0)
-                    .max(self.compaction.reserved.load(Ordering::Relaxed))
-                    + 1;
-                let name = format!("gen-{n:04}");
-                let dir = root.join(&name);
-                if dir.exists() {
-                    std::fs::remove_dir_all(&dir)?;
-                }
-                (dir, name, None)
-            }
-            None => {
-                let t = tempfile::Builder::new().prefix("sparkles-mem-").tempdir()?;
-                (t.path().to_path_buf(), "mem".to_string(), Some(t))
-            }
-        };
-        let mut bopts = self.build_options();
-        bopts.first_bnode = w.next_bnode;
-        let wopts = check.as_ref().map(|(_, o)| (*o).clone());
-        let interrupt = self.build_interrupt(wopts.clone(), &dir);
         // What a bulk commit into a dataset that is not empty changes: the quads of its
         // sources and of the graphs it drops are collected as the build reads them, up to
         // the change log's limit, so the log need not compare the two states.
-        let change_cap = if bulk.is_some() && dry.is_none() && !prior.is_empty() {
+        let change_cap = if dry.is_none() && !prior.is_empty() {
             self.bulk_change_cap()
         } else {
             None
         };
-        let mut sourced: Option<Vec<QuadKey>> = None;
-        let mut dropped: Vec<[Id; 4]> = Vec::new();
-        let mut dropped_over = false;
-        let built = (|| {
-            let mut builder = Builder::new(&dir, bopts)?;
-            if let Some(i) = interrupt.clone() {
-                builder = builder.with_interrupt(i);
-            }
-            if let Some(f) = fence.clone() {
-                builder = builder.with_graph_fence(f);
-            }
-            if let Some(cap) = change_cap {
-                builder = builder.with_change_tap(cap);
-            }
-            write_snapshot(
-                &builder,
-                snap,
-                None,
-                |q| {
-                    if !drop_graphs.contains(&q[3]) {
-                        return Ok(true);
-                    }
-                    if let Some(cap) = change_cap {
-                        if (dropped.len() as u64) < cap {
-                            dropped.push(*q);
-                        } else {
-                            dropped_over = true;
-                        }
-                    }
-                    Ok(false)
-                },
+        let BuiltGeneration {
+            dir,
+            name,
+            tmp,
+            meta,
+            storage,
+            sourced,
+            dropped,
+        } = self.build_generation(
+            w,
+            snap,
+            GenerationInput {
+                extra,
                 extra_quads,
-            )?;
-            for s in extra {
-                builder.add_source(s)?;
-            }
-            sourced = builder.take_tapped();
-            builder.add_prefixes(self.prefixes());
-            let meta = builder.finish()?;
-            // a write stopped while it was built publishes nothing
-            if let Some(i) = &interrupt {
-                i()?;
-            }
-            let mut storage = crate::preview::StorageCheck::default();
-            if bulk.is_some() {
-                let old = snap.generation.dir.as_deref();
-                if dry.is_some() {
-                    storage = self.rebuild_storage(old, &dir);
-                }
-                let fits = self
-                    .check_memory(dir_size(&dir))
-                    .and_then(|_| self.quota.check_rebuild(old, &dir));
-                match fits {
-                    Err(e) if dry.is_some() => storage.refused = Some(e),
-                    r => r?,
-                }
-            }
-            Ok((meta, storage))
-        })();
-        let (meta, storage) = match built {
-            Ok(m) => m,
-            Err(e) => {
-                // the unfinished generation's space is freed now, not at the next rebuild
-                if self.root.is_some() {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-                return Err(e);
-            }
-        };
+                drop_graphs,
+                fence,
+                change_cap,
+                opts: o,
+                dry: dry.is_some(),
+            },
+        )?;
         let mut gen_ = Generation::open(&dir, &name, self.root.is_some())?;
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
@@ -5310,43 +5271,35 @@ impl Store {
                 change_log: self.changelog.clone(),
             })
         };
-        // a bulk commit is validated on the built generation, before anything is published
-        let validation = match (&bulk, check) {
-            (Some(b), Some((changes, o))) => {
-                match self.run_guard(snap, candidate, b.kind, changes, o, head_seq) {
-                    Ok(v) => v,
-                    Err(Error::Rejected(r)) if dry.is_some() => Some(Arc::new(r.summary)),
-                    Err(e) => {
-                        drop(gen_);
-                        if self.root.is_some() {
-                            let _ = std::fs::remove_dir_all(&dir);
-                        }
-                        return Err(e);
-                    }
+        // the bulk commit is validated on the built generation, before anything is published
+        let validation = match self.run_guard(snap, candidate, bulk.kind, changes, o, head_seq) {
+            Ok(v) => v,
+            Err(Error::Rejected(r)) if dry.is_some() => Some(Arc::new(r.summary)),
+            Err(e) => {
+                drop(gen_);
+                if self.root.is_some() {
+                    let _ = std::fs::remove_dir_all(&dir);
                 }
+                return Err(e);
             }
-            _ => None,
         };
-        let head = match &bulk {
-            Some(b) => CommitInfo {
-                seq: w.head.seq + 1,
-                timestamp_ms: self.commit_time(&w.head),
-                kind: b.kind,
-                inserted: (meta.quads + b.net_del).saturating_sub(b.start_len),
-                deleted: b.net_del,
-                quads: meta.quads,
-                generation: commit::generation_number(&name),
-                bulk: true,
-                exact: b.net_del == 0,
-                reconstructed: false,
-                default_graph: b.default_graph,
-                unvalidated: validation
-                    .as_ref()
-                    .is_some_and(|v| v.status == crate::guard::GuardStatus::Bypassed),
-            },
-            None => w.head,
+        let head = CommitInfo {
+            seq: w.head.seq + 1,
+            timestamp_ms: self.commit_time(&w.head),
+            kind: bulk.kind,
+            inserted: (meta.quads + bulk.net_del).saturating_sub(bulk.start_len),
+            deleted: bulk.net_del,
+            quads: meta.quads,
+            generation: commit::generation_number(&name),
+            bulk: true,
+            exact: bulk.net_del == 0,
+            reconstructed: false,
+            default_graph: bulk.default_graph,
+            unvalidated: validation
+                .as_ref()
+                .is_some_and(|v| v.status == crate::guard::GuardStatus::Bypassed),
         };
-        if let (Some(dr), Some((changes, o))) = (&dry, check) {
+        if let Some(dr) = &dry {
             let preview = self.preview_bulk(crate::store::preview::BulkPreview {
                 head: w.head,
                 view: snap,
@@ -5368,72 +5321,61 @@ impl Store {
             self.quota.invalidate();
             return Err(Error::DryRun(Box::new(preview?)));
         }
-        // the last check of a bulk commit, before anything of it becomes durable
-        if bulk.is_some()
-            && let Some((_, o)) = &check
-            && let Err(e) = o.check_publish()
-        {
+        // the last check of the bulk commit, before anything of it becomes durable
+        if let Err(e) = o.check_publish() {
             drop(gen_);
             if self.root.is_some() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
             return Err(e);
         }
-        let mut annotation = crate::annotations::Annotation::default();
+        let annotation;
         if let Some(root) = &self.root {
             // Publication order: the new generation's files (with the commit its base
             // holds) and directory entries are durable, its WAL file exists durably, then
             // CURRENT switches durably, and only after that is the old generation removed.
-            let origin = if bulk.is_some() { "bulk" } else { "compaction" };
             write_synced(
                 &dir.join("commit.json"),
-                &commit::gen_commit_bytes(self.dataset_id, origin, &head),
+                &commit::gen_commit_bytes(self.dataset_id, "bulk", &head),
             )?;
             let wal = wal::open_for_append(&dir.join("wal.log"))?;
+            let wal_size = wal.metadata()?.len();
             sync_dir(&dir)?;
             sync_dir(root)?;
-            // a bulk commit's message is durable before the switch (no digest: its
-            // change set is not at hand)
-            if bulk.is_some() {
-                annotation = self.annotate(&head, message.clone(), || None)?;
-            }
-            if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
-                // CURRENT may name the new generation, or a read that fails leaves it
-                // unknown
-                let maybe_switched = std::fs::read_to_string(root.join("CURRENT"))
-                    .map_or(true, |c| c.trim() == name);
-                if maybe_switched {
-                    // The next open may use the new generation, so the bulk commit may
-                    // come back and keeps its annotation. Later commits to the old
-                    // generation would be lost, so the writer takes no more.
-                    w.poisoned = true;
-                } else if !annotation.is_empty() && self.annotations.lock().undo(head.seq).is_err()
+            // the commit's message is durable before the switch (no digest: its change
+            // set is not at hand)
+            annotation = self.annotate(&head, message.clone(), || None)?;
+            if let Err(f) = self.switch_generation(w, root, &name) {
+                // Unless CURRENT may name the new generation, in which case the next open
+                // may bring the bulk commit back with its annotation, the annotation goes.
+                if !f.maybe_switched
+                    && !annotation.is_empty()
+                    && self.annotations.lock().undo(head.seq).is_err()
                 {
                     w.poisoned = true;
                 }
-                return Err(e);
+                return Err(f.error);
             }
-            w.trim_wal();
-            // the old generation's vocabulary takes no more writes either
-            self.snapshot().generation.dvocab.trim();
-            self.quota.set_vocab_preallocated(0);
-            w.tail = wal::Tail::new(wal.metadata()?.len(), wal::HEADER_BYTES);
-            w.wal = Some(BufWriter::new(wal));
-            // the new log holds its header record
-            w.wal_len = wal::HEADER_BYTES;
-            self.wal_end.store(wal::HEADER_BYTES, Ordering::Relaxed);
-            self.quota.set_preallocated(0);
-            *gen_.wal_index.lock() = Some(wal::WalIndex::new(head.seq, false));
-        } else if bulk.is_some() {
+            self.adopt_generation_log(
+                w,
+                &gen_,
+                NextLog {
+                    wal: BufWriter::new(wal),
+                    // the new log holds its header record
+                    tail: wal::Tail::new(wal_size, wal::HEADER_BYTES),
+                    len: wal::HEADER_BYTES,
+                    index: wal::WalIndex::new(head.seq, false),
+                    vocab_preallocated: 0,
+                },
+            );
+        } else {
             annotation = self.annotate(&head, message.clone(), || None)?;
         }
         // the switch is the commit point: a failure after it leaves the published state
         // behind the durable one, so later writes are refused
-        if bulk.is_some() {
-            w.head = head;
-            self.catalog.lock().append(head);
-            self.forget_annotations();
-        }
+        w.head = head;
+        self.catalog.lock().append(head);
+        self.forget_annotations();
         self.compaction
             .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
         if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
@@ -5453,11 +5395,7 @@ impl Store {
             results: self.results.clone(),
             dvocab_len,
             commit: head.seq,
-            text: if bulk.is_some() {
-                None
-            } else {
-                snap.text.clone()
-            },
+            text: None,
             geo: None,
             union_default_graph: self.opts.union_default_graph,
             geo_op_vertices: self.opts.geo_op_vertices,
@@ -5466,43 +5404,36 @@ impl Store {
             historical: false,
             change_log: self.changelog.clone(),
         };
-        if bulk.is_some() {
-            self.rebuild_text_locked(&mut new_snap, &prior);
-            // the bulk commit's changes, while the state before it is at hand
-            let author = check.as_ref().and_then(|(_, o)| o.author.clone());
-            let txn_log: &[(u8, [Id; 4])] = match check.as_ref().map(|c| c.0) {
-                Some(crate::guard::Changes::Rebuilt { log, .. }) => log,
-                _ => &[],
-            };
-            let candidates = change_cap.map(|_| changelog::BulkCandidates {
-                sources: sourced,
-                dropped: (!dropped_over).then_some(dropped),
-                view: snap,
-                log: txn_log,
-                bulk: extra_quads,
-            });
-            self.log_bulk_commit(
-                &head,
-                message.clone(),
-                author,
-                &prior,
-                &new_snap,
-                candidates,
-            );
-        }
-        // a new generation needs its own spatial base (bulk commits and compactions)
+        self.rebuild_text_locked(&mut new_snap, &prior);
+        // the bulk commit's changes, while the state before it is at hand
+        let txn_log: &[(u8, [Id; 4])] = match changes {
+            crate::guard::Changes::Rebuilt { log, .. } => log,
+            _ => &[],
+        };
+        let candidates = change_cap.map(|_| changelog::BulkCandidates {
+            sources: sourced,
+            dropped,
+            view: snap,
+            log: txn_log,
+            bulk: extra_quads,
+        });
+        self.log_bulk_commit(
+            &head,
+            message.clone(),
+            o.author.clone(),
+            &prior,
+            &new_snap,
+            candidates,
+        );
+        // a new generation needs its own spatial base
         self.rebuild_geo_locked(&mut new_snap, snap);
-        if bulk.is_some() {
-            self.remember_past(head.seq);
-        }
+        self.remember_past(head.seq);
         self.current.store(Arc::new(new_snap));
         self.commits.send_replace(head.seq);
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
-        if bulk.is_some() {
-            // a bulk commit has no log to schedule embeddings from
-            self.embed_bulk(head.seq);
-        }
+        // a bulk commit has no log to schedule embeddings from
+        self.embed_bulk(head.seq);
         // The old generation is kept if history needs it, else removed; open readers
         // keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
@@ -5538,11 +5469,8 @@ impl Store {
                 }
             }
         }
-        if validation.is_some() && bulk.is_some() {
+        if validation.is_some() {
             self.guard_committed(head.seq);
-        }
-        if bulk.is_none() {
-            annotation = self.annotation(head.seq).unwrap_or_default();
         }
         // a linked branch that rebuilt no longer reads its upstream's files
         self.release_link_if_rebuilt();
@@ -5550,12 +5478,174 @@ impl Store {
         self.quota.invalidate();
         let receipt = Receipt {
             dataset_id: self.owner_dataset_id(),
-            committed: bulk.is_some(),
+            committed: true,
             commit: head,
             validation,
             annotation,
         };
         Ok((meta.quads.saturating_sub(before), receipt))
+    }
+
+    /// Build the generation of a bulk commit next to the current one: the quads of
+    /// `snap` outside the dropped graphs, the encoded extra quads and the sources. A
+    /// build that fails removes its directory. A bulk commit also checks the built
+    /// generation's size against the memory limit and quota, which a dry run records
+    /// in the returned storage check instead of failing.
+    fn build_generation(
+        &self,
+        w: &WriterState,
+        snap: &Snapshot,
+        input: GenerationInput<'_>,
+    ) -> Result<BuiltGeneration> {
+        let GenerationInput {
+            extra,
+            extra_quads,
+            drop_graphs,
+            fence,
+            change_cap,
+            opts: o,
+            dry,
+        } = input;
+        let (dir, name, tmp) = match &self.root {
+            Some(root) => {
+                // above a number a background compaction is building in
+                let n: u32 = snap
+                    .generation
+                    .name
+                    .strip_prefix("gen-")
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(0)
+                    .max(self.compaction.reserved.load(Ordering::Relaxed))
+                    + 1;
+                let name = format!("gen-{n:04}");
+                let dir = root.join(&name);
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)?;
+                }
+                (dir, name, None)
+            }
+            None => {
+                let t = tempfile::Builder::new().prefix("sparkles-mem-").tempdir()?;
+                (t.path().to_path_buf(), "mem".to_string(), Some(t))
+            }
+        };
+        let mut bopts = self.build_options();
+        bopts.first_bnode = w.next_bnode;
+        let interrupt = self.build_interrupt(Some(o.clone()), &dir);
+        let mut sourced: Option<Vec<QuadKey>> = None;
+        let mut dropped: Vec<[Id; 4]> = Vec::new();
+        let mut dropped_over = false;
+        let built = (|| {
+            let mut builder = Builder::new(&dir, bopts)?;
+            if let Some(i) = interrupt.clone() {
+                builder = builder.with_interrupt(i);
+            }
+            if let Some(f) = fence {
+                builder = builder.with_graph_fence(f);
+            }
+            if let Some(cap) = change_cap {
+                builder = builder.with_change_tap(cap);
+            }
+            write_snapshot(
+                &builder,
+                snap,
+                None,
+                |q| {
+                    if !drop_graphs.contains(&q[3]) {
+                        return Ok(true);
+                    }
+                    if let Some(cap) = change_cap {
+                        if (dropped.len() as u64) < cap {
+                            dropped.push(*q);
+                        } else {
+                            dropped_over = true;
+                        }
+                    }
+                    Ok(false)
+                },
+                extra_quads,
+            )?;
+            for s in extra {
+                builder.add_source(s)?;
+            }
+            sourced = builder.take_tapped();
+            builder.add_prefixes(self.prefixes());
+            let meta = builder.finish()?;
+            // a write stopped while it was built publishes nothing
+            if let Some(i) = &interrupt {
+                i()?;
+            }
+            let mut storage = crate::preview::StorageCheck::default();
+            let old = snap.generation.dir.as_deref();
+            if dry {
+                storage = self.rebuild_storage(old, &dir);
+            }
+            let fits = self
+                .check_memory(dir_size(&dir))
+                .and_then(|_| self.quota.check_rebuild(old, &dir));
+            match fits {
+                Err(e) if dry => storage.refused = Some(e),
+                r => r?,
+            }
+            Ok((meta, storage))
+        })();
+        match built {
+            Ok((meta, storage)) => Ok(BuiltGeneration {
+                dir,
+                name,
+                tmp,
+                meta,
+                storage,
+                sourced,
+                dropped: (!dropped_over).then_some(dropped),
+            }),
+            Err(e) => {
+                // the unfinished generation's space is freed now, not at the next rebuild
+                if self.root.is_some() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Switch `CURRENT` durably to the generation `name`, the commit point of a bulk
+    /// commit and of a compaction. When the write fails and `CURRENT` may name the new
+    /// generation, or a read that fails leaves it unknown, the next open may use the new
+    /// generation, which lacks the commits this process would make to the old one, so
+    /// the writer takes no more.
+    fn switch_generation(
+        &self,
+        w: &mut WriterState,
+        root: &Path,
+        name: &str,
+    ) -> std::result::Result<(), SwitchFailed> {
+        let Err(error) = write_atomic(&root.join("CURRENT"), name.as_bytes()) else {
+            return Ok(());
+        };
+        let maybe_switched =
+            std::fs::read_to_string(root.join("CURRENT")).map_or(true, |c| c.trim() == name);
+        if maybe_switched {
+            w.poisoned = true;
+        }
+        Err(SwitchFailed {
+            error,
+            maybe_switched,
+        })
+    }
+
+    /// Move the writer onto the log of the generation `gen_` that `CURRENT` now names.
+    /// The old generation's log and vocabulary take no more writes.
+    fn adopt_generation_log(&self, w: &mut WriterState, gen_: &Generation, next: NextLog) {
+        w.trim_wal();
+        self.snapshot().generation.dvocab.trim();
+        self.quota.set_vocab_preallocated(next.vocab_preallocated);
+        w.wal = Some(next.wal);
+        w.tail = next.tail;
+        w.wal_len = next.len;
+        self.wal_end.store(next.len, Ordering::Relaxed);
+        self.quota.set_preallocated(0);
+        *gen_.wal_index.lock() = Some(next.index);
     }
 
     /// Build the generation directory `gdir` from `snap`: every quad `keep` accepts (of
@@ -6596,22 +6686,16 @@ impl WriteTxn<'_> {
                 || bulk.iter().any(|q| q[3] == Id::DEFAULT_GRAPH),
         };
         let log = std::mem::take(&mut self.log);
-        let check = Some((
+        let check = (
             crate::guard::Changes::Rebuilt {
                 log: &log,
                 bulk: &bulk,
             },
             &self.opts,
-        ));
-        let (_, receipt) = self.store.rebuild_locked(
-            &mut self.guard,
-            &view,
-            &[],
-            &bulk,
-            &[],
-            Some(commit),
-            check,
-        )?;
+        );
+        let (_, receipt) =
+            self.store
+                .rebuild_locked(&mut self.guard, &view, &[], &bulk, &[], commit, check)?;
         Ok(receipt)
     }
 
@@ -7424,29 +7508,6 @@ fn commit_direct(
     Ok(written)
 }
 
-fn sync_commit(wal: &File, dvocab: &DeltaVocab) -> Result<()> {
-    if !dvocab.needs_sync() {
-        return Ok(wal.sync_data()?);
-    }
-    // the caller wrote both files' new bytes before either sync starts, so that both
-    // are part of the journal commit the first sync starts
-    std::thread::scope(|s| {
-        let vocab = std::thread::Builder::new()
-            .name("vocab-sync".into())
-            .spawn_scoped(s, || dvocab.sync());
-        let synced = wal.sync_data();
-        let vocab = match vocab {
-            Ok(h) => h.join().unwrap_or_else(|_| {
-                Err(std::io::Error::other("the delta vocabulary sync panicked").into())
-            }),
-            // no thread to spare: one after the other
-            Err(_) => dvocab.sync(),
-        };
-        synced?;
-        vocab
-    })
-}
-
 /// The highest delta-vocabulary id among `quads`, plus one (0 when they name none).
 fn delta_ids_end<'a>(quads: impl IntoIterator<Item = &'a [Id; 4]>) -> u64 {
     quads
@@ -7729,7 +7790,7 @@ pub(crate) fn replay_wal(
                     )));
                 }
                 // A commit's new terms and its WAL records are synced at the same time
-                // (see `sync_commit`): after a crash, a commit that was not durable yet
+                // (see `sync_commit_reused`): after a crash, a commit that was not durable yet
                 // may name terms that did not reach `delta.vocab`.
                 let needs = delta_ids_end(pending.iter().map(|(_, q)| q));
                 if needs > dvocab_len {

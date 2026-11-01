@@ -1,6 +1,6 @@
 # X14: Unified executor
 
-> **Status:** planned.
+> **Status:** in progress.
 >
 > **Roadmap:** [item 453](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -178,4 +178,19 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 453](../../ROADMAP.md) tracks the work.
+Stage 1 is under way, and [item 453](../../ROADMAP.md) tracks the rest of the work.
+
+### Dead compaction arm and one generation switch
+
+Item 474 shipped. `rebuild_locked` takes a plain `BulkCommit` and its write options,
+since every caller passes a bulk commit, and the branches that served a compaction
+through it are gone. The build of a bulk commit's generation is its own function,
+`build_generation`. A bulk commit and a compaction switch `CURRENT` through one
+function, `switch_generation`, which poisons the writer when the switch may have
+happened, and move the writer onto the new generation's log through one function,
+`adopt_generation_log`. The compaction's last catch-up sync runs the delta-vocabulary
+sync on the store writer's lazily started worker instead of a thread spawned per call,
+and the thread-per-call `sync_commit` is deleted. A bulk commit now reads the size of
+its new log before the switch rather than after it, so a failed read can no longer
+leave the writer on the old log after `CURRENT` moved. Behaviour is otherwise unchanged,
+and the existing compaction, bulk-load, relink and crash-boundary tests cover the paths.
