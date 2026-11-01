@@ -1288,3 +1288,26 @@ python3 scripts/bench-gate.py w3c "$out/output.log" --out "$out/record.json" \
   --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
   --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)"
 '''
+
+[tasks."bench:incr"]
+description = "Incremental view maintenance (item 471): every test of crates/sparkles-core/tests/incr_bench.rs in release mode, alone, into a gate record"
+usage = '''
+flag "--people <n>" default="200000" help="people in the generated data (about 6 quads each)"
+flag "--out <dir>" help="results directory (default .artifacts/bench-incr/<UTC time>)"
+'''
+run = '''
+set -e
+out=$(realpath -m "${usage_out:-.artifacts/bench-incr/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+[ ! -e "$out/metrics.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
+started=$(date -u +%FT%TZ)
+INCR_BENCH_PEOPLE="$usage_people" INCR_BENCH_JSON="$out/metrics.jsonl" \
+  mbx test --release -p sparkles-core --test incr_bench -- --ignored --nocapture --test-threads 1 \
+  | tee "$out/output.md"
+python3 scripts/bench-gate.py metrics "$out/metrics.jsonl" --gate incr --suite incremental-views \
+  --scale "$usage_people people" --threshold 0.10 --out "$out/record.json" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" \
+  --manifest rustc="$(rustc -V)" --setting people="$usage_people" \
+  --setting harness="crates/sparkles-core/tests/incr_bench.rs" --setting load="$(cut -d' ' -f1-3 /proc/loadavg)"
+'''

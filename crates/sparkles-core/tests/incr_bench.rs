@@ -7,6 +7,9 @@
 //! ```
 //!
 //! `INCR_BENCH_PEOPLE` sets the size (200,000 people, about 1.2M quads, by default).
+//! `INCR_BENCH_JSON=path` also appends each measured value as a JSON line, which
+//! `scripts/bench-gate.py metrics` turns into a gate record. `mise run bench:incr` runs
+//! every test this way (ROADMAP item 471, docs/benchmarks/writes/README.md).
 
 use sparkles_core::incr::{LiveOptions, OpenHost, Runtime, RuntimeOptions, ViewDef};
 use sparkles_core::io::{RdfFormat, Source};
@@ -67,6 +70,21 @@ fn upd(s: &Store, u: &str) {
 fn fresh() -> usize {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Append one value to `INCR_BENCH_JSON`, when it is set. `better` is `lower` or `higher`.
+fn metric(key: &str, value: f64, unit: &str, better: &str) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("INCR_BENCH_JSON") else {
+        return;
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    let line = serde_json::json!({ "key": key, "value": value, "unit": unit, "better": better });
+    writeln!(f, "{line}").unwrap();
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -151,11 +169,16 @@ fn pass_against_recompute() {
         let qm = pct(&mut query, 0.5);
         let pm = pct(&mut passes, 0.5);
         let p95 = pct(&mut passes, 0.95);
+        let state = info.state_bytes as f64 / (1 << 20) as f64;
         println!(
-            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {:.0} | {:.1} |",
+            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {:.0} | {state:.1} |",
             qm / pm,
-            info.state_bytes as f64 / (1 << 20) as f64
         );
+        metric(&format!("pass/{name}/build"), build, "ms", "lower");
+        metric(&format!("pass/{name}/query"), qm, "ms", "lower");
+        metric(&format!("pass/{name}/pass-median"), pm, "ms", "lower");
+        metric(&format!("pass/{name}/pass-p95"), p95, "ms", "lower");
+        metric(&format!("pass/{name}/state"), state, "MiB", "lower");
         rt.delete(name).unwrap();
         rt.round(&s);
     }
@@ -221,9 +244,21 @@ fn commit_latency_with_views() {
             }
         }
         let _ = head;
-        println!(
-            "| {views} | {med:.3} | {p99:.3} | {rate:.0} | {:.0} |",
-            t.elapsed().as_secs_f64() * 1e3
+        let catch_up = t.elapsed().as_secs_f64() * 1e3;
+        println!("| {views} | {med:.3} | {p99:.3} | {rate:.0} | {catch_up:.0} |");
+        metric(&format!("commits/{views}-views/median"), med, "ms", "lower");
+        metric(&format!("commits/{views}-views/p99"), p99, "ms", "lower");
+        metric(
+            &format!("commits/{views}-views/rate"),
+            rate,
+            "commits/s",
+            "higher",
+        );
+        metric(
+            &format!("commits/{views}-views/catch-up"),
+            catch_up,
+            "ms",
+            "lower",
         );
         rt.close(&s);
         drop(rt);
@@ -240,12 +275,39 @@ fn commit_path_without_views() {
     let n = people() / 4;
     let dir = tempfile::tempdir().unwrap();
     let s = store(n, Some(dir.path()));
+    // the median over the rounds of each value, for the gate record
+    let rounds = |case: &str, all: &mut Vec<(f64, f64, f64)>| {
+        let mut med: Vec<f64> = all.iter().map(|r| r.0).collect();
+        let mut p99: Vec<f64> = all.iter().map(|r| r.1).collect();
+        let mut rate: Vec<f64> = all.iter().map(|r| r.2).collect();
+        metric(
+            &format!("commit-path/{case}/median"),
+            pct(&mut med, 0.5),
+            "ms",
+            "lower",
+        );
+        metric(
+            &format!("commit-path/{case}/p99"),
+            pct(&mut p99, 0.5),
+            "ms",
+            "lower",
+        );
+        metric(
+            &format!("commit-path/{case}/rate"),
+            pct(&mut rate, 0.5),
+            "commits/s",
+            "higher",
+        );
+    };
+    let mut all = Vec::new();
     for round in 0..3 {
         let (med, p99, rate) = commits(&s, 3000);
         println!(
             "no views, round {round}: median {med:.3} ms, p99 {p99:.3} ms, {rate:.0} commits/s"
         );
+        all.push((med, p99, rate));
     }
+    rounds("no-views", &mut all);
     let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
     rt.set_host(Arc::new(OpenHost));
     let live = rt
@@ -256,12 +318,15 @@ fn commit_path_without_views() {
             &LiveOptions::default(),
         )
         .unwrap();
+    let mut all = Vec::new();
     for round in 0..3 {
         let (med, p99, rate) = commits(&s, 3000);
         println!(
             "ring filled, round {round}: median {med:.3} ms, p99 {p99:.3} ms, {rate:.0} commits/s"
         );
+        all.push((med, p99, rate));
     }
+    rounds("live-query", &mut all);
     drop(live);
 }
 
@@ -304,12 +369,11 @@ fn pass_breakdown() {
             c.advance(&d, &Control::none()).unwrap();
             adv.push(t.elapsed().as_secs_f64() * 1e6);
         }
-        println!(
-            "| {name} | {:.1} | {:.1} | {:.1} |",
-            pct(&mut read, 0.5),
-            pct(&mut old, 0.5),
-            pct(&mut adv, 0.5)
-        );
+        let (r, o, a) = (pct(&mut read, 0.5), pct(&mut old, 0.5), pct(&mut adv, 0.5));
+        println!("| {name} | {r:.1} | {o:.1} | {a:.1} |");
+        metric(&format!("breakdown/{name}/read"), r, "µs", "lower");
+        metric(&format!("breakdown/{name}/old"), o, "µs", "lower");
+        metric(&format!("breakdown/{name}/advance"), a, "µs", "lower");
     }
 }
 
@@ -439,12 +503,22 @@ fn inferred_pass_against_query() {
         let qm = pct(&mut query, 0.5);
         let pm = pct(&mut passes, 0.5);
         let p95 = pct(&mut passes, 0.95);
+        let skip = pct(&mut skips, 0.5);
         println!(
-            "| {name} | {qm:.1} | {pm:.1} | {p95:.1} | {:.2} | {:.3} | {} | {} |",
+            "| {name} | {qm:.1} | {pm:.1} | {p95:.1} | {:.2} | {skip:.3} | {} | {} |",
             pm / qm,
-            pct(&mut skips, 0.5),
             info.passes,
             info.skipped
+        );
+        let key = name.replace(' ', "-");
+        metric(&format!("inferred/{key}/query"), qm, "ms", "lower");
+        metric(&format!("inferred/{key}/round-median"), pm, "ms", "lower");
+        metric(&format!("inferred/{key}/round-p95"), p95, "ms", "lower");
+        metric(
+            &format!("inferred/{key}/unrelated-commit"),
+            skip,
+            "ms",
+            "lower",
         );
         rt.close(&s);
     }
