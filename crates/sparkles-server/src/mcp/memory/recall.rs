@@ -698,13 +698,12 @@ impl Tools<'_> {
         {
             return Err(eng(e));
         }
-        let mut fused: HashMap<String, f64> = HashMap::new();
-        for l in &lists {
-            for (s, rank) in l {
-                *fused.entry(s.clone()).or_default() += 1.0 / (RRF_K + *rank as f64);
-            }
-        }
-        let mut hits: Vec<(String, f64)> = fused.into_iter().collect();
+        let mut hits: Vec<(String, f64)> = sparkles::rank::fuse_rrf(
+            lists
+                .iter()
+                .map(|l| (1.0, l.iter().map(|(s, rank)| (s.clone(), *rank)))),
+            RRF_K,
+        );
         // seeds whose facts are all unreviewed count for less (C18 §8.8)
         if let Some((memory, w)) = weigh
             && !hits.is_empty()

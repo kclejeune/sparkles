@@ -31,8 +31,7 @@ pub(super) async fn shex() -> super::ApiResult {
 mod enabled {
     use super::super::{
         ApiError, ApiResult, INFERRED_GRAPH, Params, QueryBody, St, blocking, cancel_on_drop,
-        content_type, dataset, err, negotiate, query_options, timeout_param, with_commit,
-        with_inferences,
+        content_type, dataset, err, negotiate, timeout_param, with_commit, with_inferences,
     };
     use crate::auth::Principal;
     use crate::shex_cmd::{ShexFormat, write_report};
@@ -161,7 +160,7 @@ mod enabled {
             guard,
             schema_format,
             graph,
-            use_inferred: params.get("reasoning").is_none_or(|v| v != "false"),
+            use_inferred: crate::http::reasoning_mode(params).reads_inferences(),
             only_nonconformant,
             format,
             timeout: timeout_param(st, params),
@@ -384,13 +383,8 @@ mod enabled {
         };
         // SPARQL selectors: the request's row and memory budgets (SERVICE is refused
         // when the map is parsed, and the caller's permissions apply all the same)
-        let mut selector_query = query_options(&st, &ds, &query);
-        crate::auth::restrict(
-            &mut selector_query,
-            &principal,
-            &ds.name,
-            crate::auth::Endpoint::Shex,
-        );
+        let selector_query = crate::http::CallerContext::for_caller(&st, &ds, &principal)
+            .options(&query, crate::auth::Endpoint::Shex);
         let has_inferred = ds.reasoning.read().is_some();
         // a client that disconnects stops the validation at its next check
         let (cancel, _cancel_on_drop) = cancel_on_drop();

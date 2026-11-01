@@ -68,6 +68,13 @@ request or on every write, and the schema report counts what the data holds.
   schema expansion creates thousands of rules can use a bounded temporary closure of
   the original rules. This retains intermediate facts within the session and uses the
   same resource limits. EXPLAIN shows a `Derive` node per pattern.
+* The library names the reasoning of a query with `sparkles::reasoning::ReasoningMode`,
+  which is `Off`, `Materialized`, `Demand` with a profile and a limit, or `Auto`.
+  `Dataset::inference_view` turns a mode into an `InferenceView`, which gives the query
+  options that read the selected data, the inferred data that incremental views read and
+  the source of an explanation. The `reasoning` parameter of the HTTP endpoints, the
+  `--reasoning` flag of `sparkles query` and the `reasoning` argument of the MCP tools are
+  read into a mode. `Auto` is refused until a cost-based choice exists.
 * `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
   RDFS on read or the demand engine ([API.md](../API.md#explanations),
   [F18](../specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded

@@ -179,8 +179,8 @@ impl LocalEndpoints for SelfEndpoints {
                 "SERVICE <{iri}>: dataset /{name} is offline"
             ))));
         }
-        let mut opts = super::query_options(&self.st, &ds, &super::Params(Vec::new()));
-        crate::auth::restrict(&mut opts, p, &ds.name, Endpoint::Query);
+        let mut opts = super::CallerContext::for_caller(&self.st, &ds, p)
+            .options(&super::Params(Vec::new()), Endpoint::Query);
         install(&self.st, &mut opts, p);
         Some(Ok(LocalTarget {
             snap: ds.store.snapshot(),

@@ -964,12 +964,12 @@ pub(crate) async fn run(
     view: ViewOpts,
 ) -> ApiResult {
     let at = super::super::history::at_param(&params)?;
-    let mut opts = super::super::query_options(&st, &ds, &params);
+    let mut opts =
+        super::super::CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     // budgets the request asked for, never above the server's
     let asked = super::super::budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
     let limit = asked.result_limit(st.limits.max_result_bytes);
-    crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Query);
     // the whole result is computed, and the answer is cut to the request's row limit
     let max_rows = opts.max_rows.take().unwrap_or(usize::MAX);
     let (q, request) = request_key(&ds, &req)?;

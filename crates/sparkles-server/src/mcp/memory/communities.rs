@@ -276,8 +276,7 @@ impl Tools<'_> {
                 Err(e) => return Err(e),
             }
         }
-        let mut fused: HashMap<String, f64> = HashMap::new();
-        for l in &lists {
+        let lists = lists.iter().map(|l| {
             // a report's best subject counts once per list
             let mut best: HashMap<String, usize> = HashMap::new();
             for (s, rank) in l {
@@ -287,13 +286,9 @@ impl Tools<'_> {
                     *e = *rank;
                 }
             }
-            for (rep, rank) in best {
-                *fused.entry(rep).or_default() += 1.0 / (super::RRF_K + rank as f64);
-            }
-        }
-        let mut out: Vec<(String, f64)> = fused.into_iter().collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(out)
+            (1.0, best)
+        });
+        Ok(sparkles::rank::fuse_rrf(lists, super::RRF_K))
     }
 }
 

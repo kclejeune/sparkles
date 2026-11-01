@@ -51,15 +51,19 @@ impl QueryOpts {
         let mut o = QueryOptions {
             base_iri: self.base_iri.clone(),
             union_default_graph: self.union_default_graph,
-            timeout: self.timeout_ms.map(Duration::from_millis),
-            max_rows: self.max_rows.map(|m| m as usize),
-            max_memory_bytes: self.max_memory_bytes,
-            max_rows_produced: self.max_rows_produced,
             allow_service: self.allow_service,
             cancel: Some(cancel),
             no_cache: self.no_cache,
             ..Default::default()
         };
+        sparkles::Budgets {
+            timeout: self.timeout_ms.map(Duration::from_millis),
+            max_rows: self.max_rows.map(|m| m as usize),
+            max_memory_bytes: self.max_memory_bytes,
+            max_rows_produced: self.max_rows_produced,
+            max_spill_bytes: None,
+        }
+        .apply(&mut o);
         o.outbound.allow_private = self.allow_private_network;
         if self.include_inferred {
             o.default_graph_extra = vec![INFERRED_GRAPH.to_string()];
@@ -362,7 +366,20 @@ impl FfiQuery {
     ///
     /// [`ExecutionMode::Auto`]: sparkles::sparql::ExecutionMode::Auto
     pub fn execute_with(&self, first_rows: u32, auto: bool) -> FfiResult<Execution> {
-        if !auto || !self.cursor_allowed {
+        // `auto` is the binding's default rather than a request, so a write transaction
+        // runs the query eagerly instead of refusing it
+        use sparkles::sparql::{Consumer, ExecutionMode};
+        let mode = sparkles::sparql::choose_execution(&Consumer {
+            default: if auto {
+                ExecutionMode::Auto
+            } else {
+                ExecutionMode::Eager
+            },
+            in_transaction: !self.cursor_allowed,
+            ..Consumer::default()
+        })
+        .map_err(|e| FfiError::new(ErrorKind::Invalid, e.message()))?;
+        if mode == ExecutionMode::Eager {
             return self.execute(first_rows);
         }
         if self.executed.swap(true, Ordering::SeqCst) {
@@ -384,7 +401,7 @@ impl FfiQuery {
             &self.text,
             &self.opts,
             &options,
-            sparkles::sparql::ExecutionMode::Auto,
+            mode,
         )?;
         match execution {
             sparkles::sparql::QueryExecution::Select(cursor) => {

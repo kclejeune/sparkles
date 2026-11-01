@@ -5231,7 +5231,10 @@ sparkles settings set org assistant.send=rows
 ```
 
 The build sends facts to the model provider, so the provider must be allowed to receive
-rows, through `assistant.send` or `assistant.sendByProvider`.
+rows, through `assistant.send` or `assistant.sendByProvider`. The build's queries run
+under `--max-rows`, the query memory and rows-produced budgets, the spill budget and
+`--update-timeout`, which sets no limit by default. The `/$/graphrag/{ds}` read routes run
+under `--timeout` and the same budgets.
 
 ```sh
 sparkles graphrag --dataset org build            # shows the estimate and asks
@@ -5482,7 +5485,10 @@ output is blocked, for example by a slow pipe, because the command has no reader
 separate that time from the query's own. Rust callers choose a mode with
 `Dataset::query_execution_with`, and `Dataset::query_execution` runs in
 `ExecutionMode::Auto`, the default of `ExecutionMode`. `Dataset::query` and
-`Dataset::query_with` return a collected result and always run eagerly.
+`Dataset::query_with` return a collected result and always run eagerly. A Rust program
+that serves answers to its own consumers can describe each one as a
+`sparkles::sparql::Consumer` and let `sparkles::sparql::choose_execution` pick the mode,
+as the server, the CLI and the bindings do.
 
 Python has `Dataset.select_cursor` and `Dataset.graph_cursor`. A Python cursor can be
 iterated, closed with `close()`, used as a context manager, asked for stats and

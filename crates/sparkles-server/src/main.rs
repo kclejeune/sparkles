@@ -2997,11 +2997,8 @@ fn run() -> Result<()> {
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             st.metrics.fuseki_names = metrics_fuseki_names;
-            st.default_execution = if default_execution == "eager" {
-                sparkles::sparql::ExecutionMode::Eager
-            } else {
-                sparkles::sparql::ExecutionMode::Auto
-            };
+            st.default_execution = sparkles::sparql::ExecutionMode::parse(&default_execution)
+                .unwrap_or(sparkles::sparql::ExecutionMode::Auto);
             st.task_queue.set_max(max_tasks);
             st.task_queue.set_kind_max("clone", max_clones);
             st.compaction = auto_compact.state()?;
@@ -3763,15 +3760,16 @@ fn run() -> Result<()> {
                 None => store.snapshot(),
             };
             use sparkles::sparql::{ExecutionMode, QueryExecution};
-            let mode = match execution.as_deref() {
-                Some("streaming") => ExecutionMode::Streaming,
-                Some("auto") => ExecutionMode::Auto,
-                Some(_) => ExecutionMode::Eager,
-                // the text table measures every row before it prints one, and `--explain`
-                // prints the eager explanation
-                None if fmt == "text" || explain => ExecutionMode::Eager,
-                None => ExecutionMode::Auto,
-            };
+            // the text table measures every row before it prints one, and `--explain`
+            // prints the eager explanation
+            let mode = sparkles::sparql::choose_execution(&sparkles::sparql::Consumer {
+                requested: execution
+                    .as_deref()
+                    .map(|name| ExecutionMode::parse(name).unwrap_or(ExecutionMode::Eager)),
+                exact_total: fmt == "text",
+                plan: explain,
+                ..Default::default()
+            })?;
             // the result of a default automatic run that stayed eager, printed as an eager
             // query's is
             let mut collected = None;
@@ -5981,19 +5979,19 @@ fn query_reasoning_options(
     rules: Option<PathBuf>,
     max_derived: Option<usize>,
 ) -> Result<QueryOptions> {
-    match reasoning {
-        None | Some("materialized") | Some("true") => {
-            if profile.is_some() || rules.is_some() || max_derived.is_some() {
-                bail!("--profile, --rules and --max-derived need --reasoning demand");
+    use sparkles::reasoning::ReasoningMode;
+    let mode = match reasoning {
+        None => ReasoningMode::Materialized,
+        Some(name) => match ReasoningMode::parse(name) {
+            Some(ReasoningMode::Auto) | None => {
+                bail!("--reasoning must be materialized, demand or false, not {name}")
             }
-            Ok(qopts)
-        }
-        Some("false") => Ok(QueryOptions {
-            default_graph_extra: Vec::new(),
-            rdfs: None,
-            ..qopts
-        }),
-        Some("demand") => {
+            Some(mode) => mode,
+        },
+    };
+    let mut qopts = qopts;
+    match mode {
+        ReasoningMode::Demand(_) => {
             #[cfg(feature = "reasoning")]
             {
                 let profile = match (profile, rules) {
@@ -6004,16 +6002,14 @@ fn query_reasoning_options(
                     (Some(p), None) => Some(p.parse::<sparkles_reasoner::Profile>()?),
                     (None, None) => None,
                 };
-                let r = ds.query_reasoner(profile)?;
-                let r = match max_derived {
-                    Some(0) => r.with_max_derived(usize::MAX),
-                    Some(n) => r.with_max_derived(n),
-                    None => r,
+                let demand = sparkles::reasoning::Demand {
+                    profile,
+                    // zero lifts the limit
+                    max_derived: max_derived.map(|n| if n == 0 { usize::MAX } else { n }),
                 };
-                Ok(QueryOptions {
-                    reasoning: Some(r.provider()),
-                    ..qopts
-                })
+                ds.inference_view(ReasoningMode::Demand(demand))?
+                    .apply(&mut qopts);
+                Ok(qopts)
             }
             #[cfg(not(feature = "reasoning"))]
             {
@@ -6021,7 +6017,16 @@ fn query_reasoning_options(
                 bail!("built without the `reasoning` feature")
             }
         }
-        Some(other) => bail!("--reasoning must be materialized, demand or false, not {other}"),
+        mode => {
+            if mode == ReasoningMode::Materialized
+                && (profile.is_some() || rules.is_some() || max_derived.is_some())
+            {
+                bail!("--profile, --rules and --max-derived need --reasoning demand");
+            }
+            ds.stored_inference_view(mode.reads_inferences())
+                .apply(&mut qopts);
+            Ok(qopts)
+        }
     }
 }
 

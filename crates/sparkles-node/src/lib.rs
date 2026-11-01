@@ -193,15 +193,19 @@ fn query_options(v: &Value, flag: Arc<AtomicBool>) -> sparkles::Result<QueryOpti
     let mut o = QueryOptions {
         cancel: Some(flag.clone()),
         write: write_options(v, flag)?,
-        timeout: v["timeout"].as_u64().map(Duration::from_millis),
         union_default_graph: v["unionDefaultGraph"].as_bool(),
         no_cache: v["noCache"].as_bool().unwrap_or(false),
         base_iri: v["baseIri"].as_str().map(str::to_string),
+        ..Default::default()
+    };
+    sparkles::Budgets {
+        timeout: v["timeout"].as_u64().map(Duration::from_millis),
         max_rows: v["maxRows"].as_u64().map(|n| n as usize),
         max_memory_bytes: v["maxMemoryBytes"].as_u64(),
         max_rows_produced: v["maxRowsProduced"].as_u64(),
-        ..Default::default()
-    };
+        max_spill_bytes: None,
+    }
+    .apply(&mut o);
     if !v["describe"].is_null() {
         o.describe = serde_json::from_value(v["describe"].clone())
             .map_err(|e| EngineError::invalid(e.to_string()))?;
@@ -242,19 +246,36 @@ fn query_options(v: &Value, flag: Arc<AtomicBool>) -> sparkles::Result<QueryOpti
     }
     Ok(o)
 }
+/// How a query with options `v` runs, by the one execution policy. The default is
+/// automatic execution, and a write transaction (`in_transaction`) has no cursors.
+fn execution(v: &Value, in_transaction: bool) -> napi::Result<sparkles::sparql::ExecutionMode> {
+    use sparkles::sparql::{Consumer, ExecutionMode, PolicyError};
+    let requested = match v["execution"].as_str() {
+        None => None,
+        Some(name) => match ExecutionMode::parse(name) {
+            Some(mode) => Some(mode),
+            // a transaction refuses every mode but eager with its own message
+            None if in_transaction => {
+                return Err(invalid(PolicyError::CursorInTransaction.message()));
+            }
+            None => return Err(invalid("execution must be eager, streaming or auto")),
+        },
+    };
+    sparkles::sparql::choose_execution(&Consumer {
+        in_transaction,
+        ..Consumer::requesting(requested)
+    })
+    .map_err(|e| invalid(e.message()))
+}
+/// Open a query that the policy runs as a cursor or automatically (`mode`).
 fn open_query_cursor(
     ds: &Dataset,
     text: &str,
     v: &Value,
     flag: Arc<AtomicBool>,
+    mode: sparkles::sparql::ExecutionMode,
 ) -> sparkles::Result<sparkles::sparql::QueryExecution> {
     let opts = query_options(v, flag)?;
-    // callers open a cursor for `streaming` and for `auto`, the default
-    let mode = if v["execution"].as_str() == Some("streaming") {
-        sparkles::sparql::ExecutionMode::Streaming
-    } else {
-        sparkles::sparql::ExecutionMode::Auto
-    };
     let cursor_opts = sparkles::sparql::CursorOptions {
         batch_rows: v["batchSize"]
             .as_u64()
@@ -522,9 +543,10 @@ impl NativeDataset {
         let shared = self.get(false)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
-        match v["execution"].as_str().unwrap_or("auto") {
-            "eager" => {}
-            "auto" => {
+        let mode = execution(&v, false)?;
+        match mode {
+            sparkles::sparql::ExecutionMode::Eager => {}
+            sparkles::sparql::ExecutionMode::Auto => {
                 // A plan that automatic execution keeps eager returns the same result as
                 // an eager query, with its first batch computed in this call.
                 let permit = query_permit(&v, &flag).await?;
@@ -532,7 +554,7 @@ impl NativeDataset {
                 let cancellation = flag.clone();
                 let result =
                     blocking(
-                        move || match open_query_cursor(&shared.ds, &text, &v, flag)? {
+                        move || match open_query_cursor(&shared.ds, &text, &v, flag, mode)? {
                             sparkles::sparql::QueryExecution::Eager(result) => {
                                 NativeResult::query(result.into_result()).with_first(first)
                             }
@@ -543,15 +565,14 @@ impl NativeDataset {
                 drop(permit);
                 return Ok(result);
             }
-            "streaming" => {
+            sparkles::sparql::ExecutionMode::Streaming => {
                 let permit = query_permit(&v, &flag).await?;
                 let cancellation = flag.clone();
                 let cursor =
-                    blocking(move || open_query_cursor(&shared.ds, &text, &v, flag)).await?;
+                    blocking(move || open_query_cursor(&shared.ds, &text, &v, flag, mode)).await?;
                 drop(permit);
                 return NativeResult::streaming(cursor, cancellation).map_err(err);
             }
-            _ => return Err(invalid("execution must be eager, streaming or auto")),
         }
         let _permit = query_permit(&v, &flag).await?;
         let first = first_batch_option(&v);
@@ -1594,11 +1615,7 @@ impl NativeTransaction {
     ) -> napi::Result<NativeResult> {
         let worker = self.inner.clone();
         let v = parse(&options)?;
-        if v["execution"].as_str().is_some_and(|mode| mode != "eager") {
-            return Err(invalid(
-                "finish the transaction before opening a streaming cursor",
-            ));
-        }
+        execution(&v, true)?;
         let flag = cancel.flag.clone();
         let first = first_batch_option(&v);
         blocking(move || {

@@ -178,7 +178,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Stage 1 is under way, and [item 453](../../ROADMAP.md) tracks the rest of the work.
+Stage 1 has shipped and stage 3 is under way, and [item 453](../../ROADMAP.md) tracks the
+rest of the work.
 
 ### Dead compaction arm and one generation switch
 
@@ -288,6 +289,110 @@ remain until item 4 has measured them, and item 513 makes them test-only then.
 `SPARKLES_NO_IN_PLACE` remains as the method of the published memory benchmark, which
 compares the in-place runner with the blocking pool.
 
+### One execution policy
+
+Item 480 shipped. `sparkles::sparql::choose_execution` decides how a query runs from a
+`Consumer`, the description of what the consumer of the answer needs. A consumer names
+the mode it asked for and the mode it runs in without one, and states whether it needs the
+exact total before its first row, the eager plan explanation or the whole answer at once,
+whether it runs inside a write transaction, whether its format has a cursor writer and
+whether the query has initial bindings. A requested mode wins over the default. Inside a
+write transaction a requested cursor or automatic execution is refused, and a query that
+asked for nothing runs eagerly. Automatic execution runs eagerly for a format without a
+cursor writer and for a query with initial bindings. `ExecutionMode::parse` reads the
+names `eager`, `streaming` and `auto`.
+
+The HTTP query endpoint, `sparkles query`, the Node addon and the FFI's `execute_with`
+state their needs and take the mode the policy returns. SPARQL Results Thrift is a format
+without a cursor writer, the CLI's text table needs the exact total, `--explain` needs the
+plan, a Node or FFI transaction is a write transaction, and the FFI's `auto` argument is a
+default rather than a request. The MCP tools, GraphQL and the Python `query` methods read
+whole answers through the eager query APIs, which is the policy's answer for a whole-result
+consumer. The HTTP server's in-place quick runner remains a scheduling choice after the
+policy, as stage 6 keeps it. Behaviour is unchanged, and the unit tests of the policy
+compare it with each surface's former rules for every combination of their inputs. The
+server's tests of Thrift, stored queries with values and an eager server default, the
+CLI's execution tests and the FFI's automatic execution tests cover the surfaces.
+
+### Typed reasoning mode and one inference view
+
+Item 481 shipped. `sparkles::reasoning::ReasoningMode` is `Off`, `Materialized`,
+`Demand` with an optional profile and limit of derived facts, or `Auto`.
+`ReasoningMode::parse` reads `false`, `true`, `materialized`, `demand` and `auto`, and
+`from_param` reads a request parameter, where an absent or unknown value keeps the
+materialized inferences as the endpoints always have. `Dataset::inference_view` turns a
+mode into an `InferenceView`. Its query options read the selected data, and its `apply`
+changes a caller's options as the mode changes the dataset's defaults. Options that do not
+hold the dataset's defaults get them first, and a view replaces a query-time reasoner that
+the options had unless its mode is demand. Its `inference` is
+the input of incremental views and live queries, and `explain_source` names the source of
+an explanation. Demand builds the query-time reasoner and fails as `query_reasoner`
+does, and `Auto` is refused. `stored_inference_view` gives the infallible views of the
+materialized inferences or of the asserted data alone.
+
+The HTTP query options, `reasoning=demand` and `reasoning=auto` on queries and
+explanations, the reasoning diagnostics, SHACL and ShEx validation over HTTP, the CLI's
+`--reasoning` with its profile, rules and limit, and the MCP tools' `reasoning` argument
+now read a mode and apply its view. `Dataset::query_options` and the views runtime read the
+materialized inferences through one function, where each repeated the rule before. The
+schema report and the GraphQL draft keep their own true-or-false parameters, which reject
+other values or default to off, and the explanation request keeps its `source`, which
+names only `materialized` or `demand`. Behaviour is unchanged. The new CLI test covers
+`--reasoning false`, `true`, `materialized` and `demand` with and without a profile and
+with an unlimited limit, and the library tests cover each view.
+
+### Query request builder and caller context
+
+Item 482 shipped. `sparkles::QueryRequest` builds the options of one query from a
+dataset's defaults. `budgets` sets a `sparkles::Budgets` of timeout, rows, memory, rows
+produced and spill bytes, `lower_budgets` only lowers them as a request lowers a server's,
+`with_reasoning` reads the data of an `InferenceView`, and `cancel` sets the cancellation
+flag. The server's `CallerContext::for_caller` holds the state, the dataset and the caller.
+Its `options` gives the request options of the dataset's defaults, the server's budgets and
+settings and the request's parameters, restricted to the caller's grants on an endpoint.
+`task_options` gives a background task the same budgets with the update timeout and no
+pool grant, and `read_options` gives a route without parameters of its own the query
+timeout and the budgets.
+
+The query, text search and explanation endpoints, the graph and facet routes, the SPARQL
+diff, the forms model and check, the view reads, GraphQL, ShEx selectors, in-process
+SERVICE calls and algorithm write-back now take their options from the caller context
+instead of repeating the recipe. The request budgets lower the options through `Budgets`,
+the MCP tools build theirs with `QueryRequest` and their own memory budget, and the Node,
+Python and FFI bindings apply their callers' limits as `Budgets`. The update endpoint keeps
+its own options, which have no spill budget and no dataset defaults besides the pool.
+
+The GraphRAG build and its read routes used to run with the dataset's defaults and the
+caller's grants alone, so no server timeout or budget applied to them. A build now runs
+under the server's row, memory, rows-produced and spill budgets and its update timeout, as
+an algorithm write-back does, and the read routes run under the query timeout and the same
+budgets. This is the one intended change in behaviour. A unit test of the caller context
+checks the budgets, settings, parameters and inferred data of a request, a task and a
+read, and the library tests check the builder's budgets, reasoning and cancellation. The
+server's budget, limit and quota tests cover the endpoints.
+
+### Shared rank fusion and text hits
+
+Item 483 shipped. `sparkles::rank` holds the reciprocal rank fusion. `fuse_rrf` sums
+`weight / (k + rank)` over weighted ranked lists in list order and returns each key once,
+best first, with ties broken by key. `rrf_score` gives one key's score from its ranks, and
+`competition_ranks` ranks keys by their best score, so that tied keys share a rank.
+`spk:hybridSearch` ranks and fuses its two lists with them, and the MCP memory layer's
+`recall`, `community_reports`, `link_entities` and `similar_queries` fuse with them where
+each had its own loop. `link_entities` keeps its tiers before the score, and
+`similar_queries` keeps its ties broken by query name. The server's two rankers of memory
+hits keep their own handling of a NaN score, which ranks first there.
+
+`sparkles::handles::text_call` writes the one `text:query` call, and `TextIndex::hits`
+reads its hits from a given snapshot, as `search` reads them from the current state. The
+MCP `search_text` tool reads its hits through `hits` with its caller's options and commit,
+and the memory layer's text hits build their call with `text_call` inside their graph
+pattern. A search without highlighting now returns a literal as stored, where the search
+of the library and `GET /{ds}/text` used to remove the private-use characters that mark a
+match from it even when no match was marked. Results and their order are otherwise
+unchanged, and the hybrid search, MCP search and memory tests cover them, with unit tests
+of the fusion's sums, weights and ties.
+
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries
@@ -298,3 +403,16 @@ an Intel host. EXPLAIN printed the same plans before and after for four generate
 of 17 to 22 triple patterns over the same data, a chain, a chain with a filter, a star
 and a snowflake, since a group of more than 16 inputs already kept the greedy plan of
 `joinorder.rs`.
+
+### Measurements of stage 3
+
+A Namespace screen of the base against items 480 to 483 ran the 30 synthetic queries at
+1.05M triples with one thread in four A,B,B,A rounds, with both binaries built on one host
+by the same compilers. Both returned the same answers to every query. The geometric mean
+of server time was 0.984 of the base, and no query of 0.3 ms or more was 5% or more slower.
+`distinct-obj`, which runs in about 0.008 ms, read 1.130, and a rerun of it with
+`count-all` and `path-plus` in 12 rounds read 1.155, 1.059 and 1.037. Server time covers
+the execution of the plan, which none of the items changes for these queries, so item
+524 measures `distinct-obj` on an Intel host. Building the options of a request
+through the caller context and the query request builder adds a few moves of the options
+and one reference count, outside the measured time.

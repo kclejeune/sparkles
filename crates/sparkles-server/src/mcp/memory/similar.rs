@@ -148,8 +148,7 @@ impl Tools<'_> {
         }
         let mut ranked: Vec<(usize, f64)> = (0..docs.len())
             .filter_map(|i| {
-                let score = text_ranks[i].map_or(0.0, |r| 1.0 / (RRF_K + r as f64))
-                    + vector_ranks[i].map_or(0.0, |r| 1.0 / (RRF_K + r as f64));
+                let score = sparkles::rank::rrf_score(RRF_K, [text_ranks[i], vector_ranks[i]]);
                 (score > 0.0).then_some((i, score))
             })
             .collect();

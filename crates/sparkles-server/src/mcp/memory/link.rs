@@ -567,16 +567,15 @@ impl Tools<'_> {
         }
         // the fused score, over the exact, normalized, text and vector lists
         for c in pool.values_mut() {
-            c.score = [
-                c.exact.then_some(1),
-                c.normalized.then_some(1),
-                c.text_rank,
-                c.vector_rank,
-            ]
-            .iter()
-            .flatten()
-            .map(|&r| 1.0 / (RRF_K + r as f64))
-            .sum();
+            c.score = sparkles::rank::rrf_score(
+                RRF_K,
+                [
+                    c.exact.then_some(1),
+                    c.normalized.then_some(1),
+                    c.text_rank,
+                    c.vector_rank,
+                ],
+            );
         }
         // keep the label matches and the best of the rest
         let observed_candidates = pool.len();
@@ -681,13 +680,8 @@ impl Tools<'_> {
         query: &str,
         graphs: &[NamedNode],
     ) -> Result<Vec<(NamedNode, f64, String)>, Error> {
-        let mut args: Vec<String> = preds.iter().map(NamedNode::to_string).collect();
-        args.push(Literal::new_simple_literal(query).to_string());
-        args.push(LIST_DEPTH.to_string());
-        let call = format!(
-            "(?s ?score ?lit) <http://jena.apache.org/text#query> ({})",
-            args.join(" ")
-        );
+        let call =
+            sparkles::handles::text_call("?s ?score ?lit", preds, query, LIST_DEPTH, None, false);
         let q = format!(
             "SELECT ?s ?score ?lit WHERE {{ {} FILTER(isIRI(?s)) }} ORDER BY DESC(?score) LIMIT {}",
             r.quads(&call, graphs),

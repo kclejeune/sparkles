@@ -8,6 +8,7 @@ use crate::Dataset;
 use crate::error::Result;
 use crate::geo::{GeoConfig, GeoStatus};
 use crate::sparql::QueryOptions;
+use crate::store::Snapshot;
 use crate::text::{TextConfig, TextStatus};
 use crate::vector::config::VectorRecall;
 use crate::vector::embed::EmbeddingStatus;
@@ -15,6 +16,7 @@ use crate::vector::embed::Environment;
 use crate::vector::{VectorIndexConfig, VectorIndexStatus};
 use oxrdf::{Literal, NamedNode, Term};
 use serde::{Serialize, Serializer};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The dataset's indexes (from [`Dataset::indexes`]).
@@ -107,14 +109,51 @@ impl TextIndex {
     /// score, literal, predicate and graph, and, when `req.highlight` is set, an HTML
     /// snippet of the literal with the matches in `<mark>`.
     pub fn search(&self, req: &TextSearch) -> Result<TextHits> {
+        self.hits(self.ds.snapshot(), req)
+    }
+
+    /// The best hits of a search read from `snapshot`, as [`search`](Self::search)
+    /// reads them from the current state. This is the one reader of `text:query` hits.
+    pub fn hits(&self, snapshot: Arc<Snapshot>, req: &TextSearch) -> Result<TextHits> {
         #[cfg(feature = "text")]
-        return text_search(&self.ds, req);
+        return text_search(&self.ds, snapshot, req);
         #[cfg(not(feature = "text"))]
         {
-            let _ = req;
+            let _ = (snapshot, req);
             Err(no_text())
         }
     }
+}
+
+/// The `text:query` call that binds `vars`, such as `?s ?score ?lit`, to the hits of
+/// `query` over `predicates` (every indexed predicate when empty), at most `limit` of
+/// them, in literals tagged `lang` when it is set, with the matches marked for a snippet
+/// when `highlight` is set. The query string and the options are literals that oxrdf
+/// serializes with their escapes, and the predicates are IRIs.
+pub fn text_call(
+    vars: &str,
+    predicates: &[NamedNode],
+    query: &str,
+    limit: usize,
+    lang: Option<&str>,
+    highlight: bool,
+) -> String {
+    let mut args: Vec<String> = predicates.iter().map(|p| p.to_string()).collect();
+    args.push(Literal::new_simple_literal(query).to_string());
+    args.push(limit.to_string());
+    if let Some(l) = lang {
+        args.push(Literal::new_simple_literal(format!("lang:{l}")).to_string());
+    }
+    if highlight {
+        args.push(
+            Literal::new_simple_literal(format!("highlight:s:{} | e:{} | f:…", MARK.0, MARK.1))
+                .to_string(),
+        );
+    }
+    format!(
+        "({vars}) <http://jena.apache.org/text#query> ({})",
+        args.join(" ")
+    )
 }
 
 /// A full-text search (see [`TextIndex::search`]).
@@ -208,34 +247,23 @@ impl Serialize for TextHit {
 
 /// Marks the engine puts around a match in a snippet, replaced by `<mark>` and `</mark>`
 /// once the text is HTML-escaped (private-use characters).
-#[cfg(feature = "text")]
 const MARK: (char, char) = ('\u{e000}', '\u{e001}');
 
 #[cfg(feature = "text")]
-fn text_search(ds: &Dataset, req: &TextSearch) -> Result<TextHits> {
-    // the call's arguments, serialized by oxrdf (escaped)
-    let mut args: Vec<String> = req.predicates.iter().map(|p| p.to_string()).collect();
-    args.push(Literal::new_simple_literal(req.query.as_str()).to_string());
-    args.push(req.limit.to_string());
-    if let Some(l) = &req.lang {
-        args.push(Literal::new_simple_literal(format!("lang:{l}")).to_string());
-    }
-    if req.highlight {
-        args.push(
-            Literal::new_simple_literal(format!("highlight:s:{} | e:{} | f:…", MARK.0, MARK.1))
-                .to_string(),
-        );
-    }
-    let call = format!(
-        "(?s ?score ?lit ?g ?p) <http://jena.apache.org/text#query> ({})",
-        args.join(" ")
+fn text_search(ds: &Dataset, snap: Arc<Snapshot>, req: &TextSearch) -> Result<TextHits> {
+    let call = text_call(
+        "?s ?score ?lit ?g ?p",
+        &req.predicates,
+        &req.query,
+        req.limit,
+        req.lang.as_deref(),
+        req.highlight,
     );
     let pattern = match &req.graph {
         Some(g) => format!("GRAPH {g} {{ {call} }}"),
         None => call,
     };
     let query = format!("SELECT ?s ?score ?lit ?g ?p WHERE {{ {pattern} }} ORDER BY DESC(?score)");
-    let snap = ds.snapshot();
     let commit = snap.commit;
     let r = crate::sparql::query(snap, &query, &ds.with_query_defaults(&req.options))?;
     let hits: Vec<TextHit> = r
@@ -266,10 +294,15 @@ fn text_search(ds: &Dataset, req: &TextSearch) -> Result<TextHits> {
                         }
                         html
                     });
-                    let plain: String = text
-                        .chars()
-                        .filter(|c| *c != MARK.0 && *c != MARK.1)
-                        .collect();
+                    // only a highlighted search has marks, and a literal of the data may
+                    // hold the same private-use characters
+                    let plain: String = if req.highlight {
+                        text.chars()
+                            .filter(|c| *c != MARK.0 && *c != MARK.1)
+                            .collect()
+                    } else {
+                        text.to_string()
+                    };
                     let lit = match l.language() {
                         Some(lang) => Literal::new_language_tagged_literal_unchecked(plain, lang),
                         None => Literal::new_typed_literal(plain, l.datatype()),

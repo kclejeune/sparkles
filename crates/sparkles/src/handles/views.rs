@@ -80,14 +80,8 @@ impl Host for LibraryHost {
 /// their whole query again with it.
 #[doc(hidden)]
 pub fn inference(state: &DatasetState) -> Option<Inference> {
-    Inference::new(
-        state.rdfs.read().clone(),
-        if state.reasoning.read().is_some() {
-            vec![crate::reasoning::INFERRED_GRAPH.to_string()]
-        } else {
-            Vec::new()
-        },
-    )
+    let (rdfs, extra) = crate::reasoning::mode::materialized(state);
+    Inference::new(rdfs, extra)
 }
 
 /// Answers `SERVICE view:read` for a dataset's queries.

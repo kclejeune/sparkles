@@ -87,3 +87,74 @@ fn query_reads_the_materialized_inferences() {
     assert!(ask(&db));
     assert!(stored_ask(&db));
 }
+
+/// The answer of [`ASK`] with `extra` arguments, or the error of a refused run.
+#[cfg(feature = "reasoning")]
+#[track_caller]
+fn ask_with(db: &str, extra: &[&str]) -> Result<bool, String> {
+    let mut args = vec!["query", "--loc", db, "--results", "json"];
+    args.extend_from_slice(extra);
+    args.push(ASK);
+    let o = Command::new(BIN).args(&args).output().unwrap();
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).into_owned());
+    }
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    Ok(j["boolean"].as_bool().unwrap())
+}
+
+/// `--reasoning` chooses which inferred data a query reads: the configured RDFS on read
+/// and materialized inferences by default, the asserted data alone for `false`, and the
+/// facts a query-time reasoner derives for `demand`.
+#[cfg(feature = "reasoning")]
+#[test]
+fn query_reasoning_modes_choose_the_inferred_data() {
+    let (_dir, db) = database();
+    let refused = |extra: &[&str]| ask_with(&db, extra).unwrap_err();
+    // without a reasoning record, demand reasoning needs a profile
+    assert!(
+        refused(&["--reasoning", "demand"]).contains("needs a profile"),
+        "{}",
+        refused(&["--reasoning", "demand"])
+    );
+    assert_eq!(
+        ask_with(&db, &["--reasoning", "demand", "--profile", "rdfs"]),
+        Ok(true)
+    );
+    assert_eq!(ask_with(&db, &["--reasoning", "false"]), Ok(false));
+    // the profile and the limit belong to demand reasoning
+    for mode in [&[][..], &["--reasoning", "materialized"][..]] {
+        let mut extra = mode.to_vec();
+        extra.extend(["--profile", "rdfs"]);
+        assert!(refused(&extra).contains("need --reasoning demand"));
+    }
+    std::fs::write(
+        std::path::Path::new(&db).join("rdfs.json"),
+        r#"{"rdfsFormat": 1, "graph": "default"}"#,
+    )
+    .unwrap();
+    for (extra, expected) in [
+        (&[][..], true),
+        (&["--reasoning", "true"][..], true),
+        (&["--reasoning", "materialized"][..], true),
+        (&["--reasoning", "false"][..], false),
+        (&["--reasoning", "false", "--profile", "rdfs"][..], false),
+    ] {
+        assert_eq!(ask_with(&db, extra), Ok(expected), "{extra:?}");
+    }
+    // a limit of zero derived facts lifts the limit
+    assert_eq!(
+        ask_with(
+            &db,
+            &[
+                "--reasoning",
+                "demand",
+                "--profile",
+                "rdfs",
+                "--max-derived",
+                "0"
+            ]
+        ),
+        Ok(true)
+    );
+}

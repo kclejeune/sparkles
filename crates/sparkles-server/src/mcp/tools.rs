@@ -670,30 +670,34 @@ impl Tools<'_> {
         }
         // the dataset's query defaults (RDFS on read, the inferred overlay and DESCRIBE),
         // as over HTTP
-        let mut defaults = self
-            .server
-            .state
-            .datasets()
-            .get(ds)
+        let dataset = self.server.state.datasets().get(ds).cloned();
+        let mut defaults = dataset
+            .as_ref()
             .map(|d| d.dataset.query_options())
             .unwrap_or_default();
-        if !reasoning {
-            defaults.default_graph_extra.clear();
-            defaults.rdfs = None;
+        if let Some(d) = &dataset {
+            d.dataset
+                .stored_inference_view(reasoning)
+                .apply(&mut defaults);
         }
-        let mut opts = QueryOptions {
+        // the MCP memory budget, and no spill, which MCP calls do not use
+        let budgets = sparkles::Budgets {
             timeout: Some(remaining(deadline)?),
             max_rows: Some(self.server.state.limits.max_rows),
             max_memory_bytes: self.cfg().query_memory_bytes,
             max_rows_produced: self.server.state.limits.max_rows_produced,
-            allow_service: self.cfg().allow_service,
-            outbound: self.server.state.outbound.clone(),
-            cancel: Some(self.call.cancel.clone()),
-            prefixes: prefix_vec(prefixes),
-            // the grant the call was admitted with (X08-P1-grant-routing)
-            grant: self.call.grant.clone(),
-            ..defaults
+            max_spill_bytes: None,
         };
+        let mut request = sparkles::QueryRequest::from_options(defaults)
+            .budgets(&budgets)
+            .cancel(self.call.cancel.clone());
+        let o = request.options_mut();
+        o.allow_service = self.cfg().allow_service;
+        o.outbound = self.server.state.outbound.clone();
+        o.prefixes = prefix_vec(prefixes);
+        // the grant the call was admitted with (X08-P1-grant-routing)
+        o.grant = self.call.grant.clone();
+        let mut opts = request.build();
         // SERVICE and LOAD are the principal's server permissions, and the graphs its
         // grants cover, as over HTTP
         crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint);

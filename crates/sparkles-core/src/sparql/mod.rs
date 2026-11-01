@@ -36,6 +36,7 @@ pub mod lateral;
 pub mod pathsearch;
 pub mod patternplan;
 pub mod plan;
+pub mod policy;
 pub mod pool;
 mod propertyext;
 pub(crate) mod query_memory;
@@ -70,6 +71,7 @@ pub use cursor::{
     select_cursor,
 };
 pub use exec::{PlanFidelity, PlanInfo};
+pub use policy::{Consumer, PolicyError, choose_execution};
 
 /// `s` in Unicode Normalization Form C, as `fn:normalize-unicode` gives it.
 pub fn nfc(s: &str) -> String {

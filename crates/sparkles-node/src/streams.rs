@@ -498,23 +498,20 @@ impl NativeDataset {
     ) -> napi::Result<NativeByteStream> {
         let shared = self.get(false)?;
         let v = parse(&options)?;
+        let mode = execution(&v, false)?;
         let flag = cancel.flag.clone();
         let stream_permit = query_permit(&v, &flag).await?;
         let result = blocking({
             let shared = shared.clone();
             let flag = flag.clone();
             let v = v.clone();
-            move || match v["execution"].as_str().unwrap_or("auto") {
-                "streaming" | "auto" => {
-                    open_query_cursor(&shared.ds, &text, &v, flag).map(StreamResult::Streaming)
-                }
-                "eager" => shared
+            move || match mode {
+                sparkles::sparql::ExecutionMode::Eager => shared
                     .ds
                     .query_with(&text, &query_options(&v, flag)?)
                     .map(|r| StreamResult::Eager(Box::new(r))),
-                _ => Err(EngineError::invalid(
-                    "execution must be eager, streaming or auto",
-                )),
+                mode => open_query_cursor(&shared.ds, &text, &v, flag, mode)
+                    .map(StreamResult::Streaming),
             }
         })
         .await?;

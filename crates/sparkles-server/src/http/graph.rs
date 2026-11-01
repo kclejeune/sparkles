@@ -91,8 +91,7 @@ pub(super) async fn groups(
         req.default_reports_graph(&settings.reports_graph);
     }
     let params = Params::from_query(&uri);
-    let mut opts = super::query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Query);
+    let mut opts = super::CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     // one deadline for every query of the answer
     let timeout = opts.timeout.unwrap_or(st.default_timeout);
     opts.deadline = Some(Instant::now() + timeout);
@@ -148,8 +147,7 @@ pub(super) async fn facets(
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
     let req = FacetsRequest::from_json(&j)?;
     let params = Params::from_query(&uri);
-    let mut opts = super::query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Query);
+    let mut opts = super::CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     let timeout = opts.timeout.unwrap_or(st.default_timeout);
     opts.deadline = Some(Instant::now() + timeout);
     let (cancel, _cancel_on_drop) = super::cancel_on_drop();

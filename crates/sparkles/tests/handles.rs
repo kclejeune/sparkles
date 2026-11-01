@@ -283,6 +283,48 @@ fn text_search_marks_the_matches() {
     assert!(plain.limited && plain.hits[0].snippet.is_none());
 }
 
+/// `TextIndex::hits` reads the snapshot it is given, and a search without highlighting returns a
+/// literal as stored, with the private-use characters that would mark a match.
+#[cfg(feature = "text")]
+#[test]
+fn text_hits_read_a_snapshot_and_keep_unmarked_literals() {
+    use sparkles::handles::TextSearch;
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<http://ex.org/a> <http://www.w3.org/2000/01/rdf-schema#label> \"red \u{e000}fox\" .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let text = ds.indexes().text();
+    text.enable(Default::default()).unwrap();
+    let search = TextSearch {
+        query: "fox".into(),
+        highlight: false,
+        ..Default::default()
+    };
+    let snap = ds.snapshot();
+    let hits = text.hits(snap.clone(), &search).unwrap();
+    assert_eq!(hits.commit, snap.commit);
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(
+        hits.hits[0].literal.as_ref().unwrap().value(),
+        "red \u{e000}fox"
+    );
+    assert_eq!(text.search(&search).unwrap().hits.len(), 1);
+    let call = sparkles::handles::text_call(
+        "?s ?score",
+        &[oxrdf::NamedNode::new_unchecked("urn:p")],
+        "a \"quoted\" query",
+        5,
+        Some("en"),
+        false,
+    );
+    assert_eq!(
+        call,
+        r#"(?s ?score) <http://jena.apache.org/text#query> (<urn:p> "a \"quoted\" query" 5 "lang:en")"#
+    );
+}
+
 #[test]
 fn schema_reports_are_kept_paged_and_compared() {
     use sparkles::handles::{Computed, ReportRequest};

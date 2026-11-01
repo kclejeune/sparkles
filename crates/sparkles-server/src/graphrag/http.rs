@@ -93,16 +93,9 @@ fn footprint_present(ds: &Dataset, fp: &str, graph: &str) -> bool {
     rows(ds, &QueryOptions::default(), &q).is_ok_and(|r| !r.is_empty())
 }
 
-/// The caller's query options on `ds`.
-fn caller_options(ds: &Dataset, p: &Principal) -> QueryOptions {
-    let mut opts = ds.dataset.query_options();
-    #[cfg(feature = "auth")]
-    crate::auth::restrict(&mut opts, p, &ds.name, Endpoint::Query);
-    #[cfg(not(feature = "auth"))]
-    {
-        opts.graphs = p.view(&ds.name, Endpoint::Query);
-    }
-    opts
+/// The caller's query options on `ds`, under the server's query timeout and budgets.
+fn caller_options(st: &AppState, ds: &Dataset, p: &Principal) -> QueryOptions {
+    crate::http::caller::CallerContext::for_caller(st, ds, p).read_options()
 }
 
 /// Whether the caller may read the reports graph at the head commit (§6.3).
@@ -279,7 +272,7 @@ async fn get_status(
             return Ok(out);
         }
         out["available"] = true.into();
-        let opts = caller_options(&ds, &p);
+        let opts = caller_options(&st, &ds, &p);
         out["reports"] = json!(statuses(&ds, &opts, &graph)?);
         let q = format!(
             "SELECT ?l (COUNT(?c) AS ?n) WHERE {{ GRAPH <{graph}> {{ ?c a <{}> ; <{}> ?l }} }} GROUP BY ?l ORDER BY ?l",
@@ -342,7 +335,7 @@ async fn get_communities(
         if !proven(&ds, &p, &graph) {
             return Ok(json!({ "available": false, "communities": [] }));
         }
-        let opts = caller_options(&ds, &p);
+        let opts = caller_options(&st, &ds, &p);
         let q = format!(
             "SELECT ?c ?l ?parent ?n ?r ?title ?status ?rating WHERE {{ GRAPH <{graph}> {{ ?c a <{community}> ; <{level}> ?l ; <{count}> ?n . OPTIONAL {{ ?c <{broader}> ?parent }} OPTIONAL {{ ?c <{report}> ?r . OPTIONAL {{ ?r <{label}> ?title }} OPTIONAL {{ ?r <{status}> ?status }} OPTIONAL {{ ?r <{rating}> ?rating }} }} }} }} ORDER BY ?l DESC(?rating) ?c LIMIT 100000",
             community = gr("Community"),
@@ -401,7 +394,7 @@ async fn get_community(
         if !proven(&ds, &p, &graph) {
             return Err(none());
         }
-        let opts = caller_options(&ds, &p);
+        let opts = caller_options(&st, &ds, &p);
         let head = rows(
             &ds,
             &opts,
@@ -517,7 +510,7 @@ async fn post_memberships(
         if !proven(&ds, &p, &graph) {
             return Ok(json!({ "available": false, "memberships": [], "communities": [] }));
         }
-        let opts = caller_options(&ds, &p);
+        let opts = caller_options(&st, &ds, &p);
         let level = req
             .level
             .map(|l| format!("FILTER(?l = {l})"))
@@ -738,7 +731,7 @@ async fn post_review(
         let lock = st2.graphrag.lock(&ds.name);
         let _held = lock.lock();
         // the report as the caller reads it, and its community
-        let opts = caller_options(&ds, &p);
+        let opts = caller_options(&st, &ds, &p);
         let found = rows(
             &ds,
             &opts,
@@ -930,7 +923,7 @@ pub(crate) fn inbox_member(st: &AppState, ds: &Dataset, p: &Principal) -> Option
     }
     out["available"] = true.into();
     let graph = &s.reports_graph;
-    let opts = caller_options(ds, p);
+    let opts = caller_options(st, ds, p);
     let q = format!(
         "SELECT ?c ?r ?title ?rating ?l WHERE {{ GRAPH <{graph}> {{ ?c <{report}> ?r ; <{level}> ?l . ?r <{status}> \"unreviewed\" . OPTIONAL {{ ?r <{label}> ?title }} OPTIONAL {{ ?r <{rating}> ?rating }} }} }} ORDER BY DESC(?rating) ?c LIMIT {}",
         MAX_INBOX_REPORTS + 1,

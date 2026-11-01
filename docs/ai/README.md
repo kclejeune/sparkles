@@ -376,6 +376,9 @@ freshness. Synthetic count examples define no operational health policy or conne
   [USAGE.md](../USAGE.md#community-reports-graphrag), [API.md](../API.md#graphrag)).
 * Reports are triples with provenance and review status in a reports graph, which a reader
   sees only when its access covers everything the build read.
+* A build's queries run under the server's row, memory, rows-produced and spill budgets
+  and its update timeout, as an algorithm write-back does, and the report routes run under
+  the query timeout and the same budgets.
 * A build reports an upper bound of its tokens and waits for confirmation, and reserves
   every request against per-build and daily budgets. A refresh rewrites only the reports
   of communities that changed, and `refresh.mode: auto` starts one when enough facts

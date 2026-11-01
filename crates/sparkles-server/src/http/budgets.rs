@@ -58,11 +58,14 @@ impl Overrides {
 
     /// Lower the engine budgets of `o` to what the request asked for.
     pub(super) fn apply(&self, o: &mut QueryOptions) {
-        o.max_memory_bytes = lower(o.max_memory_bytes, self.memory_bytes);
-        o.max_spill_bytes = lower(o.max_spill_bytes, self.spill_bytes);
-        o.max_rows_produced = lower(o.max_rows_produced, self.rows_produced);
-        o.max_rows = lower(o.max_rows.map(|r| r as u64), self.rows)
-            .map(|r| usize::try_from(r).unwrap_or(usize::MAX));
+        sparkles::Budgets {
+            timeout: None,
+            max_rows: self.rows.map(|r| usize::try_from(r).unwrap_or(usize::MAX)),
+            max_memory_bytes: self.memory_bytes,
+            max_rows_produced: self.rows_produced,
+            max_spill_bytes: self.spill_bytes,
+        }
+        .lower(o);
     }
 
     /// The result-size budget of the response.

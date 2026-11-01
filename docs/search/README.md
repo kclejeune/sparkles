@@ -75,7 +75,9 @@ rest of a query.
   `sparkles models pull` fills from the Hugging Face Hub or a Nix build provides.
 * `spk:hybridSearch` fuses a `text:query` ranking and a `spk:vectorSearch` ranking by
   reciprocal rank fusion and returns the fused score and both ranks
-  ([API.md](../API.md#hybrid-text-and-vector-search)).
+  ([API.md](../API.md#hybrid-text-and-vector-search)). The MCP memory tools fuse their
+  text and vector lists with the same library function, `sparkles::rank::fuse_rrf`, and
+  read full-text hits through the same `text:query` call as `GET /{ds}/text`.
 
 ### Path search
 

@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use caller::CallerContext;
 use oxrdfio::{RdfFormat, RdfSerializer};
 use serde_json::{Value as J, json};
 use sparkles::BudgetKind;
@@ -25,6 +26,7 @@ use std::time::Duration;
 mod algo;
 pub(crate) mod branches;
 mod budgets;
+pub(crate) mod caller;
 mod changes;
 mod commit_graph;
 mod conditional;
@@ -1308,33 +1310,15 @@ pub(crate) fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiErr
     e
 }
 
-/// The options of a query request: the dataset's query defaults (RDFS on read, the
-/// inferred overlay and DESCRIBE, see [`sparkles::Dataset::query_options`]) with the
-/// server's limits and the request's parameters. `reasoning=false` leaves the inferred
-/// overlay and RDFS on read out, so the request reads the asserted data alone.
+/// The options of a query request (see [`caller::request_options`]).
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
-    let mut defaults = ds.dataset.query_options();
-    if params.get("reasoning") == Some("false") {
-        defaults.default_graph_extra.clear();
-        defaults.rdfs = None;
-    }
-    QueryOptions {
-        timeout: Some(timeout_param(st, params)),
-        max_rows: Some(st.limits.max_rows),
-        max_memory_bytes: st.limits.query_memory_bytes,
-        // the grant the request was admitted with, if the server has a memory pool
-        grant: crate::server_memory::current_grant(),
-        max_rows_produced: st.limits.max_rows_produced,
-        // cursor sorts write sorted runs here when they outgrow the memory budget
-        spill: st.spill.clone(),
-        max_spill_bytes: st.limits.query_spill_bytes,
-        no_cache: params.get("nocache").is_some_and(truthy),
-        default_graph_uris: params.all("default-graph-uri"),
-        named_graph_uris: params.all("named-graph-uri"),
-        allow_service: st.allow_service,
-        outbound: st.outbound.clone(),
-        ..defaults
-    }
+    caller::request_options(st, ds, params)
+}
+
+/// The reasoning mode a request's `reasoning` parameter names. An absent or unknown value
+/// reads the dataset's materialized inferences, and `false` reads the asserted data alone.
+pub(crate) fn reasoning_mode(params: &Params) -> sparkles::reasoning::ReasoningMode {
+    sparkles::reasoning::ReasoningMode::from_param(params.get("reasoning"))
 }
 
 /// Query-time reasoning a query asks for with `reasoning=demand` (spec F17 Phase 1): the
@@ -1348,9 +1332,10 @@ fn query_reasoning(
     params: &Params,
     opts: &mut QueryOptions,
 ) -> ApiResult<()> {
-    match params.get("reasoning") {
-        Some("demand") => {}
-        Some("auto") => {
+    use sparkles::reasoning::ReasoningMode;
+    match reasoning_mode(params) {
+        ReasoningMode::Demand(_) => {}
+        ReasoningMode::Auto => {
             return Err(err_code(
                 StatusCode::BAD_REQUEST,
                 "reasoning-mode",
@@ -1379,8 +1364,13 @@ fn query_reasoning(
                 }
             },
         };
-        let reasoner = ds.dataset.query_reasoner(profile)?.with_max_derived(max);
-        opts.reasoning = Some(reasoner.provider());
+        let demand = sparkles::reasoning::Demand {
+            profile,
+            max_derived: Some(max),
+        };
+        ds.dataset
+            .inference_view(ReasoningMode::Demand(demand))?
+            .apply(opts);
         Ok(())
     }
     #[cfg(not(feature = "reasoning"))]
@@ -1564,25 +1554,22 @@ pub(crate) async fn run_query(
     bindings: Vec<(String, oxrdf::Term)>,
 ) -> ApiResult {
     let io = io_profile(&params, &p)?;
-    let execution = match params.get("execution") {
-        None => st.default_execution,
-        Some("eager") => sparkles::sparql::ExecutionMode::Eager,
-        Some("streaming") => sparkles::sparql::ExecutionMode::Streaming,
-        Some("auto") => sparkles::sparql::ExecutionMode::Auto,
-        Some(_) => {
-            return Err(err(
+    let requested = match params.get("execution") {
+        None => None,
+        Some(name) => Some(sparkles::sparql::ExecutionMode::parse(name).ok_or_else(|| {
+            err(
                 StatusCode::BAD_REQUEST,
                 "execution must be eager, streaming or auto",
-            ));
-        }
+            )
+        })?),
     };
-    let mut opts = query_options(&st, &ds, &params);
+    let mut opts =
+        CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     query_reasoning(&st, &ds, &params, &mut opts)?;
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
     opts.describe = describe::request_options(&ds, &params)?;
-    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     // a SERVICE call to this server runs in process, as this caller
     self_service::install(&st, &mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
@@ -1601,10 +1588,18 @@ pub(crate) async fn run_query(
     // otherwise name for nobody (item 180).
     opts.no_plan_patterns = sfmt != SolutionsFormat::Sparkles && !params_wants_sparkles(&headers);
     // Automatic execution decides once the query is planned, and a plan it keeps eager
-    // continues below exactly as an eager request does. Some requests run eagerly
-    // without asking. SPARQL Results Thrift has no cursor writer, and initial bindings
-    // rule out every automatic plan.
-    let auto = execution == sparkles::sparql::ExecutionMode::Auto && !thrift && bindings.is_empty();
+    // continues below exactly as an eager request does. The policy runs some requests
+    // eagerly without asking, since SPARQL Results Thrift has no cursor writer and
+    // initial bindings rule out every automatic plan.
+    let execution = sparkles::sparql::choose_execution(&sparkles::sparql::Consumer {
+        requested,
+        default: st.default_execution,
+        cursor_format: !thrift,
+        initial_bindings: !bindings.is_empty(),
+        ..Default::default()
+    })
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e.message()))?;
+    let auto = execution == sparkles::sparql::ExecutionMode::Auto;
     if execution == sparkles::sparql::ExecutionMode::Streaming {
         let rdf_format = rdf_format(&params, &headers, false);
         let native_graph = params_wants_sparkles(&headers);
@@ -2158,8 +2153,8 @@ async fn text_search(
         return Err(bad(format!("lang: {l:?} is not a language tag")));
     }
     let graph = params.get("graph").map(|g| iri("graph", g)).transpose()?;
-    let mut options = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut options, &p, &ds.name, crate::auth::Endpoint::Query);
+    let options =
+        CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     let search = sparkles::handles::TextSearch {
         query: q,
         predicates,
@@ -2718,9 +2713,9 @@ async fn explain(
         }
         params.get("query").unwrap_or_default().to_string()
     };
-    let mut opts = query_options(&st, &ds, &params);
+    let mut opts =
+        CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     query_reasoning(&st, &ds, &params, &mut opts)?;
-    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let at = history::at_param(&params)?;
     blocking(move || {
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
@@ -5292,7 +5287,7 @@ async fn reason_diagnostics(
     // the inferences follow from the default graph: included by default when it is checked
     let inferences = reasoning.record().is_some()
         && match params.get("reasoning") {
-            Some(v) => v != "false",
+            Some(v) => sparkles::reasoning::ReasoningMode::from_param(Some(v)).reads_inferences(),
             None => graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH),
         };
     let mut prefixes: Vec<(String, String)> = ds.store.prefixes().into_iter().collect();
@@ -5649,7 +5644,7 @@ async fn shacl(
                 .unwrap_or(ReportFormat::Rdf(RdfFormat::Turtle))
         }
     };
-    let use_inferred = params.get("reasoning").is_none_or(|v| v != "false");
+    let use_inferred = reasoning_mode(&params).reads_inferences();
     let has_inferred = ds.reasoning.read().is_some();
     let timeout = timeout_param(&st, &params);
     let at = history::at_param(&params)?;

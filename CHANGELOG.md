@@ -24,6 +24,38 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+The library builds the options of a query with `sparkles::QueryRequest`, which applies a
+`sparkles::Budgets` of timeout, rows, memory, rows produced and spill bytes, a caller's
+lower budgets, an inference view and a cancellation flag. The server builds every query
+endpoint's options through one caller context, and the MCP tools and the bindings apply
+their limits through `Budgets`. A GraphRAG build now runs under the server's `--max-rows`,
+query memory, rows-produced and spill budgets and `--update-timeout`, and the
+`/$/graphrag/{ds}` read routes under `--timeout` and the same budgets. Before, neither had
+a server timeout or budget, so a large build or report read could outrun the limits that
+every other query meets.
+
+`spk:hybridSearch` and the MCP memory tools fuse ranked lists with one library function,
+`sparkles::rank::fuse_rrf`, and read full-text hits through one `text:query` call,
+`sparkles::handles::text_call`, and one reader, `TextIndex::hits`, which reads a given
+snapshot. Their results and order are unchanged. A text search without highlighting, in
+the library and over `GET /{ds}/text?highlight=false`, now returns a matching literal as
+stored. It used to lose the private-use characters U+E000 and U+E001, which mark a
+highlighted match, from the literal.
+
+The library names the reasoning of a query with `sparkles::reasoning::ReasoningMode`
+and selects its inferred data with one `InferenceView` from `Dataset::inference_view`.
+The view gives the query options, the input of incremental views and the source of an
+explanation. The server's `reasoning` parameter, the CLI's `--reasoning` and the MCP
+tools' `reasoning` argument read a mode and apply its view, and each reads the data it
+read before.
+
+The library chooses how a query runs in one function. `sparkles::sparql::choose_execution`
+takes a `Consumer`, which states the mode a caller asked for, the mode it runs in without
+one and what its consumer needs, and returns the execution mode or a refusal of a cursor
+inside a write transaction. `ExecutionMode::parse` reads the names `eager`, `streaming`
+and `auto`. The HTTP query endpoint, `sparkles query`, the Node addon and the FFI use it,
+and each chooses the mode it chose before.
+
 Server code can attach internal circuits to a dataset's incremental views runtime
 (spec F13 §3.6) with `Runtime::attach_internal`, or `Dataset::attach_internal` in the
 library. Such a circuit keeps a query's rows, or counts the changed facts per key in each

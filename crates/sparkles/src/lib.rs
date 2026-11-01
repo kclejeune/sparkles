@@ -6,9 +6,9 @@
 pub use sparkles_core::{
     access, algo, annotations, branch, builder, check, codec, commit, disk, duration, error,
     explain, formats, fsutil, geo, guard, history, id, incr, index, io, ioacct, jena_formats,
-    managed, mapping, migrate, nesting, outbound, patch, patterns, preview, schema, sparql, spill,
-    store, stored, stored_mappings, syntaxes, tabular, task, text, trix, validation, vector, vocab,
-    xsd,
+    managed, mapping, migrate, nesting, outbound, patch, patterns, preview, rank, schema, sparql,
+    spill, store, stored, stored_mappings, syntaxes, tabular, task, text, trix, validation, vector,
+    vocab, xsd,
 };
 
 #[cfg(feature = "backup")]
@@ -27,6 +27,7 @@ pub mod managed_source;
 pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;
+pub mod request;
 pub mod shared_entity;
 pub mod stats;
 pub mod syntax;
@@ -36,5 +37,6 @@ pub mod write_guard;
 
 pub use catalog::{Catalog, CatalogOptions};
 pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};
+pub use request::{Budgets, QueryRequest};
 pub use sparkles_core::{Budget, BudgetKind, Error, Result};
 pub use syntax::RdfSyntax;

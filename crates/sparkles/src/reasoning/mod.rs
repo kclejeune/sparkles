@@ -16,11 +16,13 @@ pub mod freshness;
 pub mod hypotheses;
 #[cfg(feature = "reasoning")]
 pub mod justify;
+pub mod mode;
 pub mod rdfs;
 #[cfg(feature = "reasoning")]
 pub mod run;
 
 pub use freshness::{Freshness, ReasoningStatus, freshness, watched_graphs};
+pub use mode::{Demand, InferenceView, ReasoningMode};
 #[cfg(feature = "reasoning")]
 pub use run::{
     Diagnostics, ReasonOutcome, ReasonRequest, diagnose, diagnose_with, incremental_since,
