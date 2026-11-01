@@ -7251,16 +7251,43 @@ impl Graph<'_> {
     /// pass over the predicate's index rows between the first and last frontier node,
     /// merged with the frontier.
     fn expand(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
-        let Some((p, rev)) = self.spec.simple else {
-            return self.expand_each(frontier, forward, out);
-        };
+        if let Some((p, rev)) = self.spec.simple {
+            return self.expand_pred(p, rev, frontier, forward, out);
+        }
+        if let Some(preds) = &self.spec.preds {
+            // each predicate of an alternative as a simple path would expand it, so a
+            // wide frontier takes one sweep per predicate rather than a lookup per node
+            for &(p, rev) in preds {
+                self.expand_pred(p, rev, frontier, forward, out)?;
+            }
+            return Ok(());
+        }
+        self.expand_each(frontier, forward, out)
+    }
+
+    /// [`Graph::expand`] over predicate `p` (`rev`: its inverse) alone.
+    fn expand_pred(
+        &self,
+        p: u64,
+        rev: bool,
+        frontier: &[u64],
+        forward: bool,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
         let perm = if forward != rev { Perm::Pso } else { Perm::Pos };
         let rows = self.ctx.snap.estimate(perm, &[p]);
         if !self.ctx.opt.batched_paths
             || frontier.len() < 64
             || (frontier.len() as u64).saturating_mul(SWEEP_RATIO) < rows
         {
-            return self.expand_each(frontier, forward, out);
+            let mut grown = Growth::new(self.ctx, out)?;
+            for (i, &x) in frontier.iter().enumerate() {
+                self.seek(p, rev, x, forward, out, &mut grown)?;
+                if i % 1024 == 1023 {
+                    self.ctx.check()?;
+                }
+            }
+            return Ok(());
         }
         self.sweeps.set(self.sweeps.get() + 1);
         let gc = perm.col_of(crate::index::G);
