@@ -299,6 +299,7 @@ async fn admin_responses_match_their_schemas() {
         ("/$/queries/{ds}/{name}", "/$/queries/h/labels"),
         ("/$/vector/{ds}", "/$/vector/h"),
         ("/$/vector/{ds}/{name}", "/$/vector/h/v1"),
+        ("/$/evidence/{ds}/settings", "/$/evidence/h/settings"),
     ];
     let put = |uri: &'static str, body: J| {
         let app = app.clone();
@@ -337,6 +338,12 @@ async fn admin_responses_match_their_schemas() {
     )
     .await;
     until(&app, "/$/vector/h/v1", |j| j["state"] == "ready").await;
+    put(
+        "/$/evidence/h/settings",
+        json!({ "format": 1, "profile": 1, "enabled": true,
+                "sourceRecords": ["urn:ev:s"], "proposals": ["urn:ev:p"] }),
+    )
+    .await;
     #[cfg(feature = "shacl")]
     {
         put(

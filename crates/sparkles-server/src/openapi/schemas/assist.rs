@@ -12,6 +12,79 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     ingestion(put);
     maintenance(put);
     graphrag(put);
+    evidence(put);
+}
+
+fn evidence(put: &mut dyn FnMut(&str, J)) {
+    let graphs = |d: &str| with_desc(strings(), d);
+    put(
+        "EvidenceSettings",
+        doc(
+            closed(
+                &["format", "profile", "enabled", "sourceRecords", "proposals"],
+                json!({
+                    "format": { "const": 1 },
+                    "profile": { "const": 1 },
+                    "enabled": boolean(),
+                    "sourceRecords": graphs("Graphs of source revisions, renditions and passages."),
+                    "proposals": graphs("Graphs of claim occurrences, evidence references and evidence links."),
+                    "decisions": graphs("Graphs of review decisions."),
+                    "supports": graphs("Graphs of acceptance supports, which own projected triples."),
+                    "identity": graphs("Graphs of identity proposals and resolution maps."),
+                    "projections": graphs("Dedicated graphs of accepted projections, with no other role."),
+                    "policies": {
+                        "type": "object",
+                        "maxProperties": 64,
+                        "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+                        "description": "Named review policies.",
+                        "additionalProperties": closed(
+                            &["version", "admittedKinds", "conflicts", "boundary", "decisions", "supports", "output"],
+                            json!({
+                                "version": with_desc(json!({ "type": "integer", "minimum": 1 }), "Raised whenever the policy's meaning changes."),
+                                "admittedKinds": with_desc(array(string_enum(&["reported", "observation", "hypothesis", "preference"])), "The claim kinds the policy can admit. Only positive claims are admitted."),
+                                "requiredScope": graphs("Scope predicates an admitted claim must carry."),
+                                "conflicts": string_enum(&["refuse", "admitLabelled"]),
+                                "boundary": graphs("The sourceRecords and proposals graphs whose records the policy's reviews may use."),
+                                "decisions": with_desc(string(), "The decisions graph the policy's reviews append to."),
+                                "supports": with_desc(string(), "The supports graph that owns the policy's projected triples."),
+                                "output": with_desc(string(), "The projection graph the policy writes."),
+                            }),
+                        ),
+                    },
+                }),
+            ),
+            "The evidence settings of a dataset, as `evidence.json` format 1 holds them.",
+            "evidence-settings",
+        ),
+    );
+    put(
+        "EvidenceSettingsStatus",
+        doc(
+            closed(
+                &["settings", "digest", "revision", "managed", "detached"],
+                json!({
+                    "settings": sref("EvidenceSettings"),
+                    "digest": with_desc(or_null(string()), "The SHA-256 digest of `evidence.json`, `null` before the first configuration."),
+                    "revision": with_desc(int(), "The revision of the managed-graph registry, 0 when there is none."),
+                    "managed": graphs("Role graphs that ordinary writes cannot change."),
+                    "detached": graphs("Role graphs that an administrator detached."),
+                }),
+            ),
+            "Recorded evidence settings and the protection they have now.",
+            "evidence-settings",
+        ),
+    );
+    put(
+        "EvidenceDetach",
+        doc(
+            closed(
+                &["graph"],
+                json!({ "graph": with_desc(string(), "A protected graph of the settings' roles.") }),
+            ),
+            "The graph to stop protecting.",
+            "evidence-settings",
+        ),
+    );
 }
 
 fn explaining(put: &mut dyn FnMut(&str, J)) {

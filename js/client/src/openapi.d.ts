@@ -979,6 +979,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/evidence/{ds}/detach": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop protecting an evidence graph
+         * @description Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again.
+         */
+        post: operations["detachEvidenceGraph"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/evidence/{ds}/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the evidence settings
+         * @description Needs `admin` on the dataset. Answers the disabled defaults before the first configuration.
+         */
+        get: operations["getEvidenceSettings"];
+        /**
+         * Set the evidence settings
+         * @description Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, or that races with another change, is a `409` that writes nothing.
+         */
+        put: operations["putEvidenceSettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/format": {
         parameters: {
             query?: never;
@@ -5886,6 +5930,64 @@ export interface components {
             requestId?: string;
         } & {
             [key: string]: unknown;
+        };
+        /** @description The graph to stop protecting. */
+        EvidenceDetach: {
+            /** @description A protected graph of the settings' roles. */
+            graph: string;
+        };
+        /** @description The evidence settings of a dataset, as `evidence.json` format 1 holds them. */
+        EvidenceSettings: {
+            /** @description Graphs of review decisions. */
+            decisions?: string[];
+            enabled: boolean;
+            /** @constant */
+            format: 1;
+            /** @description Graphs of identity proposals and resolution maps. */
+            identity?: string[];
+            /** @description Named review policies. */
+            policies?: {
+                [key: string]: {
+                    /** @description The claim kinds the policy can admit. Only positive claims are admitted. */
+                    admittedKinds: ("reported" | "observation" | "hypothesis" | "preference")[];
+                    /** @description The sourceRecords and proposals graphs whose records the policy's reviews may use. */
+                    boundary: string[];
+                    /** @enum {string} */
+                    conflicts: "refuse" | "admitLabelled";
+                    /** @description The decisions graph the policy's reviews append to. */
+                    decisions: string;
+                    /** @description The projection graph the policy writes. */
+                    output: string;
+                    /** @description Scope predicates an admitted claim must carry. */
+                    requiredScope?: string[];
+                    /** @description The supports graph that owns the policy's projected triples. */
+                    supports: string;
+                    /** @description Raised whenever the policy's meaning changes. */
+                    version: number;
+                };
+            };
+            /** @constant */
+            profile: 1;
+            /** @description Dedicated graphs of accepted projections, with no other role. */
+            projections?: string[];
+            /** @description Graphs of claim occurrences, evidence references and evidence links. */
+            proposals: string[];
+            /** @description Graphs of source revisions, renditions and passages. */
+            sourceRecords: string[];
+            /** @description Graphs of acceptance supports, which own projected triples. */
+            supports?: string[];
+        };
+        /** @description Recorded evidence settings and the protection they have now. */
+        EvidenceSettingsStatus: {
+            /** @description Role graphs that an administrator detached. */
+            detached: string[];
+            /** @description The SHA-256 digest of `evidence.json`, `null` before the first configuration. */
+            digest: string | null;
+            /** @description Role graphs that ordinary writes cannot change. */
+            managed: string[];
+            /** @description The revision of the managed-graph registry, 0 when there is none. */
+            revision: number;
+            settings: components["schemas"]["EvidenceSettings"];
         };
         Explain: {
             /** @description The algebra in SSE. */
@@ -12900,6 +13002,102 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    detachEvidenceGraph: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceDetach"];
+            };
+        };
+        responses: {
+            /** @description The settings and their protection. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceSettingsStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getEvidenceSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The settings and their protection. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceSettingsStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putEvidenceSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceSettings"];
+            };
+        };
+        responses: {
+            /** @description The settings and their protection. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceSettingsStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };

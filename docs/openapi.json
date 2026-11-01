@@ -7213,6 +7213,214 @@
         ],
         "type": "object"
       },
+      "EvidenceDetach": {
+        "additionalProperties": false,
+        "description": "The graph to stop protecting.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "properties": {
+          "graph": {
+            "description": "A protected graph of the settings' roles.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "graph"
+        ],
+        "type": "object"
+      },
+      "EvidenceSettings": {
+        "additionalProperties": false,
+        "description": "The evidence settings of a dataset, as `evidence.json` format 1 holds them.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "properties": {
+          "decisions": {
+            "description": "Graphs of review decisions.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "format": {
+            "const": 1
+          },
+          "identity": {
+            "description": "Graphs of identity proposals and resolution maps.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "policies": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "admittedKinds": {
+                  "description": "The claim kinds the policy can admit. Only positive claims are admitted.",
+                  "items": {
+                    "enum": [
+                      "reported",
+                      "observation",
+                      "hypothesis",
+                      "preference"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "boundary": {
+                  "description": "The sourceRecords and proposals graphs whose records the policy's reviews may use.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "conflicts": {
+                  "enum": [
+                    "refuse",
+                    "admitLabelled"
+                  ],
+                  "type": "string"
+                },
+                "decisions": {
+                  "description": "The decisions graph the policy's reviews append to.",
+                  "type": "string"
+                },
+                "output": {
+                  "description": "The projection graph the policy writes.",
+                  "type": "string"
+                },
+                "requiredScope": {
+                  "description": "Scope predicates an admitted claim must carry.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "supports": {
+                  "description": "The supports graph that owns the policy's projected triples.",
+                  "type": "string"
+                },
+                "version": {
+                  "description": "Raised whenever the policy's meaning changes.",
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "version",
+                "admittedKinds",
+                "conflicts",
+                "boundary",
+                "decisions",
+                "supports",
+                "output"
+              ],
+              "type": "object"
+            },
+            "description": "Named review policies.",
+            "maxProperties": 64,
+            "propertyNames": {
+              "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+            },
+            "type": "object"
+          },
+          "profile": {
+            "const": 1
+          },
+          "projections": {
+            "description": "Dedicated graphs of accepted projections, with no other role.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "proposals": {
+            "description": "Graphs of claim occurrences, evidence references and evidence links.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sourceRecords": {
+            "description": "Graphs of source revisions, renditions and passages.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "supports": {
+            "description": "Graphs of acceptance supports, which own projected triples.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "format",
+          "profile",
+          "enabled",
+          "sourceRecords",
+          "proposals"
+        ],
+        "type": "object"
+      },
+      "EvidenceSettingsStatus": {
+        "additionalProperties": false,
+        "description": "Recorded evidence settings and the protection they have now.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "properties": {
+          "detached": {
+            "description": "Role graphs that an administrator detached.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "digest": {
+            "description": "The SHA-256 digest of `evidence.json`, `null` before the first configuration.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "managed": {
+            "description": "Role graphs that ordinary writes cannot change.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "description": "The revision of the managed-graph registry, 0 when there is none.",
+            "type": "integer"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/EvidenceSettings"
+          }
+        },
+        "required": [
+          "settings",
+          "digest",
+          "revision",
+          "managed",
+          "detached"
+        ],
+        "type": "object"
+      },
       "Explain": {
         "properties": {
           "algebra": {
@@ -26428,6 +26636,212 @@
         "summary": "Set the DESCRIBE setting",
         "tags": [
           "SPARQL"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/detach": {
+      "post": {
+        "description": "Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "operationId": "detachEvidenceGraph",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceDetach"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceSettingsStatus"
+                }
+              }
+            },
+            "description": "The settings and their protection."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Stop protecting an evidence graph",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/settings": {
+      "get": {
+        "description": "Needs `admin` on the dataset. Answers the disabled defaults before the first configuration.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "operationId": "getEvidenceSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceSettingsStatus"
+                }
+              }
+            },
+            "description": "The settings and their protection."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the evidence settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "put": {
+        "description": "Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, or that races with another change, is a `409` that writes nothing.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-settings"
+        },
+        "operationId": "putEvidenceSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceSettings"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceSettingsStatus"
+                }
+              }
+            },
+            "description": "The settings and their protection."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set the evidence settings",
+        "tags": [
+          "Datasets"
         ],
         "x-sparkles-permission": "admin"
       }
