@@ -714,3 +714,75 @@ fn split_bindings_are_charged() {
         "the run allocated {over} bytes and charged {charged}"
     );
 }
+
+const CHAIN_RULE: &str =
+    "[t: (?a <http://ex.org/r> ?b), (?b <http://ex.org/r> ?c) -> (?a <http://ex.org/r> ?c)]";
+
+/// A closure operator stops at the limit of candidates as it emits its pairs: a cycle of
+/// 3,000 nodes, whose closure has nine million pairs, fails with the limit of inferred
+/// triples after buffering about a million of them, not all nine.
+#[test]
+fn closure_operators_stop_at_the_candidate_limit() {
+    let _one = one_at_a_time();
+    const MIB: usize = 1 << 20;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::new();
+    for i in 0..3000 {
+        ttl.push_str(&format!("ex:n{i} ex:r ex:n{} .\n", (i + 1) % 3000));
+    }
+    load(&s, &ttl);
+    s.flush_change_log().unwrap();
+    let opts = ReasonOptions {
+        max_inferred: 0,
+        max_memory: Some(256 * MIB),
+        threads: Some(1),
+        ..Default::default()
+    };
+    let rules = Profile::Rules(CHAIN_RULE.into());
+    let snap = s.snapshot();
+    let before = NOW.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let e = infer(snap, &rules, &opts).unwrap_err();
+    let over = PEAK.load(Ordering::SeqCst) - before;
+    eprintln!("the failed run allocated {over} bytes beyond what it started with");
+    assert!(
+        e.downcast_ref::<sparkles_reasoner::InferredLimitExceeded>()
+            .is_some(),
+        "{e:#}"
+    );
+    assert!(over < 64 * MIB, "the failed run allocated {over} bytes");
+}
+
+/// A closure operator charges its scratch arrays: a reverse star of 200,000 edges, which
+/// derives nothing, stays within its memory limit or fails with it.
+#[test]
+fn closure_operators_charge_their_scratch() {
+    let _one = one_at_a_time();
+    const LIMIT: usize = 8 << 20;
+    // the store's blocks a scan decodes, the evaluation state and the error
+    const SLACK: usize = 1 << 20;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::new();
+    for i in 0..200_000 {
+        ttl.push_str(&format!("ex:l{i} ex:r ex:hub .\n"));
+    }
+    load(&s, &ttl);
+    s.flush_change_log().unwrap();
+    let rules = Profile::Rules(CHAIN_RULE.into());
+    let opts = limited(Some(LIMIT));
+    let snap = s.snapshot();
+    // a first run warms the store's caches
+    let _ = infer(snap.clone(), &rules, &opts);
+    let before = NOW.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let run = infer(snap, &rules, &opts);
+    let over = PEAK.load(Ordering::SeqCst) - before;
+    eprintln!("the run allocated {over} bytes beyond what it started with");
+    if let Err(e) = &run {
+        assert!(e.to_string().contains("memory limit"), "{e:#}");
+    }
+    assert!(
+        over <= LIMIT + SLACK,
+        "the run allocated {over} bytes for a limit of {LIMIT}"
+    );
+}

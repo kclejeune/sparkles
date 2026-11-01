@@ -13,8 +13,9 @@
 //! The rules stay in the program, so explanations and maintenance still name them, and
 //! the closure is the fixpoint the rules reach: the operator only reaches it in fewer
 //! iterations. A program with a rule that is not monotonic (see
-//! [`crate::engine::incremental_blocker`]) runs without operators, because the order of
-//! derivation matters there.
+//! [`crate::engine::incremental_blocker`]), or with a list test whose result changes as
+//! derived list facts arrive, runs without operators, because the order of derivation
+//! matters there.
 //!
 //! The operator is semi-naive. It keeps, per predicate, the row up to which the relation
 //! is closed. The relation of the rows before that mark needs nothing more, so with few
@@ -36,6 +37,65 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Inner steps between two polls of the cancellation flag.
+const POLL_EVERY: usize = 1 << 16;
+
+/// Counts inner steps and polls the cancellation flag every [`POLL_EVERY`] of them.
+struct Poll<'a> {
+    cancel: Option<&'a AtomicBool>,
+    steps: usize,
+}
+
+impl<'a> Poll<'a> {
+    fn new(cancel: Option<&'a AtomicBool>) -> Poll<'a> {
+        Poll { cancel, steps: 0 }
+    }
+
+    #[inline]
+    fn tick(&mut self, k: usize) -> anyhow::Result<()> {
+        self.steps += k;
+        if self.steps >= POLL_EVERY {
+            self.steps = 0;
+            if self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                anyhow::bail!("reasoning cancelled");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An operator's pairs passed the room left for an iteration's candidates.
+#[derive(Debug)]
+struct Overflow;
+
+impl std::fmt::Display for Overflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("closure candidates over the limit")
+    }
+}
+
+impl std::error::Error for Overflow {}
+
+/// Push a pair of the closure onto `out`, which holds at most `room` pairs, charging each
+/// growth of its buffer before it is reserved.
+#[inline]
+fn emit(out: &mut Vec<Triple>, t: Triple, held: &mut Held, room: usize) -> anyhow::Result<()> {
+    if out.len() >= room {
+        return Err(Overflow.into());
+    }
+    if out.len() == out.capacity() {
+        let before = out.capacity();
+        let cap = (before * 2).max(1024).min(room);
+        held.try_grow((cap - before) * size_of::<Triple>())?;
+        out.reserve_exact(cap - out.len());
+        if out.capacity() > cap {
+            held.try_grow((out.capacity() - cap) * size_of::<Triple>())?;
+        }
+    }
+    out.push(t);
+    Ok(())
+}
 
 /// The predicates an operator closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,9 +226,19 @@ impl Closures {
     /// whose result depends on the order of derivation. `start` is the row before which
     /// the facts are closed under the rules, as for [`crate::engine::run`].
     pub(crate) fn detect(rules: &[CRule], terms: &Terms, start: Option<u32>) -> Option<Closures> {
+        // a list test whose result changes as derived list facts arrive, such as
+        // listNotContains, depends on when the closure's pairs appear
+        let order_dependent = |r: &CRule| {
+            r.builtins.iter().any(|b| {
+                matches!(
+                    b.kind,
+                    BuiltinKind::ListNotContains | BuiltinKind::ListLength | BuiltinKind::ListEntry
+                )
+            })
+        };
         if rules
             .iter()
-            .any(|r| incremental_blocker(r, terms).is_some())
+            .any(|r| incremental_blocker(r, terms).is_some() || order_dependent(r))
         {
             return None;
         }
@@ -259,18 +329,35 @@ impl Closures {
                 if mark >= now || g.count_p(q, mark, now) == 0 {
                     continue;
                 }
-                let local = Local::build(g, q, mark, now, op.shape, budget)?;
+                let local = Local::build(g, q, mark, now, op.shape, budget, cancel)?;
+                let room = max_out.saturating_sub(total);
                 let out = match op.shape {
                     Shape::Transitive => {
                         if op.irreflexive && local.literal_subject(terms) {
-                            None
+                            Ok(None)
                         } else {
-                            Some(local.transitive(q, op.irreflexive, &mut held, cancel)?)
+                            local
+                                .transitive(q, op.irreflexive, &mut held, cancel, room)
+                                .map(Some)
                         }
                     }
                     Shape::Equivalence => {
-                        local.equivalence(q, op.irreflexive, terms, &mut held, cancel)?
+                        local.equivalence(q, op.irreflexive, terms, &mut held, cancel, room)
                     }
+                };
+                let out = match out {
+                    Ok(out) => out,
+                    Err(e) if e.is::<Overflow>() => {
+                        return Err(crate::InferredLimitExceeded {
+                            limit,
+                            context: format!(
+                                " (the closure of rule '{}' produced more than {max_out} candidate triples)",
+                                rules[op.rules[0]].name
+                            ),
+                        }
+                        .into());
+                    }
+                    Err(e) => return Err(e),
                 };
                 let Some(out) = out else {
                     back = true;
@@ -482,38 +569,53 @@ impl Local {
         now: u32,
         shape: Shape,
         budget: &Arc<Budget>,
+        cancel: Option<&AtomicBool>,
     ) -> anyhow::Result<Local> {
         let total = g.count_p(q, 0, now);
         let fresh = g.count_p(q, mark, now);
+        let mut poll = Poll::new(cancel);
         if mark >= g.offset()
             && fresh.saturating_mul(4) < total
-            && let Some(l) = Local::around(g, q, mark, now, shape, budget, total / 2)?
+            && let Some(l) = Local::around(g, q, (mark, now), shape, budget, total / 2, &mut poll)?
         {
             return Ok(l);
         }
-        Local::scan(g, q, now, budget)
+        Local::scan(g, q, now, budget, &mut poll)
     }
 
     /// Every edge of `q` in rows `< now`.
-    fn scan(g: &Graph, q: u64, now: u32, budget: &Arc<Budget>) -> anyhow::Result<Local> {
+    fn scan(
+        g: &Graph,
+        q: u64,
+        now: u32,
+        budget: &Arc<Budget>,
+        poll: &mut Poll,
+    ) -> anyhow::Result<Local> {
         let mut b = Builder::new(budget);
         if let Some(base) = g.base()
             && g.reads_base(0, now)
         {
-            let mut err = None;
-            base.for_each(None, Some(q), None, |t| match b.edge(t[0], t[2]) {
-                Ok(()) => true,
-                Err(e) => {
-                    err = Some(e);
-                    false
+            let mut err: Option<anyhow::Error> = None;
+            base.for_each(None, Some(q), None, |t| {
+                match b
+                    .edge(t[0], t[2])
+                    .map_err(anyhow::Error::from)
+                    .and_then(|()| poll.tick(1))
+                {
+                    Ok(()) => true,
+                    Err(e) => {
+                        err = Some(e);
+                        false
+                    }
                 }
             })?;
             if let Some(e) = err {
-                return Err(e.into());
+                return Err(e);
             }
         }
         let c = g.cands(None, Some(q), None, g.offset(), now);
         for i in 0..c.len() {
+            poll.tick(1)?;
             let r = c.get(i);
             if !g.alive(r) {
                 continue;
@@ -531,17 +633,22 @@ impl Local {
     fn around(
         g: &Graph,
         q: u64,
-        mark: u32,
-        now: u32,
+        (mark, now): (u32, u32),
         shape: Shape,
         budget: &Arc<Budget>,
         limit: usize,
+        poll: &mut Poll,
     ) -> anyhow::Result<Option<Local>> {
         let mut memo = Memo::default();
         let mut b = Builder::new(budget);
         let mut seeds: Vec<u64> = Vec::new();
+        // the search's own sets, charged as they grow
+        let mut search = Held::new(budget);
+        let set_bytes = |s: &FxHashSet<u64>| table_bytes(s.capacity(), size_of::<u64>());
         let c = g.cands(None, Some(q), None, mark.max(g.offset()), now);
+        search.try_grow(c.len() * 2 * size_of::<u64>())?;
         for i in 0..c.len() {
+            poll.tick(1)?;
             let r = c.get(i);
             if g.alive(r) {
                 let t = g.triple(r);
@@ -566,6 +673,7 @@ impl Local {
                 }
             }
             let mut steps = 0usize;
+            let mut charged_at = 0usize;
             while let Some(x) = queue.pop() {
                 let mut back = g.try_subjects(&mut memo, q, x, now)?;
                 if shape == Shape::Equivalence {
@@ -575,14 +683,29 @@ impl Local {
                 if steps > limit {
                     return Ok(None);
                 }
+                poll.tick(back.len() + 1)?;
                 for p in back {
                     if sources.insert(p) {
                         queue.push(p);
                     }
                 }
+                if steps >= charged_at + CHARGE_EVERY {
+                    charged_at = steps;
+                    search.try_set(
+                        seeds.capacity() * size_of::<u64>()
+                            + set_bytes(&sources)
+                            + queue.capacity() * size_of::<u64>(),
+                    )?;
+                }
             }
+            search.try_set(
+                seeds.capacity() * size_of::<u64>()
+                    + set_bytes(&sources)
+                    + queue.capacity() * size_of::<u64>(),
+            )?;
             // every node the sources reach, with its out-edges
             let mut seen: FxHashSet<u64> = FxHashSet::default();
+            search.try_grow(sources.len() * size_of::<u64>())?;
             let mut order: Vec<u64> = sources.iter().copied().collect();
             order.sort_unstable();
             for &s in &order {
@@ -591,8 +714,11 @@ impl Local {
             }
             let mut queue = order;
             let mut edges = 0usize;
+            let mut charged_at = 0usize;
             while let Some(x) = queue.pop() {
-                for o in g.try_objects(&mut memo, x, q, now)? {
+                let outs = g.try_objects(&mut memo, x, q, now)?;
+                poll.tick(outs.len() + 1)?;
+                for o in outs {
                     b.edge(x, o)?;
                     edges += 1;
                     if seen.insert(o) {
@@ -602,7 +728,23 @@ impl Local {
                 if edges > limit {
                     return Ok(None);
                 }
+                if edges >= charged_at + CHARGE_EVERY {
+                    charged_at = edges;
+                    search.try_set(
+                        seeds.capacity() * size_of::<u64>()
+                            + set_bytes(&sources)
+                            + set_bytes(&seen)
+                            + queue.capacity() * size_of::<u64>(),
+                    )?;
+                }
             }
+            search.try_set(
+                seeds.capacity() * size_of::<u64>()
+                    + set_bytes(&sources)
+                    + set_bytes(&seen)
+                    + queue.capacity() * size_of::<u64>()
+                    + b.ids.len(),
+            )?;
             let emit: Vec<bool> = b.ids.iter().map(|id| sources.contains(id)).collect();
             Ok(Some(
                 std::mem::replace(&mut b, Builder::new(budget)).finish(emit)?,
@@ -639,9 +781,18 @@ impl Local {
         irreflexive: bool,
         held: &mut Held,
         cancel: Option<&AtomicBool>,
+        room: usize,
     ) -> anyhow::Result<Vec<Triple>> {
         let n = self.ids.len();
-        let (comp, ncomp) = self.components();
+        let mut poll = Poll::new(cancel);
+        let (comp, ncomp) = self.components(held.budget(), &mut poll)?;
+        // comp, members, stamp and set by node; moff, fill, readers, the successor stamp
+        // and succ by component; and the outer vector of the reachable sets
+        let mut work = Held::try_new(
+            held.budget(),
+            n * 4 * size_of::<u32>()
+                + ncomp * (4 * size_of::<u32>() + size_of::<usize>() + size_of::<Vec<u32>>()),
+        )?;
         // the members of each component, in the order of the components
         let mut moff = vec![0u32; ncomp + 1];
         for &c in &comp {
@@ -657,13 +808,13 @@ impl Local {
             fill[c as usize] += 1;
         }
         drop(fill);
-        let mut work = Held::try_new(held.budget(), (n * 3 + ncomp * 3) * size_of::<u32>())?;
         // the distinct components that point into each one, so that its reachable set is
         // released once they have read it
         let mut stamp = vec![u32::MAX; ncomp.max(n)];
         let mut readers = vec![0u32; ncomp];
         for c in 0..ncomp {
             for &x in &members[moff[c] as usize..moff[c + 1] as usize] {
+                poll.tick(self.out(x).len() + 1)?;
                 for &y in self.out(x) {
                     let d = comp[y as usize] as usize;
                     if d != c && stamp[d] != c as u32 {
@@ -677,24 +828,24 @@ impl Local {
         // per component: the nodes reachable from it, itself included
         let mut reach: Vec<Vec<u32>> = (0..ncomp).map(|_| Vec::new()).collect();
         let mut out: Vec<Triple> = Vec::new();
-        let mut out_charged = 0usize;
-        let mut succ: Vec<usize> = Vec::new();
-        let mut set: Vec<u32> = Vec::new();
+        let mut succ: Vec<usize> = Vec::with_capacity(ncomp);
+        let mut seen_succ = vec![u32::MAX; ncomp];
+        let mut set: Vec<u32> = Vec::with_capacity(n);
         // Tarjan numbers components in reverse topological order: a component's
         // successors come before it
         for c in 0..ncomp {
-            if c % 4096 == 0 && cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-                anyhow::bail!("reasoning cancelled");
-            }
+            poll.tick(1)?;
             let mine = &members[moff[c] as usize..moff[c + 1] as usize];
             succ.clear();
             let mut cyclic = mine.len() > 1;
             for &x in mine {
+                poll.tick(self.out(x).len())?;
                 for &y in self.out(x) {
                     let d = comp[y as usize] as usize;
                     if d == c {
                         cyclic = true;
-                    } else if !succ.contains(&d) {
+                    } else if seen_succ[d] != c as u32 {
+                        seen_succ[d] = c as u32;
                         succ.push(d);
                     }
                 }
@@ -703,6 +854,7 @@ impl Local {
             set.clear();
             let stamp_c = c as u32;
             for &d in &succ {
+                poll.tick(reach[d].len())?;
                 for &z in &reach[d] {
                     if stamp[z as usize] != stamp_c {
                         stamp[z as usize] = stamp_c;
@@ -730,6 +882,7 @@ impl Local {
                 if !self.emits(x) {
                     continue;
                 }
+                poll.tick(set.len())?;
                 let have = self.out(x);
                 let mut h = 0;
                 for &z in &set {
@@ -742,12 +895,12 @@ impl Local {
                     if h < have.len() && have[h] == z {
                         continue;
                     }
-                    out.push([self.ids[x as usize], q, self.ids[z as usize]]);
-                }
-                let bytes = out.capacity() * size_of::<Triple>();
-                if bytes > out_charged {
-                    held.try_grow(bytes - out_charged)?;
-                    out_charged = bytes;
+                    emit(
+                        &mut out,
+                        [self.ids[x as usize], q, self.ids[z as usize]],
+                        held,
+                        room,
+                    )?;
                 }
             }
             if readers[c] > 0 {
@@ -766,8 +919,20 @@ impl Local {
 
     /// Tarjan's strongly connected components, iteratively: the component of each node
     /// and the number of components, numbered in reverse topological order.
-    fn components(&self) -> (Vec<u32>, usize) {
+    fn components(
+        &self,
+        budget: &Arc<Budget>,
+        poll: &mut Poll,
+    ) -> anyhow::Result<(Vec<u32>, usize)> {
         let n = self.ids.len();
+        // index, low, comp, on, and the node and call stacks at their deepest
+        let _work = Held::try_new(
+            budget,
+            n * (3 * size_of::<u32>()
+                + size_of::<bool>()
+                + size_of::<u32>()
+                + size_of::<(u32, u32)>()),
+        )?;
         const NONE: u32 = u32::MAX;
         let mut index = vec![NONE; n];
         let mut low = vec![0u32; n];
@@ -788,6 +953,7 @@ impl Local {
             stack.push(root);
             on[root as usize] = true;
             while let Some(&mut (v, ref mut e)) = call.last_mut() {
+                poll.tick(1)?;
                 let end = self.off[v as usize + 1];
                 if *e < end {
                     let w = self.adj[*e as usize];
@@ -821,7 +987,7 @@ impl Local {
                 }
             }
         }
-        (comp, ncomp as usize)
+        Ok((comp, ncomp as usize))
     }
 
     /// The pairs `(x, y)` of the classes of the symmetric and transitive closure, for the
@@ -835,10 +1001,13 @@ impl Local {
         terms: &Terms,
         held: &mut Held,
         cancel: Option<&AtomicBool>,
+        room: usize,
     ) -> anyhow::Result<Option<Vec<Triple>>> {
         let n = self.ids.len();
+        let mut poll = Poll::new(cancel);
+        // parent, roots, moff, members and fill
+        let _work = Held::try_new(held.budget(), (n * 5 + 1) * size_of::<u32>())?;
         let mut parent: Vec<u32> = (0..n as u32).collect();
-        let _work = Held::try_new(held.budget(), n * 3 * size_of::<u32>())?;
         fn find(parent: &mut [u32], mut x: u32) -> u32 {
             while parent[x as usize] != x {
                 let p = parent[x as usize];
@@ -848,6 +1017,7 @@ impl Local {
             x
         }
         for x in 0..n as u32 {
+            poll.tick(self.out(x).len() + 1)?;
             for &y in self.out(x) {
                 let (a, b) = (find(&mut parent, x), find(&mut parent, y));
                 if a != b {
@@ -873,22 +1043,21 @@ impl Local {
         }
         drop(fill);
         let mut out: Vec<Triple> = Vec::new();
-        let mut out_charged = 0usize;
         for r in 0..n {
-            if r % 4096 == 0 && cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
-                anyhow::bail!("reasoning cancelled");
-            }
+            poll.tick(1)?;
             let class = &members[moff[r] as usize..moff[r + 1] as usize];
             if class.len() < 2 || !class.iter().any(|&x| self.emits(x)) {
                 continue;
             }
-            let literals: Vec<u64> = class
-                .iter()
-                .map(|&x| self.ids[x as usize])
-                .filter(|&id| terms.kind(id) == Kind::Literal)
-                .collect();
-            if literals.len() > 64 {
-                return Ok(None);
+            let mut literals: Vec<u64> = Vec::new();
+            for &x in class {
+                let id = self.ids[x as usize];
+                if terms.kind(id) == Kind::Literal {
+                    if literals.len() == 64 {
+                        return Ok(None);
+                    }
+                    literals.push(id);
+                }
             }
             for (i, &a) in literals.iter().enumerate() {
                 if literals[i + 1..].iter().any(|&b| same_value(terms, a, b)) {
@@ -900,6 +1069,7 @@ impl Local {
                 if !self.emits(x) {
                     continue;
                 }
+                poll.tick(class.len())?;
                 let have = self.out(x);
                 let mut h = 0;
                 for &z in class {
@@ -912,12 +1082,12 @@ impl Local {
                     if h < have.len() && have[h] == z {
                         continue;
                     }
-                    out.push([self.ids[x as usize], q, self.ids[z as usize]]);
-                }
-                let bytes = out.capacity() * size_of::<Triple>();
-                if bytes > out_charged {
-                    held.try_grow(bytes - out_charged)?;
-                    out_charged = bytes;
+                    emit(
+                        &mut out,
+                        [self.ids[x as usize], q, self.ids[z as usize]],
+                        held,
+                        room,
+                    )?;
                 }
             }
         }

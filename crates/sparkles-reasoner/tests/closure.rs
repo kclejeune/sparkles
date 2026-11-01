@@ -323,3 +323,49 @@ fn non_monotonic_programs_keep_the_rules() {
     let (with, without) = same(&s, &Profile::Rules(rules.into()), "noValue");
     assert_eq!(with, without);
 }
+
+/// A list test whose result changes as derived list facts arrive keeps the ordinary
+/// evaluation: the operators would derive `(a r d)` an iteration earlier, build the list
+/// before the flag, and lose `q`.
+#[test]
+fn delayed_lists_keep_the_rules() {
+    let rules = "
+@prefix ex: <http://ex.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+[t: (?a ex:r ?b), (?b ex:r ?c) -> (?a ex:r ?c)]
+[mk: (ex:a ex:r ex:d) -> (ex:L rdf:first ex:x), (ex:L rdf:rest rdf:nil)]
+[fl: (ex:a ex:r ex:c) -> (ex:a ex:flag ex:on)]
+[qq: (ex:a ex:flag ex:on), listNotContains(ex:L, ex:x) -> (ex:a ex:q ex:yes)]
+";
+    let s = store("ex:a ex:r ex:b . ex:b ex:r ex:c . ex:c ex:r ex:d .");
+    let p = Profile::Rules(rules.into());
+    let (with, without) = same(&s, &p, "listNotContains");
+    assert_eq!(with, without);
+    assert!(
+        facts(&s, &p, true)
+            .iter()
+            .any(|f| f.contains("http://ex.org/q")),
+        "q is derived as the rules derive it"
+    );
+}
+
+/// One source with many successors in distinct components closes in linear time: the
+/// successors of a component are deduplicated with a stamp, not a search. With a search,
+/// 400,000 successors took 12.9 s in a release build, and with the stamp 0.85 s.
+#[test]
+fn wide_fan_out_is_linear() {
+    let mut t = String::new();
+    for i in 0..400_000 {
+        t += &format!("ex:s ex:r ex:l{i} .\n");
+    }
+    let s = store(&t);
+    let p = Profile::Rules(
+        "[t: (?a <http://ex.org/r> ?b), (?b <http://ex.org/r> ?c) -> (?a <http://ex.org/r> ?c)]"
+            .into(),
+    );
+    let start = std::time::Instant::now();
+    let (n, _, _) = derive(&s, &p, true);
+    assert_eq!(n, 0);
+    let took = start.elapsed();
+    assert!(took.as_secs() < 10, "the closure of a star took {took:?}");
+}

@@ -19,9 +19,9 @@ request or on every write, and the schema report counts what the data holds.
 * The `owl-rl` profile covers the rules of the OWL 2 RL/RDF tables of OWL 2 Profiles
   §4.3, and a test checks each one ([F23](../specs/F23-reasoner-core/SPEC.md#outcome)).
   Rules whose conclusion is `false` are reported by the inconsistency checks below
-  rather than materialized. The profile leaves out three rules. `eq-ref` would make every
-  term `owl:sameAs` itself, `dt-type2` would type every literal, and `dt-eq` would relate
-  literals with equal values. Literal types are read where a rule needs them, as
+  rather than materialized. The profile leaves out four rules. `eq-ref` would make every
+  term `owl:sameAs` itself, `dt-type2` would type every literal, and `dt-eq` and `dt-diff`
+  would relate every pair of literals with equal values and with different values. Literal types are read where a rule needs them, as
   `owl:someValuesFrom` with a datatype does. Property chains have rules for 2 and 3
   properties and keys for 1 and 2, because each longer rule adds thousands of rules to
   the demand programs of query-time reasoning.

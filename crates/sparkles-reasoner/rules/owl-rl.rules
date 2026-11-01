@@ -11,8 +11,9 @@
 # cardinality zero, dt-not-type and the other inconsistencies) are not
 # materialization rules: the inconsistency checks of diagnostics.rs cover
 # them. Not covered: cardinality > 1, reflexive owl:sameAs for every
-# individual (eq-ref), dt-type2 and dt-eq for every literal, property
-# chains of more than 3 properties and keys of more than 2. Each longer
+# individual (eq-ref), dt-type2 and dt-eq for every literal, dt-diff for
+# every pair of literals with different values, property chains of more
+# than 3 properties and keys of more than 2. Each longer
 # chain or key rule adds thousands of rules to the demand programs of
 # query-time reasoning.
 #

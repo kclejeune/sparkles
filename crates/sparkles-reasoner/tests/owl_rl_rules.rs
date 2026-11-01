@@ -423,11 +423,6 @@ const CHECKS: &[(&str, &str, &str)] = &[
         "all-disjoint-classes",
     ),
     (
-        "dt-diff",
-        "ex:p a owl:FunctionalProperty . ex:a ex:p 1 , 2 .",
-        "functional-literal-conflict",
-    ),
-    (
         "dt-not-type",
         "ex:a ex:p \"abc\"^^xsd:integer .",
         "literal-not-in-datatype",
@@ -435,10 +430,11 @@ const CHECKS: &[(&str, &str, &str)] = &[
 ];
 
 /// Rules the profile leaves out, each with what it would add: reflexive `owl:sameAs` for
-/// every term (eq-ref), a type for every literal (dt-type2), and `owl:sameAs` between
-/// literals with equal values (dt-eq). The `owl-rl` profile evaluates literal types where
+/// every term (eq-ref), a type for every literal (dt-type2), `owl:sameAs` between
+/// literals with equal values (dt-eq), and `owl:differentFrom` between literals with
+/// different values (dt-diff). The `owl-rl` profile evaluates literal types where
 /// a rule reads them, through `isDType` (cls-svf1 with a datatype above).
-const GAPS: &[&str] = &["eq-ref", "dt-type2", "dt-eq"];
+const GAPS: &[&str] = &["eq-ref", "dt-type2", "dt-eq", "dt-diff"];
 
 fn store(ttl: &str) -> Store {
     let s = Store::in_memory(StoreOptions::default());
