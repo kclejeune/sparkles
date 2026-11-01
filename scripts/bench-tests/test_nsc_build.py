@@ -199,6 +199,23 @@ a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a
         self.assertEqual(self.builds(), 1)
         self.assertIn("cargo args: \n", (entry / "build.txt").read_text())
 
+    def test_a_build_reclaims_trees_left_by_killed_runs(self):
+        abandoned = self.cache / "src" / f"{self.sha}.abandon1"
+        abandoned.mkdir(parents=True)
+        (abandoned / "partial").write_text("archive of a run killed with SIGKILL")
+        self.assertEqual(self.bench()[0], "built with ")
+        self.assertEqual(list((self.cache / "src").iterdir()), [])
+
+    def test_a_run_waits_while_another_process_holds_the_entry_lock(self):
+        (self.cache / "locks").mkdir(parents=True)
+        holder = subprocess.Popen(["flock", str(self.cache / "locks" / f"{self.sha}.lock"),
+                                   "sleep", "2"])
+        self.addCleanup(holder.wait)
+        time.sleep(0.5)
+        started = time.monotonic()
+        self.assertEqual(self.bench()[0], "built with ")
+        self.assertGreater(time.monotonic() - started, 1.0)
+
     def start(self, tag):
         out = self.root / f"out-{tag}"
         return out, subprocess.Popen(

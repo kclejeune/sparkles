@@ -1035,8 +1035,10 @@ reused only when its `build.txt` records the same cargo arguments, and an entry 
 that record is rebuilt. Compiler changes still require removing the entry by hand.
 
 Each build extracts its source into a private directory under
-`~/.cache/sparkles-nsc/src` and removes it when the run ends. A lock per cache entry
-under `locks` serializes builds of the same entry. A second run of the same commit and
+`~/.cache/sparkles-nsc/src` and removes it when the run ends. The next build of the
+same entry also removes trees that killed runs left behind. A lock per cache entry
+under `locks` serializes builds of the same entry, and a build that outlives a killed
+run keeps the lock. A second run of the same commit and
 cargo arguments waits for the first build, then reuses the finished binary. Runs of
 different commits or arguments build at the same time. The script needs `flock`.
 

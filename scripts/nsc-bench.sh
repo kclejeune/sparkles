@@ -189,6 +189,9 @@ binary() {
         echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
         rm -f "$entry/build.txt"
         mkdir -p "$entry"
+        # Holding the lock, no other run is building this entry, so earlier private trees are
+        # abandoned by runs that were killed.
+        rm -rf -- "${CACHE:?}/src/$key".*
         SRC_TMP=$(mktemp -d "$CACHE/src/$key.XXXXXXXX")
         # Keep source mtimes current. Each archive has its own managed mutable target;
         # Boxington shares immutable build results rather than one Cargo target.
@@ -198,12 +201,10 @@ binary() {
         mkdir -p "$SRC_TMP/ui/build"
         echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
           > "$SRC_TMP/ui/build/index.html"
-        # The build does not inherit the lock descriptor, so a process it leaves behind cannot
-        # hold the lock after this run ends. A build that outlives a killed run can then
-        # overlap the next one, which is harmless because each uses its own source tree and
-        # temporary file names.
+        # The build inherits the lock descriptor, so a build that outlives a killed run keeps
+        # the lock and the next run waits for it.
         # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
-        (cd "$SRC_TMP" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) {lock}>&- \
+        (cd "$SRC_TMP" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) \
           > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
         # the shell's compilers, beside the binary's own record of them in .comment
         {
