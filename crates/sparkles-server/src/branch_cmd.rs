@@ -357,7 +357,11 @@ fn run_branch_inner(cmd: BranchCmd, opts: StoreOptions, actor: &crate::audit::Ac
                     let store = Store::open(loc, opts)?;
                     store.delete_branch_with(
                         &name,
-                        &sparkles::branch::DeleteOptions { force, reparent },
+                        &sparkles::branch::DeleteOptions {
+                            force,
+                            reparent,
+                            release_holds: false,
+                        },
                     )?;
                     crate::audit::dataset(
                         "branch_deleted",

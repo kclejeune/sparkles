@@ -963,6 +963,40 @@ impl BranchSet {
         }
     }
 
+    /// The branch store whose history serves each of `commits`, which name `main` or a
+    /// listed branch: a seq at or below a branch's starting commit is its upstream's.
+    pub(super) fn hold_stores(&self, commits: &[CommitRef]) -> Result<Vec<uuid::Uuid>> {
+        let t = self.lock_listed(commits.iter().map(|c| c.branch_id))?;
+        Ok(commits
+            .iter()
+            .map(|c| {
+                let mut c = *c;
+                for _ in 0..1024 {
+                    match self.start_of(&t, c.branch_id) {
+                        Some(f) if c.seq <= f.seq => c.branch_id = f.branch_id,
+                        _ => break,
+                    }
+                }
+                c.branch_id
+            })
+            .collect())
+    }
+
+    /// The branch table, locked, once every one of `ids` is `main` or a listed branch.
+    /// Lock order: the table, then the family's holds.
+    pub(super) fn lock_listed(
+        &self,
+        ids: impl Iterator<Item = uuid::Uuid>,
+    ) -> Result<parking_lot::MutexGuard<'_, TableFile>> {
+        let t = self.table.lock();
+        for id in ids {
+            if id != self.dataset_id && t.by_id(id).is_none() {
+                return Err(branch::no_such_branch(&id.to_string()));
+            }
+        }
+        Ok(t)
+    }
+
     /// The commit `c` names, on the branch that made it: a seq at or below a branch's
     /// starting commit is a commit of its upstream.
     pub(crate) fn normalize(&self, c: CommitRef) -> CommitRef {
@@ -2287,7 +2321,7 @@ impl Store {
             name,
             &branch::DeleteOptions {
                 force,
-                reparent: false,
+                ..Default::default()
             },
         )
     }
@@ -2298,6 +2332,10 @@ impl Store {
     /// history and linked generations need it. Without `o.force`, the deletion is
     /// refused while the branch has commits that neither its upstream descends from nor
     /// a re-parented branch keeps in its history.
+    ///
+    /// A branch that a source hold names is not deleted (`branch-held`) unless
+    /// `o.release_holds`, which releases those holds durably first (see
+    /// [`crate::holds`]).
     pub fn delete_branch_with(&self, name: &str, o: &branch::DeleteOptions) -> Result<()> {
         let _family = self.shared_family(&Default::default())?;
         if name == MAIN {
@@ -2364,6 +2402,44 @@ impl Store {
         let retire = !children.is_empty();
         // the commit point: the table without the name
         let mut t = set.table.lock();
+        // The source holds that name the branch go first, durably, when the caller
+        // releases them. A failure after that leaves the branch without its holds.
+        let mut holds = self.family.holds.state.lock();
+        let records = match &*holds {
+            crate::holds::HoldsState::Ready(r) => r,
+            crate::holds::HoldsState::Unavailable(reason) => {
+                return Err(crate::holds::unavailable(reason));
+            }
+        };
+        let held: Vec<uuid::Uuid> = records
+            .values()
+            .filter(|r| r.hold.commits.iter().any(|c| c.branch_id == e.id))
+            .map(|r| r.hold.id)
+            .collect();
+        if !held.is_empty() {
+            if !o.release_holds {
+                return Err(branch::conflict(
+                    "branch-held",
+                    format!(
+                        "branch {name} is named by {} source {}; release {}, or delete with releaseHolds",
+                        held.len(),
+                        if held.len() == 1 { "hold" } else { "holds" },
+                        if held.len() == 1 { "it" } else { "them" },
+                    ),
+                ));
+            }
+            let mut kept = records.clone();
+            for id in &held {
+                kept.remove(id);
+            }
+            self.persist_holds(&kept)?;
+            self.failpoint("branch-delete-holds-released");
+            self.family
+                .holds
+                .index
+                .store(Arc::new(crate::holds::HeldIndex::of(kept.values())));
+            *holds = crate::holds::HoldsState::Ready(kept);
+        }
         let mut next = t.clone();
         next.branches.retain(|b| b.id != e.id);
         if retire {
@@ -2379,6 +2455,7 @@ impl Store {
         let pruned = next.prune_retired();
         set.save(&next)?;
         *t = next;
+        drop(holds);
         drop(t);
         self.failpoint("branch-delete-committed");
         if retire {

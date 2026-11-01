@@ -63,6 +63,7 @@ fn memory_branch_bases_outlive_history_rings_and_retired_parents() {
         &DeleteOptions {
             force: true,
             reparent: true,
+            release_holds: false,
         },
     )
     .unwrap();

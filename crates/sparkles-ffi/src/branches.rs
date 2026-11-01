@@ -196,10 +196,14 @@ impl FfiDataset {
     }
     pub fn branches_delete(&self, name: String, force: bool, reparent: bool) -> FfiResult<()> {
         self.inner.check_writable()?;
-        Ok(self
-            .inner
-            .ds
-            .delete_branch_with(&name, &sparkles::branch::DeleteOptions { force, reparent })?)
+        Ok(self.inner.ds.delete_branch_with(
+            &name,
+            &sparkles::branch::DeleteOptions {
+                force,
+                reparent,
+                release_holds: false,
+            },
+        )?)
     }
     pub fn branches_rename(&self, name: String, to: String) -> FfiResult<BranchInfo> {
         self.inner.check_writable()?;

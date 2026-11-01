@@ -172,6 +172,7 @@ fn removed_and_retired_members_keep_exclusion_through_field_destruction() {
             &crate::branch::DeleteOptions {
                 force: true,
                 reparent: retire,
+                release_holds: false,
             },
         )
         .unwrap();

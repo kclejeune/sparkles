@@ -45,6 +45,9 @@ mod group_index_tests;
 mod group_model;
 mod history_limited;
 mod history_query;
+mod holds;
+#[cfg(test)]
+mod holds_tests;
 pub mod keyset;
 #[doc(hidden)]
 pub mod lifecycle;
@@ -53,6 +56,7 @@ mod lock;
 #[cfg(test)]
 mod lock_tests;
 mod managed;
+pub use holds::Acquired;
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod managed_tests;
@@ -2261,7 +2265,18 @@ impl Store {
         open_step("vocab-settled");
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
-        let history = open_history(root, dataset_id, gen_no, head.seq, !rebased, &catalog)?;
+        let mut history = open_history(root, dataset_id, gen_no, head.seq, !rebased, &catalog)?;
+        // the dataset's source holds, which its branches share, before anything is
+        // collected
+        if ctx.is_none() {
+            family
+                .holds
+                .install(crate::holds::load_dir(root, dataset_id));
+        }
+        history.held = Some(crate::holds::HeldView {
+            index: family.holds.index.clone(),
+            store: dataset_id,
+        });
         let annotations =
             crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
         #[cfg(test)]

@@ -19,6 +19,8 @@ pub(crate) struct Family {
     /// [`crate::managed`]). One registry serves main and every branch, including those
     /// created before it was enabled, so they cannot diverge.
     pub(crate) managed: arc_swap::ArcSwapOption<crate::managed::ManagedState>,
+    /// The durable source holds of main and every branch (see [`crate::holds`]).
+    pub(crate) holds: crate::holds::FamilyHolds,
     _owner_lock: Option<Arc<super::ProcessLock>>,
 }
 
@@ -27,6 +29,7 @@ impl Family {
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
             managed: arc_swap::ArcSwapOption::empty(),
+            holds: Default::default(),
             _owner_lock: owner_lock,
         })
     }

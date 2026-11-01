@@ -493,6 +493,7 @@ fn a29_deleting_a_branch_re_parents_its_children() {
     let re = crate::branch::DeleteOptions {
         force: false,
         reparent: true,
+        release_holds: false,
     };
     // d (dev's commit 4) is in no other history; c is in feat's
     assert_eq!(
@@ -502,6 +503,7 @@ fn a29_deleting_a_branch_re_parents_its_children() {
     let re = crate::branch::DeleteOptions {
         force: true,
         reparent: true,
+        release_holds: false,
     };
     s.delete_branch_with("dev", &re).unwrap();
     let names: Vec<String> = s.branches().unwrap().into_iter().map(|b| b.name).collect();
@@ -565,6 +567,7 @@ fn a29_a_crash_in_a_deletion_that_re_parents() {
     let re = crate::branch::DeleteOptions {
         force: true,
         reparent: true,
+        release_holds: false,
     };
     // after the table names dev retired
     let (dir, s, dev_id) = family();

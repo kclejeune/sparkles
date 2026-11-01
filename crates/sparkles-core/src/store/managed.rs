@@ -596,7 +596,7 @@ impl Store {
     }
 
     /// The directory that holds the family's `managed.json`: the dataset root.
-    fn managed_root(&self) -> Option<std::path::PathBuf> {
+    pub(super) fn managed_root(&self) -> Option<std::path::PathBuf> {
         if !self.is_branch() {
             return self.root.clone();
         }

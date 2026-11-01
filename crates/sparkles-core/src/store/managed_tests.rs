@@ -815,6 +815,7 @@ fn enablement_waits_for_detached_writers() {
                     &crate::branch::DeleteOptions {
                         force: true,
                         reparent: false,
+                        release_holds: false,
                     },
                 );
                 deleted_tx.send(r.is_ok()).unwrap();

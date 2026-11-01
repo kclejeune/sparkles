@@ -155,6 +155,9 @@ pub struct DeleteOptions {
     /// delete it also when other branches were created from it: they take its upstream
     /// as theirs, and its storage stays while their history needs it
     pub reparent: bool,
+    /// delete it also when source holds name it, releasing them first (see
+    /// [`crate::holds`])
+    pub release_holds: bool,
 }
 
 /// What counts as one value when both sides changed it.
