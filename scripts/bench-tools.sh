@@ -65,14 +65,18 @@ fluree_bin() {
 
 # Fix the hyperfine timer for the whole run and put it first on PATH, so the runners' bare
 # `hyperfine` calls, including those behind a CPU-pinning client prefix, all use it. It is
-# the hyperfine on PATH, or the locked nixpkgs' when PATH has none. HYPERFINE names the
-# absolute path of another executable, which runs whatever its file name. The runners read
-# the JSON of hyperfine 1 and 2 (scripts/bench_hyperfine.py). Runners that time requests
-# call this after resolve_tools.
+# the hyperfine on PATH, which the mise pin supplies. The locked nixpkgs packages an older
+# hyperfine, so there is no fallback to it. HYPERFINE names the absolute path of another
+# executable, which runs whatever its file name. The runners read the JSON of hyperfine 1
+# and 2 (scripts/bench_hyperfine.py). Runners that time requests call this after
+# resolve_tools.
 use_hyperfine() {
   local binary=${HYPERFINE:-}
   if [ -z "$binary" ]; then
-    binary=$(nixbin hyperfine hyperfine) || return
+    binary=$(type -P hyperfine) || {
+      echo "hyperfine is not on PATH; run mise install, or set HYPERFINE" >&2
+      return 1
+    }
     # A second call finds the first call's link on PATH and must not link it to itself.
     binary=$(readlink -f "$binary") || return
   elif [[ $binary != /* ]] || [ ! -f "$binary" ] || [ ! -x "$binary" ]; then

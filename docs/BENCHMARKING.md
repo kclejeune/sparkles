@@ -102,9 +102,10 @@ can explicitly select other executables. The billion-triple loader also accepts 
 Jena loaders and servers clear `JAVA_HOME` so their wrappers use the packaged JDK.
 The RDFS oracle also defaults to the locked JDK, with `JAVA` as an explicit override.
 The hyperfine timer is the `hyperfine` on `PATH`, which the mise pin supplies as hyperfine
-2.0. Without one on `PATH`, the runners take hyperfine from the locked nixpkgs, which
-packages hyperfine 1.20. A runner that times requests resolves the timer once and uses it
-for the whole run. `HYPERFINE` can select another executable by its absolute path, under
+2.0.0. The locked nixpkgs packages an older hyperfine, so the runners do not fall back to
+it, and the Nix development shell does not provide one. A runner that times requests stops
+when `PATH` has no hyperfine, and otherwise resolves the timer once and uses it for the
+whole run. `HYPERFINE` can select another executable by its absolute path, under
 any file name. Runs that time nothing, such as the long-write runner and the load step of
 the billion-triple runner, do not resolve it. The geospatial, vector and SHACL write
 runners call the `hyperfine` on `PATH` directly. The run manifest records the timer's

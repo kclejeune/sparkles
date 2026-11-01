@@ -167,7 +167,7 @@ for output in outputs:
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.splitlines(), [str(on_path), "on-path"])
 
-    def test_use_hyperfine_falls_back_to_locked_nixpkgs(self):
+    def test_use_hyperfine_needs_hyperfine_on_path(self):
         # A PATH with the test's nix and the shell's basic tools, and no hyperfine.
         tools = self.work / "tools"
         tools.mkdir()
@@ -175,11 +175,11 @@ for output in outputs:
             found = shutil.which(name)
             if found:
                 (tools / name).symlink_to(found)
-        p = self.shell('use_hyperfine; readlink "$(command -v hyperfine)"',
-                       PATH=f"{self.bin}:{tools}")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout.strip(), str((self.store / "hyperfine" / "bin" / "hyperfine").resolve()))
-        self.assertIn("nixpkgs#hyperfine", self.nix_calls()[-1])
+        p = self.shell('use_hyperfine; echo started', PATH=f"{self.bin}:{tools}")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("mise install", p.stderr)
+        self.assertEqual(self.nix_calls(), [])
 
     def test_hyperfine_override_runs_under_any_name(self):
         on_path = self.bin / "hyperfine"

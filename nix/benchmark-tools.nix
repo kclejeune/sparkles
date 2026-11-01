@@ -5,7 +5,6 @@
 # package that this list or nix/benchmarks.nix does not name.
 [
   "apache-jena"
-  "hyperfine"
   "jdk"
   "jdk17_headless"
   "jdk8_headless"
