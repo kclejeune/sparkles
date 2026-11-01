@@ -511,10 +511,12 @@ class Runner:
         )
 
     def labels(self, iris, texts):
-        """The label texts of `iris` among `texts`, from the set's data. A lookup
-        that fails or passes the row cap leaves those IRIs without labels."""
+        """The label texts of `iris` among `texts`, from the set's data. A label
+        names one IRI only when every IRI's labels were read, so a lookup that skips
+        an IRI, passes a cap or fails returns no labels at all."""
         found = {}
-        iris = [i for i in iris if self.safe_iri(i)][:400]
+        if len(iris) > 400 or not all(self.safe_iri(i) for i in iris):
+            return found
         texts = texts[:200]
         if not iris or not texts:
             return found
@@ -531,7 +533,7 @@ class Runner:
             except HarnessFault:
                 raise
             except Invalid:
-                continue
+                return {}
             for row in rel.rows:
                 if row[0][0] == "uri" and row[1][0] in ("literal", "lang"):
                     found.setdefault(row[0][1], set()).add(row[1][1])

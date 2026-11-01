@@ -66,6 +66,10 @@ class GuardedScore(unittest.TestCase):
         self.assertTrue(lenient(gold, rel(["c"], [lit("3.4317E4", "double")]), {}))
         self.assertFalse(lenient(gold, rel(["c"], [lit("34317")]), {}))
         self.assertFalse(lenient(gold, rel(["c"], [lit("34318", "int")]), {}))
+        self.assertFalse(lenient(gold, rel(["c"], [lit("34317/1", "integer")]), {}))
+        big = rel(["n"], [lit("9007199254740993", "integer")])
+        self.assertFalse(lenient(big, rel(["c"], [lit("9007199254740993", "double")]), {}))
+        self.assertTrue(lenient(rel(["n"], [lit("0.5", "decimal")]), rel(["c"], [lit("5E-1", "float")]), {}))
 
     def test_a_label_names_a_gold_iri_only_when_unambiguous(self):
         gold = rel(["uri"], [uri("ex:Pinta_(ship)")], [uri("ex:Nina")])
@@ -94,6 +98,9 @@ class GuardedScore(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")]))[0])[0])
         self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")], [lit("", lang="en")]), gold=False)[0])[0])
+        # an unbound row holds no empty string and stays
+        unbound = rel(["y", "l"], [uri("ex:a"), lit("A")], [None, None])
+        self.assertEqual(guarded.drop_empty(unbound, gold=False)[1], 0)
         # an empty label beside a wrong answer keeps that answer
         got = rel(["y", "l"], [uri("ex:a"), lit("A")], [uri("ex:b"), lit("")])
         self.assertFalse(guarded.compare(g2, guarded.drop_empty(got, gold=False)[0])[0])
@@ -111,6 +118,9 @@ class GuardedScore(unittest.TestCase):
         self.assertEqual(guarded.flags(gold, got, d, lambda iris: set(iris)), ["predicate_column"])
         self.assertEqual(guarded.flags(gold, got, d, lambda iris: set()), [])
         self.assertEqual(guarded.flags(gold, got, d, lambda iris: None), ["predicate_column_unknown"])
+        many = rel(["x", "p"], *[[uri("ex:a"), uri(f"ex:p{i}")] for i in range(201)])
+        ok, d = guarded.compare(gold, many)
+        self.assertIn("predicate_column_unknown", guarded.flags(gold, many, d, lambda iris: set(iris)))
         # a projection that collapses rows
         got = rel(["x", "l"], [uri("ex:a"), lit("A")], [uri("ex:a"), lit("B")])
         ok, d = guarded.compare(gold, got)
@@ -130,6 +140,8 @@ class GuardedScore(unittest.TestCase):
         self.assertIsNone(guarded.errata_exclusion(q, gold, {}))
         q = {"id": "q1", "gold": "SELECT ?x WHERE { { SELECT * WHERE { ?x <urn:p> ?y } } }"}
         self.assertIsNone(guarded.errata_exclusion(q, gold, {}))
+        q = {"id": "q1", "gold": "ASK { { SELECT * WHERE { ?s <urn:p> ?o } } }"}
+        self.assertIsNone(guarded.errata_exclusion(q, True, {}))
         q = {"id": "q1", "gold": "SELECT ?x ?s WHERE { ?x ?p ?o }"}
         unbound = rel(["x", "s"], [uri("ex:a"), None])
         self.assertEqual(guarded.errata_exclusion(q, unbound, {})["rule"], "unbound-column")

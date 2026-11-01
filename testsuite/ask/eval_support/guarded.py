@@ -25,9 +25,11 @@ Nothing here reads a model answer to decide what the gold is.
 
 import fractions
 import hashlib
+import math
 import json
 import pathlib
 import re
+import struct
 
 from evaluator import UNBOUND, XSD_STRING, Invalid, Relation, project, align
 
@@ -51,7 +53,7 @@ NUMERIC = {
 }
 ERRATA_FILE = pathlib.Path(__file__).resolve().parent.parent / "gold-errata-v1.json"
 SELECT_STAR = re.compile(r"\bSELECT\s+(?:DISTINCT\s+|REDUCED\s+)?\*", re.I)
-FIRST_SELECT = re.compile(r"\bSELECT\b", re.I)
+QUERY_FORM = re.compile(r"\b(SELECT|ASK|CONSTRUCT|DESCRIBE)\b", re.I)
 
 
 def load_errata(path=ERRATA_FILE):
@@ -74,9 +76,9 @@ def errata_exclusion(question, gold, errata, release=None):
     if named is not None and release is not None and named.get("release") == release:
         return {"rule": "named", "reason": named["reason"]}
     text = strip_strings(question["gold"])
-    outer = FIRST_SELECT.search(text)
-    # Only the outer projection decides the answer's columns. A subquery's SELECT *
-    # inside it does not.
+    outer = QUERY_FORM.search(text)
+    # Only the outer query form and projection decide the answer's columns. A
+    # subquery's SELECT * inside it does not.
     if outer and SELECT_STAR.match(text, outer.start()):
         return {
             "rule": "select-star",
@@ -107,22 +109,35 @@ def drop_empty(rel, gold=True):
     if gold:
         keep = lambda r: not any(empty_string(c) for c in r)  # noqa: E731
     else:
-        keep = lambda r: not all(empty_string(c) or c == UNBOUND for c in r)  # noqa: E731
+        keep = lambda r: not (  # noqa: E731
+            any(empty_string(c) for c in r)
+            and all(empty_string(c) or c == UNBOUND for c in r)
+        )
     rows = frozenset(r for r in rel.rows if keep(r))
     return Relation(rel.variables, rows, rel.duplicates), len(rel.rows) - len(rows)
 
 
+INTEGER = re.compile(r"[+-]?[0-9]+")
+DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
+FLOATING = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
 def numeric_value(cell):
+    """The exact value of an XSD numeric literal whose lexical form is valid for its
+    datatype, or None. A float or double is the value it rounds to at its precision."""
     if cell[0] != "literal" or cell[2] not in NUMERIC:
         return None
-    text = cell[1].strip()
-    try:
-        if cell[2] in (XSD + "float", XSD + "double"):
-            if text.lower().lstrip("+-") in ("inf", "infinity", "nan"):
-                return None
-        return fractions.Fraction(text)
-    except (ValueError, ZeroDivisionError):
-        return None
+    text, datatype = cell[1].strip(), cell[2]
+    if datatype in (XSD + "float", XSD + "double"):
+        if not FLOATING.fullmatch(text):
+            return None
+        value = float(text)
+        if datatype == XSD + "float":
+            value = struct.unpack("f", struct.pack("f", value))[0]
+        return fractions.Fraction(value) if math.isfinite(value) else None
+    if datatype == XSD + "decimal":
+        return fractions.Fraction(text) if DECIMAL.fullmatch(text) else None
+    return fractions.Fraction(int(text)) if INTEGER.fullmatch(text) else None
 
 
 def literal_text(cell):
@@ -248,12 +263,13 @@ def flags(gold, got, detail, predicates):
     extra = [j for j in range(len(got.variables)) if j not in mapping]
     for j in extra:
         values = {r[j][1] for r in got.rows if r[j][0] == "uri"}
-        if values and len(values) <= 200:
-            found = predicates(sorted(values))
-            if found is None:
-                out.append("predicate_column_unknown")
-            elif found >= values:
-                out.append("predicate_column")
+        if not values:
+            continue
+        found = predicates(sorted(values)) if len(values) <= 200 else None
+        if found is None:
+            out.append("predicate_column_unknown")
+        elif found >= values:
+            out.append("predicate_column")
     if detail["gotRows"] > detail["projectedRows"]:
         out.append("projection_drops_rows")
     if mapping != list(range(len(mapping))):
