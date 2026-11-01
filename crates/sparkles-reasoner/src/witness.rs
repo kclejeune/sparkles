@@ -228,7 +228,15 @@ pub(crate) struct Prepared {
     rekeyed: Vec<u32>,
     /// whether the update has to build the witnesses again
     rebuild: bool,
+    /// the charge of this state and of the search that found it, until the update ends
+    held: Option<Held>,
 }
+
+/// The heap of one fact that the search before a deletion visits, in its set of visited
+/// facts, and of one it adds to its region, in the set of seen nodes, the region and the
+/// queue, charged as they are reached.
+const VISITED_BYTES: usize = size_of::<Triple>() + 8;
+const REACHED_BYTES: usize = 2 * size_of::<u32>() + 4 + size_of::<Triple>();
 
 fn cancelled(cx: &Cx<'_>) -> bool {
     cx.abort.load(Ordering::Relaxed) || cx.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
@@ -958,14 +966,25 @@ impl Witnesses {
             complete: true,
             ..Pass::default()
         };
+        held.try_grow(heads.len() * 4)?;
         let mut seeds = Vec::with_capacity(heads.len());
         for &t in &heads {
             let key = (kind(c, &t) == Kind::Base).then(|| fact_key(c, &t));
             seeds.push(w.add_node(t, key));
+            // the nodes charge themselves as they are added
+            if seeds.len().is_multiple_of(1024) {
+                cx.budget.check()?;
+            }
         }
         let mut bytes = 0usize;
         for (ch, f) in heads.chunks(256).zip(found) {
             for (t, f) in ch.iter().zip(f) {
+                // each fact's instances are given back as their node ids are charged
+                let fb = size_of::<Found>()
+                    + f.bodies.iter().map(|b| body_bytes(b.len())).sum::<usize>();
+                let ib: usize = f.bodies.iter().map(|b| b.len() * 8 + 32).sum();
+                held.try_grow(ib)?;
+                bytes += ib;
                 let i = w.index[t];
                 let mut ins = Ins {
                     bodies: Vec::with_capacity(f.bodies.len()),
@@ -983,13 +1002,14 @@ impl Witnesses {
                             }
                         })
                         .collect();
-                    bytes += ids.len() * 8 + 32;
                     ins.bodies.push(ids);
                 }
                 pass.ins.insert(i, ins);
+                found_held.shrink(fb);
+                cx.budget.check()?;
             }
         }
-        held.try_set(bytes + heads.capacity() * size_of::<Triple>())?;
+        held.try_set(bytes + heads.len() * 4 + heads.capacity() * size_of::<Triple>())?;
         drop(found_held);
         drop(heads);
         // the base facts that are premises only have their own quad
@@ -1065,7 +1085,9 @@ impl Witnesses {
         if p.dead.is_empty() && start.is_empty() {
             return Ok(p);
         }
-        let lost = self.lost(&p.dead);
+        let mut reached = Held::new(&limits.budget);
+        reached.try_grow(start.len() * (REACHED_BYTES + VISITED_BYTES) + p.dead.len() * 24)?;
+        let lost = self.lost(&p.dead, &mut reached)?;
         let plans = Plans::new(&mut c.graph, rules)?;
         let abort = AtomicBool::new(false);
         let cx = Cx::new(c, rules, &plans, &abort, limits);
@@ -1097,20 +1119,27 @@ impl Witnesses {
                 if !visited.insert(h) {
                     continue;
                 }
+                reached.try_grow(VISITED_BYTES)?;
                 let Some(j) = self.node(&h) else {
                     continue;
                 };
                 if (self.nodes[j as usize].trunc || lost.contains(&j)) && seen.insert(j) {
+                    reached.try_grow(REACHED_BYTES)?;
                     p.region.push(j);
                     queue.push_back(h);
                 }
             }
         }
+        p.held = Some(reached);
         Ok(p)
     }
 
     /// The nodes whose kept witnesses name one of `dead`.
-    fn lost(&self, dead: &FxHashSet<FactKey>) -> FxHashSet<u32> {
+    fn lost(
+        &self,
+        dead: &FxHashSet<FactKey>,
+        held: &mut Held,
+    ) -> Result<FxHashSet<u32>, MemoryExceeded> {
         let mut out = FxHashSet::default();
         for k in dead {
             for &i in self.rev.get(k).into_iter().flatten() {
@@ -1119,12 +1148,13 @@ impl Witnesses {
                     && n.w
                         .iter()
                         .any(|x| x.atoms().binary_search(&Atom::Fact(*k)).is_ok())
+                    && out.insert(i)
                 {
-                    out.insert(i);
+                    held.try_grow(REACHED_BYTES)?;
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Bring the witnesses to the closure `c` after an update: the explicit facts
@@ -1225,14 +1255,14 @@ impl Witnesses {
         if pass.rebuild {
             return Ok(false);
         }
-        self.compact_rev();
+        self.compact_rev()?;
         self.settle_charge()?;
         self.finish_report(c, false, pass.evaluated, t0);
         Ok(true)
     }
 
     /// Drop the stale entries of the reverse index once they are most of it.
-    fn compact_rev(&mut self) {
+    fn compact_rev(&mut self) -> Result<(), MemoryExceeded> {
         let live: usize = self
             .nodes
             .iter()
@@ -1240,8 +1270,13 @@ impl Witnesses {
             .map(|n| n.w.iter().map(|x| x.len()).sum::<usize>())
             .sum();
         if self.rev_entries <= 2 * live + 1024 {
-            return;
+            return Ok(());
         }
+        // the new index is charged before it is built, beside the old one
+        let mut tmp = Held::try_new(
+            self.held.budget(),
+            table_bytes(self.rev.len(), size_of::<(FactKey, Vec<u32>)>()) + live * 4,
+        )?;
         let mut rev: FxHashMap<FactKey, Vec<u32>> = FxHashMap::default();
         let mut n = 0;
         for (i, node) in self.nodes.iter().enumerate() {
@@ -1267,6 +1302,8 @@ impl Witnesses {
         self.rev = rev;
         self.rev_entries = n;
         self.recharge();
+        tmp.set(0);
+        Ok(())
     }
 
     fn finish_report(&mut self, c: &Closure, built: bool, evaluated: u64, t0: Instant) {
@@ -2230,7 +2267,7 @@ mod tests {
             w.remove_node(i);
             assert_eq!(w.held.bytes(), w.heap_bytes());
         }
-        w.compact_rev();
+        w.compact_rev().unwrap();
         assert_eq!(w.held.bytes(), w.heap_bytes());
         assert!(w.held.bytes() < held / 2, "{}", w.held.bytes());
         assert_eq!(w.rev_entries, 0);
@@ -2316,5 +2353,74 @@ mod tests {
         };
         assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
         assert!(charged <= 10 * one, "{charged}");
+    }
+
+    /// Regression (fifth review of item 416): the search before a deletion kept its sets,
+    /// queue and region without a charge. The prepared state now holds the charge of
+    /// every fact it reached until the update consumes it.
+    #[test]
+    fn the_search_before_a_deletion_is_charged() {
+        let v = Vocab::new();
+        let sub = v.id(RDFS, "subClassOf");
+        let ty = v.id(RDF, "type");
+        let cs: Vec<u64> = (0..6).map(|k| ex(&v, &format!("C{k}"))).collect();
+        let mut base: FxHashSet<Triple> = cs.windows(2).map(|w| [w[0], sub, w[1]]).collect();
+        for k in 0..8 {
+            base.insert([ex(&v, &format!("i{k}")), ty, cs[0]]);
+        }
+        let text = crate::RDFS_RULES;
+        let mut c = full(&v, text, &base);
+        let rules = compiled(text, &c.terms);
+        let mut w = Witnesses::build(&mut c, &rules, 8, &limits()).unwrap();
+        let budget = Budget::new(None);
+        let l = Limits {
+            budget: budget.clone(),
+            ..limits()
+        };
+        let gone = [cs[0], sub, cs[1]];
+        let prep = w.prepare(&mut c, &rules, &l, &[gone], &[]).unwrap();
+        assert!(!prep.region.is_empty());
+        let reached = prep.held.as_ref().map_or(0, Held::bytes);
+        assert!(
+            reached >= prep.region.len() * REACHED_BYTES,
+            "{reached} {}",
+            prep.region.len()
+        );
+        assert!(budget.used() >= reached);
+        drop(prep);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// Regression (fifth review of item 416): compacting the reverse index built the new
+    /// index before charging it, beside the old one. Both are charged during the
+    /// compaction.
+    #[test]
+    fn compaction_charges_both_indexes() {
+        let budget = Budget::new(None);
+        let mut w = Witnesses::empty(8, &budget);
+        for n in 0..1000u64 {
+            let i = w.add_node([n, 1, 2], None);
+            let ws: Vec<Witness> = (0..4).map(|k| singleton(n * 4 + k)).collect();
+            w.set(i, ws, false, false);
+        }
+        // the supports change, so that the index holds stale entries
+        for n in 0..1000u64 {
+            let i = w.node(&[n, 1, 2]).unwrap();
+            w.set(i, vec![singleton(10_000 + n)], false, false);
+        }
+        // a fresh budget, whose peak is the charge from here on
+        let budget = Budget::new(None);
+        w.set_budget(&budget).unwrap();
+        let before = budget.used();
+        assert_eq!(budget.peak(), before);
+        w.compact_rev().unwrap();
+        assert!(w.rev_entries == 1000, "{}", w.rev_entries);
+        assert!(budget.used() < before);
+        assert!(
+            budget.peak() >= before + 1000 * 4,
+            "{} {before}",
+            budget.peak()
+        );
+        assert_eq!(w.held.bytes(), w.heap_bytes());
     }
 }

@@ -443,9 +443,9 @@ fn discarded_witnesses_release_their_memory() {
         &s,
         Some(r.receipt.unwrap().commit.seq),
         &cache,
-        // the update fits in the full build's peak once the discarded witnesses are
-        // given back; before, it needed about 1.24 times that peak
-        &opts(Some(peak)),
+        // the update fits in 1.1 times the full build's peak once the discarded
+        // witnesses are given back; before, it needed about 1.24 times that peak
+        &opts(Some(peak + peak / 10)),
     );
     assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
     let got = cache.witnesses(&t("i", &ty(), &format!("C{n}"))).unwrap();
