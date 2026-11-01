@@ -1136,9 +1136,11 @@ impl Asking<'_, '_> {
         };
         // The default graph and every named graph the caller may read, as the linker
         // searches them, without materialized inferences unless the ask reads them.
-        let inferred = (self.o.reasoning != Some(true))
-            .then(|| format!(" FILTER(?{{g}} != <{}>)", crate::http::INFERRED_GRAPH))
-            .unwrap_or_default();
+        let inferred = if self.o.reasoning == Some(true) {
+            String::new()
+        } else {
+            format!(" FILTER(?{{g}} != <{}>)", crate::http::INFERRED_GRAPH)
+        };
         // A union with GRAPH patterns costs a scan of every named graph for each pattern,
         // so it is used only when the caller can read a named graph at all.
         let named = run(format!(
