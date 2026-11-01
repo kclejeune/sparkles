@@ -1802,6 +1802,88 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 `SRC` must be a database that no server has open. A run that stops before it finishes
 leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 
+## Ontology
+
+The design and its rationale are in [F21 Ontology API](specs/F21-ontology-api.md). The
+routes read the OWL 2 ontology of a dataset's graphs by the reverse mapping of the OWL 2
+Mapping to RDF Graphs, check it against the OWL 2 profiles and edit it through the
+forward mapping. Each route reads the graphs that `graph` names, which is repeatable and
+defaults to the default graph, with the imports that resolve to graphs of the dataset
+unless `imports=false`. `mode=strict` keeps every triple outside the mapping unmapped,
+and the default `mode=lenient` types undeclared entities from their use and says so in
+the diagnostics. The routes read with the caller's grants. An import of a graph the
+caller cannot read is not followed.
+
+`GET /$/ontology/{ds}` answers the ontology header, the counts of declared entities by
+kind and of axioms by type, the graphs read, the imports and whether each resolved, the
+number of triples read and unmapped, and the first 100 diagnostics. The counts cover the
+terminology, which is everything but the class and property assertions. Its `ETag` names
+the commit it read.
+
+```json
+{
+  "dataset": "uni",
+  "commit": 12,
+  "mode": "lenient",
+  "graphs": ["default"],
+  "imports": [],
+  "header": { "iri": "http://ex.org/uni", "versionIri": null, "imports": [], "annotations": ["Annotation(rdfs:label \"University\")"] },
+  "axioms": { "Declaration": 4, "SubClassOf": 2 },
+  "axiomCount": 6,
+  "entities": { "Class": 3, "ObjectProperty": 1 },
+  "triples": 13,
+  "unmapped": 0,
+  "diagnostics": { "warnings": 0, "errors": 0, "list": [] },
+  "cached": false
+}
+```
+
+`GET /$/ontology/{ds}/axioms` lists the axioms, 100 at a time by default and at most
+10,000 (`limit`, `offset`, and `next` in the answer). `type` keeps the axiom types it
+lists, comma separated, and `about` keeps the axioms that mention an IRI. An `about` IRI
+that the ontology neither declares nor uses is `404`. `assertions=true` adds the
+assertions the store holds, which the listing streams from the graphs. Each axiom comes
+in functional-style syntax (`ofn`), with the dataset's prefixes, and in its JSON form
+(`axiom`), with the graph it was read from. `format=ofn` answers one functional-style
+document of the page, as `text/owl-functional`.
+
+The JSON form of an axiom names its type and its operands. IRIs are strings, an
+anonymous individual is `_:label`, an inverse property is `{"inverseOf": IRI}` and a
+literal is `{"@value": …, "@type": …}` or `{"@value": …, "@language": …}`. A class
+expression other than a class is an object with its `type` and members such as
+`classes`, `property`, `class`, `cardinality`, `individual`, `range` and `value`.
+
+```json
+{ "type": "SubClassOf",
+  "subClass": "http://ex.org/Professor",
+  "superClass": { "type": "ObjectSomeValuesFrom", "property": "http://ex.org/teaches", "class": "http://ex.org/Course" },
+  "annotations": [{ "property": "http://www.w3.org/2000/01/rdf-schema#comment", "value": { "@value": "every professor teaches" } }] }
+```
+
+`POST /$/ontology/{ds}/check` takes `graph`, `imports`, `mode`, `profiles` (`el`, `ql`,
+`rl`, `dl` or `all`, with `dl` by default), `assertions` and `maxViolations`, and answers
+one report per profile. A report says whether the ontology conforms and lists at most
+`maxViolations` violations, 1,000 by default, with the total. Each violation has the rule
+it breaks, such as `OWL 2 Profiles §2.2.3`, a message, and the axiom and graph when the
+violation is one axiom's. The EL, QL and RL reports also list the OWL 2 DL violations,
+since each profile is a subset of OWL 2 DL. With `assertions: false` the check covers
+the terminology alone, which is faster on a large data graph.
+
+`POST /$/ontology/{ds}/axioms` adds the axioms of `add` and removes those of `remove` in
+one commit. A removed axiom takes its triples with it, including the blank nodes of its
+class expressions and lists, except those another axiom or triple still uses. Removing an
+axiom that the ontology does not hold is not an error, and the answer lists it under
+`absent`. A removal edits the graphs `graph` names and the graph `target` names. An
+axiom read only from an imported graph is `400` until `target` names that graph. An
+added axiom goes to the graph `target` names, the first graph read by default. The edit also declares the entities the added axioms use that the ontology does
+not declare, unless `declare` is false. Named individuals are not declared. The answer
+counts the axioms added, already present and removed, and the triples inserted, deleted
+and kept. The route takes the parameters of the other writes, such as `dryRun` and
+`receipt`, and an `If-Match` with the summary's tag. An axiom the forward mapping cannot
+write, such as a `DisjointClasses` of one class, is `400` with code `invalid-axiom`.
+Writing needs write access to the target graph, and a removal needs it on the graphs the
+removed triples are in.
+
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 
 | Method     | Path                  | Description |

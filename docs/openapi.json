@@ -33557,6 +33557,614 @@
         "x-sparkles-permission": "server-admin"
       }
     },
+    "/$/ontology/{ds}": {
+      "get": {
+        "description": "The ontology header, the counts of declared entities by kind and of axioms by type in the terminology, the graphs read with the imports that resolved, the triples read, the unmapped triples and the diagnostics of the read. The entity tag names the commit read, and an edit's `If-Match` can name it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "getOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The summary."
+          },
+          "304": {
+            "description": "The summary is still at the tagged commit."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Ontology summary",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/axioms": {
+      "get": {
+        "description": "The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "getOntologyAxioms",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "Axiom types, comma separated, such as `SubClassOf,EquivalentClasses`.",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An entity IRI the axioms mention.",
+            "in": "query",
+            "name": "about",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Also list the assertions the store holds.",
+            "in": "query",
+            "name": "assertions",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "`json` (the default) or `ofn`.",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "json",
+                "ofn"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most axioms listed, from 1 to 10,000 (100 by default).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The axioms skipped.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/owl-functional": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "One page of axioms."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Ontology axioms",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "editOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "add": {
+                    "items": {
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "declare": {
+                    "type": "boolean"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "remove": {
+                    "items": {
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "target": {
+                    "description": "The graph that takes the added axioms.",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The axioms.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "absent": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "added": {
+                      "type": "integer"
+                    },
+                    "committed": {
+                      "type": "boolean"
+                    },
+                    "declared": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "deleted": {
+                      "type": "integer"
+                    },
+                    "inserted": {
+                      "type": "integer"
+                    },
+                    "kept": {
+                      "type": "integer"
+                    },
+                    "present": {
+                      "type": "integer"
+                    },
+                    "removed": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "What the edit did, with the receipt when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Add and remove axioms",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/ontology/{ds}/check": {
+      "post": {
+        "description": "One report per profile in `profiles` (`el`, `ql`, `rl`, `dl` or `all`; `dl` by default), over the terminology and, unless `assertions` is false, the assertions the store holds. Each report lists the violations with the rule of the OWL 2 Profiles or the structural specification that each breaks. The EL, QL and RL reports also list the OWL 2 DL violations.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "checkOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "assertions": {
+                    "description": "Check the assertions the store holds (the default).",
+                    "type": "boolean"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "maxViolations": {
+                    "description": "The most violations each report lists (1,000 by default).",
+                    "maximum": 10000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "profiles": {
+                    "items": {
+                      "enum": [
+                        "el",
+                        "ql",
+                        "rl",
+                        "dl",
+                        "all"
+                      ],
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The ontology and the profiles.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The reports."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Check OWL 2 profiles",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/openapi.json": {
       "get": {
         "externalDocs": {
@@ -50928,6 +51536,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#schema-discovery"
       },
       "name": "Schema"
+    },
+    {
+      "description": "The OWL 2 axioms of a dataset's graphs, their profile checks and edits.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+      },
+      "name": "Ontology"
     },
     {
       "description": "Named, parameterized queries of a dataset.",

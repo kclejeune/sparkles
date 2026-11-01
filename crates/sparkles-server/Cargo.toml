@@ -134,7 +134,7 @@ sparkles-office = { workspace = true, features = ["fixtures"] }
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "backup-encryption", "fmt", "tls", "graphql", "pdf", "pdf-ocr", "office", "embed-local", "mapping-sqlite", "mapping-parquet"]
+default = ["reasoning", "ontology", "shacl", "shex", "mimalloc", "text", "text-cjk-dict", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "backup-encryption", "fmt", "tls", "graphql", "pdf", "pdf-ocr", "office", "embed-local", "mapping-sqlite", "mapping-parquet"]
 # SQLite connections of R2RML and RML mappings (`sparkles map`, `--connection`, the
 # `connections` settings kind); bundles SQLite's C sources
 mapping-sqlite = ["sparkles/mapping-sqlite"]
@@ -142,6 +142,8 @@ mapping-sqlite = ["sparkles/mapping-sqlite"]
 mapping-parquet = ["sparkles/mapping-parquet"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
+# the OWL 2 ontology of a dataset (`/$/ontology`, `sparkles ontology`, spec F21)
+ontology = ["reasoning", "sparkles/ontology"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
 shacl = ["dep:sparkles-shacl", "sparkles/shacl"]
 # ShEx validation (`/{ds}/shex`, `sparkles shex`)

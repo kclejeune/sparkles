@@ -5689,6 +5689,7 @@ dependencies = [
  "sparkles-core",
  "sparkles-fmt",
  "sparkles-graphql",
+ "sparkles-owl",
  "sparkles-reasoner",
  "sparkles-shacl",
  "sparkles-shex",
@@ -5931,6 +5932,17 @@ dependencies = [
  "flate2",
  "quick-xml 0.37.5",
  "zip",
+]
+
+[[package]]
+name = "sparkles-owl"
+version = "0.1.0"
+dependencies = [
+ "oxrdf",
+ "oxrdfio",
+ "proptest",
+ "rustc-hash 2.1.3",
+ "serde_json",
 ]
 
 [[package]]

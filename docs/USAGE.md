@@ -683,6 +683,11 @@ sparkles infer   --loc db --profile owl-rl --threads 8   # evaluate the rules on
 sparkles infer   --loc db --profile rdfs --max-inferred 200000000   # allow 200 million derived triples
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
 sparkles infer   --loc db --ontology-graph http://ex.org/onto --imports fetch   # input graphs and owl:imports
+sparkles ontology summary --loc db             # OWL 2 header, axiom and entity counts, unmapped triples
+sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Person   # functional-style syntax (--format json)
+sparkles ontology check   --loc db --profile el,rl   # OWL 2 profile checks (exit 1 when outside one)
+sparkles ontology check   onto.ttl --profile all     # check a file without a database
+sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axioms, in one commit
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
                                               #   --language fr=french-light (a tag with an analyzer),
                                               #   --rebuild, --status, --disable, --text-dicts DIR

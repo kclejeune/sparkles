@@ -1,19 +1,20 @@
 # F21: An OWL 2 ontology API
 
-> **Status:** specified
+> **Status:** partially implemented
 >
-> **Phases:** None shipped. Phase 1 is the axiom model, reading and writing it through
-> the OWL 2 mapping to RDF graphs, the OWL 2 EL, QL and RL profile checks, the Rust
-> library API, `/$/ontology/{ds}` and `sparkles ontology`. Phase 2 adds the Python and
-> Node.js surfaces, the JVM entry point that runs Jena's `jena-ontapi` over a Sparkles
-> graph, entity views that include materialized inferences, and the reasoner's use of the
-> profile checks. Phase 3 adds the OWL 2 DL global restrictions, the functional-style
-> syntax reader, an MCP tool and ontology diffs between commits.
+> **Phases:** Phase 1 is delivered. It provides the axiom model, reading and writing it
+> through the OWL 2 mapping to RDF graphs, the OWL 2 EL, QL and RL profile checks and the
+> OWL 2 DL structural restrictions, the Rust library API, `/$/ontology/{ds}` and
+> `sparkles ontology`. Phase 2 adds the Python and Node.js surfaces, the JVM entry point
+> that runs Jena's `jena-ontapi` over a Sparkles graph, entity views that include
+> materialized inferences, and the reasoner's use of the profile checks. Phase 3 adds the
+> functional-style syntax reader, an MCP tool and ontology diffs between commits.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies) and
+> [API: Ontology](../API.md#ontology).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> The design below is the one written before implementation. The [Outcome](#outcome)
+> section records how Phase 1 landed and where it departs from the design.
 
 This design was written from the W3C recommendations *OWL 2 Web Ontology Language
 Structural Specification and Functional-Style Syntax*, *OWL 2 Web Ontology Language
@@ -552,9 +553,14 @@ capabilities and remaining work are described by the spec status and Outcome.
     `crates/sparkles/src/handles/`, `crates/sparkles/src/dataset.rs`,
     `jvm/gradle/libs.versions.toml`) and specs C02, C08, C12, C12b, C17, F16, F17, F18, P01,
     P04, P05, P06 and AUDIT §5.
-- **Implementation:** not built. `jena-ontapi` (Apache-2.0) is planned as an optional
-  dependency of `sparkles-jena`. No new Rust dependency is planned; `horned-owl`
-  (LGPL-3.0) is named only as a rejected alternative and was not read.
+- **Implementation (Phase 1):** written from the W3C OWL 2 Structural Specification,
+  Mapping to RDF Graphs and Profiles recommendations (second edition), re-read for the
+  implementation, and checked against the W3C OWL 2 test cases, the approved export
+  `all.rdf` of the OWL Working Group's test repository (W3C Test Suite licence), which
+  `scripts/fetch-test-suites.sh` fetches by checksum and which is not vendored. No code of
+  Jena's `jena-ontapi` or of any other ontology library was read or copied, and no new
+  third-party dependency was added. `jena-ontapi` remains planned as an optional
+  dependency of `sparkles-jena` in Phase 2.
 - **Rejected** (spec §13):
   - a native implementation of `jena-ontapi`'s interfaces in the JVM binding;
   - an ontology store separate from the triples;
@@ -563,7 +569,103 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 71.
+Phase 1 is delivered as roadmap item 71. Phases 2 and 3 remain as roadmap items
+537 and 538.
+
+### Phase 1
+
+The `sparkles-owl` crate holds the structural model of §3, the reverse mapping of §4
+with lenient and strict reads, the forward mapping of §5, a functional-style writer, a
+JSON form of axioms and the profile checks of §6. The library's `ontology` cargo feature
+adds the handle `ds.ontology()`, which opens a snapshot's ontology, checks it, edits it
+and removes entities. The server builds it by default. `GET /$/ontology/{ds}`,
+`GET /$/ontology/{ds}/axioms`, `POST /$/ontology/{ds}/check` and
+`POST /$/ontology/{ds}/axioms` serve it with the caller's grants through the server's
+`CallerContext`. `sparkles ontology summary|axioms|check|edit` works on a database
+directory or a server, and `sparkles ontology check FILE` checks a file without a
+database.
+
+The tests cover acceptance examples A1 to A5, the QL half of A6 and the graph-view half
+of A8. `mise run test:owl` reads the 335 W3C OWL 2 test cases that have an RDF/XML
+ontology. The DL species agree for 326 cases, the 983 EL, QL and RL memberships the cases
+state agree apart from the listed differences, and the 246 ontologies in OWL 2 DL
+round-trip. The 31 known differences in `crates/sparkles-owl/tests/w3c_owl_known.txt`
+are cases that type entities the OWL 1 way, use anonymous individuals in EL or QL, which
+their grammars do not allow, or omit the ontology header that the mapping requires.
+Property tests write random axioms to triples and read them back.
+
+### Decisions and departures from the design
+
+**Shared expressions in strict mode.** §4.2 and A4 make a blank node structure used more
+than once unmapped in a strict read. The W3C test case Restriction-002 shares a
+restriction and is in OWL 2 DL, so a strict read accepts a shared class expression, data
+range or property expression and warns. A shared list cell is still unmapped in a strict
+read. Removing one of two axioms that share a structure keeps the structure, as A4 asks.
+
+**The ontology header.** The Mapping §3.1.2 requires exactly one ontology header, so an
+ontology without one is outside OWL 2 DL. When several nodes are typed `owl:Ontology`,
+the header is the one no other ontology node points to, such as the object of
+`owl:priorVersion`.
+
+**The DL check in Phase 1.** §6.4 placed the OWL 2 DL global restrictions in Phase 3.
+Phase 1 checks them, since the profile checks are subsets of OWL 2 DL and the test cases
+state DL membership. The DL check covers the typing of entities, reserved vocabulary,
+simple properties in cardinalities and other restrictions, regular property chains,
+datatype definitions, anonymous individuals and unmapped triples. An EL, QL or RL report
+also lists the DL violations.
+
+**Profile grammars.** The QL check follows the QL grammar, which has no
+`IrreflexiveObjectProperty`, although the test case New-Feature-IrreflexiveProperty-001
+lists QL. EL and QL refuse anonymous individuals.
+
+**Equivalences of one operand.** An `EquivalentClasses` or `SameIndividual` of one
+operand, as `owl:equivalentClass` from a class to itself reads, is accepted. A
+disjointness axiom still needs two operands, and an edit that adds one with fewer is
+refused with code `invalid-axiom`.
+
+**The Rust API.** The handle takes request structures, `OntologyRequest`,
+`CheckRequest` and `EditRequest`, with `QueryOptions` for the caller's grants and
+deadline, instead of the builder and closure of §2.1. Entity accessors such as
+`super_classes` are not provided, and callers filter axioms by type and entity. Roadmap
+item 540 adds both.
+
+**Imports.** A read follows `owl:imports` only to graphs of the dataset that the caller
+can read. Fetching is refused, because a read route would otherwise make outbound
+requests. Roadmap item 538 can add fetching through the outbound policy beside the
+syntax reader.
+
+**Caching.** The handle keeps the last four reads of up to two million triples each. An
+entry is keyed by commit, graphs, imports and mode, so any commit replaces it, and only
+callers who can read every graph share it. The size budget of §4.5 and its `507` answer
+are not enforced, and reads are bounded by the query deadline. Roadmap item 539
+adds the budget and the A7 measurement on LUBM.
+
+**Assertions.** A check covers all the assertions the store holds by default, not only
+the restricted forms, and `assertions: false` restricts it to the terminology. The
+assertions stream from the store and are never held by the ontology.
+
+**Removal scope.** A removal edits the graphs the request names and the graph the
+edit names as its target. An axiom read only from an imported graph is refused with
+`invalid` until the edit names that graph, as §5.4 asks. A structure stays when a triple
+of the graphs read refers to it, and the main triple of a removed axiom goes even when
+its subject is an expression another axiom shares.
+
+**Nesting.** A read follows class expressions and data ranges 128 levels deep. A deeper
+structure stays unmapped with the error diagnostic `nesting`, so that a long chain of
+blank nodes cannot exhaust the stack.
+
+**Removal.** A removal deletes only the declarations it names. `remove_entity` names the
+entity's declarations, the axioms that mention it and the assertions about it, which
+answers open question 3 for punned IRIs by removing both uses.
+
+**Commits.** The routes accept `at=` to read an earlier commit, which answers open
+question 5. An edit reads the ontology from the head it writes on, under the writer lock.
+
+**Unchecked.** The profile checks do not check literals' lexical forms against their
+datatypes, roadmap item 541. A8 is tested with graph views, not with C12b
+triple protections.
+
+The parity test of the library administration API (P06) does not cover the handle.
 
 ### Scope changes
 
@@ -587,7 +689,7 @@ These phases belong to [ROADMAP](../ROADMAP.md) item 457, the ontology workbench
 
 **Ontology refactoring operations.** Rename or change IRIs everywhere including RDF 1.2 triple terms, merge entities, move axioms between ontologies, deprecate with replacement and delete with usage check, each as a previewed commit. These are daily ontology maintenance tasks. Rename can ship first over SPARQL. It depends on item 71.
 
-**The F21 axiom model as the workbench base.** Item 71 builds the F21 Phase 1 axiom model, the reverse and forward mappings, the profile checks and `/$/ontology/{ds}` as a new `sparkles-owl` crate. Almost every ontology editing, refactoring, diff, documentation and classification phase depends on it, so it is the root of this workstream.
+**The F21 axiom model as the workbench base.** Item 71 built the F21 Phase 1 axiom model, the reverse and forward mappings, the profile checks and `/$/ontology/{ds}` in the `sparkles-owl` crate. Almost every ontology editing, refactoring, diff, documentation and classification phase depends on it, so it is the root of this workstream.
 
 **Functional, Manchester, OWL/XML, OBO and OBO Graphs JSON syntaxes.** Add readers and writers for OFN, Manchester, OWL/XML, OBO 1.4 and OBO Graphs JSON in sparkles-owl, registered with the loader, formatter, linter and LSP, with a Manchester class-expression editor mode. Ontologies are distributed in these formats and Protégé users write Manchester. Manchester is only rendered today (`schema/expressions.rs`). It depends on item 71.
 

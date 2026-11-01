@@ -59,6 +59,8 @@ mod models_cmd;
 mod notify;
 mod notify_cmd;
 mod obs;
+#[cfg(feature = "ontology")]
+mod ontology_cmd;
 mod openapi;
 mod otel;
 mod outbound;
@@ -1755,6 +1757,13 @@ enum Cmd {
     Algo {
         #[command(subcommand)]
         cmd: algo_cmd::AlgoCmd,
+    },
+    /// The OWL 2 ontology of a database's graphs: its summary, its axioms, its profile
+    /// checks and edits, and the check of an ontology file
+    #[cfg(feature = "ontology")]
+    Ontology {
+        #[command(subcommand)]
+        cmd: ontology_cmd::OntologyCmd,
     },
     /// Stored, parameterized queries of a database: list, get, put, delete and run them
     Queries {
@@ -4107,6 +4116,8 @@ fn run() -> Result<()> {
         Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Algo { cmd } => algo_cmd::run(cmd, opts),
+        #[cfg(feature = "ontology")]
+        Cmd::Ontology { cmd } => ontology_cmd::run(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         #[cfg(feature = "graphql")]
         Cmd::Graphql(args) => graphql::run(args, opts),

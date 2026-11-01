@@ -192,6 +192,7 @@ implementation status.
 | [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available. Provenance-aware inferred visibility and review protections remain planned. |
 | [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, including nested read models in the Rust library. Form checks use bounded shape-dependent targets and refuse incomplete discovery. Atomic nested editing, remaining editors and producer admission remain planned. |
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
+| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The OWL 2 axiom model, both RDF mappings, the DL, EL, QL and RL checks, the Rust handle, `/$/ontology/{ds}` and `sparkles ontology` are available. Bindings, a functional-syntax reader, an MCP tool, axiom diffs, a size budget and entity accessors remain in items 537 to 541. |
 | [Server and Fuseki integration](server/README.md#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. Items 76, 38, 51, 37 and 39 complete the capability. The ARQ extensions that item 69 lists are a lower-priority extension outside that path, and the guide names them. |
 | [Access control and authentication](server/README.md#access-control-and-security) | Partially complete. | Dataset, graph and triple protections, OIDC, API tokens and administration audit events are available, while derived visibility and authentication extensions remain planned. Bounded Rust permission masks and the built-in disclosure guard are available without protection-pattern planning or unresolved nested providers. Those boundaries and guarded caller adoption remain under item 395. |
 | [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete within the documented settings scope. | Layered settings, operator locks, runtime administration and prefix completion are available. |
@@ -212,7 +213,7 @@ implementation status.
 | [Batched updates and triggers](specs/C23-batched-updates-and-triggers.md) | Planned. | Item 36 specifies batched work, commit-trigger authoring and the writer that graph algorithms use. |
 | [Additional query languages](specs/C24-json-query-languages.md) | Planned. | JSON node-pattern and Datalog query surfaces remain item 72. openCypher remains item 20, which also supplies graph algorithm procedures. |
 | [Query by example and notebooks](#known-gaps) | Planned. | Items 28 and 30 describe these interfaces. The existing visual query builder is available. |
-| [Local-first engine and ontology object API](#known-gaps) | Planned. | Items 44 and 71 describe these extensions. Ordinary RDF ontology graphs already work. |
+| [Local-first engine](#known-gaps) | Planned. | Item 44 describes this extension. |
 
 ## Compatibility boundaries
 
@@ -255,7 +256,7 @@ and links each item to its design spec.
 | <a id="sparql-and-formats"></a>[SPARQL and formats](querying/README.md#sparql-and-formats) | Additional query surfaces, execution coverage, formats and editor support remain. |
 | <a id="search-and-graph-algorithms"></a>[Search and graph algorithms](search/README.md#search-and-graph-algorithms) | Multi-field search, quantization and further algorithm surfaces remain. |
 | <a id="geosparql-1"></a>[GeoSPARQL](search/README.md#geosparql-1) | Item 24 adds per-row nearest-neighbour joins, spatial syntax, polygon approximations and further CRS support. |
-| <a id="reasoning-and-validation"></a>[Reasoning and validation](reasoning/README.md#reasoning-and-validation) | Automatic reasoning selection, a separate derived layer and remaining validation and form work remain. |
+| <a id="reasoning-and-validation"></a>[Reasoning and validation](reasoning/README.md#reasoning-and-validation) | Automatic reasoning selection, a separate derived layer, the remaining ontology API surfaces and remaining validation and form work remain. |
 | <a id="server-access-control-and-operations"></a>[Server, access control and operations](server/README.md#server-access-control-and-operations) | Further Fuseki integration, derived visibility and operational controls remain. |
 | <a id="ai-and-agents-1"></a>[AI and agents](ai/README.md#ai-and-agents-1) | Ask accuracy, contextual linking, ingestion formats and configurable reports remain. |
 | <a id="web-ui-1"></a>[Web UI](visualization/README.md#web-ui-1) | Live profiling, additional query-builder blocks and larger graph rendering remain. |
