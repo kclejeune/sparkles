@@ -436,3 +436,38 @@ fn local_head_constants_survive_a_checkpoint() {
         .collect();
     assert_eq!(shown(&s.snapshot(), &back), want);
 }
+
+/// A restored program notices a local constant that the store came to hold after its
+/// checkpoint, and is built again instead of advancing over facts with the old id.
+#[test]
+fn a_restored_program_sees_its_constants_move() {
+    let s = store("<http://ex/a> <http://ex/p> <http://ex/b> .");
+    let rules = "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+                 [qr: (?x <http://ex/q> ?y) -> (?x <http://ex/r> ?y)]";
+    let fp = program(rules, &s, Provenance::None, None).expect("build");
+    let snap = s.snapshot();
+    let bytes = RuleProgram::encode(&fp, &snap).expect("encode");
+    let parsed = parse_rules(rules).expect("rules");
+    let mut back = FixedPoint::new(RuleProgram::new(&parsed).expect("program"));
+    RuleProgram::decode(&mut back, &bytes, &snap).expect("decode");
+    let after = snap.commit;
+    update(
+        &s,
+        "DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/b> } ;
+         INSERT DATA { <http://ex/c> <http://ex/q> <http://ex/d> }",
+        &QueryOptions::default(),
+    )
+    .expect("update");
+    assert!(
+        advance(&s, &mut back, after).is_none(),
+        "the moved constant builds the program again"
+    );
+    let want: BTreeSet<String> = [
+        "<http://ex/c> <http://ex/q> <http://ex/d>",
+        "<http://ex/c> <http://ex/r> <http://ex/d>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(shown(&s.snapshot(), &back), want);
+}

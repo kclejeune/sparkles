@@ -191,6 +191,12 @@ impl RuleProgram {
     /// facts name the wrong id: `begin` then returns `true`, and the caller builds the
     /// fixed point again instead of advancing it.
     pub fn begin(&mut self, cx: &RuleCx) -> bool {
+        self.resolve(&cx.new)
+    }
+
+    /// Resolve the rules' constants at `snap`, and whether one of them moved since the
+    /// last resolution.
+    fn resolve(&mut self, snap: &Snapshot) -> bool {
         let mut consts = Vec::new();
         let mut resolved = Vec::with_capacity(self.rules.len());
         for c in &self.rules {
@@ -202,7 +208,7 @@ impl RuleProgram {
                             out[i] = match p {
                                 Pos::Var(v) => R::Var(*v),
                                 Pos::Const(t) => {
-                                    let id = self.terms.intern(&cx.new, t);
+                                    let id = self.terms.intern(snap, t);
                                     consts.push(id);
                                     R::Id(id)
                                 }
@@ -235,8 +241,9 @@ impl RuleProgram {
     }
 
     /// Load into `fp` the state that [`Self::encode`] wrote, mapping its terms into the
-    /// id space of `snap` and the program's fresh local terms. Call [`Self::begin`]
-    /// before the next pass, as for any other.
+    /// id space of `snap` and the program's fresh local terms. The constants are
+    /// resolved at `snap`, so that the next [`Self::begin`] reports a constant that the
+    /// store came to hold after `snap` and the caller builds again.
     pub fn decode(
         fp: &mut fixpoint::FixedPoint<RuleProgram>,
         data: &[u8],
@@ -246,7 +253,7 @@ impl RuleProgram {
         let mut r = Reader::new(data, snap, &mut terms)?;
         fp.program.terms = terms;
         fp.program.consts.clear();
-        fp.program.resolved.clear();
+        fp.program.resolve(snap);
         fp.load(&mut r)
     }
 
