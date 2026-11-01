@@ -70,7 +70,8 @@ def drafts(replies_path):
         text = prompt_text(req)
         if "```sparql" in text.split("Question:", 1)[-1]:
             continue  # a repair quotes the failed query
-        u = (r.get("reply") or {}).get("usage") if r.get("status") == 200 else None
+        reply = r.get("reply")
+        u = reply.get("usage") if r.get("status") == 200 and isinstance(reply, dict) else None
         tokens = (
             sum(
                 u.get(k) or 0
@@ -94,16 +95,21 @@ def grouped_terms(text):
     return out
 
 
+# What may not follow a whole IRI or prefixed name: a character that would continue
+# it, or a dot followed by one, so that `ex:p` does not match `ex:p.x` or `ex:p/q`
+# and `http://x/p` does not match `http://x/p/q`.
+END = r"(?![\w%/#?=&~+-]|\.[\w%/#-])"
+
+
 def present(term, text, prefixes, grouped=frozenset()):
     if term in grouped:
         return True
-    if f"<{term}>" in text or re.search(r"(?<![\w:/])" + re.escape(term) + r"(?![\w%-])", text):
+    if f"<{term}>" in text or re.search(r"(?<![\w:/<])" + re.escape(term) + END, text):
         return True
     for p, ns in prefixes.items():
         if term.startswith(ns) and len(term) > len(ns):
             local = term[len(ns) :]
-            pat = r"(?<![\w-])" + re.escape(f"{p}:{local}") + r"(?![\w%-])"
-            if re.search(pat, text):
+            if re.search(r"(?<![\w-])" + re.escape(f"{p}:{local}") + END, text):
                 return True
     return False
 

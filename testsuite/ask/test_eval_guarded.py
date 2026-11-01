@@ -104,6 +104,11 @@ class GuardedScore(unittest.TestCase):
         self.assertTrue(lenient(gold, got, {}))
         wrong = rel(["x", "l", "n"], [uri("ex:a"), lit("Bob"), lit("1", "nonNegativeInteger")])
         self.assertFalse(lenient(gold, wrong, {"ex:a": {"Alice"}}))
+        # a label column that already matches keeps its literal while another
+        # column's label turns into the IRI
+        gold = rel(["x", "l"], [uri("ex:a"), lit("Alice")])
+        self.assertTrue(lenient(gold, rel(["y", "m"], [lit("Alice"), lit("Alice")]), {"ex:a": {"Alice"}}))
+        self.assertFalse(lenient(gold, rel(["y", "m"], [lit("Alice"), lit("Bob")]), {"ex:a": {"Alice"}}))
 
     def test_empty_strings_drop_from_both_sides(self):
         gold = rel(["x"], [uri("ex:a")], [lit("")])
@@ -214,6 +219,24 @@ class GroundingRecall(unittest.TestCase):
             self.assertTrue(rows["a"]["prompt"])
             self.assertIsNone(rows["a"]["promptTokens"])
             self.assertEqual(grounding_recall.summary(rows)["promptTokensKnown"], 0)
+            # a malformed 200 reply saved as text keeps its prompt
+            (p / "replies.jsonl").write_text(json.dumps({"case": "c1", "status": 200, "reply": "not json", "request": {
+                "system": "You translate", "messages": [{"content": "<http://ex.org/p> Question: Q?"}]}}) + "\n")
+            self.assertTrue(grounding_recall.recall(qset, p)["a"]["prompt"])
+
+    def test_a_term_matches_only_a_whole_name(self):
+        import grounding_recall
+
+        present = grounding_recall.present
+        pre = {"ex": "http://example.org/"}
+        self.assertFalse(present("http://example.org/p", "<http://example.org/p/qualifier>", pre))
+        self.assertFalse(present("http://example.org/p", "http://example.org/p/qualifier", pre))
+        self.assertFalse(present("http://example.org/p", "ex:p.suffix", pre))
+        self.assertFalse(present("http://example.org/p", "ex:p/q", pre))
+        self.assertTrue(present("http://example.org/p", "Use ex:p.", pre))
+        self.assertTrue(present("http://example.org/p", "ex:p, ex:q", pre))
+        self.assertTrue(present("http://example.org/p", "<http://example.org/p>", pre))
+        self.assertTrue(present("http://example.org/p", "see http://example.org/p.", pre))
 
 
 class KilledChild(unittest.TestCase):

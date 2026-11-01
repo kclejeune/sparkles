@@ -194,9 +194,11 @@ def label_requests(gold, got):
     return sorted(iris), sorted(texts)
 
 
-def canonical(gold, got, labels):
+def canonical(gold, got, labels, columns=None):
     """Both relations with numeric literals as values and unambiguous labels as the
-    IRIs they name. `labels` maps an IRI to the set of its label texts."""
+    IRIs they name. `labels` maps an IRI to the set of its label texts. `columns`, when
+    given, is the set of ("gold", i) and ("got", j) columns whose labels may turn into
+    IRIs, and every other column keeps its literals."""
     gold_iris, got_iris = iris_of(gold), iris_of(got)
 
     def named_by(text, universe):
@@ -218,20 +220,20 @@ def canonical(gold, got, labels):
             changes["numbers"] += 1
             return n
         t = literal_text(c)
-        if t is not None and mixed[i]:
+        if t is not None and mixed[i] and (columns is None or ("gold", i) in columns):
             iri = named_by(t, got_iris | gold_iris)
             if iri:
                 changes["goldLabels"] += 1
                 return ("uri", iri)
         return c
 
-    def got_cell(c):
+    def got_cell(j, c):
         n = num(c)
         if n is not c:
             changes["numbers"] += 1
             return n
         t = literal_text(c)
-        if t is not None:
+        if t is not None and (columns is None or ("got", j) in columns):
             iri = named_by(t, gold_iris)
             if iri:
                 changes["answerLabels"] += 1
@@ -239,7 +241,7 @@ def canonical(gold, got, labels):
         return c
 
     g = frozenset(tuple(gold_cell(i, c) for i, c in enumerate(r)) for r in gold.rows)
-    a = frozenset(tuple(got_cell(c) for c in r) for r in got.rows)
+    a = frozenset(tuple(got_cell(j, c) for j, c in enumerate(r)) for r in got.rows)
     return (
         Relation(gold.variables, g, gold.duplicates),
         Relation(got.variables, a, got.duplicates),
@@ -247,14 +249,44 @@ def canonical(gold, got, labels):
     )
 
 
+MAX_LABEL_COLUMNS = 6
+
+
+def label_columns(gold, got, labels):
+    """The columns of either side in which some literal is a label that canonical()
+    would turn into an IRI."""
+    g1, a1, _ = canonical(gold, got, labels)
+    g0, a0, _ = canonical(gold, got, {})
+    out = [
+        ("gold", i)
+        for i in range(len(gold.variables))
+        if {r[i] for r in g1.rows} != {r[i] for r in g0.rows}
+    ]
+    out += [
+        ("got", j)
+        for j in range(len(got.variables))
+        if {r[j] for r in a1.rows} != {r[j] for r in a0.rows}
+    ]
+    return out
+
+
 def lenient_compare(gold, got, labels, check=lambda: None):
     """(correct, detail, changes, gold, got) of the lenient comparison, or None when
-    canonicalization changes nothing. It tries labels as IRIs and then numbers alone,
-    since turning an answer's label into its IRI can break a label column that already
-    matched the gold's literal."""
+    canonicalization changes nothing. It tries the label conversion in every subset of
+    the columns that hold labels, all of them first and none last, since turning a
+    label into its IRI in a column that already matches the gold's literal would break
+    that column. Past MAX_LABEL_COLUMNS such columns it tries only all and none."""
+    cols = label_columns(gold, got, labels) if labels else []
+    if len(cols) > MAX_LABEL_COLUMNS:
+        subsets = [cols, []]
+    else:
+        subsets = [
+            [c for k, c in enumerate(cols) if mask >> k & 1]
+            for mask in sorted(range(2 ** len(cols)), key=lambda m: -bin(m).count("1"))
+        ]
     first = None
-    for names in (labels, {}) if labels else ({},):
-        g, a, changes = canonical(gold, got, names)
+    for chosen in subsets:
+        g, a, changes = canonical(gold, got, labels, set(chosen))
         if not any(changes.values()):
             continue
         ok, detail = compare(g, a, check)
