@@ -41,9 +41,9 @@ baseline's. The threshold comes from the baseline's settings unless --threshold 
 given. When both records hold a metric's range over several processes, a slowdown
 counts only if the ranges do not overlap. A baseline's `short_below` and `short_threshold` settings give timings below
 that many milliseconds their own threshold. It refuses two records whose suite, scale,
-workload settings, host, compiler (the manifest's rustc, cc, rustflags and profile) or
-metric units differ, unless --allow-different is given; a record whose settings say
-`host_independent` may come from another host and compiler. --floor V ignores metrics whose
+workload settings, host, build (the manifest's compilers and build configuration) or
+metric units differ, or whose build is unknown, unless --allow-different is given; a
+record whose settings say `host_independent` may come from another host and build. --floor V ignores metrics whose
 baseline value is below V, for timings too short for the gate's host. A comparison
 across runs on different days carries the host's run-to-run noise, so a flagged metric
 is confirmed by an interleaved A/B of the two builds before it counts as a regression,
@@ -276,6 +276,7 @@ def executors(args):
         "host": host_info() | {"name": run_env.get("host", host_info()["name"])},
         "manifest": {"binary": manifest.get("binary"), "binary_sha256": manifest.get("binary sha256"),
                      "rustc": manifest.get("rustc"), "compilers": comp,
+                     "build_config": manifest.get("build config"),
                      "binary_commit": manifest.get("binary commit"), "version": manifest.get("version"),
                      "scripts_commit": manifest.get("scripts commit"),
                      "scripts_dirty_files": manifest.get("scripts dirty"),
@@ -452,9 +453,10 @@ def w3c(args):
 VOLATILE_SETTINGS = {"threshold", "short_below", "short_threshold", "load", "host_independent"}
 # Manifest fields of the build that must match, since another compiler or code generation
 # setting can hide or make a regression. The source revision may differ.
-# `compilers` comes from the binaries themselves and must be known in both records;
-# `rustflags` and `profile` must match when either record has them.
-TOOLCHAIN = ("compilers", "rustflags", "profile")
+# `compilers` comes from the binaries themselves and `build_config` from
+# `bench-gate.py build-config` in the build's environment; both must be known in both
+# records.
+TOOLCHAIN = ("compilers", "build_config")
 
 
 def incompatibilities(base, cand):
@@ -472,13 +474,12 @@ def incompatibilities(base, cand):
         if base["host"].get("name") != cand["host"].get("name"):
             out.append(f"host: {base['host'].get('name')!r} against {cand['host'].get('name')!r}")
         bm, cmf = base.get("manifest", {}), cand.get("manifest", {})
-        if not bm.get("compilers") or not cmf.get("compilers"):
-            out.append("manifest compilers: unknown in "
-                       + " and ".join(n for n, m in (("the baseline", bm), ("the candidate", cmf))
-                                      if not m.get("compilers")))
         for k in TOOLCHAIN:
-            if bm.get(k) != cmf.get(k):
-                out.append(f"manifest {k}: {bm.get(k)!r} against {cmf.get(k)!r}")
+            unknown = [n for n, m in (("the baseline", bm), ("the candidate", cmf)) if not m.get(k)]
+            if unknown:
+                out.append(f"manifest {k}: unknown in " + " and ".join(unknown))
+            elif bm[k] != cmf[k]:
+                out.append(f"manifest {k}: {bm[k]!r} against {cmf[k]!r}")
     cm = {m["key"]: m for m in cand["metrics"]}
     for m in base["metrics"]:
         c = cm.get(m["key"])
@@ -580,10 +581,12 @@ def compare(args):
 # --------------------------------------------------------------------------- order-digest
 
 def order_digest(args):
-    """A digest of the ORDER BY key columns of a TSV answer in the returned order, or "-"
-    when the query's ORDER BY is not a list of projected variables. Rows that tie on the
-    keys have the same key values, so a correct order gives one digest whatever it does
-    with ties. Uses bench-answers.py's ORDER BY parser."""
+    """A digest of a TSV answer's order, or "-" for a query without a top-level ORDER BY.
+    When the ORDER BY lists projected variables, the digest covers those key columns in
+    the returned order (`keys:`), which rows that tie on the keys cannot change. Otherwise,
+    such as for an expression, it covers every row in the returned order (`rows:`), which
+    is exact for a total order and may reject a correct answer whose ties come out in
+    another order, but never accepts a wrong order. Uses bench-answers.py's parser."""
     root = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location("bench_answers", root / "bench-answers.py")
     ba = importlib.util.module_from_spec(spec)
@@ -592,28 +595,49 @@ def order_digest(args):
     with open(args.tsv, newline="") as f:
         header = f.readline().rstrip("\n").split("\t")
         names = [h.lstrip("?") for h in header]
-        keys = ba.order_keys(query, set(names))
-        if not keys:
+        if ba._after_order_by(query) is None:
             print("-")
             return
-        cols = [names.index(k) for k in keys]
+        keys = ba.order_keys(query, set(names))
+        cols = [names.index(k) for k in keys] if keys else None
         h = hashlib.sha256()
         for line in f:
             row = line.rstrip("\n").split("\t")
-            h.update("\t".join(row[c] if c < len(row) else "" for c in cols).encode() + b"\n")
-    print(h.hexdigest()[:16])
+            if cols is not None:
+                row = [row[c] if c < len(row) else "" for c in cols]
+            h.update("\t".join(row).encode() + b"\n")
+    print(("keys:" if keys else "rows:") + h.hexdigest()[:16])
 
 
-def profile_cmd(args):
-    """The workspace's settings of a Cargo profile, from Cargo.toml and .cargo/config.toml,
-    as one line of JSON, for the manifest's `profile`."""
+# environment variables that change the code Cargo and rustc generate; wrappers such as
+# RUSTC_WRAPPER and cache paths do not
+# and the compilers themselves are in the binary's .comment section
+BUILD_ENV = re.compile(r"^(CARGO_PROFILE_.*|.*RUSTFLAGS|CARGO_BUILD_TARGET|CFLAGS.*|CXXFLAGS.*)$")
+
+
+def build_config_cmd(args):
+    """The build configuration that decides the generated code, as one line of JSON for
+    the manifest's `build_config`: the workspace's Cargo profile, the profile and build
+    settings of every Cargo config file that applies (the workspace's .cargo directories
+    up to the root and $CARGO_HOME), and the environment variables that override them.
+    Run it in the environment of the build."""
     import tomllib
-    root = Path(args.root)
-    out = {}
-    for f in (root / "Cargo.toml", root / ".cargo" / "config.toml"):
-        if f.exists():
-            prof = tomllib.loads(f.read_text()).get("profile", {})
-            out[str(f.relative_to(root))] = prof.get(args.name)
+    root = Path(args.root).resolve()
+    out = {"profile": args.name}
+    cargo = tomllib.loads((root / "Cargo.toml").read_text()) if (root / "Cargo.toml").exists() else {}
+    # the profile and the profiles it inherits from
+    profiles, name = {}, args.name
+    while name and name not in profiles:
+        profiles[name] = cargo.get("profile", {}).get(name)
+        name = (profiles[name] or {}).get("inherits")
+    out["Cargo.toml"] = profiles
+    configs = [d / ".cargo" / n for d in [root, *root.parents] for n in ("config.toml", "config")]
+    configs.append(Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")) / "config.toml")
+    for f in configs:
+        if f.is_file():
+            c = tomllib.loads(f.read_text())
+            out[str(f)] = {k: c[k] for k in ("profile", "build", "target") if k in c}
+    out["env"] = {k: v for k, v in sorted(os.environ.items()) if BUILD_ENV.match(k)}
     print(json.dumps(out, sort_keys=True, separators=(",", ":")))
 
 
@@ -687,12 +711,12 @@ def main():
     p.add_argument("tsv")
     p = sub.add_parser("compilers")
     p.add_argument("binary")
-    p = sub.add_parser("profile")
-    p.add_argument("name", nargs="?", default="release")
+    p = sub.add_parser("build-config")
+    p.add_argument("name", nargs="?", default="release", help="the Cargo profile")
     p.add_argument("--root", default=".")
     args = ap.parse_args()
     {"executors": executors, "metrics": metrics, "w3c": w3c, "compare": compare, "catalog": catalog,
-     "order-digest": order_digest, "compilers": compilers_cmd, "profile": profile_cmd}[args.cmd](args)
+     "order-digest": order_digest, "compilers": compilers_cmd, "build-config": build_config_cmd}[args.cmd](args)
 
 
 if __name__ == "__main__":

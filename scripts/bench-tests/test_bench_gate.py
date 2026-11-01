@@ -24,7 +24,7 @@ def metrics_record(d, name, rows, threshold=0.05, scale="1"):
     src.write_text("".join(json.dumps(r) + "\n" for r in rows))
     out = Path(d) / f"{name}.json"
     r = run("metrics", src, "--gate", "insn-screen", "--out", out, "--threshold", threshold,
-            "--manifest", "commit=abc", "--manifest", "compilers=rustc version 1", "--scale", scale)
+            "--manifest", "commit=abc", "--manifest", "compilers=rustc version 1", "--manifest", "build_config={}", "--scale", scale)
     assert r.returncode == 0, r.stderr
     return out
 
@@ -102,7 +102,7 @@ class GateTests(unittest.TestCase):
             res.mkdir(parents=True)
             (root / "queries").mkdir()
             (root / "queries" / "q.rq").write_text("SELECT * WHERE { ?s ?p ?o }")
-            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\n")
+            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\nbuild config: {}\n")
             res.joinpath("answers.tsv").write_text("A\tq\t1\tx\nB\tq\t1\tx\n")
             def record(name, value):
                 rows = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
@@ -127,7 +127,7 @@ class GateTests(unittest.TestCase):
                     files.append(f)
                 out = Path(d) / f"{name}.json"
                 r = run("metrics", *files, "--gate", "insn-screen", "--out", out, "--threshold", 0,
-                        "--manifest", "compilers=rustc version 1")
+                        "--manifest", "compilers=rustc version 1", "--manifest", "build_config={}")
                 self.assertEqual(r.returncode, 0, r.stderr)
                 return out
             base = runs("base", [100, 103, 101])
@@ -233,7 +233,7 @@ class GateTests(unittest.TestCase):
             res.mkdir(parents=True)
             (root / "queries").mkdir()
             (root / "queries" / "export.rq").write_text("SELECT * WHERE { ?s ?p ?o } LIMIT 5\n")
-            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\n")
+            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\nbuild config: {}\n")
             res.joinpath("samples.tsv").write_text(
                 "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
                 "1\t1\tA\texport\t0\t1\t2\n1\t1\tB\texport\t0\t1\t2\n")
@@ -268,7 +268,14 @@ class GateTests(unittest.TestCase):
             other.write_text(json.dumps(rec))
             r = run("compare", base, other)
             self.assertEqual(r.returncode, 2)
-            self.assertIn("unknown in the candidate", r.stderr)
+            self.assertIn("compilers: unknown in the candidate", r.stderr)
+            rec = json.loads(base.read_text())
+            rec["manifest"]["build_config"] = '{"env":{"CARGO_PROFILE_RELEASE_LTO":"off"}}'
+            other.write_text(json.dumps(rec))
+            self.assertIn("manifest build_config", run("compare", base, other).stderr)
+            del rec["manifest"]["build_config"]
+            other.write_text(json.dumps(rec))
+            self.assertIn("build_config: unknown in the candidate", run("compare", base, other).stderr)
 
     def test_records_are_validated_when_read(self):
         with tempfile.TemporaryDirectory() as d:
@@ -340,15 +347,20 @@ class GateTests(unittest.TestCase):
             a = digest([("<a>", '"x"'), ("<b>", '"x"'), ("<c>", '"y"')])
             self.assertEqual(a, digest([("<b>", '"x"'), ("<a>", '"x"'), ("<c>", '"y"')]))
             self.assertNotEqual(a, digest([("<c>", '"y"'), ("<a>", '"x"'), ("<b>", '"x"')]))
-            q.write_text("SELECT ?p ?n WHERE { ?p <name> ?n } ORDER BY STRLEN(?n)")
-            self.assertEqual(digest([("<a>", '"x"')]), "-")
+            # an expression key orders every row
+            q.write_text("SELECT ?p ?a WHERE { ?p <age> ?a } ORDER BY DESC(ABS(?a - 50)) ?p LIMIT 10")
+            e = digest([("<a>", "90"), ("<b>", "10"), ("<c>", "50")])
+            self.assertTrue(e.startswith("rows:"))
+            self.assertNotEqual(e, digest([("<c>", "50"), ("<b>", "10"), ("<a>", "90")]))
+            q.write_text("SELECT ?p WHERE { ?p <age> ?a }")
+            self.assertEqual(digest([("<a>", "90")]), "-")
 
     def test_executors_compares_the_order_of_ordered_answers(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "run"
             res = root / "people-100000-threads-1" / "results"
             res.mkdir(parents=True)
-            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\n")
+            (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\nbuild config: {}\n")
             res.joinpath("samples.tsv").write_text(
                 "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
                 "1\t1\tA\tsorted\t0\t1\t2\n1\t1\tB\tsorted\t0\t1\t2\n")
@@ -363,6 +375,14 @@ class GateTests(unittest.TestCase):
             text = Path(d) / "t.txt"
             text.write_text("not ELF")
             self.assertEqual(run("compilers", text).returncode, 2)
+
+    def test_build_config_sees_profile_overrides(self):
+        env = dict(os.environ, CARGO_PROFILE_RELEASE_LTO="off")
+        a = run("build-config", "--root", SCRIPTS.parent).stdout
+        b = subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent)],
+                           capture_output=True, text=True, env=env).stdout
+        self.assertIn('"release"', a)
+        self.assertNotEqual(a, b)
 
 
 if __name__ == "__main__":

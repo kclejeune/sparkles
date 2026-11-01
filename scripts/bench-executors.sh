@@ -36,6 +36,9 @@
 #                     shared with scripts/nsc-bench.sh)
 #   --port P          server port (default 4181, below the ephemeral port range)
 #   --commit REV      the commit the binary was built from, for the record
+#   --build-config J  the binary's build configuration, the output of
+#                     `scripts/bench-gate.py build-config` in its build environment;
+#                     compare refuses a record without one
 #   --force           start even when a compiler or another server is running
 set -euo pipefail
 
@@ -50,6 +53,7 @@ QUERIES=
 DATA_DIR=${SPARKLES_NSC_CACHE:-$HOME/.cache/sparkles-nsc}/data
 PORT=4181
 COMMIT=
+BUILD_CONFIG=
 FORCE=
 die() {
   echo "bench-executors: $*" >&2
@@ -67,6 +71,7 @@ while [ $# -gt 0 ]; do
     --data-dir) DATA_DIR=$2 ;;
     --port) PORT=$2 ;;
     --commit) COMMIT=$2 ;;
+    --build-config) BUILD_CONFIG=$2 ;;
     --force)
       FORCE=1
       shift
@@ -110,6 +115,7 @@ if [ -z "$FORCE" ]; then
 fi
 
 mkdir -p "$OUT" "$DATA_DIR"
+DATA_DIR=$(realpath "$DATA_DIR")
 log() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$OUT/progress.log"; }
 
 # the queries of scripts/bench.sh: its `P='…'` line and `add name '…'` lines
@@ -135,6 +141,7 @@ NQ=$(find "$OUT/queries" -name '*.rq' | wc -l)
   echo "version: $("$BIN" --version 2> /dev/null || echo unknown)"
   # the compilers, from the binary's .comment section, for compare's toolchain check
   echo "compilers: $(python3 "$ROOT/scripts/bench-gate.py" compilers "$BIN")"
+  [ -z "$BUILD_CONFIG" ] || echo "build config: $BUILD_CONFIG"
   echo "scripts commit: $(git -C "$ROOT" rev-parse HEAD 2> /dev/null || echo unknown)"
   echo "scripts dirty: $(git -C "$ROOT" status --porcelain 2> /dev/null | grep -c . || true)"
   echo "host: $(hostname)"
