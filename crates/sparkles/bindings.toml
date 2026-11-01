@@ -446,6 +446,11 @@ python = "planned: evidence holds in the bindings with the typed evidence operat
 jvm = "planned: evidence holds in the bindings with the typed evidence operations"
 node = "planned: evidence holds in the bindings with the typed evidence operations"
 
+["evidence.propose"]
+python = "planned: evidence proposals in the bindings with the typed evidence operations"
+jvm = "planned: evidence proposals in the bindings with the typed evidence operations"
+node = "planned: evidence proposals in the bindings with the typed evidence operations"
+
 ["evidence.release_hold"]
 python = "planned: evidence holds in the bindings with the typed evidence operations"
 jvm = "planned: evidence holds in the bindings with the typed evidence operations"

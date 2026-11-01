@@ -1552,6 +1552,15 @@ impl Store {
     /// unknown identity. Reads only the branch table, so no branch store is opened, and
     /// waits for the table under the cancellation, deadline and no-wait choice of
     /// `options`.
+    /// The ids of the listed branches, read from the branch table without taking any
+    /// writer. Empty for a store without branches.
+    pub fn listed_branch_ids(&self) -> Vec<uuid::Uuid> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return Vec::new();
+        };
+        set.table.lock().branches.iter().map(|b| b.id).collect()
+    }
+
     pub fn listed_branch_name(
         &self,
         id: uuid::Uuid,
@@ -2496,6 +2505,8 @@ impl Store {
         // releases them. A failure after that leaves the branch without its holds. The
         // holds' lock comes before the table, which a collection takes under its
         // history lock while an acquisition holds the holds' lock.
+        // Released with the holds' lock, before any cleanup below takes a writer.
+        let publishing = self.family.holds.publishing.write();
         let mut holds = self.family.holds.state.lock();
         // the commit point: the table without the name
         let mut t = set.table.lock();
@@ -2550,6 +2561,7 @@ impl Store {
         *t = next;
         drop(t);
         drop(holds);
+        drop(publishing);
         self.failpoint("branch-delete-committed");
         if retire {
             // its store stays for the branches created from it, read-only

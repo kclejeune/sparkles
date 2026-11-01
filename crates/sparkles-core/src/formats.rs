@@ -701,7 +701,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("paths.json", 1),
     ds("forms.json", 1),
     // the managed-graph registry and its owners' settings (see `crate::managed`)
-    ds("managed.json", 1),
+    ds("managed.json", 2),
     ds("evidence.json", 1),
     // durable source holds (see `crate::holds`)
     ds("holds.json", 1),

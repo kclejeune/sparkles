@@ -370,7 +370,7 @@ fn a_newer_managed_registry_refuses_writes_not_the_open() {
     assert_eq!(v.minimum_reader, 6);
     std::fs::write(
         root.join("managed.json"),
-        r#"{"format": 2, "revision": 9, "owners": {}}"#,
+        r#"{"format": 3, "revision": 9, "owners": {}}"#,
     )
     .unwrap();
     assert!(sparkles_core::formats::check_dataset_dir(&root).is_ok());

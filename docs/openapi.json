@@ -7397,6 +7397,1064 @@
         ],
         "type": "object"
       },
+      "EvidenceProposal": {
+        "additionalProperties": false,
+        "description": "One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-proposals"
+        },
+        "properties": {
+          "assessments": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "conclusion": {
+                  "description": "An N-Triples term.",
+                  "type": "string"
+                },
+                "confidence": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "evaluator": {
+                      "description": "Who evaluated it.",
+                      "type": "string"
+                    },
+                    "method": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "method": {
+                          "description": "The method's IRI.",
+                          "type": "string"
+                        },
+                        "version": {
+                          "description": "The method's version.",
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "method",
+                        "version"
+                      ],
+                      "type": "object"
+                    },
+                    "scale": {
+                      "description": "The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`.",
+                      "type": "string"
+                    },
+                    "value": {
+                      "description": "An N-Triples literal, or a decimal such as `0.8`.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "scale",
+                    "value",
+                    "evaluator"
+                  ],
+                  "type": "object"
+                },
+                "configurationDigest": {
+                  "description": "The digest of the method's configuration.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "evaluatedAt": {
+                  "description": "The evaluation time, with an explicit offset.",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "evaluator": {
+                  "description": "The attributed evaluator.",
+                  "type": "string"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "method": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "method": {
+                      "description": "The method's IRI.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "description": "The method's version.",
+                      "maxLength": 256,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "method",
+                    "version"
+                  ],
+                  "type": "object"
+                },
+                "occurrenceKey": {
+                  "description": "The assessment's key within its target.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "scope": {
+                  "additionalProperties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "description": "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
+                  "type": "object"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "description": "A claim or assessment.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key",
+                "occurrenceKey",
+                "target",
+                "conclusion",
+                "method",
+                "configurationDigest",
+                "evaluatedAt",
+                "evaluator"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "claims": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "author": {
+                  "description": "The attributed source author, not the authenticated caller.",
+                  "type": "string"
+                },
+                "confidence": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "analyst": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "evaluator": {
+                          "description": "Who evaluated it.",
+                          "type": "string"
+                        },
+                        "method": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "method": {
+                              "description": "The method's IRI.",
+                              "type": "string"
+                            },
+                            "version": {
+                              "description": "The method's version.",
+                              "maxLength": 256,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "method",
+                            "version"
+                          ],
+                          "type": "object"
+                        },
+                        "scale": {
+                          "description": "The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`.",
+                          "type": "string"
+                        },
+                        "value": {
+                          "description": "An N-Triples literal, or a decimal such as `0.8`.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "scale",
+                        "value",
+                        "evaluator"
+                      ],
+                      "type": "object"
+                    },
+                    "extraction": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "evaluator": {
+                          "description": "Who evaluated it.",
+                          "type": "string"
+                        },
+                        "method": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "method": {
+                              "description": "The method's IRI.",
+                              "type": "string"
+                            },
+                            "version": {
+                              "description": "The method's version.",
+                              "maxLength": 256,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "method",
+                            "version"
+                          ],
+                          "type": "object"
+                        },
+                        "scale": {
+                          "description": "The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`.",
+                          "type": "string"
+                        },
+                        "value": {
+                          "description": "An N-Triples literal, or a decimal such as `0.8`.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "scale",
+                        "value",
+                        "evaluator"
+                      ],
+                      "type": "object"
+                    },
+                    "source": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "evaluator": {
+                          "description": "Who evaluated it.",
+                          "type": "string"
+                        },
+                        "method": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "method": {
+                              "description": "The method's IRI.",
+                              "type": "string"
+                            },
+                            "version": {
+                              "description": "The method's version.",
+                              "maxLength": 256,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "method",
+                            "version"
+                          ],
+                          "type": "object"
+                        },
+                        "scale": {
+                          "description": "The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`.",
+                          "type": "string"
+                        },
+                        "value": {
+                          "description": "An N-Triples literal, or a decimal such as `0.8`.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "scale",
+                        "value",
+                        "evaluator"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "reported",
+                    "observation",
+                    "hypothesis",
+                    "preference"
+                  ],
+                  "type": "string"
+                },
+                "occurrenceKey": {
+                  "description": "The claim's key within its revision.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "polarity": {
+                  "enum": [
+                    "positive",
+                    "negative",
+                    "uncertain"
+                  ],
+                  "type": "string"
+                },
+                "proposition": {
+                  "description": "One N-Triples 1.2 triple without its final `.` and without blank nodes. It is described, never asserted.",
+                  "type": "string"
+                },
+                "revision": {
+                  "additionalProperties": false,
+                  "description": "The source revision that states it.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "scope": {
+                  "additionalProperties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "description": "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key",
+                "occurrenceKey",
+                "revision",
+                "proposition",
+                "kind",
+                "polarity",
+                "author"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dryRun": {
+            "description": "Check and preview the write without committing it or holding commits.",
+            "type": "boolean"
+          },
+          "idempotencyKey": {
+            "description": "Makes a retry with the same payload answer the first receipt. The operation IRI is derived from the dataset, the caller and the key.",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ifHead": {
+            "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "links": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "author": {
+                  "description": "Who made the judgment.",
+                  "type": "string"
+                },
+                "evidence": {
+                  "additionalProperties": false,
+                  "description": "An evidence reference.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "occurrenceKey": {
+                  "description": "The link's key within its target.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "relation": {
+                  "enum": [
+                    "supports",
+                    "contradicts",
+                    "mentions"
+                  ],
+                  "type": "string"
+                },
+                "target": {
+                  "additionalProperties": false,
+                  "description": "A claim or assessment.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key",
+                "occurrenceKey",
+                "target",
+                "evidence",
+                "relation",
+                "author"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "The commit message.",
+            "type": "string"
+          },
+          "passages": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "end": {
+                  "description": "The code point after the selection.",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "occurrenceKey": {
+                  "description": "The passage's key within its rendition.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "quote": {
+                  "type": "string"
+                },
+                "rendition": {
+                  "additionalProperties": false,
+                  "description": "A rendition of this batch with normalized text.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "revision": {
+                  "additionalProperties": false,
+                  "description": "The rendition's revision.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "start": {
+                  "description": "The first selected Unicode code point.",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "textDigest": {
+                  "description": "The digest of the selected text.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "revision",
+                "rendition",
+                "occurrenceKey",
+                "start",
+                "end",
+                "textDigest"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "proposalGraph": {
+            "description": "The proposal graph, needed when the settings name more than one.",
+            "type": "string"
+          },
+          "references": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "occurrenceKey": {
+                  "description": "The reference's key within what it references.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "passage": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "passage": {
+                      "additionalProperties": false,
+                      "description": "A passage of this batch.",
+                      "maxProperties": 1,
+                      "minProperties": 1,
+                      "properties": {
+                        "iri": {
+                          "description": "An existing authenticated record, by its IRI.",
+                          "type": "string"
+                        },
+                        "key": {
+                          "description": "A record of this batch, by its key.",
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "rendition": {
+                      "additionalProperties": false,
+                      "description": "The passage's rendition.",
+                      "maxProperties": 1,
+                      "minProperties": 1,
+                      "properties": {
+                        "iri": {
+                          "description": "An existing authenticated record, by its IRI.",
+                          "type": "string"
+                        },
+                        "key": {
+                          "description": "A record of this batch, by its key.",
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "revision": {
+                      "additionalProperties": false,
+                      "description": "The passage's revision.",
+                      "maxProperties": 1,
+                      "minProperties": 1,
+                      "properties": {
+                        "iri": {
+                          "description": "An existing authenticated record, by its IRI.",
+                          "type": "string"
+                        },
+                        "key": {
+                          "description": "A record of this batch, by its key.",
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "revision",
+                    "rendition",
+                    "passage"
+                  ],
+                  "type": "object"
+                },
+                "storedFact": {
+                  "description": "A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation.",
+                  "type": "object"
+                },
+                "structured": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "method": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "method": {
+                          "description": "The method's IRI.",
+                          "type": "string"
+                        },
+                        "version": {
+                          "description": "The method's version.",
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "method",
+                        "version"
+                      ],
+                      "type": "object"
+                    },
+                    "pointer": {
+                      "description": "An RFC 6901 JSON Pointer.",
+                      "type": "string"
+                    },
+                    "revision": {
+                      "additionalProperties": false,
+                      "description": "A retained JSON revision of this batch.",
+                      "maxProperties": 1,
+                      "minProperties": 1,
+                      "properties": {
+                        "iri": {
+                          "description": "An existing authenticated record, by its IRI.",
+                          "type": "string"
+                        },
+                        "key": {
+                          "description": "A record of this batch, by its key.",
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "valueDigest": {
+                      "description": "The digest of the selected value.",
+                      "pattern": "^sha256:[0-9a-f]{64}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "revision",
+                    "pointer",
+                    "method",
+                    "valueDigest"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key",
+                "occurrenceKey"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "renditions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content": {
+                  "additionalProperties": false,
+                  "description": "Normalized `text`, retained bytes or a digest.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "base64": {
+                      "description": "Retained bytes in base64.",
+                      "type": "string"
+                    },
+                    "digest": {
+                      "description": "The digest of content that is not retained.",
+                      "pattern": "^sha256:[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "text": {
+                      "description": "Retained UTF-8 text.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "conversion": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "method": {
+                      "description": "The method's IRI.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "description": "The method's version.",
+                      "maxLength": 256,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "method",
+                    "version"
+                  ],
+                  "type": "object"
+                },
+                "expectedDigest": {
+                  "description": "The digest the content must have.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "mediaType": {
+                  "type": "string"
+                },
+                "occurrenceKey": {
+                  "description": "The rendition's key within its revision.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "revision": {
+                  "additionalProperties": false,
+                  "description": "The revision it represents.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "iri": {
+                      "description": "An existing authenticated record, by its IRI.",
+                      "type": "string"
+                    },
+                    "key": {
+                      "description": "A record of this batch, by its key.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key",
+                "revision",
+                "occurrenceKey",
+                "conversion",
+                "mediaType",
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "revisions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content": {
+                  "additionalProperties": false,
+                  "description": "The revision's bytes or their digest.",
+                  "maxProperties": 1,
+                  "minProperties": 1,
+                  "properties": {
+                    "base64": {
+                      "description": "Retained bytes in base64.",
+                      "type": "string"
+                    },
+                    "digest": {
+                      "description": "The digest of content that is not retained.",
+                      "pattern": "^sha256:[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "text": {
+                      "description": "Retained UTF-8 text.",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "expectedDigest": {
+                  "description": "The digest the retained bytes must have.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "families": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "locators": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "publishedAt": {
+                  "description": "The source's publication time, with an explicit offset.",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "reportedAvailableAt": {
+                  "description": "An attributed allegation of earlier availability.",
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "reportedRights": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "source": {
+                  "description": "The continuing source identity.",
+                  "type": "string"
+                },
+                "sourceKey": {
+                  "description": "The importer's stable source key.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "upstreamRevisions": {
+                  "items": {
+                    "additionalProperties": false,
+                    "description": "An upstream revision.",
+                    "maxProperties": 1,
+                    "minProperties": 1,
+                    "properties": {
+                      "iri": {
+                        "description": "An existing authenticated record, by its IRI.",
+                        "type": "string"
+                      },
+                      "key": {
+                        "description": "A record of this batch, by its key.",
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "upstreamVersion": {
+                  "description": "The upstream version identifier.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "source",
+                "sourceKey",
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "sourceGraph": {
+            "description": "The source-record graph, needed when the settings name more than one.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "EvidenceProposalResult": {
+        "additionalProperties": false,
+        "description": "The outcome of a claims proposal.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-proposals"
+        },
+        "properties": {
+          "branchId": {
+            "description": "The branch the commit published on.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "commit": {
+            "description": "The publishing commit, the first one for a replay, or the head for a dry run.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "Whether this request published a commit.",
+            "type": "boolean"
+          },
+          "dryRun": {
+            "additionalProperties": false,
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "inserted": {
+                "type": "integer"
+              },
+              "wouldCommit": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wouldCommit",
+              "inserted",
+              "deleted",
+              "error"
+            ],
+            "type": "object"
+          },
+          "firstAvailableAt": {
+            "description": "The commit's time, the first availability of its source revisions. `null` for a dry run.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hold": {
+            "description": "The source hold of the stored facts of this dataset that the batch references.",
+            "oneOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation": {
+            "description": "The operation, which is every record's availability receipt.",
+            "type": "string"
+          },
+          "records": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "existing": {
+                  "description": "An earlier operation had published the record with equal content, so this one did not write it again.",
+                  "type": "boolean"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "SourceRevision",
+                    "Rendition",
+                    "Passage",
+                    "EvidenceRef",
+                    "Claim",
+                    "EvidenceLink",
+                    "Assessment",
+                    "Note",
+                    "Decision",
+                    "Task",
+                    "ReviewDecision",
+                    "IdentityProposal"
+                  ],
+                  "type": "string"
+                },
+                "recordDigest": {
+                  "description": "The digest of the record's immutable content.",
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "kind",
+                "iri",
+                "graph",
+                "recordDigest",
+                "existing"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "replayed": {
+            "description": "Whether the idempotency key had published the same payload, whose receipt this is.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "committed",
+          "replayed",
+          "commit",
+          "branchId",
+          "firstAvailableAt",
+          "hold",
+          "records"
+        ],
+        "type": "object"
+      },
       "EvidenceResolveRequest": {
         "additionalProperties": false,
         "description": "Evidence references to verify at their exact retained views.",
@@ -7603,6 +8661,18 @@
                       ],
                       "type": "object"
                     },
+                    "recordDigest": {
+                      "oneOf": [
+                        {
+                          "description": "The digest of the record's immutable content that its typed writer recorded.",
+                          "pattern": "^sha256:[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "span": {
                       "oneOf": [
                         {
@@ -7647,6 +8717,7 @@
                     "graph",
                     "receipt",
                     "contentDigest",
+                    "recordDigest",
                     "span"
                   ],
                   "type": "object"
@@ -18476,6 +19547,37 @@
             "required": [
               "enabled"
             ],
+            "type": "object"
+          },
+          "capabilities": {
+            "description": "Typed operations a client discovers before it uses them. A client of claims proposals must not fall back to an asserting endpoint when `claims` is absent.",
+            "properties": {
+              "claims": {
+                "properties": {
+                  "profiles": {
+                    "description": "The evidence profile versions whose typed operations this build serves.",
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "propose": {
+                    "description": "The route template of authenticated claim proposals.",
+                    "type": "string"
+                  },
+                  "resolve": {
+                    "description": "The route template of evidence resolution.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "profiles",
+                  "propose",
+                  "resolve"
+                ],
+                "type": "object"
+              }
+            },
             "type": "object"
           },
           "datasets": {
@@ -44465,6 +45567,96 @@
           "SPARQL"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/claims": {
+      "post": {
+        "description": "Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-proposals"
+        },
+        "operationId": "proposeClaims",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceProposal"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceProposalResult"
+                }
+              }
+            },
+            "description": "The operation and its records, published, replayed or previewed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Propose claims with their evidence",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/{ds}/claims/resolve": {

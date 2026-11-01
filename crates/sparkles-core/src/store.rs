@@ -56,7 +56,7 @@ mod lock;
 #[cfg(test)]
 mod lock_tests;
 mod managed;
-pub use holds::Acquired;
+pub use holds::{Acquired, HoldPublication};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod managed_tests;

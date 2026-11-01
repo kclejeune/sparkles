@@ -89,7 +89,20 @@ pub fn profile(version: u32) -> Option<&'static Profile> {
     (version == V1.version).then_some(&V1)
 }
 
+pub mod propose;
 pub mod resolve;
+
+pub use propose::{
+    AuthorityFence, Options as ProposeOptions, Proposed, ProposedRecord, operation_recorded,
+    propose, reconcile_operation_holds,
+};
+pub use sparkles_core::evidence::{
+    AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
+    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, JSON_LEXICAL_UTF8_V1,
+    JSON_LEXICAL_UTF8_VERSION, MethodRef, PassageInput, Polarity, RecordKey, RecordRef,
+    RecordVersion, RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage,
+    SourceMetadata, SourceRevisionInput, SourceTimes,
+};
 
 // ------------------------------------------------------------ settings ------------
 
@@ -137,7 +150,7 @@ fn unavailable(reason: String) -> Error {
 }
 
 /// The recorded settings `bytes`, which must be readable by this build.
-fn recorded(bytes: &[u8]) -> Result<Settings> {
+pub(crate) fn recorded(bytes: &[u8]) -> Result<Settings> {
     Settings::from_slice(bytes, &Control::none()).map_err(|e| {
         unavailable(format!(
             "{} cannot be read by this build: {e}",

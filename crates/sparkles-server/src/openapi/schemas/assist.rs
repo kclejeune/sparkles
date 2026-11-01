@@ -223,7 +223,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                                 }),
                             ),
                             "record": closed(
-                                &["iri", "kind", "graph", "receipt", "contentDigest", "span"],
+                                &["iri", "kind", "graph", "receipt", "contentDigest", "recordDigest", "span"],
                                 json!({
                                     "iri": string(),
                                     "kind": kinds(),
@@ -238,6 +238,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                                         }),
                                     ),
                                     "contentDigest": or_null(digest("The record's content digest.")),
+                                    "recordDigest": or_null(digest("The digest of the record's immutable content that its typed writer recorded.")),
                                     "span": or_null(closed(
                                         &["rendition", "start", "end", "textDigest"],
                                         json!({
@@ -255,6 +256,245 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             ),
             "The verified evidence references.",
             "evidence-resolution",
+        ),
+    );
+    let key = |d: &str| {
+        with_desc(
+            json!({ "type": "string", "minLength": 1, "maxLength": 256 }),
+            d,
+        )
+    };
+    let iri = |d: &str| with_desc(string(), d);
+    let record_ref = |d: &str| {
+        with_desc(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "key": { "type": "string", "description": "A record of this batch, by its key." },
+                    "iri": { "type": "string", "description": "An existing authenticated record, by its IRI." },
+                },
+                "minProperties": 1,
+                "maxProperties": 1,
+            }),
+            d,
+        )
+    };
+    let method = || {
+        closed(
+            &["method", "version"],
+            json!({ "method": iri("The method's IRI."), "version": key("The method's version.") }),
+        )
+    };
+    let content = |d: &str| {
+        with_desc(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "text": { "type": "string", "description": "Retained UTF-8 text." },
+                    "base64": { "type": "string", "description": "Retained bytes in base64." },
+                    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "The digest of content that is not retained." },
+                },
+                "minProperties": 1,
+                "maxProperties": 1,
+            }),
+            d,
+        )
+    };
+    let confidence = || {
+        closed(
+            &["scale", "value", "evaluator"],
+            json!({
+                "scale": iri("The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`."),
+                "value": with_desc(string(), "An N-Triples literal, or a decimal such as `0.8`."),
+                "evaluator": iri("Who evaluated it."),
+                "method": method(),
+            }),
+        )
+    };
+    let terms = || {
+        with_desc(
+            json!({ "type": "object", "additionalProperties": array(string()) }),
+            "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
+        )
+    };
+    let date_time = |d: &str| with_desc(json!({ "type": "string", "format": "date-time" }), d);
+    put(
+        "EvidenceProposal",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "dryRun": with_desc(boolean(), "Check and preview the write without committing it or holding commits."),
+                    "ifHead": commit("Publish only while this commit is the branch head, else `409 head-changed`."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt. The operation IRI is derived from the dataset, the caller and the key."),
+                    "sourceGraph": iri("The source-record graph, needed when the settings name more than one."),
+                    "proposalGraph": iri("The proposal graph, needed when the settings name more than one."),
+                    "message": with_desc(string(), "The commit message."),
+                    "revisions": array(closed(
+                        &["key", "source", "sourceKey", "content"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "source": iri("The continuing source identity."),
+                            "sourceKey": key("The importer's stable source key."),
+                            "upstreamVersion": key("The upstream version identifier."),
+                            "content": content("The revision's bytes or their digest."),
+                            "expectedDigest": digest("The digest the retained bytes must have."),
+                            "locators": array(string()),
+                            "reportedRights": array(string()),
+                            "publishedAt": date_time("The source's publication time, with an explicit offset."),
+                            "reportedAvailableAt": date_time("An attributed allegation of earlier availability."),
+                            "upstreamRevisions": array(record_ref("An upstream revision.")),
+                            "families": array(string()),
+                        }),
+                    )),
+                    "renditions": array(closed(
+                        &["key", "revision", "occurrenceKey", "conversion", "mediaType", "content"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "revision": record_ref("The revision it represents."),
+                            "occurrenceKey": key("The rendition's key within its revision."),
+                            "conversion": method(),
+                            "mediaType": string(),
+                            "language": string(),
+                            "content": content("Normalized `text`, retained bytes or a digest."),
+                            "expectedDigest": digest("The digest the content must have."),
+                        }),
+                    )),
+                    "passages": array(closed(
+                        &["key", "revision", "rendition", "occurrenceKey", "start", "end", "textDigest"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "revision": record_ref("The rendition's revision."),
+                            "rendition": record_ref("A rendition of this batch with normalized text."),
+                            "occurrenceKey": key("The passage's key within its rendition."),
+                            "start": commit("The first selected Unicode code point."),
+                            "end": commit("The code point after the selection."),
+                            "textDigest": digest("The digest of the selected text."),
+                            "quote": string(),
+                        }),
+                    )),
+                    "references": array(closed(
+                        &["key", "occurrenceKey"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "occurrenceKey": key("The reference's key within what it references."),
+                            "storedFact": with_desc(json!({ "type": "object" }), "A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation."),
+                            "passage": closed(
+                                &["revision", "rendition", "passage"],
+                                json!({
+                                    "revision": record_ref("The passage's revision."),
+                                    "rendition": record_ref("The passage's rendition."),
+                                    "passage": record_ref("A passage of this batch."),
+                                }),
+                            ),
+                            "structured": closed(
+                                &["revision", "pointer", "method", "valueDigest"],
+                                json!({
+                                    "revision": record_ref("A retained JSON revision of this batch."),
+                                    "pointer": with_desc(string(), "An RFC 6901 JSON Pointer."),
+                                    "method": method(),
+                                    "valueDigest": digest("The digest of the selected value."),
+                                }),
+                            ),
+                        }),
+                    )),
+                    "claims": array(closed(
+                        &["key", "occurrenceKey", "revision", "proposition", "kind", "polarity", "author"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "occurrenceKey": key("The claim's key within its revision."),
+                            "revision": record_ref("The source revision that states it."),
+                            "proposition": with_desc(string(), "One N-Triples 1.2 triple without its final `.` and without blank nodes. It is described, never asserted."),
+                            "kind": string_enum(&["reported", "observation", "hypothesis", "preference"]),
+                            "polarity": string_enum(&["positive", "negative", "uncertain"]),
+                            "author": iri("The attributed source author, not the authenticated caller."),
+                            "scope": terms(),
+                            "confidence": closed(
+                                &[],
+                                json!({ "source": confidence(), "extraction": confidence(), "analyst": confidence() }),
+                            ),
+                        }),
+                    )),
+                    "links": array(closed(
+                        &["key", "occurrenceKey", "target", "evidence", "relation", "author"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "occurrenceKey": key("The link's key within its target."),
+                            "target": record_ref("A claim or assessment."),
+                            "evidence": record_ref("An evidence reference."),
+                            "relation": string_enum(&["supports", "contradicts", "mentions"]),
+                            "author": iri("Who made the judgment."),
+                        }),
+                    )),
+                    "assessments": array(closed(
+                        &["key", "occurrenceKey", "target", "conclusion", "method", "configurationDigest", "evaluatedAt", "evaluator"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "occurrenceKey": key("The assessment's key within its target."),
+                            "target": record_ref("A claim or assessment."),
+                            "conclusion": with_desc(string(), "An N-Triples term."),
+                            "method": method(),
+                            "configurationDigest": digest("The digest of the method's configuration."),
+                            "evaluatedAt": date_time("The evaluation time, with an explicit offset."),
+                            "evaluator": iri("The attributed evaluator."),
+                            "confidence": confidence(),
+                            "scope": terms(),
+                        }),
+                    )),
+                }),
+            ),
+            "One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input.",
+            "evidence-proposals",
+        ),
+    );
+    put(
+        "EvidenceProposalResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "firstAvailableAt",
+                    "hold",
+                    "records",
+                ],
+                json!({
+                    "operation": iri("The operation, which is every record's availability receipt."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "firstAvailableAt": with_desc(or_null(string()), "The commit's time, the first availability of its source revisions. `null` for a dry run."),
+                    "hold": with_desc(or_null(json!({ "type": "string", "format": "uuid" })), "The source hold of the stored facts of this dataset that the batch references."),
+                    "records": array(closed(
+                        &["key", "kind", "iri", "graph", "recordDigest", "existing"],
+                        json!({
+                            "key": string(),
+                            "kind": kinds(),
+                            "iri": string(),
+                            "graph": string(),
+                            "recordDigest": digest("The digest of the record's immutable content."),
+                            "existing": with_desc(boolean(), "An earlier operation had published the record with equal content, so this one did not write it again."),
+                        }),
+                    )),
+                    "dryRun": closed(
+                        &["wouldCommit", "inserted", "deleted", "error"],
+                        json!({
+                            "wouldCommit": boolean(),
+                            "inserted": int(),
+                            "deleted": int(),
+                            "error": or_null(string()),
+                        }),
+                    ),
+                }),
+            ),
+            "The outcome of a claims proposal.",
+            "evidence-proposals",
         ),
     );
 }

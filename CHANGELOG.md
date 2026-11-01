@@ -189,6 +189,31 @@ and `Store::snapshot_of_branch_limited` reads a branch by identity at an exact c
 within a cap without opening a cold branch store. `Store::listed_branch_name` names a
 listed branch by its identity.
 
+`POST /{ds}/claims` and `sparkles::evidence::propose` publish authenticated evidence
+proposals. One batch of source revisions, renditions, passages, references, claims,
+links and assessments is one commit of the evidence owner, and claims never assert
+their propositions. The route needs `write` through the update endpoint, update grants
+on the written graphs and read access to the referenced records and facts. Record IRIs
+derive from the dataset, the caller and the record's keys. The server records each
+record's receipt, creation activity and `ev:recordDigest`, each source revision's
+`ev:firstAvailableAt` and the operation, an `ev:Operation` whose agent is the caller. A
+repeated `idempotencyKey` returns the first receipt, and the codes `409 head-changed`,
+`409 idempotency-conflict`, `409 immutable-record-conflict` and `503 authority-changed`
+are new. The stored facts of the dataset that a proposal references are held before
+its commit, and holds of operations that never published are released after an hour.
+`GET /$/server` advertises `capabilities.claims`. `managed.json` is now format 2, which
+gives each managed graph a protection nonce. Older releases refuse format 2, and this
+release reads format 1 as graphs that take no typed writes until they are protected
+again. A proposal records the nonce on the operation and on each record, and resolution
+requires both, so a record written while its graph was detached answers
+`origin-not-reproduced`. Evidence resolution reports each record's `recordDigest`.
+Revoking a token, ending a session and a login that evicts sessions now wait for the
+typed writes those credentials authorized that are publishing, and releasing a source
+hold waits for a commit that is publishing a reference to it. The
+vocabulary adds `ev:Operation`, `ev:graphProtection`, `ev:payloadDigest`,
+`ev:idempotencyKey`, `ev:sourceHold`, `ev:recordDigest`, `ev:retainedBytes`,
+`ev:locator` and `ev:reportedRights`.
+
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
 An operator condenses a relation's strongly connected components and computes each

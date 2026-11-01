@@ -185,6 +185,12 @@ pub(crate) struct FamilyHolds {
     /// Held by every acquisition, release and branch deletion that changes the holds.
     /// Lock order: this before a branch table or a store's history.
     pub state: parking_lot::Mutex<HoldsState>,
+    /// Shared by a commit that publishes a reference to a hold, from its check of the
+    /// hold until the commit has published or been refused, and taken exclusively by
+    /// every release before it takes `state`. So a release either happens before the
+    /// check, which then refuses the commit, or waits until the commit is published.
+    /// Lock order: a writer, then this, then `state`.
+    pub publishing: Arc<parking_lot::RwLock<()>>,
     pub index: Arc<arc_swap::ArcSwap<HeldIndex>>,
     /// the last [`Record::touch`] given out
     pub touches: std::sync::atomic::AtomicU64,
@@ -199,6 +205,7 @@ impl Default for FamilyHolds {
     fn default() -> Self {
         FamilyHolds {
             state: parking_lot::Mutex::new(HoldsState::default()),
+            publishing: Default::default(),
             index: Arc::new(arc_swap::ArcSwap::from_pointee(HeldIndex::default())),
             touches: Default::default(),
             uncertain: Default::default(),

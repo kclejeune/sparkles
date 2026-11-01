@@ -11,6 +11,7 @@ mod primitives;
 pub mod resolve;
 mod settings;
 mod structured;
+pub mod write;
 
 pub use canonical::{IdentityNamespace, canonical_term_digest};
 pub use primitives::{

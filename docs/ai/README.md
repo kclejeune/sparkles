@@ -240,8 +240,8 @@ managed graph of the evidence owner and store canonical `evidence.json` bytes. A
 configuration never stops protecting a graph. A graph leaves protection only through
 `POST /$/evidence/{ds}/detach` or `sparkles::evidence::detach`, and the next
 configuration protects it again. Protection does not authenticate what a graph already
-holds. Evidence resolution reads records from these graphs, and the typed operations
-that write them remain under item 81.
+holds. Evidence resolution reads records from these graphs, and
+[evidence proposals](../API.md#evidence-proposals) write them.
 
 [Evidence holds](../API.md#evidence-holds) keep the commits that evidence references
 name readable. A hold names commits of `main` or any branch by the branch's identity, and
@@ -251,8 +251,9 @@ releases its holds. Administrators acquire, list and release holds through
 `/$/evidence/{ds}/holds`, and Rust applications use `sparkles::evidence::acquire_hold`,
 `holds`, `release_hold` and `reconcile_holds`. The last releases old holds that the
 evidence owner no longer needs, such as those of an operation whose commit never
-published. The typed operations of item 81 will acquire holds for the references they
-record.
+published. A claims proposal acquires a hold for the stored facts of its dataset that
+it references, before its commit, and releases the holds of operations that never
+published once they are an hour old.
 
 Rust importers can prepare typed batches with `sparkles_core::evidence::prepare_input`.
 It checks local content digests and retained text or JSON selectors within its bounds.
@@ -269,6 +270,22 @@ and a passage's selector is checked against its rendition's retained text. A mis
 unretained and unreadable reference give the same `evidence-unavailable` answer. Rust
 applications use `sparkles::evidence::resolve::Resolution`, which shares one 64 MiB
 allowance, the deadline and cancellation across an operation's references.
+
+[Evidence proposals](../API.md#evidence-proposals) are the authenticated typed writer.
+`POST /{ds}/claims` and `sparkles::evidence::propose` publish one batch of source
+revisions, renditions, passages, references, claims, links and assessments as one
+commit of the evidence owner, and a claim describes its proposition without asserting
+it. The caller needs update grants on the written graphs and read access to every
+referenced record and fact, and a hidden reference answers as a missing one. Record
+identities are derived from the dataset, the authenticated caller and each record's
+keys, so an equal record is not written twice and a different one under the same
+identity conflicts. The server sets the receipt, the creation activity and its agent,
+the first availability of each source revision and each record digest. A repeated
+idempotency key returns the first receipt, `ifHead` refuses a moved head, and a
+credential revoked before the commit publishes refuses it. Every graph has a protection
+nonce, which the operation records, so a record written while its graph was detached
+never authenticates. The Python, JVM and Node.js bindings and the MCP tools do not
+propose claims yet.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly

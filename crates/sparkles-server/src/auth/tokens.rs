@@ -224,6 +224,9 @@ impl TokenStore {
     /// Remove tokens, and the tokens they minted. Returns how many were removed.
     /// This revokes only those credentials and leaves the generation unchanged.
     pub fn remove(&self, ids: &[String]) -> Result<usize> {
+        // A publication authorized by one of these tokens that is in progress is
+        // published first; one that has not checked its credential yet finds it gone.
+        let _revocation = self.authority.begin_revocation();
         let mut inner = self.inner.lock();
         let mut gone: Vec<String> = ids.to_vec();
         let mut i = 0;

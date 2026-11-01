@@ -4044,6 +4044,15 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
         "auth": crate::auth::server_json(&st),
         // the UI's pages name its origins in their CSP anyway
         "mapStyleUrl": st.map_style_url,
+        // typed operations a client discovers before using them (spec C25 §5): a
+        // client of claims never falls back to an asserting endpoint without them
+        "capabilities": {
+            "claims": {
+                "profiles": [1],
+                "propose": "/{ds}/claims",
+                "resolve": "/{ds}/claims/resolve",
+            },
+        },
     });
     if !p.is_anonymous() {
         doc["version"] = env!("CARGO_PKG_VERSION").into();

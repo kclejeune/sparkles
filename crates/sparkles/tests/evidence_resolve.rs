@@ -189,11 +189,51 @@ fn typed(ds: &Dataset, trig: &str) -> u64 {
     let mut labels = HashMap::new();
     for quad in oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::TriG).for_slice(text.as_bytes())
     {
-        let q = t.encode_quad(&quad.unwrap(), &mut labels).unwrap();
-        t.insert(q).unwrap();
+        let quad = quad.unwrap();
+        for q in marked(ds, quad) {
+            let q = t.encode_quad(&q, &mut labels).unwrap();
+            t.insert(q).unwrap();
+        }
     }
     t.commit().unwrap();
     seq
+}
+
+/// `quad` and the operation marker a typed writer records with it: a receipt, found by
+/// its `ev:commit`, is an `ev:Operation` with the graph's protection nonce, and a record,
+/// found by its `ev:availabilityReceipt`, carries the nonce as well.
+fn marked(ds: &Dataset, quad: oxrdf::Quad) -> Vec<oxrdf::Quad> {
+    let mut out = vec![quad.clone()];
+    let oxrdf::GraphName::NamedNode(g) = &quad.graph_name else {
+        return out;
+    };
+    let Some(nonce) = ds
+        .store()
+        .managed_graphs()
+        .unwrap()
+        .and_then(|r| r.owners.get(&OwnerKind::Evidence).cloned())
+        .and_then(|e| e.protections.get(g.as_str()).copied())
+    else {
+        return out;
+    };
+    let p = quad.predicate.as_str();
+    if p == format!("{EV}commit") {
+        out.push(oxrdf::Quad::new(
+            quad.subject.clone(),
+            iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            iri(&format!("{EV}Operation")),
+            quad.graph_name.clone(),
+        ));
+    }
+    if p == format!("{EV}commit") || p == format!("{EV}availabilityReceipt") {
+        out.push(oxrdf::Quad::new(
+            quad.subject.clone(),
+            iri(&format!("{EV}graphProtection")),
+            oxrdf::Literal::new_simple_literal(nonce.to_string()),
+            quad.graph_name.clone(),
+        ));
+    }
+    out
 }
 
 fn sha(text: &str) -> String {

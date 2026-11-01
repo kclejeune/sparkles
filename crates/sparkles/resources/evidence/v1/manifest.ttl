@@ -1,7 +1,7 @@
 PREFIX ev: <urn:x-sparkles:evidence:>
 
 <urn:x-sparkles:evidence:profile:1> ev:profileVersion 1 ;
-  ev:contentDigest "sha256:c697ea47184f489e1c2ca6aaa2ff60d9f541ed6f2507d91a523d93a12e7db2d5" .
+  ev:contentDigest "sha256:d3d7b1ada8daf27f8d31d41ede50acaf86c72b02caf669b255de63d62ab8d793" .
 <urn:x-sparkles:evidence:shapes:1> ev:profileVersion 1 ;
   ev:contentDigest "sha256:21a1bd3055de9d6b810d36ddd95181824bafd7f4e3c9fde627a43504d670b636" .
 <urn:x-sparkles:evidence:query:1:assertion-status.rq> ev:profileVersion 1 ;

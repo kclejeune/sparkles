@@ -194,6 +194,12 @@ struct SessionCreation {
 
 /// Drop the oldest session of the owner that holds the most (of those tied, the one
 /// with the oldest session); returns its digest.
+/// The authority fence a session issuance holds.
+enum Fence<'a> {
+    Issue(sparkles::access::authority::AuthorityIssue<'a>),
+    Revocation(sparkles::access::authority::AuthorityRevocation<'a>),
+}
+
 fn evict_one(map: &mut HashMap<[u8; 32], SessionRecord>) -> Option<[u8; 32]> {
     // owner → (sessions, oldest seq, its digest)
     let mut owners: HashMap<String, (usize, u64, [u8; 32])> = HashMap::new();
@@ -382,49 +388,67 @@ impl SessionStore {
             seq: 0,
         };
         let (max, per_owner) = self.caps;
-        // Issuance changes no other principal's rights, so it shares the fence.
-        // Sessions it evicts are revoked one by one, like a logout.
-        let issue = self.authority.begin_issue();
-        if original_generation.is_some_and(|original| original != issue.generation()) {
-            return Err(super::store::AuthorityChanged.into());
-        }
-        rec.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let mut ended = Vec::new();
-        let mut map = self.inner.lock();
-        map.retain(|_, s| s.expires_at() > now);
-        // the owner's oldest sessions beyond its cap
-        let owner = rec.owner();
-        let mut mine: Vec<(u64, [u8; 32])> = map
-            .iter()
-            .filter(|(_, s)| s.owner() == owner)
-            .map(|(k, s)| (s.seq, *k))
-            .collect();
-        mine.sort_unstable();
-        let excess = (mine.len() + 1).saturating_sub(per_owner.max(1));
-        for (_, k) in mine.into_iter().take(excess) {
-            map.remove(&k);
-            ended.push(k);
-        }
-        // a full store: the biggest owner's oldest
-        while map.len() >= max.max(1) {
-            match evict_one(&mut map) {
-                Some(k) => ended.push(k),
-                None => break,
+        // Issuance changes no other principal's rights, so it shares the fence. An
+        // issuance that must evict sessions revokes them, so it starts again under the
+        // exclusive revocation fence, ordered against the publications they authorized.
+        let mut exclusive = false;
+        loop {
+            let fence = if exclusive {
+                Fence::Revocation(self.authority.begin_revocation())
+            } else {
+                Fence::Issue(self.authority.begin_issue())
+            };
+            let generation = match &fence {
+                Fence::Issue(g) => g.generation(),
+                Fence::Revocation(g) => g.generation(),
+            };
+            if original_generation.is_some_and(|original| original != generation) {
+                return Err(super::store::AuthorityChanged.into());
             }
+            let mut map = self.inner.lock();
+            map.retain(|_, s| s.expires_at() > now);
+            // the owner's oldest sessions beyond its cap
+            let owner = rec.owner();
+            let mut mine: Vec<(u64, [u8; 32])> = map
+                .iter()
+                .filter(|(_, s)| s.owner() == owner)
+                .map(|(k, s)| (s.seq, *k))
+                .collect();
+            let excess = (mine.len() + 1).saturating_sub(per_owner.max(1));
+            if !exclusive && (excess > 0 || map.len() >= max.max(1)) {
+                drop(map);
+                drop(fence);
+                exclusive = true;
+                continue;
+            }
+            rec.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let mut ended = Vec::new();
+            mine.sort_unstable();
+            for (_, k) in mine.into_iter().take(excess) {
+                map.remove(&k);
+                ended.push(k);
+            }
+            // a full store: the biggest owner's oldest
+            while map.len() >= max.max(1) {
+                match evict_one(&mut map) {
+                    Some(k) => ended.push(k),
+                    None => break,
+                }
+            }
+            map.insert(digest, rec);
+            let saved = self.save(&mut map);
+            drop(map);
+            let mut ids = self.id_tokens.lock();
+            let mut seen = self.seen.lock();
+            for k in ended {
+                ids.remove(&k);
+                seen.remove(&k);
+            }
+            drop(ids);
+            drop(fence);
+            saved?;
+            return Ok((raw, digest));
         }
-        map.insert(digest, rec);
-        let saved = self.save(&mut map);
-        drop(map);
-        let mut ids = self.id_tokens.lock();
-        let mut seen = self.seen.lock();
-        for k in ended {
-            ids.remove(&k);
-            seen.remove(&k);
-        }
-        drop(ids);
-        drop(issue);
-        saved?;
-        Ok((raw, digest))
     }
 
     /// A live session: before its absolute expiry and, with an `idle` timeout, used
@@ -450,6 +474,8 @@ impl SessionStore {
     }
 
     pub fn remove(&self, digest: &[u8; 32]) -> Result<Option<SessionRecord>> {
+        // Ordered against publications authorized by the session (see the token store).
+        let _revocation = self.authority.begin_revocation();
         self.id_tokens.lock().remove(digest);
         self.seen.lock().remove(digest);
         let mut map = self.inner.lock();
@@ -464,6 +490,7 @@ impl SessionStore {
     /// `sid` (of subject `sub` when both are given), or every session of `sub`. Returns
     /// how many ended.
     pub fn end_oidc(&self, sid: Option<&str>, sub: Option<&str>) -> Result<usize> {
+        let _revocation = self.authority.begin_revocation();
         let mut map = self.inner.lock();
         let gone: Vec<[u8; 32]> = map
             .iter()
@@ -643,6 +670,48 @@ mod tests {
         assert!(sessions.get(&digest, 119, Some(10)).is_none());
         let reopened = SessionStore::open(path, 119).unwrap();
         assert_eq!(reopened.active(119), 0);
+    }
+
+    #[test]
+    fn an_issuance_that_evicts_waits_for_publications_in_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let registry = Arc::new(AuthorityRegistry::default());
+        let sessions = SessionStore::open_with_registry(path, 0, registry.clone())
+            .unwrap()
+            .with_caps(1, 1);
+        let owner = || Identity {
+            kind: super::super::Kind::User,
+            name: "evicted-owner".into(),
+            groups: vec![],
+            display_name: None,
+        };
+        let (_, first) = sessions
+            .create(Method::Password, owner(), None, 100, 1000)
+            .unwrap();
+        // a publication authorized by the first session has passed its fence
+        let hold = registry.begin_hold();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let r = sessions.create(Method::Password, owner(), None, 101, 1000);
+                tx.send(r.map(|(_, d)| d).map_err(|e| e.to_string()))
+                    .unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the eviction waits for the publication"
+            );
+            assert!(sessions.contains(&first));
+            drop(hold);
+            let second = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert!(sessions.contains(&second));
+            assert!(!sessions.contains(&first));
+        });
     }
 
     #[test]

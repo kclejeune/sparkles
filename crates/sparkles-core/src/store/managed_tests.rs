@@ -423,7 +423,7 @@ fn enabling_raises_the_reader_and_survives_a_reopen() {
     crate::commit::check_dataset_value_as(&v, 6).unwrap();
     let file: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
-    assert_eq!(file["format"], 1);
+    assert_eq!(file["format"], 2);
     assert_eq!(file["revision"], 1);
     assert_eq!(file["owners"]["evidence"]["graphs"][0], M);
     assert_eq!(std::fs::read(root.join("evidence.json")).unwrap(), SETTINGS);
@@ -468,7 +468,7 @@ fn an_unenforceable_registry_refuses_writes_and_keeps_reads() {
         (
             "managed.json",
             "newer format",
-            |v| v["format"] = 2.into(),
+            |v| v["format"] = 3.into(),
             false,
         ),
         (
@@ -910,7 +910,7 @@ fn copies_of_unknown_owners_are_refused() {
                 });
                 std::fs::write(root.join("jobs.json"), b"{}").unwrap();
             }
-            "newer format" => edit(&root, "managed.json", |v| v["format"] = 2.into()),
+            "newer format" => edit(&root, "managed.json", |v| v["format"] = 3.into()),
             _ => edit(&root, "managed.json", |v| {
                 v["owners"]["evidence"]["settingsDigest"] = "sha256:00".into()
             }),
@@ -1019,4 +1019,36 @@ fn an_enablement_does_not_block_nested_family_operations() {
         )),
         "profile-managed-graph"
     );
+}
+
+#[test]
+fn protection_nonces_persist_while_protected_and_renew_after_a_detach() {
+    let (dir, s) = setup();
+    let first = enable(&s, &[M, "urn:other"]);
+    let nonce = |g: &crate::managed::ManagedGraphs, iri: &str| {
+        g.owners[&OwnerKind::Evidence].protections.get(iri).copied()
+    };
+    let m = nonce(&first, M).expect("a protected graph has a nonce");
+    assert_ne!(Some(m), nonce(&first, "urn:other"));
+    // enabling again keeps the nonce of a graph that stays protected
+    let again = enable(&s, &[M, "urn:other"]);
+    assert_eq!(nonce(&again, M), Some(m));
+    // a capability reads the nonce of its own registry
+    let cap = s
+        .managed_writer(OwnerKind::Evidence, uuid::Uuid::new_v4())
+        .unwrap();
+    assert_eq!(cap.protection(M), Some(m));
+    assert_eq!(cap.protection("urn:unmanaged"), None);
+    // a detach drops it and protecting the graph again chooses another
+    let detached = s.detach_managed(OwnerKind::Evidence, M).unwrap();
+    assert_eq!(nonce(&detached, M), None);
+    let renewed = enable(&s, &[M, "urn:other"]);
+    let r = nonce(&renewed, M).unwrap();
+    assert_ne!(r, m);
+    assert_eq!(nonce(&renewed, "urn:other"), nonce(&first, "urn:other"));
+    // the nonces are durable
+    drop((cap, s));
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    let reopened = s.managed_graphs().unwrap().unwrap();
+    assert_eq!(nonce(&reopened, M), Some(r));
 }

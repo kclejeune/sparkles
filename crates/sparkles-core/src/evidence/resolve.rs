@@ -92,6 +92,9 @@ pub struct VerifiedRecord {
     pub graph: NamedNode,
     pub receipt: Receipt,
     pub content_digest: Option<Sha256Digest>,
+    /// The digest of the record's immutable content that its typed writer recorded
+    /// as `ev:recordDigest` (see [`crate::evidence::write`]).
+    pub record_digest: Option<Sha256Digest>,
     /// For a passage, its verified selection.
     pub span: Option<VerifiedSpan>,
 }
@@ -244,6 +247,9 @@ struct RecordGraphs {
     dataset: Uuid,
     state: Option<Arc<crate::managed::ManagedState>>,
     graphs: Vec<NamedNode>,
+    /// Each record graph's protection nonce, which a typed writer records with the
+    /// receipts it publishes there.
+    protections: BTreeMap<String, Uuid>,
     _held: Reservation,
 }
 
@@ -383,12 +389,13 @@ impl Resolver {
         });
         if !current {
             self.record_graphs = None;
-            let (graphs, held) =
+            let (graphs, protections, held) =
                 record_graphs(state.as_deref(), &self.preparation).map_err(|e| classify(key, e))?;
             self.record_graphs = Some(RecordGraphs {
                 dataset: main.dataset_id(),
                 state,
                 graphs,
+                protections,
                 _held: held,
             });
         }
@@ -445,7 +452,14 @@ impl Resolver {
                 "the record exists with another kind than the reference expects",
             ));
         }
-        let receipt = receipt(&mut lookups, &graph, &request.iri, key)?;
+        let protections = &self.record_graphs.as_ref().expect("prepared").protections;
+        let receipt = receipt(
+            &mut lookups,
+            &graph,
+            &request.iri,
+            key,
+            protections.get(graph.as_str()).copied(),
+        )?;
         if receipt.dataset != main.dataset_id()
             || !main
                 .branch_known_prepared(receipt.branch, lookups.preparation)
@@ -463,10 +477,12 @@ impl Resolver {
                 "the record's content digest differs from the expected digest",
             ));
         }
+        let record_digest = single_digest(&mut lookups, &graph, &request.iri, "recordDigest", key)?;
         let span = if kind == RecordKind::Passage {
             Some(verify_passage(
                 &mut lookups,
                 &graphs,
+                protections,
                 &graph,
                 &request.iri,
                 main,
@@ -481,6 +497,7 @@ impl Resolver {
             graph,
             receipt,
             content_digest,
+            record_digest,
             span,
         })
     }
@@ -708,15 +725,16 @@ fn isomorphic(a: &Triple, b: &Triple) -> bool {
 fn record_graphs(
     state: Option<&crate::managed::ManagedState>,
     preparation: &Preparation,
-) -> Result<(Vec<NamedNode>, Reservation)> {
+) -> Result<(Vec<NamedNode>, BTreeMap<String, Uuid>, Reservation)> {
     use crate::managed::ManagedState;
     let mut held = preparation.reserve(0)?;
+    let mut protections = BTreeMap::new();
     // The registry is borrowed from the running state, never copied.
     let Some(ManagedState::Installed(installed)) = state else {
-        return Ok((Vec::new(), held));
+        return Ok((Vec::new(), protections, held));
     };
     let Some(bytes) = installed.settings.get(&OwnerKind::Evidence) else {
-        return Ok((Vec::new(), held));
+        return Ok((Vec::new(), protections, held));
     };
     // Decoding copies the settings' strings into its own maps and vectors.
     let decoding = preparation.reserve(
@@ -728,16 +746,13 @@ fn record_graphs(
         Ok(settings) => settings,
         Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
         // Settings this build cannot read authenticate no record.
-        Err(_) => return Ok((Vec::new(), held)),
+        Err(_) => return Ok((Vec::new(), protections, held)),
     };
     if !settings.enabled {
-        return Ok((Vec::new(), held));
+        return Ok((Vec::new(), protections, held));
     }
-    let protected: &[String] = installed
-        .graphs
-        .owners
-        .get(&OwnerKind::Evidence)
-        .map_or(&[], |e| &e.graphs);
+    let entry = installed.graphs.owners.get(&OwnerKind::Evidence);
+    let protected: &[String] = entry.map_or(&[], |e| &e.graphs);
     let mut sorted: Vec<&str> = Vec::new();
     held.grow_by((protected.len() as u64).saturating_mul(16))?;
     sorted
@@ -767,15 +782,18 @@ fn record_graphs(
             return Err(e);
         }
         if found.is_ok() && !out.iter().any(|n| n.as_str() == graph) {
-            held.grow_by((graph.len() as u64).saturating_add(64))?;
+            held.grow_by((graph.len() as u64).saturating_mul(2).saturating_add(128))?;
             if let Ok(node) = NamedNode::new(graph.as_str()) {
                 out.push(node);
+                if let Some(nonce) = entry.and_then(|e| e.protections.get(graph)) {
+                    protections.insert(graph.clone(), *nonce);
+                }
             }
         }
     }
     out.sort();
     drop(decoding);
-    Ok((out, held))
+    Ok((out, protections, held))
 }
 
 /// Controlled lookups in one prepared view, with the view's graph policy applied.
@@ -941,12 +959,18 @@ fn find_record(
     Ok(found)
 }
 
-/// The record's one publication receipt in its graph.
+/// The record's one publication receipt in its graph, which must be the receipt of a
+/// typed operation published under the graph's current protection `nonce`: the
+/// receipt is an `ev:Operation` whose one `ev:graphProtection` there is the nonce.
+/// A record written while its graph was detached cannot carry the nonce of the
+/// protection in force now, because that nonce was chosen when the graph was protected
+/// again, after which nobody but a typed writer could change the graph.
 fn receipt(
     lookups: &mut Lookups<'_>,
     graph: &NamedNode,
     iri: &NamedNode,
     key: &str,
+    nonce: Option<Uuid>,
 ) -> Result<Receipt> {
     let receipt = match lookups
         .one(iri.as_str(), &format!("{EV}availabilityReceipt"), graph)
@@ -983,6 +1007,30 @@ fn receipt(
     let Some(commit) = commit else {
         return Err(origin(key));
     };
+    // The operation marker of decision 1 of the resolution step.
+    let Some(nonce) = nonce else {
+        return Err(origin(key));
+    };
+    if !lookups
+        .has(receipt.as_str(), RDF_TYPE, &format!("{EV}Operation"), graph)
+        .map_err(|e| classify(key, e))?
+    {
+        return Err(origin(key));
+    }
+    // The record and its operation both carry the nonce. A record planted while the
+    // graph was detached cannot, even when it names an operation that a later typed
+    // write records with the current nonce.
+    for subject in [receipt.as_str(), iri.as_str()] {
+        match lookups
+            .one(subject, &format!("{EV}graphProtection"), graph)
+            .map_err(|e| classify(key, e))?
+        {
+            One::Some(Term::Literal(l))
+                if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string"
+                    && Uuid::parse_str(l.value()).ok() == Some(nonce) => {}
+            _ => return Err(origin(key)),
+        }
+    }
     Ok(Receipt {
         iri: receipt,
         dataset,
@@ -1026,6 +1074,7 @@ fn single_digest(
 fn verify_passage(
     lookups: &mut Lookups<'_>,
     graphs: &[&NamedNode],
+    protections: &BTreeMap<String, Uuid>,
     graph: &NamedNode,
     iri: &NamedNode,
     main: &Store,
@@ -1049,6 +1098,7 @@ fn verify_passage(
             return verify_with_selector(
                 lookups,
                 graphs,
+                protections,
                 graph,
                 iri,
                 &rendition,
@@ -1064,6 +1114,7 @@ fn verify_passage(
     verify_with_selector(
         lookups,
         graphs,
+        protections,
         graph,
         iri,
         &rendition,
@@ -1077,6 +1128,7 @@ fn verify_passage(
 fn verify_with_selector(
     lookups: &mut Lookups<'_>,
     graphs: &[&NamedNode],
+    protections: &BTreeMap<String, Uuid>,
     graph: &NamedNode,
     iri: &NamedNode,
     rendition: &NamedNode,
@@ -1130,7 +1182,13 @@ fn verify_with_selector(
     if kind != RecordKind::Rendition {
         return Err(conflict(key, "the passage's source is not a rendition"));
     }
-    let receipt = receipt(lookups, &rendition_graph, rendition, key)?;
+    let receipt = receipt(
+        lookups,
+        &rendition_graph,
+        rendition,
+        key,
+        protections.get(rendition_graph.as_str()).copied(),
+    )?;
     if receipt.dataset != main.dataset_id()
         || !main
             .branch_known_prepared(receipt.branch, lookups.preparation)

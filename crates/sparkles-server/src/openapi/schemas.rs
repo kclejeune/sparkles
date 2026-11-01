@@ -141,6 +141,17 @@ pub(super) fn schemas() -> Map<String, J> {
                 "datasets": array(sref("DatasetInfo")),
                 "limits": sref("Limits"),
                 "auth": obj(&["enabled"], json!({ "enabled": { "type": "boolean" } })),
+                "capabilities": {
+                    "type": "object",
+                    "description": "Typed operations a client discovers before it uses them. A client of claims proposals must not fall back to an asserting endpoint when `claims` is absent.",
+                    "properties": {
+                        "claims": obj(&["profiles", "propose", "resolve"], json!({
+                            "profiles": with_desc(array(json!({ "type": "integer" })), "The evidence profile versions whose typed operations this build serves."),
+                            "propose": with_desc(json!({ "type": "string" }), "The route template of authenticated claim proposals."),
+                            "resolve": with_desc(json!({ "type": "string" }), "The route template of evidence resolution."),
+                        })),
+                    },
+                },
                 "startDateTime": { "type": "string", "description": "Fuseki's name for `startedAt`." },
                 "uptime": { "type": "number", "description": "Fuseki's uptime in seconds." },
                 "formats": {

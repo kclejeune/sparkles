@@ -277,6 +277,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/memory/brief", &["POST"]),
     // retained-reference resolution of the evidence profile (C25 §3 and §8)
     ("/{ds}/claims/resolve", &["POST"]),
+    // authenticated claim proposals of the evidence profile (C25 §5 and §7)
+    ("/{ds}/claims", &["POST"]),
     // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
     ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
@@ -587,9 +589,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/backups/{ds}/{repo}/{backup}"
         | "/$/backups/{ds}/{repo}/{backup}/restore"
         | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
-        "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" | "/{ds}/mappings/{name}/run" => {
-            Dataset(Write)
-        }
+        "/{ds}/update"
+        | "/{ds}/upload"
+        | "/{ds}/facts"
+        | "/{ds}/claims"
+        | "/{ds}/mappings/{name}/run" => Dataset(Write),
         "/{ds}/memory/brief" => Dataset(Read),
         "/{ds}/sources" if get => Dataset(Read),
         "/{ds}/sources" => Dataset(Write),
@@ -650,7 +654,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
         "/$/ontology/{ds}/axioms" => Endpoint::Update,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
-        "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
+        "/{ds}/update" | "/{ds}/facts" | "/{ds}/claims" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,
         "/{ds}/sources" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,
