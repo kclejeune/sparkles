@@ -322,6 +322,17 @@ impl Annotations {
         self.tail.as_ref().map_or(0, |t| t.preallocated())
     }
 
+    /// Cut the zeros preallocated after the records, before the store closes: a file that
+    /// is no longer written ends at its last record (an open cuts them as well). Nothing
+    /// is cut while a group commit fence still has records to write.
+    pub fn trim(&mut self) {
+        if let Some(tail) = &self.tail
+            && tail.end() == self.len
+        {
+            let _ = tail.trim();
+        }
+    }
+
     /// Take back the annotation of `seq`, appended for a commit that did not happen.
     /// `Err` when the file could not be cut back (the caller refuses further writes).
     pub fn undo(&mut self, seq: u64) -> Result<()> {
@@ -504,6 +515,17 @@ impl Tail {
         cut?;
         if sync {
             io.file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// Cut the preallocated zeros after the written records.
+    fn trim(&self) -> std::io::Result<()> {
+        let mut io = self.io.lock();
+        if io.alloc > io.end {
+            let end = io.end;
+            io.file.set_len(end)?;
+            io.alloc = end;
         }
         Ok(())
     }

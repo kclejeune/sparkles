@@ -7416,6 +7416,9 @@ impl Drop for Store {
             w.trim_wal();
             if !w.poisoned {
                 self.snapshot().generation.dvocab.trim();
+                let mut a = self.annotations.lock();
+                a.trim();
+                self.quota.set_ann_preallocated(a.preallocated());
             }
         }
         if let Some(log) = &self.changelog

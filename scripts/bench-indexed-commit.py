@@ -1438,6 +1438,8 @@ def _measure(
     ]
     if index == "embed":
         command += ["--allow-receipt-gaps"]
+    if getattr(args, "message", None):
+        command += ["--message", args.message]
     command += (
         ["serial", "--warmup", str(args.warmup)]
         if scenario.startswith("serial-")
@@ -1943,6 +1945,11 @@ def main():
         nargs="+",
         default=["serial-literal", "serial-iri", "serial-delete", "writers", "mixed"],
         choices=["serial-literal", "serial-iri", "serial-delete", "writers", "mixed"],
+    )
+    p.add_argument(
+        "--message",
+        help="the commit message of every update, which makes each commit write an "
+        "annotation record",
     )
     p.add_argument("--serial-changes", type=int, default=2000)
     p.add_argument("--warmup", type=int, default=200)
