@@ -115,7 +115,9 @@ fn check_with(name: &str, ok: bool, detail: String, fingerprint: Option<String>)
     writeln!(f, "{line}").unwrap();
 }
 
-/// Rows as sorted strings, each repeated by its multiplicity.
+/// Rows as sorted strings, each repeated by its multiplicity. A row of negative weight,
+/// which a correct maintained result never holds, is kept as a marked row so that the
+/// answer cannot match a query's.
 fn rows_of(rows: &[(Vec<Option<oxrdf::Term>>, i64)]) -> Vec<String> {
     let mut out: Vec<String> = rows
         .iter()
@@ -125,11 +127,21 @@ fn rows_of(rows: &[(Vec<Option<oxrdf::Term>>, i64)]) -> Vec<String> {
                 .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
                 .collect::<Vec<_>>()
                 .join(" ");
-            std::iter::repeat_n(s, (*w).max(0) as usize)
+            if *w < 0 {
+                return vec![format!("weight {w}: {s}")];
+            }
+            vec![s; *w as usize]
         })
         .collect();
     out.sort();
     out
+}
+
+#[test]
+fn negative_weights_are_kept() {
+    let row = vec![Some(oxrdf::NamedNode::new_unchecked("http://ex/a").into())];
+    let good = rows_of(&[(row.clone(), 1)]);
+    assert_ne!(good, rows_of(&[(row.clone(), 1), (row, -1)]));
 }
 
 /// Check that the view `name` is at the store's head commit and holds the rows of
@@ -505,7 +517,7 @@ fn commit_path_without_views() {
     // every commit wrote two new quads, a team and an age of a new :w subject
     let written = sparql::query(
         s.snapshot(),
-        &format!("{PREFIX}SELECT (COUNT(*) AS ?n) (SUM(?a) AS ?t) WHERE {{ ?w :memberOf ?m ; :age ?a FILTER(STRSTARTS(STR(?w), \"http://ex/w\")) }}"),
+        &format!("{PREFIX}SELECT ?w ?m ?a WHERE {{ ?w :memberOf ?m ; :age ?a FILTER(STRSTARTS(STR(?w), \"http://ex/w\")) }}"),
         &QueryOptions {
             no_cache: true,
             ..Default::default()
@@ -513,16 +525,27 @@ fn commit_path_without_views() {
     )
     .unwrap();
     let added = s.snapshot().len() - quads;
-    let rows: Vec<String> = written.rows()[0]
-        .iter()
-        .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
-        .collect();
-    let rows = rows.join(" ");
+    let vars = written.vars.clone();
+    let rows = rows_of(
+        &written
+            .rows()
+            .into_iter()
+            .map(|r| (r, 1))
+            .collect::<Vec<_>>(),
+    );
+    // the i-th commit of a round gave its subject the team t(i % 50) and the age i % 60
+    let shaped = rows.iter().all(|r| {
+        let f: Vec<&str> = r.split(' ').collect();
+        f.len() == 3 && f[1].starts_with("<http://ex/t")
+    });
     check_with(
         "commit-path/written",
-        added == 36_000 && rows.starts_with("\"18000\""),
-        format!("{added} quads added, {rows}"),
-        Some(format!("{added} quads, {rows}")),
+        added == 36_000 && rows.len() == 18_000 && shaped,
+        format!(
+            "{added} quads added, {} subjects with a team and an age",
+            rows.len()
+        ),
+        Some(answer_fingerprint(&vars, &rows)),
     );
     drop(live);
 }

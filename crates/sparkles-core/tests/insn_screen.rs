@@ -397,7 +397,14 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
         assert!(n > items as u64, "{name}: {n} keys");
         // every key, read once by the scan and compared with lookups by id
         let mut all: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
-        v.for_each(|_, k| all.push(k.to_vec()));
+        v.for_each(|i, k| {
+            assert_eq!(
+                i,
+                all.len() as u64,
+                "{name}: the scan's ids are not in order"
+            );
+            all.push(k.to_vec());
+        });
         assert_eq!(all.len() as u64, n, "{name}: the scan missed keys");
         for (i, k) in all.iter().enumerate().step_by(97) {
             assert_eq!(
