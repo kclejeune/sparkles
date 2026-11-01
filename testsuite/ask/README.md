@@ -170,8 +170,9 @@ line, in input order. `--jobs N` runs up to N questions at once on the shared st
 Every other flag applies to each question, and each question keeps its own deadline,
 token budget and query memory budget. A line that is invalid, fails or panics gets its
 own error result while the rest go on. A line's `modelSecrets` replace the
-`--model-secret` of the same name for that question. The question still counts against the provider's concurrency,
-request spacing and daily token limits that every other line shares.
+`--model-secret` of the same name for that question. The question still counts against
+the provider's concurrency, request spacing and daily token limits that every other
+line shares.
 
 `scripts/eval-ask-anthropic` asks each phase's cases through one such child, run in its
 own systemd user scope with 16G of memory and no swap. `--no-batch` asks each case in
@@ -185,10 +186,14 @@ and with none in flight it ends the run as the cap would. The runner keeps at mo
 `--jobs` lines in flight, sends a second line with the chosen answer for a clarified
 case, and holds each case's reply lines until that case and every earlier one are done,
 so the report, the case files and `replies.jsonl` keep question order. A batch child
-holds a database directory's lock, so the cases are scored after it ends. When the
-child dies or a line passes its deadline, the cases in flight fail as `killed` or
-`timeout` and a new child asks the rest. A case's wall time is its result's
-`usage.elapsedMs`.
+holds a database directory's lock, so the cases are scored after it ends. A line that
+the child's input does not take, because the input closed or the child stopped
+reading, goes to the next child, and the results of the lines the child did take are
+still read to its end. When the child dies or a line passes its deadline, the cases in
+flight that got no result fail as `killed` or `timeout` and a new child asks the rest.
+Writes, waits and the proxy's drain of a case's requests all end at the phase
+deadline, and a run that ends with an error keeps every case that finished, unscored.
+A case's wall time is its result's `usage.elapsedMs`.
 
 The store's caches stay warm from one question to the next within a phase, as a running
 server's do. This lowers latency against one child per case but leaves the answers
