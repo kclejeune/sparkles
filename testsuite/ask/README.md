@@ -255,6 +255,16 @@ The local ledger is the authority. A Console workspace spend limit below the acc
 balance is a backstop against a defect, and it can lag billing, so the run does not rely
 on it.
 
+The Anthropic Console cost export of 2026-10-03 to 2026-11-01 was checked against every
+campaign ledger of that period. The ledgers match the export to the cent for each model
+on the full days of 2026-10-19, 2026-10-24, 2026-10-25 and 2026-10-31. On 2026-11-01,
+up to 12:00 UTC where the export ends, every Opus and Haiku rate matches. Sonnet 5.5
+cache reads were billed at $0.10 per million tokens against the $0.20 in the proxy's
+table, so the ledger charged $0.57 more than the bill, and the table now holds $0.10.
+The Haiku ledger stands about $0.05 above the bill, which is one request that timed out
+upstream and was settled at its bound but never billed. Existing ledgers keep the costs
+they recorded, and only new settlements use the corrected rate.
+
 Before spending, the run counts tokens, which is free, and sends each model of the run
 one structured-output request of at most 256 tokens. It records the status and headers
 of the replies in `preflight.json`, without rate-limit, request, organization, workspace

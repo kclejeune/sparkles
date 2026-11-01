@@ -463,7 +463,7 @@ class Rates(unittest.TestCase):
             px.RATES,
             {
                 HAIKU: ((100, 125, 200, 10, 500), (500, 625, 1000, 50, 2500)),
-                SONNET: ((2000, 2500, 4000, 200, 10000),) * 2,
+                SONNET: ((2000, 2500, 4000, 100, 10000),) * 2,
                 OPUS: ((4000, 5000, 8000, 200, 20000),) * 2,
             },
         )
@@ -471,7 +471,7 @@ class Rates(unittest.TestCase):
     def test_cache_reads_on_every_model(self):
         usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 1000}
         self.assertEqual(px.cost(HAIKU, usage), 1000 * 10)  # $0.01 per million
-        self.assertEqual(px.cost(SONNET, usage), 1000 * 200)  # $0.20 per million
+        self.assertEqual(px.cost(SONNET, usage), 1000 * 100)  # $0.10 per million
         self.assertEqual(px.cost(OPUS, usage), 1000 * 200)  # $0.20 per million
         big = dict(usage, cache_read_input_tokens=100001)
         self.assertEqual(px.cost(HAIKU, big), 100001 * 50)
@@ -590,7 +590,7 @@ class Errors(Base):
         }
         self.assertEqual(
             px.cost(SONNET, usage),
-            100 * 2000 + 10 * 2500 + 20 * 4000 + 50 * 200 + 10 * 10000,
+            100 * 2000 + 10 * 2500 + 20 * 4000 + 50 * 100 + 10 * 10000,
         )
         usage = dict(usage, cache_creation={"ephemeral_5m_input_tokens": 1})
         self.assertIsNone(px.cost(SONNET, usage))

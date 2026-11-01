@@ -38,13 +38,16 @@ REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # copy bundled with Claude Code 2.1.296 in its claude-api skill, `shared/models.md` and
 # `shared/prompt-caching.md`, on 2026-10-18, not from the live pricing page. Haiku 5.5 is
 # $0.10 and $0.50 per million up to 100K prompt tokens and $0.50 and $2.50 above.
-# Sonnet 5.5 is $2 and $10 and Opus 5.5 is $4 and $20, both with cache reads at $0.20
-# and no long-context premium. Cache writes are 1.25 times input for five minutes and
-# 2 times for one hour, and a Haiku cache read is 0.1 times input. The Haiku long-context
-# cache columns apply those multipliers to the higher base. A test pins this table.
+# Sonnet 5.5 is $2 and $10 with cache reads at $0.10, and Opus 5.5 is $4 and $20 with
+# cache reads at $0.20, both with no long-context premium. Cache writes are 1.25 times
+# input for five minutes and 2 times for one hour, and a Haiku cache read is 0.1 times
+# input. The Haiku long-context cache columns apply those multipliers to the higher
+# base. The Anthropic console cost export of 2026-11-01 confirmed the input, output,
+# five-minute write and read rates of all three models. It billed Sonnet reads at
+# $0.10, where the earlier table had $0.20. A test pins this table.
 RATES = {
     MODELS[0]: ((100, 125, 200, 10, 500), (500, 625, 1000, 50, 2500)),
-    MODELS[1]: ((2000, 2500, 4000, 200, 10000),) * 2,
+    MODELS[1]: ((2000, 2500, 4000, 100, 10000),) * 2,
     MODELS[2]: ((4000, 5000, 8000, 200, 20000),) * 2,
 }
 LONG_CONTEXT = 100000
