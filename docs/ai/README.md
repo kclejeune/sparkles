@@ -424,10 +424,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   retained QALD-9-plus questions, which Ask grounding was tuned on, Opus answers 41, Sonnet
   33 and Haiku 28 under projected-column scoring. On the 74 retained Text2SPARQL'25 DBpedia
   questions they answer 33, 32 and 19. Missing predicates in the grounding
-  context and missed entity links cause most wrong answers. A generated query with a
-  property path can exhaust memory under Ask, because the default query memory budget and
-  timeout do not bound property-path evaluation, which roadmap item 505 tracks.
-  Model-dependent
+  context and missed entity links cause most wrong answers. Property path evaluation
+  runs within Ask's query memory budget and timeout, so a generated query with a
+  property path fails with the usual error rather than exhausting memory. Model-dependent
   accuracy and contextual namesake resolution remain roadmap item 263, and the higher
   median end-to-end latency is item 318. Local and OpenAI-compatible models, LC-QuAD 2.0,
   which needs a Wikidata load from the full dump, and an evaluation of independent roles

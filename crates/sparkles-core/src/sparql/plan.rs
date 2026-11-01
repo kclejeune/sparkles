@@ -331,6 +331,9 @@ pub struct PathSpec {
     pub max_one: bool,
     /// for index-based traversal: predicate + direction (true = reverse)
     pub simple: Option<(u64, bool)>,
+    /// for index-based traversal of an alternative of predicates from a bound or
+    /// constant end: each predicate with its direction, in place of an edge plan
+    pub preds: Option<Vec<(u64, bool)>>,
     pub graph: GraphFilter,
     pub graph_var: Option<VarId>,
     /// edge variables of the child plan (src, dst) when not simple
@@ -3549,6 +3552,39 @@ impl<'a> Planner<'a> {
 
     // --------------------------------------------------------------- paths ------
 
+    /// The predicates of a path that is an alternative of predicates and inverse
+    /// predicates, each with whether it is inverted. A predicate that is not in the
+    /// store has no edges and is left out. `None` when the path is not such an
+    /// alternative, or when a predicate is a term of the query's local facts.
+    fn alt_preds(&mut self, inner: &PropertyPathExpression) -> Option<Vec<(u64, bool)>> {
+        use PropertyPathExpression as PP;
+        if !matches!(inner, PP::Alternative(..)) {
+            return None;
+        }
+        let mut alts = Vec::new();
+        flatten_alt(inner, &mut alts);
+        let mut preds = Vec::new();
+        for a in alts {
+            let (n, rev) = match a {
+                PP::NamedNode(n) => (n, false),
+                PP::Reverse(r) => match &**r {
+                    PP::NamedNode(n) => (n, true),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let id = self.ctx.intern_term(&Term::NamedNode(n.clone()));
+            if self.ctx.unknown_const(id) {
+                continue;
+            }
+            if id.tag() == Tag::Local {
+                return None;
+            }
+            preds.push((id.0, rev));
+        }
+        Some(preds)
+    }
+
     fn attach_path(&mut self, left: Node, p: PathItem) -> Result<Node> {
         use PropertyPathExpression as PP;
         let mut count = None;
@@ -3617,9 +3653,23 @@ impl<'a> Planner<'a> {
             },
             _ => None,
         };
+        let bound_var = [p.s, p.o].into_iter().find_map(|e| match e {
+            PT::V(v) if left.vars.contains(&v) && left.certain.contains(&v) => Some(v),
+            _ => None,
+        });
+        let bound_side = bound_var.is_some() && !left.vars.is_empty() && gvar.is_none();
+        let const_end = matches!(p.s, PT::C(_)) || matches!(p.o, PT::C(_));
+        // A closure over an alternative of predicates and inverse predicates with a
+        // bound or constant end walks from that end by index lookups, rather than
+        // reading every edge of the alternative into memory first.
+        let preds = match (simple, count) {
+            (None, None) if bound_side || const_end => self.alt_preds(inner),
+            _ => None,
+        };
         let mut children = Vec::new();
         let mut edge_vars = None;
         let simple = match simple {
+            None if preds.is_some() => None,
             Some((id, _)) if self.ctx.unknown_const(id) && min == 1 => {
                 return Ok(Node::empty(left.vars.clone()));
             }
@@ -3649,6 +3699,7 @@ impl<'a> Planner<'a> {
             min,
             max_one,
             simple,
+            preds,
             graph: gf,
             graph_var: gvar,
             edge_vars,
@@ -3666,15 +3717,10 @@ impl<'a> Planner<'a> {
         if let Some(g) = gvar {
             vars.push(g);
         }
-        let bound_var = [&spec.subj, &spec.obj].into_iter().find_map(|e| match e {
-            PathEnd::Var(v) if left.vars.contains(v) && left.certain.contains(v) => Some(*v),
-            _ => None,
-        });
         let desc = format!("{} {} {}", self.pt_str(&p.s), p.path, self.pt_str(&p.o));
         let fanout = 10.0;
         if let Some(bv) = bound_var
-            && !left.vars.is_empty()
-            && gvar.is_none()
+            && bound_side
         {
             // bound-side traversal from the left input (QLever TransitivePath with bound side)
             let est = left.est * fanout;

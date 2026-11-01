@@ -674,12 +674,13 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         } => {
             let _ = write!(
                 s,
-                "{:?}{:?}{}{}{:?}{}{:?}{:?}",
+                "{:?}{:?}{}{}{:?}{:?}{}{:?}{:?}",
                 spec.subj,
                 spec.obj,
                 spec.min,
                 spec.max_one,
                 spec.simple,
+                spec.preds,
                 bound_from_left,
                 spec.graph,
                 spec.count
