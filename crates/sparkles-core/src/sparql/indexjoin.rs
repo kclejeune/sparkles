@@ -23,7 +23,7 @@ use super::plan::{GraphFilter, Kind, Node, ScanSpec};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{ALL_COLS, BLOCK_ROWS, Block, ColMask, G, Key, O, P, Perm, S, bound_cols, pad};
+use crate::index::{BLOCK_ROWS, Block, ColMask, G, Key, O, P, Perm, S, bound_cols, pad};
 use crate::store::Chunk;
 use std::ops::Bound;
 
@@ -1087,9 +1087,6 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
     for &(a, b) in rule.eqs {
         mask |= (1 << a) | (1 << b);
     }
-    if !ctx.opt.selective_columns {
-        mask = ALL_COLS;
-    }
     let mut last = None;
     let mut last_span: Option<(usize, (usize, usize))> = None;
     // the segments of the current block that the ranges so far read
@@ -1287,9 +1284,6 @@ fn read_ranges(
     for &(a, b) in rule.eqs {
         mask |= (1 << a) | (1 << b);
     }
-    if !ctx.opt.selective_columns {
-        mask = ALL_COLS;
-    }
     let width: usize = cols.iter().map(Vec::len).sum::<usize>().max(1);
     let total = |out: &[Table]| out.iter().map(Table::len).sum::<usize>();
     let push = |k: &Key, r: usize, last: &mut Option<(usize, Key)>, out: &mut [Table]| {
@@ -1406,9 +1400,6 @@ fn read_ranges_gallop(
     }
     for &(a, b) in rule.eqs {
         mask |= (1 << a) | (1 << b);
-    }
-    if !ctx.opt.selective_columns {
-        mask = ALL_COLS;
     }
     let idx = ctx.snap.perm(perm);
     let metas = &idx.blocks;
@@ -2084,6 +2075,7 @@ fn combine(
 #[cfg(test)]
 mod prefetch_tests {
     use super::*;
+    use crate::index::ALL_COLS;
     use crate::store::{Store, StoreOptions};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};

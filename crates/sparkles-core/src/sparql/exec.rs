@@ -978,11 +978,11 @@ fn run_node(
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => t.clone(),
         Kind::Scan(spec) => {
-            note = column_note(ctx, spec);
+            note = column_note(spec);
             scan(ctx, spec, &n.vars)?
         }
         Kind::RangeScan(spec, range) => {
-            note = column_note(ctx, spec);
+            note = column_note(spec);
             range_scan(ctx, spec, range, &n.vars)?
         }
         Kind::OrderedTopK(spec) => match ordered_topk(ctx, spec, &n.vars)? {
@@ -1611,7 +1611,7 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
         ranges: &[(Key, Key)],
     ) -> Vec<(usize, ColMask, Key, Key)> {
         let index = ctx.snap.perm(spec.perm);
-        let scan = scan_mask(ctx, spec);
+        let scan = scan_mask(spec);
         let mut out: Vec<(usize, ColMask, Key, Key)> = Vec::new();
         for range in ranges {
             let (b0, b1) = index.key_block_range(&range.0, &range.1);
@@ -1661,7 +1661,7 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
             // a warm scan costs this one probe, before any other block is listed
             let first = ranges.iter().find_map(|r| {
                 let (b0, b1) = index.key_block_range(&r.0, &r.1);
-                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0), r))
+                (b0 < b1).then(|| (b0, wanted(index, scan_mask(spec), r, b0), r))
             });
             if let Some((b, mask, r)) = first
                 && !index.range_cached(&ctx.snap.cache, b, &r.0, &r.1, mask)
@@ -1683,10 +1683,7 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
 
 /// Key columns a scan reads: its variables, the graph (unless every graph passes) and
 /// the repeated-variable columns. The others are never decoded for whole blocks.
-pub(super) fn scan_mask(ctx: &Ctx, spec: &ScanSpec) -> crate::index::ColMask {
-    if !ctx.opt.selective_columns {
-        return crate::index::ALL_COLS;
-    }
+pub(super) fn scan_mask(spec: &ScanSpec) -> crate::index::ColMask {
     let mut m: crate::index::ColMask = 0;
     for &(c, _) in &spec.cols {
         m |= 1 << c;
@@ -1701,8 +1698,8 @@ pub(super) fn scan_mask(ctx: &Ctx, spec: &ScanSpec) -> crate::index::ColMask {
 }
 
 /// EXPLAIN note naming the key columns a scan decodes, when it skips any.
-fn column_note(ctx: &Ctx, spec: &ScanSpec) -> Option<String> {
-    let m = scan_mask(ctx, spec);
+fn column_note(spec: &ScanSpec) -> Option<String> {
+    let m = scan_mask(spec);
     (m != crate::index::ALL_COLS).then(|| {
         let names: Vec<&str> = (0..4)
             .filter(|c| m & (1 << c) != 0)
@@ -1787,8 +1784,8 @@ pub(super) fn run_end(col: &[Id], i: usize) -> usize {
 /// Key columns read for the runs of a scan's first free column: that column and the
 /// columns of the graph filter and repeated-variable checks, or every variable column
 /// when duplicates across graphs are dropped (rows are compared on all of them).
-fn run_mask(ctx: &Ctx, spec: &ScanSpec) -> crate::index::ColMask {
-    let all = scan_mask(ctx, spec);
+fn run_mask(spec: &ScanSpec) -> crate::index::ColMask {
+    let all = scan_mask(spec);
     if spec.dedup || all == crate::index::ALL_COLS {
         return all;
     }
@@ -1880,7 +1877,7 @@ pub(super) fn key_ranges(
     let Some(prefixes) = kf.and_then(|k| k.key_prefixes()) else {
         return vec![whole_range(spec)];
     };
-    if !ctx.opt.filter_key_ranges || spec.cols.first().map(|x| x.0) != Some(c) || c >= 4 {
+    if spec.cols.first().map(|x| x.0) != Some(c) || c >= 4 {
         return vec![whole_range(spec)];
     }
     let vocab = &ctx.snap.generation.vocab;
@@ -1952,84 +1949,80 @@ fn par_count_on_keys(
     } else {
         PIECE
     };
-    let parts = ctx.snap.par_blocks_in_ranges(
-        spec.perm,
-        ranges,
-        run_mask(ctx, spec),
-        piece,
-        |b, s, e| {
-            let _scratch = if ctx.is_cursor() {
-                Some(ctx.charge((e - s) as u64 * 48 + 1024)?)
-            } else {
-                None
-            };
-            let mut out = KeyCount {
-                _cursor_charge: ctx.retained_charge((e - s) as u64 * 32 + 256)?,
-                ..Default::default()
-            };
-            // Reserve required work before optional worker-local regex caches.
-            let kf = kf.clone();
-            let (mut ids, mut counts): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
-            block_runs(spec, b, s, e, |k, n| {
-                if Id(k).tag() == crate::id::Tag::Vocab {
-                    ids.push(Id(k).payload());
-                    counts.push(n);
+    let parts =
+        ctx.snap
+            .par_blocks_in_ranges(spec.perm, ranges, run_mask(spec), piece, |b, s, e| {
+                let _scratch = if ctx.is_cursor() {
+                    Some(ctx.charge((e - s) as u64 * 48 + 1024)?)
                 } else {
-                    out.other.push((Id(k), n));
-                }
-            });
-            let mut pass = vec![false; ids.len()];
-            let mut j = 0;
-            let mut test = |p, key: &[u8]| {
-                while ids[j] != p {
-                    j += 1;
-                }
-                pass[j] = kf.test(key);
-            };
-            if ctx.is_cursor() {
-                let scratch = ctx.charge(0)?;
-                let mut reserved = 0;
-                let mut tested = 0usize;
-                vocab.get_sorted_checked(
-                    &ids,
-                    |need| {
-                        ctx.check()?;
-                        let bytes = (need as u64).saturating_mul(2);
-                        scratch.add(bytes.saturating_sub(reserved))?;
-                        reserved = bytes;
-                        Ok::<(), Error>(())
-                    },
-                    |p, key| {
-                        test(p, key);
-                        tested += 1;
-                        if tested.is_multiple_of(1024) {
+                    None
+                };
+                let mut out = KeyCount {
+                    _cursor_charge: ctx.retained_charge((e - s) as u64 * 32 + 256)?,
+                    ..Default::default()
+                };
+                // Reserve required work before optional worker-local regex caches.
+                let kf = kf.clone();
+                let (mut ids, mut counts): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+                block_runs(spec, b, s, e, |k, n| {
+                    if Id(k).tag() == crate::id::Tag::Vocab {
+                        ids.push(Id(k).payload());
+                        counts.push(n);
+                    } else {
+                        out.other.push((Id(k), n));
+                    }
+                });
+                let mut pass = vec![false; ids.len()];
+                let mut j = 0;
+                let mut test = |p, key: &[u8]| {
+                    while ids[j] != p {
+                        j += 1;
+                    }
+                    pass[j] = kf.test(key);
+                };
+                if ctx.is_cursor() {
+                    let scratch = ctx.charge(0)?;
+                    let mut reserved = 0;
+                    let mut tested = 0usize;
+                    vocab.get_sorted_checked(
+                        &ids,
+                        |need| {
                             ctx.check()?;
-                        }
-                        Ok::<(), Error>(())
-                    },
-                )?;
-            } else {
-                vocab.get_sorted(&ids, test);
-            }
-            for (h, n) in pass.iter().zip(&counts) {
-                if *h {
-                    out.rows += n;
-                    out.passed += 1;
+                            let bytes = (need as u64).saturating_mul(2);
+                            scratch.add(bytes.saturating_sub(reserved))?;
+                            reserved = bytes;
+                            Ok::<(), Error>(())
+                        },
+                        |p, key| {
+                            test(p, key);
+                            tested += 1;
+                            if tested.is_multiple_of(1024) {
+                                ctx.check()?;
+                            }
+                            Ok::<(), Error>(())
+                        },
+                    )?;
+                } else {
+                    vocab.get_sorted(&ids, test);
                 }
-            }
-            out.tested = ids.len() as u64;
-            let raw = |i: usize| Id::vocab(ids[i]).0;
-            if !ids.is_empty() {
-                out.first = Some((raw(0), pass[0]));
-                out.last = Some((raw(ids.len() - 1), pass[ids.len() - 1]));
-            }
-            ctx.check()?;
-            if let Some(charge) = &mut out._cursor_charge {
-                charge.resize(out.other.capacity() as u64 * 16 + 256)?;
-            }
-            Ok(out)
-        },
-    )?;
+                for (h, n) in pass.iter().zip(&counts) {
+                    if *h {
+                        out.rows += n;
+                        out.passed += 1;
+                    }
+                }
+                out.tested = ids.len() as u64;
+                let raw = |i: usize| Id::vocab(ids[i]).0;
+                if !ids.is_empty() {
+                    out.first = Some((raw(0), pass[0]));
+                    out.last = Some((raw(ids.len() - 1), pass[ids.len() - 1]));
+                }
+                ctx.check()?;
+                if let Some(charge) = &mut out._cursor_charge {
+                    charge.resize(out.other.capacity() as u64 * 16 + 256)?;
+                }
+                Ok(out)
+            })?;
     let Some(parts) = parts else {
         return Ok(None);
     };
@@ -2156,60 +2149,56 @@ fn filter_scan_runs(
     drop(counts);
     let passed = hit.iter().filter(|h| **h).count();
     let width = spec.cols.len();
-    let parts = ctx.snap.par_blocks_in_ranges(
-        spec.perm,
-        &ranges,
-        scan_mask(ctx, spec),
-        PIECE,
-        |b, s, e| {
-            let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
-            if s >= e {
-                return Ok(cols);
-            }
-            let col = &b.cols[kc];
-            // the block's values among the runs, and whether any of them passed
-            let j0 = keys.partition_point(|k| k.0 < col[s]);
-            let j1 = keys.partition_point(|k| k.0 <= col[e - 1]);
-            if !hit[j0..j1].iter().any(|h| *h) {
-                return Ok(cols);
-            }
-            let mut j = j0;
-            if block_passes(spec, b, s, e) {
-                let mut i = s;
-                while i < e {
-                    let run = run_len(&col[i..e], col[i]);
-                    while keys[j].0 < col[i] {
-                        j += 1;
-                    }
-                    if hit[j] {
-                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
-                            cols[c].extend(b.cols[kc][i..i + run].iter().map(|&x| Id(x)));
-                        }
-                    }
-                    i += run;
+    let parts =
+        ctx.snap
+            .par_blocks_in_ranges(spec.perm, &ranges, scan_mask(spec), PIECE, |b, s, e| {
+                let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
+                if s >= e {
+                    return Ok(cols);
                 }
-            } else {
-                for i in s..e {
-                    let k = b.key(i);
-                    if !spec.graph.accepts(k[spec.graph_col])
-                        || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
-                    {
-                        continue;
+                let col = &b.cols[kc];
+                // the block's values among the runs, and whether any of them passed
+                let j0 = keys.partition_point(|k| k.0 < col[s]);
+                let j1 = keys.partition_point(|k| k.0 <= col[e - 1]);
+                if !hit[j0..j1].iter().any(|h| *h) {
+                    return Ok(cols);
+                }
+                let mut j = j0;
+                if block_passes(spec, b, s, e) {
+                    let mut i = s;
+                    while i < e {
+                        let run = run_len(&col[i..e], col[i]);
+                        while keys[j].0 < col[i] {
+                            j += 1;
+                        }
+                        if hit[j] {
+                            for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                                cols[c].extend(b.cols[kc][i..i + run].iter().map(|&x| Id(x)));
+                            }
+                        }
+                        i += run;
                     }
-                    while keys[j].0 < k[kc] {
-                        j += 1;
-                    }
-                    if hit[j] {
-                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
-                            cols[c].push(Id(k[kc]));
+                } else {
+                    for i in s..e {
+                        let k = b.key(i);
+                        if !spec.graph.accepts(k[spec.graph_col])
+                            || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
+                        {
+                            continue;
+                        }
+                        while keys[j].0 < k[kc] {
+                            j += 1;
+                        }
+                        if hit[j] {
+                            for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                                cols[c].push(Id(k[kc]));
+                            }
                         }
                     }
                 }
-            }
-            ctx.check()?;
-            Ok(cols)
-        },
-    )?;
+                ctx.check()?;
+                Ok(cols)
+            })?;
     let Some(parts) = parts else {
         return Ok(None);
     };
@@ -2284,105 +2273,101 @@ pub(super) fn filter_scan_morsel(
     let kc = spec.cols[0].0;
     let vocab = &ctx.snap.generation.vocab;
     let width = cols.len();
-    let parts = ctx.snap.par_blocks_in_ranges(
-        spec.perm,
-        ranges,
-        scan_mask(ctx, spec),
-        PIECE,
-        |b, s, e| {
-            let mut out: MorselPart = vec![Vec::new(); width];
-            if s >= e {
-                return Ok((out, 0));
-            }
-            // The rows of the piece that pass the scan's graph filter and repeated
-            // variable checks, when not all of them do.
-            let sel: Option<Vec<u32>> = (!block_passes(spec, b, s, e)).then(|| {
-                (s..e)
-                    .filter(|&i| {
-                        let k = b.key(i);
-                        spec.graph.accepts(k[spec.graph_col])
-                            && spec.eqs.iter().all(|&(x, y)| k[x] == k[y])
-                    })
-                    .map(|i| i as u32)
-                    .collect()
-            });
-            let col = &b.cols[kc];
-            let n = sel.as_ref().map_or(e - s, Vec::len);
-            let row = |j: usize| sel.as_ref().map_or(s + j, |v| v[j] as usize);
-            let _scratch = ctx.charge((n as u64).saturating_mul(24).saturating_add(1024))?;
-            // The distinct values of the sorted column, in order. Raw ids sort by tag, so
-            // the base-vocabulary values are one stretch of them.
-            let mut values: Vec<u64> = Vec::new();
-            for j in 0..n {
-                let v = col[row(j)];
-                if values.last() != Some(&v) {
-                    values.push(v);
+    let parts =
+        ctx.snap
+            .par_blocks_in_ranges(spec.perm, ranges, scan_mask(spec), PIECE, |b, s, e| {
+                let mut out: MorselPart = vec![Vec::new(); width];
+                if s >= e {
+                    return Ok((out, 0));
                 }
-            }
-            let lo = values.partition_point(|&v| Id(v).tag() < Tag::Vocab);
-            let hi = lo + values[lo..].partition_point(|&v| Id(v).tag() == Tag::Vocab);
-            let payloads: Vec<u64> = values[lo..hi].iter().map(|&v| Id(v).payload()).collect();
-            let mut pass = vec![false; values.len()];
-            // A copy of the filter per task: tasks sharing a regular expression contend
-            // for its match caches. The copies are kept for later tasks, whose regular
-            // expressions then start with warm caches.
-            let kf = filters.lock().pop().unwrap_or_else(|| kf.clone());
-            let scratch = ctx.charge(0)?;
-            let mut reserved = 0;
-            let mut at = 0;
-            vocab.get_sorted_checked(
-                &payloads,
-                |need| {
-                    ctx.check()?;
-                    let bytes = (need as u64).saturating_mul(2);
-                    scratch.add(bytes.saturating_sub(reserved))?;
-                    reserved = bytes;
-                    Ok::<(), Error>(())
-                },
-                |p, k| {
-                    while payloads[at] != p {
-                        at += 1;
+                // The rows of the piece that pass the scan's graph filter and repeated
+                // variable checks, when not all of them do.
+                let sel: Option<Vec<u32>> = (!block_passes(spec, b, s, e)).then(|| {
+                    (s..e)
+                        .filter(|&i| {
+                            let k = b.key(i);
+                            spec.graph.accepts(k[spec.graph_col])
+                                && spec.eqs.iter().all(|&(x, y)| k[x] == k[y])
+                        })
+                        .map(|i| i as u32)
+                        .collect()
+                });
+                let col = &b.cols[kc];
+                let n = sel.as_ref().map_or(e - s, Vec::len);
+                let row = |j: usize| sel.as_ref().map_or(s + j, |v| v[j] as usize);
+                let _scratch = ctx.charge((n as u64).saturating_mul(24).saturating_add(1024))?;
+                // The distinct values of the sorted column, in order. Raw ids sort by tag, so
+                // the base-vocabulary values are one stretch of them.
+                let mut values: Vec<u64> = Vec::new();
+                for j in 0..n {
+                    let v = col[row(j)];
+                    if values.last() != Some(&v) {
+                        values.push(v);
                     }
-                    pass[lo + at] = kf.test(k);
-                    Ok::<(), Error>(())
-                },
-            )?;
-            drop(payloads);
-            filters.lock().push(kf);
-            if lo > 0 || hi < values.len() {
-                let other: Vec<Id> = values[..lo]
-                    .iter()
-                    .chain(&values[hi..])
-                    .map(|&v| Id(v))
-                    .collect();
-                let (hit, _) = super::exprcache::filter_values(ctx, &other, key, on_key)?;
-                for (i, h) in (0..lo).chain(hi..values.len()).zip(hit) {
-                    pass[i] = h;
                 }
-            }
-            // The passing rows, gathered without a branch per row, then each column.
-            let mut at: Vec<u32> = vec![0; n];
-            let mut w = 0;
-            let mut k = 0;
-            for j in 0..n {
-                let i = row(j);
-                if col[i] != values[k] {
-                    k += 1;
+                let lo = values.partition_point(|&v| Id(v).tag() < Tag::Vocab);
+                let hi = lo + values[lo..].partition_point(|&v| Id(v).tag() == Tag::Vocab);
+                let payloads: Vec<u64> = values[lo..hi].iter().map(|&v| Id(v).payload()).collect();
+                let mut pass = vec![false; values.len()];
+                // A copy of the filter per task: tasks sharing a regular expression contend
+                // for its match caches. The copies are kept for later tasks, whose regular
+                // expressions then start with warm caches.
+                let kf = filters.lock().pop().unwrap_or_else(|| kf.clone());
+                let scratch = ctx.charge(0)?;
+                let mut reserved = 0;
+                let mut at = 0;
+                vocab.get_sorted_checked(
+                    &payloads,
+                    |need| {
+                        ctx.check()?;
+                        let bytes = (need as u64).saturating_mul(2);
+                        scratch.add(bytes.saturating_sub(reserved))?;
+                        reserved = bytes;
+                        Ok::<(), Error>(())
+                    },
+                    |p, k| {
+                        while payloads[at] != p {
+                            at += 1;
+                        }
+                        pass[lo + at] = kf.test(k);
+                        Ok::<(), Error>(())
+                    },
+                )?;
+                drop(payloads);
+                filters.lock().push(kf);
+                if lo > 0 || hi < values.len() {
+                    let other: Vec<Id> = values[..lo]
+                        .iter()
+                        .chain(&values[hi..])
+                        .map(|&v| Id(v))
+                        .collect();
+                    let (hit, _) = super::exprcache::filter_values(ctx, &other, key, on_key)?;
+                    for (i, h) in (0..lo).chain(hi..values.len()).zip(hit) {
+                        pass[i] = h;
+                    }
                 }
-                at[w] = i as u32;
-                w += usize::from(pass[k]);
-            }
-            at.truncate(w);
-            if w > 0 {
-                for (to, &from) in out.iter_mut().zip(cols) {
-                    let column = &b.cols[from];
-                    to.extend(at.iter().map(|&i| Id(column[i as usize])));
+                // The passing rows, gathered without a branch per row, then each column.
+                let mut at: Vec<u32> = vec![0; n];
+                let mut w = 0;
+                let mut k = 0;
+                for j in 0..n {
+                    let i = row(j);
+                    if col[i] != values[k] {
+                        k += 1;
+                    }
+                    at[w] = i as u32;
+                    w += usize::from(pass[k]);
                 }
-            }
-            ctx.check()?;
-            Ok((out, n as u64))
-        },
-    )?;
+                at.truncate(w);
+                if w > 0 {
+                    for (to, &from) in out.iter_mut().zip(cols) {
+                        let column = &b.cols[from];
+                        to.extend(at.iter().map(|&i| Id(column[i as usize])));
+                    }
+                }
+                ctx.check()?;
+                Ok((out, n as u64))
+            })?;
     Ok(parts.map(|parts| {
         let read = parts.iter().map(|p| p.1).sum();
         (
@@ -2407,22 +2392,18 @@ fn par_key_runs(
     if spec.dedup {
         return Ok(None);
     }
-    let parts = ctx.snap.par_blocks_in_ranges(
-        spec.perm,
-        ranges,
-        run_mask(ctx, spec),
-        PIECE,
-        |b, s, e| {
-            let mut keys: Vec<Id> = Vec::new();
-            let mut counts: Vec<u64> = Vec::new();
-            block_runs(spec, b, s, e, |k, n| {
-                keys.push(Id(k));
-                counts.push(n);
-            });
-            ctx.check()?;
-            Ok((keys, counts))
-        },
-    )?;
+    let parts =
+        ctx.snap
+            .par_blocks_in_ranges(spec.perm, ranges, run_mask(spec), PIECE, |b, s, e| {
+                let mut keys: Vec<Id> = Vec::new();
+                let mut counts: Vec<u64> = Vec::new();
+                block_runs(spec, b, s, e, |k, n| {
+                    keys.push(Id(k));
+                    counts.push(n);
+                });
+                ctx.check()?;
+                Ok((keys, counts))
+            })?;
     let Some(parts) = parts else {
         return Ok(None);
     };
@@ -2468,7 +2449,7 @@ fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
     let mut last: Option<[u64; 4]> = None;
     let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     ctx.snap
-        .scan_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |chunk| {
+        .scan_between_cols(spec.perm, lo, hi, run_mask(spec), |chunk| {
             let mut row = |k: &[u64; 4]| {
                 if !spec.graph.accepts(k[spec.graph_col])
                     || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
@@ -2529,7 +2510,7 @@ fn count_distinct_scan(ctx: &Ctx, spec: &ScanSpec) -> Result<u64> {
     let mut last: Option<u64> = None;
     let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     ctx.snap
-        .scan_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |chunk| {
+        .scan_between_cols(spec.perm, lo, hi, run_mask(spec), |chunk| {
             let mut row = |k: &[u64; 4]| {
                 if spec.graph.accepts(k[spec.graph_col])
                     && spec.eqs.iter().all(|&(a, b)| k[a] == k[b])
@@ -3936,7 +3917,7 @@ fn scan_into(
         t.len += 1;
     };
     ctx.snap
-        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+        .scan_between_cols(spec.perm, lo, hi, scan_mask(spec), |chunk| {
             if t.len >= limit {
                 truncated = true;
                 return Ok(false);
@@ -4329,111 +4310,66 @@ fn join_pairs(
             pairs.push((i as u32, j as u32));
         }
     };
-    if ctx.opt.flat_hash_join {
-        let groups = KeyGroups::build(ctx, bt, &bcols)?;
-        let single = bcols.len() == 1;
-        // with several key columns the table is keyed by a hash of them, so a key's
-        // rows can include rows of other keys with the same hash
-        let same = |bi: usize, pi: usize| {
-            single
-                || bcols
-                    .iter()
-                    .zip(&pcols)
-                    .all(|(&b, &p)| bt.cols[b][bi] == pt.cols[p][pi])
-        };
-        // the pairs of the probe rows `[s, e)`, in probe order; `total` counts the pairs
-        // of all pieces for the output limits
-        let total = AtomicUsize::new(0);
-        let pcol = single.then(|| &pt.cols[pcols[0]]);
-        let piece = |s: usize, e: usize| -> Result<Vec<(u32, u32)>> {
-            let mut out = Vec::new();
-            let mut counted = 0;
-            for pi in s..e {
-                if (pi - s) % 4096 == 4095 {
-                    let n = out.len() - counted;
-                    counted = out.len();
-                    let all = total.fetch_add(n, AtomicOrdering::Relaxed) + n;
-                    ctx.check()?;
-                    ctx.check_output(all, w)?;
-                }
-                let k = match pcol {
-                    Some(c) => c[pi].0,
-                    None => KeyGroups::key_of(pt, &pcols, pi),
-                };
-                let m = groups.rows(k);
-                if m.len() > 1024 {
-                    let all = total.load(AtomicOrdering::Relaxed);
-                    ctx.check_output(all.saturating_add(out.len() - counted + m.len()), w)?;
-                }
-                for &bi in m {
-                    if same(bi as usize, pi) {
-                        emit(bi as usize, pi, &mut out);
-                    }
-                }
-            }
-            total.fetch_add(out.len() - counted, AtomicOrdering::Relaxed);
-            Ok(out)
-        };
-        let n = pt.len();
-        if n < 2 * PROBE_PIECE {
-            pairs = piece(0, n)?;
-        } else {
-            let parts: Vec<Vec<(u32, u32)>> = (0..n.div_ceil(PROBE_PIECE))
-                .into_par_iter()
-                .map(|p| piece(p * PROBE_PIECE, ((p + 1) * PROBE_PIECE).min(n)))
-                .collect::<Result<_>>()?;
-            ctx.check_output(parts.iter().map(Vec::len).sum(), w)?;
-            pairs = parts.concat();
-        }
-        *note = Some(format!(
-            "[flat hash table: {} keys in {} parts]",
-            groups.len(),
-            groups.parts.len()
-        ));
-    } else if bcols.len() == 1 {
-        let mut map: FxHashMap<Id, Vec<u32>> = FxHashMap::default();
-        for (i, v) in bt.cols[bcols[0]].iter().enumerate() {
-            map.entry(*v).or_default().push(i as u32);
-        }
-        for (pi, v) in pt.cols[pcols[0]].iter().enumerate() {
-            if pi % 65536 == 0 {
+    let groups = KeyGroups::build(ctx, bt, &bcols)?;
+    let single = bcols.len() == 1;
+    // with several key columns the table is keyed by a hash of them, so a key's
+    // rows can include rows of other keys with the same hash
+    let same = |bi: usize, pi: usize| {
+        single
+            || bcols
+                .iter()
+                .zip(&pcols)
+                .all(|(&b, &p)| bt.cols[b][bi] == pt.cols[p][pi])
+    };
+    // the pairs of the probe rows `[s, e)`, in probe order; `total` counts the pairs
+    // of all pieces for the output limits
+    let total = AtomicUsize::new(0);
+    let pcol = single.then(|| &pt.cols[pcols[0]]);
+    let piece = |s: usize, e: usize| -> Result<Vec<(u32, u32)>> {
+        let mut out = Vec::new();
+        let mut counted = 0;
+        for pi in s..e {
+            if (pi - s) % 4096 == 4095 {
+                let n = out.len() - counted;
+                counted = out.len();
+                let all = total.fetch_add(n, AtomicOrdering::Relaxed) + n;
                 ctx.check()?;
-                ctx.check_output(pairs.len(), w)?;
+                ctx.check_output(all, w)?;
             }
-            if let Some(m) = map.get(v) {
-                if m.len() > 1024 {
-                    ctx.check_output(pairs.len().saturating_add(m.len()), w)?;
-                }
-                for &bi in m {
-                    emit(bi as usize, pi, &mut pairs);
+            let k = match pcol {
+                Some(c) => c[pi].0,
+                None => KeyGroups::key_of(pt, &pcols, pi),
+            };
+            let m = groups.rows(k);
+            if m.len() > 1024 {
+                let all = total.load(AtomicOrdering::Relaxed);
+                ctx.check_output(all.saturating_add(out.len() - counted + m.len()), w)?;
+            }
+            for &bi in m {
+                if same(bi as usize, pi) {
+                    emit(bi as usize, pi, &mut out);
                 }
             }
         }
+        total.fetch_add(out.len() - counted, AtomicOrdering::Relaxed);
+        Ok(out)
+    };
+    let n = pt.len();
+    if n < 2 * PROBE_PIECE {
+        pairs = piece(0, n)?;
     } else {
-        let mut map: FxHashMap<Vec<Id>, Vec<u32>> = FxHashMap::default();
-        for i in 0..bt.len() {
-            map.entry(bcols.iter().map(|&c| bt.cols[c][i]).collect())
-                .or_default()
-                .push(i as u32);
-        }
-        let mut key = Vec::with_capacity(pcols.len());
-        for pi in 0..pt.len() {
-            if pi % 65536 == 0 {
-                ctx.check()?;
-                ctx.check_output(pairs.len(), w)?;
-            }
-            key.clear();
-            key.extend(pcols.iter().map(|&c| pt.cols[c][pi]));
-            if let Some(m) = map.get(&key) {
-                if m.len() > 1024 {
-                    ctx.check_output(pairs.len().saturating_add(m.len()), w)?;
-                }
-                for &bi in m {
-                    emit(bi as usize, pi, &mut pairs);
-                }
-            }
-        }
+        let parts: Vec<Vec<(u32, u32)>> = (0..n.div_ceil(PROBE_PIECE))
+            .into_par_iter()
+            .map(|p| piece(p * PROBE_PIECE, ((p + 1) * PROBE_PIECE).min(n)))
+            .collect::<Result<_>>()?;
+        ctx.check_output(parts.iter().map(Vec::len).sum(), w)?;
+        pairs = parts.concat();
     }
+    *note = Some(format!(
+        "[flat hash table: {} keys in {} parts]",
+        groups.len(),
+        groups.parts.len()
+    ));
     Ok(pairs)
 }
 
@@ -7209,11 +7145,7 @@ impl Graph<'_> {
             perm,
             [p, first, 0, 0],
             [p, last, u64::MAX, u64::MAX],
-            if self.ctx.opt.selective_columns {
-                (1 << 1) | (1 << 2) | (1 << gc)
-            } else {
-                crate::index::ALL_COLS
-            },
+            (1 << 1) | (1 << 2) | (1 << gc),
             |c| {
                 match c {
                     Chunk::Block(b, s, e) => {
@@ -7260,11 +7192,7 @@ impl Graph<'_> {
             let perm = if dir { Perm::Pso } else { Perm::Pos };
             let gc = perm.col_of(crate::index::G);
             let mut out = Vec::new();
-            let mask = if self.ctx.opt.selective_columns {
-                (1 << 2) | (1 << gc)
-            } else {
-                crate::index::ALL_COLS
-            };
+            let mask = (1 << 2) | (1 << gc);
             let (lo, hi) = (pad(&[p, x], 0), pad(&[p, x], u64::MAX));
             self.ctx.snap.scan_between_cols(perm, lo, hi, mask, |c| {
                 match c {

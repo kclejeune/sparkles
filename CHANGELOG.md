@@ -655,6 +655,12 @@ about the name as it does about any unknown one. A group of up to 12 inputs that
 more than 128 variables now keeps the greedy plan instead of the exhaustive program's
 (X14, item 475).
 
+The optimization switches `flat_hash_join`, `selective_columns`, `delta_statistics`,
+`filter_key_ranges` and `filter_id_ranges` are gone, and their optimizations always
+apply. `SPARKLES_DISABLE_OPTIMIZATIONS` warns about these names, and
+`Optimizations::NONE` now uses the flat hash table, selective column decoding, the
+corrected statistics and the key ranges of a fixed string start (X14, item 476).
+
 ### Fixed
 
 A PDF converted in a child process no longer fails with "the converter stopped on it"

@@ -76,9 +76,7 @@ operator or its cost model changes.
   pattern with a single free subject, predicate or object has a distinct value of it per
   row. Costs are counted in rows read by a scan. A hash join costs 8 of them for each row
   of its smaller input, which goes into the hash table at 3 to 15 ns a row, and one for
-  each row of the larger input that probes it. A scan reads a row in 1.3 to 2.2 ns. With
-  the flat table switched off (`flat_hash_join`), a row of the smaller input costs 48,
-  since the lists per key take 18 to 100 ns a row. Merge joins gallop through skewed
+  each row of the larger input that probes it. A scan reads a row in 1.3 to 2.2 ns. Merge joins gallop through skewed
   inputs. `COUNT(*)` over one pattern comes from index
   metadata. Transitive paths traverse from the bound side, with index lookups per
   frontier node, instead of materializing the closure.
@@ -87,8 +85,10 @@ operator or its cost model changes.
 
 ## Further scan and filter optimizations
 
-Each of these can be switched off per query (`QueryOptions::optimizations`) or per process
-(`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`). EXPLAIN shows which ones ran.
+Each of these that names a switch can be switched off per query
+(`QueryOptions::optimizations`) or per process
+(`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`). The others replaced an earlier
+implementation and always apply. EXPLAIN shows which ones ran.
 
 * **`COUNT(DISTINCT ?v)` from index runs.** Over one triple pattern, the scan switches to a
   permutation sorted on `?v` and counts runs of equal ids (`CountDistinctFromIndex`). No
@@ -185,12 +185,12 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   with it. No single factor fits both. With the new estimates, the median join of both
   datasets is estimated exactly, and the mean error falls from a factor of 1.37 to 1.04
   on the generated data and from 4.2 to 1.6 on WatDiv.
-* **Key ranges for a fixed start** (`filter_key_ranges`). Under a `STRSTARTS`, or a
+* **Key ranges for a fixed start.** Under a `STRSTARTS`, or a
   `REGEX` anchored on a literal start (`^abc` with no flag other than `s` and no
   alternation), the two operators above read only the base-vocabulary ids of the keys
   with that start: literals for `?v`, literals and IRIs for `STR(?v)`. Ids outside the
   base vocabulary (inline values and terms added by updates) are still read and tested.
-* **Id ranges for a fixed start** (`filter_id_ranges`). The same starts restrict the other
+* **Id ranges for a fixed start.** The same starts restrict the other
   places that test such a filter on vocabulary keys. A FILTER over the rows of a join
   fails the base-vocabulary ids outside the ranges without reading their keys, and reads
   only the keys of the ids inside them, which lie together in the vocabulary. The planner
@@ -298,8 +298,7 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   it. The planner uses the statistics when one probe per changed value costs less than
   reading the scan. The corrected counts are kept with the snapshot, so later queries at
   the same commit reuse them. EXPLAIN notes `[from statistics, corrected for N delta
-  quads]` or `[from statistics, without N quads of graphs not read]`. The
-  `delta_statistics` switch limits the statistics to a store without a delta.
+  quads]` or `[from statistics, without N quads of graphs not read]`.
 * **Batched path frontiers.** `p*` and `p+` traversals expand a large BFS level with one
   merged pass over the predicate's index rows instead of a seek per node.
 * **Selective column decoding.** The block cache holds decoded columns, and scans decode
@@ -387,7 +386,7 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   `?author = ?author2`. At 10M triples the product has 1.58 × 10¹² rows, while the
   candidate pairs number 7.4 million. EXPLAIN notes `[keyed on ?a = ?b: N
   candidate pairs]`.
-* **Flat hash joins** (`flat_hash_join`). A hash join groups the rows of its smaller input
+* **Flat hash joins.** A hash join groups the rows of its smaller input
   by key in flat arrays instead of a list per key. It counts each key's rows and then
   places every row, so the rows of a key are one span of an array, in row order. An input
   of 64K rows or more is first split into partitions of about 8K rows by bits of a hash

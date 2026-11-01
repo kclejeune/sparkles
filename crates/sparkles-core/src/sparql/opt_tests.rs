@@ -1630,31 +1630,17 @@ fn scans_decode_only_the_columns_they_read() {
             "",
         ),
     ];
-    let without = Optimizations {
-        selective_columns: false,
-        ..Optimizations::ALL
-    };
-    let (a, b) = (build(), build());
+    let a = build();
     for (q, note) in queries {
         let fast = run(&a, q, Optimizations::ALL);
         if !note.is_empty() {
             assert!(has_desc(&fast.plan, note), "{q}: {:#?}", fast.plan);
         }
     }
-    // the same work on a second store with whole blocks caches more bytes
-    for (q, _) in queries {
-        run(&b, q, without);
-    }
-    assert!(
-        a.cache().bytes() < b.cache().bytes(),
-        "{} vs {}",
-        a.cache().bytes(),
-        b.cache().bytes()
-    );
     for (q, _) in queries {
         assert_eq!(
             solutions(&run(&a, q, Optimizations::ALL)),
-            solutions(&run(&a, q, without)),
+            solutions(&run(&a, q, Optimizations::NONE)),
             "{q}"
         );
     }
@@ -1666,7 +1652,7 @@ fn scans_decode_only_the_columns_they_read() {
     for (q, _) in queries {
         assert_eq!(
             solutions(&run(&a, q, Optimizations::ALL)),
-            solutions(&run(&a, q, without)),
+            solutions(&run(&a, q, Optimizations::NONE)),
             "{q}"
         );
     }

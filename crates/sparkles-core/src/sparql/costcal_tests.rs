@@ -390,15 +390,12 @@ fn cal_drives() {
 
 /// Hash joins, merge joins, left joins and sorts of generated tables: a probe side of `p`
 /// rows with distinct keys and a build side of `b` of those keys (so `b` output rows),
-/// timed apart from any scan. Hash joins run with the flat table (`hash`, `left`) and with
-/// a list per key (`hashlists`, `leftlists`).
+/// timed apart from any scan. Hash joins run with the flat table (`hash`, `left`).
 #[test]
 #[ignore]
 fn cal_tables() {
     let s = Store::in_memory(StoreOptions::default());
     let ctx = Ctx::new(s.snapshot());
-    let mut lists = Ctx::new(s.snapshot());
-    lists.opt.flat_hash_join = false;
     let mut x = 0x2545_f491_4f6c_dd1du64;
     let mut next = move || {
         x ^= x << 13;
@@ -437,14 +434,8 @@ fn cal_tables() {
             let hash = time(&mut || {
                 super::exec::join_tables(&ctx, &probe, &build, &[0], false).unwrap();
             });
-            let hashlists = time(&mut || {
-                super::exec::join_tables(&lists, &probe, &build, &[0], false).unwrap();
-            });
             let left = time(&mut || {
                 super::exec::left_join(&ctx, &probe, &build, None, &mut None).unwrap();
-            });
-            let leftlists = time(&mut || {
-                super::exec::left_join(&lists, &probe, &build, None, &mut None).unwrap();
             });
             let mut sorted_build = build.clone();
             sorted_build.sort_by_vars(&[0]);
@@ -462,9 +453,7 @@ fn cal_tables() {
                 .unwrap()
                 .len();
             println!("T\thash\t{b}\t{p}\t{out}\t{hash:.4}");
-            println!("T\thashlists\t{b}\t{p}\t{out}\t{hashlists:.4}");
             println!("T\tleft\t{b}\t{p}\t{p}\t{left:.4}");
-            println!("T\tleftlists\t{b}\t{p}\t{p}\t{leftlists:.4}");
             println!("T\tmerge\t{b}\t{p}\t{out}\t{merge:.4}");
             println!("T\tsort\t{b}\t0\t0\t{:.4}", (sort - copy).max(0.0));
         }

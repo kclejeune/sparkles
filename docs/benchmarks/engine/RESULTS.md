@@ -13,7 +13,8 @@ These sections measure single features of the engine, mostly with Sparkles alone
 Executor optimizations can be switched off one at a time with
 `SPARKLES_DISABLE_OPTIMIZATIONS`. This comparison ran the warm 10.5M suite with each of 33
 switches off in turn and once with the defaults, and every configuration passed the answer
-checks. The table lists the changes larger than 25%.
+checks. The table lists the changes larger than 25%. Id ranges for a fixed start can no
+longer be switched off, and the `filter_id_ranges` row records the run before that.
 
 | Feature disabled | Effect at 10.5M |
 |---|---|

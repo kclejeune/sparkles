@@ -3705,11 +3705,8 @@ pub(super) fn join_est_from(a_est: f64, b_est: f64, denom: f64) -> f64 {
     (a_est * b_est / denom * 0.7).max(if a_est > 0.0 && b_est > 0.0 { 1.0 } else { 0.0 })
 }
 
-/// A hash join builds a table of the smaller input, keyed on the join variables, and
-/// probes it with each row of the larger one. With a list allocated per key, inserting a
-/// row takes 40 to 100 ns, about as long as scanning 48 rows.
-const HASH_BUILD_COST: f64 = 48.0;
-/// Inserting a row into the flat table takes 10 to 15 ns on one thread while the table
+/// A hash join builds a flat table of the smaller input, keyed on the join variables,
+/// and probes it with each row of the larger one. Inserting a row into the flat table takes 10 to 15 ns on one thread while the table
 /// fits in the CPU caches, and 3 to 7 ns for a million rows built in partitions in
 /// parallel, where a scan reads a row in 2.2 ns and the lists took 18 to 62 ns (measured
 /// on generated tables by `costcal_tests::cal_tables`). A probe takes about 1.2 ns, in
@@ -3758,11 +3755,7 @@ impl Costing {
     pub fn of(ctx: &Ctx) -> Costing {
         Costing {
             index_joins: ctx.opt.batched_join,
-            hash_build: if ctx.opt.flat_hash_join {
-                FLAT_HASH_BUILD_COST
-            } else {
-                HASH_BUILD_COST
-            },
+            hash_build: FLAT_HASH_BUILD_COST,
         }
     }
 }
@@ -4191,7 +4184,7 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
 /// `key_ranges` in the executor). `None` when the scan reads every row.
 fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
     let o = &ctx.opt;
-    if !(o.filter_id_ranges && o.filter_scan_runs && o.filter_key_ranges) {
+    if !o.filter_scan_runs {
         return None;
     }
     let Kind::Scan(spec) = &n.kind else {
@@ -5351,16 +5344,9 @@ fn statistics(
     est: f64,
     ctx: &Ctx,
 ) -> Option<Arc<super::stats::Counts>> {
-    super::stats::exact_counts(
-        &ctx.snap,
-        k,
-        rdf_type,
-        est.max(0.0) as u64,
-        ctx.opt.delta_statistics,
-        &|| ctx.check(),
-    )
-    .ok()
-    .flatten()
+    super::stats::exact_counts(&ctx.snap, k, rdf_type, est.max(0.0) as u64, &|| ctx.check())
+        .ok()
+        .flatten()
 }
 
 /// A scan description (`PSO ?s <p> ?o`) naming the permutation of a re-targeted scan.

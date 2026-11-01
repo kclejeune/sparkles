@@ -211,3 +211,34 @@ optimization off, a group is now planned on cost summaries as well, where it use
 take the exhaustive program. Default plans change only for groups that share more than
 128 variables, since every other group already took the program on cost summaries or
 its greedy plan.
+
+### Superseded replacement toggles
+
+Item 476 shipped for the switches whose off path served no purpose but the old
+implementation. Five switches are gone with their off paths. Hash joins always build the
+flat table, so the per-key lists and their cost constant are deleted (`flat_hash_join`).
+Scans always decode only the key columns they read (`selective_columns`). Index
+statistics are always corrected for the delta and for unread graphs (`delta_statistics`).
+A filter with a fixed string start always reads only its key ranges and fails the base
+ids outside its id ranges (`filter_key_ranges` and `filter_id_ranges`). Every result was
+already the same with each switch on, which the tests checked, and the tests now compare
+these paths with a nested-loop join, with the statistics switched off and with the
+generic operators.
+
+The other switches stay. The algorithm switches that the merge keeps choose between
+different algorithms for diagnosis. `expr_cache`, `sampled_filters`,
+`decorrelate_exists`, `count_filter_runs`, `filter_scan_runs` and `topk_first_key` are
+switched off at run time for queries that call extensions, so their off paths are live.
+The cost-model switches `sampled_filters`, `characteristic_sets`, `probed_keys` and
+`fused_star_costs` are what the cost calibration harness compares. `grow_input` and
+`decode_ahead` are the memory and latency tradeoffs that the cursor tests measure against
+their off paths, and the sequential writer stays as the path of a single Rayon worker.
+The prefetch and decoding switches of X07 wait for item 4 under item 478. The switches
+that shipped with their measurements in the current release, `probed_optional` and
+`bound_order_keys`, keep their off paths as the baseline of the forge checks.
+`gallop_index_join` chooses between the galloping reader and the clustered reader, which
+are different read paths.
+
+The generic operators of `Optimizations::NONE` remain the oracle of the differential
+tests. The test-only evaluator that follows the SPARQL algebra literally, after which
+the remaining off paths that only tests reach can go, is item NEW-ITEM-1.
