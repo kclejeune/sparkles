@@ -696,6 +696,26 @@ python = "Dataset.mappings.versions"
 jvm = "SparklesMappings.versions"
 node = "Dataset.mappings.versions"
 
+["ontology.axioms"]
+python = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+jvm = "planned: roadmap item NEW-ITEM-1, through jena-ontapi in F21 Phase 2"
+node = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+
+["ontology.check"]
+python = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+jvm = "planned: roadmap item NEW-ITEM-1, through jena-ontapi in F21 Phase 2"
+node = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+
+["ontology.edit"]
+python = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+jvm = "planned: roadmap item NEW-ITEM-1, through jena-ontapi in F21 Phase 2"
+node = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+
+["ontology.summary"]
+python = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+jvm = "planned: roadmap item NEW-ITEM-1, through jena-ontapi in F21 Phase 2"
+node = "planned: roadmap item NEW-ITEM-1, F21 Phase 2"
+
 ["queries.delete"]
 python = "Dataset.queries.delete"
 jvm = "DatasetGraphSparkles.queries().delete"

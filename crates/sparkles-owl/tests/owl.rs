@@ -777,6 +777,47 @@ fn dl_counts_unmapped_triples() {
     assert_profiles(&o, &[], &[(Profile::Dl, "§3")]);
 }
 
+/// spec F21 A5: a universal and a functional property are two EL violations, each
+/// naming its axiom, and both are in RL.
+#[test]
+fn el_names_the_axioms_it_refuses() {
+    let o = strict(&decl(
+        ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:allValuesFrom :B ] .
+         :p a owl:FunctionalProperty .",
+    ));
+    let r = report(&o, Profile::El);
+    let named: Vec<String> = r
+        .violations
+        .iter()
+        .map(|v| v.axiom.as_ref().expect("an axiom").to_string())
+        .collect();
+    assert_eq!(r.violations.len(), 2, "{:?}", rules(&r));
+    assert!(
+        named.iter().any(|a| a.starts_with("SubClassOf(")),
+        "{named:?}"
+    );
+    assert!(
+        named
+            .iter()
+            .any(|a| a.starts_with("FunctionalObjectProperty(")),
+        "{named:?}"
+    );
+    assert_profiles(&o, &[Profile::Rl], &[]);
+}
+
+/// spec F21 A6, without F17: a transitive property takes an ontology out of QL with
+/// one violation.
+#[test]
+fn ql_refuses_one_transitive_property() {
+    let body =
+        ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+         :B rdfs:subClassOf :C .";
+    assert_profiles(&strict(&decl(body)), &[Profile::Ql], &[]);
+    let o = strict(&decl(&format!("{body}\n:p a owl:TransitiveProperty .")));
+    let r = report(&o, Profile::Ql);
+    assert_eq!(r.violations.len(), 1, "{:?}", rules(&r));
+}
+
 #[test]
 fn profile_reports_include_dl_violations() {
     let o = lenient(&decl(":x a owl:ObjectProperty , owl:DatatypeProperty ."));
