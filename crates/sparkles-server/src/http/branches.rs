@@ -881,7 +881,7 @@ fn grants_changing(st: &AppState, ds: &str, old: &str, new: &str) -> Vec<String>
 }
 
 /// `DELETE /$/branches/{ds}/{name}`: delete a branch (`?force=true` with unmerged
-/// commits).
+/// commits, `?releaseHolds=true`, which needs `admin`, while source holds name it).
 pub(crate) async fn delete_branch(
     State(st): St,
     Path((name, branch)): Path<(String, String)>,
@@ -907,8 +907,17 @@ async fn delete_branch_inner(
     let o = sparkles::branch::DeleteOptions {
         force: flag("force"),
         reparent: flag("reparent"),
+        release_holds: flag("releaseHolds"),
     };
     check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
+    // Releasing source holds gives up retained evidence, a retention decision for the
+    // whole dataset: a hold that names this branch can also hold main's commits, so it
+    // takes what the hold routes take.
+    if o.release_holds && !p.admin_everywhere(&name) {
+        return Err(forbidden(format!(
+            "releasing source holds needs admin on every branch and graph of /{name}"
+        )));
+    }
     if branch != MAIN {
         let info = ds.store.branch_info(&branch).ok();
         if info.as_ref().is_some_and(|i| i.protected) {

@@ -104,7 +104,7 @@ fn history(put: &mut dyn FnMut(&str, J)) {
                             "endSeq": int(),
                             "bytes": int(),
                             "current": boolean(),
-                            "heldBy": { "type": "array", "items": string(), "description": "`head`, `snapshot:NAME` or `retention`." },
+                            "heldBy": { "type": "array", "items": string(), "description": "`head`, `snapshot:NAME`, `retention`, `backup:NAME`, `clone:NAME`, `branch:NAME`, `branch-base:NAME` or `source-holds`." },
                         }),
                     )),
                     "retention": retention,

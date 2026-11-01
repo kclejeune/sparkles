@@ -551,6 +551,7 @@ fn cold_nested_origins_follow_renamed_retired_parent_by_identity() {
         &sparkles_core::branch::DeleteOptions {
             force: true,
             reparent: true,
+            release_holds: false,
         },
     )
     .unwrap();

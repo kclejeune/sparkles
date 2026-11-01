@@ -173,7 +173,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5, 6],
+    reads: &[1, 2, 3, 4, 5, 6, 7],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
@@ -684,6 +684,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     // the managed-graph registry and its owners' settings (see `crate::managed`)
     ds("managed.json", 1),
     ds("evidence.json", 1),
+    // durable source holds (see `crate::holds`)
+    ds("holds.json", 1),
     // a view's definition, `views/NAME/view.json`: format 2 is a paused one
     ds("view.json", 2),
     named(ds("graphrag/state.json", 2), "version"),
@@ -718,6 +720,11 @@ pub fn informational(name: &str) -> bool {
 /// enforce keeps the dataset readable and refuses every write instead (see
 /// [`crate::managed`]).
 pub const WRITE_FENCED_SETTINGS: &[&str] = &["managed.json", "evidence.json"];
+
+/// Dataset settings files that refuse the open only when they are of a newer version.
+/// Any other damage keeps the dataset open and makes the file's owner fail closed:
+/// `holds.json` then keeps every past state (see [`crate::holds`]).
+pub const RETENTION_FENCED_SETTINGS: &[&str] = &["holds.json"];
 
 /// Unpublished branch scratch that existing startup recovery removes by name.
 pub(crate) fn transient_branch_directory(name: &str) -> bool {
@@ -775,9 +782,18 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
             && !informational(s.name)
             && !WRITE_FENCED_SETTINGS.contains(&s.name)
     }) {
-        let bytes = match std::fs::read(dir.join(s.name)) {
-            Ok(b) => b,
+        let fenced = RETENTION_FENCED_SETTINGS.contains(&s.name);
+        // a fenced file's own reader bounds its size, and so does this check
+        let read = if fenced {
+            read_bounded(&dir.join(s.name), crate::holds::MAX_FILE_BYTES)
+        } else {
+            std::fs::read(dir.join(s.name)).map(Some)
+        };
+        let bytes = match read {
+            Ok(Some(b)) => b,
+            Ok(None) => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) if fenced => continue,
             Err(e) => {
                 out.push(Error::Io(e));
                 continue;
@@ -788,6 +804,10 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         };
         match check_settings(s.name, &v) {
             Ok(_) => {}
+            Err(Error::Unsupported(m)) if fenced => {
+                out.push(Error::Unsupported(format!("{}: {m}", dir.display())))
+            }
+            Err(_) if fenced => {}
             Err(Error::Unsupported(m)) => {
                 out.push(Error::Unsupported(format!("{}: {m}", dir.display())))
             }
@@ -796,6 +816,17 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         }
     }
     out
+}
+
+/// The bytes of `path`, or `None` when it is longer than `limit`, read without taking
+/// more than `limit + 1` bytes into memory.
+fn read_bounded(path: &std::path::Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
 /// `Ok` when no settings file of the dataset directory `dir` refuses it, else the first

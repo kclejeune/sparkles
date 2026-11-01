@@ -74,6 +74,72 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             "evidence-settings",
         ),
     );
+    let uuid = |d: &str| with_desc(json!({ "type": "string", "format": "uuid" }), d);
+    put(
+        "EvidenceHold",
+        doc(
+            closed(
+                &["id", "owner", "created", "commits"],
+                json!({
+                    "id": uuid("The hold's identity."),
+                    "owner": with_desc(string_enum(&["evidence"]), "The profile that holds the commits."),
+                    "created": with_desc(json!({ "type": "string", "format": "date-time" }), "When the hold was acquired."),
+                    "commits": with_desc(array(closed(
+                        &["branch", "branchId", "commit"],
+                        json!({
+                            "branch": with_desc(or_null(string()), "The branch's name, `null` once it is deleted."),
+                            "branchId": uuid("The branch's identity."),
+                            "commit": with_desc(json!({ "type": "integer", "minimum": 0 }), "The commit's sequence number."),
+                        }),
+                    )), "The held commits, sorted by branch identity and commit."),
+                }),
+            ),
+            "A durable source hold that keeps commits readable.",
+            "evidence-holds",
+        ),
+    );
+    put(
+        "EvidenceHoldRequest",
+        doc(
+            closed(
+                &["commits"],
+                json!({
+                    "id": uuid("The hold's identity. A random one when absent."),
+                    "commits": with_desc(json!({
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 65536,
+                        "items": closed(
+                            &["commit"],
+                            json!({
+                                "branch": with_desc(string(), "The branch by name. `main` when neither member is present."),
+                                "branchId": uuid("The branch by identity, as an evidence reference names it."),
+                                "commit": with_desc(json!({ "type": "integer", "minimum": 0 }), "The commit's sequence number."),
+                            }),
+                        ),
+                    }), "The commits to keep readable."),
+                }),
+            ),
+            "The commits a new source hold keeps.",
+            "evidence-holds",
+        ),
+    );
+    put(
+        "EvidenceHoldList",
+        doc(
+            closed(
+                &["holds", "next", "heldCommits", "maxCommits"],
+                json!({
+                    "holds": array(sref("EvidenceHold")),
+                    "next": with_desc(or_null(json!({ "type": "string", "format": "uuid" })), "The `after` of the next page, `null` on the last."),
+                    "heldCommits": with_desc(int(), "The commits all the evidence holds name together."),
+                    "maxCommits": with_desc(int(), "The most commits the dataset's holds may name together."),
+                }),
+            ),
+            "A page of the evidence holds, by id.",
+            "evidence-holds",
+        ),
+    );
     put(
         "EvidenceDetach",
         doc(

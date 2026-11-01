@@ -219,6 +219,7 @@ impl BranchCreate {
 pub struct BranchDeleteOptions {
     force: bool,
     reparent: bool,
+    release_holds: bool,
     call: CallOptions,
 }
 impl BranchDeleteOptions {
@@ -233,6 +234,11 @@ impl BranchDeleteOptions {
     /// Reparent branches that depend on the deleted branch.
     pub fn reparent(mut self) -> Self {
         self.reparent = true;
+        self
+    }
+    /// Release the source holds that name the branch first, which needs `admin`.
+    pub fn release_holds(mut self) -> Self {
+        self.release_holds = true;
         self
     }
 }
@@ -310,6 +316,9 @@ impl Dataset {
         }
         if options.reparent {
             request.param("reparent", "true");
+        }
+        if options.release_holds {
+            request.param("releaseHolds", "true");
         }
         request.accept = Some("application/json");
         request.call = options.call.clone();

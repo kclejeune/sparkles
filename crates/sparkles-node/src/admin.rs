@@ -759,6 +759,7 @@ fn run_admin(
                 &sparkles::branch::DeleteOptions {
                     force: a["force"].as_bool().unwrap_or(false),
                     reparent: a["reparent"].as_bool().unwrap_or(false),
+                    release_holds: false,
                 },
             )?;
             Value::Null

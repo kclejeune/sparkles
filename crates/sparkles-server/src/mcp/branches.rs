@@ -423,6 +423,7 @@ impl Tools<'_> {
                     &DeleteOptions {
                         force: true,
                         reparent: false,
+                        release_holds: false,
                     },
                 );
                 actor.failed_branch("branch_created", Some(&ds.name), &name, e.code());
@@ -692,6 +693,7 @@ impl Tools<'_> {
                 &DeleteOptions {
                     force: a.force.unwrap_or(false),
                     reparent: false,
+                    release_holds: false,
                 },
             )
             .map_err(|e| {
@@ -895,6 +897,7 @@ pub(crate) fn sweep(
                 &DeleteOptions {
                     force: true,
                     reparent: false,
+                    release_holds: false,
                 },
             ) {
                 Ok(_) => {

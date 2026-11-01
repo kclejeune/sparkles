@@ -84,6 +84,18 @@ registry only at an expected revision. `Store::managed_snapshot` returns the reg
 and its owners' settings from one load, and `Store::managed_settings` returns one
 owner's recorded settings.
 
+Durable source holds keep the commits that evidence references name readable.
+Administrators list, acquire and release them with `GET` and `POST
+/$/evidence/{ds}/holds` and `DELETE /$/evidence/{ds}/holds/{id}`, and Rust applications
+use `sparkles::evidence::holds`, `acquire_hold`, `release_hold` and `reconcile_holds` or
+`Store::acquire_hold` and its companions. History trimming, the retention window and
+its limits, compaction and generation retirement keep every held commit, and an
+in-memory dataset keeps its held states. A branch that a hold names is refused deletion
+with `409 branch-held` unless `DeleteOptions::release_holds`, `?releaseHolds=true`, which
+needs `admin`, or `sparkles branch delete --release-holds` releases its holds first.
+`sparkles check` counts holds among retained generations. The Rust client's
+`BranchDeleteOptions::release_holds` sends the new parameter.
+
 Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
 and `owl:sameAs` with closure operators instead of joins, and derives the same facts.
 An operator condenses a relation's strongly connected components and computes each
@@ -906,6 +918,14 @@ refuses writes the same way. A newer `managed.json` therefore does not refuse th
 and a backup or clone of a registry with an unknown format or owner is refused. Branches share
 the registry without copying the file, and backups, restores and clones carry both
 files.
+
+`holds.json` format 1 at a dataset root records the durable source holds of the dataset
+and its branches, each with its `id`, `owner`, `created` time and `commits` of
+`branchId`, `seq` and, when it differs, the serving `storeId`. The first hold raises
+`minimumReader` to 7, so releases that read only up to reader 6 refuse the dataset. A
+file of a newer format refuses the open. A file that cannot be read or belongs to
+another dataset keeps every past state and refuses hold changes. Backups and clones do
+not carry it.
 
 `evidence.json` format 1 and profile 1 now hold all six roles and `policies`, written
 canonically with sorted sets and keys. A file that names only `sourceRecords` and

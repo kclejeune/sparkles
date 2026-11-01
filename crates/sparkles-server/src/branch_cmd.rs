@@ -180,6 +180,9 @@ pub enum BranchCmd {
         /// upstream, and its storage stays while their history needs it
         #[arg(long)]
         reparent: bool,
+        /// Delete it also when evidence holds name it, releasing those holds first
+        #[arg(long)]
+        release_holds: bool,
     },
     /// Show or set the predicates whose cells never conflict in the dataset's merges
     Exempt {
@@ -351,13 +354,18 @@ fn run_branch_inner(cmd: BranchCmd, opts: StoreOptions, actor: &crate::audit::Ac
             name,
             force,
             reparent,
+            release_holds,
         } => {
             match &target.loc {
                 Some(loc) => {
                     let store = Store::open(loc, opts)?;
                     store.delete_branch_with(
                         &name,
-                        &sparkles::branch::DeleteOptions { force, reparent },
+                        &sparkles::branch::DeleteOptions {
+                            force,
+                            reparent,
+                            release_holds,
+                        },
                     )?;
                     crate::audit::dataset(
                         "branch_deleted",
@@ -371,11 +379,18 @@ fn run_branch_inner(cmd: BranchCmd, opts: StoreOptions, actor: &crate::audit::Ac
                     );
                 }
                 None => {
-                    let q = match (force, reparent) {
-                        (false, false) => "",
-                        (true, false) => "?force=true",
-                        (false, true) => "?reparent=true",
-                        (true, true) => "?force=true&reparent=true",
+                    let flags: Vec<&str> = [
+                        (force, "force=true"),
+                        (reparent, "reparent=true"),
+                        (release_holds, "releaseHolds=true"),
+                    ]
+                    .into_iter()
+                    .filter_map(|(on, f)| on.then_some(f))
+                    .collect();
+                    let q = if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("?{}", flags.join("&"))
                     };
                     remote_send(&target, "DELETE", &format!("/{name}{q}"), None)?;
                 }

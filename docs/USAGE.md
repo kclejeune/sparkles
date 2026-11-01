@@ -2472,10 +2472,11 @@ It reads the files when a server holds the database, and then shows heads and st
 points without the ahead and behind counts. `branch create` takes `--from BRANCH` and
 `--at REF` to start elsewhere than `main`'s head, and `--protected` to refuse every write
 but merges. `branch protect NAME [--off]`, `branch show NAME`, `branch rename NAME NEW` and `branch
-delete NAME [--force] [--reparent]` complete the set. A rename keeps the branch's
-commits and storage, and the old name stops working. `--reparent` deletes a branch that
-other branches start from: they take its upstream, and its storage stays while their
-history needs it. These commands also work against a server with
+delete NAME [--force] [--reparent] [--release-holds]` complete the set. A rename keeps
+the branch's commits and storage, and the old name stops working. `--reparent` deletes a
+branch that other branches start from: they take its upstream, and its storage stays
+while their history needs it. `--release-holds` deletes a branch that
+[evidence holds](API.md#evidence-holds) name, releasing those holds first. These commands also work against a server with
 `--server URL --dataset NAME`.
 
 A persistent branch that still shares an index can move onto main's current index
@@ -7087,7 +7088,8 @@ because the generations it writes from then on start their logs with a header. F
 then on, releases that read only up to reader 4 refuse it. To go back to such a
 release, dump the database with `sparkles dump` and load the dump with the older
 release. A dataset whose graphs a profile manages through `managed.json` needs
-reader 6, so a release that cannot enforce that protection refuses it.
+reader 6, so a release that cannot enforce that protection refuses it. A dataset with
+durable source holds in `holds.json` needs reader 7 for the same reason.
 [Upgrading databases](#upgrading-databases) describes the version window and
 `sparkles migrate`.
 

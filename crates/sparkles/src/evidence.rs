@@ -288,3 +288,59 @@ pub fn detach(dataset: &Dataset, graph: &str) -> Result<SettingsStatus> {
     let graphs = store.detach_managed_at(OwnerKind::Evidence, graph, snapshot.graphs.revision)?;
     status_from(Some(&graphs), bytes.as_deref())
 }
+
+// --------------------------------------------------------------- holds ------------
+
+pub use sparkles_core::branch::CommitRef;
+pub use sparkles_core::holds::{DEFAULT_GRACE_MS, MAX_COMMITS, SourceHold};
+pub use sparkles_core::store::Acquired;
+
+/// The durable source holds of the evidence profile in `dataset` and its branches, by
+/// id. Fails with `holds-unavailable` when the dataset's `holds.json` cannot be read.
+pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
+    Ok(dataset
+        .store()
+        .source_holds()?
+        .into_iter()
+        .filter(|h| h.owner == OwnerKind::Evidence)
+        .collect())
+}
+
+/// Keep `commits` readable for the evidence profile under the hold `id`. Each commit
+/// names `main` or a listed branch by its id, as an evidence reference does. The hold
+/// is durable when this returns: no history trimming, compaction or generation
+/// retirement removes the commits' states, and a branch the hold names is deleted only
+/// by a deletion that releases its holds. Acquiring the same hold again returns it
+/// unchanged. A hold of that id with other commits is `hold-conflict`, more than
+/// [`MAX_COMMITS`] held commits in the dataset is `holds-limit`, and a commit that is
+/// no longer readable is `history-gone`, and these refusals record nothing. An I/O error
+/// while the holds file is replaced may leave the hold recorded and protecting its
+/// commits, so repeat the acquisition, release it or reconcile it. The first hold raises
+/// the dataset reader to 7.
+pub fn acquire_hold(dataset: &Dataset, id: uuid::Uuid, commits: &[CommitRef]) -> Result<Acquired> {
+    dataset
+        .store()
+        .acquire_hold(OwnerKind::Evidence, id, commits)
+}
+
+/// Release the evidence hold `id`, returning whether it existed. Its commits can be
+/// collected once `holds.json` is durable without it.
+pub fn release_hold(dataset: &Dataset, id: uuid::Uuid) -> Result<bool> {
+    Ok(!dataset
+        .store()
+        .release_holds(OwnerKind::Evidence, &[id])?
+        .is_empty())
+}
+
+/// Release the evidence holds acquired at least `grace_ms` milliseconds ago that `keep`
+/// does not keep, such as holds whose referencing commit never published. Returns the
+/// released ids.
+pub fn reconcile_holds(
+    dataset: &Dataset,
+    grace_ms: i64,
+    keep: &mut dyn FnMut(&SourceHold) -> Result<bool>,
+) -> Result<Vec<uuid::Uuid>> {
+    dataset
+        .store()
+        .reconcile_holds(OwnerKind::Evidence, grace_ms, keep)
+}

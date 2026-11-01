@@ -45,6 +45,9 @@ mod group_index_tests;
 mod group_model;
 mod history_limited;
 mod history_query;
+mod holds;
+#[cfg(test)]
+mod holds_tests;
 pub mod keyset;
 #[doc(hidden)]
 pub mod lifecycle;
@@ -53,6 +56,7 @@ mod lock;
 #[cfg(test)]
 mod lock_tests;
 mod managed;
+pub use holds::Acquired;
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod managed_tests;
@@ -2310,7 +2314,18 @@ impl Store {
         open_step("vocab-settled");
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
-        let history = open_history(root, dataset_id, gen_no, head.seq, !rebased, &catalog)?;
+        let mut history = open_history(root, dataset_id, gen_no, head.seq, !rebased, &catalog)?;
+        // the dataset's source holds, which its branches share, before anything is
+        // collected
+        if ctx.is_none() {
+            family
+                .holds
+                .install(crate::holds::load_dir(root, dataset_id));
+        }
+        history.held = Some(crate::holds::HeldView {
+            index: family.holds.index.clone(),
+            store: dataset_id,
+        });
         let annotations =
             crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
         #[cfg(test)]
@@ -2661,9 +2676,12 @@ impl Store {
         let meta = meta.or_else(|| {
             self.mem_history
                 .as_ref()
-                .and_then(|m| m.lock().branch_bases.get(&seq).map(|(c, _)| *c))
+                .and_then(|m| m.lock().kept_commit(seq))
         });
         let Some(commit) = meta else {
+            if self.starts_at(seq) {
+                return Err(self.inherited(at, seq));
+            }
             let snapshot = match at {
                 At::Snapshot(n) => Some(n.clone()),
                 _ => None,
@@ -2679,6 +2697,16 @@ impl Store {
             head: head.seq,
             historical: seq != self.snapshot().commit,
         })
+    }
+
+    /// Whether this is a branch store that started at commit `seq`. Its state there is
+    /// its upstream's, which serves a read of it once this store no longer keeps it, as
+    /// when a source hold keeps only the upstream's copy.
+    pub(super) fn starts_at(&self, seq: u64) -> bool {
+        self.branching
+            .ident
+            .as_ref()
+            .is_some_and(|i| i.from.seq == seq)
     }
 
     /// The error for a commit a branch store shares with its upstream: reads of it are
@@ -2801,7 +2829,13 @@ impl Store {
                         crate::history::At::Snapshot(n) => Some(n.clone()),
                         _ => None,
                     };
-                    if memory.is_some() {
+                    if self.starts_at(seq) {
+                        if memory.is_some() {
+                            Err(self.inherited_limited(at, seq, &limit)?)
+                        } else {
+                            Err(self.inherited(at, seq))
+                        }
+                    } else if memory.is_some() {
                         Err(self.mem_gone_limited(seq, r.head, name, Some(r.commit), &limit)?)
                     } else {
                         Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
@@ -2831,6 +2865,14 @@ impl Store {
             h.owner(seq, current, r.head)
         };
         let Some(owner) = owner else {
+            if self.starts_at(seq) {
+                drop(h);
+                return Err(if memory.is_some() {
+                    self.inherited_limited(at, seq, &limit)?
+                } else {
+                    self.inherited(at, seq)
+                });
+            }
             return if memory.is_some() {
                 Err(self.history_gone_limited(
                     &h,

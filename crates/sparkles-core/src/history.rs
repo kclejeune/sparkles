@@ -260,6 +260,9 @@ pub enum Hold {
     Branch(String),
     /// a branch's starting commit, kept readable for merges (by branch name)
     BranchBase(String),
+    /// durable source holds on its commits (see [`crate::holds`]), or every past state
+    /// while the holds cannot be read
+    Source,
 }
 
 impl std::fmt::Display for Hold {
@@ -272,6 +275,7 @@ impl std::fmt::Display for Hold {
             Hold::Clone(n) => write!(f, "clone:{n}"),
             Hold::Branch(n) => write!(f, "branch:{n}"),
             Hold::BranchBase(n) => write!(f, "branch-base:{n}"),
+            Hold::Source => write!(f, "source-holds"),
         }
     }
 }
@@ -619,6 +623,8 @@ pub(crate) struct HistoryState {
     pub branch_gens: Vec<(u32, Hold)>,
     /// commits branches keep readable (their starting commits)
     pub branch_pins: Vec<(u64, Hold)>,
+    /// the durable source holds on this store's commits, read when collecting
+    pub(crate) held: Option<crate::holds::HeldView>,
     /// the byte budget the cached states are charged to, shared with other stores when
     /// the server shares its caches
     pub budget: Arc<crate::store::caches::ByteBudget>,
@@ -671,6 +677,7 @@ impl HistoryState {
             materialize_nanos: 0,
             branch_gens: Vec::new(),
             branch_pins: Vec::new(),
+            held: None,
             budget: Arc::new(crate::store::caches::ByteBudget::new(u64::MAX)),
             charged: 0,
         }
@@ -685,6 +692,7 @@ impl HistoryState {
         h.gens = self.gens.clone();
         h.branch_gens = self.branch_gens.clone();
         h.branch_pins = self.branch_pins.clone();
+        h.held = self.held.clone();
         h
     }
 
@@ -831,6 +839,11 @@ impl HistoryState {
         max_gens: usize,
     ) -> BTreeMap<u32, Vec<Hold>> {
         let protected = self.protected(head, now_ms, ts);
+        // `None` keeps every generation: the holds cannot be read
+        let held: Option<Arc<[u64]>> = match &self.held {
+            None => Some(Arc::from(Vec::new())),
+            Some(v) => v.held(),
+        };
         let ranges = self.ranges(current, head);
         let mut covered: Vec<(u64, u64)> = ranges
             .iter()
@@ -848,6 +861,19 @@ impl HistoryState {
                 if lo <= hi && !fully_covered(lo, hi, &covered) && !holds.contains(hold) {
                     holds.push(hold.clone());
                 }
+            }
+            let source = match &held {
+                None => true,
+                Some(seqs) => {
+                    let from = seqs.partition_point(|s| *s < b);
+                    seqs[from..]
+                        .iter()
+                        .take_while(|s| **s <= e)
+                        .any(|s| !fully_covered(*s, *s, &covered))
+                }
+            };
+            if source {
+                holds.push(Hold::Source);
             }
             if !holds.is_empty() {
                 out.insert(no, holds);
@@ -903,6 +929,9 @@ impl HistoryState {
 pub(crate) struct MemHistory {
     pub branch_bases: BTreeMap<u64, (crate::commit::CommitInfo, Arc<Snapshot>)>,
     pub pins: BTreeMap<String, (Pin, Arc<Snapshot>)>,
+    /// the states durable source holds keep (see [`crate::holds`]) with their commit
+    /// metadata, which the commit ring may have dropped, by commit
+    pub held: BTreeMap<u64, (CommitInfo, Arc<Snapshot>)>,
     pub retention: Retention,
     /// past states kept by the window, oldest first (never the head)
     pub window: std::collections::VecDeque<Arc<Snapshot>>,
@@ -920,6 +949,9 @@ impl MemHistory {
         if let Some((_, snapshot)) = self.branch_bases.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
+        if let Some((_, snapshot)) = self.held.get(&seq) {
+            return Ok(Some(snapshot.clone()));
+        }
         for snapshot in self.window.iter().chain(self.pins.values().map(|(_, s)| s)) {
             limit.check(0)?;
             if snapshot.commit == seq {
@@ -934,6 +966,7 @@ impl MemHistory {
         self.branch_bases
             .get(&seq)
             .map(|(_, s)| s.clone())
+            .or_else(|| self.held.get(&seq).map(|(_, s)| s.clone()))
             .or_else(|| {
                 self.window
                     .iter()
@@ -941,6 +974,15 @@ impl MemHistory {
                     .or_else(|| self.pins.values().map(|p| &p.1).find(|s| s.commit == seq))
                     .cloned()
             })
+    }
+
+    /// The metadata of commit `seq` that a branch base or a source hold keeps beside its
+    /// state.
+    pub(crate) fn kept_commit(&self, seq: u64) -> Option<CommitInfo> {
+        self.branch_bases
+            .get(&seq)
+            .map(|(c, _)| *c)
+            .or_else(|| self.held.get(&seq).map(|(c, _)| *c))
     }
 
     /// The readable commits, the head included, as ascending disjoint ranges.
@@ -951,6 +993,7 @@ impl MemHistory {
             .map(|s| s.commit)
             .chain(self.pins.values().map(|p| p.1.commit))
             .chain(self.branch_bases.keys().copied())
+            .chain(self.held.keys().copied())
             .chain(std::iter::once(head))
             .collect();
         seqs.sort_unstable();
@@ -1043,7 +1086,11 @@ pub fn retained_offline(
     let HistoryConfig {
         pins, retention, ..
     } = read_file(root, dataset_id)?;
-    if pins.is_empty() && retention == Retention::default() {
+    let held = offline_holds(root, dataset_id);
+    if pins.is_empty()
+        && retention == Retention::default()
+        && held.as_ref().is_some_and(|h| h.is_empty())
+    {
         return Ok(BTreeMap::new());
     }
     let recs = commit::read_catalog(&root.join("commits.bin"))?
@@ -1084,7 +1131,41 @@ pub fn retained_offline(
             .map(|c| c.timestamp_ms)
     };
     let max_gens = crate::store::StoreOptions::default().history_max_generations;
+    let index = match held {
+        Some(seqs) => {
+            let mut by = std::collections::HashMap::new();
+            by.insert(dataset_id, seqs);
+            crate::holds::HeldIndex::with(by)
+        }
+        None => crate::holds::HeldIndex::unreadable("holds.json cannot be read".into()),
+    };
+    h.held = Some(crate::holds::HeldView {
+        index: Arc::new(arc_swap::ArcSwap::from_pointee(index)),
+        store: dataset_id,
+    });
     Ok(h.needed(current, head, commit::now_ms(), &ts, max_gens))
+}
+
+/// The commits held on the store at `root`, whose id is `store`, from the dataset's
+/// `holds.json` alone: at `root` for the dataset's own store, two levels up for a
+/// branch's, which has a branch descriptor. `None` when the holds cannot be read.
+fn offline_holds(root: &Path, store: uuid::Uuid) -> Option<Arc<[u64]>> {
+    let dataset_root = match root.parent() {
+        Some(p)
+            if p.file_name()
+                .is_some_and(|n| n == crate::store::BRANCHES_DIR)
+                && root.join(crate::store::BRANCH_FILE_NAME).exists() =>
+        {
+            p.parent()?.to_path_buf()
+        }
+        _ => root.to_path_buf(),
+    };
+    let dataset_id = if dataset_root == root {
+        store
+    } else {
+        commit::read_dataset_file(&dataset_root).ok().flatten()?
+    };
+    crate::holds::held_offline(&dataset_root, dataset_id, store)
 }
 
 /// The readable commits of a database, from its files alone (no lock): the ranges of

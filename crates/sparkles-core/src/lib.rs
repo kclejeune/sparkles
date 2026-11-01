@@ -16,6 +16,7 @@ pub mod fsutil;
 pub mod geo;
 pub mod guard;
 pub mod history;
+pub mod holds;
 pub mod id;
 pub mod incr;
 pub mod index;

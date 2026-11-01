@@ -261,13 +261,20 @@ pub enum ManagedErrorKind {
     Unavailable,
     /// The owner or profile is not enabled or not supported by this build.
     UnsupportedProfile,
+    /// A source hold of that id already holds other commits (see [`crate::holds`]).
+    HoldConflict,
+    /// The holds would name more than [`crate::holds::MAX_COMMITS`] commits.
+    HoldsLimit,
+    /// The dataset's `holds.json` cannot be read, so holds cannot change.
+    HoldsUnavailable,
 }
 
 /// An error of the managed-graph boundary, with its stable code. Nothing was written.
 #[derive(Clone, Debug)]
 pub struct ManagedError {
     pub kind: ManagedErrorKind,
-    /// `profile-managed-graph`, `managed-unavailable` or `unsupported-profile`
+    /// `profile-managed-graph`, `managed-unavailable`, `unsupported-profile`,
+    /// `hold-conflict`, `holds-limit` or `holds-unavailable`
     pub code: &'static str,
     pub message: String,
 }
@@ -279,6 +286,9 @@ impl ManagedError {
             ManagedErrorKind::Protected => "profile-managed-graph",
             ManagedErrorKind::Unavailable => "managed-unavailable",
             ManagedErrorKind::UnsupportedProfile => "unsupported-profile",
+            ManagedErrorKind::HoldConflict => "hold-conflict",
+            ManagedErrorKind::HoldsLimit => "holds-limit",
+            ManagedErrorKind::HoldsUnavailable => "holds-unavailable",
         };
         Error::Managed(Box::new(ManagedError {
             kind,
@@ -293,6 +303,9 @@ impl ManagedError {
             ManagedErrorKind::Protected => 409,
             ManagedErrorKind::Unavailable => 503,
             ManagedErrorKind::UnsupportedProfile => 409,
+            ManagedErrorKind::HoldConflict => 409,
+            ManagedErrorKind::HoldsLimit => 409,
+            ManagedErrorKind::HoldsUnavailable => 503,
         }
     }
 }

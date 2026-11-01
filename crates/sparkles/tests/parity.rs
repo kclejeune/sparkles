@@ -426,6 +426,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("detachEvidenceGraph", "evidence.detach", |ds| {
             let _ = sparkles::evidence::detach(ds, &any::<String>());
         }),
+        op!("listEvidenceHolds", "evidence.holds", |ds| {
+            let _ = sparkles::evidence::holds(ds);
+        }),
+        op!("acquireEvidenceHold", "evidence.acquire_hold", |ds| {
+            let _ = sparkles::evidence::acquire_hold(ds, any(), &[]);
+        }),
+        op!("releaseEvidenceHold", "evidence.release_hold", |ds| {
+            let _ = sparkles::evidence::release_hold(ds, any());
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),

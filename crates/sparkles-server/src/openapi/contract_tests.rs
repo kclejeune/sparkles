@@ -300,6 +300,7 @@ async fn admin_responses_match_their_schemas() {
         ("/$/vector/{ds}", "/$/vector/h"),
         ("/$/vector/{ds}/{name}", "/$/vector/h/v1"),
         ("/$/evidence/{ds}/settings", "/$/evidence/h/settings"),
+        ("/$/evidence/{ds}/holds", "/$/evidence/h/holds"),
     ];
     let put = |uri: &'static str, body: J| {
         let app = app.clone();

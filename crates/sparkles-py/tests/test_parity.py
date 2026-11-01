@@ -49,7 +49,14 @@ def _resolve(tree: ast.Module, name: str) -> None:
 
 
 # Keys whose Python binding is deliberately deferred.
-DEFERRED = {"evidence.configure", "evidence.detach", "evidence.settings"}
+DEFERRED = {
+    "evidence.acquire_hold",
+    "evidence.configure",
+    "evidence.detach",
+    "evidence.holds",
+    "evidence.release_hold",
+    "evidence.settings",
+}
 
 
 def test_python_binding_names_resolve() -> None:
@@ -60,7 +67,7 @@ def test_python_binding_names_resolve() -> None:
     for key, entry in bindings.items():
         name = entry["python"]
         if name.startswith("planned:"):
-            # Evidence settings reach the bindings with the typed evidence operations
+            # Evidence settings and holds reach the bindings with the typed evidence operations
             # of roadmap item 81, as spec C25 decides. No other key may be planned.
             assert key in DEFERRED, f"`{key}` still has a planned Python binding"
             assert name.split(":", 1)[1].strip(), f"`{key}` needs a reason"

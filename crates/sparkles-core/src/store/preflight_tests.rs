@@ -57,6 +57,7 @@ fn refusal_before_writes(retained: bool) {
                     &crate::branch::DeleteOptions {
                         force: true,
                         reparent: true,
+                        release_holds: false,
                     },
                 )
                 .unwrap();
@@ -345,6 +346,7 @@ mod algo_catalog_admission {
                         &crate::branch::DeleteOptions {
                             force: true,
                             reparent: true,
+                            release_holds: false,
                         },
                     )
                     .unwrap();

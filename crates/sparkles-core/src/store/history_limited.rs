@@ -3,7 +3,12 @@ use super::*;
 use crate::history::{At, HistoryOptions, ReadLimit, Resolved};
 
 impl Store {
-    fn inherited_limited(&self, at: &At, seq: u64, limit: &ReadLimit<'_>) -> Result<Error> {
+    pub(super) fn inherited_limited(
+        &self,
+        at: &At,
+        seq: u64,
+        limit: &ReadLimit<'_>,
+    ) -> Result<Error> {
         let name = limit.read_lock(&self.branching.name)?;
         limit.check(name.len() as u64)?;
         Ok(self.inherited_named(at, seq, &name))
@@ -43,6 +48,7 @@ impl Store {
                             .map(|(commit, _)| (commit.seq, commit.seq)),
                     )
                     .chain(history.branch_bases.keys().map(|&seq| (seq, seq)))
+                    .chain(history.held.keys().map(|&seq| (seq, seq)))
                     .chain(std::iter::once((head, head))),
                 limit,
             )?
@@ -174,10 +180,13 @@ impl Store {
         }
         let metadata = limit.lock(&self.catalog)?.get(seq);
         let metadata = match (metadata, &self.mem_history) {
-            (None, Some(history)) => limit.lock(history)?.branch_bases.get(&seq).map(|(c, _)| *c),
+            (None, Some(history)) => limit.lock(history)?.kept_commit(seq),
             (metadata, _) => metadata,
         };
         let Some(commit) = metadata else {
+            if self.starts_at(seq) {
+                return Err(self.inherited_limited(at, seq, limit)?);
+            }
             let name = match at {
                 At::Snapshot(name) => Some(name.clone()),
                 _ => None,
@@ -326,6 +335,7 @@ impl Store {
                         .map(|s| s.commit)
                         .chain(history.pins.values().map(|p| p.1.commit))
                         .chain(history.branch_bases.keys().copied())
+                        .chain(history.held.keys().copied())
                         .chain(std::iter::once(head))
                         .map(|seq| (seq, seq)),
                     limit,
@@ -797,6 +807,61 @@ mod tests {
         let task = std::thread::spawn(move || {
             send.send(read.snapshot_at_limited(
                 &At::Commit(0),
+                &HistoryOptions {
+                    cancel: Some(signal),
+                    deadline: None,
+                },
+                2 << 20,
+            ))
+            .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        cancel.store(true, Ordering::Relaxed);
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        task.join().unwrap();
+        assert!(matches!(result, Ok(Err(Error::Cancelled))));
+    }
+
+    /// The same wait on a branch's starting commit whose own state was collected, which
+    /// the read follows to the upstream.
+    #[test]
+    fn inherited_name_read_wait_at_a_collected_start_is_interruptible() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = Arc::new(Store::open(root.path(), StoreOptions::default()).unwrap());
+        let update = |s: &Store, n: u64| {
+            crate::sparql::update::update(
+                s,
+                &format!("INSERT DATA {{ <urn:a> <urn:p> {n} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+        };
+        update(&owner, 1);
+        owner.create_branch("dev", &Default::default()).unwrap();
+        let start = owner.head_commit().seq;
+        let branch = owner
+            .owned_set()
+            .unwrap()
+            .open_store(owner.branch_id_of("dev").unwrap())
+            .unwrap();
+        for n in 0..3 {
+            update(&branch, 10 + n);
+            branch.compact().unwrap();
+        }
+        let o = HistoryOptions::default();
+        assert!(matches!(
+            branch.snapshot_at_limited(&At::Commit(start), &o, 2 << 20),
+            Err(ref e) if crate::branch::inherited_commit(e).is_some()
+        ));
+        let held = branch.branching.name.write();
+        let read = branch.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            send.send(read.snapshot_at_limited(
+                &At::Commit(start),
                 &HistoryOptions {
                     cancel: Some(signal),
                     deadline: None,

@@ -321,3 +321,176 @@ fn fewer_canonical(v: &J) -> J {
         .value()
         .clone()
 }
+
+/// `GET`/`POST /$/evidence/{ds}/holds`, `DELETE /$/evidence/{ds}/holds/{id}` and
+/// `releaseHolds` on a branch deletion (spec C25 §3 and §7).
+#[tokio::test]
+async fn evidence_holds_are_acquired_listed_and_released_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    for i in 0..3 {
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/d/update",
+            Some(UPDATE),
+            &format!("INSERT DATA {{ <urn:x> <urn:p> {i} }}"),
+        )
+        .await;
+        assert!(status.is_success());
+    }
+    let ds = state.get("d").unwrap();
+    let dev = ds
+        .store
+        .create_branch("dev", &sparkles::branch::BranchOptions::default())
+        .unwrap();
+    let id = "00000000-0000-0000-0000-000000000001";
+    let body = json!({ "id": id, "commits": [{ "commit": 1 }, { "branch": "main", "commit": 2 }] });
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/holds",
+        Some("application/json"),
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    assert_eq!(j["owner"], "evidence");
+    assert_eq!(j["commits"][0]["branch"], "main");
+    assert_eq!(j["commits"][1]["commit"], 2);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/holds",
+        Some("application/json"),
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let on_dev = json!({ "commits": [{ "branchId": dev.id, "commit": 3 }] });
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/$/evidence/d/holds",
+        Some("application/json"),
+        &on_dev.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    assert_eq!(j["commits"][0]["branch"], "dev");
+    let dev_hold = j["id"].as_str().unwrap().to_string();
+    let (status, j) = call(&app, "GET", "/$/evidence/d/holds", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["holds"].as_array().unwrap().len(), 2);
+    assert_eq!(j["heldCommits"], 3);
+    assert_eq!(j["maxCommits"], 65536);
+    let (status, j) = call(
+        &app,
+        "GET",
+        "/$/evidence/d/holds?onBranch=dev&limit=1",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["holds"][0]["id"], dev_hold.as_str());
+    assert_eq!(j["next"], J::Null);
+    let (status, j) = call(&app, "GET", "/$/evidence/d/holds?limit=1", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let after = j["next"].as_str().unwrap().to_string();
+    let (_, j) = call(
+        &app,
+        "GET",
+        &format!("/$/evidence/d/holds?limit=1&after={after}"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(j["holds"].as_array().unwrap().len(), 1);
+    assert_eq!(j["next"], J::Null);
+
+    // the held branch is deleted only with its holds released
+    let (status, j) = call(&app, "DELETE", "/$/branches/d/dev", None, "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "branch-held");
+    let (status, j) = call(
+        &app,
+        "DELETE",
+        "/$/branches/d/dev?releaseHolds=true",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{j}");
+    let (_, j) = call(&app, "GET", "/$/evidence/d/holds", None, "").await;
+    assert_eq!(j["holds"].as_array().unwrap().len(), 1);
+
+    // refusals
+    for (body, expected, code) in [
+        (
+            json!({ "id": id, "commits": [{ "commit": 1 }] }),
+            StatusCode::CONFLICT,
+            Some("hold-conflict"),
+        ),
+        (
+            json!({ "commits": [{ "commit": 99 }] }),
+            StatusCode::GONE,
+            Some("history-gone"),
+        ),
+        (
+            json!({ "commits": [{ "branch": "nope", "commit": 1 }] }),
+            StatusCode::NOT_FOUND,
+            None,
+        ),
+        (
+            json!({ "commits": [{ "branch": "main", "branchId": dev.id, "commit": 1 }] }),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        (json!({ "commits": [] }), StatusCode::BAD_REQUEST, None),
+        (
+            json!({ "commits": [{ "commit": 1 }], "note": "x" }),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+    ] {
+        let (status, j) = call(
+            &app,
+            "POST",
+            "/$/evidence/d/holds",
+            Some("application/json"),
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}: {j}");
+        if let Some(code) = code {
+            assert_eq!(j["code"], code, "{body}");
+        }
+    }
+    let (status, _) = call(&app, "GET", "/$/evidence/d/holds?limit=0", None, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/$/evidence/d/holds/{id}"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/$/evidence/d/holds/{id}"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&app, "DELETE", "/$/evidence/d/holds/not-a-uuid", None, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

@@ -167,7 +167,7 @@ impl Store {
 }
 
 /// A live snapshot kept as a past state.
-fn past(s: &Snapshot) -> Snapshot {
+pub(super) fn past(s: &Snapshot) -> Snapshot {
     Snapshot {
         historical: true,
         text: None,

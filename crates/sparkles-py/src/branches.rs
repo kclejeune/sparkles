@@ -110,7 +110,14 @@ impl PyBranches {
     fn delete(&self, py: Python<'_>, name: &str, force: bool, reparent: bool) -> PyResult<()> {
         let ds = self.write(py)?;
         py.detach(|| {
-            ds.delete_branch_with(name, &sparkles::branch::DeleteOptions { force, reparent })
+            ds.delete_branch_with(
+                name,
+                &sparkles::branch::DeleteOptions {
+                    force,
+                    reparent,
+                    release_holds: false,
+                },
+            )
         })
         .py(py)
     }

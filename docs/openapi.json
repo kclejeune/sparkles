@@ -7230,6 +7230,164 @@
         ],
         "type": "object"
       },
+      "EvidenceHold": {
+        "additionalProperties": false,
+        "description": "A durable source hold that keeps commits readable.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-holds"
+        },
+        "properties": {
+          "commits": {
+            "description": "The held commits, sorted by branch identity and commit.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "branch": {
+                  "description": "The branch's name, `null` once it is deleted.",
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "branchId": {
+                  "description": "The branch's identity.",
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "commit": {
+                  "description": "The commit's sequence number.",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "branch",
+                "branchId",
+                "commit"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "created": {
+            "description": "When the hold was acquired.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "The hold's identity.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "owner": {
+            "description": "The profile that holds the commits.",
+            "enum": [
+              "evidence"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "owner",
+          "created",
+          "commits"
+        ],
+        "type": "object"
+      },
+      "EvidenceHoldList": {
+        "additionalProperties": false,
+        "description": "A page of the evidence holds, by id.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-holds"
+        },
+        "properties": {
+          "heldCommits": {
+            "description": "The commits all the evidence holds name together.",
+            "type": "integer"
+          },
+          "holds": {
+            "items": {
+              "$ref": "#/components/schemas/EvidenceHold"
+            },
+            "type": "array"
+          },
+          "maxCommits": {
+            "description": "The most commits the dataset's holds may name together.",
+            "type": "integer"
+          },
+          "next": {
+            "description": "The `after` of the next page, `null` on the last.",
+            "oneOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "holds",
+          "next",
+          "heldCommits",
+          "maxCommits"
+        ],
+        "type": "object"
+      },
+      "EvidenceHoldRequest": {
+        "additionalProperties": false,
+        "description": "The commits a new source hold keeps.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-holds"
+        },
+        "properties": {
+          "commits": {
+            "description": "The commits to keep readable.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "branch": {
+                  "description": "The branch by name. `main` when neither member is present.",
+                  "type": "string"
+                },
+                "branchId": {
+                  "description": "The branch by identity, as an evidence reference names it.",
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "commit": {
+                  "description": "The commit's sequence number.",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "commit"
+              ],
+              "type": "object"
+            },
+            "maxItems": 65536,
+            "minItems": 1,
+            "type": "array"
+          },
+          "id": {
+            "description": "The hold's identity. A random one when absent.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "commits"
+        ],
+        "type": "object"
+      },
       "EvidenceSettings": {
         "additionalProperties": false,
         "description": "The evidence settings of a dataset, as `evidence.json` format 1 holds them.",
@@ -9694,7 +9852,7 @@
                   "type": "integer"
                 },
                 "heldBy": {
-                  "description": "`head`, `snapshot:NAME` or `retention`.",
+                  "description": "`head`, `snapshot:NAME`, `retention`, `backup:NAME`, `clone:NAME`, `branch:NAME`, `branch-base:NAME` or `source-holds`.",
                   "items": {
                     "type": "string"
                   },
@@ -24808,7 +24966,7 @@
     },
     "/$/branches/{ds}/{name}": {
       "delete": {
-        "description": "Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it.",
+        "description": "Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it. A branch that an evidence hold names is refused with `409 branch-held` unless `releaseHolds=true`, which needs `admin` and releases those holds first.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
         },
@@ -24835,6 +24993,14 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "description": "Release the source holds that name the branch, then delete it. Needs `admin`.",
+            "in": "query",
+            "name": "releaseHolds",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -24855,6 +25021,9 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -26715,6 +26884,245 @@
           }
         ],
         "summary": "Stop protecting an evidence graph",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/holds": {
+      "get": {
+        "description": "Needs `admin` on the dataset. Lists the durable source holds of the evidence profile by id, a page at a time.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-holds"
+        },
+        "operationId": "listEvidenceHolds",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Only holds that name this branch.",
+            "in": "query",
+            "name": "onBranch",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Start after this hold id, the `next` of the previous page.",
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most holds in the page, 1000 by default.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceHoldList"
+                }
+              }
+            },
+            "description": "A page of holds."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the evidence holds",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-pagination": {
+          "next": "next",
+          "parameters": [
+            "after",
+            "limit"
+          ],
+          "style": "cursor"
+        },
+        "x-sparkles-permission": "admin"
+      },
+      "post": {
+        "description": "Needs `admin` on the dataset. Keeps the commits readable until the hold is released: history trimming, compaction and generation retirement keep them, and a branch the hold names is deleted only with `releaseHolds=true`. The hold is durable when the answer arrives. The same id with the same commits answers `200` with the existing hold. Another set of commits under that id is `409 hold-conflict`, more than 65,536 held commits in the dataset is `409 holds-limit`, and a commit that is no longer readable is `410 history-gone`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-holds"
+        },
+        "operationId": "acquireEvidenceHold",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceHoldRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceHold"
+                }
+              }
+            },
+            "description": "The existing hold of that id."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceHold"
+                }
+              }
+            },
+            "description": "The new hold."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Acquire an evidence hold",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/evidence/{ds}/holds/{id}": {
+      "delete": {
+        "description": "Needs `admin` on the dataset. The held commits can be collected once the release is durable.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-holds"
+        },
+        "operationId": "releaseEvidenceHold",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Released."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Release an evidence hold",
         "tags": [
           "Datasets"
         ],

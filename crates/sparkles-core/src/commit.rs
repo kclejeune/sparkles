@@ -433,8 +433,8 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 /// 3: relinked generations with an immutable base overlay, 4: framed delta
 /// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
 /// see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
-/// [`crate::managed`]). [`crate::formats::DATASET`] lists them.
-pub const DATASET_READER: u32 = 6;
+/// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`]). [`crate::formats::DATASET`] lists them.
+pub const DATASET_READER: u32 = 7;
 fn legacy_reader() -> u32 {
     1
 }
@@ -608,6 +608,10 @@ pub(crate) fn with_reader(bytes: &[u8], reader: u32) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn require_reader(root: &Path, reader: u32) -> Result<()> {
+    // Callers under different locks, such as a managed-graph enablement under the
+    // writer lock and a source hold under the holds' lock, share `dataset.tmp`.
+    static RAISING: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+    let _raising = RAISING.lock();
     let Some(mut ds) = read_dataset(root)? else {
         return Ok(());
     };
