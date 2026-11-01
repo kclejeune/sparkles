@@ -744,7 +744,7 @@ fn deleted_default_geometries_leave_no_witnesses() {
             got.annotation
                 .witnesses
                 .iter()
-                .all(|w| !w.atoms().contains(&Atom::Fact(dead.clone()))),
+                .all(|w| !w.atoms().contains(&Atom::Fact(dead))),
             "{got:?}"
         );
     }
