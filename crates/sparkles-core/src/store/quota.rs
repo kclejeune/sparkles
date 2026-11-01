@@ -74,7 +74,8 @@ pub(crate) struct Quota {
     preallocated: AtomicU64,
     /// the same after the last chunk of the delta vocabulary
     vocab_preallocated: AtomicU64,
-    /// the same after the last record of `annotations.bin`
+    /// the same after the last record of `annotations.bin`, summed over the stores of the
+    /// dataset, each of which reports its own changes
     ann_preallocated: AtomicU64,
     /// the records of grouped commits queued for their fence, which the leader writes to
     /// the log later: counted as if they were in it
@@ -222,7 +223,7 @@ impl Quota {
         grew: u64,
         preallocated: u64,
         vocab_preallocated: u64,
-        ann_preallocated: Option<u64>,
+        ann_preallocated: Option<(u64, u64)>,
     ) {
         let _m = self.measured.lock();
         let released: u64 = reservations.into_iter().map(Reservation::take).sum();
@@ -230,8 +231,8 @@ impl Quota {
         self.add(grew);
         self.set_preallocated(preallocated);
         self.set_vocab_preallocated(vocab_preallocated);
-        if let Some(bytes) = ann_preallocated {
-            self.set_ann_preallocated(bytes);
+        if let Some((was, now)) = ann_preallocated {
+            self.move_ann_preallocated(was, now);
         }
     }
 
@@ -275,9 +276,12 @@ impl Quota {
         self.ann_preallocated.load(Ordering::Relaxed)
     }
 
-    /// `annotations.bin` now holds `bytes` of preallocated zeros after its last record.
-    pub(crate) fn set_ann_preallocated(&self, bytes: u64) {
-        self.ann_preallocated.store(bytes, Ordering::Relaxed);
+    /// One store's `annotations.bin` now holds `now` bytes of preallocated zeros after its
+    /// last record, where it last reported `was` (see `Tail::take_prealloc`).
+    pub(crate) fn move_ann_preallocated(&self, was: u64, now: u64) {
+        // added first, so the sum never passes below zero
+        self.ann_preallocated.fetch_add(now, Ordering::Relaxed);
+        self.ann_preallocated.fetch_sub(was, Ordering::Relaxed);
     }
 
     /// A small commit grew the write-ahead log by `bytes`, its records and any zeros
@@ -320,7 +324,10 @@ impl Quota {
             return Ok(());
         };
         let building = self.excluded.lock().as_deref().map_or(0, dir_size);
-        let now = dir_size(root).saturating_sub(building);
+        // the zeros after the annotation records are not data, as for `used`
+        let now = dir_size(root)
+            .saturating_sub(building)
+            .saturating_sub(self.ann_preallocated.load(Ordering::Relaxed));
         let before = now.saturating_sub(dir_size(new));
         let projected = now.saturating_sub(old.map_or(0, dir_size));
         if projected > limit && projected > before {
@@ -348,7 +355,7 @@ impl Quota {
         let (Some(limit), Some(root)) = (self.limit(), &self.root) else {
             return None;
         };
-        let now = dir_size(root);
+        let now = dir_size(root).saturating_sub(self.ann_preallocated.load(Ordering::Relaxed));
         Some((
             limit,
             now.saturating_sub(dir_size(new)),

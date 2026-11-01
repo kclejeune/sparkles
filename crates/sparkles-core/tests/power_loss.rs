@@ -1497,10 +1497,13 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     let mut named = 0;
     let base_db = run.root.join("base-db");
     // A crash between a commit's annotation write and its log write: images are taken
-    // after each write to annotations.bin and after each log write that returns while an
-    // annotation write is in flight, besides the evenly spaced points. A point is split
-    // when one of the two write-through writes had returned and the other had not.
-    let (mut ann_pending, mut wal_pending) = (false, false);
+    // when each write to annotations.bin starts and returns, and when a log write returns
+    // before the annotation write of its commit or fence has, besides the evenly spaced
+    // points. Each commit, or each fence, writes one annotation record and its log
+    // records, and the next starts only after both returned, so the first of the two
+    // writes to return leaves a split point, where one is durable and the other is not,
+    // in either order and whether or not the writes overlap.
+    let (mut open, mut ann_done, mut wal_done) = (false, false, false);
     let (mut forced, mut split) = (0usize, 0usize);
     const FORCED: usize = 48;
     for (i, rec) in log.iter().enumerate() {
@@ -1517,30 +1520,29 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         // the evenly spaced crash points miss this short phase at the end of the run.
         let locked_cleared =
             matches!(rec, Rec::Write { path, .. } if path.ends_with("/locked-cleared"));
-        let between = match rec {
-            Rec::Write { path, .. } if path.ends_with("/annotations.bin") => {
-                ann_pending = true;
-                true
+        let ann = |path: &str| path.ends_with("/annotations.bin");
+        let wal = |path: &str| path.ends_with("/wal.log");
+        if let Rec::Write { path, .. } = rec
+            && (ann(path) || wal(path))
+            && !open
+        {
+            (open, ann_done, wal_done) = (true, false, false);
+        }
+        let (between, is_split) = match rec {
+            Rec::Write { path, .. } if ann(path) => (true, false),
+            Rec::WriteEnd { path, .. } if ann(path) && open => {
+                ann_done = true;
+                open = !wal_done;
+                (true, !wal_done)
             }
-            Rec::Write {
-                path, dsync: true, ..
-            } if path.ends_with("/wal.log") => {
-                wal_pending = true;
-                false
+            Rec::WriteEnd { path, .. } if wal(path) && open => {
+                wal_done = true;
+                open = !ann_done;
+                (!ann_done, !ann_done)
             }
-            Rec::WriteEnd { path, .. } if path.ends_with("/annotations.bin") => {
-                ann_pending = false;
-                split += usize::from(wal_pending && forced < FORCED);
-                true
-            }
-            Rec::WriteEnd { path, .. } if path.ends_with("/wal.log") => {
-                wal_pending = false;
-                let between = ann_pending;
-                split += usize::from(between && forced < FORCED);
-                between
-            }
-            _ => false,
+            _ => (false, false),
         };
+        split += usize::from(between && is_split && forced < FORCED);
         let between = between && forced < FORCED;
         forced += usize::from(between);
         if i % stride != 0 && i + 1 != log.len() && !locked_cleared && !between {

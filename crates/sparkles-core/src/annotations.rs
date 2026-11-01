@@ -122,6 +122,9 @@ pub(crate) struct Annotations {
     digests: bool,
     /// write records that fit in preallocated space through `O_DIRECT | O_DSYNC`
     direct: bool,
+    /// the zeros of files this store replaced that it last reported to the quota, which
+    /// the next [`take_prealloc`](Self::take_prealloc) withdraws
+    retired: u64,
 }
 
 impl Annotations {
@@ -133,6 +136,7 @@ impl Annotations {
             map: BTreeMap::new(),
             digests,
             direct: false,
+            retired: 0,
         }
     }
 
@@ -219,6 +223,7 @@ impl Annotations {
             map,
             digests,
             direct,
+            retired: 0,
         })
     }
 
@@ -316,10 +321,13 @@ impl Annotations {
         Ok(self.tail.clone())
     }
 
-    /// The zero bytes preallocated after the written records, which are on disk but are
-    /// not data.
-    pub fn preallocated(&self) -> u64 {
-        self.tail.as_ref().map_or(0, |t| t.preallocated())
+    /// The change in the zero bytes preallocated after the written records, which are on
+    /// disk but are not data, since the last report: what was reported then and what is
+    /// there now. The caller reports it to the quota, which adds the zeros of every store
+    /// that shares it (see [`Tail::take_prealloc`]).
+    pub fn take_prealloc(&mut self) -> (u64, u64) {
+        let (was, now) = self.tail.as_ref().map_or((0, 0), |t| t.take_prealloc());
+        (was + std::mem::take(&mut self.retired), now)
     }
 
     /// Cut the zeros preallocated after the records, before the store closes: a file that
@@ -371,6 +379,9 @@ impl Annotations {
             buf.extend_from_slice(&encode_record(*seq, a));
         }
         crate::store::write_atomic(path, &buf)?;
+        // the old file's zeros are gone with it
+        self.retired += tail.take_prealloc().0;
+        self.tail = None;
         let f = OpenOptions::new().read(true).write(true).open(path)?;
         self.len = buf.len() as u64;
         self.tail = Some(Tail::new(f, path, self.direct, self.len));
@@ -397,8 +408,6 @@ pub(crate) struct Queued {
 pub(crate) struct Written {
     /// the bytes the file grew by, its records and the zeros preallocated after them
     pub grew: u64,
-    /// the zero bytes preallocated after the records now
-    pub preallocated: u64,
     /// the records went through the write-through handle
     #[cfg_attr(not(test), allow(dead_code))]
     pub direct: bool,
@@ -422,6 +431,8 @@ struct TailIo {
     /// the bytes of records written to the file, where the next write starts
     end: u64,
     direct: Direct,
+    /// the zeros after `end` as last reported to the quota
+    reported: u64,
 }
 
 impl Tail {
@@ -433,6 +444,7 @@ impl Tail {
                 alloc: len,
                 end: len,
                 direct: Direct::Untried,
+                reported: 0,
             }),
         })
     }
@@ -441,9 +453,14 @@ impl Tail {
         self.io.lock().end
     }
 
-    fn preallocated(&self) -> u64 {
-        let io = self.io.lock();
-        io.alloc - io.end
+    /// The zeros after the written records as last reported, and as they are now, which
+    /// becomes the reported amount. Every change of the file, a failed write's included,
+    /// is reported this way, so the quota's sum over the stores that share it stays the
+    /// zeros on disk.
+    pub(crate) fn take_prealloc(&self) -> (u64, u64) {
+        let mut io = self.io.lock();
+        let now = io.alloc.saturating_sub(io.end);
+        (std::mem::replace(&mut io.reported, now), now)
     }
 
     /// Write the records `data` at `at`, the file's written end, durably. When they fit
@@ -473,7 +490,6 @@ impl Tail {
                 io.end = end;
                 return Ok(Written {
                     grew: 0,
-                    preallocated: io.alloc - end,
                     direct: true,
                 });
             }
@@ -491,7 +507,6 @@ impl Tail {
         io.end = end;
         Ok(Written {
             grew: io.alloc - before,
-            preallocated: io.alloc - end,
             direct: false,
         })
     }
@@ -931,6 +946,62 @@ pub fn nquads_line(q: &oxrdf::Quad) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each change of the zeros after the records is reported as what was reported last
+    /// and what is there now, the cut of an undone record included, so that a quota that
+    /// several stores share keeps their sum.
+    #[test]
+    fn the_preallocated_zeros_are_reported_as_they_change() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut a = Annotations::open(root.path(), id, 0, false, true).unwrap();
+        assert_eq!(a.take_prealloc(), (0, 0), "no file yet");
+        let message = |m: &str| Annotation {
+            message: Some(Arc::from(m)),
+            digest: None,
+        };
+        let w = a
+            .append(1, message("one"), id, || MAX_PREALLOC)
+            .unwrap()
+            .unwrap();
+        let (was, zeros) = a.take_prealloc();
+        assert_eq!(was, 0);
+        assert!(
+            zeros >= 64 << 10,
+            "the first record grew the file by a step"
+        );
+        let path = root.path().join(FILE);
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(w.grew, len - HEADER as u64);
+        assert_eq!(
+            records_end(&std::fs::read(&path).unwrap()),
+            Some((len - zeros) as usize)
+        );
+        a.append(2, message("two"), id, || MAX_PREALLOC)
+            .unwrap()
+            .unwrap();
+        let (was, now) = a.take_prealloc();
+        assert_eq!(was, zeros);
+        assert!(now < zeros, "the second record took some of the zeros");
+        // an undone record is cut with the zeros after it
+        a.undo(2).unwrap();
+        assert_eq!(a.take_prealloc(), (now, 0));
+        assert_eq!(a.take_prealloc(), (0, 0));
+        let end = records_end(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), end as u64);
+        // a pruned file is replaced, and its zeros are withdrawn
+        a.append(2, message("two"), id, || MAX_PREALLOC)
+            .unwrap()
+            .unwrap();
+        let (_, before) = a.take_prealloc();
+        assert!(before > 0);
+        a.prune_before(2, id).unwrap();
+        assert_eq!(a.take_prealloc(), (before, 0));
+        drop(a);
+        let reopened = Annotations::open(root.path(), id, 2, false, true).unwrap();
+        assert!(reopened.get(1).is_none());
+        assert_eq!(reopened.get(2).unwrap().message.as_deref(), Some("two"));
+    }
 
     #[test]
     fn controlled_membership_refuses_future_primary_version_without_repair() {

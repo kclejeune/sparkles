@@ -3493,7 +3493,8 @@ impl Store {
         {
             let mut a = self.annotations.lock();
             let pruned = a.prune_before(cutoff, self.dataset_id);
-            self.quota.set_ann_preallocated(a.preallocated());
+            let (was, now) = a.take_prealloc();
+            self.quota.move_ann_preallocated(was, now);
             pruned?;
         }
         drop(w);
@@ -3620,10 +3621,12 @@ impl Store {
         let ann = self.annotation_of(&a, c, message, changes);
         let written = a.append(c.seq, ann.clone(), self.dataset_id, || {
             self.annotation_prealloc()
-        })?;
-        if let Some(w) = written {
+        });
+        // a failed append cut the file back, zeros included
+        let (was, now) = a.take_prealloc();
+        self.quota.move_ann_preallocated(was, now);
+        if let Some(w) = written? {
             self.quota.add(w.grew);
-            self.quota.set_ann_preallocated(w.preallocated);
         }
         Ok(ann)
     }
@@ -3647,7 +3650,8 @@ impl Store {
     fn undo_annotation(&self, seq: u64) -> Result<()> {
         let mut a = self.annotations.lock();
         let undone = a.undo(seq);
-        self.quota.set_ann_preallocated(a.preallocated());
+        let (was, now) = a.take_prealloc();
+        self.quota.move_ann_preallocated(was, now);
         undone
     }
 
@@ -7418,7 +7422,8 @@ impl Drop for Store {
                 self.snapshot().generation.dvocab.trim();
                 let mut a = self.annotations.lock();
                 a.trim();
-                self.quota.set_ann_preallocated(a.preallocated());
+                let (was, now) = a.take_prealloc();
+                self.quota.move_ann_preallocated(was, now);
             }
         }
         if let Some(log) = &self.changelog

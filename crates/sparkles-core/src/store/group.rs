@@ -633,8 +633,18 @@ impl Store {
             })
         };
         tail.release(&io);
-        let direct = written?;
-        let ann_written = ann_written.transpose()?;
+        // every change of the annotations file reaches the quota, a failed write's too
+        let ann_prealloc = (!anns.is_empty()).then(|| anns[0].tail.take_prealloc());
+        let direct = written.inspect_err(|_| {
+            if let Some((was, now)) = ann_prealloc {
+                self.quota.move_ann_preallocated(was, now);
+            }
+        })?;
+        let ann_written = ann_written.transpose().inspect_err(|_| {
+            if let Some((was, now)) = ann_prealloc {
+                self.quota.move_ann_preallocated(was, now);
+            }
+        })?;
         #[cfg(test)]
         if ann_written.is_some_and(|w| w.direct)
             && let Some(g) = &self.group
@@ -650,7 +660,7 @@ impl Store {
                 + ann_written.map_or(0, |w| w.grew),
             io.alloc - io.end,
             dvocab.preallocated(),
-            ann_written.map(|w| w.preallocated),
+            ann_prealloc,
         );
         // the growth is on disk now
         drop(promise);
@@ -4327,6 +4337,57 @@ mod tests {
             .collect();
         messages.sort();
         assert_eq!(messages, ["message four", "message three", "message two"]);
+    }
+
+    /// Branch stores share their dataset's quota, which sums the zeros after the records
+    /// of every store's annotations file, and a close takes them back.
+    #[test]
+    fn the_quota_sums_the_annotation_zeros_of_every_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ds");
+        let s = Store::open(&root, Default::default()).unwrap();
+        kind_insert(
+            &s,
+            CommitKind::Update,
+            message_options("main"),
+            in_graph("a", "urn:g"),
+        )
+        .unwrap();
+        s.create_branch("dev", &Default::default()).unwrap();
+        let dev = s.branch("dev").unwrap();
+        kind_insert(
+            &dev,
+            CommitKind::Update,
+            message_options("dev"),
+            in_graph("b", "urn:g"),
+        )
+        .unwrap();
+        fn files(p: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(p).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    files(&p, out);
+                } else if p.file_name() == Some(std::ffi::OsStr::new(crate::annotations::FILE)) {
+                    out.push(p);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        files(&root, &mut found);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let zeros: Vec<u64> = found
+            .iter()
+            .map(|p| {
+                let b = std::fs::read(p).unwrap();
+                (b.len() - crate::annotations::records_end(&b).unwrap()) as u64
+            })
+            .collect();
+        assert!(zeros.iter().all(|z| *z > 0), "{zeros:?}");
+        assert_eq!(s.quota.ann_preallocated(), zeros.iter().sum::<u64>());
+        drop(dev);
+        drop(s);
+        let s = Store::open(&root, Default::default()).unwrap();
+        assert_eq!(s.quota.ann_preallocated(), 0);
     }
 
     /// Once the annotations file has preallocated space, a fence writes its commits'
