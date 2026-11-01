@@ -1289,6 +1289,34 @@ python3 scripts/bench-gate.py w3c "$out/output.log" --out "$out/record.json" \
   --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)"
 '''
 
+[tasks."bench:executors"]
+description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; writes a gate record"
+usage = '''
+arg "[binary]" help="a built sparkles binary (default: build this checkout's release binary)"
+flag "--out <dir>" help="results directory (default .artifacts/bench-executors/<UTC time>)"
+flag "--scales <list>" default="100000 1000000" help="dataset sizes in people (~10.5 triples each)"
+flag "--threads <list>" default="12 1" help="Rayon thread counts"
+flag "--rounds <n>" default="2" help="A,B,B,A rounds per cell"
+flag "--reps <n>" default="10" help="timed requests per query and server process"
+flag "--queries <list>" help="only these queries (default: all 31)"
+flag "--commit <rev>" help="the commit the binary was built from, for the record"
+'''
+run = '''
+mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
+bin=${usage_binary:-}
+commit=${usage_commit:-}
+if [ -z "$bin" ]; then
+  # Built again inside this lease, so collection cannot remove the binary before it runs.
+  mbx build --release -p sparkles-server --bin sparkles
+  bin=target/release/sparkles
+  commit=${commit:-$(git rev-parse HEAD)}
+fi
+scripts/bench-executors.sh --scales "$usage_scales" --threads "$usage_threads" \
+  --rounds "$usage_rounds" --reps "$usage_reps" ${usage_queries:+--queries "$usage_queries"} \
+  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} "$bin"
+SPARKLES_TASK
+'''
+
 [tasks."bench:incr"]
 description = "Incremental view maintenance (item 471): every test of crates/sparkles-core/tests/incr_bench.rs in release mode, alone, into a gate record"
 usage = '''
