@@ -656,7 +656,11 @@ exactly and identically. `tests/witnesses.rs` checks the library surface, the mo
 witness between input graphs and the bounds.
 
 The witnesses are charged to the run's memory budget as they grow, and a run past its
-`max_memory` stops with a memory error. Kept witnesses that a later run does not use,
+`max_memory` stops with a memory error. The charge counts the nodes and supports that
+are kept, the tables by their capacity and the search state of each pass. It does not
+count the spare capacity of growing lists or the old table while a table is moved, so
+the allocated heap can exceed the charge by up to about twice the size of the largest
+growing list or table, which roadmap item NEW-ITEM-5 addresses. Kept witnesses that a later run does not use,
 because it keeps none or keeps another bound, are dropped before the kept closure is
 charged to that run.
 

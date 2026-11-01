@@ -234,6 +234,10 @@ pub(crate) struct Prepared {
     held: Option<Held>,
 }
 
+/// The heap of one fact in the worklists of a pass, its queue entry, its entry in the set
+/// of queued facts and its count of changes.
+const WORK_BYTES: usize = 32;
+
 /// The heap of one fact that the search before a deletion visits, in its set of visited
 /// facts, and of one it adds to its region, in the set of seen nodes, the region and the
 /// queue, charged as they are reached.
@@ -1041,7 +1045,12 @@ impl Witnesses {
                 cx.budget.check()?;
             }
         }
-        held.try_set(bytes + heads.len() * 4 + heads.capacity() * size_of::<Triple>())?;
+        held.try_set(
+            bytes
+                + heads.len() * 4
+                + heads.capacity() * size_of::<Triple>()
+                + table_bytes(pass.ins.capacity(), size_of::<(u32, Ins)>()),
+        )?;
         drop(found_held);
         drop(heads);
         // the base facts that are premises only have their own quad
@@ -1055,6 +1064,7 @@ impl Witnesses {
                     cx.opaque,
                     cx.opaque,
                 );
+                cx.budget.check()?;
             }
         }
         // users from the instances
@@ -1260,10 +1270,12 @@ impl Witnesses {
                 self.nodes[i as usize].key = Some(fact_key(c, t));
             }
             seeds.push(i);
+            self.held.budget().check()?;
         }
         for t in added.iter().chain(touched) {
             if c.graph.contains(t) {
                 seeds.push(self.add_node(*t, None));
+                self.held.budget().check()?;
             }
         }
         // a fact that moved to the base tier by other means keeps its key current
@@ -1460,6 +1472,9 @@ impl Witnesses {
     /// until no value changes.
     fn settle(&mut self, cx: &Cx<'_>, seeds: Vec<u32>, pass: &mut Pass) -> anyhow::Result<()> {
         let cap = pool_cap(self.max);
+        // the worklists are charged per fact queued or changed
+        let mut wl = Held::new(cx.budget);
+        wl.try_grow(seeds.len() * WORK_BYTES)?;
         let mut queue: VecDeque<u32> = VecDeque::with_capacity(seeds.len());
         let mut queued: FxHashSet<u32> = FxHashSet::default();
         for i in seeds {
@@ -1467,6 +1482,7 @@ impl Witnesses {
                 queue.push_back(i);
             }
         }
+        wl.set(queue.len() * WORK_BYTES);
         let mut changes: FxHashMap<u32, u32> = FxHashMap::default();
         let mut memo = Memo::default();
         let mut more: Vec<u32> = Vec::new();
@@ -1480,6 +1496,7 @@ impl Witnesses {
             // charged here once they move into a node or are dropped
             debug_assert_eq!(tmp.bytes(), 0);
             queued.remove(&i);
+            wl.shrink(WORK_BYTES);
             ticks = ticks.wrapping_add(1);
             if ticks.is_multiple_of(256) && cancelled(cx) {
                 anyhow::bail!("reasoning cancelled");
@@ -1564,6 +1581,7 @@ impl Witnesses {
             }
             for &j in &more {
                 if queued.insert(j) {
+                    wl.try_grow(WORK_BYTES)?;
                     queue.push_back(j);
                 }
             }
@@ -1571,6 +1589,9 @@ impl Witnesses {
                 continue;
             }
             let was = n.trunc;
+            if !changes.contains_key(&i) {
+                wl.try_grow(WORK_BYTES)?;
+            }
             let c = changes.entry(i).or_insert(0);
             *c += 1;
             if *c > MAX_CHANGES {
@@ -1597,6 +1618,7 @@ impl Witnesses {
                             un.trunc = false;
                             stack.push(u);
                             if queued.insert(u) {
+                                wl.try_grow(WORK_BYTES)?;
                                 queue.push_back(u);
                             }
                         }
@@ -1605,6 +1627,7 @@ impl Witnesses {
             }
             for &u in self.users_of(cx, pass, i, &mut memo)? {
                 if queued.insert(u) {
+                    wl.try_grow(WORK_BYTES)?;
                     queue.push_back(u);
                 }
             }
