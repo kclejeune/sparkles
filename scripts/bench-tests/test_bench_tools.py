@@ -23,6 +23,10 @@ class BenchToolsTests(unittest.TestCase):
         self.store = Path(self.store_tmp.name)
         self.bin = self.work / "bin"
         self.bin.mkdir()
+        # A stand-in timer, so the runners under test never depend on the host's hyperfine.
+        timer = self.bin / "hyperfine"
+        timer.write_text("#!/bin/sh\nexit 0\n")
+        timer.chmod(0o755)
         self.calls = self.work / "calls.jsonl"
         nix = self.bin / "nix"
         nix.write_text("""#!/usr/bin/env python3
@@ -168,6 +172,7 @@ for output in outputs:
         self.assertEqual(p.stdout.splitlines(), [str(on_path), "on-path"])
 
     def test_use_hyperfine_needs_hyperfine_on_path(self):
+        (self.bin / "hyperfine").unlink()
         # A PATH with the test's nix and the shell's basic tools, and no hyperfine.
         tools = self.work / "tools"
         tools.mkdir()
