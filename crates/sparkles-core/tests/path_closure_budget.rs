@@ -368,3 +368,36 @@ fn bound_seed_alternative_closure_reads_no_edge_relation() {
         );
     }
 }
+
+#[test]
+fn one_hub_lookup_is_charged_as_it_is_read() {
+    // One lookup returns all 300,000 neighbours of the hub. The neighbours are charged
+    // as they are read, so the query fails near its budget rather than after holding
+    // them all, and the closure state for them, uncharged.
+    let mut data = String::new();
+    for i in 0..300_000 {
+        let p = if i % 2 == 0 { "p" } else { "q" };
+        data.push_str(&format!("<urn:hub> <urn:{p}> <urn:n:{i}> .\n"));
+    }
+    let store = store(&data);
+    let limit = 1u64 << 20;
+    let opts = QueryOptions {
+        max_memory_bytes: Some(limit),
+        no_cache: true,
+        ..Default::default()
+    };
+    for q in [
+        "SELECT (COUNT(*) AS ?n) WHERE { <urn:hub> (<urn:p>|<urn:q>)* ?t }",
+        "SELECT (COUNT(*) AS ?n) WHERE { <urn:hub> <urn:p>* ?t }",
+    ] {
+        for mode in MODES {
+            match run(&store, q, &opts, mode) {
+                Err(Error::BudgetExceeded(b)) => {
+                    assert_eq!(b.kind, BudgetKind::Memory, "{q} {mode:?}");
+                    assert!(b.requested < 4 * limit, "{q} {mode:?}: {b:?}");
+                }
+                r => panic!("{q} {mode:?}: {r:?}"),
+            }
+        }
+    }
+}

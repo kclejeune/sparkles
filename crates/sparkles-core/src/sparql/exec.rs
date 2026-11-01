@@ -7165,6 +7165,36 @@ struct Graph<'a> {
     sweeps: &'a std::cell::Cell<usize>,
 }
 
+/// The growth of a neighbour buffer while one lookup or sweep fills it: the capacity
+/// added since it started is charged, and the deadline checked, every few thousand
+/// nodes. The charge ends with the lookup, once the closure charges what it keeps.
+struct Growth<'a> {
+    ctx: &'a Ctx,
+    held: super::ctx::Charge<'a>,
+    charged: usize,
+}
+
+impl<'a> Growth<'a> {
+    fn new(ctx: &'a Ctx) -> Result<Self> {
+        Ok(Self {
+            ctx,
+            held: ctx.charge(0)?,
+            charged: 0,
+        })
+    }
+
+    // the capacity, which a slice does not have
+    #[allow(clippy::ptr_arg)]
+    fn track(&mut self, out: &Vec<u64>) -> Result<()> {
+        if out.capacity() >= self.charged.saturating_add(4096) {
+            self.held.add((out.capacity() - self.charged) as u64 * 8)?;
+            self.charged = out.capacity();
+            self.ctx.check()?;
+        }
+        Ok(())
+    }
+}
+
 /// A frontier at least `rows / SWEEP_RATIO` long is expanded by one merged pass over the
 /// predicate's rows instead of one index seek per node (a seek costs about as much as
 /// merging a few hundred rows).
@@ -7219,6 +7249,7 @@ impl Graph<'_> {
         let gc = perm.col_of(crate::index::G);
         let (first, last) = (frontier[0], frontier[frontier.len() - 1]);
         let mut j = 0;
+        let mut grown = Growth::new(self.ctx)?;
         self.ctx.snap.scan_between_cols(
             perm,
             [p, first, 0, 0],
@@ -7260,6 +7291,7 @@ impl Graph<'_> {
                         }
                     }
                 }
+                grown.track(out)?;
                 Ok(j < frontier.len())
             },
         )?;
@@ -7271,16 +7303,13 @@ impl Graph<'_> {
     /// the neighbour buffer's memory between lookups, since one level of a wide
     /// closure may hold millions of nodes.
     fn expand_each(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
-        let held = self.ctx.charge(0)?;
-        let mut charged = out.capacity();
+        let mut grown = Growth::new(self.ctx)?;
+        grown.charged = out.capacity();
         for (i, &x) in frontier.iter().enumerate() {
             out.extend(self.neighbours(x, forward)?);
+            grown.track(out)?;
             if i % 1024 == 1023 {
                 self.ctx.check()?;
-                if out.capacity() > charged {
-                    held.add((out.capacity() - charged) as u64 * 8)?;
-                    charged = out.capacity();
-                }
             }
         }
         Ok(())
@@ -7317,6 +7346,9 @@ impl Graph<'_> {
             crate::index::ALL_COLS
         };
         let (lo, hi) = (pad(&[p, x], 0), pad(&[p, x], u64::MAX));
+        // A hub's neighbours are charged and the deadline checked as they are read,
+        // since one lookup may return millions of them.
+        let mut grown = Growth::new(self.ctx)?;
         self.ctx.snap.scan_between_cols(perm, lo, hi, mask, |c| {
             match c {
                 Chunk::Block(b, s, e) => {
@@ -7332,6 +7364,7 @@ impl Graph<'_> {
                     }
                 }
             }
+            grown.track(&out)?;
             Ok(true)
         })?;
         out.dedup();
