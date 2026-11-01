@@ -1082,8 +1082,8 @@ holds every sample.
 
 In `38deb1e8` the lookahead was inlined into the join's read loop, and `group-avg` and
 `expr-agg-arg` at 10.5M ran 7.6% and 10.6% slower cold and 14% and 21% slower warm.
-Neither reads through an index join. They ran 1.4% and 2.1% fewer instructions and about
-12% more cycles per request, with front-end counters that did not account for the
+Neither reads through an index join. They ran 1.4% and 2.1% fewer instructions and 12% and
+20% more cycles per request, with front-end counters that did not account for the
 difference, so the change had moved how the compiler built code that these queries share
 with the join. The final code keeps the first look at a block and the walk out of line,
 marked `#[cold]` and `#[inline(never)]`. It runs both queries with the instructions and

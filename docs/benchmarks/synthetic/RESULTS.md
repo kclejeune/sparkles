@@ -310,11 +310,8 @@ The time to ready stays at 52 ms with and without the prewarm.
 | `path-plus` | 3.7 | 3.5 | 2.7 | 3.4 | 3.3 | 2.8 |
 | `star-join` | 21.5 | **11.4** | 18.5 | 77.9 | **33.4** | 71.1 |
 
-With the lookahead inlined into the join's read loop, `group-avg` and `expr-agg-arg` at
-10.5M ran 8% and 11% slower cold and 14% and 21% slower warm, with fewer instructions and
-about 12% more cycles per request, although neither reads through an index join. Keeping
-the lookahead out of line restores their instructions and cycles, and the final build
-runs them within 0.5% of main warm and no slower cold. Warm point lookups run 1.6% to 2.5%
+The final build runs `group-avg` and `expr-agg-arg` at 10.5M within 0.5% of main warm and
+no slower cold, with the instructions and cycles of main. Warm point lookups run 1.6% to 2.5%
 more instructions for the check of cold segments, which
 [item 516](../../ROADMAP.md#performance-follow-ups) covers.
 The [immutable run record](runs/2026-11-01-cold-lookups-forge/validation.json) holds the
