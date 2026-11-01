@@ -200,8 +200,10 @@ impl Store {
         }
         self.failpoint("holds-verified");
         // 6. the commit point: `holds.json` replaced. From the rename on, the hold stays
-        // installed even if syncing the directory fails, so that the running store
-        // never protects less than the file may record.
+        // installed even if the rename reports an error or syncing the directory fails,
+        // so that the running store never protects less than the file may record. A
+        // failed rename leaves the file uncertain, so the next change rewrites it, and
+        // an unpublished hold is an orphan for reconciliation.
         let root = self.managed_root();
         if let Some(root) = &root {
             crate::commit::require_reader(root, holds::READER)?;
@@ -210,8 +212,10 @@ impl Store {
             let tmp = path.with_extension("tmp");
             super::write_synced(&tmp, &holds::encode(self.owner_dataset_id(), &next))?;
             if let Err(e) = std::fs::rename(&tmp, &path) {
-                // the file may or may not have been replaced
+                // the file may or may not have been replaced: keep protecting the hold
                 self.family.holds.uncertain.store(true, Ordering::Relaxed);
+                undo.previous = None;
+                *state = HoldsState::Ready(next);
                 return Err(e.into());
             }
         }

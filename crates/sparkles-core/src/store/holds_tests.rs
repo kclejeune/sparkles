@@ -599,6 +599,73 @@ fn offline_retention_counts_holds() {
     assert_eq!(kept.get(&1), Some(&vec![Hold::Source]));
 }
 
+#[test]
+fn offline_retention_of_a_dataset_in_a_directory_named_branches_reads_its_own_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(crate::store::BRANCHES_DIR).join("ds");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    s.set_retention(Retention {
+        keep_commits: Some(100),
+        keep_age_ms: None,
+        max_bytes: None,
+    })
+    .unwrap();
+    bump(&s, 3);
+    s.compact().unwrap();
+    bump(&s, 2);
+    s.compact().unwrap();
+    let id = s.dataset_id();
+    drop(s);
+    let current: u32 = gens(&root).last().unwrap()["gen-".len()..].parse().unwrap();
+    // no holds: the window keeps older generations, but none is listed as source-held
+    let kept = crate::history::retained_offline(&root, id, current).unwrap();
+    assert!(!kept.is_empty());
+    assert!(
+        kept.values().all(|why| !why.contains(&Hold::Source)),
+        "{kept:?}"
+    );
+}
+
+#[test]
+fn an_oversized_holds_file_opens_the_dataset_and_fails_closed() {
+    let (_dir, root, s) = setup();
+    drop(s);
+    // a newer format behind more padding than a holds file may have: the preflight
+    // does not read it whole and the dataset opens with its holds unavailable
+    let mut bytes = vec![b' '; crate::holds::MAX_FILE_BYTES as usize + 1];
+    bytes.extend_from_slice(br#"{"format":2}"#);
+    std::fs::write(root.join(crate::holds::FILE), bytes).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(code(s.source_holds()), "holds-unavailable");
+    bump(&s, 3);
+    s.compact().unwrap();
+    assert!(readable(&s, 1), "unreadable holds keep every past state");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hold_whose_rename_fails_stays_protected_and_is_written_on_retry() {
+    let (_dir, root, s) = setup();
+    // a directory in the way makes the rename fail
+    let path = root.join(crate::holds::FILE);
+    std::fs::create_dir_all(path.join("blocker")).unwrap();
+    assert!(s.acquire_hold(EV, id(1), &[at(&s, 1)]).is_err());
+    assert!(s.family.holds.index.load().holds(s.dataset_id(), 1));
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+    s.compact().unwrap();
+    bump(&s, 2);
+    s.compact().unwrap();
+    assert!(readable(&s, 1));
+    // the retry of the same acquisition writes the file
+    std::fs::remove_dir_all(&path).unwrap();
+    let again = s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    assert!(!again.created);
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+    assert!(readable(&s, 1));
+}
+
 /// Acquisitions and releases race with commits, compactions and collections, and a
 /// held commit never stops being readable while its hold exists.
 #[test]

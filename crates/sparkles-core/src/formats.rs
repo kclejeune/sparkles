@@ -783,8 +783,15 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
             && !WRITE_FENCED_SETTINGS.contains(&s.name)
     }) {
         let fenced = RETENTION_FENCED_SETTINGS.contains(&s.name);
-        let bytes = match std::fs::read(dir.join(s.name)) {
-            Ok(b) => b,
+        // a fenced file's own reader bounds its size, and so does this check
+        let read = if fenced {
+            read_bounded(&dir.join(s.name), crate::holds::MAX_FILE_BYTES)
+        } else {
+            std::fs::read(dir.join(s.name)).map(Some)
+        };
+        let bytes = match read {
+            Ok(Some(b)) => b,
+            Ok(None) => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) if fenced => continue,
             Err(e) => {
@@ -809,6 +816,17 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         }
     }
     out
+}
+
+/// The bytes of `path`, or `None` when it is longer than `limit`, read without taking
+/// more than `limit + 1` bytes into memory.
+fn read_bounded(path: &std::path::Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
 /// `Ok` when no settings file of the dataset directory `dir` refuses it, else the first

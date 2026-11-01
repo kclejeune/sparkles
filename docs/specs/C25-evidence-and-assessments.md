@@ -695,8 +695,9 @@ Durable source holds are the third Phase 2 step. `sparkles_core::holds` records 
 `main` and every branch. A hold has an owner-chosen UUID, its owner, its creation time
 and a sorted set of commits, each named by the branch identity the caller gave and the
 branch store whose history serves it. A commit at or below a branch's starting point is
-served by its upstream. Together the holds of a dataset name at most 65,536 commits, and
-the file is refused above 32 MiB. `Store::acquire_hold`, `Store::release_holds`,
+served by its upstream. Together the holds of a dataset name at most 65,536 commits. The
+file is refused above 32 MiB, and the format check at open reads no more of it than
+that. `Store::acquire_hold`, `Store::release_holds`,
 `Store::source_holds` and `Store::reconcile_holds` change and list them through the main
 store, and `sparkles::evidence` and `/$/evidence/{ds}/holds` expose the evidence owner's
 holds to administrators. Acquiring the same hold again returns it, and other commits
@@ -726,9 +727,11 @@ before the index was published, and the check then finds the commit gone and the
 acquisition fails with `history-gone` and restores the index, or the collection reads
 the new index and keeps the commit. The acquisition then raises the reader and replaces
 `holds.json` atomically, and returns only after the file and its directory are synced.
-It installs the hold as soon as the file is replaced, so the running store never
-protects less than the file records. A write that fails after it may have replaced the
-file marks the holds uncertain, and the next change or repeated acquisition writes the
+It installs the hold as soon as the file may have been replaced, including when the
+rename reports an error, so the running store never protects less than the file
+records. Such a hold answers an error and stays until a release or reconciliation
+removes it. A write that fails after it may have replaced the file marks the holds
+uncertain, and the next change or repeated acquisition writes the
 installed holds again before it answers. A crash before the replacement leaves no hold, and
 a crash after it leaves the complete hold. A release replaces `holds.json` without the
 hold before it narrows the index, so a crash leaves either the hold in force or the

@@ -1148,12 +1148,13 @@ pub fn retained_offline(
 
 /// The commits held on the store at `root`, whose id is `store`, from the dataset's
 /// `holds.json` alone: at `root` for the dataset's own store, two levels up for a
-/// branch's. `None` when the holds cannot be read.
+/// branch's, which has a branch descriptor. `None` when the holds cannot be read.
 fn offline_holds(root: &Path, store: uuid::Uuid) -> Option<Arc<[u64]>> {
     let dataset_root = match root.parent() {
         Some(p)
             if p.file_name()
-                .is_some_and(|n| n == crate::store::BRANCHES_DIR) =>
+                .is_some_and(|n| n == crate::store::BRANCHES_DIR)
+                && root.join(crate::store::BRANCH_FILE_NAME).exists() =>
         {
             p.parent()?.to_path_buf()
         }
