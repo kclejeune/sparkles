@@ -682,7 +682,7 @@ export interface paths {
         post?: never;
         /**
          * Delete a branch
-         * @description Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it.
+         * @description Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it. A branch that an evidence hold names is refused with `409 branch-held` unless `releaseHolds=true`, which needs `admin` and releases those holds first.
          */
         delete: operations["deleteBranch"];
         options?: never;
@@ -994,6 +994,50 @@ export interface paths {
          */
         post: operations["detachEvidenceGraph"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/evidence/{ds}/holds": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the evidence holds
+         * @description Needs `admin` on the dataset. Lists the durable source holds of the evidence profile by id, a page at a time.
+         */
+        get: operations["listEvidenceHolds"];
+        put?: never;
+        /**
+         * Acquire an evidence hold
+         * @description Needs `admin` on the dataset. Keeps the commits readable until the hold is released: history trimming, compaction and generation retirement keep them, and a branch the hold names is deleted only with `releaseHolds=true`. The hold is durable when the answer arrives. The same id with the same commits answers `200` with the existing hold. Another set of commits under that id is `409 hold-conflict`, more than 65,536 held commits in the dataset is `409 holds-limit`, and a commit that is no longer readable is `410 history-gone`.
+         */
+        post: operations["acquireEvidenceHold"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/evidence/{ds}/holds/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Release an evidence hold
+         * @description Needs `admin` on the dataset. The held commits can be collected once the release is durable.
+         */
+        delete: operations["releaseEvidenceHold"];
         options?: never;
         head?: never;
         patch?: never;
@@ -5936,6 +5980,66 @@ export interface components {
             /** @description A protected graph of the settings' roles. */
             graph: string;
         };
+        /** @description A durable source hold that keeps commits readable. */
+        EvidenceHold: {
+            /** @description The held commits, sorted by branch identity and commit. */
+            commits: {
+                /** @description The branch's name, `null` once it is deleted. */
+                branch: string | null;
+                /**
+                 * Format: uuid
+                 * @description The branch's identity.
+                 */
+                branchId: string;
+                /** @description The commit's sequence number. */
+                commit: number;
+            }[];
+            /**
+             * Format: date-time
+             * @description When the hold was acquired.
+             */
+            created: string;
+            /**
+             * Format: uuid
+             * @description The hold's identity.
+             */
+            id: string;
+            /**
+             * @description The profile that holds the commits.
+             * @enum {string}
+             */
+            owner: "evidence";
+        };
+        /** @description A page of the evidence holds, by id. */
+        EvidenceHoldList: {
+            /** @description The commits all the evidence holds name together. */
+            heldCommits: number;
+            holds: components["schemas"]["EvidenceHold"][];
+            /** @description The most commits the dataset's holds may name together. */
+            maxCommits: number;
+            /** @description The `after` of the next page, `null` on the last. */
+            next: string | null;
+        };
+        /** @description The commits a new source hold keeps. */
+        EvidenceHoldRequest: {
+            /** @description The commits to keep readable. */
+            commits: {
+                /** @description The branch by name. `main` when neither member is present. */
+                branch?: string;
+                /**
+                 * Format: uuid
+                 * @description The branch by identity, as an evidence reference names it.
+                 */
+                branchId?: string;
+                /** @description The commit's sequence number. */
+                commit: number;
+            }[];
+            /**
+             * Format: uuid
+             * @description The hold's identity. A random one when absent.
+             */
+            id?: string;
+        };
         /** @description The evidence settings of a dataset, as `evidence.json` format 1 holds them. */
         EvidenceSettings: {
             /** @description Graphs of review decisions. */
@@ -6593,7 +6697,7 @@ export interface components {
                 bytes: number;
                 current: boolean;
                 endSeq: number;
-                /** @description `head`, `snapshot:NAME` or `retention`. */
+                /** @description `head`, `snapshot:NAME`, `retention`, `backup:NAME`, `clone:NAME`, `branch:NAME`, `branch-base:NAME` or `source-holds`. */
                 heldBy: string[];
                 name: string;
             }[];
@@ -12212,6 +12316,8 @@ export interface operations {
                 force?: boolean;
                 /** @description Delete a branch that other branches start from, and re-parent them. */
                 reparent?: boolean;
+                /** @description Release the source holds that name the branch, then delete it. Needs `admin`. */
+                releaseHolds?: boolean;
             };
             header?: never;
             path: {
@@ -12236,6 +12342,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -13035,6 +13142,115 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listEvidenceHolds: {
+        parameters: {
+            query?: {
+                /** @description Only holds that name this branch. */
+                onBranch?: string;
+                /** @description Start after this hold id, the `next` of the previous page. */
+                after?: string;
+                /** @description The most holds in the page, 1000 by default. */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of holds. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceHoldList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    acquireEvidenceHold: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceHoldRequest"];
+            };
+        };
+        responses: {
+            /** @description The existing hold of that id. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceHold"];
+                };
+            };
+            /** @description The new hold. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceHold"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            410: components["responses"]["Gone"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    releaseEvidenceHold: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token or lock. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Released. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
