@@ -68,15 +68,15 @@ impl ShapesSyntax {
         let n = name.trim().to_ascii_lowercase();
         match n.as_str() {
             "shaclc" | "shc" | "compact" => Some(ShapesSyntax::Compact),
-            "turtle" | "ttl" => Some(ShapesSyntax::Rdf(RdfFormat::Turtle)),
-            "ntriples" | "n-triples" | "nt" => Some(ShapesSyntax::Rdf(RdfFormat::NTriples)),
-            "nquads" | "n-quads" | "nq" => Some(ShapesSyntax::Rdf(RdfFormat::NQuads)),
-            "trig" => Some(ShapesSyntax::Rdf(RdfFormat::TriG)),
-            "rdfxml" | "rdf/xml" | "xml" | "rdf" => Some(ShapesSyntax::Rdf(RdfFormat::RdfXml)),
-            "jsonld" | "json-ld" => Some(ShapesSyntax::Rdf(RdfFormat::JsonLd {
-                profile: oxrdfio::JsonLdProfileSet::empty(),
-            })),
-            _ => ShapesSyntax::from_media_type(&n),
+            _ => match sparkles_core::syntaxes::by_name(&n) {
+                // shapes are not read from N3 or streaming JSON-LD
+                Some(RdfFormat::N3) => None,
+                Some(RdfFormat::JsonLd { .. }) => Some(ShapesSyntax::Rdf(RdfFormat::JsonLd {
+                    profile: oxrdfio::JsonLdProfileSet::empty(),
+                })),
+                Some(f) => Some(ShapesSyntax::Rdf(f)),
+                None => ShapesSyntax::from_media_type(&n),
+            },
         }
     }
 

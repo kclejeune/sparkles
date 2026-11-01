@@ -1680,24 +1680,10 @@ pub(crate) fn component(e: anyhow::Error) -> Error {
 }
 pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    let result = (|| {
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        sync_dir(path.parent().unwrap_or(Path::new(".")))
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(tmp);
-    }
-    result
+    Ok(sparkles_core::fsutil::write_atomic_via(path, &tmp, bytes)?)
 }
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
+    Ok(sparkles_core::fsutil::sync_dir(dir)?)
 }
 
 #[cfg(test)]

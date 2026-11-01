@@ -12,8 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// The named graph that reasoning writes and `include_inferred` reads.
-pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+pub use sparkles::reasoning::INFERRED_GRAPH;
 
 /// Rows of a later batch at most, and its size in bytes at most.
 const MAX_ROWS: u32 = 1 << 16;

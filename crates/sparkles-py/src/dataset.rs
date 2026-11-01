@@ -28,8 +28,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// The named graph that `reason` writes and `include_inferred` reads.
-pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+pub use sparkles::reasoning::INFERRED_GRAPH;
 
 /// An RDF dataset: the default graph and named graphs, in memory or in a database
 /// directory.

@@ -44,7 +44,7 @@ mod nested;
 pub use nested::{NestedAnchor, NestedFormModel, NestedNode};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const INFERRED: &str = "urn:x-sparkles:inferred";
+use sparkles_core::INFERRED_GRAPH as INFERRED;
 const LABELS: [&str; 5] = [
     "http://www.w3.org/2004/02/skos/core#prefLabel",
     "http://www.w3.org/2000/01/rdf-schema#label",

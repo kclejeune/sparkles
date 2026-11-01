@@ -49,19 +49,9 @@ pub struct Opts {
     pub named: Option<PathBuf>,
 }
 
-/// `30d`, `12h`, `90m` or `45s`.
+/// `30d`, `12h`, `90m` or `45s` (see [`sparkles::duration::parse_duration`]).
 pub fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
-    let n: u64 = n.parse().ok()?;
-    let secs = match unit {
-        "d" => n * 86_400,
-        "h" => n * 3600,
-        "m" => n * 60,
-        "s" => n,
-        _ => return None,
-    };
-    Some(Duration::from_secs(secs))
+    sparkles::duration::parse_duration(s)
 }
 
 /// One transcript file found for a project.

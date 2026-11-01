@@ -725,23 +725,14 @@ pub fn parse_rfc3339(s: &str) -> Result<i64> {
         .timestamp())
 }
 
-/// A duration `<n>s|m|h|d` in seconds.
+/// A duration of at least a second, such as `90s`, `30m`, `12h` or `7d` (see
+/// [`sparkles::duration::parse_duration`]), in whole seconds.
 pub fn parse_duration(s: &str) -> Result<i64> {
     let s = s.trim();
-    let (n, unit) = s.split_at(s.len().saturating_sub(1));
-    let mult = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86400,
-        _ => bail!("invalid duration '{s}' (expected <n>s, <n>m, <n>h or <n>d)"),
-    };
-    let n: i64 =
-        n.parse().ok().filter(|n| *n > 0).with_context(|| {
-            format!("invalid duration '{s}' (expected <n>s, <n>m, <n>h or <n>d)")
-        })?;
-    n.checked_mul(mult)
-        .with_context(|| format!("duration '{s}' is too long"))
+    let d = sparkles::duration::parse_duration(s)
+        .filter(|d| d.as_secs() > 0)
+        .with_context(|| format!("invalid duration '{s}' (expected <n>s, <n>m, <n>h or <n>d)"))?;
+    i64::try_from(d.as_secs()).with_context(|| format!("duration '{s}' is too long"))
 }
 
 /// A public URL: `http(s)://host[:port]` without a path; `http` only for loopback hosts.

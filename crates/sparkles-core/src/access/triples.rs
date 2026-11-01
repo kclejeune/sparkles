@@ -29,8 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) mod controlled;
 
-/// The graph of materialized inferences.
-pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+pub use crate::INFERRED_GRAPH;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 

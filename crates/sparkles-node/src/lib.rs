@@ -237,7 +237,8 @@ fn query_options(v: &Value, flag: Arc<AtomicBool>) -> sparkles::Result<QueryOpti
         }
     }
     if v["includeInferred"].as_bool() == Some(true) {
-        o.default_graph_extra.push("urn:x-sparkles:inferred".into());
+        o.default_graph_extra
+            .push(sparkles::reasoning::INFERRED_GRAPH.into());
     }
     Ok(o)
 }

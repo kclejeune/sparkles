@@ -65,8 +65,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use terms::{LocalTerm, Terms};
 
-/// Named graph holding materialized entailments.
-pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+pub use sparkles_core::INFERRED_GRAPH;
 
 /// Full RDFS entailment (Jena `etc/rdfs.rules`, W3C RDF 1.1 Semantics rules).
 pub const RDFS_RULES: &str = include_str!("../rules/rdfs.rules");

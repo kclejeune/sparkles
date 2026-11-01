@@ -5918,31 +5918,19 @@ pub(crate) fn dir_size(p: &Path) -> u64 {
         .sum()
 }
 
-/// Replace `path` durably: write and sync a temporary file, rename it over `path`, then
-/// sync the directory so the rename itself survives a power loss.
+/// [`crate::fsutil::write_atomic`] with the store's error type.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    write_synced(&tmp, bytes)?;
-    std::fs::rename(tmp, path)?;
-    sync_dir(path.parent().unwrap_or(Path::new(".")))
+    Ok(crate::fsutil::write_atomic(path, bytes)?)
 }
 
-/// Write a file and flush its contents to stable storage.
+/// [`crate::fsutil::write_synced`] with the store's error type.
 pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = File::create(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(())
+    Ok(crate::fsutil::write_synced(path, bytes)?)
 }
 
-/// Flush a directory's entries (created, renamed or removed files) to stable storage.
-/// Directories cannot be opened for syncing on Windows, where this is a no-op.
+/// [`crate::fsutil::sync_dir`] with the store's error type.
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
+    Ok(crate::fsutil::sync_dir(dir)?)
 }
 
 /// Apply an insert/delete to a delta, preserving the invariants

@@ -354,22 +354,16 @@ enum SnapshotCmd {
     },
 }
 
-/// `90s`, `30m`, `12h`, `7d`, `2w`, or plain seconds, to milliseconds.
+/// `90s`, `30m`, `12h`, `7d`, `2w` (see [`sparkles::duration::parse_duration`]), or
+/// plain seconds, to milliseconds.
 pub(crate) fn parse_duration_ms(s: &str) -> Result<u64> {
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (num, unit) = s.split_at(split);
-    let n: u64 = num
-        .parse()
-        .with_context(|| format!("invalid duration {s:?}"))?;
-    let secs = match unit {
-        "" | "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 604_800,
-        _ => bail!("invalid duration {s:?}: use s, m, h, d or w"),
+    let d = match s.trim().parse::<u64>() {
+        Ok(secs) => secs.checked_mul(1000),
+        Err(_) => {
+            sparkles::duration::parse_duration(s).and_then(|d| u64::try_from(d.as_millis()).ok())
+        }
     };
-    Ok(n * secs * 1000)
+    d.with_context(|| format!("invalid duration {s:?}: use ms, s, m, h, d or w"))
 }
 
 fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {

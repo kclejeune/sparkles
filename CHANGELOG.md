@@ -661,6 +661,18 @@ apply. `SPARKLES_DISABLE_OPTIMIZATIONS` warns about these names, and
 `Optimizations::NONE` now uses the flat hash table, selective column decoding, the
 corrected statistics and the key ranges of a fixed string start (X14, item 476).
 
+Every reader of RDF syntax names, file extensions and media types uses one registry,
+so the aliases that one place accepted work everywhere. `--format`, `format=` and
+syntax names accept `n-triples`, `n-quads`, `rdf/xml`, `rdf-xml` and `xml` wherever
+they name a syntax, `.owl` and `.xml` files read as RDF/XML in ShEx schemas and Fuseki
+configuration files, and `.json` configuration files read as JSON-LD. Durations accept
+`ms` and compound terms such as `1d 12h` everywhere the server or the backup policy reads
+one, and the auth configuration accepts weeks. The change-log index syncs its directory
+after it replaces its file. `sparkles map draft` escapes line breaks and quotes in table
+and column names, including in the template of a table without a primary key, which
+could produce invalid Turtle, and escapes backslashes in template column names (X14,
+item 477).
+
 ### Fixed
 
 A PDF converted in a child process no longer fails with "the converter stopped on it"

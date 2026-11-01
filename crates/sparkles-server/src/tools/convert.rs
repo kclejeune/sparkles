@@ -123,25 +123,11 @@ pub struct ConvertArgs {
 
 /// An RDF syntax by Jena's or Sparkles' name, short name, file extension or media type.
 pub fn rdf_syntax(name: &str) -> Option<RdfFormat> {
-    let jsonld = RdfFormat::JsonLd {
-        profile: oxrdfio::JsonLdProfileSet::empty(),
-    };
-    Some(match name.to_ascii_lowercase().as_str() {
-        "turtle" | "ttl" => RdfFormat::Turtle,
-        "n-triples" | "ntriples" | "n-triple" | "nt" => RdfFormat::NTriples,
-        "n-quads" | "nquads" | "n-quad" | "nq" => RdfFormat::NQuads,
-        "trig" => RdfFormat::TriG,
-        "rdf/xml" | "rdfxml" | "rdf" | "xml" | "owl" => RdfFormat::RdfXml,
-        "json-ld" | "jsonld" | "json" => jsonld,
-        "jsonld-streaming" | "json-ld-streaming" => RdfFormat::JsonLd {
-            profile: oxrdfio::JsonLdProfile::Streaming.into(),
-        },
-        "n3" => RdfFormat::N3,
-        other => {
-            return sparkles::io::format_for_media_type(other)
-                .or_else(|| RdfFormat::from_extension(other));
-        }
-    })
+    let name = name.to_ascii_lowercase();
+    sparkles::syntaxes::by_name(&name)
+        .or_else(|| sparkles::syntaxes::by_extension(&name))
+        .or_else(|| sparkles::io::format_for_media_type(&name))
+        .or_else(|| RdfFormat::from_extension(&name))
 }
 
 fn is_quad_syntax(f: RdfFormat) -> bool {

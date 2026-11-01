@@ -122,10 +122,9 @@ pub fn parse_timezone(s: &str) -> Result<Tz> {
         .map_err(|_| BackupError::new(Code::InvalidSchedule, format!("unknown time zone {s:?}")))
 }
 
-/// A retention, grace or schedule duration: one or more `<n><unit>` terms, spaces
-/// allowed between them (`30d`, `12h`, `1w`, `90m`, `1d 12h`). Units: `s`, `m`, `h`,
-/// `d`, `w`, also spelled `sec`, `min`, `hr`, `hour`, `day`, `week` (and plurals).
-/// `400 invalid-config` otherwise, and for a zero duration.
+/// A retention, grace or schedule duration, as
+/// [`sparkles_core::duration::parse_duration`] reads it (`30d`, `12h`, `1w`, `90m`,
+/// `1d 12h`). `400 invalid-config` otherwise, and for a zero duration.
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let bad = || {
         BackupError::new(
@@ -133,41 +132,14 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
             format!("cannot read the duration {s:?}"),
         )
     };
-    let src = s.trim().to_ascii_lowercase();
-    let mut rest = src.as_str();
-    if rest.is_empty() {
-        return Err(bad());
-    }
-    let mut total: u64 = 0;
-    while !rest.is_empty() {
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 {
-            return Err(bad());
-        }
-        let n: u64 = rest[..digits].parse().map_err(|_| bad())?;
-        rest = rest[digits..].trim_start();
-        let letters = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
-        let unit: u64 = match &rest[..letters] {
-            "s" | "sec" | "secs" | "second" | "seconds" => 1,
-            "m" | "min" | "mins" | "minute" | "minutes" => 60,
-            "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
-            "d" | "day" | "days" => 86_400,
-            "w" | "week" | "weeks" => 604_800,
-            _ => return Err(bad()),
-        };
-        total = n
-            .checked_mul(unit)
-            .and_then(|x| total.checked_add(x))
-            .ok_or_else(bad)?;
-        rest = rest[letters..].trim_start();
-    }
-    if total == 0 {
+    let total = sparkles_core::duration::parse_duration(s).ok_or_else(bad)?;
+    if total.is_zero() {
         return Err(BackupError::new(
             Code::InvalidConfig,
             format!("the duration {s:?} is zero"),
         ));
     }
-    Ok(Duration::from_secs(total))
+    Ok(total)
 }
 
 /// The instant a wall clock time `local` of `tz` stands for: itself when it exists

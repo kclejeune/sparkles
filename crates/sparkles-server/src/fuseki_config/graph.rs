@@ -27,8 +27,8 @@ pub struct ConfigGraph {
 
 /// The RDF syntax of a configuration file, from its extension.
 pub fn format_of(path: &Path) -> Option<oxrdfio::RdfFormat> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    oxrdfio::RdfFormat::from_extension(&ext)
+    let ext = path.extension()?.to_str()?;
+    sparkles::syntaxes::by_extension(ext).or_else(|| oxrdfio::RdfFormat::from_extension(ext))
 }
 
 impl ConfigGraph {

@@ -242,3 +242,30 @@ are different read paths.
 The generic operators of `Optimizations::NONE` remain the oracle of the differential
 tests. The test-only evaluator that follows the SPARQL algebra literally, after which
 the remaining off paths that only tests reach can go, is item NEW-ITEM-1.
+
+### Shared format registry and small helpers
+
+Item 477 shipped. `sparkles_core::syntaxes` is the registry of the names, file
+extensions and media types of the W3C RDF syntaxes. File names, media types, result
+format names, Jena-style syntax names, SHACL shapes syntax names, the `convert` tool,
+the ShEx schema hint and Fuseki configuration files look a syntax up there, so an alias
+that one of them accepted is accepted by all of them. The callers keep their
+exclusions. Results are not written in N3, and the generic JSON and XML media types
+still name result formats. A shapes file is not read as N3, and a `.json` ShEx schema
+is ShExJ. Jena reads the N3 media types as Turtle, and so do media-type lookups.
+`sparkles_core::INFERRED_GRAPH` is the one inferred-graph constant, which the other
+crates re-export, and `sparkles_core::duration::parse_duration` is the one parser of
+written durations, behind the backup policy, the server's retention and age flags,
+the auth configuration and the transcript import. `sparkles_core::fsutil::write_atomic`
+and `write_atomic_via` are the durable atomic write, which the store, the change-log
+index, the catalog and the server's state files use. The change-log index now also
+syncs its directory after the rename. The R2RML draft writer escapes its strings with
+the main mapping writer's Turtle escaping, so a table or column name with a line break
+or a quote no longer produces invalid Turtle.
+
+The helpers whose differences are deliberate keep their own code. The reasoner's
+unsynced write, the backup cache and the server's writers that set file permissions or
+keep a file's mode are not durable replacements in this sense. The day-based `assist`
+ages accept fractions and years, the rate limiter parses rates, and Fuseki's timeouts
+are milliseconds. The client and the formatter do not depend on `sparkles-core` and keep
+their extension tables.

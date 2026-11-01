@@ -22,8 +22,7 @@ use crate::branch::{
 use crate::history::At;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// The inferred graph that merges leave out unless asked to include it.
-pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+pub use crate::INFERRED_GRAPH;
 
 /// A toggle set: each quad whose presence differs, and whether it was added.
 pub(crate) type Toggles = FxHashMap<QuadKey, bool>;
