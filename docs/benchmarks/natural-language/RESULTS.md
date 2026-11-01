@@ -172,9 +172,9 @@ context is partial and to use one predicate per relation.
 [C18](../../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-grounding-from-predicate-use-item-263)
 describes the changes. The table compares it with the baseline on the same questions and
 settings. The QALD rows split into the 72 training questions that tuned the changes and
-the 35 validation questions. The fresh set is 150 questions from the QALD-9-plus training
-split that no tuning step read, chosen by the SHA-256 of a fixed seed and the question
-id after six duplicates of QALD test or db25 questions were dropped.
+the 35 validation questions. The fresh set is 150 questions from the QALD-9-plus
+training split that no tuning step read, chosen by the SHA-256 of a fixed seed and the
+question id after six duplicates of QALD test or db25 questions were dropped.
 
 | Measurement context | |
 |---|---|
@@ -204,11 +204,11 @@ id after six duplicates of QALD test or db25 questions were dropped.
 Each cell gives the strict projected score of record. The secondary score in brackets is
 `rdf-term-set-projected-guarded-lenient-v3` over the questions its gold rules keep, with
 the passes that rely on a predicate column or on dropped rows left out. The paired gain
-on the fresh set is 26.7 points with a 95% half-width of 7.6 for Haiku, which gained 42 questions and lost
-2, and 14.7 points with a half-width of 7.5 for Sonnet, which gained 29 and lost 7. On
-db25 it is 13.5 points for Haiku against the same starting commit and 12.2 points for
-Sonnet and for Opus, each with a half-width of about 10, and on QALD it is 13 to 20
-points for every model.
+on the fresh set is 26.7 points with a 95% half-width of 7.6 for Haiku, which gained 42
+questions and lost 2, and 14.7 points with a half-width of 7.5 for Sonnet, which gained
+29 and lost 7. On db25 it is 13.5 points for Haiku against the same starting commit and
+12.2 points for Sonnet and for Opus, each with a half-width of about 10, and on QALD it
+is 13 to 20 points for every model.
 
 The gain is largest on the fresh set, so it does not come from tuning to the QALD and
 db25 questions. Predicate-use grounding alone took Haiku from 24.0 to 35.0 on
@@ -226,12 +226,12 @@ answers and wrong query shape most of the rest.
 
 Haiku at commit 2d43aa5a scored 26 and 22 on QALD, against a mean of 28.0 at 7b3b6df5,
 and 21 on db25 against 19. The difference is within the noise of so few runs, and it may
-come from the grounding reordered for prompt caching. [ROADMAP](../../ROADMAP.md) item NEW-ITEM-2 tracks it. A provider
-outage stopped the first Haiku fresh baseline after 42 of 150 questions, and the record
-keeps that attempt and its cost beside the full rerun. The
-[paid record](../2026-11-01-ask-hillclimb-paid.json) gives per-run and per-case results
-under both scores, every case the secondary score changes, costs, token counts and source
-digests.
+come from the grounding reordered for prompt caching. [ROADMAP](../../ROADMAP.md) item
+NEW-ITEM-2 tracks it. A provider outage stopped the first Haiku fresh baseline after 42
+of 150 questions, and the record keeps that attempt and its cost beside the full rerun.
+The [paid record](../2026-11-01-ask-hillclimb-paid.json) gives per-run and per-case
+results under both scores, every case the secondary score changes, costs, token counts
+and source digests.
 
 #### Ask repair options
 
@@ -267,15 +267,15 @@ The guarded secondary score equals the strict score in every run. The exploratio
 3.0 questions, and its lowest run is above the highest baseline run, at about 16% more
 cost per question. It turns refusals into answers, which fall from 24 to 8 over the
 three runs. The shape check fires on at most 3 of the 51 questions in a run, so it
-cannot move the score much on this set, and it may help on data whose questions more often ask for counts or
-dates. Voting gains 1.0 question, inside the
-baseline's spread of 2, for 63% more cost per question. It may help a weaker model or a
-dataset whose drafts disagree more often. Type hints lose 2.3 questions, past the spread.
-More of their queries add a class constraint, and their empty results double from 11
-to 22 over the three runs. They may help on data whose labels are shared by many entities of different
-classes. The exploration with the shape check and voting scores no higher than the
-exploration alone and costs 59% more per question. Every option stays available through `assistant.json`, the ask request and
-the command line.
+cannot move the score much on this set, and it may help on data whose questions more
+often ask for counts or dates. Voting gains 1.0 question, inside the baseline's spread
+of 2, for 63% more cost per question. It may help a weaker model or a dataset whose
+drafts disagree more often. Type hints lose 2.3 questions, past the spread. More of
+their queries add a class constraint, and their empty results double from 11 to 22 over
+the three runs. They may help on data whose labels are shared by many entities of
+different classes. The exploration with the shape check and voting scores no higher than
+the exploration alone and costs 59% more per question. Every option stays available
+through `assistant.json`, the ask request and the command line.
 
 ### Global answering
 

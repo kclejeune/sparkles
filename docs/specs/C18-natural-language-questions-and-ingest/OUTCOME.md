@@ -1851,15 +1851,15 @@ half of the remaining wrong answers, as when "President Obama" does not reach
 `dbr:Barack_Obama`, and most of the rest have every gold term in the prompt and a wrong
 query shape.
 
-The secondary score `rdf-term-set-projected-guarded-lenient-v3` applies the guard and the
-gold and scorer fixes that the baseline checks demonstrated. It excludes gold that uses
-`SELECT *`, gold with a column unbound in every row, gold of empty strings alone and the
-one named erratum of `gold-errata-v1`, and it drops rows that hold only empty strings.
-It compares numbers by value, matches an unambiguous label to the gold IRI it names,
-fails an answer with more than three extra columns and reports apart any pass that relies
-on a predicate column or on rows the projection drops. The strict score stays the score of record, and the record lists every
-case that the secondary score changes. The comma-separated literal of db25-65 stays wrong
-under both scores.
+The secondary score `rdf-term-set-projected-guarded-lenient-v3` applies the guard and
+the gold and scorer fixes that the baseline checks demonstrated. It excludes gold that
+uses `SELECT *`, gold with a column unbound in every row, gold of empty strings alone
+and the one named erratum of `gold-errata-v1`, and it drops rows that hold only empty
+strings. It compares numbers by value, matches an unambiguous label to the gold IRI it
+names, fails an answer with more than three extra columns and reports apart any pass
+that relies on a predicate column or on rows the projection drops. The strict score
+stays the score of record, and the record lists every case that the secondary score
+changes. The comma-separated literal of db25-65 stays wrong under both scores.
 
 High effort for Sonnet was left for a later run. Four repair turns were then built as
 Ask options and measured three times each with Haiku on 51 validation questions, the 35
@@ -1872,21 +1872,21 @@ spread of 2, and type hints scored 22.7, so all three are off by default. Each o
 set from `assistant.json`, the ask request or the command line, and a sample value or a
 result row reaches a repair only when the dataset lets its providers receive rows. The
 [results](../../benchmarks/natural-language/RESULTS.md#ask-repair-options) give every
-run. Haiku at `2d43aa5a` scored
-24.0 on QALD over two runs against 28.0 over three at `7b3b6df5`, and 21 on db25 against
-19. The difference is within the noise of so few runs, and NEW-ITEM-2 tracks whether the
-grounding reordered for prompt caching costs accuracy. NEW-ITEM-1 tracks linking
-through redirects and aliases. The campaign spent $26.74 of a $50 cap in 3,696
-requests, with nothing unresolved, and a provider outage stopped one Haiku fresh
-baseline after 42 questions before it was rerun. The eight final phases took about three hours,
-one case at a time. `sparkles ask --questions` now asks a whole phase with one store
-and one model configuration, up to `--jobs` questions at once, and the Anthropic runner
-uses it with exact per-case cost holds. Caches then stay warm across a phase's
-questions, which lowers latency but leaves the answers unchanged. The
+run. Haiku at `2d43aa5a` scored 24.0 on QALD over two runs against 28.0 over three at
+`7b3b6df5`, and 21 on db25 against 19. The difference is within the noise of so few
+runs, and NEW-ITEM-2 tracks whether the grounding reordered for prompt caching costs
+accuracy. NEW-ITEM-1 tracks linking through redirects and aliases. The campaign spent
+$26.74 of a $50 cap in 3,696 requests, with nothing unresolved, and a provider outage
+stopped one Haiku fresh baseline after 42 questions before it was rerun. The eight final
+phases took about three hours, one case at a time. `sparkles ask --questions` now asks a
+whole phase with one store and one model configuration, up to `--jobs` questions at
+once, and the Anthropic runner uses it with exact per-case cost holds. Caches then stay
+warm across a phase's questions, which lowers latency but leaves the answers unchanged.
+The
 [results](../../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)
-give the secondary scores and the
-[paid record](../../benchmarks/2026-11-01-ask-hillclimb-paid.json) gives the per-case
-results, costs and source digests.
+give the secondary scores and the [paid
+record](../../benchmarks/2026-11-01-ask-hillclimb-paid.json) gives the per-case results,
+costs and source digests.
 
 ### Roadmap follow-ups
 

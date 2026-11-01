@@ -10,12 +10,12 @@ the same format, and `--loc DIR` runs a set against a database.
 
 `scripts/qald9plus-convert` converts the 150 questions of the QALD-9-plus DBpedia test
 split, and `--split train` converts the 408 questions of its training split, whose IDs
-start with `qald9p-train-`. `scripts/text2sparql-convert --set db25` converts the 100 DBpedia questions of
-Text2SPARQL'25, and `--set ck25` the 50 questions over CK25, the challenge's corporate
-graph. `scripts/lcquad2-convert` converts the 6,046 questions of the LC-QuAD 2.0 test
-split over Wikidata, and `--sample N` keeps a fixed sample of them. Each converter pins
-its source files by commit and SHA256 and fetches them, or reads local copies with
-`--input`. None of the data is kept in the repository.
+start with `qald9p-train-`. `scripts/text2sparql-convert --set db25` converts the 100
+DBpedia questions of Text2SPARQL'25, and `--set ck25` the 50 questions over CK25, the
+challenge's corporate graph. `scripts/lcquad2-convert` converts the 6,046 questions of
+the LC-QuAD 2.0 test split over Wikidata, and `--sample N` keeps a fixed sample of them.
+Each converter pins its source files by commit and SHA256 and fetches them, or reads
+local copies with `--input`. None of the data is kept in the repository.
 
 Given `--sparkles` and a database with `--loc`, a converter runs every gold query on that
 database and drops the questions whose gold returns nothing, fails or cannot be scored.
@@ -126,11 +126,12 @@ Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
 a refusal by the model, an Ask timeout or an unusable draft is a failed answer with the
 status `provider_error`, `refusal`, `timeout`, `budget_exceeded` or `invalid_output`,
-and the run goes on. An Ask child that ends by SIGKILL, as when the kernel's out-of-memory
-killer or a memory cap stops it, or by SIGABRT after a failed allocation is the failed
-case `killed`, since its generated query is the likely cause. A case that the cost cap refused is `budget_refused`. It leaves the
-denominators, marks its row incomplete and ends the run. A harness fault stops a run,
-such as failing gold, a wrong binary hash or a child with an unknown exit status.
+and the run goes on. An Ask child that ends by SIGKILL, as when the kernel's
+out-of-memory killer or a memory cap stops it, or by SIGABRT after a failed allocation
+is the failed case `killed`, since its generated query is the likely cause. A case that
+the cost cap refused is `budget_refused`. It leaves the denominators, marks its row
+incomplete and ends the run. A harness fault stops a run, such as failing gold, a wrong
+binary hash or a child with an unknown exit status.
 
 Each child has capped output, its own process group and cleanup. A matrix has no
 wall-clock deadline unless `--phase-deadline` sets one. Ask gets 300 seconds, a query
@@ -206,18 +207,18 @@ escapes it ends the whole batch child and fails the cases in flight with it.
 ## The cost cap
 
 `scripts/eval-ask-paid` starts a proxy on a loopback port and gives the children a
-random token in place of the key. `scripts/eval-ask-anthropic` is the same command
-under its earlier name. Only the proxy reads `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`
-for a run file whose `provider` is `openai`, and neither key reaches a child. It sends
-each request once to `api.anthropic.com`, or to `api.openai.com` for OpenAI, with the standard library, so Content-Length,
-chunked and close-delimited replies all work. A reply that comes back gzip or deflate
-encoded, although the request asks for none, is decoded. It sets `stream` to false and
-the effort from the run file, and it refuses tools, cache control and any model outside
-the run. The key is stripped once when it is read, and a key with whitespace or control
-characters inside is refused. An error inside the request keeps only its class, so the
-key cannot reach a message. The key does stay in the proxy's initial process
-environment, which another process of the same user can read, so the machine should be
-one only the operator uses.
+random token in place of the key. `scripts/eval-ask-anthropic` is the same command under
+its earlier name. Only the proxy reads `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` for a
+run file whose `provider` is `openai`, and neither key reaches a child. It sends each
+request once to `api.anthropic.com`, or to `api.openai.com` for OpenAI, with the
+standard library, so Content-Length, chunked and close-delimited replies all work. A
+reply that comes back gzip or deflate encoded, although the request asks for none, is
+decoded. It sets `stream` to false and the effort from the run file, and it refuses
+tools, cache control and any model outside the run. The key is stripped once when it is
+read, and a key with whitespace or control characters inside is refused. An error inside
+the request keeps only its class, so the key cannot reach a message. The key does stay
+in the proxy's initial process environment, which another process of the same user can
+read, so the machine should be one only the operator uses.
 
 A JSON-lines ledger at the run file's `ledger` path holds the cap. Before each request the
 proxy writes a reserve line with an upper bound from the request size and `max_tokens`,
@@ -244,18 +245,18 @@ are refused the same way, and need a new ledger directory or an edit by hand.
 
 A charge that stands at an upper bound can be reconciled with the amount the provider
 billed. Such charges are the carryover, a reserve that a crash left without a settle
-line, a request settled at its bound because its reply was lost or its usage could
-not be read, and a reply of another model, whose charge is an estimate. `--held` lists them with each request's model, case, time and request ID.
-`--reconcile TARGET --billed-nanodollars N --evidence TEXT` appends a reconcile line
-that replaces one of them, where TARGET is `carryover` or a request ID. The evidence is
-10 to 1000 printable characters that name the source of the amount, such as the
-Console's cost for one day of an API key that only the run used. The held charge is an
-upper bound, so an amount above it is refused unless `--allow-raise` is given, and the
-line then records the raise. The command prints the previous and the new amount. Each
-charge is reconciled once, and replay checks every reconcile line against the charge it
-replaced. Neither command reads a key or sends a request, and both create the ledger
-with its carryover when it does not exist yet. Both take the ledger's lock, so they
-cannot run while a paid run holds it.
+line, a request settled at its bound because its reply was lost or its usage could not
+be read, and a reply of another model, whose charge is an estimate. `--held` lists them
+with each request's model, case, time and request ID. `--reconcile TARGET
+--billed-nanodollars N --evidence TEXT` appends a reconcile line that replaces one of
+them, where TARGET is `carryover` or a request ID. The evidence is 10 to 1000 printable
+characters that name the source of the amount, such as the Console's cost for one day of
+an API key that only the run used. The held charge is an upper bound, so an amount above
+it is refused unless `--allow-raise` is given, and the line then records the raise. The
+command prints the previous and the new amount. Each charge is reconciled once, and
+replay checks every reconcile line against the charge it replaced. Neither command reads
+a key or sends a request, and both create the ledger with its carryover when it does not
+exist yet. Both take the ledger's lock, so they cannot run while a paid run holds it.
 
 ```
 scripts/eval-ask-paid --run RUN.json --held
@@ -339,12 +340,13 @@ ledger holds the rest with a cap of USD 49.1452. The two caps together equal the
 the models of each set, the effort, `maxOutputTokens`, the request and Ask timeouts, the
 query timeout, the cap, the carryover, the ledger, the output directory and the binary
 with its SHA256. The carryover is required, zero for a fresh authorization, and the cap
-plus the carryover cannot pass USD 50 for either provider. `clarifications` is `answer` unless the run file
-sets `score`. `contextTokens` gives every model its context window. Without it the server
-assumes 8192 tokens, treats each model as a small one and trims the grounding to 30
-classes, 60 predicates, two examples and three candidates per mention, which is how the
-first paid run asked. A real run refuses a second `.jsonl` file in the ledger directory, so the ledger
-file stays the account of record for the whole spend.
+plus the carryover cannot pass USD 50 for either provider. `clarifications` is `answer`
+unless the run file sets `score`. `contextTokens` gives every model its context window.
+Without it the server assumes 8192 tokens, treats each model as a small one and trims
+the grounding to 30 classes, 60 predicates, two examples and three candidates per
+mention, which is how the first paid run asked. A real run refuses a second `.jsonl`
+file in the ledger directory, so the ledger file stays the account of record for the
+whole spend.
 
 `askTokenBudget` is the total token limit of one Ask. The default of 32768 ends most
 repaired or DBpedia-grounded Asks after one or two calls, so the example sets 100000. The
