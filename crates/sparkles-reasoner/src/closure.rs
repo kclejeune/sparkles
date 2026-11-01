@@ -627,10 +627,20 @@ impl Builder {
         let ids_cap = grow(self.ids.capacity(), self.ids.len() + nodes);
         let at_cap = grow(self.at.capacity(), self.at.len() + nodes);
         let pairs_cap = grow(self.pairs.capacity(), self.pairs.len() + 1);
+        // a growing buffer keeps its old allocation while it builds the new one, so
+        // both are charged until the growth is done
+        let grown = |old: usize, new: usize| if new > old { old + new } else { old };
         self.held.try_set(
-            ids_cap * size_of::<u64>()
-                + table_bytes(at_cap, size_of::<(u64, u32)>())
-                + pairs_cap * size_of::<(u32, u32)>(),
+            grown(
+                self.ids.capacity() * size_of::<u64>(),
+                ids_cap * size_of::<u64>(),
+            ) + grown(
+                table_bytes(self.at.capacity(), size_of::<(u64, u32)>()),
+                table_bytes(at_cap, size_of::<(u64, u32)>()),
+            ) + grown(
+                self.pairs.capacity() * size_of::<(u32, u32)>(),
+                pairs_cap * size_of::<(u32, u32)>(),
+            ),
         )?;
         self.ids.reserve_exact(ids_cap - self.ids.len());
         self.at.reserve(at_cap - self.at.len());

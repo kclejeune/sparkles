@@ -788,12 +788,20 @@ fn closure_operators_charge_their_scratch() {
 }
 
 /// The graph an operator builds charges each growth of its buffers before it reserves
-/// it: a limit of 4 MiB stops the reverse star's graph within the limit. When the
-/// buffers were charged every 65,536 edges, the run allocated 8.8 MB first.
+/// it, together with the old buffer that the growth copies from: limits of 4 and 7 MiB
+/// stop the reverse star's graph within the limit. When the buffers were charged every
+/// 65,536 edges, the run allocated 8.8 MB first, and when a growth charged only the new
+/// table, 8.8 MB under the limit of 7 MiB.
 #[test]
 fn closure_graphs_charge_before_growing() {
+    for mib in [4, 7] {
+        graph_within(mib << 20);
+    }
+}
+
+/// The reverse star's run under `limit` fails with the memory limit within it.
+fn graph_within(limit: usize) {
     let _one = one_at_a_time();
-    const LIMIT: usize = 4 << 20;
     // the store's blocks a scan decodes and the evaluation state
     const SLACK: usize = 512 << 10;
     let s = Store::in_memory(StoreOptions::default());
@@ -808,12 +816,12 @@ fn closure_graphs_charge_before_growing() {
     let _ = infer(snap.clone(), &rules, &limited(None));
     let before = NOW.load(Ordering::SeqCst);
     PEAK.store(before, Ordering::SeqCst);
-    let e = infer(snap, &rules, &limited(Some(LIMIT))).unwrap_err();
+    let e = infer(snap, &rules, &limited(Some(limit))).unwrap_err();
     let over = PEAK.load(Ordering::SeqCst) - before;
     eprintln!("the failed run allocated {over} bytes beyond what it started with");
     assert!(e.to_string().contains("memory limit"), "{e:#}");
     assert!(
-        over <= LIMIT + SLACK,
-        "the failed run allocated {over} bytes for a limit of {LIMIT}"
+        over <= limit + SLACK,
+        "the failed run allocated {over} bytes for a limit of {limit}"
     );
 }
