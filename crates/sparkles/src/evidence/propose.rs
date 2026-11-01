@@ -725,10 +725,14 @@ pub fn operation_recorded(main: &Dataset, id: Uuid, control: &Control) -> Result
 /// the hold, which the store then does not release. The store asks again under the
 /// lock that every release takes, and that second answer reads only current
 /// snapshots of those stores and takes no writer or branch table, since a commit
-/// waiting for the lock may hold its writer.
+/// waiting for the lock may hold its writer. A branch that is renamed, deleted or
+/// replaced under its name while the stores are found keeps every hold.
 pub fn reconcile_operation_holds(main: &Dataset, grace_ms: i64) -> Result<Vec<Uuid>> {
     let control = Control::none();
     let mut stores: Option<Vec<Dataset>> = None;
+    // A branch renamed while it is found may open another branch under its name, so
+    // the stores found may miss one: then every hold is kept.
+    let mut unsure = false;
     super::reconcile_holds(main, grace_ms, &mut |hold| {
         let stores = match &mut stores {
             Some(s) => s,
@@ -736,13 +740,18 @@ pub fn reconcile_operation_holds(main: &Dataset, grace_ms: i64) -> Result<Vec<Uu
                 // the listed branches, found without their heads, so without writers
                 let mut found = vec![main.clone()];
                 for id in main.store().listed_branch_ids() {
-                    if let Some(name) = main.store().listed_branch_name(id, &Default::default())? {
-                        found.push(main.branch(&name)?);
+                    let name = main.store().listed_branch_name(id, &Default::default())?;
+                    match name.map(|n| main.branch(&n)) {
+                        Some(Ok(ds)) if ds.store().branch_id() == id => found.push(ds),
+                        _ => unsure = true,
                     }
                 }
                 stores.insert(found)
             }
         };
+        if unsure {
+            return Ok(true);
+        }
         let op = operation_iri(hold.id);
         let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
         for ds in stores.iter() {
