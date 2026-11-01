@@ -1034,6 +1034,12 @@ the `--cargo-args` text, and a default build keeps the plain commit key. An entr
 reused only when its `build.txt` records the same cargo arguments, and an entry without
 that record is rebuilt. Compiler changes still require removing the entry by hand.
 
+Each build extracts its source into a private directory under
+`~/.cache/sparkles-nsc/src` and removes it when the run ends. A lock per cache entry
+under `locks` serializes builds of the same entry. A second run of the same commit and
+cargo arguments waits for the first build, then reuses the finished binary. Runs of
+different commits or arguments build at the same time. The script needs `flock`.
+
 ```sh
 mise run bench:nsc main my-branch                                   # 1.05M triples, every query
 mise run bench:nsc ba547b89 c2fe4b92 --queries "optional-count minus regex-iri"

@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -122,6 +123,8 @@ import json,os,pathlib,subprocess,sys
 args=sys.argv[1:]
 with open(os.environ['CACHE_TEST_CALLS'],'a') as stream:stream.write(json.dumps(args)+'\\n')
 if args[:2]==['sparkles-task','--']:raise SystemExit(subprocess.run(args[2:]).returncode)
+import time
+time.sleep(float(os.environ.get('CACHE_TEST_DELAY','0')))
 pathlib.Path('target/release').mkdir(parents=True,exist_ok=True)
 pathlib.Path('target/release/sparkles').write_text('built with '+' '.join(args[4:]))
 pathlib.Path('target/release/sparkles').chmod(0o755)
@@ -186,6 +189,27 @@ a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a
         self.assertEqual(self.bench()[0], "built with ")
         self.assertEqual(self.builds(), 1)
         self.assertIn("cargo args: \n", (entry / "build.txt").read_text())
+
+    def start(self, tag):
+        out = self.root / f"out-{tag}"
+        return out, subprocess.Popen(
+            ["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out), self.sha, self.sha],
+            env=dict(self.env, CACHE_TEST_DELAY="1.5"), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+
+    def test_concurrent_runs_of_one_commit_build_it_once(self):
+        runs = [self.start("first")]
+        time.sleep(0.5)  # the first run is inside its build when the second starts
+        runs.append(self.start("second"))
+        for out, process in runs:
+            _, stderr = process.communicate(timeout=60)
+            # Both runs stop at the compiler check, after staging a complete binary.
+            self.assertIn("not built with the same known compilers", stderr)
+            self.assertNotIn("build of", stderr)
+            self.assertEqual((out / "stage/bin-A.zst").read_text(), "built with ")
+        self.assertEqual(self.builds(), 1)
+        leftovers = [p.name for p in (self.cache / "src").iterdir()]
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

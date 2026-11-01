@@ -140,9 +140,9 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -eq 2 ] || usage 1
-for t in nsc zstd python3 mbx cargo readelf; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+for t in nsc zstd python3 mbx cargo readelf flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 OUT=$(realpath -m "${OUT:-$ROOT/.artifacts/nsc-bench/$(date -u +%Y%m%dT%H%M%SZ)}")
-mkdir -p "$OUT/stage/queries" "$OUT/logs" "$CACHE"/{bin,data,src}
+mkdir -p "$OUT/stage/queries" "$OUT/logs" "$CACHE"/{bin,data,src,locks}
 STAGE=$OUT/stage
 MANIFEST=$OUT/manifest.txt
 : > "$MANIFEST"
@@ -156,9 +156,18 @@ compilers() {
   readelf -p .comment "$1" 2> /dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | sort -u | paste -sd ';' - | sed 's/;/; /g'
 }
 declare -A COMPILERS
+# The private source tree of this run's build, removed when the run ends in any way.
+SRC_TMP=
+cleanup_src() {
+  [ -z "$SRC_TMP" ] || rm -rf -- "$SRC_TMP"
+  SRC_TMP=
+}
+trap cleanup_src EXIT
+trap 'exit 130' INT TERM
 # binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source, SHA-256 and compilers
 binary() {
-  local ref=$1 v=$2 bin sha src key entry
+  local ref=$1 v=$2 bin sha src key entry lock
+  entry_current() { [ -x "$bin" ] && grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null; }
   if [ -f "$ref" ]; then
     bin=$(realpath "$ref")
     src="file $bin"
@@ -171,31 +180,41 @@ binary() {
     entry=$CACHE/bin/$key
     bin=$entry/sparkles
     # An entry without a build record, or one recording other arguments, is rebuilt.
-    if [ ! -x "$bin" ] || ! grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null; then
-      echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
-      rm -rf "${CACHE:?}/src/$sha" "$entry/build.txt"
-      mkdir -p "$CACHE/src/$sha" "$entry"
-      # Keep source mtimes current. Each archive has its own managed mutable target;
-      # Boxington shares immutable build results rather than one Cargo target.
-      git -C "$ROOT" archive "$sha" | tar -x -m -C "$CACHE/src/$sha"
-      # the server embeds ui/build; its build script writes a placeholder, but does not
-      # rerun for a second source tree in the shared target directory
-      mkdir -p "$CACHE/src/$sha/ui/build"
-      echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
-        > "$CACHE/src/$sha/ui/build/index.html"
-      # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
-      (cd "$CACHE/src/$sha" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) \
-        > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
-      # the shell's compilers, beside the binary's own record of them in .comment
-      {
-        echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "cargo args: $CARGO_ARGS"
-        echo "cc: $(cc --version 2> /dev/null | head -1)"
-        echo "c++: $(c++ --version 2> /dev/null | head -1)"
-        (cd "$CACHE/src/$sha" && rustc -V)
-      } > "$entry/build.txt.tmp"
-      mv "$entry/build.txt.tmp" "$entry/build.txt"
-      rm -rf "${CACHE:?}/src/$sha"
+    # A lock per cache key makes a concurrent run of the same commit wait here and then
+    # reuse the finished build. The source tree is private to this run in any case.
+    if ! entry_current; then
+      exec {lock}> "$CACHE/locks/$key.lock"
+      flock "$lock"
+      if ! entry_current; then
+        echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
+        rm -f "$entry/build.txt"
+        mkdir -p "$entry"
+        SRC_TMP=$(mktemp -d "$CACHE/src/$key.XXXXXXXX")
+        # Keep source mtimes current. Each archive has its own managed mutable target;
+        # Boxington shares immutable build results rather than one Cargo target.
+        git -C "$ROOT" archive "$sha" | tar -x -m -C "$SRC_TMP"
+        # the server embeds ui/build; its build script writes a placeholder, but does not
+        # rerun for a second source tree in the shared target directory
+        mkdir -p "$SRC_TMP/ui/build"
+        echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
+          > "$SRC_TMP/ui/build/index.html"
+        # The build must not inherit the lock descriptor, or a process it leaves behind would
+        # keep the lock after this run ends.
+        # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
+        (cd "$SRC_TMP" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) {lock}>&- \
+          > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
+        # the shell's compilers, beside the binary's own record of them in .comment
+        {
+          echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "cargo args: $CARGO_ARGS"
+          echo "cc: $(cc --version 2> /dev/null | head -1)"
+          echo "c++: $(c++ --version 2> /dev/null | head -1)"
+          (cd "$SRC_TMP" && rustc -V)
+        } > "$entry/build.txt.tmp"
+        mv "$entry/build.txt.tmp" "$entry/build.txt"
+        cleanup_src
+      fi
+      exec {lock}>&-
     fi
     src="commit $sha ($ref)"
     [ -z "$CARGO_ARGS" ] || src+=", cargo $CARGO_ARGS"
@@ -285,7 +304,7 @@ destroy() {
   note "instance lifetime: $s s, billed as $min minutes x $VCPUS vCPUs = $((min * VCPUS)) vCPU-minutes (\$$(awk "BEGIN {printf \"%.3f\", $min * $VCPUS * 0.0015}") at the overage rate)"
   ID=
 }
-trap destroy EXIT
+trap 'destroy; cleanup_src' EXIT
 trap 'exit 130' INT TERM
 
 T_CREATE=$(now)
