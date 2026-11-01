@@ -107,9 +107,9 @@
       "metadata_note": "Null fields mean this metadata is not available in the common record fields. Read the raw assessment for its own provenance and correctness contract."
     },
     {
-      "run_id": "sha256-1241b9257ffe31c61cedfbe8debe54acc7d2f5e0ac0585f95ef837fc952172c9",
+      "run_id": "sha256-bd6c6834a171c2af71e6e1d6590e938608a20a1bed2c7c2b8d416bd0d4519017",
       "path": "../2026-11-01-ask-model-baseline-paid.json",
-      "sha256": "1241b9257ffe31c61cedfbe8debe54acc7d2f5e0ac0585f95ef837fc952172c9",
+      "sha256": "bd6c6834a171c2af71e6e1d6590e938608a20a1bed2c7c2b8d416bd0d4519017",
       "format": "legacy-assessment",
       "context": {
         "suite": null,

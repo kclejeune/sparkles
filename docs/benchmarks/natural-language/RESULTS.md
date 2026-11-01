@@ -107,9 +107,9 @@ of scorer error. Three QALD gold queries cast an `xsd:gYear` to `xsd:date`, whic
 1.1 refuses, so their gold is one row with no binding. One projects a variable that is
 never bound, and one more, in db25, uses `SELECT *` and so demands the book beside each
 author. One gold answer is the infobox text "SeeList of nicknames for San Francisco", and
-three include an empty string beside the real answers. The four that have no binding or
-an unbound column cannot be matched. The other five can be matched only by returning the
-same defective data, which happened for one of them in every QALD run and for two in the
+three include an empty string beside the real answers. No correctly shaped answer matches
+the four that have no binding or an unbound column, although a query that fails the same
+way would. The other five can be matched only by returning the same defective data, which happened for one of them in every QALD run and for two in the
 Opus run. Without these nine questions, the projected scores are 27, 28 and 26 of 99 for
 Haiku, 31 and 33 for Sonnet and 39 for Opus on QALD, and 19, 32 and 33 of 73 on db25.
 

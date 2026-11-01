@@ -7586,19 +7586,19 @@
  "goldOverrides": {
   "qald9p-125": {
    "category": "f",
-   "note": "gold BIND(year(xsd:date(?end)) - ...) casts an xsd:gYear to xsd:date, which SPARQL 1.1 refuses, so the gold is one row with no binding and no answer can match"
+   "note": "gold BIND(year(xsd:date(?end)) - ...) casts an xsd:gYear to xsd:date, which SPARQL 1.1 refuses, so the gold is one row with no binding that no correctly shaped answer matches"
   },
   "qald9p-82": {
    "category": "f",
-   "note": "gold projects xsd:date(?year) of an xsd:gYear, which fails, so the gold is one row with no binding"
+   "note": "gold projects xsd:date(?year) of an xsd:gYear, which fails, so the gold is one row with no binding that no correctly shaped answer matches"
   },
   "qald9p-78": {
    "category": "f",
-   "note": "gold projects xsd:date(?date) of an xsd:gYear, which fails, so the gold is one row with no binding"
+   "note": "gold projects xsd:date(?date) of an xsd:gYear, which fails, so the gold is one row with no binding that no correctly shaped answer matches"
   },
   "qald9p-122": {
    "category": "f",
-   "note": "gold projects ?uri ?string with ?string never bound, so the scorer requires a second column and refuses every one-column answer"
+   "note": "gold projects ?uri ?string with ?string never bound, so the scorer requires a second, unbound column and refuses every one-column answer"
   },
   "db25:db25-100": {
    "category": "f",

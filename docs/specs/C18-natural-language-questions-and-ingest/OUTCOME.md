@@ -1752,9 +1752,11 @@ The proposed improvements, in order of expected effect, are these.
 5. Compare medium and high effort for Sonnet. Opus costs twice as much per question as
    Sonnet for about 8 more points, and effort has not been varied.
 6. Fix the gold and scorer problems that the checks demonstrated. The converters should
-   drop gold rows with no binding, unbound projected columns and empty-string values,
-   and the scorer should report a lenient count for numeric datatypes and IRI labels
-   beside the strict count. These change 0 to 3 answers per run, and both scores stay.
+   repair or exclude the questions whose gold cast fails or projects an unbound column,
+   since dropping their only row would let an empty answer pass. They should also drop
+   empty-string gold values, and the scorer should report a lenient count for numeric
+   datatypes and IRI labels beside the strict count. The scorer fixes change 0 to 3
+   answers per run, and both scores stay.
 7. Guard the projected policy by capping extra columns at three and reporting passes
    that rely on predicate columns or dropped rows separately.
 
