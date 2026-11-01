@@ -657,6 +657,14 @@ def nt_norm(term):
     return t
 
 
+def is_triple_export(query, names):
+    """Whether the query is a plain export of triples, `SELECT ?s ?p ?o` or `SELECT *` over
+    the single pattern `?s ?p ?o`, whose rows must then be triples of the input."""
+    q = re.sub(r"#[^\n]*", "", re.sub(r"<[^<>\s]*>", "<>", query))
+    return names == ["s", "p", "o"] and re.search(r"\{\s*\?s\s+\?p\s+\?o\s*\.?\s*\}", q) is not None \
+        and len(re.findall(r"[{}]", q)) == 2
+
+
 def missing_triples(rows, data):
     """How many of `rows`, (s, p, o) N-Triples terms, are not triples of the N-Triples file
     `data`, which is read once as a stream."""
@@ -710,8 +718,10 @@ def order_digest(args):
             # be any, still cannot repeat rows unnoticed; with --data, a three-column answer
             # also counts its rows that are not triples of the input
             lines = [line.rstrip("\n") for line in f]
-            out = f"distinct:{len(set(lines))}"
-            if args.data and len(names) == 3:
+            # the header, since a LIMIT's count and distinct rows say nothing about it
+            schema = hashlib.sha256("\t".join(header).encode()).hexdigest()[:8]
+            out = f"distinct:{len(set(lines))} schema:{schema}"
+            if args.data and is_triple_export(query, names):
                 rows = [line.split("\t") for line in lines]
                 out += f" missing:{missing_triples(rows, args.data)}"
             print(out)
@@ -801,7 +811,7 @@ def native_digest(args):
         return
     rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
     missing = None
-    if args.data and len(names) == 3 and ba._after_order_by(query) is None:
+    if args.data and is_triple_export(query, names) and ba._after_order_by(query) is None:
         missing = missing_triples([[native_nt(t) for t in row] for row in r.get("rows") or []], args.data)
     # the query type and the projected variables, in order, belong to the answer
     head = f"{r.get('queryType')} " + " ".join(names)

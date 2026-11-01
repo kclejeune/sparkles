@@ -359,7 +359,7 @@ class GateTests(unittest.TestCase):
             self.assertTrue(e.startswith("rows:"))
             self.assertNotEqual(e, digest([("<c>", "50"), ("<b>", "10"), ("<a>", "90")]))
             q.write_text("SELECT ?p WHERE { ?p <age> ?a }")
-            self.assertEqual(digest([("<a>", "90"), ("<a>", "90")]), "distinct:1")
+            self.assertTrue(digest([("<a>", "90"), ("<a>", "90")]).startswith("distinct:1 schema:"))
 
     def test_executors_compares_the_order_of_ordered_answers(self):
         with tempfile.TemporaryDirectory() as d:
@@ -531,12 +531,21 @@ class GateTests(unittest.TestCase):
             data = Path(d) / "data.nt"
             data.write_text('<a> <p> "x"@en .\n<a> <q> "5"^^<http://www.w3.org/2001/XMLSchema#integer> .\n<b> <p> <c> .\n')
             q = Path(d) / "q.rq"
-            q.write_text("SELECT * WHERE { ?s ?p ?o } LIMIT 3")
+            q.write_text("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 3")
             t = Path(d) / "a.tsv"
             t.write_text('?s\t?p\t?o\n<a>\t<p>\t"x"@en\n<a>\t<q>\t5\n')
-            self.assertEqual(run("order-digest", q, t, "--data", data).stdout.strip(), "distinct:2 missing:0")
+            ok = run("order-digest", q, t, "--data", data).stdout.split()
+            self.assertEqual((ok[0], ok[2]), ("distinct:2", "missing:0"))
+            # a permuted header changes the schema
+            t.write_text('?o\t?p\t?s\n<a>\t<p>\t"x"@en\n<a>\t<q>\t5\n')
+            self.assertNotEqual(run("order-digest", q, t, "--data", data).stdout.split()[1], ok[1])
             t.write_text('?s\t?p\t?o\n<z>\t<p>\t"x"@en\n<a>\t<q>\t5\n')
-            self.assertEqual(run("order-digest", q, t, "--data", data).stdout.strip(), "distinct:2 missing:1")
+            self.assertEqual(run("order-digest", q, t, "--data", data).stdout.split()[2], "missing:1")
+            # a three-column answer that is not a triple export is not checked against the input
+            oc = Path(d) / "oc.rq"
+            oc.write_text("SELECT ?p ?o ?c WHERE { ?p <knows> ?o OPTIONAL { ?o <c> ?c } } LIMIT 3")
+            t.write_text('?p\t?o\t?c\n<z>\t<y>\t<x>\n')
+            self.assertNotIn("missing", run("order-digest", oc, t, "--data", data).stdout)
             f = Path(d) / "resp.json"
             def native(s_):
                 f.write_text(json.dumps({"queryType": "SELECT", "vars": ["s", "p", "o"], "rows": [
