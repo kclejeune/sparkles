@@ -10,8 +10,16 @@
 //! holds the shared issue guard instead and leaves the generation unchanged. The
 //! issuer compares the generation its authentication observed with the guarded
 //! value and fails only when an exclusive update completed in between.
+//!
+//! A write authorized by a credential holds the shared guard across its check and
+//! its publication ([`AuthorityRegistry::begin_hold`]). Revoking one credential
+//! holds the exclusive revocation guard while it removes the credential
+//! ([`AuthorityRegistry::begin_revocation`]), which leaves the generation unchanged.
+//! A revocation therefore completes either before the write's check, which then
+//! finds the credential gone, or after the write published.
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A common revocation fence for policy and credential changes.
@@ -19,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct AuthorityRegistry {
     // Access adapters may borrow this fence after completing policy callbacks.
     // Keep it unavailable to external hosts so a generation is never a grant.
-    pub(super) epoch: RwLock<u64>,
+    pub(super) epoch: Arc<RwLock<u64>>,
     generation: AtomicU64,
 }
 
@@ -64,6 +72,36 @@ impl AuthorityIssue<'_> {
     }
 }
 
+/// Holds a registry's shared fence across one authorized publication, such as a
+/// typed write's commit. Owned, so it can be kept by a hook that outlives the
+/// caller's borrow of the registry.
+///
+/// Exclusive updates and revocations wait until it drops. Do not acquire another
+/// guard of the same registry while holding this one, and do not wait for a
+/// dataset writer while holding it: take it under the writer, right before
+/// publication.
+pub struct AuthorityHold {
+    epoch: parking_lot::ArcRwLockReadGuard<RawRwLock, u64>,
+}
+
+impl AuthorityHold {
+    /// The stable generation that no exclusive update can change while this guard
+    /// is held. It is always even.
+    pub fn generation(&self) -> u64 {
+        *self.epoch
+    }
+}
+
+/// Holds a registry's exclusive fence across the removal of one credential, without
+/// advancing the generation. It waits until the publications that hold the shared
+/// fence are published.
+///
+/// Do not acquire a dataset writer or another guard of the same registry while
+/// holding it.
+pub struct AuthorityRevocation<'a> {
+    _epoch: RwLockWriteGuard<'a, u64>,
+}
+
 impl AuthorityRegistry {
     /// Observe without blocking, including while a read fence is already held
     /// and an updater is queued. Even values are stable. Odd values mean rights
@@ -93,6 +131,23 @@ impl AuthorityRegistry {
     pub fn begin_issue(&self) -> AuthorityIssue<'_> {
         AuthorityIssue {
             epoch: self.epoch.read(),
+        }
+    }
+
+    /// Hold the shared fence across one authorized publication. Waits while an
+    /// exclusive update or a revocation is in progress.
+    pub fn begin_hold(&self) -> AuthorityHold {
+        AuthorityHold {
+            epoch: self.epoch.read_arc(),
+        }
+    }
+
+    /// Serialize the removal of one credential against authorized publications in
+    /// progress without advancing the generation. Waits while a publication holds
+    /// the shared fence.
+    pub fn begin_revocation(&self) -> AuthorityRevocation<'_> {
+        AuthorityRevocation {
+            _epoch: self.epoch.write(),
         }
     }
 }
@@ -154,6 +209,41 @@ mod tests {
         updater.join().unwrap();
         assert_eq!(previous.unwrap(), 2);
         assert_eq!(registry.generation(), 4);
+    }
+
+    #[test]
+    fn a_revocation_waits_for_a_held_publication_and_keeps_the_generation() {
+        let registry = Arc::new(AuthorityRegistry::default());
+        let hold = registry.begin_hold();
+        assert_eq!(hold.generation(), 0);
+        let revoking = registry.clone();
+        let (tx, rx) = mpsc::channel();
+        let revoker = std::thread::spawn(move || {
+            let _revocation = revoking.begin_revocation();
+            tx.send(revoking.generation()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a revocation must wait for a publication in progress"
+        );
+        drop(hold);
+        let observed = rx.recv_timeout(Duration::from_secs(2));
+        revoker.join().unwrap();
+        assert_eq!(observed.unwrap(), 0);
+        assert_eq!(
+            registry.generation(),
+            0,
+            "a revocation keeps the generation"
+        );
+        // an update waits for a hold as well
+        let hold = registry.begin_hold();
+        let updating = registry.clone();
+        let updater = std::thread::spawn(move || drop(updating.begin_update()));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(registry.generation(), 0);
+        drop(hold);
+        updater.join().unwrap();
+        assert_eq!(registry.generation(), 2);
     }
 
     #[test]

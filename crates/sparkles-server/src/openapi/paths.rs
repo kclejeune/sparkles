@@ -3142,6 +3142,14 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 413, 422]),
     );
     p.add(
+        op(POST, "/{ds}/claims", "proposeClaims", "SPARQL", "Propose claims with their evidence")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication.")
+            .see("evidence-proposals")
+            .json_body(true, "EvidenceProposal")
+            .json("200", "The operation and its records, published, replayed or previewed.", "EvidenceProposalResult")
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
+    );
+    p.add(
         op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")
             .doc("The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.")
             .see("importing-agent-memory")

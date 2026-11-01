@@ -228,6 +228,20 @@ impl Store {
             );
             let mut files = current.map(|i| i.settings.clone()).unwrap_or_default();
             graphs.revision += 1;
+            // A graph that stays protected keeps its nonce; one that becomes protected
+            // gets a new random one, which nobody could have known before.
+            let previous = graphs.owners.get(&owner);
+            let mut entry = entry;
+            entry.protections = entry
+                .graphs
+                .iter()
+                .map(|g| {
+                    let kept = previous
+                        .filter(|p| p.graphs.contains(g))
+                        .and_then(|p| p.protections.get(g).copied());
+                    (g.clone(), kept.unwrap_or_else(uuid::Uuid::new_v4))
+                })
+                .collect();
             graphs.owners.insert(owner, entry);
             files.insert(owner, Arc::from(settings));
             Ok((Installed::new(graphs, files)?, Some(owner)))
@@ -342,6 +356,9 @@ impl Store {
                 )));
             };
             entry.graphs.remove(at);
+            // Protecting the graph again chooses a new nonce, so a record written while
+            // it is detached never carries the nonce of a protection.
+            entry.protections.remove(graph);
             graphs.revision += 1;
             Ok((Installed::new(graphs, current.settings.clone())?, None))
         })

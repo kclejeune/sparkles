@@ -37,7 +37,7 @@ oxsdatatypes = "0.2"
 oxilangtag = "0.1"
 imbl = "7"
 arc-swap = "1"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 rustc-hash = "2"
 hashbrown = { version = "=0.16.1", default-features = false }
 smallvec = "1"

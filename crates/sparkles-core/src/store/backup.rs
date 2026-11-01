@@ -845,8 +845,12 @@ impl Store {
         self.catalog.lock().fail_writes = on;
     }
 
+    /// Run the test hook installed at failpoint `name`, if any. Typed writers outside
+    /// this crate mark their own crash points with it. It does nothing in a build
+    /// without failpoints.
     #[inline]
-    pub(crate) fn failpoint(&self, name: &'static str) {
+    #[doc(hidden)]
+    pub fn failpoint(&self, name: &'static str) {
         #[cfg(any(test, feature = "failpoints"))]
         {
             let hook = self.failpoints.lock().get(name).cloned();

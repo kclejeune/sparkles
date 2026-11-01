@@ -73,6 +73,15 @@ ev:reviewPolicy a rdf:Property ; rdfs:comment "The named review policy governing
 ev:policyVersion a rdf:Property ; rdfs:comment "The exact review policy revision." .
 ev:legacyAssertion a rdf:Property ; rdfs:comment "Marks a compatibility projection of an already asserted fact." .
 ev:legacySource a rdf:Property ; rdfs:comment "The original source locator retained without inventing an immutable revision." .
+ev:Operation a rdfs:Class ; rdfs:subClassOf prov:Activity ; rdfs:comment "An authenticated typed operation that published profile records; it is their availability receipt." .
+ev:graphProtection a rdf:Property ; rdfs:comment "The protection nonce of the graph an operation wrote, under which its records authenticate." .
+ev:payloadDigest a rdf:Property ; rdfs:comment "The digest of an operation's request payload, compared when its idempotency key repeats." .
+ev:idempotencyKey a rdf:Property ; rdfs:comment "The caller's idempotency key of an operation." .
+ev:sourceHold a rdf:Property ; rdfs:comment "The durable source hold that keeps an operation's referenced commits readable." .
+ev:recordDigest a rdf:Property ; rdfs:comment "The digest of a record's immutable content, recorded by its typed writer." .
+ev:retainedBytes a rdf:Property ; rdfs:comment "The retained bytes of a source revision or rendition, whose contentDigest they match." .
+ev:locator a rdf:Property ; rdfs:comment "A locator of a source revision; a locator is not its identity." .
+ev:reportedRights a rdf:Property ; rdfs:comment "Rights metadata reported for a source revision; it grants no permission." .
 ev:Reported a rdfs:Resource ; rdfs:comment "The proposition was reported by its attributed source." .
 ev:Observation a rdfs:Resource ; rdfs:comment "The attributed author describes an observation." .
 ev:Hypothesis a rdfs:Resource ; rdfs:comment "The proposition is proposed for investigation." .

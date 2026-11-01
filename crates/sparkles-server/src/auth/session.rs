@@ -450,6 +450,8 @@ impl SessionStore {
     }
 
     pub fn remove(&self, digest: &[u8; 32]) -> Result<Option<SessionRecord>> {
+        // Ordered against publications authorized by the session (see the token store).
+        let _revocation = self.authority.begin_revocation();
         self.id_tokens.lock().remove(digest);
         self.seen.lock().remove(digest);
         let mut map = self.inner.lock();
@@ -464,6 +466,7 @@ impl SessionStore {
     /// `sid` (of subject `sub` when both are given), or every session of `sub`. Returns
     /// how many ended.
     pub fn end_oidc(&self, sid: Option<&str>, sub: Option<&str>) -> Result<usize> {
+        let _revocation = self.authority.begin_revocation();
         let mut map = self.inner.lock();
         let gone: Vec<[u8; 32]> = map
             .iter()

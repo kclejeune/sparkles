@@ -175,3 +175,190 @@ async fn anchors_and_graph_grants_do_not_disclose_hidden_data() {
     assert_eq!(unreadable.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(unreadable.body, absent.body);
 }
+
+// ------------------------------------------------------------------ proposals ------
+
+/// A server with a persistent dataset `ev` whose evidence profile is configured, a
+/// writer of all of it (`evw`) and a writer of its claims graph alone (`evp`).
+fn proposal_server() -> AuthServer {
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[users]]
+name = "evw"
+password = "{evw}"
+datasets = {{ ev = "write" }}
+
+[[users]]
+name = "evp"
+password = "{evp}"
+[[users.grants]]
+dataset = "ev"
+level = "write"
+graphs = ["urn:ev:claims"]
+"#,
+            evw = h("evw-pw"),
+            evp = h("evp-pw"),
+        ),
+        ..Default::default()
+    });
+    let ds = s.state.attach("ev", DbType::Persistent, None).unwrap();
+    let settings = sparkles::evidence::Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        ..Default::default()
+    };
+    sparkles::evidence::configure(&ds.dataset, &settings, &sparkles::task::Control::none())
+        .unwrap();
+    s
+}
+
+async fn propose(s: &AuthServer, creds: &str, body: &serde_json::Value) -> R {
+    call(
+        &s.app,
+        "POST",
+        "/ev/claims",
+        &[
+            ("authorization", creds),
+            ("content-type", "application/json"),
+        ],
+        &body.to_string(),
+    )
+    .await
+}
+
+fn revision_and_claim(occurrence: &str) -> serde_json::Value {
+    serde_json::json!({
+        "revisions": [{"key": "rev", "source": "urn:bulletin", "sourceKey": "bulletin",
+                       "content": {"digest": format!("sha256:{}", "0".repeat(64))}}],
+        "claims": [claim(occurrence, serde_json::json!({"key": "rev"}))],
+    })
+}
+
+fn claim(occurrence: &str, revision: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"key": "claim", "occurrenceKey": occurrence, "revision": revision,
+        "proposition": "<urn:release> <urn:affectedBy> <urn:cve>",
+        "kind": "reported", "polarity": "positive", "author": "urn:publisher"})
+}
+
+#[tokio::test]
+async fn proposals_need_update_grants_on_every_written_graph() {
+    let s = proposal_server();
+    let head = s.state.get("ev").unwrap().store.head_commit().seq;
+    // evp may write claims but not the source records the batch also writes
+    let r = propose(&s, &b("evp"), &revision_and_claim("c1")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(s.state.get("ev").unwrap().store.head_commit().seq, head);
+    // evw may write both, and records the authenticated principal
+    let r = propose(&s, &b("evw"), &revision_and_claim("c1")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let ds = s.state.get("ev").unwrap();
+    assert!(
+        ds.dataset
+            .ask(&format!(
+                "ASK {{ GRAPH <urn:ev:claims> {{ <{}> <http://www.w3.org/ns/prov#wasAssociatedWith> <urn:x-sparkles:principal:user:evw> }} }}",
+                r.json()["operation"].as_str().unwrap()
+            ))
+            .unwrap()
+    );
+    // a reader without write is refused by the route
+    let r = propose(&s, &b("bob"), &revision_and_claim("c2")).await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}",
+        r.status
+    );
+}
+
+#[tokio::test]
+async fn a_proposal_does_not_disclose_records_its_caller_cannot_read() {
+    let s = proposal_server();
+    let r = propose(&s, &b("evw"), &revision_and_claim("c1")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rev = r.json()["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "rev")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // evp cannot read the source-record graph that holds the revision
+    let only_claim = |revision: &str| serde_json::json!({ "claims": [claim("c9", serde_json::json!({"iri": revision}))] });
+    let missing_iri = "urn:uuid:00000000-0000-4000-8000-000000000000";
+    let hidden = propose(&s, &b("evp"), &only_claim(&rev)).await;
+    let missing = propose(&s, &b("evp"), &only_claim(missing_iri)).await;
+    assert_eq!(
+        hidden.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        hidden.text()
+    );
+    assert_eq!(hidden.json()["code"], "evidence-unavailable");
+    // the answers are equal byte for byte apart from the IRI and the request id
+    let scrub = |r: &R, iri: &str| {
+        let mut v = r.json();
+        v.as_object_mut().unwrap().remove("requestId");
+        serde_json::to_string(&v).unwrap().replace(iri, "IRI")
+    };
+    assert_eq!(scrub(&hidden, &rev), scrub(&missing, missing_iri));
+    // evw reads it, so the same claim publishes
+    let r = propose(&s, &b("evw"), &only_claim(&rev)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+#[tokio::test]
+async fn a_token_revoked_before_publication_writes_nothing() {
+    let s = proposal_server();
+    let (cookie, csrf) = password_session(&s, "evw").await;
+    let r = super::tokens::mint_as(
+        &s.app,
+        &[("cookie", &cookie), ("x-sparkles-csrf", &csrf)],
+        r#"{"name":"importer","datasets":{"ev":"write"},"expiresIn":"7d"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let token = r.json()["token"].as_str().unwrap().to_string();
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let ds = s.state.get("ev").unwrap();
+    // a fact the proposal references, so that it holds a commit before it writes
+    ds.dataset
+        .update("INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:p> <urn:o> } }")
+        .unwrap();
+    let mut body = revision_and_claim("c1");
+    body["references"] = serde_json::json!([{"key": "f", "occurrenceKey": "f", "storedFact": {
+        "datasetId": ds.store.dataset_id(), "branchId": ds.store.dataset_id(),
+        "commit": ds.store.head_commit().seq, "graph": "urn:g",
+        "triple": "<urn:a> <urn:p> <urn:o>"}}]);
+    // the token is revoked after the request was authorized and its hold acquired
+    let auth = s.auth();
+    let revoked = id.clone();
+    ds.store.set_failpoint(
+        "evidence-held",
+        Some(Arc::new(move |_| {
+            assert_eq!(
+                auth.tokens.remove(std::slice::from_ref(&revoked)).unwrap(),
+                1
+            );
+        })),
+    );
+    let head = ds.store.head_commit().seq;
+    let r = propose(&s, &bearer(&token), &body).await;
+    ds.store.set_failpoint("evidence-held", None);
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
+    assert_eq!(r.json()["code"], "authority-changed");
+    assert_eq!(ds.store.head_commit().seq, head, "nothing was written");
+    // the orphaned hold reconciles once its grace has passed
+    assert_eq!(
+        sparkles::evidence::reconcile_operation_holds(&ds.dataset, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    // the revoked token is refused at authentication from now on
+    let r = propose(&s, &bearer(&token), &body).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+}

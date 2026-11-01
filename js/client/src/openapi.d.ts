@@ -3829,6 +3829,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/claims": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Propose claims with their evidence
+         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication.
+         */
+        post: operations["proposeClaims"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/claims/resolve": {
         parameters: {
             query?: never;
@@ -6320,6 +6340,348 @@ export interface components {
              */
             id?: string;
         };
+        /** @description One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input. */
+        EvidenceProposal: {
+            assessments?: {
+                /** @description An N-Triples term. */
+                conclusion: string;
+                confidence?: {
+                    /** @description Who evaluated it. */
+                    evaluator: string;
+                    method?: {
+                        /** @description The method's IRI. */
+                        method: string;
+                        /** @description The method's version. */
+                        version: string;
+                    };
+                    /** @description The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`. */
+                    scale: string;
+                    /** @description An N-Triples literal, or a decimal such as `0.8`. */
+                    value: string;
+                };
+                /** @description The digest of the method's configuration. */
+                configurationDigest: string;
+                /**
+                 * Format: date-time
+                 * @description The evaluation time, with an explicit offset.
+                 */
+                evaluatedAt: string;
+                /** @description The attributed evaluator. */
+                evaluator: string;
+                /** @description The record's key in this batch. */
+                key: string;
+                method: {
+                    /** @description The method's IRI. */
+                    method: string;
+                    /** @description The method's version. */
+                    version: string;
+                };
+                /** @description The assessment's key within its target. */
+                occurrenceKey: string;
+                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused. */
+                scope?: {
+                    [key: string]: string[];
+                };
+                /** @description A claim or assessment. */
+                target: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
+            }[];
+            claims?: {
+                /** @description The attributed source author, not the authenticated caller. */
+                author: string;
+                confidence?: {
+                    analyst?: {
+                        /** @description Who evaluated it. */
+                        evaluator: string;
+                        method?: {
+                            /** @description The method's IRI. */
+                            method: string;
+                            /** @description The method's version. */
+                            version: string;
+                        };
+                        /** @description The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`. */
+                        scale: string;
+                        /** @description An N-Triples literal, or a decimal such as `0.8`. */
+                        value: string;
+                    };
+                    extraction?: {
+                        /** @description Who evaluated it. */
+                        evaluator: string;
+                        method?: {
+                            /** @description The method's IRI. */
+                            method: string;
+                            /** @description The method's version. */
+                            version: string;
+                        };
+                        /** @description The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`. */
+                        scale: string;
+                        /** @description An N-Triples literal, or a decimal such as `0.8`. */
+                        value: string;
+                    };
+                    source?: {
+                        /** @description Who evaluated it. */
+                        evaluator: string;
+                        method?: {
+                            /** @description The method's IRI. */
+                            method: string;
+                            /** @description The method's version. */
+                            version: string;
+                        };
+                        /** @description The declared scale, such as `urn:x-sparkles:evidence:ZeroToOne`. */
+                        scale: string;
+                        /** @description An N-Triples literal, or a decimal such as `0.8`. */
+                        value: string;
+                    };
+                };
+                /** @description The record's key in this batch. */
+                key: string;
+                /** @enum {string} */
+                kind: "reported" | "observation" | "hypothesis" | "preference";
+                /** @description The claim's key within its revision. */
+                occurrenceKey: string;
+                /** @enum {string} */
+                polarity: "positive" | "negative" | "uncertain";
+                /** @description One N-Triples 1.2 triple without its final `.` and without blank nodes. It is described, never asserted. */
+                proposition: string;
+                /** @description The source revision that states it. */
+                revision: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
+                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused. */
+                scope?: {
+                    [key: string]: string[];
+                };
+            }[];
+            /** @description Check and preview the write without committing it or holding commits. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. The operation IRI is derived from the dataset, the caller and the key. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            links?: {
+                /** @description Who made the judgment. */
+                author: string;
+                /** @description An evidence reference. */
+                evidence: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
+                /** @description The record's key in this batch. */
+                key: string;
+                /** @description The link's key within its target. */
+                occurrenceKey: string;
+                /** @enum {string} */
+                relation: "supports" | "contradicts" | "mentions";
+                /** @description A claim or assessment. */
+                target: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
+            }[];
+            /** @description The commit message. */
+            message?: string;
+            passages?: {
+                /** @description The code point after the selection. */
+                end: number;
+                /** @description The record's key in this batch. */
+                key: string;
+                /** @description The passage's key within its rendition. */
+                occurrenceKey: string;
+                quote?: string;
+                /** @description A rendition of this batch with normalized text. */
+                rendition: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
+                /** @description The rendition's revision. */
+                revision: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
+                /** @description The first selected Unicode code point. */
+                start: number;
+                /** @description The digest of the selected text. */
+                textDigest: string;
+            }[];
+            /** @description The proposal graph, needed when the settings name more than one. */
+            proposalGraph?: string;
+            references?: {
+                /** @description The record's key in this batch. */
+                key: string;
+                /** @description The reference's key within what it references. */
+                occurrenceKey: string;
+                passage?: {
+                    /** @description A passage of this batch. */
+                    passage: {
+                        /** @description An existing authenticated record, by its IRI. */
+                        iri?: string;
+                        /** @description A record of this batch, by its key. */
+                        key?: string;
+                    };
+                    /** @description The passage's rendition. */
+                    rendition: {
+                        /** @description An existing authenticated record, by its IRI. */
+                        iri?: string;
+                        /** @description A record of this batch, by its key. */
+                        key?: string;
+                    };
+                    /** @description The passage's revision. */
+                    revision: {
+                        /** @description An existing authenticated record, by its IRI. */
+                        iri?: string;
+                        /** @description A record of this batch, by its key. */
+                        key?: string;
+                    };
+                };
+                /** @description A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation. */
+                storedFact?: Record<string, never>;
+                structured?: {
+                    method: {
+                        /** @description The method's IRI. */
+                        method: string;
+                        /** @description The method's version. */
+                        version: string;
+                    };
+                    /** @description An RFC 6901 JSON Pointer. */
+                    pointer: string;
+                    /** @description A retained JSON revision of this batch. */
+                    revision: {
+                        /** @description An existing authenticated record, by its IRI. */
+                        iri?: string;
+                        /** @description A record of this batch, by its key. */
+                        key?: string;
+                    };
+                    /** @description The digest of the selected value. */
+                    valueDigest: string;
+                };
+            }[];
+            renditions?: {
+                /** @description Normalized `text`, retained bytes or a digest. */
+                content: {
+                    /** @description Retained bytes in base64. */
+                    base64?: string;
+                    /** @description The digest of content that is not retained. */
+                    digest?: string;
+                    /** @description Retained UTF-8 text. */
+                    text?: string;
+                };
+                conversion: {
+                    /** @description The method's IRI. */
+                    method: string;
+                    /** @description The method's version. */
+                    version: string;
+                };
+                /** @description The digest the content must have. */
+                expectedDigest?: string;
+                /** @description The record's key in this batch. */
+                key: string;
+                language?: string;
+                mediaType: string;
+                /** @description The rendition's key within its revision. */
+                occurrenceKey: string;
+                /** @description The revision it represents. */
+                revision: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
+            }[];
+            revisions?: {
+                /** @description The revision's bytes or their digest. */
+                content: {
+                    /** @description Retained bytes in base64. */
+                    base64?: string;
+                    /** @description The digest of content that is not retained. */
+                    digest?: string;
+                    /** @description Retained UTF-8 text. */
+                    text?: string;
+                };
+                /** @description The digest the retained bytes must have. */
+                expectedDigest?: string;
+                families?: string[];
+                /** @description The record's key in this batch. */
+                key: string;
+                locators?: string[];
+                /**
+                 * Format: date-time
+                 * @description The source's publication time, with an explicit offset.
+                 */
+                publishedAt?: string;
+                /**
+                 * Format: date-time
+                 * @description An attributed allegation of earlier availability.
+                 */
+                reportedAvailableAt?: string;
+                reportedRights?: string[];
+                /** @description The continuing source identity. */
+                source: string;
+                /** @description The importer's stable source key. */
+                sourceKey: string;
+                upstreamRevisions?: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                }[];
+                /** @description The upstream version identifier. */
+                upstreamVersion?: string;
+            }[];
+            /** @description The source-record graph, needed when the settings name more than one. */
+            sourceGraph?: string;
+        };
+        /** @description The outcome of a claims proposal. */
+        EvidenceProposalResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The commit's time, the first availability of its source revisions. `null` for a dry run. */
+            firstAvailableAt: string | null;
+            /** @description The source hold of the stored facts of this dataset that the batch references. */
+            hold: string | null;
+            /** @description The operation, which is every record's availability receipt. */
+            operation: string;
+            records: {
+                /** @description An earlier operation had published the record with equal content, so this one did not write it again. */
+                existing: boolean;
+                graph: string;
+                iri: string;
+                key: string;
+                /** @enum {string} */
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal";
+                /** @description The digest of the record's immutable content. */
+                recordDigest: string;
+            }[];
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+        };
         /** @description Evidence references to verify at their exact retained views. */
         EvidenceResolveRequest: {
             /** @description The references, verified in order. Each names exactly one of `storedFact` and `record`. */
@@ -6385,6 +6747,7 @@ export interface components {
                         datasetId: string;
                         iri: string;
                     };
+                    recordDigest: string | null;
                     span: {
                         /** @description The code point after the selection. */
                         end: number;
@@ -9785,6 +10148,17 @@ export interface components {
         ServerInfo: {
             auth: {
                 enabled: boolean;
+            };
+            /** @description Typed operations a client discovers before it uses them. A client of claims proposals must not fall back to an asserting endpoint when `claims` is absent. */
+            capabilities?: {
+                claims?: {
+                    /** @description The evidence profile versions whose typed operations this build serves. */
+                    profiles: number[];
+                    /** @description The route template of authenticated claim proposals. */
+                    propose: string;
+                    /** @description The route template of evidence resolution. */
+                    resolve: string;
+                };
             };
             datasets: components["schemas"]["DatasetInfo"][];
             /** @description The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on. */
@@ -21153,6 +21527,43 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    proposeClaims: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceProposal"];
+            };
+        };
+        responses: {
+            /** @description The operation and its records, published, replayed or previewed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceProposalResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };

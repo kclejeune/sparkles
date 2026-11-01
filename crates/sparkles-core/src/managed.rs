@@ -12,8 +12,17 @@
 //! ```json
 //! {"format": 1, "revision": 3,
 //!  "owners": {"evidence": {"profile": 1, "settingsDigest": "sha256:…", "graphs": ["…"],
+//!                            "protections": {"…": "<uuid>"},
 //!                            "visibility": "public", "merge": "refuse"}}}
 //! ```
+//!
+//! Each managed graph has a protection nonce, a random UUID chosen when the graph
+//! becomes protected and kept while it stays protected. Detaching a graph drops its
+//! nonce, and protecting it again chooses a new one. A typed writer records the nonce
+//! of each graph it writes, so a reader can tell a record written under the current
+//! protection from one written while the graph was detached: nobody could write the
+//! graph while it was protected, and the nonce of a later protection is unknown until
+//! it begins.
 //!
 //! Each owner keeps its settings in its own file, such as `evidence.json`, whose SHA-256
 //! digest `managed.json` records. A dataset with `managed.json` needs dataset reader 6
@@ -155,6 +164,13 @@ pub struct OwnerEntry {
     pub settings_digest: String,
     /// The absolute IRIs of the graphs the owner manages.
     pub graphs: Vec<String>,
+    /// The protection nonce of each managed graph, chosen at random when the graph
+    /// became protected. Enabling an owner keeps the nonce of each graph that stays
+    /// protected and chooses one for each graph that becomes protected, whatever the
+    /// entry it is given holds. A registry written before nonces were recorded has none,
+    /// and its graphs get one when the owner is enabled again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub protections: BTreeMap<String, uuid::Uuid>,
     /// Who sees the graphs through the ordinary read surfaces: `public`, under the
     /// caller's grants. `hidden` is reserved for owners whose control graphs only
     /// their typed inspection renders (spec C26 §2.3), and this build refuses it.
@@ -207,6 +223,7 @@ impl OwnerEntry {
             profile,
             settings_digest: settings_digest(settings),
             graphs,
+            protections: BTreeMap::new(),
             visibility: Visibility::Public,
             merge: MergePolicy::Refuse,
         }
@@ -283,6 +300,13 @@ pub enum ManagedErrorKind {
     /// A record's immutable content differs from what the reference expects, or the
     /// record is stored more than once.
     ImmutableRecordConflict,
+    /// A typed operation's expected head is no longer the branch head.
+    HeadChanged,
+    /// An idempotency key was used before with a different payload.
+    IdempotencyConflict,
+    /// The caller's authority changed between authorization and publication, as when
+    /// its credential was revoked or the access policy was reloaded.
+    AuthorityChanged,
 }
 
 /// An error of the managed-graph boundary, with its stable code. Nothing was written.
@@ -293,7 +317,8 @@ pub struct ManagedError {
     /// `hold-conflict`, `holds-limit`, `holds-unavailable` or one of the evidence
     /// resolution codes, `evidence-unavailable`, `incomplete-evidence`,
     /// `unanchored-evidence`, `span-mismatch`, `origin-not-reproduced` and
-    /// `immutable-record-conflict`
+    /// `immutable-record-conflict`, and the typed-write codes `head-changed`,
+    /// `idempotency-conflict` and `authority-changed`
     pub code: &'static str,
     pub message: String,
 }
@@ -314,6 +339,9 @@ impl ManagedError {
             ManagedErrorKind::SpanMismatch => "span-mismatch",
             ManagedErrorKind::OriginNotReproduced => "origin-not-reproduced",
             ManagedErrorKind::ImmutableRecordConflict => "immutable-record-conflict",
+            ManagedErrorKind::HeadChanged => "head-changed",
+            ManagedErrorKind::IdempotencyConflict => "idempotency-conflict",
+            ManagedErrorKind::AuthorityChanged => "authority-changed",
         };
         Error::Managed(Box::new(ManagedError {
             kind,
@@ -336,7 +364,10 @@ impl ManagedError {
             | ManagedErrorKind::UnanchoredEvidence
             | ManagedErrorKind::SpanMismatch
             | ManagedErrorKind::OriginNotReproduced => 422,
-            ManagedErrorKind::ImmutableRecordConflict => 409,
+            ManagedErrorKind::ImmutableRecordConflict
+            | ManagedErrorKind::HeadChanged
+            | ManagedErrorKind::IdempotencyConflict => 409,
+            ManagedErrorKind::AuthorityChanged => 503,
         }
     }
 }
@@ -470,6 +501,22 @@ impl ManagedWrite {
     /// The typed operation the capability was made for.
     pub fn operation(&self) -> uuid::Uuid {
         self.operation
+    }
+
+    /// The protection nonce of `graph` in the registry this capability is valid for,
+    /// when the capability's owner manages it there. A commit made with the capability
+    /// is refused if the registry changes, so a nonce read here is the graph's nonce
+    /// when the commit publishes.
+    pub fn protection(&self, graph: &str) -> Option<uuid::Uuid> {
+        match &*self.state {
+            ManagedState::Installed(i) => i
+                .graphs
+                .owners
+                .get(&self.owner)
+                .filter(|e| e.graphs.iter().any(|g| g == graph))
+                .and_then(|e| e.protections.get(graph).copied()),
+            ManagedState::Unavailable { .. } => None,
+        }
     }
 }
 

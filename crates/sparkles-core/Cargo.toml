@@ -35,6 +35,8 @@ md-5.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+# the retained bytes of evidence source records (xsd:base64Binary)
+base64 = "0.23"
 rand.workspace = true
 percent-encoding.workspace = true
 csv.workspace = true

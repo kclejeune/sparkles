@@ -4,7 +4,8 @@
 //! and `GET` and `POST /$/evidence/{ds}/holds` and `DELETE
 //! /$/evidence/{ds}/holds/{id}` list, acquire and release durable source holds.
 //! `POST /{ds}/claims/resolve` verifies evidence references at their exact retained
-//! views and records by their publication origin.
+//! views and records by their publication origin, and `POST /{ds}/claims` publishes
+//! authenticated claim proposals (see [`claims`]).
 //!
 //! Authorization (the route table in `auth/routes.rs`): every `/$/evidence` route needs
 //! `admin` on `{ds}`. The settings name the dataset's protected graphs and policies,
@@ -40,7 +41,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/evidence/{ds}/holds", get(list_holds).post(acquire_hold))
         .route("/$/evidence/{ds}/holds/{id}", delete(release_hold))
         .route("/{ds}/claims/resolve", post(resolve))
+        .route("/{ds}/claims", post(claims::propose))
 }
+
+mod claims;
 
 /// The response body: the canonical settings, their digest, the registry revision and
 /// the role graphs that are protected or detached.
@@ -442,6 +446,35 @@ fn parse_triple(field: &str, text: &str) -> ApiResult<oxrdf::Triple> {
     ))
 }
 
+/// A stored-fact reference of a request body, whose fields are named under `at`.
+fn stored_fact_ref(at: &str, f: StoredFactJson) -> ApiResult<StoredFactRef> {
+    let graph = match &f.graph {
+        None => GraphIdentity::Default,
+        Some(g) => GraphIdentity::Named(named(&format!("{at}.graph"), g)?),
+    };
+    let anchor = match (&f.reifier, &f.import_map) {
+        (Some(_), Some(_)) => {
+            return Err(bad(
+                at.to_string(),
+                "name a reifier or an import mapping, not both",
+            ));
+        }
+        (Some(r), None) => Some(BlankAnchor::Reifier(named(&format!("{at}.reifier"), r)?)),
+        (None, Some(m)) => Some(BlankAnchor::ImportMap(named(
+            &format!("{at}.importMap"),
+            m,
+        )?)),
+        (None, None) => None,
+    };
+    Ok(StoredFactRef {
+        dataset: f.dataset_id,
+        branch: f.branch_id,
+        commit: f.commit,
+        graph,
+        expected: parse_triple(&format!("{at}.triple"), &f.triple)?,
+        anchor,
+    })
+}
 fn parse_references(request: ResolveRequest) -> ApiResult<Vec<(String, Reference)>> {
     use sparkles::evidence::resolve::MAX_REFERENCES;
     if request.references.len() > MAX_REFERENCES {
@@ -465,32 +498,7 @@ fn parse_references(request: ResolveRequest) -> ApiResult<Vec<(String, Reference
         }
         let reference = match (r.stored_fact, r.record) {
             (Some(f), None) => {
-                let at = format!("{at}.storedFact");
-                let graph = match &f.graph {
-                    None => GraphIdentity::Default,
-                    Some(g) => GraphIdentity::Named(named(&format!("{at}.graph"), g)?),
-                };
-                let anchor = match (&f.reifier, &f.import_map) {
-                    (Some(_), Some(_)) => {
-                        return Err(bad(at, "name a reifier or an import mapping, not both"));
-                    }
-                    (Some(r), None) => {
-                        Some(BlankAnchor::Reifier(named(&format!("{at}.reifier"), r)?))
-                    }
-                    (None, Some(m)) => Some(BlankAnchor::ImportMap(named(
-                        &format!("{at}.importMap"),
-                        m,
-                    )?)),
-                    (None, None) => None,
-                };
-                Reference::StoredFact(StoredFactRef {
-                    dataset: f.dataset_id,
-                    branch: f.branch_id,
-                    commit: f.commit,
-                    graph,
-                    expected: parse_triple(&format!("{at}.triple"), &f.triple)?,
-                    anchor,
-                })
+                Reference::StoredFact(stored_fact_ref(&format!("{at}.storedFact"), f)?)
             }
             (None, Some(rec)) => {
                 let at = format!("{at}.record");
@@ -564,6 +572,7 @@ fn verified_json(key: &str, v: &Verified) -> J {
                     "commit": r.receipt.commit,
                 },
                 "contentDigest": r.content_digest.map(|d| d.to_string()),
+                "recordDigest": r.record_digest.map(|d| d.to_string()),
                 "span": r.span.as_ref().map(|s| json!({
                     "rendition": s.rendition.as_str(),
                     "start": s.start,

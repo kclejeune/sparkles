@@ -923,6 +923,16 @@ impl Auth {
         CookieMode { secure }
     }
 
+    /// The registry of authority generations shared by the policy and the credential
+    /// stores. A typed write holds its shared fence across its authority check and its
+    /// publication ([`AuthorityRegistry::begin_hold`]), so that a policy change or the
+    /// revocation of its credential is ordered before the check or after the commit.
+    ///
+    /// [`AuthorityRegistry::begin_hold`]: sparkles::access::authority::AuthorityRegistry::begin_hold
+    pub fn authority_registry(&self) -> &Arc<sparkles::access::authority::AuthorityRegistry> {
+        &self.authority
+    }
+
     /// The nonblocking authority generation. Odd values mean a visible rights
     /// mutation is in progress. Lookup callers require one unchanged even value.
     pub fn epoch(&self) -> u64 {

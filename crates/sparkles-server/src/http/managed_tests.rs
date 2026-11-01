@@ -545,11 +545,15 @@ async fn evidence_references_are_resolved_over_http() {
     )
     .unwrap();
     let (seq, _) = t.managed_stamp().unwrap();
+    // the receipt carries the operation marker of the graph's current protection
+    let nonce = ds.store.managed_graphs().unwrap().unwrap().owners[&OwnerKind::Evidence]
+        .protections["urn:ev:sources"];
     let trig = format!(
         "PREFIX ev: <urn:x-sparkles:evidence:>
          GRAPH <urn:ev:sources> {{
            <urn:rev> a ev:SourceRevision ; ev:availabilityReceipt <urn:receipt> .
-           <urn:receipt> ev:datasetId \"{id}\" ; ev:branchId \"{id}\" ; ev:commit {seq} .
+           <urn:receipt> a ev:Operation ; ev:graphProtection \"{nonce}\" ;
+             ev:datasetId \"{id}\" ; ev:branchId \"{id}\" ; ev:commit {seq} .
          }}"
     );
     let mut labels = std::collections::HashMap::new();
@@ -660,4 +664,206 @@ async fn evidence_references_are_resolved_over_http() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `POST /{ds}/claims` publishes one batch as one commit of the evidence owner with
+/// server-owned receipts, replays a repeated key, and answers each refusal with its
+/// status and code, writing nothing.
+#[tokio::test]
+async fn claims_are_proposed_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let ds = state.get("d").unwrap();
+    let id = ds.store.dataset_id();
+    // without the profile
+    let small = |occurrence: &str, object: &str| {
+        json!({
+            "revisions": [{"key": "rev", "source": "urn:bulletin", "sourceKey": "bulletin",
+                           "content": {"digest": format!("sha256:{}", "0".repeat(64))}}],
+            "claims": [{"key": "claim", "occurrenceKey": occurrence, "revision": {"key": "rev"},
+                        "proposition": format!("<urn:release> <urn:affectedBy> <{object}>"),
+                        "kind": "reported", "polarity": "positive", "author": "urn:publisher"}],
+        })
+    };
+    let post = |body: J| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/d/claims",
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let (status, j) = post(small("c1", "urn:cve")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "unsupported-profile");
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        r#"{"format":1,"profile":1,"enabled":true,"sourceRecords":["urn:ev:sources"],"proposals":["urn:ev:claims"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        "INSERT DATA { GRAPH <urn:g> { <urn:release> <urn:affectedBy> <urn:cve> } }",
+    )
+    .await;
+    assert!(status.is_success());
+    let fact_commit = ds.store.head_commit().seq;
+    let text = "Release 1.2 is affected by CVE-1.";
+    let selected = sparkles::evidence::Sha256Digest::of_bytes(
+        &text.as_bytes()[0..11],
+        &sparkles::task::Control::none(),
+    )
+    .unwrap()
+    .to_string();
+    let full = json!({
+        "idempotencyKey": "k1",
+        "message": "import bulletin",
+        "revisions": [{"key": "rev", "source": "urn:bulletin", "sourceKey": "bulletin",
+                       "content": {"text": text}, "publishedAt": "2026-01-01T10:00:00Z",
+                       "locators": ["https://example.org/bulletin"]}],
+        "renditions": [{"key": "text", "revision": {"key": "rev"}, "occurrenceKey": "text",
+                        "conversion": {"method": "urn:method:identity", "version": "1"},
+                        "mediaType": "text/plain", "language": "en", "content": {"text": text}}],
+        "passages": [{"key": "span", "revision": {"key": "rev"}, "rendition": {"key": "text"},
+                      "occurrenceKey": "span", "start": 0, "end": 11, "textDigest": selected}],
+        "references": [
+            {"key": "fact", "occurrenceKey": "fact", "storedFact": {
+                "datasetId": id, "branchId": id, "commit": fact_commit,
+                "graph": "urn:g", "triple": "<urn:release> <urn:affectedBy> <urn:cve>"}},
+            {"key": "pref", "occurrenceKey": "pref", "passage": {
+                "revision": {"key": "rev"}, "rendition": {"key": "text"}, "passage": {"key": "span"}}},
+        ],
+        "claims": [{"key": "claim", "occurrenceKey": "c1", "revision": {"key": "rev"},
+                    "proposition": "<urn:release> <urn:affectedBy> <urn:cve>",
+                    "kind": "reported", "polarity": "positive", "author": "urn:publisher",
+                    "scope": {"urn:scope:release": ["<urn:release>"]},
+                    "confidence": {"source": {"scale": "urn:x-sparkles:evidence:ZeroToOne",
+                                              "value": "0.8", "evaluator": "urn:publisher"}}}],
+        "links": [{"key": "link", "occurrenceKey": "l1", "target": {"key": "claim"},
+                   "evidence": {"key": "pref"}, "relation": "supports", "author": "urn:importer"}],
+        "assessments": [{"key": "a", "occurrenceKey": "a1", "target": {"key": "claim"},
+                         "conclusion": "<urn:conclusion:plausible>",
+                         "method": {"method": "urn:method:review", "version": "1"},
+                         "configurationDigest": selected, "evaluatedAt": "2026-01-02T00:00:00Z",
+                         "evaluator": "urn:analyst"}],
+    });
+    // a dry run writes nothing
+    let mut dry = full.clone();
+    dry["dryRun"] = true.into();
+    let head = ds.store.head_commit().seq;
+    let (status, j) = post(dry).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["committed"], false);
+    assert_eq!(j["dryRun"]["wouldCommit"], true, "{j}");
+    assert_eq!(ds.store.head_commit().seq, head);
+    let (status, first) = post(full.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["committed"], true);
+    assert_eq!(first["commit"], head + 1);
+    assert_eq!(first["records"].as_array().unwrap().len(), 8);
+    assert!(first["hold"].is_string(), "{first}");
+    assert!(first["firstAvailableAt"].is_string());
+    // the claim resolves as an authenticated record
+    let claim = first["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claim")
+        .unwrap()["iri"]
+        .clone();
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/d/claims/resolve",
+        Some("application/json"),
+        &json!({"references": [{"key": "c", "record": {"iri": claim, "kinds": ["Claim"]}}]})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(
+        j["resolved"][0]["record"]["receipt"]["iri"],
+        first["operation"]
+    );
+    // a repeated key returns the first receipt and writes nothing
+    let head = ds.store.head_commit().seq;
+    let (status, again) = post(full.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["replayed"], true);
+    assert_eq!(again["commit"], first["commit"]);
+    assert_eq!(again["records"], first["records"]);
+    assert_eq!(ds.store.head_commit().seq, head);
+    // refusals write nothing
+    let mut changed = full.clone();
+    changed["claims"][0]["polarity"] = "negative".into();
+    let mut stale = small("c2", "urn:cve");
+    stale["ifHead"] = (head - 1).into();
+    let mut unknown_kind = small("c3", "urn:cve");
+    unknown_kind["claims"][0]["kind"] = "rumor".into();
+    let mut missing = small("c4", "urn:cve");
+    missing["revisions"] = json!([]);
+    missing["claims"][0]["revision"] =
+        json!({"iri": "urn:uuid:00000000-0000-4000-8000-000000000000"});
+    let mut both = small("c5", "urn:cve");
+    both["claims"][0]["revision"] = json!({"key": "rev", "iri": "urn:x"});
+    let mut unknown_field = small("c6", "urn:cve");
+    unknown_field["firstAvailableAt"] = "2020-01-01T00:00:00Z".into();
+    for (body, want, code) in [
+        (changed, StatusCode::CONFLICT, "idempotency-conflict"),
+        (stale, StatusCode::CONFLICT, "head-changed"),
+        (
+            missing,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "evidence-unavailable",
+        ),
+        (unknown_kind, StatusCode::BAD_REQUEST, "invalid-reference"),
+        (both, StatusCode::BAD_REQUEST, "invalid-reference"),
+        (unknown_field, StatusCode::BAD_REQUEST, "invalid-proposal"),
+        (json!({}), StatusCode::BAD_REQUEST, ""),
+    ] {
+        let (status, j) = post(body.clone()).await;
+        assert_eq!(status, want, "{body}: {j}");
+        if !code.is_empty() {
+            assert_eq!(j["code"], code, "{body}: {j}");
+        }
+        assert_eq!(ds.store.head_commit().seq, head, "{body}");
+    }
+    // the same identity with other content
+    let (status, j) = post(small("c1", "urn:cve")).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let head = ds.store.head_commit().seq;
+    let (status, j) = post(small("c1", "urn:other")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "immutable-record-conflict");
+    assert_eq!(ds.store.head_commit().seq, head);
+    // a direct write of a typed record's graph stays refused
+    let (status, j) = call(
+        &app,
+        "POST",
+        "/d/update",
+        Some(UPDATE),
+        "INSERT DATA { GRAPH <urn:ev:claims> { <urn:x> <urn:y> <urn:z> } }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    // clients discover the operation
+    let (_, server) = call(&app, "GET", "/$/server", None, "").await;
+    assert_eq!(server["capabilities"]["claims"]["profiles"], json!([1]));
+    assert_eq!(server["capabilities"]["claims"]["propose"], "/{ds}/claims");
 }
