@@ -1,0 +1,1913 @@
+//! Witnesses of the facts of a closure (spec F18 §7.1), kept with the provenance algebra
+//! of F13 §5.1 ([`sparkles_core::incr::prov`]).
+//!
+//! **What is kept.** For each fact of a closure, at most `max` supports, each a set of
+//! input quads ([`FactKey`]s) from which the rules derive the fact, and a flag that says
+//! whether supports may be missing. A support of a fact is the set of asserted leaves of
+//! one well-founded derivation tree. The kept supports form an antichain, so no kept
+//! support contains another, and they are the smallest ones a fact's evaluation saw.
+//!
+//! **Why sets and not counts.** F13's `why` semiring counts the derivations per support.
+//! A fact in a recursive program can have infinitely many derivation trees, since a fact
+//! of a cycle supports itself (F13 §4.3), so the reasoner counts each support once. In
+//! that semiring addition and multiplication are those of F13, the union of supports and
+//! the pairwise [`Witness::union`] of a product, and a sum also absorbs a support that
+//! contains another one. The least fixed point of the rules over it is, for a positive
+//! program, the set of minimal supports of each fact: the minimal sets of input quads
+//! whose closure holds the fact. The reasoner reports a fact's witnesses as an
+//! [`Ann::Why`] whose kept supports each count 1 and whose unknown count is 1 when the
+//! fact is truncated, and [`Ann::report`] gives the minimal kept supports, smallest
+//! first, as it does for a view.
+//!
+//! **The two rules of F13, for sets.** With the true count of a support being 1 when it
+//! is a support of the fact and 0 otherwise, the rules of F13 §5.1 read as follows, and
+//! every operation below keeps them.
+//!
+//! 1. A kept support is a support of the fact: the fact follows from its quads. It
+//!    therefore never counts more than its true count.
+//! 2. When a fact is not truncated (its unknown count is 0), its kept supports are
+//!    exactly its minimal supports.
+//!
+//! **Truncation.** A fact is truncated locally when its own evaluation may have lost a
+//! support. That happens when more minimal supports reach it than `max`, when a product
+//! or a sum passes its working bound, when the fact has more rule instances than
+//! [`MAX_INSTANCES`], when an instance holds through `noValue`, when the fact is a
+//! GeoSPARQL default geometry, when the program derives facts that rule instances do not
+//! show, and when a fact keeps changing in one pass. A fact is truncated when it is
+//! truncated locally or a premise of one of its instances is truncated, the least such
+//! assignment. Rule 2 then holds because a fact that is not truncated has a cone of
+//! premises that is not truncated, whose supports satisfy the equations of the rules
+//! exactly, and the least solution of those equations is the minimal supports.
+//!
+//! **Convergence.** A full build evaluates every fact until no value changes. An update
+//! keeps the supports that avoid the removed quads, which for a positive program are
+//! exactly the minimal supports that remain, and evaluates again the facts that lost a
+//! kept support, the facts that joined the closure or the base tier, and every truncated
+//! fact that a removed fact reaches through truncated facts or facts that lost a support.
+//! Those are the facts whose dropped supports may have used a removed fact. Their
+//! truncation is reset first and found again, so a fact whose minimal supports fit the
+//! bound once the removed facts are gone is exact again after the update, as F13's rows
+//! are once their unknown derivations are removed.
+//!
+//! **Closure operators.** The operators of [`crate::closure`] compute transitive and
+//! equivalence relations without rule instances. Their rules stay in the program, so the
+//! witnesses of the facts they derive come from the rules' instances, found as joins over
+//! the closure the operators built, like any other fact's. The witnesses therefore do not
+//! depend on how the closure was computed. A long chain of a transitive property gives a
+//! fact one instance per intermediate node and many minimal supports, one per path, so
+//! such facts are often truncated.
+
+use crate::budget::{Budget, Held, MemoryExceeded, table_bytes};
+use crate::builtins::BuiltinKind;
+use crate::engine::{self, CHead, CRule, Eval, Limits, Mode, Slot};
+use crate::facts::Memo;
+use crate::graph::Triple;
+use crate::incremental::{Closure, Plans, bind_head};
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
+use sparkles_core::id::Id;
+use sparkles_core::incr::prov::{Ann, Annotation, Atom, FactKey, Why, Witness};
+use std::collections::VecDeque;
+use std::mem::size_of;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+pub use sparkles_core::incr::prov::{DEFAULT_MAX_WITNESSES, MAX_WITNESSES_LIMIT};
+
+/// Rule instances read per fact before the fact is truncated.
+pub(crate) const MAX_INSTANCES: usize = 4096;
+/// Evaluations that change one fact in one pass before the fact is frozen and truncated.
+/// Without truncation the values only grow, so a fact changes at most once per support
+/// that reaches it; the bound stops the rare pass whose truncated values keep moving.
+const MAX_CHANGES: u32 = 256;
+/// List cells read per list before an instance counts as unknown.
+const MAX_LIST: usize = 1 << 16;
+
+/// The working bound of the products and sums of one fact's evaluation.
+fn pool_cap(max: usize) -> usize {
+    (max * 4).max(64)
+}
+
+/// What a run reports of its witnesses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WitnessReport {
+    /// the bound of witnesses per fact
+    pub max_witnesses: usize,
+    /// derived facts of the closure
+    pub facts: u64,
+    /// derived facts whose witnesses may be incomplete
+    pub truncated: u64,
+    /// witnesses kept for the derived facts
+    pub witnesses: u64,
+    /// facts evaluated by the run
+    pub evaluated: u64,
+    /// whether the run built the witnesses from the closure rather than updating them
+    pub built: bool,
+    /// the estimated heap of the witnesses and their index
+    pub bytes: u64,
+    pub millis: u64,
+}
+
+/// How a fact of the closure is held.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// in the input graphs: its own quad is a support
+    Base,
+    /// derived
+    Derived,
+    /// in the derived tier and flagged explicit: a GeoSPARQL default geometry, whose
+    /// supports are not known
+    Flagged,
+}
+
+fn kind(c: &Closure, t: &Triple) -> Kind {
+    match c.graph.position(t) {
+        Some(r) if c.flagged(r) => Kind::Flagged,
+        Some(_) => Kind::Derived,
+        None => Kind::Base,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Node {
+    t: Triple,
+    /// the key of the fact's input quad, for a fact of the base tier
+    key: Option<FactKey>,
+    /// the kept supports: an antichain, in the order of [`Witness`]
+    w: Vec<Witness>,
+    /// supports may be missing at this fact itself
+    local: bool,
+    /// supports may be missing: at this fact or at a premise
+    trunc: bool,
+    live: bool,
+}
+
+impl Node {
+    fn bytes(&self) -> usize {
+        size_of::<Node>()
+            + self
+                .w
+                .iter()
+                .map(|x| x.len() * size_of::<Atom>() + size_of::<Witness>())
+                .sum::<usize>()
+    }
+}
+
+/// The witnesses of a closure's facts, with an index from input quads to the facts whose
+/// kept witnesses name them.
+pub struct Witnesses {
+    max: usize,
+    nodes: Vec<Node>,
+    index: FxHashMap<Triple, u32>,
+    free: Vec<u32>,
+    /// per input quad: the nodes whose kept witnesses may contain it (a superset)
+    rev: FxHashMap<FactKey, Vec<u32>>,
+    rev_entries: usize,
+    /// the heap of the witnesses, charged to the run's budget
+    held: Held,
+    /// the last run's report
+    pub(crate) report: WitnessReport,
+}
+
+/// What a pass reads.
+struct Cx<'a> {
+    c: &'a Closure,
+    rules: &'a [CRule],
+    plans: &'a Plans,
+    abort: &'a AtomicBool,
+    cancel: Option<&'a AtomicBool>,
+    budget: &'a Arc<Budget>,
+    /// per rule: its instances hold through a negation
+    negated: Vec<bool>,
+    /// the program derives facts whose instances a backward search cannot show: head
+    /// actions, `makeTemp` and heads without a plan
+    opaque: bool,
+    /// the program reads RDF lists
+    lists: bool,
+    first: u64,
+    rest: u64,
+    nil: u64,
+}
+
+/// The rule instances of one fact.
+#[derive(Default)]
+struct Found {
+    bodies: Vec<Box<[Triple]>>,
+    /// an instance holds through a negation, or reads a list that is not plain
+    unknown: bool,
+    /// more than [`MAX_INSTANCES`] instances
+    capped: bool,
+}
+
+/// The instances of one fact, as nodes.
+#[derive(Default)]
+struct Ins {
+    bodies: Vec<Box<[u32]>>,
+    unknown: bool,
+    capped: bool,
+}
+
+/// The state of what changes in an update, found before its deletion (see
+/// [`Witnesses::prepare`]).
+#[derive(Default)]
+pub(crate) struct Prepared {
+    /// the keys of the input quads that are no longer input quads
+    dead: FxHashSet<FactKey>,
+    /// the truncated facts and the facts with a dead key that a removed fact reaches
+    region: Vec<u32>,
+    /// base facts whose quad changed
+    rekeyed: Vec<u32>,
+    /// whether the update has to build the witnesses again
+    rebuild: bool,
+}
+
+fn cancelled(cx: &Cx<'_>) -> bool {
+    cx.abort.load(Ordering::Relaxed) || cx.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
+/// The key of the input quad that holds the base fact `t`: with several input graphs,
+/// the smallest key among the graphs that hold it (F13 §5.1).
+pub(crate) fn fact_key(c: &Closure, t: &Triple) -> FactKey {
+    let terms = &c.terms;
+    let key = |x: u64| terms.key_of(x).unwrap_or_default();
+    let (s, p, o) = (key(t[0]), key(t[1]), key(t[2]));
+    let Some(base) = c.graph.base() else {
+        return FactKey::of_keys(&s, &p, &o, None);
+    };
+    let graphs = base.graph_ids();
+    let of = |g: Id| {
+        let gk = (g != Id::DEFAULT_GRAPH).then(|| key(g.0));
+        FactKey::of_keys(&s, &p, &o, gk.as_deref())
+    };
+    if graphs.len() == 1 {
+        return of(graphs[0]);
+    }
+    let snap = &base.snap;
+    let stored = t
+        .iter()
+        .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
+    graphs
+        .iter()
+        .filter(|&&g| {
+            stored
+                && snap
+                    .contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])
+                    .unwrap_or(false)
+        })
+        .map(|&g| of(g))
+        .min()
+        .unwrap_or_else(|| of(graphs[0]))
+}
+
+/// Add `x` to the antichain `a`, kept in the order of [`Witness`]: nothing when a member
+/// is a subset of `x`, and otherwise the members that contain `x` leave.
+fn insert_min(a: &mut Vec<Witness>, x: Witness) -> bool {
+    if a.iter().any(|y| y.len() <= x.len() && y.is_subset(&x)) {
+        return false;
+    }
+    a.retain(|y| !(x.len() < y.len() && x.is_subset(y)));
+    let at = a.binary_search(&x).unwrap_or_else(|i| i);
+    a.insert(at, x);
+    true
+}
+
+/// The minimal supports of an instance whose premises have the supports `ws`, and
+/// whether the working bound cut them.
+fn product(ws: &[&[Witness]], cap: usize) -> (Vec<Witness>, bool) {
+    let mut over = false;
+    let mut r: Vec<Witness> = vec![Witness::default()];
+    for p in ws {
+        if p.is_empty() {
+            return (Vec::new(), over);
+        }
+        let mut next = Vec::with_capacity(r.len() * p.len());
+        for a in &r {
+            for b in p.iter() {
+                insert_min(&mut next, a.union(b));
+            }
+        }
+        if next.len() > cap {
+            next.truncate(cap);
+            over = true;
+        }
+        r = next;
+    }
+    (r, over)
+}
+
+fn bind_atom(a: &engine::Atom, t: &Triple, b: &mut [u64]) -> bool {
+    for (s, v) in [(a.s, t[0]), (a.p, t[1]), (a.o, t[2])] {
+        match s {
+            Slot::Const(c) if c != v => return false,
+            Slot::Var(x) => {
+                if b[x] == 0 {
+                    b[x] = v;
+                } else if b[x] != v {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn reads_list(k: BuiltinKind) -> bool {
+    use BuiltinKind as B;
+    matches!(
+        k,
+        B::ListMember
+            | B::ListContains
+            | B::ListNotContains
+            | B::ListLength
+            | B::ListEntry
+            | B::ListForAll
+    )
+}
+
+impl<'a> Cx<'a> {
+    fn new(
+        c: &'a Closure,
+        rules: &'a [CRule],
+        plans: &'a Plans,
+        abort: &'a AtomicBool,
+        limits: &'a Limits,
+    ) -> Cx<'a> {
+        let negated = rules
+            .iter()
+            .map(|r| r.builtins.iter().any(|b| b.kind == BuiltinKind::NoValue))
+            .collect();
+        let opaque = rules.iter().enumerate().any(|(ri, r)| {
+            r.builtins.iter().any(|b| b.kind == BuiltinKind::MakeTemp)
+                || r.head.iter().enumerate().any(|(hi, h)| match h {
+                    CHead::Action(..) => true,
+                    CHead::Triple(..) => plans.back[ri][hi].is_none(),
+                })
+        });
+        let t = &c.terms;
+        Cx {
+            c,
+            rules,
+            plans,
+            abort,
+            cancel: limits.cancel.as_deref(),
+            budget: &limits.budget,
+            negated,
+            opaque,
+            lists: rules.iter().any(engine::reads_lists),
+            first: t.rdf_first,
+            rest: t.rdf_rest,
+            nil: t.rdf_nil,
+        }
+    }
+
+    /// Whether `t` may be the head of a rule instance.
+    fn head_candidate(&self, t: &Triple) -> bool {
+        self.plans.heads(t[1]).next().is_some()
+    }
+
+    /// The list cells that the list builtins of an instance of `rule` with bindings
+    /// `vals` read, added to `out`; false when a list is not plain (a cell with several
+    /// values, whose reading depends on the order of derivation, or a cycle).
+    fn list_cells(
+        &self,
+        rule: &CRule,
+        vals: &[u64],
+        out: &mut Vec<Triple>,
+        memo: &mut Memo,
+    ) -> bool {
+        let g = &self.c.graph;
+        for bi in &rule.builtins {
+            if !reads_list(bi.kind) {
+                continue;
+            }
+            let l = match bi.args.first() {
+                Some(Slot::Var(v)) => vals[*v],
+                Some(Slot::Const(c)) => *c,
+                _ => continue,
+            };
+            let mut cur = l;
+            let mut seen = 0usize;
+            while cur != self.nil {
+                seen += 1;
+                if seen > MAX_LIST {
+                    return false;
+                }
+                let one = |memo: &mut Memo, p: u64| -> Option<u64> {
+                    let mut v = g.objects(memo, cur, p, g.len());
+                    v.sort_unstable();
+                    v.dedup();
+                    (v.len() == 1).then(|| v[0])
+                };
+                let (Some(f), Some(r)) = (one(memo, self.first), one(memo, self.rest)) else {
+                    return false;
+                };
+                out.push([cur, self.first, f]);
+                out.push([cur, self.rest, r]);
+                if r == l {
+                    return false;
+                }
+                cur = r;
+            }
+        }
+        true
+    }
+
+    /// The rule instances that derive `t`, with their premises: the facts their atoms
+    /// match, the facts `listForAll` reads and the cells of the lists they read.
+    fn instances(&self, t: Triple, memo: &mut Memo) -> anyhow::Result<Found> {
+        let g = &self.c.graph;
+        let mut f = Found::default();
+        let mut lmemo = Memo::default();
+        for (ri, hi) in self.plans.heads(t[1]) {
+            let Some((steps, pre)) = &self.plans.back[ri][hi] else {
+                continue;
+            };
+            let rule = &self.rules[ri];
+            let Some(mut b) = bind_head(rule, hi, pre, t) else {
+                continue;
+            };
+            let m = std::mem::take(memo);
+            let (failed, m) = {
+                let mut sink = |body: &[Triple], implicit: &[Triple], vals: &[u64]| -> bool {
+                    if self.negated[ri] {
+                        f.unknown = true;
+                        return true;
+                    }
+                    // an instance that uses its own head adds no support
+                    if body.iter().chain(implicit).any(|u| *u == t) {
+                        return true;
+                    }
+                    let mut all: Vec<Triple> = body.iter().chain(implicit).copied().collect();
+                    if !self.list_cells(rule, vals, &mut all, &mut lmemo) {
+                        f.unknown = true;
+                        return true;
+                    }
+                    all.sort_unstable();
+                    all.dedup();
+                    if f.bodies.len() >= MAX_INSTANCES {
+                        f.capped = true;
+                        return false;
+                    }
+                    f.bodies.push(all.into());
+                    true
+                };
+                let mut ev = Eval::new(
+                    g,
+                    &self.c.terms,
+                    rule,
+                    steps,
+                    g.len(),
+                    self.abort,
+                    self.cancel,
+                    usize::MAX,
+                    Mode::Instances {
+                        head: hi,
+                        target: t,
+                        sink: &mut sink,
+                    },
+                    self.budget,
+                );
+                ev.lend_memo(m);
+                ev.run(0, &mut b, None);
+                (ev.err.take(), ev.take_memo())
+            };
+            *memo = m;
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if f.capped {
+                break;
+            }
+        }
+        // repeated instances (other bindings of the same body) add nothing
+        f.bodies.sort_unstable();
+        f.bodies.dedup();
+        Ok(f)
+    }
+
+    /// The facts of the closure that are heads of rule instances with `t` matched by a
+    /// body atom; `t` need not be in the closure.
+    fn users(&self, t: &Triple, memo: &mut Memo) -> anyhow::Result<Vec<Triple>> {
+        let g = &self.c.graph;
+        let mut out = Vec::new();
+        for (ri, r) in self.rules.iter().enumerate() {
+            for (d, a) in r.atoms.iter().enumerate() {
+                let Some(steps) = &self.plans.forward[ri][d] else {
+                    continue;
+                };
+                let mut b = vec![0u64; r.nvars];
+                if !bind_atom(a, t, &mut b) {
+                    continue;
+                }
+                let m = std::mem::take(memo);
+                let mut ev = Eval::new(
+                    g,
+                    &self.c.terms,
+                    r,
+                    steps,
+                    g.len(),
+                    self.abort,
+                    self.cancel,
+                    usize::MAX,
+                    Mode::Existing,
+                    self.budget,
+                );
+                ev.lend_memo(m);
+                // the plan's first step is the atom that `t` matches
+                ev.run(1, &mut b, None);
+                *memo = ev.take_memo();
+                if let Some(e) = ev.err.take() {
+                    return Err(e);
+                }
+                let (heads, _held) = ev.take_out();
+                out.extend(heads);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.retain(|h| h != t);
+        Ok(out)
+    }
+}
+
+/// The instances and users a pass has read, by node.
+#[derive(Default)]
+struct Pass {
+    ins: FxHashMap<u32, Ins>,
+    users: FxHashMap<u32, Vec<u32>>,
+    /// the users of every node are known from `ins` (a full build)
+    complete: bool,
+    evaluated: u64,
+    /// a list cell changed while the rules read lists: build again
+    rebuild: bool,
+}
+
+impl Witnesses {
+    fn empty(max: usize, budget: &Arc<Budget>) -> Witnesses {
+        Witnesses {
+            max,
+            nodes: Vec::new(),
+            index: FxHashMap::default(),
+            free: Vec::new(),
+            rev: FxHashMap::default(),
+            rev_entries: 0,
+            held: Held::new(budget),
+            report: WitnessReport::default(),
+        }
+    }
+
+    /// The bound of witnesses per fact.
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Check a bound asked for.
+    pub fn check_max(max: usize) -> anyhow::Result<()> {
+        if max == 0 || max > MAX_WITNESSES_LIMIT {
+            anyhow::bail!("maxWitnesses must be between 1 and {MAX_WITNESSES_LIMIT}, not {max}");
+        }
+        Ok(())
+    }
+
+    /// The estimated heap.
+    pub fn heap_bytes(&self) -> usize {
+        let nodes: usize = self.nodes.iter().map(Node::bytes).sum();
+        nodes
+            + self.free.capacity() * 4
+            + table_bytes(self.index.capacity(), size_of::<(Triple, u32)>())
+            + table_bytes(self.rev.capacity(), size_of::<(FactKey, Vec<u32>)>())
+            + self.rev_entries * 4
+    }
+
+    /// Charge the witnesses to `budget`, as the closure they belong to is.
+    pub(crate) fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
+        let n = self.held.bytes();
+        let mut h = Held::try_new(budget, n)?;
+        std::mem::swap(&mut self.held, &mut h);
+        drop(h);
+        Ok(())
+    }
+
+    fn settle_charge(&mut self) -> Result<(), MemoryExceeded> {
+        let n = self.heap_bytes();
+        self.held.try_set(n)
+    }
+
+    fn node(&self, t: &Triple) -> Option<u32> {
+        self.index.get(t).copied()
+    }
+
+    fn add_node(&mut self, t: Triple, key: Option<FactKey>) -> u32 {
+        if let Some(&i) = self.index.get(&t) {
+            return i;
+        }
+        let n = Node {
+            t,
+            key,
+            w: Vec::new(),
+            local: false,
+            trunc: false,
+            live: true,
+        };
+        let i = match self.free.pop() {
+            Some(i) => {
+                self.nodes[i as usize] = n;
+                i
+            }
+            None => {
+                self.nodes.push(n);
+                (self.nodes.len() - 1) as u32
+            }
+        };
+        self.index.insert(t, i);
+        i
+    }
+
+    fn remove_node(&mut self, i: u32) {
+        let n = &mut self.nodes[i as usize];
+        if !n.live {
+            return;
+        }
+        n.live = false;
+        n.w = Vec::new();
+        let t = n.t;
+        self.index.remove(&t);
+        self.free.push(i);
+    }
+
+    /// Replace the kept supports of node `i`, indexing the quads they name.
+    fn set(&mut self, i: u32, w: Vec<Witness>, local: bool, trunc: bool) {
+        let n = &mut self.nodes[i as usize];
+        let mut added: Vec<FactKey> = Vec::new();
+        for x in &w {
+            if n.w.contains(x) {
+                continue;
+            }
+            for a in x.atoms() {
+                if let Atom::Fact(k) = a {
+                    added.push(*k);
+                }
+            }
+        }
+        n.w = w;
+        n.local = local;
+        n.trunc = trunc;
+        added.sort_unstable();
+        added.dedup();
+        for k in added {
+            self.rev.entry(k).or_default().push(i);
+            self.rev_entries += 1;
+        }
+    }
+
+    /// The witnesses of `t` as an annotation of the `why` semiring: each kept support
+    /// counts once, and the unknown count is 1 when supports may be missing. `None` when
+    /// `t` is not a fact the witnesses know.
+    pub(crate) fn ann(&self, t: &Triple) -> Option<Ann> {
+        let n = &self.nodes[self.node(t)? as usize];
+        Some(Ann::Why(Box::new(Why {
+            unknown: n.trunc as i64,
+            supports: n.w.iter().map(|x| (x.clone(), 1)).collect(),
+        })))
+    }
+
+    /// The witnesses of `t` as a reader sees them ([`Ann::report`]); the count is the
+    /// number of kept supports. A fact of the base tier that no rule derives has its own
+    /// quad as its only witness.
+    pub(crate) fn report_of(&self, c: &Closure, t: &Triple) -> Option<Annotation> {
+        if let Some(a) = self.ann(t) {
+            return Some(a.report(self.max));
+        }
+        if !c.graph.contains(t) || kind(c, t) != Kind::Base {
+            return None;
+        }
+        let w = Witness::new(vec![Atom::Fact(fact_key(c, t))]);
+        Some(Annotation {
+            count: 1,
+            lineage: Vec::new(),
+            witnesses: vec![w],
+            truncated: false,
+        })
+    }
+
+    /// The facts whose kept witnesses name the input quad `k`.
+    pub(crate) fn dependents(&self, k: &FactKey) -> Vec<Triple> {
+        let Some(v) = self.rev.get(k) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Triple> = v
+            .iter()
+            .map(|&i| &self.nodes[i as usize])
+            .filter(|n| {
+                n.live
+                    && n.w
+                        .iter()
+                        .any(|x| x.atoms().binary_search(&Atom::Fact(*k)).is_ok())
+            })
+            .map(|n| n.t)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Replace ids that moved (local ids the store now has).
+    pub(crate) fn remap(&mut self, moved: &FxHashMap<u64, u64>) {
+        if moved.is_empty() {
+            return;
+        }
+        let m = |x: u64| moved.get(&x).copied().unwrap_or(x);
+        self.index.clear();
+        for (i, n) in self.nodes.iter_mut().enumerate() {
+            if !n.live {
+                continue;
+            }
+            n.t = [m(n.t[0]), m(n.t[1]), m(n.t[2])];
+            self.index.insert(n.t, i as u32);
+        }
+    }
+
+    /// Build the witnesses of every fact of `c`.
+    pub(crate) fn build(
+        c: &mut Closure,
+        rules: &[CRule],
+        max: usize,
+        limits: &Limits,
+    ) -> anyhow::Result<Witnesses> {
+        let t0 = Instant::now();
+        Self::check_max(max)?;
+        let plans = Plans::new(&mut c.graph, rules)?;
+        let c = &*c;
+        let abort = AtomicBool::new(false);
+        let cx = Cx::new(c, rules, &plans, &abort, limits);
+        let mut w = Witnesses::empty(max, &limits.budget);
+        // the facts that may be heads: every derived fact, and the base facts whose
+        // predicate a head can have
+        let mut heads: Vec<Triple> = c.live().map(|(t, _)| t).collect();
+        if let Some(base) = c.graph.base() {
+            let mut scan = |p: Option<u64>| {
+                base.for_each(None, p, None, |t| {
+                    heads.push(t);
+                    true
+                })
+            };
+            if plans.any_pred.is_empty() {
+                let mut ps: Vec<u64> = plans.by_pred.keys().copied().collect();
+                ps.sort_unstable();
+                for p in ps {
+                    scan(Some(p))?;
+                }
+            } else {
+                scan(None)?;
+            }
+        }
+        heads.sort_unstable();
+        heads.dedup();
+        let mut held = Held::try_new(&limits.budget, heads.capacity() * size_of::<Triple>())?;
+        let found: Vec<anyhow::Result<Vec<Found>>> = heads
+            .par_chunks(256)
+            .map(|ch| {
+                let mut memo = Memo::default();
+                let mut out = Vec::with_capacity(ch.len());
+                for &t in ch {
+                    if cancelled(&cx) {
+                        anyhow::bail!("reasoning cancelled");
+                    }
+                    out.push(cx.instances(t, &mut memo)?);
+                }
+                Ok(out)
+            })
+            .collect();
+        let mut pass = Pass {
+            complete: true,
+            ..Pass::default()
+        };
+        let mut seeds = Vec::with_capacity(heads.len());
+        for &t in &heads {
+            let key = (kind(c, &t) == Kind::Base).then(|| fact_key(c, &t));
+            seeds.push(w.add_node(t, key));
+        }
+        let mut bytes = 0usize;
+        for (ch, f) in heads.chunks(256).zip(found) {
+            for (t, f) in ch.iter().zip(f?) {
+                let i = w.index[t];
+                let mut ins = Ins {
+                    bodies: Vec::with_capacity(f.bodies.len()),
+                    unknown: f.unknown,
+                    capped: f.capped,
+                };
+                for body in f.bodies {
+                    let ids: Box<[u32]> = body
+                        .iter()
+                        .map(|u| match w.node(u) {
+                            Some(j) => j,
+                            None => {
+                                let key = (kind(c, u) == Kind::Base).then(|| fact_key(c, u));
+                                w.add_node(*u, key)
+                            }
+                        })
+                        .collect();
+                    bytes += ids.len() * 8 + 32;
+                    ins.bodies.push(ids);
+                }
+                pass.ins.insert(i, ins);
+            }
+        }
+        held.try_set(bytes + heads.capacity() * size_of::<Triple>())?;
+        drop(heads);
+        // the base facts that are premises only have their own quad
+        for i in 0..w.nodes.len() as u32 {
+            if !pass.ins.contains_key(&i)
+                && let Some(k) = w.nodes[i as usize].key
+            {
+                w.set(i, vec![Witness::new(vec![Atom::Fact(k)])], false, false);
+            }
+        }
+        // users from the instances
+        let mut users: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for (&h, ins) in &pass.ins {
+            for b in &ins.bodies {
+                for &p in b.iter() {
+                    users.entry(p).or_default().push(h);
+                }
+            }
+        }
+        for v in users.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        pass.users = users;
+        held.try_grow(pass.users.values().map(|v| v.len() * 4 + 24).sum())?;
+        w.settle(&cx, seeds, &mut pass)?;
+        drop(held);
+        w.settle_charge()?;
+        w.finish_report(c, true, pass.evaluated, t0);
+        Ok(w)
+    }
+
+    /// Find, before an update deletes facts from `c`, what the update changes: the keys
+    /// of the input quads that go, and the truncated facts and facts with such a key that
+    /// a removed fact reaches. Called when the closure still holds every fact of the
+    /// previous closure (and the removed explicit facts as candidates).
+    pub(crate) fn prepare(
+        &mut self,
+        c: &mut Closure,
+        rules: &[CRule],
+        limits: &Limits,
+        removed: &[Triple],
+        moved: &[Triple],
+    ) -> anyhow::Result<Prepared> {
+        let mut p = Prepared::default();
+        let mut start: Vec<Triple> = Vec::new();
+        for t in removed {
+            if let Some(i) = self.node(t)
+                && let Some(k) = self.nodes[i as usize].key.take()
+            {
+                p.dead.insert(k);
+            }
+            start.push(*t);
+        }
+        for t in moved {
+            if let Some(i) = self.node(t)
+                && let Some(k) = self.nodes[i as usize].key
+            {
+                let now = fact_key(c, t);
+                if now != k {
+                    p.dead.insert(k);
+                    self.nodes[i as usize].key = Some(now);
+                    p.rekeyed.push(i);
+                    start.push(*t);
+                }
+            }
+        }
+        if p.dead.is_empty() && start.is_empty() {
+            return Ok(p);
+        }
+        let lost = self.lost(&p.dead);
+        let plans = Plans::new(&mut c.graph, rules)?;
+        let abort = AtomicBool::new(false);
+        let cx = Cx::new(c, rules, &plans, &abort, limits);
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        // the removed facts that stay derived are evaluated again, as are the facts that
+        // lost a kept support
+        for t in &start {
+            if let Some(i) = self.node(t)
+                && seen.insert(i)
+            {
+                p.region.push(i);
+            }
+        }
+        let mut queue: VecDeque<Triple> = start.into_iter().collect();
+        for &i in &lost {
+            if seen.insert(i) {
+                p.region.push(i);
+                queue.push_back(self.nodes[i as usize].t);
+            }
+        }
+        let mut memo = Memo::default();
+        let mut visited: FxHashSet<Triple> = queue.iter().copied().collect();
+        while let Some(x) = queue.pop_front() {
+            if cancelled(&cx) {
+                anyhow::bail!("reasoning cancelled");
+            }
+            for h in cx.users(&x, &mut memo)? {
+                if !visited.insert(h) {
+                    continue;
+                }
+                let Some(j) = self.node(&h) else {
+                    continue;
+                };
+                if (self.nodes[j as usize].trunc || lost.contains(&j)) && seen.insert(j) {
+                    p.region.push(j);
+                    queue.push_back(h);
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// The nodes whose kept witnesses name one of `dead`.
+    fn lost(&self, dead: &FxHashSet<FactKey>) -> FxHashSet<u32> {
+        let mut out = FxHashSet::default();
+        for k in dead {
+            for &i in self.rev.get(k).into_iter().flatten() {
+                let n = &self.nodes[i as usize];
+                if n.live
+                    && n.w
+                        .iter()
+                        .any(|x| x.atoms().binary_search(&Atom::Fact(*k)).is_ok())
+                {
+                    out.insert(i);
+                }
+            }
+        }
+        out
+    }
+
+    /// Bring the witnesses to the closure `c` after an update: the explicit facts
+    /// `inserted` were added and `removed` ones taken out, `deleted` facts left the
+    /// derived tier and `added` joined it, and `touched` default geometries changed.
+    /// `prep` is what [`prepare`](Self::prepare) found before the deletion.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update(
+        &mut self,
+        c: &mut Closure,
+        rules: &[CRule],
+        limits: &Limits,
+        prep: Prepared,
+        inserted: &[Triple],
+        removed: &[Triple],
+        deleted: &[Triple],
+        added: &[Triple],
+        touched: &[Triple],
+    ) -> anyhow::Result<bool> {
+        let t0 = Instant::now();
+        if prep.rebuild {
+            return Ok(false);
+        }
+        // the supports that name a quad that is gone
+        let mut seeds: Vec<u32> = Vec::new();
+        for k in &prep.dead {
+            let Some(v) = self.rev.remove(k) else {
+                continue;
+            };
+            self.rev_entries -= v.len().min(self.rev_entries);
+            for i in v {
+                let n = &mut self.nodes[i as usize];
+                if !n.live {
+                    continue;
+                }
+                let before = n.w.len();
+                n.w.retain(|x| x.atoms().binary_search(&Atom::Fact(*k)).is_err());
+                if n.w.len() != before {
+                    seeds.push(i);
+                }
+            }
+        }
+        // the facts that left the closure
+        for t in deleted.iter().chain(removed).chain(touched) {
+            if let Some(i) = self.node(t)
+                && !c.graph.contains(t)
+            {
+                self.remove_node(i);
+            }
+        }
+        // truncation is found again in the region
+        for &i in &prep.region {
+            let n = &mut self.nodes[i as usize];
+            if n.live {
+                n.trunc = false;
+                n.local = false;
+                seeds.push(i);
+            }
+        }
+        seeds.extend(prep.rekeyed.iter().copied());
+        for t in inserted {
+            if !c.graph.contains(t) {
+                continue;
+            }
+            let i = self.add_node(*t, None);
+            if kind(c, t) == Kind::Base {
+                self.nodes[i as usize].key = Some(fact_key(c, t));
+            }
+            seeds.push(i);
+        }
+        for t in added.iter().chain(touched) {
+            if c.graph.contains(t) {
+                seeds.push(self.add_node(*t, None));
+            }
+        }
+        // a fact that moved to the base tier by other means keeps its key current
+        for t in removed {
+            if let Some(i) = self.node(t)
+                && kind(c, t) == Kind::Base
+                && self.nodes[i as usize].key.is_none()
+            {
+                self.nodes[i as usize].key = Some(fact_key(c, t));
+                seeds.push(i);
+            }
+        }
+        seeds.retain(|&i| self.nodes[i as usize].live);
+        seeds.sort_unstable();
+        seeds.dedup();
+        let plans = Plans::new(&mut c.graph, rules)?;
+        let c = &*c;
+        let abort = AtomicBool::new(false);
+        let cx = Cx::new(c, rules, &plans, &abort, limits);
+        let mut pass = Pass::default();
+        self.settle(&cx, seeds, &mut pass)?;
+        if pass.rebuild {
+            return Ok(false);
+        }
+        self.compact_rev();
+        self.settle_charge()?;
+        self.finish_report(c, false, pass.evaluated, t0);
+        Ok(true)
+    }
+
+    /// Drop the stale entries of the reverse index once they are most of it.
+    fn compact_rev(&mut self) {
+        let live: usize = self
+            .nodes
+            .iter()
+            .filter(|n| n.live)
+            .map(|n| n.w.iter().map(|x| x.len()).sum::<usize>())
+            .sum();
+        if self.rev_entries <= 2 * live + 1024 {
+            return;
+        }
+        let mut rev: FxHashMap<FactKey, Vec<u32>> = FxHashMap::default();
+        let mut n = 0;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !node.live {
+                continue;
+            }
+            let mut ks: Vec<FactKey> = node
+                .w
+                .iter()
+                .flat_map(|x| x.atoms())
+                .filter_map(|a| match a {
+                    Atom::Fact(k) => Some(*k),
+                    Atom::Absent(_) => None,
+                })
+                .collect();
+            ks.sort_unstable();
+            ks.dedup();
+            for k in ks {
+                rev.entry(k).or_default().push(i as u32);
+                n += 1;
+            }
+        }
+        self.rev = rev;
+        self.rev_entries = n;
+    }
+
+    fn finish_report(&mut self, c: &Closure, built: bool, evaluated: u64, t0: Instant) {
+        let mut r = WitnessReport {
+            max_witnesses: self.max,
+            built,
+            evaluated,
+            bytes: self.heap_bytes() as u64,
+            millis: t0.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
+        for n in self.nodes.iter().filter(|n| n.live) {
+            if kind(c, &n.t) == Kind::Base {
+                continue;
+            }
+            r.facts += 1;
+            r.truncated += n.trunc as u64;
+            r.witnesses += n.w.len() as u64;
+        }
+        self.report = r;
+    }
+
+    /// The instances of node `i` as nodes, read once per pass. Premises without a node
+    /// get one: a base fact, whose own quad is a support, evaluated when it may be a head.
+    fn ins<'p>(
+        &mut self,
+        cx: &Cx<'_>,
+        pass: &'p mut Pass,
+        i: u32,
+        queue: &mut Vec<u32>,
+        memo: &mut Memo,
+    ) -> anyhow::Result<&'p Ins> {
+        if let std::collections::hash_map::Entry::Vacant(_) = pass.ins.entry(i) {
+            let t = self.nodes[i as usize].t;
+            let f = cx.instances(t, memo)?;
+            let mut ins = Ins {
+                bodies: Vec::with_capacity(f.bodies.len()),
+                unknown: f.unknown,
+                capped: f.capped,
+            };
+            for body in f.bodies {
+                let ids: Box<[u32]> = body
+                    .iter()
+                    .map(|u| match self.node(u) {
+                        Some(j) => j,
+                        None => {
+                            let base = kind(cx.c, u) == Kind::Base;
+                            let key = base.then(|| fact_key(cx.c, u));
+                            let j = self.add_node(*u, key);
+                            if let Some(k) = key {
+                                self.set(j, vec![Witness::new(vec![Atom::Fact(k)])], false, false);
+                            }
+                            if !base || cx.head_candidate(u) {
+                                queue.push(j);
+                            }
+                            j
+                        }
+                    })
+                    .collect();
+                ins.bodies.push(ids);
+            }
+            pass.ins.insert(i, ins);
+        }
+        Ok(&pass.ins[&i])
+    }
+
+    /// The nodes that are heads of instances with node `i` among their premises.
+    fn users_of(
+        &mut self,
+        cx: &Cx<'_>,
+        pass: &mut Pass,
+        i: u32,
+        memo: &mut Memo,
+    ) -> anyhow::Result<Vec<u32>> {
+        if pass.complete {
+            return Ok(pass.users.get(&i).cloned().unwrap_or_default());
+        }
+        if let Some(u) = pass.users.get(&i) {
+            return Ok(u.clone());
+        }
+        let t = self.nodes[i as usize].t;
+        let heads = cx.users(&t, memo)?;
+        let mut out = Vec::with_capacity(heads.len());
+        for h in heads {
+            out.push(match self.node(&h) {
+                Some(j) => j,
+                None => {
+                    let key = (kind(cx.c, &h) == Kind::Base).then(|| fact_key(cx.c, &h));
+                    self.add_node(h, key)
+                }
+            });
+        }
+        pass.users.insert(i, out.clone());
+        Ok(out)
+    }
+
+    /// Evaluate the facts of `seeds`, and the users of every fact whose value changes,
+    /// until no value changes.
+    fn settle(&mut self, cx: &Cx<'_>, seeds: Vec<u32>, pass: &mut Pass) -> anyhow::Result<()> {
+        let cap = pool_cap(self.max);
+        let mut queue: VecDeque<u32> = VecDeque::with_capacity(seeds.len());
+        let mut queued: FxHashSet<u32> = FxHashSet::default();
+        for i in seeds {
+            if queued.insert(i) {
+                queue.push_back(i);
+            }
+        }
+        let mut changes: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut memo = Memo::default();
+        let mut more: Vec<u32> = Vec::new();
+        let mut gone: Vec<u32> = Vec::new();
+        let mut frozen: FxHashSet<u32> = FxHashSet::default();
+        let mut ticks = 0u32;
+        while let Some(i) = queue.pop_front() {
+            queued.remove(&i);
+            ticks = ticks.wrapping_add(1);
+            if ticks.is_multiple_of(256) {
+                if cancelled(cx) {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                cx.budget.check()?;
+            }
+            if !self.nodes[i as usize].live {
+                continue;
+            }
+            let t = self.nodes[i as usize].t;
+            if !cx.c.graph.contains(&t) {
+                // not a fact of the closure: the node goes after the pass, whose caches
+                // name it
+                gone.push(i);
+                continue;
+            }
+            let k = kind(cx.c, &t);
+            match (k, self.nodes[i as usize].key) {
+                (Kind::Base, None) => self.nodes[i as usize].key = Some(fact_key(cx.c, &t)),
+                (Kind::Derived | Kind::Flagged, Some(_)) => self.nodes[i as usize].key = None,
+                _ => {}
+            }
+            pass.evaluated += 1;
+            more.clear();
+            let ins = self.ins(cx, pass, i, &mut more, &mut memo)?;
+            // evaluate
+            let n = &self.nodes[i as usize];
+            let mut local = ins.unknown || ins.capped;
+            let mut pool: Vec<Witness> = Vec::new();
+            match k {
+                Kind::Base => {
+                    let k = n.key.expect("the key was set above");
+                    pool.push(Witness::new(vec![Atom::Fact(k)]));
+                }
+                Kind::Flagged => local = true,
+                Kind::Derived => local |= ins.bodies.is_empty() || cx.opaque,
+            }
+            let mut trunc = false;
+            let mut ws: Vec<&[Witness]> = Vec::new();
+            for body in &ins.bodies {
+                ws.clear();
+                for &p in body.iter() {
+                    let pn = &self.nodes[p as usize];
+                    trunc |= pn.trunc;
+                    ws.push(&pn.w);
+                }
+                let (prod, over) = product(&ws, cap);
+                local |= over;
+                for x in prod {
+                    insert_min(&mut pool, x);
+                }
+                if pool.len() > cap {
+                    pool.truncate(cap);
+                    local = true;
+                }
+            }
+            if pool.len() > self.max {
+                pool.truncate(self.max);
+                local = true;
+            }
+            // the empty support absorbs every other one: the fact follows from nothing,
+            // and that is its only minimal support whatever its premises keep
+            if pool.first().is_some_and(Witness::is_empty) {
+                pool.truncate(1);
+                local = false;
+                trunc = false;
+            }
+            let trunc = trunc || local;
+            let n = &self.nodes[i as usize];
+            let same = n.w == pool && n.local == local && n.trunc == trunc;
+            if cx.lists && !same && (t[1] == cx.first || t[1] == cx.rest) && !pass.complete {
+                pass.rebuild = true;
+                return Ok(());
+            }
+            for &j in &more {
+                if queued.insert(j) {
+                    queue.push_back(j);
+                }
+            }
+            if same {
+                continue;
+            }
+            let was = n.trunc;
+            let c = changes.entry(i).or_insert(0);
+            *c += 1;
+            if *c > MAX_CHANGES {
+                // frozen: the value stays, known to be incomplete
+                frozen.insert(i);
+                if !n.trunc {
+                    let w = n.w.clone();
+                    self.set(i, w, true, true);
+                } else {
+                    continue;
+                }
+            } else {
+                self.set(i, pool, local, trunc);
+            }
+            if was && !trunc {
+                // the truncation of the facts downstream may rest on this fact's, also
+                // through a cycle of truncated facts: it is reset for all of them and
+                // found again, so that it stays the least one
+                let mut stack = vec![i];
+                while let Some(x) = stack.pop() {
+                    for u in self.users_of(cx, pass, x, &mut memo)? {
+                        let un = &mut self.nodes[u as usize];
+                        if un.live && un.trunc && !frozen.contains(&u) {
+                            un.trunc = false;
+                            stack.push(u);
+                            if queued.insert(u) {
+                                queue.push_back(u);
+                            }
+                        }
+                    }
+                }
+            }
+            for u in self.users_of(cx, pass, i, &mut memo)? {
+                if queued.insert(u) {
+                    queue.push_back(u);
+                }
+            }
+        }
+        for i in gone {
+            if !cx.c.graph.contains(&self.nodes[i as usize].t) {
+                self.remove_node(i);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Brute-force oracle tests: the minimal supports of every fact, found by running the
+    //! rules over every subset of the explicit facts, against the witnesses a build and a
+    //! history of updates keep.
+
+    use super::*;
+    use crate::facts::Base;
+    use crate::graph::Graph;
+    use crate::incremental::tests::{
+        OWL, RDF, RDFS, Rng, Vocab, compiled, full, limits, set_default_graph,
+    };
+    use crate::incremental::{Fallback, update};
+    use crate::terms::Terms;
+
+    /// The number of random cases, `SPARKLES_WITNESS_CASES` for longer runs.
+    fn cases(default: u64) -> u64 {
+        std::env::var("SPARKLES_WITNESS_CASES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn seed0() -> u64 {
+        std::env::var("SPARKLES_WITNESS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    }
+
+    /// A random fact over three names of each kind, so that few facts interact.
+    fn small(v: &Vocab, r: &mut Rng, owl: bool) -> Triple {
+        let rdf = |l| v.id(RDF, l);
+        let rdfs = |l| v.id(RDFS, l);
+        let o = |l| v.id(OWL, l);
+        let (c, p, i) = (&v.classes[..3], &v.props[..3], &v.inds[..3]);
+        match r.below(if owl { 14 } else { 8 }) {
+            0 => [r.pick(c), rdfs("subClassOf"), r.pick(c)],
+            1 => [r.pick(p), rdfs("subPropertyOf"), r.pick(p)],
+            2 => [r.pick(p), rdfs("domain"), r.pick(c)],
+            3 => [r.pick(p), rdfs("range"), r.pick(c)],
+            4 => [r.pick(i), rdf("type"), r.pick(c)],
+            5..=7 => [r.pick(i), r.pick(p), r.pick(i)],
+            8 => [r.pick(i), o("sameAs"), r.pick(i)],
+            9 => [r.pick(p), o("inverseOf"), r.pick(p)],
+            10 => [
+                r.pick(p),
+                rdf("type"),
+                r.pick(&[o("TransitiveProperty"), o("SymmetricProperty")]),
+            ],
+            11 => [r.pick(c), o("equivalentClass"), r.pick(c)],
+            12 => [r.pick(p), o("equivalentProperty"), r.pick(p)],
+            _ => [r.pick(i), r.pick(&p[..1]), r.pick(i)],
+        }
+    }
+
+    /// A closure of `base` built with the closure operators.
+    fn full_operators(v: &Vocab, text: &str, base: &FxHashSet<Triple>) -> Closure {
+        let snap = set_default_graph(v, base);
+        let terms = Terms::new(snap.clone());
+        let rules = compiled(text, &terms);
+        let mut lim = limits();
+        lim.closures = true;
+        let b = Arc::new(Base::new(snap, &[Id::DEFAULT_GRAPH]).unwrap());
+        let mut g = Graph::with_base(b.clone());
+        if let Err(e) = engine::run(&mut g, &rules, &terms, &lim, None) {
+            assert!(e.is::<crate::closure::Restart>(), "{e:#}");
+            g = Graph::with_base(b);
+            engine::run(&mut g, &rules, &terms, &limits(), None).unwrap();
+        }
+        Closure::new(g, terms).unwrap()
+    }
+
+    /// The minimal supports of every fact of the closure of `base`, by brute force.
+    struct Oracle {
+        /// the explicit facts, by bit
+        keys: FxHashMap<FactKey, u32>,
+        /// per subset of the explicit facts: its closure, as text
+        closures: Vec<FxHashSet<String>>,
+        /// per fact, as text: the subsets that minimally derive it
+        minimal: FxHashMap<String, Vec<u32>>,
+    }
+
+    fn text(terms: &Terms, t: &Triple) -> String {
+        let s = |x: u64| terms.term(x).map_or(format!("?{x:x}"), |t| t.to_string());
+        format!("{} {} {}", s(t[0]), s(t[1]), s(t[2]))
+    }
+
+    fn oracle(v: &Vocab, rule_text: &str, base: &[Triple]) -> Oracle {
+        let terms = Terms::new(v.store.snapshot());
+        let rules = compiled(rule_text, &terms);
+        let n = base.len();
+        assert!(n <= 12);
+        let key = |x: u64| terms.key_of(x).unwrap();
+        let keys = base
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    FactKey::of_keys(&key(t[0]), &key(t[1]), &key(t[2]), None),
+                    i as u32,
+                )
+            })
+            .collect();
+        let mut closures = Vec::with_capacity(1 << n);
+        for mask in 0u32..(1 << n) {
+            let mut g = Graph::with_capacity(16);
+            g.add_batch((0..n).filter(|i| mask & (1 << i) != 0).map(|i| base[i]));
+            engine::run(&mut g, &rules, &terms, &limits(), None).unwrap();
+            let set: FxHashSet<String> = (0..g.len())
+                .filter(|&r| g.alive(r))
+                .map(|r| text(&terms, &g.triple(r)))
+                .collect();
+            closures.push(set);
+        }
+        let mut masks: Vec<u32> = (0..(1u32 << n)).collect();
+        masks.sort_by_key(|m| m.count_ones());
+        let mut minimal: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+        for m in masks {
+            for f in &closures[m as usize] {
+                let e = minimal.entry(f.clone()).or_default();
+                if !e.iter().any(|&x| x & !m == 0) {
+                    e.push(m);
+                }
+            }
+        }
+        Oracle {
+            keys,
+            closures,
+            minimal,
+        }
+    }
+
+    /// The facts of both tiers, by their text.
+    fn facts(c: &Closure) -> FxHashMap<String, Triple> {
+        let mut out: FxHashMap<String, Triple> =
+            c.live().map(|(t, _)| (text(&c.terms, &t), t)).collect();
+        c.graph
+            .base()
+            .unwrap()
+            .for_each(None, None, None, |t| {
+                out.insert(text(&c.terms, &t), t);
+                true
+            })
+            .unwrap();
+        out
+    }
+
+    fn mask(o: &Oracle, w: &Witness, what: &str) -> u32 {
+        w.atoms()
+            .iter()
+            .map(|a| match a {
+                Atom::Fact(k) => {
+                    1 << o.keys.get(k).unwrap_or_else(|| {
+                        panic!("{what}: a witness names {k:?}, not an explicit fact")
+                    })
+                }
+                Atom::Absent(_) => panic!("{what}: a negative condition"),
+            })
+            .fold(0, |a, b| a | b)
+    }
+
+    /// The kept supports and the truncation of `t`.
+    fn kept(c: &Closure, w: &Witnesses, t: &Triple) -> Option<(Vec<Witness>, bool)> {
+        match w.node(t) {
+            Some(i) => {
+                let n = &w.nodes[i as usize];
+                Some((n.w.clone(), n.trunc))
+            }
+            None => {
+                let a = w.report_of(c, t)?;
+                Some((a.witnesses, a.truncated))
+            }
+        }
+    }
+
+    /// Check the two rules for every fact; returns the facts that are exact and those
+    /// that are truncated.
+    fn check(o: &Oracle, c: &Closure, w: &Witnesses, what: &str) -> (usize, usize) {
+        let all = o.closures.last().unwrap();
+        let have = facts(c);
+        let names: FxHashSet<&String> = have.keys().collect();
+        assert_eq!(
+            names,
+            all.iter().collect::<FxHashSet<_>>(),
+            "{what}: the closure differs from the oracle's"
+        );
+        let (mut exact, mut truncated) = (0, 0);
+        for (f, t) in &have {
+            let (ws, trunc) =
+                kept(c, w, t).unwrap_or_else(|| panic!("{what}: no witnesses for {f}"));
+            assert!(
+                ws.len() <= w.max,
+                "{what}: {f} keeps {} witnesses",
+                ws.len()
+            );
+            let masks: Vec<u32> = ws.iter().map(|x| mask(o, x, what)).collect();
+            // rule 1: every kept support derives the fact
+            for (x, m) in ws.iter().zip(&masks) {
+                assert!(
+                    o.closures[*m as usize].contains(f),
+                    "{what}: {f} keeps {x:?}, which does not derive it"
+                );
+            }
+            // the kept supports form an antichain
+            for (a, x) in masks.iter().enumerate() {
+                for (b, y) in masks.iter().enumerate() {
+                    assert!(
+                        a == b || x & y != *x,
+                        "{what}: {f} keeps a support and a superset"
+                    );
+                }
+            }
+            if trunc {
+                truncated += 1;
+                continue;
+            }
+            // rule 2: a fact that is not truncated keeps exactly its minimal supports
+            let mut want = o.minimal[f].clone();
+            want.sort_unstable();
+            let mut got = masks.clone();
+            got.sort_unstable();
+            assert_eq!(got, want, "{what}: {f} is exact with other supports");
+            exact += 1;
+        }
+        (exact, truncated)
+    }
+
+    /// Facts that a fresh build of `c` keeps exactly are kept exactly, with the same
+    /// supports, by `w`.
+    fn converged(c: &mut Closure, rules: &[CRule], w: &Witnesses, what: &str) {
+        let fresh = Witnesses::build(c, rules, w.max, &limits()).unwrap();
+        for (f, t) in facts(c) {
+            let (a, ta) = kept(c, &fresh, &t).unwrap();
+            if ta {
+                continue;
+            }
+            let (b, tb) = kept(c, w, &t).unwrap();
+            assert!(
+                !tb,
+                "{what}: {f} is exact in a fresh build and truncated after the update"
+            );
+            assert_eq!(a, b, "{what}: {f}");
+        }
+    }
+
+    fn base_of(v: &Vocab, r: &mut Rng, owl: bool, n: usize) -> FxHashSet<Triple> {
+        let mut base = FxHashSet::default();
+        while base.len() < n {
+            base.insert(small(v, r, owl));
+        }
+        base
+    }
+
+    fn sorted(b: &FxHashSet<Triple>) -> Vec<Triple> {
+        let mut v: Vec<Triple> = b.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// A build over random small ontologies, checked against the oracle.
+    fn builds(
+        text_rules: &str,
+        owl: bool,
+        max: usize,
+        operators: bool,
+        cases: u64,
+    ) -> (usize, usize) {
+        let v = Vocab::new();
+        let (mut exact, mut truncated) = (0, 0);
+        for seed in seed0()..seed0() + cases {
+            let mut r = Rng(seed * 7919 + max as u64);
+            let n = 3 + r.below(6);
+            let base = base_of(&v, &mut r, owl, n);
+            let mut c = if operators {
+                full_operators(&v, text_rules, &base)
+            } else {
+                full(&v, text_rules, &base)
+            };
+            let rules = compiled(text_rules, &c.terms);
+            let w = Witnesses::build(&mut c, &rules, max, &limits()).unwrap();
+            let o = oracle(&v, text_rules, &sorted(&base));
+            let (e, t) = check(&o, &c, &w, &format!("seed {seed} max {max}"));
+            exact += e;
+            truncated += t;
+        }
+        (exact, truncated)
+    }
+
+    #[test]
+    fn rdfs_builds_match_the_oracle() {
+        let (exact, _) = builds(crate::RDFS_RULES, false, 256, false, cases(12));
+        assert!(exact > 0);
+    }
+
+    #[test]
+    fn rdfs_builds_without_truncation_are_exact() {
+        // with a bound above every fact's minimal supports nothing is truncated
+        let (_, truncated) = builds(crate::RDFS_SIMPLE_RULES, false, 256, false, cases(12));
+        assert_eq!(truncated, 0);
+    }
+
+    #[test]
+    fn owl_rl_builds_match_the_oracle_with_closure_operators() {
+        let (exact, _) = builds(crate::OWL_RL_RULES, true, 8, true, cases(8));
+        assert!(exact > 0);
+    }
+
+    #[test]
+    fn truncated_builds_keep_real_witnesses() {
+        for max in [1, 2] {
+            let (_, truncated) = builds(crate::RDFS_RULES, false, max, false, cases(8));
+            assert!(truncated > 0, "max {max}: nothing was truncated");
+            builds(crate::OWL_RL_RULES, true, max, true, cases(4));
+        }
+    }
+
+    /// Bring `c` and `w` to the explicit facts `base`, reached by `inserted` and
+    /// `removed`, as an incremental run does.
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        v: &Vocab,
+        text_rules: &str,
+        max: usize,
+        c: &mut Closure,
+        w: &mut Witnesses,
+        base: &FxHashSet<Triple>,
+        inserted: &[Triple],
+        removed: &[Triple],
+    ) {
+        let snap = set_default_graph(v, base);
+        let moved = c.terms.rebase(snap.clone());
+        c.remap(&moved);
+        w.remap(&moved);
+        if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
+            l.update(inserted, removed, crate::facts::rank);
+            c.put_lookups(l);
+        }
+        let rules = compiled(text_rules, &c.terms);
+        let mut prep = None;
+        let res = {
+            let mut hook = |cl: &mut Closure| -> anyhow::Result<()> {
+                prep = Some(w.prepare(cl, &rules, &limits(), removed, &[])?);
+                Ok(())
+            };
+            update(c, &rules, &limits(), inserted, removed, Some(&mut hook))
+        };
+        match res {
+            Ok(up) => {
+                let added: Vec<Triple> = up.added(c).collect();
+                let ok = w
+                    .update(
+                        c,
+                        &rules,
+                        &limits(),
+                        prep.take().expect("the hook ran"),
+                        inserted,
+                        removed,
+                        &up.deleted,
+                        &added,
+                        &[],
+                    )
+                    .unwrap();
+                if !ok {
+                    *w = Witnesses::build(c, &rules, max, &limits()).unwrap();
+                }
+            }
+            Err(e) => {
+                assert!(e.downcast_ref::<Fallback>().is_some(), "{e:#}");
+                *c = full(v, text_rules, base);
+                let rules = compiled(text_rules, &c.terms);
+                *w = Witnesses::build(c, &rules, max, &limits()).unwrap();
+            }
+        }
+    }
+
+    /// Random insertions and deletions, each followed by an update of the closure and
+    /// its witnesses, checked against the oracle and against a fresh build.
+    fn history(text_rules: &str, owl: bool, max: usize, seed: u64, steps: usize) {
+        let v = Vocab::new();
+        let mut r = Rng(seed * 104_729 + max as u64);
+        let n = 3 + r.below(5);
+        let mut base = base_of(&v, &mut r, owl, n);
+        let mut c = full(&v, text_rules, &base);
+        let rules = compiled(text_rules, &c.terms);
+        let mut w = Witnesses::build(&mut c, &rules, max, &limits()).unwrap();
+        for k in 0..steps {
+            let what = format!("seed {seed} max {max} step {k}");
+            let (mut inserted, mut removed) = (Vec::new(), Vec::new());
+            let current = sorted(&base);
+            for _ in 0..r.below(3) {
+                if current.is_empty() {
+                    break;
+                }
+                let t = r.pick(&current);
+                if base.remove(&t) {
+                    removed.push(t);
+                }
+            }
+            for _ in 0..r.below(3) {
+                if base.len() >= 9 {
+                    break;
+                }
+                let t = small(&v, &mut r, owl);
+                if base.insert(t) {
+                    inserted.push(t);
+                }
+            }
+            step(
+                &v, text_rules, max, &mut c, &mut w, &base, &inserted, &removed,
+            );
+            let o = oracle(&v, text_rules, &sorted(&base));
+            check(&o, &c, &w, &what);
+            let rules = compiled(text_rules, &c.terms);
+            converged(&mut c, &rules, &w, &what);
+            c.compact_if_needed(false).unwrap();
+        }
+    }
+
+    #[test]
+    fn rdfs_histories_match_the_oracle() {
+        for seed in seed0()..seed0() + cases(6) {
+            for max in [8, 2, 1] {
+                history(crate::RDFS_SIMPLE_RULES, false, max, seed, 6);
+            }
+        }
+    }
+
+    #[test]
+    fn full_rdfs_histories_match_the_oracle() {
+        for seed in seed0()..seed0() + cases(3) {
+            history(crate::RDFS_RULES, false, 8, seed, 5);
+            history(crate::RDFS_RULES, false, 1, seed, 5);
+        }
+    }
+
+    #[test]
+    fn owl_rl_histories_match_the_oracle() {
+        for seed in seed0()..seed0() + cases(3) {
+            history(crate::OWL_RL_RULES, true, 8, seed, 5);
+            history(crate::OWL_RL_RULES, true, 2, seed, 5);
+        }
+    }
+
+    /// The facts of `v` named by local name, for the hand-made cases.
+    fn ex(v: &Vocab, l: &str) -> u64 {
+        v.id(crate::incremental::tests::EX, l)
+    }
+
+    /// Two derivations of one fact under a bound of 1: the fact is truncated, keeps the
+    /// smaller support, and is exact again once either support is removed, also when the
+    /// removed fact is only in the support it did not keep.
+    #[test]
+    fn a_truncated_fact_converges_after_a_deletion() {
+        let v = Vocab::new();
+        let sub = v.id(RDFS, "subClassOf");
+        let ty = v.id(RDF, "type");
+        let (c0, c1, c2) = (ex(&v, "C0"), ex(&v, "C1"), ex(&v, "C2"));
+        let i0 = ex(&v, "i0");
+        let rules_text = crate::RDFS_SIMPLE_RULES;
+        for drop_kept in [false, true] {
+            // i0 a C2 follows from i0 a C0 with C0 ⊑ C2, and from i0 a C1 with C1 ⊑ C2
+            let facts = [[i0, ty, c0], [c0, sub, c2], [i0, ty, c1], [c1, sub, c2]];
+            let mut base: FxHashSet<Triple> = facts.iter().copied().collect();
+            let mut c = full(&v, rules_text, &base);
+            let rules = compiled(rules_text, &c.terms);
+            let mut w = Witnesses::build(&mut c, &rules, 1, &limits()).unwrap();
+            let target = [i0, ty, c2];
+            let (ws, trunc) = kept(&c, &w, &target).unwrap();
+            assert!(trunc && ws.len() == 1);
+            // remove a fact of the kept support, or of the one that was dropped
+            let kept_keys: FxHashSet<FactKey> = ws[0]
+                .atoms()
+                .iter()
+                .filter_map(|a| match a {
+                    Atom::Fact(k) => Some(*k),
+                    _ => None,
+                })
+                .collect();
+            let gone = *facts
+                .iter()
+                .find(|t| kept_keys.contains(&fact_key(&c, t)) == drop_kept && t[1] == sub)
+                .unwrap();
+            base.remove(&gone);
+            let snap = set_default_graph(&v, &base);
+            let moved = c.terms.rebase(snap.clone());
+            c.remap(&moved);
+            w.remap(&moved);
+            let _ = c.set_inputs(snap, &[Id::DEFAULT_GRAPH]).unwrap();
+            let rules = compiled(rules_text, &c.terms);
+            let mut prep = None;
+            let up = {
+                let mut hook = |cl: &mut Closure| -> anyhow::Result<()> {
+                    prep = Some(w.prepare(cl, &rules, &limits(), &[gone], &[])?);
+                    Ok(())
+                };
+                update(&mut c, &rules, &limits(), &[], &[gone], Some(&mut hook)).unwrap()
+            };
+            let added: Vec<Triple> = up.added(&c).collect();
+            assert!(
+                w.update(
+                    &mut c,
+                    &rules,
+                    &limits(),
+                    prep.unwrap(),
+                    &[],
+                    &[gone],
+                    &up.deleted,
+                    &added,
+                    &[]
+                )
+                .unwrap()
+            );
+            let (ws, trunc) = kept(&c, &w, &target).unwrap();
+            assert!(!trunc, "drop_kept {drop_kept}: still truncated");
+            assert_eq!(ws.len(), 1);
+            assert!(
+                ws[0]
+                    .atoms()
+                    .iter()
+                    .all(|a| matches!(a, Atom::Fact(k) if *k != fact_key(&c, &gone)))
+            );
+        }
+    }
+
+    /// A transitive chain closed by the closure operator: each fact's witness is its path
+    /// with the property's declaration.
+    #[test]
+    fn closure_operator_facts_have_path_witnesses() {
+        let v = Vocab::new();
+        let ty = v.id(RDF, "type");
+        let trans = v.id(OWL, "TransitiveProperty");
+        let p = v.props[0];
+        let i = &v.inds;
+        let mut base: FxHashSet<Triple> = FxHashSet::default();
+        base.insert([p, ty, trans]);
+        for k in 0..4 {
+            base.insert([i[k], p, i[k + 1]]);
+        }
+        let mut c = full_operators(&v, crate::OWL_RL_RULES, &base);
+        let rules = compiled(crate::OWL_RL_RULES, &c.terms);
+        let w = Witnesses::build(&mut c, &rules, 8, &limits()).unwrap();
+        let (ws, trunc) = kept(&c, &w, &[i[0], p, i[4]]).unwrap();
+        assert!(!trunc);
+        let mut want: Vec<Atom> = (0..4)
+            .map(|k| Atom::Fact(fact_key(&c, &[i[k], p, i[k + 1]])))
+            .chain([Atom::Fact(fact_key(&c, &[p, ty, trans]))])
+            .collect();
+        want.sort_unstable();
+        assert_eq!(ws, vec![Witness::new(want)]);
+        let o = oracle(&v, crate::OWL_RL_RULES, &sorted(&base));
+        check(&o, &c, &w, "chain");
+    }
+
+    /// Regression: with a bound of 1, `p1 rdf:type rdf:Property` follows from
+    /// `i0 p1 i0` and from the asserted `p1 rdfs:subPropertyOf p1`, which it derives in
+    /// turn, so the two facts and `p1 rdf:type rdfs:Resource` form a cycle of truncated
+    /// facts. Removing the asserted fact, which kept the other support and not its own,
+    /// leaves one support each. The removed fact must be evaluated again with its
+    /// truncation reset, and the reset must reach the whole cycle.
+    #[test]
+    fn removing_a_truncated_fact_resets_its_cycle() {
+        let v = Vocab::new();
+        let spo = v.id(RDFS, "subPropertyOf");
+        let (p1, i0) = (ex(&v, "p1"), ex(&v, "i0"));
+        let text_rules = crate::RDFS_RULES;
+        let gone = [p1, spo, p1];
+        let mut base: FxHashSet<Triple> = [[i0, p1, i0], gone].into_iter().collect();
+        let mut c = full(&v, text_rules, &base);
+        let rules = compiled(text_rules, &c.terms);
+        let mut w = Witnesses::build(&mut c, &rules, 1, &limits()).unwrap();
+        let ty = v.id(RDF, "type");
+        let prop = v.id(RDF, "Property");
+        assert!(kept(&c, &w, &[p1, ty, prop]).unwrap().1);
+        base.remove(&gone);
+        step(&v, text_rules, 1, &mut c, &mut w, &base, &[], &[gone]);
+        let o = oracle(&v, text_rules, &sorted(&base));
+        check(&o, &c, &w, "after the removal");
+        assert!(!kept(&c, &w, &[p1, ty, prop]).unwrap().1);
+        let rules = compiled(text_rules, &c.terms);
+        converged(&mut c, &rules, &w, "after the removal");
+    }
+}

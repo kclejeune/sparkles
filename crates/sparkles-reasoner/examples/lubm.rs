@@ -12,7 +12,9 @@
 //! ```
 //!
 //! `RAYON_NUM_THREADS` sets the number of threads, and `SPARKLES_GENERIC_CLOSURES=1` makes
-//! `infer` evaluate transitive and equivalence rules as ordinary rules. The peak heap counts every allocation
+//! `infer` evaluate transitive and equivalence rules as ordinary rules.
+//! `SPARKLES_WITNESSES=N` makes `materialize` and `keep` keep up to `N` witnesses per fact
+//! (spec F18 §7.1) and report them. The peak heap counts every allocation
 //! of the process from the start of the run, so it includes the data the run returns.
 //!
 //! `keep` measures the closure kept for incremental runs, as a server keeps it: a full
@@ -167,6 +169,28 @@ fn run_options() -> ReasonOptions {
     }
 }
 
+/// The witnesses `SPARKLES_WITNESSES` asks for.
+fn witnesses() -> Option<usize> {
+    std::env::var("SPARKLES_WITNESSES")
+        .ok()
+        .map(|v| v.parse().expect("SPARKLES_WITNESSES"))
+}
+
+/// The witness fields of a report line.
+fn witness_fields(r: &ReasonReport) -> String {
+    r.witnesses.as_ref().map_or(String::new(), |w| {
+        format!(
+            " witnesses_ms={} witness_facts={} witness_truncated={} witnesses={} witness_evaluated={} witness_mib={:.1}",
+            w.millis,
+            w.facts,
+            w.truncated,
+            w.witnesses,
+            w.evaluated,
+            mib(w.bytes as usize)
+        )
+    })
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -253,16 +277,21 @@ fn main() {
                     vm_hwm()
                 );
             } else {
-                let r = materialize(&store, &profile, &ReasonOptions::default()).unwrap();
+                let opts = ReasonOptions {
+                    witnesses: witnesses(),
+                    ..ReasonOptions::default()
+                };
+                let r = materialize(&store, &profile, &opts).unwrap();
                 let peak = PEAK.load(Ordering::Relaxed) - before;
                 println!(
-                    "materialize {} threads={threads} inferred={} iterations={} ms={} peak_heap_mib={:.1} vm_hwm={}",
+                    "materialize {} threads={threads} inferred={} iterations={} ms={} peak_heap_mib={:.1} vm_hwm={}{}",
                     profile.name(),
                     r.inferred,
                     r.iterations,
                     r.millis,
                     mib(peak),
-                    vm_hwm()
+                    vm_hwm(),
+                    witness_fields(&r)
                 );
             }
         }
@@ -273,7 +302,10 @@ fn main() {
             let store = Store::open(&db, StoreOptions::default()).unwrap();
             let threads = rayon::current_num_threads();
             let cache = Cache::new(usize::MAX);
-            let opts = ReasonOptions::default();
+            let opts = ReasonOptions {
+                witnesses: witnesses(),
+                ..ReasonOptions::default()
+            };
             let run = |since: Option<u64>, cache: Option<&Cache>| -> (ReasonReport, usize) {
                 let before = reset_peak();
                 let r = materialize_incremental(
@@ -290,13 +322,14 @@ fn main() {
             let line = |what: &str, r: &ReasonReport, peak: usize| {
                 let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
                 println!(
-                    "keep {} threads={threads} {what} method={} source={source} ms={} inferred={} peak_heap_mib={:.1} reasoner_peak_mib={:.1}",
+                    "keep {} threads={threads} {what} method={} source={source} ms={} inferred={} peak_heap_mib={:.1} reasoner_peak_mib={:.1}{}",
                     profile.name(),
                     r.method.as_str(),
                     r.millis,
                     r.inferred,
                     mib(peak),
                     mib(r.peak_bytes as usize),
+                    witness_fields(r),
                 );
             };
             let (r, peak) = run(None, Some(&cache));

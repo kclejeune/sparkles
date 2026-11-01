@@ -448,6 +448,9 @@ fn cancelled(limits: &Limits) -> bool {
         .is_some_and(|c| c.load(Ordering::Relaxed))
 }
 
+/// A call that an update makes before it deletes anything (see [`update`]).
+pub(crate) type BeforeDelete<'a> = &'a mut dyn FnMut(&mut Closure) -> anyhow::Result<()>;
+
 /// Bring `c` from the closure of the old explicit facts to that of the new ones:
 /// `removed` explicit facts are no longer explicit, `inserted` ones are. The base tier of
 /// `c` holds the new explicit facts already: the inserted ones and not the removed ones,
@@ -455,14 +458,18 @@ fn cancelled(limits: &Limits) -> bool {
 /// the derived tier holds flagged.
 ///
 /// Returns [`Fallback`] (as the error) when the rules read RDF lists and a list fact is
-/// derived, removed or added: what list builtins see then depends on the order of
 /// derivation. The closure is unusable after any error.
+///
+/// `before_delete` is called once the closure holds every fact of the previous closure
+/// and the removed explicit facts as candidates, before anything is deleted: the
+/// witnesses of [`crate::witness`] read there which facts the removed ones reach.
 pub(crate) fn update(
     c: &mut Closure,
     rules: &[CRule],
     limits: &Limits,
     inserted: &[Triple],
     removed: &[Triple],
+    before_delete: Option<BeforeDelete<'_>>,
 ) -> anyhow::Result<Update> {
     let lists = rules.iter().any(engine::reads_lists);
     let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
@@ -511,6 +518,9 @@ pub(crate) fn update(
         queue.push(*t);
     }
     c.graph.try_add_batch(back)?;
+    if let Some(f) = before_delete {
+        f(c)?;
+    }
     if !queue.is_empty() {
         let plans = Plans::new(&mut c.graph, rules)?;
         held.try_grow(plans.bytes)?;
@@ -1433,49 +1443,49 @@ pub(crate) fn bind_head(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sparkles_core::io::{RdfFormat, Source};
     use sparkles_core::store::{Snapshot, Store, StoreOptions};
     use std::sync::Arc;
 
-    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-    const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
-    const OWL: &str = "http://www.w3.org/2002/07/owl#";
-    const EX: &str = "http://ex.org/";
+    pub(crate) const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    pub(crate) const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
+    pub(crate) const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    pub(crate) const EX: &str = "http://ex.org/";
 
     /// xorshift64*
-    struct Rng(u64);
+    pub(crate) struct Rng(pub(crate) u64);
     impl Rng {
-        fn next(&mut self) -> u64 {
+        pub(crate) fn next(&mut self) -> u64 {
             self.0 ^= self.0 >> 12;
             self.0 ^= self.0 << 25;
             self.0 ^= self.0 >> 27;
             self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
         }
-        fn below(&mut self, n: usize) -> usize {
+        pub(crate) fn below(&mut self, n: usize) -> usize {
             (self.next() % n as u64) as usize
         }
-        fn pick<T: Copy>(&mut self, v: &[T]) -> T {
+        pub(crate) fn pick<T: Copy>(&mut self, v: &[T]) -> T {
             v[self.below(v.len())]
         }
     }
 
-    struct Vocab {
+    pub(crate) struct Vocab {
         /// the vocabulary in a named graph, and the explicit facts of a test in the
         /// default graph
-        store: Store,
-        snap: Arc<Snapshot>,
-        classes: Vec<u64>,
-        props: Vec<u64>,
-        inds: Vec<u64>,
-        lits: Vec<u64>,
-        list_nodes: Vec<u64>,
-        iri: FxHashMap<String, u64>,
+        pub(crate) store: Store,
+        pub(crate) snap: Arc<Snapshot>,
+        pub(crate) classes: Vec<u64>,
+        pub(crate) props: Vec<u64>,
+        pub(crate) inds: Vec<u64>,
+        pub(crate) lits: Vec<u64>,
+        pub(crate) list_nodes: Vec<u64>,
+        pub(crate) iri: FxHashMap<String, u64>,
     }
 
     impl Vocab {
-        fn new() -> Vocab {
+        pub(crate) fn new() -> Vocab {
             let mut ttl = String::new();
             let mut names = Vec::new();
             for i in 0..6 {
@@ -1579,12 +1589,12 @@ mod tests {
             }
         }
 
-        fn id(&self, ns: &str, l: &str) -> u64 {
+        pub(crate) fn id(&self, ns: &str, l: &str) -> u64 {
             self.iri[&format!("{ns}{l}")]
         }
 
         /// A random triple: schema statements, typing, property assertions.
-        fn triple(&self, r: &mut Rng, owl: bool) -> Triple {
+        pub(crate) fn triple(&self, r: &mut Rng, owl: bool) -> Triple {
             let rdf = |l| self.id(RDF, l);
             let rdfs = |l| self.id(RDFS, l);
             let o = |l| self.id(OWL, l);
@@ -1621,7 +1631,7 @@ mod tests {
         }
 
         /// The triples of a two-member list for `owl:intersectionOf` or `owl:unionOf`.
-        fn list(&self, r: &mut Rng) -> Vec<Triple> {
+        pub(crate) fn list(&self, r: &mut Rng) -> Vec<Triple> {
             let (first, rest, nil) = (
                 self.id(RDF, "first"),
                 self.id(RDF, "rest"),
@@ -1646,7 +1656,7 @@ mod tests {
         }
     }
 
-    fn limits() -> Limits {
+    pub(crate) fn limits() -> Limits {
         Limits {
             max_iterations: 10_000,
             max_inferred: 10_000_000,
@@ -1657,7 +1667,7 @@ mod tests {
         }
     }
 
-    fn compiled(text: &str, terms: &Terms) -> Vec<CRule> {
+    pub(crate) fn compiled(text: &str, terms: &Terms) -> Vec<CRule> {
         let rules = crate::parse_rules(text).unwrap();
         let mut w = Vec::new();
         let c = engine::compile(&rules, terms, &mut w);
@@ -1669,7 +1679,7 @@ mod tests {
     }
 
     /// Make the default graph hold exactly `base`, and return its snapshot.
-    fn set_default_graph(v: &Vocab, base: &FxHashSet<Triple>) -> Arc<Snapshot> {
+    pub(crate) fn set_default_graph(v: &Vocab, base: &FxHashSet<Triple>) -> Arc<Snapshot> {
         let now = v.store.snapshot();
         let g = Id::DEFAULT_GRAPH;
         let mut txn = v.store.write();
@@ -1697,7 +1707,7 @@ mod tests {
         snap
     }
 
-    fn full(v: &Vocab, text: &str, base: &FxHashSet<Triple>) -> Closure {
+    pub(crate) fn full(v: &Vocab, text: &str, base: &FxHashSet<Triple>) -> Closure {
         let snap = set_default_graph(v, base);
         let terms = Terms::new(snap.clone());
         let rules = compiled(text, &terms);
@@ -1844,7 +1854,7 @@ mod tests {
             let what = format!("seed {seed} step {step}");
             checked += check_lookups(&c, &snap, &what);
             let rules = compiled(text, &c.terms);
-            match update(&mut c, &rules, &limits(), &inserted, &removed) {
+            match update(&mut c, &rules, &limits(), &inserted, &removed, None) {
                 Ok(_) => {
                     incremental += 1;
                     checked += check_lookups(&c, &snap, &what);

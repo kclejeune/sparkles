@@ -21,6 +21,7 @@ use crate::graph::{Graph, Triple};
 use crate::incremental::{Closure, Fallback};
 use crate::inputs::GraphRef;
 use crate::terms::Terms;
+use crate::witness::Witnesses;
 use oxrdf::vocab::rdf;
 use oxrdf::{GraphName, Literal, NamedNode, Term};
 use parking_lot::Mutex;
@@ -49,10 +50,22 @@ pub struct Cache {
 pub const DEFAULT_CACHE_TRIPLES: usize = 10_000_000;
 
 impl Kept {
-    /// The heap of the closure and the generalized facts.
+    /// The heap of the closure, its witnesses and the generalized facts.
     fn heap_bytes(&self) -> usize {
-        self.closure.heap_bytes() + set_bytes(&self.generalized)
+        self.closure.heap_bytes()
+            + set_bytes(&self.generalized)
+            + self.witnesses.as_ref().map_or(0, Witnesses::heap_bytes)
     }
+}
+
+/// The witnesses of one fact of a kept closure (spec F18 §7.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FactWitnesses {
+    /// the commit whose closure holds the fact
+    pub commit: u64,
+    /// the minimal kept witnesses, smallest first, and whether others may exist
+    /// (`truncated`). `count` is the number of kept witnesses.
+    pub annotation: sparkles_core::incr::Annotation,
 }
 
 impl Default for Cache {
@@ -84,6 +97,65 @@ impl Cache {
     /// Drop the kept closure.
     pub fn clear(&self) {
         *self.kept.lock() = None;
+    }
+
+    /// The witnesses of `t` in the kept closure: `None` when no closure with witnesses
+    /// is kept (see [`crate::ReasonOptions::witnesses`]) or `t` is not one of its facts.
+    /// An asserted fact that no rule derives has its own quad as its witness.
+    pub fn witnesses(&self, t: &oxrdf::Triple) -> Option<FactWitnesses> {
+        let k = self.kept.lock();
+        let k = k.as_ref()?;
+        let w = k.witnesses.as_ref()?;
+        let id = |x: &Term| {
+            sparkles_core::id::inline_id(x)
+                .or_else(|| k.snap.lookup_term(x))
+                .map(|i| i.0)
+        };
+        let f = [
+            id(&t.subject.clone().into())?,
+            id(&t.predicate.clone().into())?,
+            id(&t.object)?,
+        ];
+        Some(FactWitnesses {
+            commit: k.commit,
+            annotation: w.report_of(&k.closure, &f)?,
+        })
+    }
+
+    /// The facts of the kept closure whose kept witnesses name the input quad `key`,
+    /// those that a protection hiding that quad has to check first (spec F18 §7.1).
+    /// `None` when no closure with witnesses is kept. Generalized facts, which are not
+    /// RDF triples, are left out.
+    pub fn witness_dependents(
+        &self,
+        key: &sparkles_core::incr::FactKey,
+    ) -> Option<(u64, Vec<oxrdf::Triple>)> {
+        let k = self.kept.lock();
+        let k = k.as_ref()?;
+        let w = k.witnesses.as_ref()?;
+        let terms = &k.closure.terms;
+        let out = w
+            .dependents(key)
+            .into_iter()
+            .filter_map(|t| {
+                let s = match terms.term(t[0])? {
+                    Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                    Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                    _ => return None,
+                };
+                let Term::NamedNode(p) = terms.term(t[1])? else {
+                    return None;
+                };
+                Some(oxrdf::Triple::new(s, p, terms.term(t[2])?))
+            })
+            .collect();
+        Some((k.commit, out))
+    }
+
+    /// What the witnesses of the kept closure hold, when it has them.
+    pub fn witness_report(&self) -> Option<crate::WitnessReport> {
+        let k = self.kept.lock();
+        k.as_ref()?.witnesses.as_ref().map(|w| w.report.clone())
     }
 
     /// Derived facts in the kept closure, and the commit it belongs to.
@@ -134,6 +206,12 @@ impl Cache {
             *k = Some(kept);
             return Taken::Refused(e.into());
         }
+        if let Some(w) = kept.witnesses.as_mut()
+            && let Err(e) = w.set_budget(budget)
+        {
+            *k = Some(kept);
+            return Taken::Refused(e.into());
+        }
         Taken::Kept(Box::new(kept))
     }
 
@@ -176,6 +254,8 @@ pub(crate) struct Kept {
     /// the snapshot at `commit`
     snap: Arc<Snapshot>,
     closure: Closure,
+    /// the witnesses of the closure's facts, when the run kept them
+    witnesses: Option<Witnesses>,
     generalized: FxHashSet<Triple>,
     /// the generalized facts as saved with the dataset for `commit`
     saved: Option<SavedMeta>,
@@ -197,6 +277,8 @@ pub(crate) struct Changes {
 /// The previous closure, ready for an update.
 pub(crate) struct Previous {
     pub closure: Closure,
+    /// the witnesses of the previous closure, when they are kept with it in memory
+    pub witnesses: Option<Witnesses>,
     pub generalized: FxHashSet<Triple>,
     pub changes: Changes,
     /// `memory` or `store`
@@ -312,6 +394,7 @@ pub(crate) fn previous(
     if let Some(k) = kept {
         let Kept {
             mut closure,
+            mut witnesses,
             mut generalized,
             saved,
             ..
@@ -321,6 +404,9 @@ pub(crate) fn previous(
         held.grow(set_bytes(&generalized));
         let moved = closure.terms.rebase(snap.clone());
         closure.remap(&moved);
+        if let Some(w) = witnesses.as_mut() {
+            w.remap(&moved);
+        }
         let old_lookups = closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
         held.set(set_bytes(&generalized));
@@ -351,6 +437,7 @@ pub(crate) fn previous(
         budget.check()?;
         return Ok(Previous {
             closure,
+            witnesses,
             generalized,
             changes,
             source: "memory",
@@ -390,6 +477,7 @@ pub(crate) fn previous(
     let closure = reconstruct(snap, terms, &changes, &generalized, run_ids, budget)?;
     Ok(Previous {
         closure,
+        witnesses: None,
         generalized,
         changes,
         source: "store",
@@ -721,6 +809,7 @@ pub(crate) fn keep(
     digest: u64,
     inputs: &[GraphRef],
     mut closure: Closure,
+    mut witnesses: Option<Witnesses>,
     mut generalized: FxHashSet<Triple>,
     stored: &FxHashMap<u64, Id>,
     saved: Option<SavedMeta>,
@@ -745,6 +834,9 @@ pub(crate) fn keep(
     let mut moved: FxHashMap<u64, u64> = stored.iter().map(|(l, id)| (*l, id.0)).collect();
     moved.extend(closure.terms.rebase(snap.clone()));
     closure.try_remap(&moved)?;
+    if let Some(w) = witnesses.as_mut() {
+        w.remap(&moved);
+    }
     // the input graphs of the commit, which are those the run read
     let ids = match closure.graph.base() {
         Some(b) => b.graph_ids(),
@@ -784,6 +876,7 @@ pub(crate) fn keep(
         inputs: inputs.to_vec(),
         snap,
         closure,
+        witnesses,
         generalized,
         saved,
     });
