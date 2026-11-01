@@ -75,6 +75,9 @@ pub struct Closure {
     cache: Cache,
 }
 
+/// A changed step: graph, from, to, whether it holds before and after the changes.
+type Edge = (Id, Id, Id, bool, bool);
+
 /// What a pass resolves once.
 #[derive(Clone, Debug, Default)]
 struct Cache {
@@ -84,8 +87,8 @@ struct Cache {
     /// the neighbours of a node at a snapshot (`true`: the new one), by walking
     /// direction (`true`: forward)
     next: FxHashMap<(bool, bool, Id, Id), Arc<[Id]>>,
-    /// the changed steps: graph, from, to, held before, held after
-    edges: Option<Vec<(Id, Id, Id, bool, bool)>>,
+    /// the changed steps
+    edges: Option<Vec<Edge>>,
     /// the nodes that reach a node at a snapshot, the node itself among them
     reach: FxHashMap<(bool, Id, Id), Arc<[Id]>>,
 }
@@ -225,7 +228,7 @@ impl Closure {
     }
 
     /// The steps the pass's changes touch, each with whether it holds before and after.
-    fn edges(&mut self, p: &mut Pass) -> Result<Vec<(Id, Id, Id, bool, bool)>> {
+    fn edges(&mut self, p: &mut Pass) -> Result<Vec<Edge>> {
         self.ensure(p);
         if let Some(e) = &self.cache.edges {
             return Ok(e.clone());
@@ -585,7 +588,7 @@ impl PathOp {
         ch.into_iter()
             .filter_map(|c| {
                 let r = self.fact_row(schema, ends, &c.fact)?;
-                let a = c.ann.unwrap_or_else(|| Ann::Count(c.weight));
+                let a = c.ann.unwrap_or(Ann::Count(c.weight));
                 Some((r, c.weight, a))
             })
             .collect()
