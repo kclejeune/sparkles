@@ -28,11 +28,11 @@
 //!
 //! **Checkpoint.** `<root>/circuits/{id}/main/state-{commit}.bin` with the header of
 //! [`persist`](super::persist) under the magic `SPKCIRC\0`. Format 1 holds a circuit
-//! without annotations, and format 2
-//! ([`INTERNAL_FORMAT`](super::persist::INTERNAL_FORMAT)) one that keeps them: its
-//! circuit state ends with the annotations of each operator's state and of the result
-//! (spec F13 §5). A circuit writes the lowest format that holds its state, and reads
-//! only that format. The body is the circuit's
+//! without annotations, and format 2 one that keeps them: its circuit state ends with
+//! the annotations of each operator's state and of the result (spec F13 §5). Formats 3
+//! and 4 ([`INTERNAL_FORMAT`](super::persist::INTERNAL_FORMAT)) hold the same for a
+//! circuit with a fixed-point operator (spec F13 §4.3). A circuit writes the lowest
+//! format that holds its state, and reads only that format. The body is the circuit's
 //! state as a view checkpoint holds it, as a length and its bytes, then a sink byte
 //! (0 rows, 1 accumulator) and, for an accumulator, the commit its counts start after,
 //! the unknown ranges (count, then each range's first and last commit), the keys

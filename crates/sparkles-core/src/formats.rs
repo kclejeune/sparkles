@@ -342,29 +342,32 @@ pub const VALIDATION_TYPING: FileKind = FileKind {
     reads: &[1],
 };
 
-/// The checkpoints of incremental views (spec F13 §8.4). A version this build does not
-/// read is left in place and the view is built again from the data.
+/// The checkpoints of incremental views (spec F13 §8.4). Version 1 holds a circuit
+/// without a fixed-point operator and version 2 one with the fixed-point state of spec
+/// F13 §4.3, and a circuit writes the lowest version that holds its state. A version this
+/// build does not read is left in place and the view is built again from the data.
 pub const VIEW_STATE: FileKind = FileKind {
     id: "view-state",
     files: "views/NAME/BRANCH/state-COMMIT.bin",
     marker: "the u32 after the `SPKVIEW` magic; another version is ignored and the view rebuilt",
     class: Class::Derived,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The checkpoints of the internal circuits that server code attaches (spec F13 §3.6).
 /// Version 1 holds a circuit without annotations and version 2 one that keeps the
-/// provenance annotations of spec F13 §5, and a circuit writes the lowest version that
-/// holds its state. A version this build does not read is left in place and the
-/// circuit is built again from the data.
+/// provenance annotations of spec F13 §5. Versions 3 and 4 hold the same with the
+/// fixed-point state of spec F13 §4.3. A circuit writes the lowest version that holds its
+/// state. A version this build does not read is left in place and the circuit is built
+/// again from the data.
 pub const INTERNAL_CIRCUIT_STATE: FileKind = FileKind {
     id: "internal-circuit-state",
     files: "circuits/ID/BRANCH/state-COMMIT.bin",
     marker: "the u32 after the `SPKCIRC` magic; another version is ignored and the circuit rebuilt",
     class: Class::Derived,
-    writes: 2,
-    reads: &[1, 2],
+    writes: 4,
+    reads: &[1, 2, 3, 4],
 };
 
 /// The prewarm list of `serve --prewarm` (spec X07 §7): the block parts and file pages a
@@ -1065,6 +1068,7 @@ mod tests {
         assert_eq!(GEO.writes, crate::geo::config::FORMAT_VERSION);
         assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
         assert_eq!(VIEW_STATE.writes, crate::incr::persist::FORMAT);
+        assert_eq!(VIEW_STATE.reads, crate::incr::persist::FORMATS);
         assert_eq!(PREWARM.writes, crate::store::prewarm::VERSION);
         assert_eq!(
             INTERNAL_CIRCUIT_STATE.writes,

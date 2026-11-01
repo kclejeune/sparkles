@@ -423,9 +423,10 @@ fn apply(state: &mut Vec<String>, e: &LiveEvent) {
     }
 }
 
-/// A10: a path with `+` is a `recompute` node, and `NOW()` is refused.
+/// A10: a path with `+` is a fixed-point operator, a path with `?` a `recompute` node,
+/// and `NOW()` is refused.
 #[test]
-fn a10_paths_recompute_and_now_is_refused() {
+fn a10_paths_are_maintained_and_now_is_refused() {
     let s = Store::in_memory(StoreOptions::default());
     load(&s);
     let rt = runtime(&s, None);
@@ -434,6 +435,18 @@ fn a10_paths_recompute_and_now_is_refused() {
             &s,
             "reach",
             ViewDef::table(q("SELECT ?p ?q WHERE { ?p foaf:knows+ ?q }")),
+        )
+        .unwrap();
+    let plan = serde_json::to_string(&info.plan).unwrap();
+    assert!(
+        plan.contains("FixedPoint") && !plan.contains("recompute"),
+        "{plan}"
+    );
+    let info = rt
+        .put(
+            &s,
+            "maybe",
+            ViewDef::table(q("SELECT ?p ?q WHERE { ?p foaf:knows? ?q }")),
         )
         .unwrap();
     let plan = serde_json::to_string(&info.plan).unwrap();

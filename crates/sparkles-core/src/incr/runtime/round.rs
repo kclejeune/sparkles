@@ -376,8 +376,10 @@ impl Runtime {
             let Some(snap) = st.circuit.snap.clone() else {
                 continue;
             };
+            let kind = persist::view_kind(st.circuit.has_fixpoint());
             let r = st.circuit.encode(&snap).and_then(|body| {
-                persist::write_with(
+                persist::write_as(
+                    kind,
                     &views::dir(&root, &name).join(BRANCH),
                     &persist::Header {
                         dataset: self.dataset,

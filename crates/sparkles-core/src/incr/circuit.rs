@@ -359,6 +359,12 @@ impl Circuit {
         self.prov
     }
 
+    /// Whether the circuit has a fixed-point operator (spec F13 §4.3), whose state its
+    /// checkpoints hold in format 2.
+    pub fn has_fixpoint(&self) -> bool {
+        self.root.has_fixpoint()
+    }
+
     /// The annotation of a row of the result, as a reader sees it.
     pub fn annotation(&self, row: &[Id]) -> Option<Annotation> {
         if self.prov.is_none() {

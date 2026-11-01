@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(super) const COMPILER: &str = "f13-phase1-4";
+pub(super) const COMPILER: &str = "f13-phase3-1";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -125,6 +125,8 @@ mod compiler_tests {
         // an EXISTS whose empty path starts at an outer variable compiles to a
         // recompute node
         ("f13-phase1-4", "650d426b8dbb3bb3"),
+        // paths with + and * compile to the fixed-point operator
+        ("f13-phase3-1", "928d8f6b0c9509b7"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

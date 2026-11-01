@@ -12,6 +12,7 @@
 
 pub mod circuit;
 pub mod compile;
+pub mod fixpoint;
 pub mod footprint;
 pub mod inference;
 pub mod internal;

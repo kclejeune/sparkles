@@ -77,7 +77,7 @@ enum RG {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RPat {
+pub(crate) struct RPat {
     s: R,
     p: R,
     o: R,
@@ -145,7 +145,9 @@ impl RPat {
 }
 
 impl Bgp {
-    fn resolve(&self, p: &Pass) -> Vec<RPat> {
+    /// The patterns with their constants resolved at the pass, for
+    /// [`probe_with`](Self::probe_with).
+    pub(crate) fn resolve(&self, p: &Pass) -> Vec<RPat> {
         let r = |s: &Slot| match s {
             Slot::Var(v) => R::Var(*v),
             Slot::Const(t) => p.constant(t).map_or(R::Never, R::Id),
@@ -582,13 +584,25 @@ impl Bgp {
     /// their values).
     pub fn probe(&self, p: &mut Pass, w: Which, seed: &[(usize, Id)]) -> Result<Changes> {
         let rps = self.resolve(p);
+        self.probe_with(p, &rps, w, seed)
+    }
+
+    /// [`probe`](Self::probe) with the patterns that [`resolve`](Self::resolve) gave
+    /// at this pass, for a caller that probes many times.
+    pub(crate) fn probe_with(
+        &self,
+        p: &mut Pass,
+        rps: &[RPat],
+        w: Which,
+        seed: &[(usize, Id)],
+    ) -> Result<Changes> {
         let mut b = vec![Id::UNDEF; self.slots];
         for &(pos, v) in seed {
             b[self.out[pos]] = v;
         }
         let mut out = Changes::new();
         let mut rest: Vec<usize> = (0..rps.len()).collect();
-        self.extend(p, &rps, &|_| w, &mut rest, &b, 1, &mut out)?;
+        self.extend(p, rps, &|_| w, &mut rest, &b, 1, &mut out)?;
         Ok(out)
     }
 
