@@ -57,7 +57,7 @@
 //! fact one instance per intermediate node and many minimal supports, one per path, so
 //! such facts are often truncated.
 
-use crate::budget::{Budget, Held, MemoryExceeded, Meter, table_bytes};
+use crate::budget::{Budget, Held, MemoryExceeded, Meter, table_bytes, table_grown};
 use crate::builtins::BuiltinKind;
 use crate::engine::{self, CHead, CRule, Eval, Limits, Mode, Slot};
 use crate::facts::Memo;
@@ -167,6 +167,8 @@ pub struct Witnesses {
     /// per input quad: the nodes whose kept witnesses may contain it (a superset)
     rev: FxHashMap<FactKey, Vec<u32>>,
     rev_entries: usize,
+    /// the capacity of the lists of `rev`
+    rev_cap: usize,
     /// the heap of `nodes`, kept as they change
     node_bytes: usize,
     /// the rules derive facts that their instances do not show, such as those of head
@@ -293,6 +295,33 @@ fn insert_min(a: &mut Vec<Witness>, x: Witness) -> isize {
     let at = a.binary_search(&x).unwrap_or_else(|i| i);
     a.insert(at, x);
     delta
+}
+
+/// Make room in `m` for one more entry, charging a table's growth to `held` first.
+fn grow_map<K: Eq + std::hash::Hash, V>(
+    m: &mut FxHashMap<K, V>,
+    held: &mut Held,
+) -> Result<(), MemoryExceeded> {
+    let cap = m.capacity();
+    if m.len() < cap {
+        return Ok(());
+    }
+    let next = table_grown(cap, m.len(), 1);
+    let elem = size_of::<(K, V)>();
+    held.try_grow(table_bytes(next, elem).saturating_sub(table_bytes(cap, elem)))?;
+    m.reserve(next - m.len());
+    Ok(())
+}
+
+/// Push `x`, charging the list's growth to `held` first.
+fn push_charged(v: &mut Vec<u32>, x: u32, held: &mut Held) -> Result<(), MemoryExceeded> {
+    if v.len() == v.capacity() {
+        let add = v.capacity().max(4);
+        held.try_grow(add * size_of::<u32>())?;
+        v.reserve_exact(add);
+    }
+    v.push(x);
+    Ok(())
 }
 
 /// The heap of one kept support.
@@ -654,6 +683,7 @@ impl Witnesses {
             free: Vec::new(),
             rev: FxHashMap::default(),
             rev_entries: 0,
+            rev_cap: 0,
             node_bytes: 0,
             opaque: false,
             held: Held::new(budget),
@@ -706,7 +736,7 @@ impl Witnesses {
             + self.free.capacity() * 4
             + table_bytes(self.index.capacity(), size_of::<(Triple, u32)>())
             + table_bytes(self.rev.capacity(), size_of::<(FactKey, Vec<u32>)>())
-            + self.rev_entries * 4
+            + self.rev_cap * 4
     }
 
     fn settle_charge(&mut self) -> Result<(), MemoryExceeded> {
@@ -784,7 +814,10 @@ impl Witnesses {
         added.dedup();
         self.node_bytes = self.node_bytes + after - before;
         for k in added {
-            self.rev.entry(k).or_default().push(i);
+            let e = self.rev.entry(k).or_default();
+            let cap = e.capacity();
+            e.push(i);
+            self.rev_cap += e.capacity() - cap;
             self.rev_entries += 1;
         }
         self.recharge();
@@ -972,9 +1005,7 @@ impl Witnesses {
             let key = (kind(c, &t) == Kind::Base).then(|| fact_key(c, &t));
             seeds.push(w.add_node(t, key));
             // the nodes charge themselves as they are added
-            if seeds.len().is_multiple_of(1024) {
-                cx.budget.check()?;
-            }
+            cx.budget.check()?;
         }
         let mut bytes = 0usize;
         for (ch, f) in heads.chunks(256).zip(found) {
@@ -1004,6 +1035,7 @@ impl Witnesses {
                         .collect();
                     ins.bodies.push(ids);
                 }
+                grow_map(&mut pass.ins, &mut held)?;
                 pass.ins.insert(i, ins);
                 found_held.shrink(fb);
                 cx.budget.check()?;
@@ -1030,7 +1062,8 @@ impl Witnesses {
         for (&h, ins) in &pass.ins {
             for b in &ins.bodies {
                 for &p in b.iter() {
-                    users.entry(p).or_default().push(h);
+                    grow_map(&mut users, &mut held)?;
+                    push_charged(users.entry(p).or_default(), h, &mut held)?;
                 }
             }
         }
@@ -1039,7 +1072,6 @@ impl Witnesses {
             v.dedup();
         }
         pass.users = users;
-        held.try_grow(pass.users.values().map(|v| v.len() * 4 + 24).sum())?;
         w.settle(&cx, seeds, &mut pass)?;
         drop(held);
         w.settle_charge()?;
@@ -1109,6 +1141,7 @@ impl Witnesses {
             }
         }
         let mut memo = Memo::default();
+        reached.try_grow(queue.len() * VISITED_BYTES)?;
         let mut visited: FxHashSet<Triple> = queue.iter().copied().collect();
         while let Some(x) = queue.pop_front() {
             if cancelled(&cx) {
@@ -1185,6 +1218,7 @@ impl Witnesses {
                 continue;
             };
             self.rev_entries -= v.len().min(self.rev_entries);
+            self.rev_cap -= v.capacity().min(self.rev_cap);
             for i in v {
                 let n = &mut self.nodes[i as usize];
                 if !n.live {
@@ -1272,13 +1306,10 @@ impl Witnesses {
         if self.rev_entries <= 2 * live + 1024 {
             return Ok(());
         }
-        // the new index is charged before it is built, beside the old one
-        let mut tmp = Held::try_new(
-            self.held.budget(),
-            table_bytes(self.rev.len(), size_of::<(FactKey, Vec<u32>)>()) + live * 4,
-        )?;
+        // the new index is charged as it is built, beside the old one
+        let mut tmp = Held::new(self.held.budget());
         let mut rev: FxHashMap<FactKey, Vec<u32>> = FxHashMap::default();
-        let mut n = 0;
+        let (mut n, mut cap) = (0, 0);
         for (i, node) in self.nodes.iter().enumerate() {
             if !node.live {
                 continue;
@@ -1295,12 +1326,17 @@ impl Witnesses {
             ks.sort_unstable();
             ks.dedup();
             for k in ks {
-                rev.entry(k).or_default().push(i as u32);
+                grow_map(&mut rev, &mut tmp)?;
+                let e = rev.entry(k).or_default();
+                let c0 = e.capacity();
+                push_charged(e, i as u32, &mut tmp)?;
+                cap += e.capacity() - c0;
                 n += 1;
             }
         }
         self.rev = rev;
         self.rev_entries = n;
+        self.rev_cap = cap;
         self.recharge();
         tmp.set(0);
         Ok(())
@@ -1380,6 +1416,7 @@ impl Witnesses {
                 ins.bodies.push(ids);
             }
             held.shrink(found);
+            grow_map(&mut pass.ins, held)?;
             pass.ins.insert(i, ins);
         }
         Ok(&pass.ins[&i])
@@ -1414,6 +1451,8 @@ impl Witnesses {
             });
         }
         drop(found);
+        let held = pass.scratch.get_or_insert_with(|| Held::new(cx.budget));
+        grow_map(&mut pass.users, held)?;
         Ok(pass.users.entry(i).or_insert(out).as_slice())
     }
 
@@ -2381,8 +2420,10 @@ mod tests {
         let prep = w.prepare(&mut c, &rules, &l, &[gone], &[]).unwrap();
         assert!(!prep.region.is_empty());
         let reached = prep.held.as_ref().map_or(0, Held::bytes);
+        // every fact of the region was visited, those it started from included (sixth
+        // review)
         assert!(
-            reached >= prep.region.len() * REACHED_BYTES,
+            reached >= prep.region.len() * (REACHED_BYTES + VISITED_BYTES),
             "{reached} {}",
             prep.region.len()
         );
@@ -2415,6 +2456,8 @@ mod tests {
         assert_eq!(budget.peak(), before);
         w.compact_rev().unwrap();
         assert!(w.rev_entries == 1000, "{}", w.rev_entries);
+        // the lists' capacity is charged, not only their entries (sixth review)
+        assert!(w.rev_cap >= 4 * 1000, "{}", w.rev_cap);
         assert!(budget.used() < before);
         assert!(
             budget.peak() >= before + 1000 * 4,
