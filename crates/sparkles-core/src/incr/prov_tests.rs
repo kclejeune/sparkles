@@ -1048,6 +1048,35 @@ fn an_annotated_build_orders_patterns_by_estimate() {
     );
 }
 
+/// A build estimates a scan prefix once, however many bindings share it. Here every
+/// `:p` row binds the same `?t`, so the `:r` range is estimated once and not once per
+/// row, while the `:q` probes differ per subject.
+#[test]
+fn an_annotated_build_estimates_a_prefix_once() {
+    let s = Store::in_memory(StoreOptions::default());
+    let n = 300;
+    let mut u = String::from("INSERT DATA {");
+    for i in 0..n {
+        u.push_str(&format!(" <{NS}s{i}> <{NS}p> <{NS}t> ."));
+    }
+    for i in 0..2 * n {
+        u.push_str(&format!(" <{NS}x{i}> <{NS}q> <{NS}c> ."));
+    }
+    for i in 0..3 * n {
+        u.push_str(&format!(" <{NS}t> <{NS}r> <{NS}v{i}> ."));
+    }
+    u.push_str(" }");
+    sparql_update(&s, &u);
+    let q = format!("SELECT ?s ?v WHERE {{ ?s <{NS}p> ?t . ?s <{NS}q> <{NS}c> . ?t <{NS}r> ?v }}");
+    let c = built(&s, &q, Provenance::Count);
+    assert_eq!(c.result.len(), 0);
+    assert!(
+        c.build_estimated <= n as u64 + 10,
+        "the build computed {} estimates for {n} rows",
+        c.build_estimated
+    );
+}
+
 /// An OPTIONAL's filter reads left variables beyond the shared ones, so two rows
 /// without a match that differ only there have different conditions.
 #[test]

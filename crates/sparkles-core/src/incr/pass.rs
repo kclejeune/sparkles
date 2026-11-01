@@ -32,6 +32,9 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// An estimate's snapshot (`true`: the new one), permutation and key prefix.
+type EstimateKey = (bool, Perm, Vec<u64>);
+
 /// Which snapshot a probe reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Which {
@@ -147,6 +150,12 @@ pub struct Pass<'a> {
     /// the quads scans visited, for tests
     #[cfg(test)]
     pub scanned: std::cell::Cell<u64>,
+    /// the estimates read so far, by snapshot (`true`: the new one), permutation and
+    /// prefix, since an estimate walks the metadata of every block in its range
+    estimates: RefCell<FxHashMap<EstimateKey, u64>>,
+    /// the estimates computed rather than found, for tests
+    #[cfg(test)]
+    pub estimated: std::cell::Cell<u64>,
     ctx: Option<Ctx>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
@@ -185,6 +194,9 @@ impl<'a> Pass<'a> {
             facts: None,
             #[cfg(test)]
             scanned: std::cell::Cell::new(0),
+            estimates: RefCell::default(),
+            #[cfg(test)]
+            estimated: std::cell::Cell::new(0),
             ctx: None,
             union_changes: None,
             work: 0,
@@ -268,7 +280,8 @@ impl<'a> Pass<'a> {
     }
 
     /// The index's estimate of the quads [`scan`](Self::scan) visits, without decoding
-    /// a block.
+    /// a block. A pass keeps each estimate, so a prefix that many bindings share is
+    /// estimated once.
     pub fn estimate(
         &self,
         w: Which,
@@ -278,7 +291,15 @@ impl<'a> Pass<'a> {
         g: GraphSel,
     ) -> u64 {
         let (perm, prefix) = scan_prefix(s, p, o, g);
-        self.snap(w).estimate(perm, &prefix)
+        let key = (matches!(w, Which::New), perm, prefix);
+        if let Some(&n) = self.estimates.borrow().get(&key) {
+            return n;
+        }
+        #[cfg(test)]
+        self.estimated.set(self.estimated.get() + 1);
+        let n = self.snap(w).estimate(perm, &key.2);
+        self.estimates.borrow_mut().insert(key, n);
+        n
     }
 
     /// Visit the visible quads of snapshot `w` with the given positions bound, in graph

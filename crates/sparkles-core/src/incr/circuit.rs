@@ -296,6 +296,9 @@ pub struct Circuit {
     /// the quads the latest build's pattern matching visited, which tests read
     #[cfg(test)]
     pub(crate) build_scanned: u64,
+    /// the index estimates the latest build computed, which tests read
+    #[cfg(test)]
+    pub(crate) build_estimated: u64,
 }
 
 /// Annotated changes split into the weights' changes, consolidated, and the changes
@@ -335,6 +338,8 @@ impl Circuit {
             facts: FactCache::default(),
             #[cfg(test)]
             build_scanned: 0,
+            #[cfg(test)]
+            build_estimated: 0,
         }
     }
 
@@ -603,11 +608,12 @@ impl Circuit {
         };
         let stats = p.stats;
         #[cfg(test)]
-        let scanned = p.scanned.get();
+        let (scanned, estimated) = (p.scanned.get(), p.estimated.get());
         drop(p);
         #[cfg(test)]
         {
             self.build_scanned = scanned;
+            self.build_estimated = estimated;
         }
         self.result = if self.keep_result {
             out.into_iter().collect()
