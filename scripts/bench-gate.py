@@ -248,7 +248,8 @@ def executors(args):
         warm = defaultdict(set)
         for row in read_tsv(d / "results" / "warm-answers.tsv"):
             _, v, q, digest = row[:4]
-            warm[q].add(digest.split(",")[0] if q in unordered else digest)
+            # unordered LIMIT answers may hold other rows, but not another count or schema
+            warm[q].add(",".join(digest.split(",")[:2]) if q in unordered else digest)
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the
@@ -729,7 +730,8 @@ def native_digest(args):
     rows = ["\t".join(show(t) for t in row) for row in r.get("rows") or []]
     # the query type and the projected variables, in order, belong to the answer
     head = f"{r.get('queryType')} " + " ".join(names)
-    out = [f"{len(rows)} rows", hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()[:16]]
+    out = [f"{len(rows)} rows", "schema " + hashlib.sha256(head.encode()).hexdigest()[:8],
+           hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()[:16]]
     if ba._after_order_by(query) is not None:
         keys = ba.order_keys(query, set(names))
         h = hashlib.sha256()

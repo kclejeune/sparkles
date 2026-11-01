@@ -455,6 +455,14 @@ class GateTests(unittest.TestCase):
             body["vars"] = ["p", "other"]
             f.write_text(json.dumps(body))
             self.assertNotEqual(run("native-digest", q, f).stdout.split(", ")[1], good.split(", ")[1])
+            # an unordered LIMIT keeps the count and the schema
+            limit = Path(d) / "limit.rq"
+            limit.write_text("SELECT ?p ?n WHERE { ?p <name> ?n } LIMIT 2")
+            renamed = run("native-digest", limit, f).stdout.strip()
+            body["vars"] = ["p", "n"]
+            f.write_text(json.dumps(body))
+            plain = run("native-digest", limit, f).stdout.strip()
+            self.assertNotEqual(",".join(renamed.split(",")[:2]), ",".join(plain.split(",")[:2]))
             body["vars"] = ["p"]
             f.write_text(json.dumps(body))
             self.assertFalse(run("native-digest", q, f).stdout.startswith("2 rows"))

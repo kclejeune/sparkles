@@ -286,15 +286,23 @@ fn clock_ticks() -> u64 {
 /// User and system clock ticks of this process's threads other than the calling one,
 /// including threads that have exited: the process's total, which keeps the time of
 /// joined threads, less the calling thread's own.
-fn other_thread_ticks() -> u64 {
-    fn ticks(path: &str) -> u64 {
+/// The two counters are read one after the other, so the difference can be a tick off
+/// either way, and it is signed; `ticks_since` clamps an interval at zero, which the
+/// guard's allowance of two ticks covers.
+fn other_thread_ticks() -> i64 {
+    fn ticks(path: &str) -> i64 {
         let stat = std::fs::read_to_string(path).unwrap();
         // the fields after the command, which is in parentheses
         let rest = &stat[stat.rfind(')').unwrap() + 2..];
         let f: Vec<&str> = rest.split(' ').collect();
-        f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+        f[11].parse::<i64>().unwrap() + f[12].parse::<i64>().unwrap()
     }
     ticks("/proc/self/stat") - ticks("/proc/thread-self/stat")
+}
+
+/// Other-thread ticks since `before`, a value of `other_thread_ticks`.
+fn ticks_since(before: i64) -> u64 {
+    (other_thread_ticks() - before).max(0) as u64
 }
 
 /// Count `f` `reps` times and check that every run returned `expected`, which the caller
@@ -319,7 +327,7 @@ fn measure<R: PartialEq + std::fmt::Debug>(
             wrong = Some(r);
         }
     }
-    let ticks = other_thread_ticks() - before;
+    let ticks = ticks_since(before);
     let detail = match &wrong {
         None => format!("{expected:?}"),
         Some(r) => format!("{r:?}, expected {expected:?}"),
@@ -572,7 +580,7 @@ fn opens(c: &counter::Instructions, src: &Path, reps: usize, want: &Content) -> 
         copy_dir(src, &dir);
         let before = other_thread_ticks();
         let (n, share, s) = c.count(|| Store::open(&dir, StoreOptions::default()).unwrap());
-        o.ticks += other_thread_ticks() - before;
+        o.ticks += ticks_since(before);
         o.coverage = o.coverage.min(share);
         o.recovered &= content(&s) == *want;
         o.counts.push(n);
@@ -699,7 +707,7 @@ fn joined_threads_count_as_other_threads() {
     })
     .join()
     .unwrap();
-    let ticks = other_thread_ticks() - before;
+    let ticks = ticks_since(before);
     assert!(ticks * 1000 / clock_ticks() >= 100, "{ticks} ticks");
 }
 
