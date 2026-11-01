@@ -17,7 +17,7 @@
 //!    unlinking of files. Such an operation is durable once a synchronization of its
 //!    directory has returned, and of those that are not, an image keeps a prefix, as a
 //!    file system that journals its metadata in order would.
-//!    `crash_images_of_a_dataset_with_full_text_search` runs the same images on a dataset
+//!    `crash_images_of_a_dataset_with_full_text_search_*` runs the same images on a dataset
 //!    with full-text search, whose index replaces its metadata file by a rename, and checks
 //!    that the index never names a commit above the recovered log and that its results
 //!    match the recovered data (X09 section 17.8). A separate background-checkpoint
@@ -1652,58 +1652,78 @@ fn crash_images_keep_every_acknowledged_commit() {
     ignore = "needs the failpoints feature to checkpoint the index at each fence"
 )]
 #[test]
-fn crash_images_of_a_dataset_with_full_text_search() {
-    for (name, cfg) in [
-        (
-            "text-group",
-            Config {
-                group: true,
-                direct: false,
-                idle_direct: false,
-                threads: 4,
-                commits: 25,
-            },
-        ),
-        (
-            "text-ordinary",
-            Config {
-                group: false,
-                direct: false,
-                idle_direct: true,
-                threads: 2,
-                commits: 15,
-            },
-        ),
-    ] {
-        crash_images(name, cfg, true, false);
-    }
+fn crash_images_of_a_dataset_with_full_text_search_grouped() {
+    crash_images(
+        "text-group",
+        Config {
+            group: true,
+            direct: false,
+            idle_direct: false,
+            threads: 4,
+            commits: 25,
+        },
+        true,
+        false,
+    );
+}
+
+/// [`crash_images_of_a_dataset_with_full_text_search_grouped`] with ordinary commits. The
+/// two configurations are separate tests so that they run in parallel.
+#[cfg(feature = "text")]
+#[cfg_attr(
+    not(feature = "failpoints"),
+    ignore = "needs the failpoints feature to checkpoint the index at each fence"
+)]
+#[test]
+fn crash_images_of_a_dataset_with_full_text_search_ordinary() {
+    crash_images(
+        "text-ordinary",
+        Config {
+            group: false,
+            direct: false,
+            idle_direct: true,
+            threads: 2,
+            commits: 15,
+        },
+        true,
+        false,
+    );
 }
 
 /// Exercise the actual unlocked background path separately from the fence/explicit
 /// checkpoint cases above. A bounded shim handshake starts a designated transaction
 /// after sync entry and holds that sync until its receipt. The test rejects a run
 /// without either a real checkpoint or fresh publication inside one successful sync.
+/// Ordinary and grouped commits are separate tests so that they run in parallel.
+fn background_full_text_checkpoints(group: bool) {
+    crash_images(
+        if group {
+            "background-text-group"
+        } else {
+            "background-text-ordinary"
+        },
+        Config {
+            group,
+            direct: false,
+            idle_direct: false,
+            threads: 4,
+            commits: 50,
+        },
+        true,
+        true,
+    );
+}
+
 #[cfg(all(feature = "text", feature = "failpoints"))]
 #[test]
-fn crash_images_during_background_full_text_checkpoints() {
-    for group in [false, true] {
-        crash_images(
-            if group {
-                "background-text-group"
-            } else {
-                "background-text-ordinary"
-            },
-            Config {
-                group,
-                direct: false,
-                idle_direct: false,
-                threads: 4,
-                commits: 50,
-            },
-            true,
-            true,
-        );
-    }
+fn crash_images_during_background_full_text_checkpoints_ordinary() {
+    background_full_text_checkpoints(false);
+}
+
+#[cfg(all(feature = "text", feature = "failpoints"))]
+#[test]
+fn crash_images_during_background_full_text_checkpoints_grouped() {
+    background_full_text_checkpoints(true);
 }
 
 // ------------------------------------------------------- a failed first annotation sync

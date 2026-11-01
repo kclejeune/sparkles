@@ -1000,22 +1000,35 @@ fn sparql10() {
 }
 
 /// The query evaluation tests through streaming cursors, at batch sizes that put
-/// boundaries everywhere. [`streaming_sparql10_and_11`] runs the default size.
+/// boundaries everywhere. [`streaming_sparql10_and_11`] runs the default size. Each
+/// batch size is its own test, so that the three run in parallel.
+fn query_cursors(batch_rows: usize) {
+    run_suite_mode(
+        &format!("SPARQL 1.0 and 1.1 query (cursor, {batch_rows} rows)"),
+        &[
+            "sparql10/manifest-evaluation.ttl",
+            "sparql11/manifest-sparql11-query.ttl",
+        ],
+        Mode {
+            cursor: Some(batch_rows),
+            ..Mode::default()
+        },
+    );
+}
+
 #[test]
-fn sparql_query_cursors() {
-    for batch_rows in [1, 2, 3] {
-        run_suite_mode(
-            &format!("SPARQL 1.0 and 1.1 query (cursor, {batch_rows} rows)"),
-            &[
-                "sparql10/manifest-evaluation.ttl",
-                "sparql11/manifest-sparql11-query.ttl",
-            ],
-            Mode {
-                cursor: Some(batch_rows),
-                ..Mode::default()
-            },
-        );
-    }
+fn sparql_query_cursors_1_row() {
+    query_cursors(1);
+}
+
+#[test]
+fn sparql_query_cursors_2_rows() {
+    query_cursors(2);
+}
+
+#[test]
+fn sparql_query_cursors_3_rows() {
+    query_cursors(3);
 }
 
 /// SPARQL 1.0 and 1.1 query evaluation with `execution=streaming` (item 470).
@@ -1081,33 +1094,39 @@ fn streaming_geosparql_oxigraph() {
     );
 }
 
-/// P03 A9: an installed registry that no query references changes no answer.
+/// P03 A9: an installed registry that no query references changes no answer, in eager
+/// execution and through cursors. The two modes are separate tests so that they run in
+/// parallel.
+fn unused_registry(mode: Mode) {
+    let label = if mode.cursor.is_some() {
+        "SPARQL 1.0 and 1.1 query (unused registry, cursor)"
+    } else {
+        "SPARQL 1.0 and 1.1 query (unused registry)"
+    };
+    run_suite_mode(
+        label,
+        &[
+            "sparql10/manifest-evaluation.ttl",
+            "sparql11/manifest-sparql11-query.ttl",
+        ],
+        mode,
+    );
+}
+
 #[test]
-fn sparql_query_with_an_unused_registry() {
-    for mode in [
-        Mode {
-            registry: true,
-            ..Mode::default()
-        },
-        Mode {
-            registry: true,
-            cursor: Some(3),
-        },
-    ] {
-        let label = if mode.cursor.is_some() {
-            "SPARQL 1.0 and 1.1 query (unused registry, cursor)"
-        } else {
-            "SPARQL 1.0 and 1.1 query (unused registry)"
-        };
-        run_suite_mode(
-            label,
-            &[
-                "sparql10/manifest-evaluation.ttl",
-                "sparql11/manifest-sparql11-query.ttl",
-            ],
-            mode,
-        );
-    }
+fn sparql_query_with_an_unused_registry_eager() {
+    unused_registry(Mode {
+        registry: true,
+        ..Mode::default()
+    });
+}
+
+#[test]
+fn sparql_query_with_an_unused_registry_cursor() {
+    unused_registry(Mode {
+        registry: true,
+        cursor: Some(3),
+    });
 }
 
 #[test]

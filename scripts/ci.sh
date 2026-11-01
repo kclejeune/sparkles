@@ -306,6 +306,10 @@ main() {
 
   echo
   cat "$summary"
+  if [ -s "$out/flaky-tests.txt" ]; then
+    printf '\nwarning: known flaky tests that passed only on a retry (.config/nextest.toml):\n'
+    cat "$out/flaky-tests.txt"
+  fi
   if [ -s "$out/slow-tests.txt" ]; then
     printf '\nwarning: tests that may time out on GitHub runners (scripts/nextest-slow.py):\n'
     cat "$out/slow-tests.txt"

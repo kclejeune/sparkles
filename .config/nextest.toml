@@ -63,12 +63,24 @@ threads-required = "num-test-threads"
 filter = "test(controlled_waits_do_not_count_against_the_deadline)"
 threads-required = "num-test-threads"
 
+# Known flaky tests, and only these, get retries. Each has a roadmap item to make it
+# deterministic, and the entry goes once that item ships. A retry prints a TRY line as it
+# happens, the final summary lists the test as FLAKY, and `mise run test` writes the tests
+# that passed only on a retry to .artifacts/ci/flaky-tests.txt, which scripts/ci.sh repeats
+# in its summary. A test that fails every attempt still fails the run.
+#
+# a_build_can_be_held_to_a_write_rate times a rate-limited compaction against the wall
+# clock, and a loaded host can stretch or shorten its sleeps (item NEW-ITEM-2).
+[[profile.default.overrides]]
+filter = "package(sparkles-core) & test(=store::compaction_tests::a_build_can_be_held_to_a_write_rate)"
+retries = 2
+
 # The slowest tests start first, so a shard does not end with one of them running alone
 # after the short tests have finished. The list comes from CI's JUnit timings and only
 # changes the order, so a renamed test merely loses its head start.
 [[profile.default.overrides]]
 filter = """test(/^(\
-crash_images_during_background_full_text_checkpoints|\
+crash_images_during_background_full_text_checkpoints_(ordinary|grouped)|\
 sparql::join_tests::galloping_index_joins_match_scans_per_cluster_across_blocks|\
 a_heavy_key_joins_as_a_block_nested_loop|\
 every_inferred_triple_has_a_sound_demand_tree|\
@@ -77,10 +89,11 @@ spilled_optional_and_minus_handle_unbound_keys|\
 sparql::cursor::joinspill::tests::spilled_distinct_of_colliding_rows_is_not_amplified|\
 comment_sweeps|\
 sparql::cursor::joinspill::tests::spilled_join_modes_match_eager_execution|\
-crash_images_of_a_dataset_with_full_text_search|\
+crash_images_of_a_dataset_with_full_text_search_(grouped|ordinary)|\
 random_joins_and_nearest_neighbours_agree|\
 demand_answers_like_materialization|\
-sparql_query_cursors|\
+sparql_query_cursors_[123]_rows?|\
+sparql_query_with_an_unused_registry_(eager|cursor)|\
 sparql::opt_tests::the_numeric_column_answers_as_decoding_does|\
 morsel_filters_and_ordered_top_k_agree_with_eager_on_mixed_terms|\
 memory_stays_bounded|\

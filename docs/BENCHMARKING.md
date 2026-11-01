@@ -944,7 +944,7 @@ same known-failure lists apply as in the default run. Each suite prints its pass
 failures, the queries that needed eager fallback and how many of the failures are on its
 known-failure list, and the task writes these into a gate record. A failure that is not
 on the list, more fallbacks or fewer passes fail the comparison. `mise run test`, and with
-it CI, runs these tests too. `sparql_query_cursors` runs batches of 1, 2 and 3 rows.
+it CI, runs these tests too. The `sparql_query_cursors_` tests run batches of 1, 2 and 3 rows.
 
 #### Incremental view maintenance
 
