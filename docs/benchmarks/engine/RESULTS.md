@@ -305,7 +305,8 @@ queries that run 1.4% to 4.2% slower with front coding since item 108.
 ## Rewrite gate baselines
 
 These baselines belong to the rewrite gates of [BENCHMARKING.md](../../BENCHMARKING.md#rewrite-gates).
-A lane compares its own gate record with them using `scripts/bench-gate.py compare`.
+A change that a gate covers compares its own gate record with them using
+`scripts/bench-gate.py compare`.
 
 ### W3C suites under streaming execution
 

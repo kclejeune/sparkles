@@ -778,12 +778,12 @@ exit status is 1 when anything is reported, so a refresh script can stop on it.
 
 ### Rewrite gates
 
-Five gates guard the engine rewrites of the unified executor (ROADMAP item 453) and the
-storage consolidation (item 455). Each gate has a mise task that writes a gate record,
-and each has a recorded baseline under `docs/benchmarks`. A lane that changes an
-executor path, an incremental-view path, the reasoner's query path, a vocabulary reader
-or the WAL reader runs the gates its change touches, compares its record with the
-baseline and reports the comparison.
+Five gates guard the engine rewrites of the unified executor, roadmap item 453, and of
+the storage consolidation, item 455. Each gate has a mise task that writes a gate record,
+and each has a recorded baseline under `docs/benchmarks`. A change to an executor path,
+an incremental-view path, the reasoner's query path, a vocabulary reader or the WAL
+reader runs the gates it touches, compares their records with the baselines and reports
+the comparisons.
 
 | Gate | Task | Host | Baseline |
 |---|---|---|---|
@@ -852,15 +852,15 @@ noise. A metric that a timing gate flags is therefore measured again in an inter
 A/B of the baseline build and the candidate on the same host, and it counts as a
 regression only if the A/B confirms it. For the matrix, `scripts/nsc-bench-remote.sh`
 runs that A/B with `EXECUTION` set to the flagged mode, and `scripts/nsc-bench.sh` with
-`--execution` does the same on Namespace for a first screen. A confirmed slowdown that the
-lane accepts gets its own roadmap item, as for every gate. The W3C counts do not depend
+`--execution` does the same on Namespace for a first screen. A confirmed slowdown that a
+change accepts gets its own roadmap item, as for every gate. The W3C counts do not depend
 on the host, and the instruction counts are compared by their ranges over five
 processes, so their comparisons stand without an A/B.
 
 #### The eager-against-cursor matrix
 
-`scripts/bench-executors.sh BIN` (`mise run bench:executors [BIN]`) runs the 31 queries of
-`scripts/bench.sh` with `execution=eager` and with `execution=streaming` at 1.05M and
+`mise run bench:executors` builds this checkout's release server and runs
+`scripts/bench-executors.sh` on it, which runs the 31 queries of `scripts/bench.sh` with `execution=eager` and with `execution=streaming` at 1.05M and
 10.5M triples, with 12 Rayon threads and with one. Each of the four cells runs
 `scripts/nsc-bench-remote.sh` on this host, with one binary, one shared store and two
 variants that differ only in the execution mode. Two rounds of eager, streaming,
@@ -890,17 +890,20 @@ that no inherited setting changes what the cell measures. The record's settings 
 digests of the query files, of `scripts/gen-data.py` and of each scale's uncompressed
 data, so a comparison refuses a matrix run on other queries or other data.
 
-Each query gives the median of the server's `execMs` (key suffix `/exec`) and of curl's
-wall time (`/wall`) for each mode. A streamed answer's `execMs` counts the time spent
+Each query gives the median of the server's `execMs`, under keys that end in `/exec`, and
+of curl's wall time, under keys that end in `/wall`, for each mode. A streamed answer's `execMs` counts the time spent
 making batches and leaves out the time spent writing them, so the wall time is the
 end-to-end measure for large answers such as `export-500k`. The one-thread cells have a
 wall-time floor of about 2 ms from the pinned server's own threads sharing one CPU, so
-their execution time is the measure for short queries. A run takes about an hour
-on forge. The script refuses to start while a compiler or a server runs, so take the
-host's locks first.
+their execution time is the measure for short queries. A run takes NEW-MATRIX-TIME on
+forge. The script refuses to start while a compiler or a server runs, so take the host's
+locks first. The task also accepts a prebuilt binary, whose record then needs
+`--build-config` with the output of `scripts/bench-gate.py build-config` from that
+binary's build environment, since a record without a build configuration cannot be
+compared.
 
 ```sh
-flock ~/lanes/.bench.lock flock ~/lanes/.heavy.lock mise run bench:executors -- target/release/sparkles
+flock ~/lanes/.bench.lock flock ~/lanes/.heavy.lock mise run bench:executors
 scripts/bench-gate.py compare BASELINE .artifacts/bench-executors/<time>/record.json --keys '/exec$'
 scripts/bench-gate.py compare BASELINE .artifacts/bench-executors/<time>/record.json --keys '/wall$' --floor 5
 ```
@@ -927,22 +930,23 @@ it CI, runs these tests too. `sparql_query_cursors` runs batches of 1, 2 and 3 r
 
 `mise run bench:incr` runs every ignored test of `crates/sparkles-core/tests/incr_bench.rs`
 in release mode with `INCR_BENCH_JSON` set, so that each measured value is also written
-as a JSON line, in five processes (`--processes`), and turns them into a gate record. The values are the build, query and
-pass times of five views, write latency and catch-up with 0, 10 and 100 views, the commit
+as a JSON line, and turns the lines into a gate record. It runs five processes by
+default, and `--processes` changes their number. The values are the build, query and pass
+times of five views, write latency and catch-up with 0, 10 and 100 views, the commit
 path with nothing subscribed and with a live query, a breakdown of a pass and the rounds
 of views over inferred data. Outside the timed intervals, each view's maintained rows are
 checked against its query evaluated again at the same commit, the views with commits
 behind them are checked to have caught up, and the commit path is checked to have
-committed every write. `--people` sets the size (200,000 by default) and `--threads`
-the `RAYON_NUM_THREADS` of every process (12 by default), and both are workload settings
-that a comparison requires to match. A run takes
-about three minutes on forge.
+committed every write. `--people` sets the size, 200,000 people by default, and
+`--threads` sets the `RAYON_NUM_THREADS` of every process, 12 by default. Both are
+workload settings that a comparison requires to match. A run takes about three minutes on
+forge.
 
 #### Derivation on demand and RDFS on read
 
 `mise run bench:reasoning-latency` runs the example
 `crates/sparkles-reasoner/examples/reasoning_latency.rs`. It generates LUBM-style data of
-10 universities (`--universities`), about 1.3 million triples, with the generator of the
+10 universities by default, about 1.3 million triples, with the generator of the
 `lubm` example, and materializes one store with the rdfs profile and one with owl-rl. It
 then runs the 14 LUBM queries of `scripts/bench-lubm/queries.txt` in process, with the
 result cache off. For each profile it times the materialized store, derivation on demand
@@ -950,9 +954,9 @@ with `nocache` and derivation on demand with its tables cached, and for rdfs als
 read with the schema of the default graph. Each mode's answer to each query is checked
 against the materialized answer of its profile before the timed runs, and the answer of
 every timed run is checked again after its timer stops, so that a cached path that
-returns other rows fails the gate. Five rounds visit
-the modes in a rotated order with three timed runs each (`--rounds`, `--reps`), and
-`--threads` sets `RAYON_NUM_THREADS` (12 by default). The metrics are the median of each
+returns other rows fails the gate. Five rounds visit the modes in a rotated order with
+three timed runs each. `--universities`, `--rounds` and `--reps` change these numbers,
+and `--threads` sets `RAYON_NUM_THREADS`, 12 by default. The metrics are the median of each
 query and mode and each profile's materialization time. Each answer is fingerprinted with
 a stable hash, so the comparison also checks that every mode still returns the
 baseline's answers. Demand may derive up to 2³² facts per query, far above the server's
@@ -964,12 +968,13 @@ default limit of a million, which the broad OWL RL queries pass at ten universit
 user-space instructions of the calling thread with the CPU's performance counters. It
 needs Linux and `kernel.perf_event_paranoid` at 2 or less, and it opens a counter on each
 core type of a hybrid Intel CPU and adds them. For a front-coded and an FSST-coded
-vocabulary of a store of 20,000 items (`--items`), it counts opening the vocabulary, a
+vocabulary of a store of 20,000 items, it counts opening the vocabulary, a
 full scan, decoding every seventh id in order, 50,000 random lookups by id, lookups of
 present and missing keys and prefix ranges. It also counts opening a store without a
-write-ahead log and with 2,000 commits in it (`--commits`), and the difference, which is
-the cost of replaying them. Each case runs five times (`--reps`) and reports the median,
-and the task runs the screen in five processes (`--processes`). Every counted result is
+write-ahead log and with 2,000 commits in it, and the difference, which is the cost of
+replaying them. Each case runs five times and reports the median, and the task runs the
+screen in five processes. `--items`, `--commits`, `--reps` and `--processes` change these
+numbers. Every counted result is
 checked against an expectation that the screen computes another way. Before the counted
 runs, the ids and keys of the ordered and random reads and the ids of the present keys are
 compared in full with a scan of the vocabulary. Every reopened store is checked against

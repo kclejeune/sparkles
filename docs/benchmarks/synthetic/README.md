@@ -6,7 +6,7 @@ Read the [results](RESULTS.md), [run catalog](RUNS.json) and
 [shared reference setup](../reference/README.md). The
 [harness guide](../../BENCHMARKING.md) documents commands and output formats.
 
-The eager-against-cursor matrix of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) records its baseline in [the results](RESULTS.md#eager-against-cursor-matrix). A lane that changes an executor path runs `mise run bench:executors` on forge and compares its record with that baseline through `scripts/bench-gate.py compare`.
+The eager-against-cursor matrix of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) records its baseline in [the results](RESULTS.md#eager-against-cursor-matrix). A change to an executor path runs `mise run bench:executors` on forge and compares the record with that baseline through `scripts/bench-gate.py compare`.
 
 The result report is a manual import. A linked raw record supports only the measurements
 and metadata it contains. Missing build revisions, host details, durability settings or
