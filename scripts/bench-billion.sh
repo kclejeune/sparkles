@@ -521,7 +521,7 @@ step_queries() {
       selected "$n" || continue
       echo
       echo "== $e throughput $n ($NREQ requests, $CONC clients)"
-      ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
+      ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --shell=sh --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
         --command-name "${NAME[$e]}" "seq $NREQ | xargs -P $CONC -I{} $(q "${URL[$e]}" "$n")" \
         --export-json "results/throughput-$n.new.json"
       merge "results/throughput-$n.new.json" "results/throughput-$n.json"

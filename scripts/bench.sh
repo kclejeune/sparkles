@@ -189,7 +189,7 @@ suite() {
     ARGS+=(--prepare "$(upd "$e" queries/_delete.ru)" --command-name "${NAME[$e]}" "$(upd "$e" queries/_update.ru)")
   done
   if [ ${#ARGS[@]} -gt 0 ]; then
-    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
+    "${CLIENT[@]}" hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
       "${ARGS[@]}" --export-json "$RES/update-latency.new.json"
     merge "$RES/update-latency.new.json" "$RES/update-latency.json"
   fi
@@ -207,7 +207,7 @@ suite() {
   pcmd() { par "${URL[$1]}"; }
   mapfile -d '' ARGS < <(engine_args pcmd)
   for e in $ENGINES; do reset_peak "$e"; done
-  hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
+  hyperfine --shell=sh --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
     "${ARGS[@]}" --export-json "$RES/throughput.new.json"
   merge "$RES/throughput.new.json" "$RES/throughput.json"
   kv=()

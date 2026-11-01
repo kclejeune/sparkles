@@ -9,7 +9,7 @@
 nixpkg() {
   local package=$1 installable
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | hyperfine)
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree)
       installable="$ROOT#$package"
       ;;
     *) installable="nixpkgs#$package" ;;
@@ -36,12 +36,11 @@ nixexe() {
   return 1
 }
 
-# Auxiliary tools come from PATH when it has them. Engines and the hyperfine timer always
-# come from this flake.
+# Auxiliary tools come from PATH when it has them, and engines always come from this flake.
 nixbin() {
   local package=$1 binary=$2
   case $package in
-    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree | hyperfine) ;;
+    apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree) ;;
     *)
       if command -v "$binary" > /dev/null; then
         command -v "$binary"
@@ -64,14 +63,18 @@ fluree_bin() {
   nixbin fluree fluree
 }
 
-# Put the flake's hyperfine first on PATH, so the runners' bare `hyperfine` calls, including
-# those behind a CPU-pinning client prefix, time with the pinned version. HYPERFINE names
-# the absolute path of another executable, which runs whatever its file name. Runners that time requests call
-# this after resolve_tools.
+# Fix the hyperfine timer for the whole run and put it first on PATH, so the runners' bare
+# `hyperfine` calls, including those behind a CPU-pinning client prefix, all use it. It is
+# the hyperfine on PATH, or the locked nixpkgs' when PATH has none. HYPERFINE names the
+# absolute path of another executable, which runs whatever its file name. The runners read
+# the JSON of hyperfine 1 and 2 (scripts/bench_hyperfine.py). Runners that time requests
+# call this after resolve_tools.
 use_hyperfine() {
   local binary=${HYPERFINE:-}
   if [ -z "$binary" ]; then
     binary=$(nixbin hyperfine hyperfine) || return
+    # A second call finds the first call's link on PATH and must not link it to itself.
+    binary=$(readlink -f "$binary") || return
   elif [[ $binary != /* ]] || [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
     echo "HYPERFINE=$binary must be the absolute path of an executable file" >&2
     return 1

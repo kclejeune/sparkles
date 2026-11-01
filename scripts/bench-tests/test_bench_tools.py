@@ -73,7 +73,7 @@ for output in outputs:
     def test_engines_ignore_path_and_keep_roots(self):
         for package, binary in [("qlever", "qlever-server"), ("apache-jena", "tdb2.tdbloader"),
                                 ("apache-jena-fuseki", "fuseki-server"), ("oxigraph", "oxigraph"),
-                                ("fluree", "fluree"), ("hyperfine", "hyperfine")]:
+                                ("fluree", "fluree")]:
             with self.subTest(package=package):
                 on_path = self.bin / binary
                 on_path.write_text("#!/bin/sh\nexit 99\n")
@@ -150,14 +150,36 @@ for output in outputs:
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.nix_calls(), [])
 
-    def test_use_hyperfine_puts_the_flake_hyperfine_first(self):
+    def test_use_hyperfine_takes_the_hyperfine_on_path(self):
         on_path = self.bin / "hyperfine"
-        on_path.write_text("#!/bin/sh\nexit 99\n")
+        on_path.write_text("#!/bin/sh\necho on-path\n")
         on_path.chmod(0o755)
-        p = self.shell('use_hyperfine; readlink "$(command -v hyperfine)"; hyperfine')
+        p = self.shell('use_hyperfine; readlink "$(command -v hyperfine)"; hyperfine', FAIL_NIX="1")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout.strip(), str(self.store / "hyperfine" / "bin" / "hyperfine"))
-        self.assertIn(f"{ROOT}#hyperfine", self.nix_calls()[-1])
+        self.assertEqual(p.stdout.splitlines(), [str(on_path), "on-path"])
+        self.assertEqual(self.nix_calls(), [])
+
+    def test_use_hyperfine_twice_keeps_the_first_timer(self):
+        on_path = self.bin / "hyperfine"
+        on_path.write_text("#!/bin/sh\necho on-path\n")
+        on_path.chmod(0o755)
+        p = self.shell('use_hyperfine; use_hyperfine; readlink "$(command -v hyperfine)"; hyperfine', FAIL_NIX="1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.splitlines(), [str(on_path), "on-path"])
+
+    def test_use_hyperfine_falls_back_to_locked_nixpkgs(self):
+        # A PATH with the test's nix and the shell's basic tools, and no hyperfine.
+        tools = self.work / "tools"
+        tools.mkdir()
+        for name in ("bash", "dirname", "mkdir", "ln", "readlink", "python3", "env"):
+            found = shutil.which(name)
+            if found:
+                (tools / name).symlink_to(found)
+        p = self.shell('use_hyperfine; readlink "$(command -v hyperfine)"',
+                       PATH=f"{self.bin}:{tools}")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), str((self.store / "hyperfine" / "bin" / "hyperfine").resolve()))
+        self.assertIn("nixpkgs#hyperfine", self.nix_calls()[-1])
 
     def test_hyperfine_override_runs_under_any_name(self):
         on_path = self.bin / "hyperfine"

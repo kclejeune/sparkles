@@ -101,12 +101,31 @@ can explicitly select other executables. The billion-triple loader also accepts 
 `FLUREE_VERSION`, when supplied without `FLUREE`, must match the packaged version.
 Jena loaders and servers clear `JAVA_HOME` so their wrappers use the packaged JDK.
 The RDFS oracle also defaults to the locked JDK, with `JAVA` as an explicit override.
-The hyperfine timer also comes from the flake, since hyperfine 2 writes its samples in a
-format the run records do not read. `HYPERFINE` can select another executable by its absolute path, under any file name. Runs that time nothing, such
-as the long-write runner and the load step of the billion-triple runner, do not resolve it. The probe,
-geospatial, vector and SHACL write runners call the `hyperfine` on `PATH`, which the mise
-pin supplies at the same version. Other auxiliary tools prefer `PATH` and otherwise use the
+The hyperfine timer is the `hyperfine` on `PATH`, which the mise pin supplies as hyperfine
+2.0. Without one on `PATH`, the runners take hyperfine from the locked nixpkgs, which
+packages hyperfine 1.20. A runner that times requests resolves the timer once and uses it
+for the whole run. `HYPERFINE` can select another executable by its absolute path, under
+any file name. Runs that time nothing, such as the long-write runner and the load step of
+the billion-triple runner, do not resolve it. The geospatial, vector and SHACL write
+runners call the `hyperfine` on `PATH` directly. The run manifest records the timer's
+version in `hyperfine`. Other auxiliary tools prefer `PATH` and otherwise use the
 repository's locked nixpkgs.
+
+Every runner passes `--shell=sh` to hyperfine, except the vector runner, which passes
+`-N`. Hyperfine 1 runs a command through `sh` by default. Hyperfine 2 runs it without a
+shell by default and refuses a command with shell syntax unless the shell is chosen
+explicitly. With `--shell=sh`, both versions run each command through `sh` and subtract the
+measured start-up time of the shell from every sample, so their timings are comparable.
+
+The runners and the record builder read the JSON export of both hyperfine 1 and hyperfine 2
+through `scripts/bench_hyperfine.py`, and refuse an unknown `schema_version`. The module
+turns either format into the fields of hyperfine 1, such as `times`, `exit_codes`, `mean`
+and `median`. A result's name is its `--command-name`, which hyperfine 2 writes as `name`
+and hyperfine 1 as `command`. The results files that the runners merge, such as
+`<query>.json`, are always written in the hyperfine 1 layout. A rerun into an older results
+directory therefore never mixes the two formats in one file. A result converted from
+hyperfine 2 keeps the timer's version in `hyperfine_version`. The raw run records under
+`docs/benchmarks` stay in the format that wrote them.
 
 The locked nixpkgs builds QLever with GCC 15.3. GCC 16 rejects range-v3's late
 `enable_borrowed_range` specialization for `std::string_view`.

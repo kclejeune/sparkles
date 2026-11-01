@@ -230,7 +230,7 @@ for delta in "${DELTAS[@]}"; do
         echo "unexpected validation status for $mode" >&2
         exit 1
       }
-      hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic \
+      hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic \
         --prepare "$(upd "delete-$w.ru")" --command-name "$mode/$w/delta=$delta" "$(upd "insert-$w.ru")" \
         --export-json "results/$RES.new.json"
       merge "results/$RES.new.json" "results/$RES.json"

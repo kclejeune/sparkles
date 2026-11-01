@@ -53,11 +53,11 @@ merge() {
 
 if [ -z "${SKIP_LOAD:-}" ]; then
   rm -rf "$DB"
-  hyperfine --runs 1 --style basic --command-name load "$SPARKLES load --loc $DB geo.nt" \
+  hyperfine --shell=sh --runs 1 --style basic --command-name load "$SPARKLES load --loc $DB geo.nt" \
     --export-json results/geo-load.new.json
   merge results/geo-load.new.json results/geo-load.json
   # the index build, from a disabled index each time
-  hyperfine --runs 1 --style basic --prepare "$SPARKLES geo-index --loc $DB --disable" \
+  hyperfine --shell=sh --runs 1 --style basic --prepare "$SPARKLES geo-index --loc $DB --disable" \
     --command-name build "$SPARKLES geo-index --loc $DB" --export-json results/geo-build.new.json
   merge results/geo-build.new.json results/geo-build.json
 fi
@@ -104,7 +104,7 @@ run() {
   done
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
+    hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
       --command-name "$engine" "$(q "$n")" --export-json "results/$n.new.json"
     merge "results/$n.new.json" "results/$n.json"
   done

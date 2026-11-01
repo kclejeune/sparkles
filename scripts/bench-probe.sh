@@ -129,7 +129,7 @@ time_query() {
     hf=$res/$n.$e.hf.json
     rm -f "$hf"
     rc=0
-    ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
+    ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
       --command-name "${NAME[$e]}" "$(q "${URL[$e]}" "$n")" --export-json "$hf" || rc=$?
     if answering "$e"; then
       # A live server with a broken preparation command is a harness failure.

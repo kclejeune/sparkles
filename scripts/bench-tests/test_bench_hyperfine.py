@@ -182,6 +182,21 @@ class MergeTests(unittest.TestCase):
                 self.assertEqual([r["command"] for r in merged["results"]], ["sparkles", "jena-fuseki", "q-exact-true"])
 
 
+class RunnerCallTests(unittest.TestCase):
+    def test_every_runner_chooses_the_shell_explicitly(self):
+        # hyperfine 2 refuses shell syntax without an explicit choice, and runs commands
+        # without a shell by default where hyperfine 1 used sh.
+        import re
+        calls = 0
+        for script in sorted(SCRIPTS.glob("bench*.sh")):
+            for line in script.read_text().splitlines():
+                if re.match(r'\s*(\S*CLIENT\S*\s+)?hyperfine\s', line):
+                    calls += 1
+                    with self.subTest(script=script.name, line=line.strip()):
+                        self.assertRegex(line, r"hyperfine (--shell=sh|-N) ")
+        self.assertGreaterEqual(calls, 12)
+
+
 class ReaderTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

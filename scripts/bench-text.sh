@@ -198,7 +198,7 @@ if [ -z "${SKIP_LOAD:-}" ]; then
     BUILD+=(--prepare 'rm -f qlever-index/bench.text.*' --command-name qlever
       "cd qlever-index && $QINDEX -i bench -A -W > text.log 2>&1")
   fi
-  hyperfine --runs 1 --style basic "${BUILD[@]}" --export-json results/text-build.new.json
+  hyperfine --shell=sh --runs 1 --style basic "${BUILD[@]}" --export-json results/text-build.new.json
   merge results/text-build.new.json results/text-build.json
   kv=()
   has sparkles && kv+=("sparkles=$(bytes sparkles.db/text)")
@@ -354,7 +354,7 @@ if [ -z "${ANSWERS_ONLY:-}" ]; then
       ARGS+=(--command-name "${NAME[$e]}"
         "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@$(qfile "$e" "$n") ${URL[$e]}")
     done
-    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
+    "${CLIENT[@]}" hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
       "${ARGS[@]}" --export-json "results/text-$n.new.json"
     merge "results/text-$n.new.json" "results/text-$n.json"
   done
