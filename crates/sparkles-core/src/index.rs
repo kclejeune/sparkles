@@ -2316,6 +2316,11 @@ impl BlockCache {
         }
         self.usage().entries as usize
     }
+    /// The bytes the underlying cache holds for all its views together, which unlike
+    /// [`bytes`](Self::bytes) of a shared view costs no walk over the entries.
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.cache.weight()
+    }
     /// The bytes the underlying cache may hold, shared with other views or not.
     pub fn capacity(&self) -> u64 {
         self.cache.capacity()

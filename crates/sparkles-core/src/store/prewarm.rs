@@ -34,6 +34,8 @@ pub const VERSION: u32 = 1;
 /// order, so that a store much larger than memory does not make every start read
 /// gigabytes it would evict again.
 pub const PAGE_LIMIT: u64 = 4 << 30;
+/// Decoded bytes of a whole block of four columns.
+const WHOLE_BLOCK: u64 = crate::index::BLOCK_ROWS as u64 * 8 * 4;
 /// Bytes read by one call when a prewarm waits for recorded pages.
 const READ_CHUNK: usize = 1 << 20;
 
@@ -198,7 +200,10 @@ impl Store {
                 if stopped() {
                     return finish(done, Some("stopped".into()));
                 }
-                if cache.bytes() >= cache.capacity() {
+                // the cache's total, since a view's own share of a shared cache costs a
+                // walk over every entry to count, and room for one more whole block, since
+                // a full cache evicts as it takes more
+                if cache.total_bytes() + WHOLE_BLOCK > cache.capacity() {
                     return finish(done, Some("the block cache is full".into()));
                 }
                 let b = b as usize;
@@ -499,6 +504,23 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         let e = store.prewarm(&|| false).unwrap_err().to_string();
         assert!(e.contains("is not in the index"), "{e}");
+    }
+
+    #[test]
+    fn a_prewarm_stops_at_a_full_block_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_data(tmp.path());
+        lookup(&store);
+        store.record_prewarm().unwrap().unwrap();
+        drop(store);
+        let opts = StoreOptions {
+            cache_bytes: 64 << 10,
+            ..StoreOptions::default()
+        };
+        let store = Store::open(tmp.path(), opts).unwrap();
+        let done = store.prewarm(&|| false).unwrap();
+        assert_eq!(done.parts, 0);
+        assert_eq!(done.skipped.as_deref(), Some("the block cache is full"));
     }
 
     #[test]
