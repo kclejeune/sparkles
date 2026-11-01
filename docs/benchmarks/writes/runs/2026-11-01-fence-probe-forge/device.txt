@@ -1,0 +1,40 @@
+# nvme id-ctrl (selected fields)
+mn        : SKHynix_HFS512GEJ9X102N                 
+fr        : 51730A10
+apsta     : 0x1
+wctemp    : 359
+ [15:0] : 86 °C (359 K, 186 °F)	Warning Composite Temperature Threshold (WCTEMP)
+cctemp    : 360
+ [15:0] : 87 °C (360 K, 188 °F)	Critical Composite Temperature Threshold (CCTEMP)
+vwc       : 0x7
+ps      0 : mp:7.50W operational enlat:5 exlat:305 rrt:0 rrl:0
+ps      1 : mp:3.9000W operational enlat:30 exlat:330 rrt:1 rrl:1
+ps      2 : mp:1.5000W operational enlat:100 exlat:400 rrt:2 rrl:2
+ps      3 : mp:0.0500W non-operational enlat:500 exlat:1500 rrt:3 rrl:3
+ps      4 : mp:0.0050W non-operational enlat:1000 exlat:9000 rrt:4 rrl:4
+# power management feature
+get-feature:0x02 (Power Management), Current value:00000000
+	Workload Hint (WH): 0 - No Workload
+	Power State   (PS): 0
+# autonomous power state transition
+get-feature:0x0c (Autonomous Power State Transition), Current value:0x00000001
+	Autonomous Power State Transition Enable (APSTE): Enabled
+	Auto PST Entries	.................
+	Entry[ 0]
+	.................
+	Idle Time Prior to Transition (ITPT): 100 ms
+# smart-log thermal fields
+temperature				: 38 °C (311 K, 100 °F)
+Warning Temperature Time		: 0
+Critical Composite Temperature Time	: 0
+Temperature Sensor 1			: 34 °C (307 K, 93 °F)
+Temperature Sensor 2			: 32 °C (305 K, 89 °F)
+Thermal Management T1 Trans Count	: 0
+Thermal Management T2 Trans Count	: 0
+Thermal Management T1 Total Time	: 0
+Thermal Management T2 Total Time	: 0
+# block queue
+write back
+1
+/dev/mapper/vg-root ext4 481827360 413078916  44199480  91% /
+7.2.9

@@ -1894,3 +1894,94 @@ still took 1.10 to 1.48 ms. With the drive in its slow state, grouped commits of
 spatial and full-text datasets, above the 1.5 that the gate requires there, with certified
 peak resident memory differences of 1.4 and 7.3 MiB. Serial spatial commits kept paired p50
 and p90 ratios of 1.005 and 0.996.
+
+**Annotation records written through (item 501).** A fence whose commits carry a commit
+message or a change digest no longer synchronizes `annotations.bin` with `fdatasync`. A
+grouped commit encodes its annotation record under the writer lock and takes its place in
+the file, as it takes its place in the log, but it writes nothing. The leader of its fence
+writes the records of the whole prefix at the file's written end in one write, in a second
+thread, while it writes the prefix's log records and terms. The file grows the way the log
+does, in steps of zero bytes that a buffered write and `fdatasync` make durable together
+with the records that needed the growth, at least 64 KiB and at most 256 KiB at a time.
+Records that fit in those zeros go through a second handle opened with `O_DIRECT |
+O_DSYNC`, which overwrites allocated blocks and changes no file size, so a device with FUA
+persists them without a cache flush. An ordinary commit writes its own record the same
+way, before its log records, as it did with `fdatasync`. The quota does not count the
+zeros, the free-space reserve counts a fence's possible growth with its promise, and a
+close cuts the zeros, as an open does.
+
+The durability argument is the following.
+
+1. A commit's annotation record takes its place in the file in commit order, under the
+   writer lock, and so do its log records. The leader checks that the prefix's records
+   start at the file's written end and follow each other, and writes nothing otherwise.
+2. A fence acknowledges its commits only after its log write, its terms and its
+   annotation write have all returned, each either a write-through write, which promises
+   the data and the metadata to read it, or a buffered write followed by a successful
+   `fdatasync`.
+3. One fence runs its I/O at a time, and the next fence seals only after the last one's
+   writes returned. The bytes of a fence therefore never reach the file before those of
+   every earlier fence are durable, and only the newest fence's records can be missing.
+4. A crash after the annotation write and before the log write leaves records whose
+   commits are not in the recovered log. Their `seq` is above the recovered head, so the
+   next open cuts them.
+5. A crash after the log write and before the annotation write leaves commits whose
+   records are missing. Each of them carries `WAL_FLAG_ANNOTATED`, and the replay
+   truncates the log from the first one without its record unless a later commit shows it
+   was durable. No later commit can, since every commit record of the prefix counts the
+   commits before it back to the published head as possibly not durable, and no later
+   fence has written. None of these commits was acknowledged.
+6. The direct write rewrites the committed bytes of the file's last block in front of the
+   new records. Those bytes are durable and unchanged, so a torn block can damage only the
+   new records. A reader stops at the first record that does not decode, so a damaged
+   record and every record after it count as missing, which is case 5. Zero bytes never
+   decode as a record, because a record's CRC-32 over its zero bytes is not zero, so the
+   preallocated zeros read as the end of the records.
+7. An ordinary commit's record is durable before its log write starts, so case 5 cannot
+   occur for it, and its commit record carries no flag. When its commit fails before the
+   log write, the record is taken back by cutting the file to the record's start, zeros
+   included, and synchronizing the cut, so a later commit that reuses its `seq` never
+   inherits it.
+
+The format of `annotations.bin` is unchanged, so no version moved. A file with zeros after
+its records reads the same in an older release, whose open cuts them as this one does.
+The queued records, at most 1,071 bytes for each of a queue's 64 commits, wait on the heap
+until their fence writes them, and the quota and the free-space reserve count them with the
+commit's records and terms.
+
+`crash_images_keep_every_acknowledged_commit` in `tests/power_loss.rs`, whose commits all
+carry a message, now also takes its images after every write to `annotations.bin` and after
+every log write that returns while an annotation write is in flight. The run in which every
+commit groups requires such a crash point between a fence's annotation write and its log
+write, and every run with the write-through handles on requires more than four write-through
+annotation writes for each synchronization of the file. Before this change the grouped run
+wrote no annotation record through and synchronized the file 55 times, and the test fails
+there. `fences_write_their_annotation_records_through` checks the path and the quota's count
+of the zeros, and the tests that take annotation records out of a crash image now find the
+records' end by decoding the file.
+
+**Fences in each drive state (item 502).** Four probe runs on `forge` on 2026-11-01
+measured the two fence shapes on their own, outside the engine, with the drive in each
+state, as the [fence probe results](../benchmarks/writes/RESULTS.md#fences-in-each-drive-state)
+record. A write-through fence wrote one 4 KiB block in each of two files through
+`O_DIRECT | O_DSYNC` handles in parallel, and a flushing fence wrote the same blocks with
+buffered writes and ran `fdatasync` of both files in parallel. The drive alternates between
+two states. In the fast state a write-through write takes 0.20 ms on the device, and the
+two writes of a fence overlap, so the fence takes 0.24 ms, while a flushing fence takes
+0.34 ms. In the slow state every write-through write and every cache flush takes about
+1.5 ms on the device, and the fences take 1.61 and 1.70 ms. Two runs alternated the shapes
+every second, so that each pair of neighbouring seconds shared the drive's state. In the 14
+pairs in the fast state the write-through fence took 0.704 times as long as the flushing
+one, in every pair, and in the 332 pairs in the slow state it took 0.944 times as long and
+was faster in 308. The drive spent most of each run in its slow state, and its fast spells
+lasted 5 to 14 seconds, often after an idle period but not always. Its thermal management
+counters stayed at zero, so temperature does not explain the slow state, and the drive's
+autonomous power state transitions start only after 100 ms without commands, which a
+running fence load never leaves.
+
+A write-through write therefore never takes about 0.47 ms. The device time of 0.47 ms per
+write in the campaigns of item 446 is the mean over a process in which the drive spent part
+of its time in each state, and the flushing processes that outran every write-through
+process ran wholly in the fast state, where any fence is fast. Write-through fences are
+faster in both states, so fences keep writing through, and no choice between the two paths
+by measured cost was built.

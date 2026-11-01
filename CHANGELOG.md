@@ -276,8 +276,19 @@ vocabulary writes a large set of terms as several chunks of at most 1 MiB, or of
 longer term, so a fence with more than 4 GiB of new terms stays readable. On `forge` the fences issued 0.001 to 0.005 device cache flushes per commit instead of
 1.00 to 1.14, and four writers on the spatial dataset at 1.05M committed 2.05 times as many
 transactions/s with the drive in its slow state. In the drive's fast state, flushing
-fences were faster than write-through ones in three of ten pairs, which roadmap item
-502 measures.
+fences were faster than write-through ones in three of ten pairs, because those
+processes ran with the drive in its fast state and the write-through ones did not.
+
+Group commit fences write their commits' messages and digests through as well. Grouped
+commits queue their annotation records, and the fence's leader writes them to
+`annotations.bin` at the same time as the prefix's records and terms, through an
+`O_DIRECT` and `O_DSYNC` handle when they fit in preallocated space, so a fence of
+annotated commits no longer flushes the device cache. Ordinary commits write their
+record the same way before their log records. The file grows by zero bytes in steps of
+64 to 256 KiB, which the quota does not count, and a close cuts them. The format of the
+file is unchanged. Probes on `forge` that alternate a write-through fence and a flushing
+fence every second found the write-through fence faster with the drive in each state,
+at 0.24 against 0.34 ms in its fast state and 1.61 against 1.71 ms in its slow state.
 
 `anthropic` model providers use Anthropic's prompt cache by default. Every call marks
 its system text for the cache, Ask also marks the grounding that every question of a

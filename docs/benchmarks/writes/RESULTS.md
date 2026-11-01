@@ -337,10 +337,11 @@ the gain in the drive's slow state, where six flushing processes took 1.48 to 1.
 fence and committed 1,157 to 1,287 transactions/s, and every write-through process took
 0.58 to 0.64 ms and committed 2,458 to 2,681. In the fast state four flushing processes
 took 0.44 to 0.67 ms a fence and committed 2,566 to 3,754 transactions/s. Three of them
-outran every write-through process, and their pairs have ratios of 0.69 to 0.73. No
-write-through process ran with fences that short, because each fence's write-through
-writes took about 0.47 ms under this load. [Roadmap](../../ROADMAP.md) item 502
-measures write-through fences with the drive held in each state. In the full-text cell
+outran every write-through process, and their pairs have ratios of 0.69 to 0.73. Those
+flushing processes ran wholly in the drive's fast state, while the device time of 0.47 ms
+per write-through write is the mean of processes in which the drive spent part of the time
+in each state. The [fence probes](#fences-in-each-drive-state) measured both shapes with
+the drive in each state and found write-through fences faster in both. In the full-text cell
 the write-through fences of eight processes took 1.10 to 1.48 ms, with device writes of
 0.76 to 1.20 ms each, and the paired gain is 1.020. Serial commits take the ordinary path
 with both builds and kept their latency. Their p90 medians differ because one flushing
@@ -354,6 +355,29 @@ drive in its slow state, where an ordinary write-through commit synchronized in 
 dataset, a paired ratio of 2.135, and 1,433 against 726 on the full-text dataset, a paired
 ratio of 1.927, both above the required 1.5. The certified peak resident memory
 differences were 1.4 and 7.3 MiB, under the limit of 64 MiB.
+
+#### Fences in each drive state
+
+Probe runs on `forge` measured the two fence shapes outside the engine. A write-through
+fence wrote one 4 KiB block in each of two files through `O_DIRECT` and `O_DSYNC` handles
+in parallel, and a flushing fence wrote the same blocks with buffered writes and ran
+`fdatasync` of both files in parallel. Two runs alternated the shapes every second, so that
+neighbouring seconds shared the drive's state, and each pair counts in a state when both of
+its seconds were in it. The [run record](runs/2026-11-01-fence-probe-forge/README.md) holds
+the probe, its schedules, its output and the drive's power and thermal state.
+
+| State | Pairs | Write-through fence (ms) | Flushing fence (ms) | Paired ratio | Write-through faster |
+|---|---:|---:|---:|---:|---:|
+| Fast | 14 | 0.241 | 0.342 | 0.704 | 14 |
+| Slow | 332 | 1.612 | 1.701 | 0.944 | 308 |
+
+In the fast state a write-through write took 0.20 ms on the device, and the two writes of a
+fence overlapped, so the fence took no longer than one write. A flushing fence's writes
+took 0.13 ms and its flushes 0.24 ms. In the slow state every write-through write and every
+flush took about 1.5 ms. The drive spent most of each run in its slow state, and its fast
+spells lasted 5 to 14 seconds, often after an idle period but not always. Its thermal
+management counters stayed at zero. Write-through fences are faster in both states, so
+fences keep writing through.
 
 #### Limits of these runs
 

@@ -3864,8 +3864,8 @@ extended value like `UTF-8''r%C3%A9%C3%A9crit`. A message that breaks these rule
 `400`, and nothing is written. A write with no net effect creates no commit and drops its
 message.
 
-The message is written and synced before the commit becomes durable, so every
-acknowledged commit keeps its message. Messages and digests live in `annotations.bin` in
+The message is durable before the commit is acknowledged, so every acknowledged commit
+keeps its message. Messages and digests live in `annotations.bin` in
 the database directory. Backups include the file, and clones start without it.
 
 **Change digests.** A dataset can record a SHA-256 digest of each commit's net changes,
