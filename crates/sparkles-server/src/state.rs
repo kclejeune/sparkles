@@ -5,7 +5,6 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use sparkles::store::StoreOptions;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "backup")]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
