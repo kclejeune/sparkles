@@ -433,8 +433,10 @@ impl<P: Program> FixedPoint<P> {
                 &|x| facts.contains_key(x),
                 &mut found,
             )?;
-            for (g, r) in found.drain(..) {
-                if self.facts.get(&g) == Some(&r) && !pending.contains(&g) {
+            // experiment: overdelete every consequence, as DRed does, rather than the
+            // facts whose records depend on the candidate
+            for (g, _) in found.drain(..) {
+                if self.facts.contains_key(&g) && !pending.contains(&g) {
                     broken.push(g);
                 }
             }
