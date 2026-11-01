@@ -11,6 +11,7 @@ import json
 import math
 import os
 import pathlib
+import signal
 import statistics
 import sys
 import tempfile
@@ -172,6 +173,22 @@ def validate_args(args):
     return qset, out
 
 
+def killed(record, directory):
+    """Whether a child ended by SIGKILL, or by SIGABRT after a failed allocation."""
+    code = record.get("returncode")
+    if type(code) is not int or code >= 0:
+        return False
+    if -code == signal.SIGKILL:
+        return True
+    if -code == signal.SIGABRT:
+        try:
+            with (pathlib.Path(directory) / "stderr").open("rb") as f:
+                return b"memory allocation of" in f.read(1024 * 1024)
+        except OSError:
+            return False
+    return False
+
+
 class Runner:
     def __init__(self, args, qset, out_dir=None, proxy=None, deadline=None):
         self.args, self.qset, self.proxy = args, qset, proxy
@@ -291,6 +308,14 @@ class Runner:
         if record["byteCap"]:
             return {"outcome": "error", "error": {"code": "output-cap"}}, (
                 "invalid_output"
+            )
+        if killed(record, directory):
+            # The kernel's OOM killer, a memory cap or an operator ended this Ask.
+            # Its generated query is the likely cause, so it is a measured failure
+            # of the case and the run goes on.
+            code = -record["returncode"]
+            return {"outcome": "error", "error": {"code": "killed", "signal": code}}, (
+                "killed"
             )
         if record["returncode"] not in (0, 2):
             raise Invalid("child execution incomplete")

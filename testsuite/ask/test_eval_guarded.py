@@ -136,5 +136,19 @@ class GuardedScore(unittest.TestCase):
         self.assertTrue(guarded.load_errata())
 
 
+class KilledChild(unittest.TestCase):
+    def test_sigkill_and_allocation_abort_are_case_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            (p / "stderr").write_bytes(b"memory allocation of 8 bytes failed\n")
+            self.assertTrue(eval_ask.killed({"returncode": -signal.SIGKILL}, p))
+            self.assertTrue(eval_ask.killed({"returncode": -signal.SIGABRT}, p))
+            (p / "stderr").write_bytes(b"thread panicked\n")
+            self.assertFalse(eval_ask.killed({"returncode": -signal.SIGABRT}, p))
+            self.assertFalse(eval_ask.killed({"returncode": -signal.SIGSEGV}, p))
+            self.assertFalse(eval_ask.killed({"returncode": 1}, p))
+            self.assertFalse(eval_ask.killed({"returncode": None}, p))
+
+
 if __name__ == "__main__":
     unittest.main()

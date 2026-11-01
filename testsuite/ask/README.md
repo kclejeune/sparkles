@@ -125,7 +125,9 @@ Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
 a refusal by the model, an Ask timeout or an unusable draft is a failed answer with the
 status `provider_error`, `refusal`, `timeout`, `budget_exceeded` or `invalid_output`,
-and the run goes on. A case that the cost cap refused is `budget_refused`. It leaves the
+and the run goes on. An Ask child that ends by SIGKILL, as when the kernel's out-of-memory
+killer or a memory cap stops it, or by SIGABRT after a failed allocation is the failed
+case `killed`, since its generated query is the likely cause. A case that the cost cap refused is `budget_refused`. It leaves the
 denominators, marks its row incomplete and ends the run. A harness fault stops a run,
 such as failing gold, a wrong binary hash or a child with an unknown exit status.
 
