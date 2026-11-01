@@ -124,6 +124,13 @@ enum Kind {
     Flagged,
 }
 
+/// Whether the base fact `t` may have supports that no instance shows: under an opaque
+/// program, or a GeoSPARQL default geometry, which the closure can also derive from the
+/// feature's geometries.
+fn hidden(c: &Closure, opaque: bool, t: &Triple) -> bool {
+    opaque || c.defaults.as_ref().is_some_and(|d| t[1] == d.pred)
+}
+
 fn kind(c: &Closure, t: &Triple) -> Kind {
     match c.graph.position(t) {
         Some(r) if c.flagged(r) => Kind::Flagged,
@@ -195,6 +202,10 @@ struct Cx<'a> {
     opaque: bool,
     /// the program reads RDF lists
     lists: bool,
+    /// per rule: it reads lists in a program with a negation, which can derive a
+    /// competing list cell from a subset of the facts and so break a list that a
+    /// support reads
+    unsure_lists: Vec<bool>,
     first: u64,
     rest: u64,
     nil: u64,
@@ -440,7 +451,7 @@ impl<'a> Cx<'a> {
         abort: &'a AtomicBool,
         limits: &'a Limits,
     ) -> Cx<'a> {
-        let negated = rules
+        let negated: Vec<bool> = rules
             .iter()
             .map(|r| {
                 // a rule that tests for absent data, whose supports can be smaller than
@@ -458,6 +469,11 @@ impl<'a> Cx<'a> {
                 })
         });
         let t = &c.terms;
+        let any_negated = negated.iter().any(|&n| n);
+        let unsure_lists = rules
+            .iter()
+            .map(|r| any_negated && engine::reads_lists(r))
+            .collect();
         Cx {
             c,
             rules,
@@ -468,6 +484,7 @@ impl<'a> Cx<'a> {
             negated,
             opaque,
             lists: rules.iter().any(engine::reads_lists),
+            unsure_lists,
             first: t.rdf_first,
             rest: t.rdf_rest,
             nil: t.rdf_nil,
@@ -550,7 +567,7 @@ impl<'a> Cx<'a> {
             };
             // a rule with a negation may derive the fact from fewer facts than the closure
             // holds, also when its negation fails now: its supports are not shown
-            if self.negated[ri] {
+            if self.negated[ri] || self.unsure_lists[ri] {
                 f.unknown = true;
                 continue;
             }
@@ -865,7 +882,7 @@ impl Witnesses {
             count: 1,
             lineage: Vec::new(),
             witnesses: vec![w],
-            truncated: self.opaque,
+            truncated: hidden(c, self.opaque, t),
         })
     }
 
@@ -1072,12 +1089,8 @@ impl Witnesses {
             if !pass.ins.contains_key(&i)
                 && let Some(k) = w.nodes[i as usize].key
             {
-                w.set(
-                    i,
-                    vec![Witness::new(vec![Atom::Fact(k)])],
-                    cx.opaque,
-                    cx.opaque,
-                );
+                let h = hidden(c, cx.opaque, &w.nodes[i as usize].t);
+                w.set(i, vec![Witness::new(vec![Atom::Fact(k)])], h, h);
                 cx.budget.check()?;
             }
         }
@@ -1445,8 +1458,8 @@ impl Witnesses {
                             let key = base.then(|| fact_key(cx.c, u));
                             let j = self.add_node(*u, key);
                             if let Some(k) = key {
-                                let o = cx.opaque;
-                                self.set(j, vec![Witness::new(vec![Atom::Fact(k)])], o, o);
+                                let h = hidden(cx.c, cx.opaque, u);
+                                self.set(j, vec![Witness::new(vec![Atom::Fact(k)])], h, h);
                             }
                             if !base || cx.head_candidate(u) {
                                 queue.push(j);
@@ -1560,7 +1573,7 @@ impl Witnesses {
                 Kind::Base => {
                     let k = n.key.expect("the key was set above");
                     pool.push(Witness::new(vec![Atom::Fact(k)]));
-                    local |= cx.opaque;
+                    local |= hidden(cx.c, cx.opaque, &t);
                 }
                 Kind::Flagged => local = true,
                 Kind::Derived => local |= ins.bodies.is_empty() || cx.opaque,

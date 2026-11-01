@@ -508,3 +508,62 @@ fn rules_with_negation_truncate_their_heads() {
     let got = cache.witnesses(&t("s", "target", "yes")).unwrap();
     assert!(got.annotation.truncated, "{got:?}");
 }
+
+/// Regression (thirteenth review of item 416): under a program with a negation, a subset
+/// of the facts can derive a competing list cell and break a list that a support reads,
+/// so list-reading instances keep no witnesses and their facts are truncated.
+#[test]
+fn list_witnesses_under_negation_are_truncated() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rest = format!("{RDF}rest");
+    let nil = format!("{RDF}nil");
+    change(
+        &s,
+        None,
+        &[
+            t("s", "marker", "yes"),
+            t("s", "seed", "yes"),
+            t("l", &rest, &nil),
+        ],
+        &[],
+    );
+    let rules = Profile::Rules(format!(
+        "[a: (?l <{RDF}rest> <{RDF}nil>) noValue(<{EX}s> <{EX}marker> <{EX}yes>) -> (?l <{RDF}first> <{EX}bad>)]
+         [b: (<{EX}s> <{EX}seed> <{EX}yes>) -> (<{EX}l> <{RDF}first> <{EX}good>)]
+         [c: (?l <{RDF}first> <{EX}good>), listContains(?l, <{EX}good>) -> (<{EX}s> <{EX}target> <{EX}yes>)]"
+    ));
+    let cache = Cache::default();
+    run_with(&s, &rules, None, &cache, &with(8)).unwrap_or_else(|e| panic!("{e:#}"));
+    let got = cache.witnesses(&t("s", "target", "yes")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+    assert!(got.annotation.witnesses.is_empty(), "{got:?}");
+}
+
+/// Regression (thirteenth review of item 416): an asserted default geometry can also be
+/// derived from the feature's geometry, so with default geometries on it is truncated.
+#[test]
+fn asserted_default_geometries_are_truncated() {
+    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+    let s = Store::in_memory(StoreOptions::default());
+    let has = format!("{GEO}hasGeometry");
+    let default = format!("{GEO}hasDefaultGeometry");
+    change(&s, None, &[t("f", &has, "g"), t("f", &default, "g")], &[]);
+    let cache = Cache::default();
+    let extras = Extras {
+        geo_default_geometry: true,
+        ..Extras::default()
+    };
+    materialize_incremental(
+        &s,
+        &Profile::RdfsSimple,
+        &extras,
+        Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &with(8),
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    let got = cache.witnesses(&t("f", &default, "g")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+}

@@ -628,9 +628,12 @@ when a rule instance's product passes its working bound of four times the bound 
 unions per premise, and when a fact has more than 4,096 instances. A fact with the empty
 support is exact whatever its premises keep. A fact that a rule with `noValue` or
 `listNotContains` can derive is truncated, also when the rule's test fails now, since a
-smaller set of facts may pass it. Facts derived through the GeoSPARQL default geometries
-and programs with head actions or `makeTemp` are truncated, since their instances do not
-show every support. Under such a program every asserted
+smaller set of facts may pass it. In a program with such a rule, a rule that reads RDF
+lists keeps no witnesses for its instances and its facts are truncated, because a
+smaller set of facts can derive a second list cell and break the list. Facts derived
+through the GeoSPARQL default geometries, asserted default geometries when the closure
+derives them, and programs with head actions or `makeTemp` are truncated, since their
+instances do not show every support. Under such a program every asserted
 fact is truncated too, because a hidden derivation may give it another minimal support.
 
 An incremental run keeps the witnesses that avoid the removed quads, which for a monotone
