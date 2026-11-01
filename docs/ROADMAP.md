@@ -99,8 +99,8 @@ Wave A holds the work that most improves the engine against objective measures.
   benchmark and an instruction-count screen. Each further loss that item 452's
   competitive coverage finds becomes its own Wave A item.
 * Streaming execution follows through item 7.
-* The first three stages of the unified executor, item 453, follow. Items 474 to 478
-  delete dead and superseded paths, item 479 sets the first-release format cutoff, and
+* The first three stages of the unified executor, item 453, follow. The deletions of
+  items 474 to 478 are complete, item 479 sets the first-release format cutoff, and
   items 480 to 484 consolidate the execution policy, the reasoning mode, request
   building, rank fusion and the commit publish tail.
 * The reasoning quick fixes of item 456 are items 485 to 487. They add closure operators,
