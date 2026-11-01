@@ -1,0 +1,7624 @@
+{
+ "schema": 1,
+ "measurement": "Ask accuracy baseline on DBpedia 2022.12.01 for Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5",
+ "date": "2026-11-01",
+ "host": "A development laptop with 16 cores and 30 GB of memory that was running other work, with load averages between 10 and 40. Wall times in this record come from that loaded host and are context, not latency measurements.",
+ "scope": "QALD-9-plus with 107 retained questions and Text2SPARQL'25 db25 with 74 retained questions. Haiku ran QALD three times, Sonnet twice and Opus once, and each model ran db25 once where the cap allowed. The QALD questions were used while Ask grounding was tuned, so they are regression evidence. db25 was not used in that tuning.",
+ "settings": {
+  "effort": "medium",
+  "contextTokens": 200000,
+  "maxOutputTokens": 4096,
+  "requestTimeoutSecs": 120,
+  "askDeadlineSecs": 300,
+  "queryTimeoutSecs": 60,
+  "askTokenBudget": 100000,
+  "clarifications": "answer",
+  "projectionMargin": 1.25
+ },
+ "methodology": {
+  "headlineScoringPolicy": "rdf-term-set-projected-columns-v2",
+  "secondaryScoringPolicy": "equal width, which is rdf-term-set-global-columns-v1 and gives no credit to an answer with extra columns",
+  "recomputation": "Every count is recomputed from the per-case files and checked against the report rows.",
+  "noiseFloor": "For two runs on the same questions, d is the per-question difference of correctness and the half-width is 1.96 times the standard deviation of d over the square root of the question count.",
+  "taxonomy": "A script classifies every wrong answer from the saved prompts, queries and results, and question-level overrides record gold that is broken on this release. The categories are (a) the needed predicate or class was missing from every prompt, (b) wrong or unlinked resource, (c) clarification policy, (d) wrong query shape or reasoning, including a refusal when the needed terms were in context, (e) a right answer that the scorer marks wrong, (f) gold that is wrong or broken on this release and (g) provider error or truncation.",
+  "officialQaldScore": false
+ },
+ "budget": {
+  "capNanodollars": 45000000000,
+  "ledger": "fresh ledger for this campaign, carryover fresh-authorization-20261031 of 0",
+  "settledNanodollars": 39220741700,
+  "unresolvedNanodollars": 0,
+  "remainingNanodollars": 5779258300,
+  "ledgerReservedRequests": 1965,
+  "interruptedNanodollars": {
+   "sonnet-qald-r1": 5339026000,
+   "opus-qald-r1": 3401060000
+  },
+  "interruptions": "The kernel ran out of memory on generated queries at about 22:49Z, 00:47Z and 01:42Z and stopped the session that held the runner. Each interrupted attempt is kept, its spend counted, and the run restarted in a fresh directory on the same ledger. The last Opus blocks ran in a scope capped at 12 GB.",
+  "skipped": []
+ },
+ "memoryFailures": [
+  {
+   "model": "claude-sonnet-5-5",
+   "question": "qald9p-152",
+   "query": "?cat skos:broader* ?c with both ends unbound",
+   "rssGB": 28.1,
+   "effect": "interrupted the first Sonnet attempt; the rerun answered the question with another query"
+  },
+  {
+   "model": "claude-opus-5-5",
+   "question": "qald9p-196",
+   "query": "(dbo:wikiPageRedirects|dbo:wikiPageDisambiguates)* from two bound seeds",
+   "rssGB": 28.9,
+   "effect": "killed twice; counted as a failed answer"
+  },
+  {
+   "model": "claude-opus-5-5",
+   "question": "qald9p-179",
+   "query": "skos:broader?/skos:broader? from an unbound category",
+   "rssGB": 12.5,
+   "effect": "reached the 12 GB scope cap; counted as a failed answer"
+  }
+ ],
+ "askQueryMemoryDefaults": {
+  "queryMemoryMb": 2048,
+  "queryTimeoutSecs": 60,
+  "enforcedOnPropertyPaths": false
+ },
+ "split": {
+  "seed": "ask-eval-baseline-split-v1",
+  "rule": "sort QALD ids by SHA256 of seed:id; first 72 train, remaining 35 validation; all db25 ids test",
+  "train": [
+   "qald9p-101",
+   "qald9p-104",
+   "qald9p-110",
+   "qald9p-120",
+   "qald9p-122",
+   "qald9p-128",
+   "qald9p-13",
+   "qald9p-131",
+   "qald9p-134",
+   "qald9p-135",
+   "qald9p-136",
+   "qald9p-137",
+   "qald9p-138",
+   "qald9p-139",
+   "qald9p-140",
+   "qald9p-141",
+   "qald9p-143",
+   "qald9p-145",
+   "qald9p-148",
+   "qald9p-150",
+   "qald9p-152",
+   "qald9p-154",
+   "qald9p-155",
+   "qald9p-156",
+   "qald9p-157",
+   "qald9p-158",
+   "qald9p-163",
+   "qald9p-164",
+   "qald9p-168",
+   "qald9p-169",
+   "qald9p-171",
+   "qald9p-174",
+   "qald9p-176",
+   "qald9p-177",
+   "qald9p-178",
+   "qald9p-179",
+   "qald9p-182",
+   "qald9p-183",
+   "qald9p-188",
+   "qald9p-192",
+   "qald9p-197",
+   "qald9p-20",
+   "qald9p-203",
+   "qald9p-209",
+   "qald9p-212",
+   "qald9p-213",
+   "qald9p-214",
+   "qald9p-22",
+   "qald9p-27",
+   "qald9p-29",
+   "qald9p-32",
+   "qald9p-37",
+   "qald9p-4",
+   "qald9p-40",
+   "qald9p-43",
+   "qald9p-45",
+   "qald9p-51",
+   "qald9p-56",
+   "qald9p-6",
+   "qald9p-60",
+   "qald9p-62",
+   "qald9p-63",
+   "qald9p-66",
+   "qald9p-73",
+   "qald9p-78",
+   "qald9p-82",
+   "qald9p-86",
+   "qald9p-87",
+   "qald9p-92",
+   "qald9p-95",
+   "qald9p-98",
+   "qald9p-99"
+  ],
+  "validation": [
+   "qald9p-102",
+   "qald9p-103",
+   "qald9p-105",
+   "qald9p-111",
+   "qald9p-113",
+   "qald9p-114",
+   "qald9p-115",
+   "qald9p-117",
+   "qald9p-123",
+   "qald9p-124",
+   "qald9p-125",
+   "qald9p-14",
+   "qald9p-15",
+   "qald9p-160",
+   "qald9p-162",
+   "qald9p-175",
+   "qald9p-196",
+   "qald9p-198",
+   "qald9p-23",
+   "qald9p-24",
+   "qald9p-25",
+   "qald9p-26",
+   "qald9p-34",
+   "qald9p-42",
+   "qald9p-44",
+   "qald9p-49",
+   "qald9p-50",
+   "qald9p-52",
+   "qald9p-64",
+   "qald9p-68",
+   "qald9p-7",
+   "qald9p-79",
+   "qald9p-83",
+   "qald9p-84",
+   "qald9p-88"
+  ],
+  "test": [
+   "db25-1",
+   "db25-2",
+   "db25-3",
+   "db25-4",
+   "db25-5",
+   "db25-6",
+   "db25-7",
+   "db25-8",
+   "db25-9",
+   "db25-10",
+   "db25-11",
+   "db25-12",
+   "db25-13",
+   "db25-14",
+   "db25-15",
+   "db25-16",
+   "db25-18",
+   "db25-25",
+   "db25-26",
+   "db25-27",
+   "db25-28",
+   "db25-29",
+   "db25-30",
+   "db25-31",
+   "db25-32",
+   "db25-33",
+   "db25-37",
+   "db25-38",
+   "db25-41",
+   "db25-42",
+   "db25-43",
+   "db25-44",
+   "db25-45",
+   "db25-49",
+   "db25-50",
+   "db25-51",
+   "db25-52",
+   "db25-53",
+   "db25-54",
+   "db25-55",
+   "db25-56",
+   "db25-57",
+   "db25-58",
+   "db25-60",
+   "db25-61",
+   "db25-62",
+   "db25-65",
+   "db25-66",
+   "db25-67",
+   "db25-68",
+   "db25-70",
+   "db25-71",
+   "db25-72",
+   "db25-74",
+   "db25-75",
+   "db25-77",
+   "db25-78",
+   "db25-79",
+   "db25-80",
+   "db25-82",
+   "db25-85",
+   "db25-87",
+   "db25-88",
+   "db25-89",
+   "db25-90",
+   "db25-91",
+   "db25-92",
+   "db25-93",
+   "db25-94",
+   "db25-95",
+   "db25-96",
+   "db25-98",
+   "db25-99",
+   "db25-100"
+  ]
+ },
+ "lenient": {
+  "haiku-db25-r1": {
+   "strict": 19,
+   "strictEqualWidth": 15,
+   "lenient": 22,
+   "lenientAdds": [
+    "db25-4",
+    "db25-5",
+    "db25-65"
+   ],
+   "questions": 74,
+   "brokenGold": 1,
+   "cleanDenominator": 73,
+   "wrongButEveryGoldRowPresent": 2
+  },
+  "haiku-qald-r1": {
+   "strict": 28,
+   "strictEqualWidth": 25,
+   "lenient": 29,
+   "lenientAdds": [
+    "qald9p-179"
+   ],
+   "questions": 107,
+   "brokenGold": 8,
+   "cleanDenominator": 99,
+   "wrongButEveryGoldRowPresent": 7
+  },
+  "haiku-qald-r2": {
+   "strict": 29,
+   "strictEqualWidth": 25,
+   "lenient": 29,
+   "lenientAdds": [],
+   "questions": 107,
+   "brokenGold": 8,
+   "cleanDenominator": 99,
+   "wrongButEveryGoldRowPresent": 5
+  },
+  "haiku-qald-r3": {
+   "strict": 27,
+   "strictEqualWidth": 23,
+   "lenient": 27,
+   "lenientAdds": [],
+   "questions": 107,
+   "brokenGold": 8,
+   "cleanDenominator": 99,
+   "wrongButEveryGoldRowPresent": 5
+  },
+  "opus-db25-r1": {
+   "strict": 33,
+   "strictEqualWidth": 13,
+   "lenient": 35,
+   "lenientAdds": [
+    "db25-4",
+    "db25-65"
+   ],
+   "questions": 74,
+   "brokenGold": 1,
+   "cleanDenominator": 73,
+   "wrongButEveryGoldRowPresent": 13
+  },
+  "opus-qald-r1": {
+   "strict": 41,
+   "strictEqualWidth": 13,
+   "lenient": 42,
+   "lenientAdds": [
+    "qald9p-49"
+   ],
+   "questions": 107,
+   "brokenGold": 8,
+   "cleanDenominator": 99,
+   "wrongButEveryGoldRowPresent": 21
+  },
+  "sonnet-db25-r1": {
+   "strict": 32,
+   "strictEqualWidth": 15,
+   "lenient": 35,
+   "lenientAdds": [
+    "db25-4",
+    "db25-5",
+    "db25-65"
+   ],
+   "questions": 74,
+   "brokenGold": 1,
+   "cleanDenominator": 73,
+   "wrongButEveryGoldRowPresent": 8
+  },
+  "sonnet-qald-r1": {
+   "strict": 32,
+   "strictEqualWidth": 14,
+   "lenient": 32,
+   "lenientAdds": [],
+   "questions": 107,
+   "brokenGold": 8,
+   "cleanDenominator": 99,
+   "wrongButEveryGoldRowPresent": 12
+  },
+  "sonnet-qald-r2": {
+   "strict": 34,
+   "strictEqualWidth": 11,
+   "lenient": 34,
+   "lenientAdds": [],
+   "questions": 107,
+   "brokenGold": 8,
+   "cleanDenominator": 99,
+   "wrongButEveryGoldRowPresent": 10
+  }
+ },
+ "contextUse": {
+  "haiku-db25": {
+   "cases": 74,
+   "schemaMissing": 34,
+   "schemaMissingCorrect": 0,
+   "resourceMissing": 23,
+   "resourceMissingCorrect": 1,
+   "bothPresent": 28,
+   "bothPresentCorrect": 18
+  },
+  "haiku-qald": {
+   "cases": 321,
+   "schemaMissing": 198,
+   "schemaMissingCorrect": 17,
+   "resourceMissing": 141,
+   "resourceMissingCorrect": 11,
+   "bothPresent": 84,
+   "bothPresentCorrect": 59
+  },
+  "opus-db25": {
+   "cases": 74,
+   "schemaMissing": 34,
+   "schemaMissingCorrect": 12,
+   "resourceMissing": 23,
+   "resourceMissingCorrect": 9,
+   "bothPresent": 28,
+   "bothPresentCorrect": 15
+  },
+  "opus-qald": {
+   "cases": 107,
+   "schemaMissing": 66,
+   "schemaMissingCorrect": 19,
+   "resourceMissing": 47,
+   "resourceMissingCorrect": 9,
+   "bothPresent": 28,
+   "bothPresentCorrect": 18
+  },
+  "sonnet-db25": {
+   "cases": 74,
+   "schemaMissing": 34,
+   "schemaMissingCorrect": 9,
+   "resourceMissing": 23,
+   "resourceMissingCorrect": 8,
+   "bothPresent": 28,
+   "bothPresentCorrect": 16
+  },
+  "sonnet-qald": {
+   "cases": 214,
+   "schemaMissing": 132,
+   "schemaMissingCorrect": 24,
+   "resourceMissing": 94,
+   "resourceMissingCorrect": 12,
+   "bothPresent": 56,
+   "bothPresentCorrect": 36
+  }
+ },
+ "projectionAudit": {
+  "answersWithExtraColumns": 334,
+  "passedByProjection": 121,
+  "passedExtraColumnHistogram": {
+   "1": 85,
+   "2": 28,
+   "3": 8
+  },
+  "passedWithRowInflation": 15,
+  "passedAllExtraLabelLike": 39,
+  "passedMatchedNotFirstColumn": 43,
+  "passedSelectStar": 0,
+  "byPhase": {
+   "haiku-db25-r1": 4,
+   "haiku-qald-r1": 3,
+   "haiku-qald-r2": 4,
+   "haiku-qald-r3": 4,
+   "opus-db25-r1": 20,
+   "opus-qald-r1": 28,
+   "sonnet-db25-r1": 17,
+   "sonnet-qald-r1": 18,
+   "sonnet-qald-r2": 23
+  },
+  "nonLabelPassed": [
+   {
+    "phase": "haiku-db25-r1",
+    "id": "db25-18",
+    "extraVars": [
+     "population"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-db25-r1",
+    "id": "db25-26",
+    "extraVars": [
+     "battle",
+     "name"
+    ],
+    "gotRows": 2,
+    "projectedRows": 2,
+    "goldRows": 2
+   },
+   {
+    "phase": "haiku-db25-r1",
+    "id": "db25-38",
+    "extraVars": [
+     "movies"
+    ],
+    "gotRows": 10,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "haiku-db25-r1",
+    "id": "db25-60",
+    "extraVars": [
+     "city"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-qald-r1",
+    "id": "qald9p-49",
+    "extraVars": [
+     "airlines"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-qald-r1",
+    "id": "qald9p-87",
+    "extraVars": [
+     "pages"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-qald-r2",
+    "id": "qald9p-49",
+    "extraVars": [
+     "airlines"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-qald-r2",
+    "id": "qald9p-162",
+    "extraVars": [
+     "lake",
+     "p"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-qald-r2",
+    "id": "qald9p-40",
+    "extraVars": [
+     "subject",
+     "predicate"
+    ],
+    "gotRows": 2,
+    "projectedRows": 2,
+    "goldRows": 2
+   },
+   {
+    "phase": "haiku-qald-r2",
+    "id": "qald9p-87",
+    "extraVars": [
+     "pages"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-qald-r3",
+    "id": "qald9p-49",
+    "extraVars": [
+     "airlines"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "haiku-qald-r3",
+    "id": "qald9p-138",
+    "extraVars": [
+     "country"
+    ],
+    "gotRows": 65,
+    "projectedRows": 65,
+    "goldRows": 65
+   },
+   {
+    "phase": "haiku-qald-r3",
+    "id": "qald9p-87",
+    "extraVars": [
+     "pages"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-2",
+    "extraVars": [
+     "label",
+     "population"
+    ],
+    "gotRows": 10,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-9",
+    "extraVars": [
+     "language",
+     "label"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-12",
+    "extraVars": [
+     "aircraft",
+     "rel",
+     "manufacturerLabel"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-18",
+    "extraVars": [
+     "label",
+     "population"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-37",
+    "extraVars": [
+     "band",
+     "p"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-38",
+    "extraVars": [
+     "name",
+     "films"
+    ],
+    "gotRows": 10,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-60",
+    "extraVars": [
+     "city"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-67",
+    "extraVars": [
+     "book",
+     "authorName"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-80",
+    "extraVars": [
+     "cityCount"
+    ],
+    "gotRows": 10,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-90",
+    "extraVars": [
+     "predecessor"
+    ],
+    "gotRows": 4,
+    "projectedRows": 4,
+    "goldRows": 4
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-91",
+    "extraVars": [
+     "cinematographer"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-92",
+    "extraVars": [
+     "country"
+    ],
+    "gotRows": 2,
+    "projectedRows": 2,
+    "goldRows": 2
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-86",
+    "extraVars": [
+     "label",
+     "elevation"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-73",
+    "extraVars": [
+     "events"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-66",
+    "extraVars": [
+     "birthDate"
+    ],
+    "gotRows": 4,
+    "projectedRows": 4,
+    "goldRows": 4
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-176",
+    "extraVars": [
+     "painting"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-62",
+    "extraVars": [
+     "prop",
+     "label"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-160",
+    "extraVars": [
+     "work",
+     "p",
+     "authorLabel"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-25",
+    "extraVars": [
+     "label",
+     "length"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-124",
+    "extraVars": [
+     "p"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-50",
+    "extraVars": [
+     "elevation"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-102",
+    "extraVars": [
+     "work",
+     "rel",
+     "creator"
+    ],
+    "gotRows": 6,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-145",
+    "extraVars": [
+     "company",
+     "p",
+     "ownerLabel"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-162",
+    "extraVars": [
+     "avgDepth",
+     "infoboxMaxDepth",
+     "infoboxDepth"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-60",
+    "extraVars": [
+     "region",
+     "link"
+    ],
+    "gotRows": 6,
+    "projectedRows": 2,
+    "goldRows": 2
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-169",
+    "extraVars": [
+     "established"
+    ],
+    "gotRows": 12,
+    "projectedRows": 11,
+    "goldRows": 11
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-174",
+    "extraVars": [
+     "work",
+     "authorLabel"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-115",
+    "extraVars": [
+     "lakes"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-138",
+    "extraVars": [
+     "country",
+     "countryLabel",
+     "capitalLabel"
+    ],
+    "gotRows": 65,
+    "projectedRows": 65,
+    "goldRows": 65
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-87",
+    "extraVars": [
+     "label",
+     "pages"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-2",
+    "extraVars": [
+     "label",
+     "population"
+    ],
+    "gotRows": 10,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-18",
+    "extraVars": [
+     "label",
+     "pop"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-32",
+    "extraVars": [
+     "team"
+    ],
+    "gotRows": 26,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-37",
+    "extraVars": [
+     "band",
+     "p"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-38",
+    "extraVars": [
+     "name",
+     "films"
+    ],
+    "gotRows": 10,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-60",
+    "extraVars": [
+     "city"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-67",
+    "extraVars": [
+     "book"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-80",
+    "extraVars": [
+     "label",
+     "cityCount"
+    ],
+    "gotRows": 10,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-88",
+    "extraVars": [
+     "author"
+    ],
+    "gotRows": 11,
+    "projectedRows": 11,
+    "goldRows": 11
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-92",
+    "extraVars": [
+     "country"
+    ],
+    "gotRows": 2,
+    "projectedRows": 2,
+    "goldRows": 2
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-98",
+    "extraVars": [
+     "s",
+     "p"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-86",
+    "extraVars": [
+     "elevation"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-66",
+    "extraVars": [
+     "date"
+    ],
+    "gotRows": 4,
+    "projectedRows": 4,
+    "goldRows": 4
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-49",
+    "extraVars": [
+     "airlines"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-62",
+    "extraVars": [
+     "s",
+     "p"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-124",
+    "extraVars": [
+     "s",
+     "p"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-102",
+    "extraVars": [
+     "creator"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-120",
+    "extraVars": [
+     "daughter"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-171",
+    "extraVars": [
+     "abstract"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-26",
+    "extraVars": [
+     "atmosphere"
+    ],
+    "gotRows": 8,
+    "projectedRows": 8,
+    "goldRows": 8
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-169",
+    "extraVars": [
+     "year"
+    ],
+    "gotRows": 12,
+    "projectedRows": 11,
+    "goldRows": 11
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-174",
+    "extraVars": [
+     "work"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-138",
+    "extraVars": [
+     "country"
+    ],
+    "gotRows": 65,
+    "projectedRows": 65,
+    "goldRows": 65
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-87",
+    "extraVars": [
+     "label",
+     "pages"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-86",
+    "extraVars": [
+     "elev"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-66",
+    "extraVars": [
+     "date"
+    ],
+    "gotRows": 4,
+    "projectedRows": 4,
+    "goldRows": 4
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-49",
+    "extraVars": [
+     "airlines"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-176",
+    "extraVars": [
+     "painting",
+     "p",
+     "label"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-62",
+    "extraVars": [
+     "s",
+     "p",
+     "label"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-160",
+    "extraVars": [
+     "work",
+     "authorLabel"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-155",
+    "extraVars": [
+     "city",
+     "p"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-124",
+    "extraVars": [
+     "p"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-102",
+    "extraVars": [
+     "work",
+     "creator"
+    ],
+    "gotRows": 3,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-162",
+    "extraVars": [
+     "p"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-120",
+    "extraVars": [
+     "child"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-26",
+    "extraVars": [
+     "atmosphere"
+    ],
+    "gotRows": 8,
+    "projectedRows": 8,
+    "goldRows": 8
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-169",
+    "extraVars": [
+     "year"
+    ],
+    "gotRows": 12,
+    "projectedRows": 11,
+    "goldRows": 11
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-138",
+    "extraVars": [
+     "country"
+    ],
+    "gotRows": 65,
+    "projectedRows": 65,
+    "goldRows": 65
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-87",
+    "extraVars": [
+     "label",
+     "pages"
+    ],
+    "gotRows": 1,
+    "projectedRows": 1,
+    "goldRows": 1
+   }
+  ],
+  "inflatedPassed": [
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-9",
+    "extraVars": [
+     "language",
+     "label"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-12",
+    "extraVars": [
+     "aircraft",
+     "rel",
+     "manufacturerLabel"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-db25-r1",
+    "id": "db25-67",
+    "extraVars": [
+     "book",
+     "authorName"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-62",
+    "extraVars": [
+     "prop",
+     "label"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-124",
+    "extraVars": [
+     "p"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-102",
+    "extraVars": [
+     "work",
+     "rel",
+     "creator"
+    ],
+    "gotRows": 6,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-60",
+    "extraVars": [
+     "region",
+     "link"
+    ],
+    "gotRows": 6,
+    "projectedRows": 2,
+    "goldRows": 2
+   },
+   {
+    "phase": "opus-qald-r1",
+    "id": "qald9p-169",
+    "extraVars": [
+     "established"
+    ],
+    "gotRows": 12,
+    "projectedRows": 11,
+    "goldRows": 11
+   },
+   {
+    "phase": "sonnet-db25-r1",
+    "id": "db25-32",
+    "extraVars": [
+     "team"
+    ],
+    "gotRows": 26,
+    "projectedRows": 10,
+    "goldRows": 10
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-62",
+    "extraVars": [
+     "s",
+     "p"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r1",
+    "id": "qald9p-169",
+    "extraVars": [
+     "year"
+    ],
+    "gotRows": 12,
+    "projectedRows": 11,
+    "goldRows": 11
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-176",
+    "extraVars": [
+     "painting",
+     "p",
+     "label"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-124",
+    "extraVars": [
+     "p"
+    ],
+    "gotRows": 2,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-102",
+    "extraVars": [
+     "work",
+     "creator"
+    ],
+    "gotRows": 3,
+    "projectedRows": 1,
+    "goldRows": 1
+   },
+   {
+    "phase": "sonnet-qald-r2",
+    "id": "qald9p-169",
+    "extraVars": [
+     "year"
+    ],
+    "gotRows": 12,
+    "projectedRows": 11,
+    "goldRows": 11
+   }
+  ],
+  "note": "Synthetic answers with competing guesses in separate columns, eight columns or repeated rows all pass the projected policy. A guard that caps extra columns at three and reports passes whose extra column holds predicates or whose projection drops rows would flag 26 measured passes."
+ },
+ "spotChecks": [
+  "qald9p-125",
+  "qald9p-82",
+  "qald9p-78",
+  "qald9p-122",
+  "qald9p-37",
+  "qald9p-60",
+  "qald9p-164",
+  "qald9p-26",
+  "qald9p-95",
+  "db25-100",
+  "db25-4",
+  "db25-5",
+  "db25-65",
+  "qald9p-179",
+  "qald9p-49",
+  "qald9p-86",
+  "qald9p-136",
+  "qald9p-92",
+  "qald9p-192",
+  "db25-12",
+  "db25-30",
+  "qald9p-198"
+ ],
+ "opusParts": {
+  "qald": "22 answers from the interrupted attempt, 42 from block a2 and 41 from block b; qald9p-196 and qald9p-179 are failures from memory exhaustion",
+  "db25": "three blocks of 30, 25 and 19 questions in set order"
+ },
+ "source": {
+  "commit": "7b3b6df5124a02f2e1cd0a0efdb252624b642bbe",
+  "binarySha256": "9bce795c06d756509fe8230fd919e431718ab1891e97e8692297abe825dcccf7",
+  "buildCommand": "mbx build --release --locked -p sparkles-server --bin sparkles",
+  "mbx": "1.28.0",
+  "features": [
+   "auth",
+   "backup",
+   "backup-encryption",
+   "default",
+   "embed-local",
+   "fmt",
+   "geo",
+   "geo-epsg",
+   "graphql",
+   "mapping-parquet",
+   "mapping-sqlite",
+   "mcp",
+   "memory",
+   "mimalloc",
+   "office",
+   "otel",
+   "pdf",
+   "pdf-ocr",
+   "reasoning",
+   "shacl",
+   "shex",
+   "text",
+   "text-cjk-dict",
+   "tls"
+  ],
+  "artifactProfile": {
+   "opt_level": "3",
+   "debuginfo": 1,
+   "debug_assertions": false,
+   "overflow_checks": false,
+   "test": false
+  },
+  "compilerComments": "\nString dump of section '.comment':\n  [     1]  GCC: (GNU) 16.2.0\n  [    13]  clang version 21.1.8\n  [    28]  rustc version 1.99.1 (58cf8f9c3 2026-10-13)\n  [    54]  Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145)\n\n",
+  "harnessSha256": {
+   "scripts/eval-ask": "0960a8ba0ded1b389b0e3a359caeaa2db0cc621fcde86bba6dbc309143b2bbe1",
+   "scripts/eval-ask-anthropic": "43238c2a75098f950ef1f14aa78a3b9967a1e2ebfa15416ec78a8ca302c71f86",
+   "testsuite/ask/eval_support/proxy.py": "48c1d71187190c9415b2c03565b99a82ae2230411fdfe202c7a9b0243ad25bea",
+   "testsuite/ask/eval_support/evaluator.py": "ae483f660ed11ad2f4d92ebcbcef98e02e3dccb62dbe9dde3fcacbe480ea3c74",
+   "scripts/text2sparql-convert": "274a8d7cb4db4f5b83a83445797265ccd582e1d9d3b2f7ef8f5df11e14f10791"
+  }
+ },
+ "datasets": {
+  "qald9plus": {
+   "setSha256": "330687b410db3cbe4fdb1f7b69a7a7b832ab7b4212a5b9db2a952b8a63f78a45",
+   "source": {
+    "repository": "KGQA/QALD_9_plus",
+    "commit": "b9fb0380902e6935efc9505170bc3652e8c242c1",
+    "file": "data/qald_9_plus_test_dbpedia.json",
+    "sha256": "7831fd113d9c5ad66c429bfb39b079fdb101578e57c095777a468f206201787f",
+    "license": "CC BY 4.0"
+   },
+   "questions": 107,
+   "goldMatchesPreviousRun": 107
+  },
+  "db25": {
+   "setSha256": "4bfd65b30e0dfa74ee05e7f7f0e0031c829a40789ca938a1e5f607bb74c991fa",
+   "source": {
+    "questions": {
+     "repository": "AKSW/text2sparql.aksw.org",
+     "commit": "9254e7868bc8a90eca445e7486afd27c653af6c9",
+     "file": "docs/benchmark/questions_db25.yaml",
+     "sha256": "41c447c361f5315b066c157f1dd9801e60ce6029cb02f56af9937fae9cfcebb6"
+    },
+    "answers": {
+     "repository": "AKSW/text2sparql.aksw.org",
+     "commit": "9254e7868bc8a90eca445e7486afd27c653af6c9",
+     "file": "docs/benchmark/db25_true_result_set.json",
+     "sha256": "e5001e581283b43dbe16c0710bb718fb98e08845c67e2ddef2e8610533175302"
+    }
+   },
+   "questions": 74,
+   "sourceQuestions": 100,
+   "dropped": {
+    "empty": 25,
+    "failed": 0,
+    "unsupported": 1,
+    "noText": 0
+   },
+   "goldRecomputedWithThisBinary": true,
+   "goldMatchesPreviousRun": 74
+  },
+  "database": {
+   "release": "2022.12.01",
+   "loadManifestSha256": "4b9494691e15485a8f83af356c3286c54e8adaa945d70352a27a6e95b3e4b569",
+   "metadata": {
+    "CURRENT": "a5645ccadf57d245a8e69e9e4129e606be98dbd0426f4632fa203746210c89ce",
+    "dataset.json": "88dad95997d2c996ca58901d6585f0762be1f6a8aaad533a1f8c5385498dcff2"
+   }
+  }
+ },
+ "runs": {
+  "haiku-db25-r1": {
+   "model": "haiku",
+   "set": "db25",
+   "rep": "r1",
+   "questions": 74,
+   "correctProjected": 19,
+   "correctEqualWidth": 15,
+   "correctByProjection": 4,
+   "clarificationsOffered": 58,
+   "clarificationsAnswered": 58,
+   "outcomes": {
+    "answered": 41,
+    "empty": 12,
+    "failed": 2,
+    "unanswerable": 19
+   },
+   "evalFailures": {},
+   "inputTokens": 1649749,
+   "outputTokens": 107983,
+   "freshCostNanodollars": 218991300,
+   "requests": 149,
+   "requestIds": [
+    602,
+    751
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 8.35880669602193,
+    "p95": 24.107041502022184
+   },
+   "reportSha256": "a49ca10bb24750ffcf4b74e78a703a2a370fd76c8c59cd8b240c920111ba6c5c",
+   "caseFilesDigest": "15042ac6d79916ff9886fce7b92351c45841d9c6d6eb53659b98467dc8bbff32",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "db25-1",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-2",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-3",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-4",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-5",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-6",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-7",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-8",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-9",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-10",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-11",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-12",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-13",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-14",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-15",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-16",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-18",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-25",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-26",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-27",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-28",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-30",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-31",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-32",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-33",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-37",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-38",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-41",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-42",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-43",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-45",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-49",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-50",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-51",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-52",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-53",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-54",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-55",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-56",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-57",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-58",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-60",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-61",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-62",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-65",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-66",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-67",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-68",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-70",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-71",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-72",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-74",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-75",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-77",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-78",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-79",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-80",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-82",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-85",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-87",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-88",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-89",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-90",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-91",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-92",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-93",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-94",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-95",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-96",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-98",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-99",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-100",
+      0,
+      0,
+      "f"
+     ]
+    ]
+   }
+  },
+  "haiku-qald-r1": {
+   "model": "haiku",
+   "set": "qald",
+   "rep": "r1",
+   "questions": 107,
+   "correctProjected": 28,
+   "correctEqualWidth": 25,
+   "correctByProjection": 3,
+   "clarificationsOffered": 84,
+   "clarificationsAnswered": 84,
+   "outcomes": {
+    "answered": 52,
+    "empty": 11,
+    "failed": 3,
+    "unanswerable": 41
+   },
+   "evalFailures": {},
+   "inputTokens": 2358275,
+   "outputTokens": 139032,
+   "freshCostNanodollars": 305368400,
+   "requests": 203,
+   "requestIds": [
+    1,
+    204
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 11.830606377974618,
+    "p95": 37.10393220803235
+   },
+   "reportSha256": "03e297262448ada51e07a3484537a4341af7d61667c2f6ebea443a1f4be27bea",
+   "caseFilesDigest": "db173b854aa5c923d3a1df42e4b251108d7a728d6a91c498062126be56c1b872",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "qald9p-99",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-98",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-86",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-84",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-73",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-66",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-64",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-6",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-56",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-49",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-42",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-4",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-37",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-32",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-23",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-68",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-22",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-214",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-203",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-197",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-196",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-188",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-176",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-62",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-168",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-160",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-158",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-157",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-155",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-150",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-25",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-143",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-140",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-139",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-137",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-136",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-134",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-128",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-125",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-124",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-123",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-122",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-111",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-117",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-113",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-104",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-178",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-183",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-7",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-135",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-50",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-83",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-213",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-209",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-105",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-52",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-102",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-34",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-145",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-154",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-198",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-162",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-212",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-40",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-79",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-141",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-163",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-51",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-131",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-120",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-164",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-88",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-63",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-27",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-156",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-24",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-103",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-15",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-45",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-82",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-171",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-182",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-13",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-114",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-92",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-175",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-26",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-60",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-110",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-20",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-169",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-192",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-78",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-174",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-152",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-95",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-115",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-138",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-177",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-101",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-14",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-87",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-148",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-43",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-179",
+      0,
+      0,
+      "e"
+     ]
+    ]
+   }
+  },
+  "haiku-qald-r2": {
+   "model": "haiku",
+   "set": "qald",
+   "rep": "r2",
+   "questions": 107,
+   "correctProjected": 29,
+   "correctEqualWidth": 25,
+   "correctByProjection": 4,
+   "clarificationsOffered": 84,
+   "clarificationsAnswered": 84,
+   "outcomes": {
+    "answered": 49,
+    "empty": 12,
+    "failed": 4,
+    "unanswerable": 42
+   },
+   "evalFailures": {},
+   "inputTokens": 2425466,
+   "outputTokens": 142178,
+   "freshCostNanodollars": 313660500,
+   "requests": 205,
+   "requestIds": [
+    204,
+    409
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 8.46101191994967,
+    "p95": 33.27794148400426
+   },
+   "reportSha256": "87077905c366d667e401809a1e96efd65aa1d72e3e6d4314c417dd5f67dabb51",
+   "caseFilesDigest": "3eddb5f0a0c258528440baf073d3277480ab68a7aa62adbf75b0bfe3712943ab",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "qald9p-99",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-98",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-86",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-84",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-73",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-66",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-64",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-6",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-56",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-49",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-42",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-4",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-37",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-32",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-23",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-68",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-22",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-214",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-203",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-197",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-196",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-188",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-176",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-62",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-168",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-160",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-158",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-157",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-155",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-150",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-25",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-143",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-140",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-139",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-137",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-136",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-134",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-128",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-125",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-124",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-123",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-122",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-111",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-117",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-113",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-104",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-178",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-183",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-7",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-135",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-50",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-83",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-213",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-209",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-105",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-52",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-102",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-34",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-145",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-154",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-198",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-162",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-212",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-40",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-79",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-141",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-163",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-51",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-131",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-120",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-164",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-88",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-63",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-27",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-156",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-24",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-103",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-15",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-45",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-82",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-171",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-182",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-13",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-114",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-92",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-175",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-26",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-60",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-110",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-20",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-169",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-192",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-78",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-174",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-152",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-95",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-115",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-138",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-177",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-101",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-14",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-87",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-148",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-43",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-179",
+      0,
+      0,
+      "b"
+     ]
+    ]
+   }
+  },
+  "haiku-qald-r3": {
+   "model": "haiku",
+   "set": "qald",
+   "rep": "r3",
+   "questions": 107,
+   "correctProjected": 27,
+   "correctEqualWidth": 23,
+   "correctByProjection": 4,
+   "clarificationsOffered": 84,
+   "clarificationsAnswered": 84,
+   "outcomes": {
+    "answered": 42,
+    "empty": 16,
+    "failed": 2,
+    "unanswerable": 47
+   },
+   "evalFailures": {
+    "invalid_output": 1
+   },
+   "inputTokens": 2346041,
+   "outputTokens": 134685,
+   "freshCostNanodollars": 301971500,
+   "requests": 193,
+   "requestIds": [
+    409,
+    602
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 8.127613766991999,
+    "p95": 24.467093323997688
+   },
+   "reportSha256": "145cad13d08858a408878874eb992de59c1a2843d8a3d2a68900750f39211f53",
+   "caseFilesDigest": "e2ee21a9dd89e2a5e11be709a76d4556ce5429c662c40d71a6dd570642f36a30",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "qald9p-99",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-98",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-86",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-84",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-73",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-66",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-64",
+      0,
+      0,
+      "g"
+     ],
+     [
+      "qald9p-6",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-56",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-49",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-42",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-4",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-37",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-32",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-23",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-68",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-22",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-214",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-203",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-197",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-196",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-188",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-176",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-62",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-168",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-160",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-158",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-157",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-155",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-150",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-25",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-143",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-140",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-139",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-137",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-136",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-134",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-128",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-125",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-124",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-123",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-122",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-111",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-117",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-113",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-104",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-178",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-183",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-7",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-135",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-50",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-83",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-213",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-209",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-105",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-52",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-102",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-34",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-145",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-154",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-198",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-162",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-212",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-40",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-79",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-141",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-163",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-51",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-131",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-120",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-164",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-88",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-63",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-27",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-156",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-24",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-103",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-15",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-45",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-82",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-171",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-182",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-13",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-114",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-92",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-175",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-26",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-60",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-110",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-20",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-169",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-192",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-78",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-174",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-152",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-95",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-115",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-138",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-177",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-101",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-14",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-87",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-148",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-43",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-179",
+      0,
+      0,
+      "b"
+     ]
+    ]
+   }
+  },
+  "opus-db25-r1": {
+   "model": "opus",
+   "set": "db25",
+   "rep": "r1",
+   "questions": 74,
+   "correctProjected": 33,
+   "correctEqualWidth": 13,
+   "correctByProjection": 20,
+   "clarificationsOffered": 58,
+   "clarificationsAnswered": 58,
+   "outcomes": {
+    "answered": 67,
+    "empty": 4,
+    "unanswerable": 3
+   },
+   "evalFailures": {},
+   "inputTokens": 1378592,
+   "outputTokens": 67049,
+   "freshCostNanodollars": 6858336000,
+   "requests": 155,
+   "requestIds": [
+    1811,
+    1966
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 14.010290100006387,
+    "p95": 31.695902116945945
+   },
+   "reportSha256": "8f8b98f78365303bd393a57c3334e04d710deaab2846f016e0d23f755d36f299",
+   "caseFilesDigest": "1c45250e1abca0ed95278f06931d7bedfe17f6aa3fe9c262f61459eaded547ec",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "db25-1",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-2",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-3",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-4",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-5",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-6",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-7",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-8",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-9",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-10",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-11",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-12",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-13",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-14",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-15",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-16",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-18",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-25",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-26",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-27",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-28",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-29",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-30",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-31",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-32",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-33",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-37",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-38",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-41",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-42",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-43",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-45",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-49",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-50",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-51",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-52",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-53",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-54",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-55",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-56",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-57",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-58",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-60",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-61",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-62",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-65",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-66",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-67",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-68",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-70",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-71",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-72",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-74",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-75",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-77",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-78",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-79",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-80",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-82",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-85",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-87",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-88",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-89",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-90",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-91",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-92",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-93",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-94",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-95",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-96",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-98",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-99",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-100",
+      0,
+      0,
+      "f"
+     ]
+    ]
+   }
+  },
+  "opus-qald-r1": {
+   "model": "opus",
+   "set": "qald",
+   "rep": "r1",
+   "questions": 107,
+   "correctProjected": 41,
+   "correctEqualWidth": 13,
+   "correctByProjection": 28,
+   "clarificationsOffered": 84,
+   "clarificationsAnswered": 84,
+   "outcomes": {
+    "answered": 86,
+    "empty": 10,
+    "failed": 2,
+    "unanswerable": 9
+   },
+   "evalFailures": {
+    "oom_killed": 2
+   },
+   "inputTokens": 2142825,
+   "outputTokens": 102830,
+   "freshCostNanodollars": 11603272000,
+   "requests": 239,
+   "requestIds": [
+    1572,
+    1811
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 13.463132482022047,
+    "p95": 35.41770131199155
+   },
+   "reportSha256": "4e0ffdb6dd777faed65bb6e95a3750162780caf0e8aaa14eec8c534318887e3a",
+   "caseFilesDigest": "8088b54ee46d669db701e0ff15b0cf3c62a0cfa5b16ef21df06782ec7466859a",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "qald9p-99",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-98",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-86",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-84",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-73",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-66",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-64",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-6",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-56",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-49",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "qald9p-44",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-42",
+      0,
+      0,
+      "c"
+     ],
+     [
+      "qald9p-4",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-37",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-32",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-23",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-68",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-22",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-214",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-203",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-197",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-196",
+      0,
+      0,
+      "g"
+     ],
+     [
+      "qald9p-188",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-176",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-62",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-168",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-160",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-158",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-157",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-155",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-150",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-25",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-143",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-140",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-139",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-137",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-136",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-134",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-128",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-125",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-124",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-123",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-122",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-111",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-117",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-113",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-104",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-178",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-183",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-7",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-135",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-50",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-83",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-213",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-209",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-105",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-52",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-102",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-34",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-145",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-154",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-198",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-162",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-212",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-40",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-79",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-141",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-163",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-51",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-131",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-120",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-164",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-88",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-63",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-27",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-156",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-24",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-103",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-15",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-45",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-82",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-171",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-182",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-13",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-114",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-92",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-175",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-26",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-60",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-110",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-20",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-169",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-192",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-78",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-174",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-152",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-95",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-115",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-138",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-177",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-101",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-14",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-87",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-148",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-43",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-179",
+      0,
+      0,
+      "g"
+     ]
+    ]
+   }
+  },
+  "sonnet-db25-r1": {
+   "model": "sonnet",
+   "set": "db25",
+   "rep": "r1",
+   "questions": 74,
+   "correctProjected": 32,
+   "correctEqualWidth": 15,
+   "correctByProjection": 17,
+   "clarificationsOffered": 58,
+   "clarificationsAnswered": 58,
+   "outcomes": {
+    "answered": 59,
+    "empty": 5,
+    "unanswerable": 10
+   },
+   "evalFailures": {},
+   "inputTokens": 1487832,
+   "outputTokens": 37090,
+   "freshCostNanodollars": 3347062000,
+   "requests": 154,
+   "requestIds": [
+    1418,
+    1572
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 8.110007402021438,
+    "p95": 21.249128747032955
+   },
+   "reportSha256": "705b2ae7300fc80c8414d7c34052d5308e93d61d0763f39c10c952110fb477d7",
+   "caseFilesDigest": "af73df03dec21ac87dbca515a1e2b5463a4c15a6b231a0d6b4b5ee08d5da2d77",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "db25-1",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-2",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-3",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-4",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-5",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-6",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-7",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-8",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-9",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-10",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-11",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-12",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-13",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-14",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-15",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-16",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-18",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-25",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-26",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-27",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-28",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-30",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-31",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-32",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-33",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-37",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-38",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-41",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-42",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-43",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-45",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-49",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-50",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-51",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-52",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-53",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-54",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-55",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-56",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-57",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-58",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-60",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-61",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-62",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-65",
+      0,
+      0,
+      "e"
+     ],
+     [
+      "db25-66",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-67",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-68",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-70",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-71",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-72",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-74",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-75",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-77",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-78",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-79",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-80",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-82",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-85",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-87",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-88",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-89",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-90",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "db25-91",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-92",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-93",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-94",
+      1,
+      1,
+      null
+     ],
+     [
+      "db25-95",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "db25-96",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-98",
+      1,
+      0,
+      null
+     ],
+     [
+      "db25-99",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "db25-100",
+      0,
+      0,
+      "f"
+     ]
+    ]
+   }
+  },
+  "sonnet-qald-r1": {
+   "model": "sonnet",
+   "set": "qald",
+   "rep": "r1",
+   "questions": 107,
+   "correctProjected": 32,
+   "correctEqualWidth": 14,
+   "correctByProjection": 18,
+   "clarificationsOffered": 85,
+   "clarificationsAnswered": 85,
+   "outcomes": {
+    "answered": 71,
+    "empty": 18,
+    "failed": 1,
+    "unanswerable": 17
+   },
+   "evalFailures": {},
+   "inputTokens": 2390189,
+   "outputTokens": 60116,
+   "freshCostNanodollars": 5382036000,
+   "requests": 221,
+   "requestIds": [
+    968,
+    1189
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 8.031231363012921,
+    "p95": 17.278805398033
+   },
+   "reportSha256": "f114c492b2c6ecd692f0c89e94667bd942bfbf53df858365d8394e68757590b6",
+   "caseFilesDigest": "b3d2df1c4688e8d4cd3cbc5410334c84792c993fd8e0bbb1138197c035931903",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "qald9p-99",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-98",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-86",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-84",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-73",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-66",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-64",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-6",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-56",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-49",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-42",
+      0,
+      0,
+      "c"
+     ],
+     [
+      "qald9p-4",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-37",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-32",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-23",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-68",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-22",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-214",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-203",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-197",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-196",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-188",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-176",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-62",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-168",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-160",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-158",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-157",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-155",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-150",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-25",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-143",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-140",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-139",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-137",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-136",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-134",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-128",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-125",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-124",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-123",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-122",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-111",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-117",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-113",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-104",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-178",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-183",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-7",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-135",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-50",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-83",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-213",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-209",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-105",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-52",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-102",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-34",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-145",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-154",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-198",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-162",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-212",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-40",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-79",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-141",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-163",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-51",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-131",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-120",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-164",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-88",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-63",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-27",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-156",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-24",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-103",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-15",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-45",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-82",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-171",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-182",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-13",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-114",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-92",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-175",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-26",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-60",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-110",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-20",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-169",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-192",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-78",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-174",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-152",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-95",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-115",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-138",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-177",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-101",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-14",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-87",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-148",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-43",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-179",
+      0,
+      0,
+      "b"
+     ]
+    ]
+   }
+  },
+  "sonnet-qald-r2": {
+   "model": "sonnet",
+   "set": "qald",
+   "rep": "r2",
+   "questions": 107,
+   "correctProjected": 34,
+   "correctEqualWidth": 11,
+   "correctByProjection": 23,
+   "clarificationsOffered": 85,
+   "clarificationsAnswered": 85,
+   "outcomes": {
+    "answered": 74,
+    "empty": 20,
+    "failed": 1,
+    "unanswerable": 12
+   },
+   "evalFailures": {},
+   "inputTokens": 2458440,
+   "outputTokens": 63364,
+   "freshCostNanodollars": 5551018000,
+   "requests": 229,
+   "requestIds": [
+    1189,
+    1418
+   ],
+   "wallSecondsLoadedHostContextOnly": {
+    "p50": 7.848360539006535,
+    "p95": 20.356881958025042
+   },
+   "reportSha256": "e441dae37adef1b2799c9e4c6cdb25617f438a27e067d4a7886f9075e58b0510",
+   "caseFilesDigest": "a64314c689d95248ac338c8fe574048117c93dfe9b2224689822418a4d620c74",
+   "cases": {
+    "columns": [
+     "id",
+     "correctProjected",
+     "correctEqualWidth",
+     "failureCategory"
+    ],
+    "rows": [
+     [
+      "qald9p-99",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-98",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-86",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-84",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-73",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-66",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-64",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-6",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-56",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-49",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-44",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-42",
+      0,
+      0,
+      "c"
+     ],
+     [
+      "qald9p-4",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-37",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-32",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-29",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-23",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-68",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-22",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-214",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-203",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-197",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-196",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-188",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-176",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-62",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-168",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-160",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-158",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-157",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-155",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-150",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-25",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-143",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-140",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-139",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-137",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-136",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-134",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-128",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-125",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-124",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-123",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-122",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-111",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-117",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-113",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-104",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-178",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-183",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-7",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-135",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-50",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-83",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-213",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-209",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-105",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-52",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-102",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-34",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-145",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-154",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-198",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-162",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-212",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-40",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-79",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-141",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-163",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-51",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-131",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-120",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-164",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-88",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-63",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-27",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-156",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-24",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-103",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-15",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-45",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-82",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-171",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-182",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-13",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-114",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-92",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-175",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-26",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-60",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-110",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-20",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-169",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-192",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-78",
+      0,
+      0,
+      "f"
+     ],
+     [
+      "qald9p-174",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-152",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-95",
+      0,
+      0,
+      "b"
+     ],
+     [
+      "qald9p-115",
+      1,
+      1,
+      null
+     ],
+     [
+      "qald9p-138",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-177",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-101",
+      0,
+      0,
+      "d"
+     ],
+     [
+      "qald9p-14",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-87",
+      1,
+      0,
+      null
+     ],
+     [
+      "qald9p-148",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-43",
+      0,
+      0,
+      "a"
+     ],
+     [
+      "qald9p-179",
+      0,
+      0,
+      "b"
+     ]
+    ]
+   }
+  }
+ },
+ "groups": {
+  "haiku-db25": {
+   "correct": {
+    "values": [
+     19
+    ],
+    "mean": 19.0,
+    "min": 19,
+    "max": 19,
+    "sd": null
+   },
+   "equalWidth": {
+    "values": [
+     15
+    ],
+    "mean": 15.0,
+    "min": 15,
+    "max": 15,
+    "sd": null
+   },
+   "pairs": {}
+  },
+  "haiku-qald": {
+   "correct": {
+    "values": [
+     28,
+     29,
+     27
+    ],
+    "mean": 28.0,
+    "min": 27,
+    "max": 29,
+    "sd": 1.0,
+    "questionsThatFlip": 10,
+    "alwaysCorrect": 24,
+    "everCorrect": 34
+   },
+   "equalWidth": {
+    "values": [
+     25,
+     25,
+     23
+    ],
+    "mean": 24.333333333333332,
+    "min": 23,
+    "max": 25,
+    "sd": 1.1547005383792515,
+    "questionsThatFlip": 10,
+    "alwaysCorrect": 20,
+    "everCorrect": 30
+   },
+   "pairs": {
+    "haiku-qald-r1 vs haiku-qald-r2": {
+     "n": 107,
+     "meanDiff": -0.009345794392523364,
+     "discordant": 9,
+     "aOnly": 4,
+     "bOnly": 5,
+     "ci95HalfWidth": 0.05518320203657535
+    },
+    "haiku-qald-r1 vs haiku-qald-r3": {
+     "n": 107,
+     "meanDiff": 0.009345794392523364,
+     "discordant": 7,
+     "aOnly": 4,
+     "bOnly": 3,
+     "ci95HalfWidth": 0.04865978211747849
+    },
+    "haiku-qald-r2 vs haiku-qald-r3": {
+     "n": 107,
+     "meanDiff": 0.018691588785046728,
+     "discordant": 4,
+     "aOnly": 3,
+     "bOnly": 1,
+     "ci95HalfWidth": 0.03663551401869158
+    }
+   }
+  },
+  "opus-db25": {
+   "correct": {
+    "values": [
+     33
+    ],
+    "mean": 33.0,
+    "min": 33,
+    "max": 33,
+    "sd": null
+   },
+   "equalWidth": {
+    "values": [
+     13
+    ],
+    "mean": 13.0,
+    "min": 13,
+    "max": 13,
+    "sd": null
+   },
+   "pairs": {}
+  },
+  "opus-qald": {
+   "correct": {
+    "values": [
+     41
+    ],
+    "mean": 41.0,
+    "min": 41,
+    "max": 41,
+    "sd": null
+   },
+   "equalWidth": {
+    "values": [
+     13
+    ],
+    "mean": 13.0,
+    "min": 13,
+    "max": 13,
+    "sd": null
+   },
+   "pairs": {}
+  },
+  "sonnet-db25": {
+   "correct": {
+    "values": [
+     32
+    ],
+    "mean": 32.0,
+    "min": 32,
+    "max": 32,
+    "sd": null
+   },
+   "equalWidth": {
+    "values": [
+     15
+    ],
+    "mean": 15.0,
+    "min": 15,
+    "max": 15,
+    "sd": null
+   },
+   "pairs": {}
+  },
+  "sonnet-qald": {
+   "correct": {
+    "values": [
+     32,
+     34
+    ],
+    "mean": 33.0,
+    "min": 32,
+    "max": 34,
+    "sd": 1.4142135623730951,
+    "questionsThatFlip": 10,
+    "alwaysCorrect": 28,
+    "everCorrect": 38
+   },
+   "equalWidth": {
+    "values": [
+     14,
+     11
+    ],
+    "mean": 12.5,
+    "min": 11,
+    "max": 14,
+    "sd": 2.1213203435596424,
+    "questionsThatFlip": 7,
+    "alwaysCorrect": 9,
+    "everCorrect": 16
+   },
+   "pairs": {
+    "sonnet-qald-r1 vs sonnet-qald-r2": {
+     "n": 107,
+     "meanDiff": -0.018691588785046728,
+     "discordant": 10,
+     "aOnly": 4,
+     "bOnly": 6,
+     "ci95HalfWidth": 0.058089543476264216
+    }
+   }
+  }
+ },
+ "crossModelPaired": {
+  "qald haiku-r1 vs opus-r1 correct": {
+   "n": 107,
+   "meanDiff": -0.12149532710280374,
+   "discordant": 25,
+   "aOnly": 6,
+   "bOnly": 19,
+   "ci95HalfWidth": 0.08906557876318898
+  },
+  "qald haiku-r1 vs opus-r1 equalWidth": {
+   "n": 107,
+   "meanDiff": 0.11214953271028037,
+   "discordant": 22,
+   "aOnly": 17,
+   "bOnly": 5,
+   "ci95HalfWidth": 0.08364028382463233
+  },
+  "qald haiku-r1 vs sonnet-r1 correct": {
+   "n": 107,
+   "meanDiff": -0.037383177570093455,
+   "discordant": 14,
+   "aOnly": 5,
+   "bOnly": 9,
+   "ci95HalfWidth": 0.06849257009607668
+  },
+  "qald haiku-r1 vs sonnet-r1 equalWidth": {
+   "n": 107,
+   "meanDiff": 0.102803738317757,
+   "discordant": 13,
+   "aOnly": 12,
+   "bOnly": 1,
+   "ci95HalfWidth": 0.063404666347668
+  },
+  "qald opus-r1 vs sonnet-r1 correct": {
+   "n": 107,
+   "meanDiff": 0.08411214953271028,
+   "discordant": 19,
+   "aOnly": 14,
+   "bOnly": 5,
+   "ci95HalfWidth": 0.07860664628496088
+  },
+  "qald opus-r1 vs sonnet-r1 equalWidth": {
+   "n": 107,
+   "meanDiff": -0.009345794392523364,
+   "discordant": 15,
+   "aOnly": 7,
+   "bOnly": 8,
+   "ci95HalfWidth": 0.07125601701524255
+  },
+  "db25 haiku-r1 vs opus-r1 correct": {
+   "n": 74,
+   "meanDiff": -0.1891891891891892,
+   "discordant": 24,
+   "aOnly": 5,
+   "bOnly": 19,
+   "ci95HalfWidth": 0.12322291121412565
+  },
+  "db25 haiku-r1 vs opus-r1 equalWidth": {
+   "n": 74,
+   "meanDiff": 0.02702702702702703,
+   "discordant": 22,
+   "aOnly": 12,
+   "bOnly": 10,
+   "ci95HalfWidth": 0.12492689157579501
+  },
+  "db25 haiku-r1 vs sonnet-r1 correct": {
+   "n": 74,
+   "meanDiff": -0.17567567567567569,
+   "discordant": 19,
+   "aOnly": 3,
+   "bOnly": 16,
+   "ci95HalfWidth": 0.10903044167315479
+  },
+  "db25 haiku-r1 vs sonnet-r1 equalWidth": {
+   "n": 74,
+   "meanDiff": 0.0,
+   "discordant": 16,
+   "aOnly": 8,
+   "bOnly": 8,
+   "ci95HalfWidth": 0.10666913485975683
+  },
+  "db25 opus-r1 vs sonnet-r1 correct": {
+   "n": 74,
+   "meanDiff": 0.013513513513513514,
+   "discordant": 19,
+   "aOnly": 10,
+   "bOnly": 9,
+   "ci95HalfWidth": 0.11619865033464866
+  },
+  "db25 opus-r1 vs sonnet-r1 equalWidth": {
+   "n": 74,
+   "meanDiff": -0.02702702702702703,
+   "discordant": 14,
+   "aOnly": 6,
+   "bOnly": 8,
+   "ci95HalfWidth": 0.0995870276337533
+  }
+ },
+ "interrupted": {
+  "sonnet-qald": {
+   "cases": 96,
+   "correctProjected": 34,
+   "correctEqualWidth": 11
+  }
+ },
+ "taxonomy": {
+  "haiku-db25": {
+   "reps": 1,
+   "wrong": 55,
+   "counts": {
+    "a": 27,
+    "b": 17,
+    "d": 7,
+    "e": 3,
+    "f": 1
+   },
+   "meanPerRep": {
+    "a": 27.0,
+    "b": 17.0,
+    "d": 7.0,
+    "e": 3.0,
+    "f": 1.0
+   },
+   "goldResourceMissingFromPrompt": 22,
+   "goldSchemaMissingFromPrompt": 34,
+   "refused": 19
+  },
+  "haiku-qald": {
+   "reps": 3,
+   "wrong": 237,
+   "counts": {
+    "a": 138,
+    "b": 48,
+    "d": 28,
+    "e": 1,
+    "f": 21,
+    "g": 1
+   },
+   "meanPerRep": {
+    "a": 46.0,
+    "b": 16.0,
+    "d": 9.333333333333334,
+    "e": 0.3333333333333333,
+    "f": 7.0,
+    "g": 0.3333333333333333
+   },
+   "goldResourceMissingFromPrompt": 130,
+   "goldSchemaMissingFromPrompt": 181,
+   "refused": 130
+  },
+  "opus-db25": {
+   "reps": 1,
+   "wrong": 41,
+   "counts": {
+    "a": 9,
+    "b": 9,
+    "d": 20,
+    "e": 2,
+    "f": 1
+   },
+   "meanPerRep": {
+    "a": 9.0,
+    "b": 9.0,
+    "d": 20.0,
+    "e": 2.0,
+    "f": 1.0
+   },
+   "goldResourceMissingFromPrompt": 14,
+   "goldSchemaMissingFromPrompt": 22,
+   "refused": 3
+  },
+  "opus-qald": {
+   "reps": 1,
+   "wrong": 66,
+   "counts": {
+    "a": 17,
+    "b": 15,
+    "c": 1,
+    "d": 24,
+    "e": 1,
+    "f": 6,
+    "g": 2
+   },
+   "meanPerRep": {
+    "a": 17.0,
+    "b": 15.0,
+    "c": 1.0,
+    "d": 24.0,
+    "e": 1.0,
+    "f": 6.0,
+    "g": 2.0
+   },
+   "goldResourceMissingFromPrompt": 38,
+   "goldSchemaMissingFromPrompt": 47,
+   "refused": 9
+  },
+  "sonnet-db25": {
+   "reps": 1,
+   "wrong": 42,
+   "counts": {
+    "a": 18,
+    "b": 9,
+    "d": 11,
+    "e": 3,
+    "f": 1
+   },
+   "meanPerRep": {
+    "a": 18.0,
+    "b": 9.0,
+    "d": 11.0,
+    "e": 3.0,
+    "f": 1.0
+   },
+   "goldResourceMissingFromPrompt": 15,
+   "goldSchemaMissingFromPrompt": 25,
+   "refused": 10
+  },
+  "sonnet-qald": {
+   "reps": 2,
+   "wrong": 148,
+   "counts": {
+    "a": 50,
+    "b": 50,
+    "c": 2,
+    "d": 32,
+    "f": 14
+   },
+   "meanPerRep": {
+    "a": 25.0,
+    "b": 25.0,
+    "c": 1.0,
+    "d": 16.0,
+    "f": 7.0
+   },
+   "goldResourceMissingFromPrompt": 82,
+   "goldSchemaMissingFromPrompt": 108,
+   "refused": 29
+  }
+ },
+ "goldOverrides": {
+  "qald9p-125": {
+   "category": "f",
+   "note": "gold BIND(year(xsd:date(?end)) - ...) casts an xsd:gYear to xsd:date, which SPARQL 1.1 refuses, so the gold is one row with no binding and no answer can match"
+  },
+  "qald9p-82": {
+   "category": "f",
+   "note": "gold projects xsd:date(?year) of an xsd:gYear, which fails, so the gold is one row with no binding"
+  },
+  "qald9p-78": {
+   "category": "f",
+   "note": "gold projects xsd:date(?date) of an xsd:gYear, which fails, so the gold is one row with no binding"
+  },
+  "qald9p-122": {
+   "category": "f",
+   "note": "gold projects ?uri ?string with ?string never bound, so the scorer requires a second column and refuses every one-column answer"
+  },
+  "db25:db25-100": {
+   "category": "f",
+   "note": "gold SELECT DISTINCT * projects the book ?y beside the author ?x, so the scorer refuses every one-column list of authors"
+  },
+  "qald9p-37": {
+   "category": "f",
+   "note": "the only gold value on this release is the infobox text \"SeeList of nicknames for San Francisco\""
+  },
+  "qald9p-60": {
+   "category": "f",
+   "note": "the gold dbp: property returns an empty-string literal beside Greg Abbott, so an answer without that empty row is scored wrong"
+  },
+  "qald9p-164": {
+   "category": "f",
+   "note": "the gold dbp: property returns an empty-string literal beside the crew, so an answer without that empty row is scored wrong"
+  },
+  "qald9p-26": {
+   "category": "f",
+   "note": "the gold dbp: property returns an empty-string literal beside the gases, so an answer without that empty row is scored wrong"
+  }
+ }
+}

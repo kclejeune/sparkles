@@ -13,42 +13,135 @@ call the provider through a local proxy that holds every request against a cost 
 
 | Measurement context | |
 |---|---|
-| Date and host | Ask measured on 2026-10-25 and global answering on 2026-10-24, on a development laptop with local data |
-| Models | Ask uses Claude Haiku 5.5 and Sonnet 5.5 at effort `medium`, with a 200,000-token context. Global answering uses Sonnet 5.5 with Opus 5.5 as judge. |
-| Builds | Ask from commit 0d4fdd8e, global answering from commit 847d8d0b |
-| Cost | $5.7450 for the full Ask run and $0.0397 for its separate pilot. Global answering cost $11.25. |
+| Date and host | Ask measured on 2026-10-31 and 2026-11-01 on a development laptop that was running other work, and global answering on 2026-10-24, both with local data |
+| Models | Ask uses Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5 at effort `medium`, with a 200,000-token context. Global answering uses Sonnet 5.5 with Opus 5.5 as judge. |
+| Builds | Ask from commit 7b3b6df5, global answering from commit 847d8d0b |
+| Cost | $39.22 for the Ask baseline under a cap of $45. Global answering cost $11.25. |
 
 ### Ask on DBpedia
 
 The questions run on the DBpedia 2022.12.01 database of 1.01 billion quads, against
 answers recomputed on that release. When the pipeline asks which resource a name means,
 the harness answers from the gold query by choosing one of the offered choices. An answer
-is correct when its rows match the gold's on the projected columns, and the equal-width
-row gives no credit for extra columns such as a label beside an IRI.
+is correct when its rows match the gold's on the projected columns, which is the
+`rdf-term-set-projected-columns-v2` policy and the headline score. A label or count
+beside the answer column does not count against an answer. The equal-width score is a
+stricter secondary column that gives no credit to any extra column.
 
-| Measurement over 107 QALD-9-plus questions | Haiku 5.5 | Sonnet 5.5 |
-|---|---|---|
-| Correct with projected columns | 26 (24%) | 31 (29%) |
-| Correct with equal width | 23 (21%) | 9 (8%) |
-| Clarifications answered by the harness | 84 | 84 |
-| Fresh cost including provider preflight | $0.2876 | $5.4574 |
-| Cost per correct projected answer | $0.0111 | $0.1760 |
-| Median wall time including clarification | 14.78 s | 14.98 s |
-| p95 wall time including clarification | 29.22 s | 33.88 s |
+QALD-9-plus keeps 107 of its 150 test questions on this release. Those questions were used
+while Ask grounding was tuned, so they are regression evidence. The Text2SPARQL'25 DBpedia
+set keeps 74 of its 100 questions on this release. It was not used in that tuning, and its
+gold answers were recomputed with the measured binary and matched the earlier recompute
+exactly. Every gold query passed before any provider request.
 
-These are repeated regression questions used during diagnosis, not an unseen test of
-generalization. The ten-question Haiku pilot is separate from both 107-question
-denominators. Every gold query passed before any provider request, and all 107 gold
-relations matched the retained reference results. The
-[paid record](../2026-10-25-ask-grounding-paid.json) gives both policies,
-paired changes, fresh ledger costs, tokens, timings and artifact digests.
+| Set and model | Runs | Correct with projected columns | Correct with equal width | Clarifications answered | Cost per run |
+|---|---|---|---|---|---|
+| QALD-9-plus, Haiku 5.5 | 3 | 28, 29 and 27, a mean of 28.0 (26%) | 25, 25 and 23 | 84 | $0.31 |
+| QALD-9-plus, Sonnet 5.5 | 2 | 32 and 34, a mean of 33.0 (31%) | 14 and 11 | 85 | $5.47 |
+| QALD-9-plus, Opus 5.5 | 1 | 41 (38%) | 13 | 84 | $11.60 |
+| Text2SPARQL'25 db25, Haiku 5.5 | 1 | 19 (26%) | 15 | 58 | $0.22 |
+| Text2SPARQL'25 db25, Sonnet 5.5 | 1 | 32 (43%) | 15 | 58 | $3.35 |
+| Text2SPARQL'25 db25, Opus 5.5 | 1 | 33 (45%) | 13 | 58 | $6.86 |
 
-The result is mixed across models. Haiku answers more of the retained questions, while
-Sonnet answers fewer under both policies. Both have higher median wall time, with nearly
-unchanged p95. Provider variability and a GCC version difference prevent attributing
-these changes to grounding alone. [C18](../../specs/C18-natural-language-questions-and-ingest.md#ask-grounding-accuracy-item-263)
-records the comparison. [ROADMAP](../../ROADMAP.md) item 263 keeps the remaining accuracy work,
-and item 318 tracks the median latency increase.
+The Opus QALD answers come from an attempt that a host failure interrupted after 22
+questions and from two later blocks with the same settings. Its cost includes $3.40 for
+the interrupted attempts, and two of its answers are failures in which the generated
+query ran the Ask process out of memory. Opus ran db25 in three blocks so that each block
+passed the harness's cost projection. The campaign spent $39.22, which includes $5.34
+for a Sonnet attempt that the same host failure interrupted. The machine was running
+other work, so the record keeps wall times only as context and they are not latency
+measurements.
+
+Sonnet and Opus name each answer beside its IRI far more often than Haiku, so the equal
+width column puts Haiku first on QALD, the reverse of the projected score. Opus leads
+Sonnet by 8 points on QALD, which is at the edge of the noise floor below, and by one
+question on db25. Its gain comes mainly where the needed predicate is missing from the
+prompt. It answers 19 of 66 such QALD questions, where Sonnet answers 12 of 66 per run
+and Haiku 6 of 66, and 12 of 34 such db25 questions, where Sonnet answers 9 and Haiku none.
+When the prompt holds every gold resource and schema term, the three models answer a
+similar share of about two thirds. Opus also refuses less, with 9 refusals against 15
+for Sonnet and 43 for Haiku per run.
+
+#### Run-to-run noise
+
+Repeating a model on the same questions changes 4 to 10 answers out of 107. Haiku's
+three runs differ by 4, 7 and 9 questions and Sonnet's two runs by 10. A Sonnet attempt
+interrupted after 96 questions scored 34 of them, against 29 and 30 for the two full runs
+on the same 96 questions. The 95% half-width of the paired difference between two single
+runs is 3.7 to 5.8 points between repeats of one model and 6.8 to 8.9 points between
+models on QALD, and 10.9 points between Haiku and Sonnet on db25. A variant therefore
+needs a gain of about 6 points, or 6 to 7 questions, on QALD in one paired run, or two
+runs for each variant to resolve a gain of about 4 points.
+
+#### Why answers fail
+
+A script classifies every wrong answer from its saved prompts, queries and results, and
+question-level checks of the gold mark the broken gold answers. The table counts wrong
+answers per run.
+
+| Cause | Haiku QALD | Sonnet QALD | Opus QALD | Haiku db25 | Sonnet db25 | Opus db25 |
+|---|---|---|---|---|---|---|
+| A needed predicate or class is missing from the prompt | 46.0 | 25.0 | 17 | 27 | 18 | 9 |
+| Wrong or unlinked resource | 16.0 | 25.0 | 15 | 17 | 9 | 9 |
+| Clarification policy | 0 | 1.0 | 1 | 0 | 0 | 0 |
+| Wrong query shape, or a refusal with the needed terms in context | 9.3 | 16.0 | 24 | 7 | 11 | 20 |
+| A right answer that the scorer marks wrong | 0.3 | 0 | 1 | 3 | 3 | 2 |
+| Gold answer wrong or broken on this release | 7.0 | 7.0 | 6 | 1 | 1 | 1 |
+| Provider error, truncation or an out-of-memory failure | 0.3 | 0 | 2 | 0 | 0 | 0 |
+
+Missing grounding is the largest cause for Haiku and Sonnet, and the second largest for
+Opus. One example is "What is the highest mountain in Germany?", whose prompt lists
+dozens of predicates that contain "highest" or "mountain" but not `dbo:elevation`, so Haiku and Sonnet answer that the data cannot
+rank mountains. Entity linking is the second cause. The five candidates for "Mars",
+"Texas" and "Scream" do not include `dbr:Mars`, `dbr:Texas` or `dbr:The_Scream`, and
+"President Obama" offers only redirect pages. Query shape grows with model strength
+because the stronger models answer instead of refusing. Their typical miss returns every
+gold row plus extra rows, by uniting `dbo:` and `dbp:` variants of a predicate, which
+happens in 21 wrong Opus answers and 10 to 12 wrong Sonnet answers on QALD.
+
+#### Scorer and gold checks
+
+Checks of 22 of the lowest-scoring questions found nine broken gold answers and four kinds
+of scorer error. Three QALD gold queries cast an `xsd:gYear` to `xsd:date`, which SPARQL
+1.1 refuses, so their gold is one row with no binding. One projects a variable that is
+never bound, and one more, in db25, uses `SELECT *` and so demands the book beside each
+author. One gold answer is the infobox text "SeeList of nicknames for San Francisco", and
+three include an empty string beside the real answers. No answer can match these, so
+the cleaned denominators are 99 for QALD and 73 for db25.
+
+The scorer marks a right answer wrong when a count has another integer datatype, when it
+names labels for gold IRIs, when the gold mixes a literal with IRIs, and when the gold is
+one comma-separated literal that names the answer IRIs. Counting these as correct adds
+0 to 3 answers per run. The record keeps this lenient count beside the strict one, and
+it keeps answers that hold every gold row plus extra rows as a separate diagnostic that
+never passes.
+
+The projected policy can be gamed. It chooses the best answer column for each gold column
+and compares the projected rows as a set, so a synthetic answer passes when it puts
+competing guesses in separate columns, adds up to eight columns or repeats each answer
+on many rows. No measured answer used `SELECT *`. Of the 121 answers that pass only by
+projection, 85 add one column, 28 add two and 8 add three. Their extra columns hold
+labels 65 times, numbers or dates such as the ranking key 34 times, related resources
+42 times and predicates 19 times, the last from queries that try several predicates
+in one `VALUES` list. Fifteen of them repeat an answer on several rows. A guard that caps
+extra columns at three and reports separately any pass whose extra column holds
+predicates or whose projection drops rows would close the synthetic cases and keep every
+label and ranking pass. It would flag 26 current passes, from none to 7 per run, with the
+most for Opus and Sonnet.
+
+#### Memory
+
+Generated queries ran the `sparkles ask` process out of memory three times. A
+zero-or-more property path over redirects and disambiguations reached about 28 GB twice,
+and `skos:broader?/skos:broader?` from an unbound category reached a 12 GB cap. Ask's
+default query memory budget of 2048 MiB and 60-second timeout did not stop them. Ask
+needs an enforced default memory budget and timeout that cover property-path evaluation.
+
+[ROADMAP](../../ROADMAP.md) item 263 holds the accuracy work. The
+[paid record](../2026-11-01-ask-model-baseline-paid.json) gives per-run and per-case
+results, failure causes, costs, source digests and the gold overrides.
+[C18](../../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#ask-model-baseline-item-263)
+gives the proposed improvements and the split of the sets for tuning.
 
 Current Ask grounding keeps half its schema budget for common vocabulary and fills the
 rest with question matches from the full visible schema. In an offline check against
@@ -56,8 +149,8 @@ rest with question matches from the full visible schema. In an offline check aga
 retrieves 189 of 304 existing predicate IRI constants mentioned in the gold, compared with
 151 from the count-only list. The check uses declared English or untagged property
 labels and includes `a` as `rdf:type`. It does not measure variable predicates, model
-answer accuracy or latency. The separate paid run above measures the complete pipeline
-with this retrieval and conservative resource/category ranking. The
+answer accuracy or latency. The paid baseline above measures the complete pipeline
+with this retrieval and conservative resource and category ranking. The
 [offline record](../2026-10-25-ask-grounding-offline.json) gives the source
 digests, per-question retrieval counts and the exact link to the old prompt's vocabulary.
 The resource preference only orders offered choices. An ambiguous mention still asks for

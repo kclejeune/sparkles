@@ -1704,6 +1704,77 @@ made. Costs use new request IDs, since raw case costs include charges from earli
 with the same case IDs. The [paid record](../../benchmarks/2026-10-25-ask-grounding-paid.json)
 retains exact policies, paired case changes, tokens, costs and provenance.
 
+### Ask model baseline, item 263
+
+A paid baseline on 2026-10-31 and 2026-11-01 measured Ask at commit `7b3b6df5` with
+Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5, at medium effort and a 200,000-token context,
+on DBpedia 2022.12.01. It used the 107 retained QALD-9-plus questions and the 74 retained
+Text2SPARQL'25 db25 questions, whose gold answers were recomputed with the measured
+binary. The projected-column policy is the headline score.
+
+| Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|
+| QALD-9-plus, projected | 28.0 of 107 over three runs, from 27 to 29 | 33.0 over two runs, 32 and 34 | 41 in one run |
+| QALD-9-plus, equal width | 24.3 | 12.5 | 13 |
+| db25, projected | 19 of 74 | 32 | 33 |
+| db25, equal width | 15 | 15 | 13 |
+
+Two runs of one model differ on 4 to 10 of the 107 questions, and the 95% half-width of
+the paired difference between two single runs is about 6 points on QALD. Missing
+predicates in the grounding context cause the most wrong answers for every model, and
+wrong or unlinked resources the second most. Opus leads Sonnet by 8 points on QALD and
+by one question on db25. It gains mainly by answering when the needed predicate is
+missing from the prompt, so its gain comes from vocabulary knowledge and reasoning rather
+than from better context. Nine gold answers are broken on
+this release. The [results](../../benchmarks/natural-language/RESULTS.md#ask-on-dbpedia)
+give the failure causes, the scorer checks and the noise floor, and the
+[paid record](../../benchmarks/2026-11-01-ask-model-baseline-paid.json) keeps the
+per-case results.
+
+The proposed improvements, in order of expected effect, are these.
+
+1. Retrieve predicates from the linked resources and from instances of the matched
+   classes, ranked by use, beside the lexical matches. A gold predicate is missing from
+   the prompt for about 62% of the QALD questions and 46% of the db25 questions. With
+   every gold term present the models answer about two thirds, and without them Haiku
+   answers 9% and Sonnet 18%. The expected gain is 8 to 15 points for Haiku and Sonnet.
+2. Rank entity candidates by exact label, in-degree and redirects, and keep a leading
+   article in the mention. The gold resource is missing from the prompt for 31 to 44% of
+   the questions, and the misses include `dbr:Mars`, `dbr:Texas` and `dbr:Barack_Obama`.
+   The expected gain is 5 to 10 points.
+3. Tell the model that it may use well-known DBpedia vocabulary that the context does
+   not list, and to choose one predicate instead of uniting `dbo:` and `dbp:` variants.
+   Haiku refuses 43 questions per run and Opus 9. Opus has 21 wrong answers that hold every
+   gold row plus extra rows on QALD. The expected gain is 3 to 8 points, mostly for Haiku.
+4. Let the repair loop run one probe query for the predicates of a linked resource after
+   an empty result or a refusal. This is the model-driven form of the first lever and
+   costs one call.
+5. Compare medium and high effort for Sonnet. Opus costs twice as much per question as
+   Sonnet for about 8 more points, and effort has not been varied.
+6. Fix the gold and scorer problems that the checks demonstrated. The converters should
+   drop gold rows with no binding, unbound projected columns and empty-string values,
+   and the scorer should report a lenient count for numeric datatypes and IRI labels
+   beside the strict count. These change 0 to 3 answers per run, and both scores stay.
+7. Guard the projected policy by capping extra columns at three and reporting passes
+   that rely on predicate columns or dropped rows separately.
+
+For tuning, the 107 QALD questions are split by the seed `ask-eval-baseline-split-v1`
+into 72 for training and 35 for validation, and the 74 db25 questions are held out as the
+test set and run only for a final comparison. The paid record lists the three sets. On
+35 questions one paired run resolves only about 10 points, so a variant chosen on the
+validation questions needs at least three runs there or a confirming run on all 107
+before it is run on the test set.
+
+Generated queries ran the Ask process out of memory three times, twice at about 28 GB on
+a zero-or-more property path over redirects and once at a 12 GB cap on
+`skos:broader?/skos:broader?` from an unbound category. Ask's default query memory budget
+of 2048 MiB and 60-second query timeout did not stop them. Ask needs an enforced default
+memory budget and timeout that also cover property paths, which needs a new roadmap item.
+The campaign made 1,965 ledger-reserved requests for $39.22 under a cap of $45. That
+includes $5.34 for a Sonnet attempt and $3.40 for Opus attempts that host failures
+interrupted, and the 22 answers that the first Opus attempt completed are part of its
+result. Two Opus answers count as failures because their queries exhausted memory.
+
 ### Roadmap follow-ups
 
 #### Agent platform workstream
