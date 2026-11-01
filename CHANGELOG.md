@@ -24,6 +24,20 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+`sparkles serve --prewarm` records the decoded blocks and resident file pages that each
+persistent dataset used, at shutdown and every `--prewarm-interval` seconds, and reads them
+again in the background after the next start is ready. On forge at 10.5M, with the list of
+a warm pass, cold `star-lookup` took 3.3 ms instead of 11.4 ms after a background read of
+15 ms, and the time to ready stayed at 52 ms. It is off by default.
+
+An index join over index format 3 reads a block whole at its first cold segment when its
+ranges in that block span more than a quarter of the block's segments. Cold `star-join` at
+10.5M on forge went from 83.8 to 78.3 ms, which matches unsegmented blocks. The same build
+runs `group-avg` and `expr-agg-arg` at 10.5M 8% and 11% slower cold and 14% and 21% slower
+warm with fewer instructions per request, a code placement cost that roadmap item
+NEW-ITEM-1 follows up. Warm point lookups run 2% to 3% more instructions, which item
+NEW-ITEM-2 covers.
+
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
 node in both shortest modes, run Dijkstra's algorithm from both ends. Weighted path
 searches add costs in double-double arithmetic everywhere, so paths whose weights have
@@ -756,6 +770,14 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+`serve --prewarm` writes `prewarm.json` version 1 into each persistent dataset's database
+directory. The file names the generation it was recorded for, the decoded index columns of
+the block cache and the resident page ranges of the generation's other files. A start reads
+only a list of version 1 for the current generation. It ignores a stale list, and it
+refuses a list of another version or one that names a file outside the generation with a
+warning while the dataset serves as usual. The file is derived state, and deleting it only
+loses the prewarm.
 
 The dataset reader capability 6 marks protected managed graphs. Enabling a profile
 owner raises `minimumReader` to 6 durably, writes the owner's settings file such as

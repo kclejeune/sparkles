@@ -529,6 +529,8 @@ happens to materialized inferences, and the limits.
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
 | `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
 | `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. A global flag. |
+| `--prewarm` | off | Record the decoded blocks and file pages each persistent dataset used, and read the recorded ones again in the background after the next start is ready. See [Memory and caches](#memory-and-caches). |
+| `--prewarm-interval S` | `300` | Seconds between two recordings of the prewarm lists while the server runs, with `--prewarm`, from 1 to 1e9. The shutdown records them too. |
 | `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
 | `--history-cache-mb N` | `512` (`small`: `128`) | Materialized past states for point-in-time reads, for the whole server. A global flag. |
 | `--memory-profile NAME` | `default` | `default` or `small`. A profile sets the defaults of the cache, query budget and pool flags above, and a flag given on the command line overrides it. A global flag. |
@@ -596,6 +598,19 @@ at the same speed with 256 MiB as with 1 GiB, but data at the scale of DBpedia t
 more, and a smaller cache costs speed when the working set no longer fits. Use `small`
 when memory matters more than the last bit of speed, and read the resolved values in the
 log line that `serve` writes at start.
+
+`--prewarm` lets a restarted server start with the blocks and pages that the last run
+used. A server started with it writes `prewarm.json` into each persistent dataset's
+database directory at shutdown and every `--prewarm-interval` seconds. The list names the
+decoded blocks of the block cache and the pages of the generation's other files that were
+in the page cache. The next start with `--prewarm` becomes ready as fast as without it,
+then reads the list on one background thread at a lower CPU priority, and logs `prewarm
+of /NAME finished` with what it read and how long it took. It stops when the block
+cache is full or the server shuts down, and it ignores a list that a compaction made
+stale. On forge at 10.5M, with the list of a warm pass, a cold `star-lookup` took 3.3 ms
+instead of 11.4 ms after a background read of 15 ms, and the time to ready stayed at
+52 ms. The prewarm reads data that the next queries may never touch, so it is off by
+default.
 
 The query memory pool bounds what all running queries may hold together, so that sixteen
 queries that each stay within `--query-memory-mb` cannot add up to more than the host has.

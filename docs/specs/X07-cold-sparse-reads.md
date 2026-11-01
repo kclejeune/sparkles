@@ -1,10 +1,11 @@
 # X07: Cold sparse reads
 
-> **Status:** implemented in part, Phases 1, 2 and 3.
+> **Status:** implemented in part, Phases 1 to 4.
 >
 > **Phases:** I/O accounting, batched constant resolution, prefetch, scan-specific read
-> windows and segmented index-format-3 blocks are available. Phase 4's optional prewarm
-> of previously used pages and the listed performance follow-ups remain planned.
+> windows, segmented index-format-3 blocks and the optional prewarm of `serve --prewarm`
+> are available. The 1.01B gates and the cold targets that the
+> [Outcome](#not-done) lists remain open.
 >
 > **User docs:** [I/O profile](../API.md#the-io-profile),
 > [cold reads](../internals/OPTIMIZATIONS.md#cold-reads) and
@@ -517,8 +518,12 @@ capabilities and remaining work are described by the spec status and Outcome.
   - the RocksDB documentation on block-based tables and the PostgreSQL documentation of
     `pg_prewarm`, read for design ideas only. No source code of these projects was read;
   - the specs X01, X05, X06 and C13.
-- **Implementation:** not built. No new dependency is planned. `memmap2`, `lz4_flex` and
-  `quick_cache` are already in the tree.
+- **Implementation:** Phases 1 to 4 are built in the Sparkles code from this spec. The
+  prewarm of Phase 4 follows the behaviour that the PostgreSQL documentation describes for
+  `pg_prewarm` and its auto-prewarm worker, and no PostgreSQL code was read. It uses the
+  `mincore(2)`, `posix_fadvise(2)` and `setpriority(2)` calls of the existing `libc`
+  dependency. No new dependency was added. `memmap2`, `lz4_flex` and `quick_cache` were
+  already in the tree.
 - **Rejected** (spec §12):
   - smaller index blocks;
   - a buffer pool with `pread` instead of memory mapping;
@@ -530,9 +535,10 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phases 1, 2 and 3 are built. Phase 4 is not. The [Phase 3 decision](#phase-3-decision)
-records why Phase 3 was started, and [Phase 3 results](#phase-3-results) records how it
-landed.
+Phases 1 to 4 are built. The [Phase 3 decision](#phase-3-decision) records why Phase 3
+was started, [Phase 3 results](#phase-3-results) records how it landed, and
+[Phase 4 and the join read](#phase-4-and-the-join-read) records the prewarm and the
+removal of the cold cost that format 3 added to `star-join`.
 
 ### What was built
 
@@ -1029,18 +1035,80 @@ the join prefetch brought `star-join` to 1.01 of main in two rounds but made
 that only the missing frames are decoded, left `star-join` at 1.07 of main, so the cost
 is not the decoding itself. With segment reads turned off the same format 3 store ran
 `star-join` at 0.97 of main, so the cost lies in the reads by segment of this join. It
-is a follow-up under roadmap item 4.
+is a follow-up under roadmap item 4, which [Phase 4 and the join read](#phase-4-and-the-join-read)
+resolves.
+
+### Phase 4 and the join read
+
+`sparkles serve --prewarm` records a prewarm list for each persistent dataset at shutdown
+and every `--prewarm-interval` seconds, 300 by default. The list is `prewarm.json` version
+1 in the database directory, registered as a derived file kind in `formats.rs`. It names
+the generation, the decoded parts of the block cache as block, part and column mask per
+permutation, and the page ranges of the generation's other files that `mincore(2)` finds
+resident, up to 4 GiB. The permutation data files are left out, because the decoded
+columns cover them. The next start with `--prewarm` becomes ready as before and then reads
+the list on one background thread at a lower CPU priority. It decodes the listed parts
+without counting them toward a block's limit of segments read one by one, and reads the
+pages with `posix_fadvise(POSIX_FADV_WILLNEED)` at most 64 MiB ahead of the reads that
+wait for them. It stops when the block cache is full, when a compaction replaces the
+generation and when the server shuts down. The shutdown joins the worker before it
+records the last list. A list for another generation is ignored, and a list of an unknown
+version or one that names a file outside the generation is refused with a warning while
+the dataset serves as usual.
+
+The cold cost that format 3 added to `star-join` came from the join prefetch, which skips
+a join of more than 16,384 ranges. The `star-join` probes have 29,717 keys per pattern
+across 63 blocks, so no prefetch marked their blocks dense, and each block was read a
+quarter by segments before it was read whole. An index join now walks its later ranges in
+a block when its first range there reaches a segment the cache does not hold, and marks
+the block dense when they span more than a quarter of its segments. The walk runs once
+per block, checks the request every `PREFETCH_CHECK_STEPS` ranges, and also runs when a
+range that starts in a held segment continues into cold ones.
+
+The gates were measured on forge on 2026-11-01 under the heavy lock, in interleaved rounds
+of A, B, B and A with `bench-regressions.py`, comparing main at `04d49b57` with the lane at
+`38deb1e8`. The [run record](../benchmarks/synthetic/runs/2026-11-01-cold-lookups-forge/validation.json)
+holds every sample.
+
+| Gate | Result |
+|---|---|
+| Cold `star-join` at 10.5M | 83.8 to 78.3 ms. The unsegmented build at `72d85c7f` takes 77.8 ms on its own store, and the lane takes 1.010 of that in the same rounds. |
+| Other cold queries at 10.5M | 25 of the other 27 are no more than 5% slower than main, after a rerun of `path-plus` and `values-star` in three pairs of 11 samples. `group-avg` and `expr-agg-arg` are 8% and 11% slower and are discussed below. |
+| Cold at 1.05M | A rerun of the queries that one pair flagged, in three pairs of 11 samples, put every one within 0.955 to 1.027 of main. |
+| Warm at 10.5M | Queries above 1 ms are no more than 5% slower except `group-avg` and `expr-agg-arg`. `star-lookup` runs 1.9% more instructions per request and `employee-docs` 2.8% more. |
+| Prewarm | With the list of a warm pass, cold `star-lookup` goes from 11.4 to 3.3 ms at 10.5M, `employee-docs` from 10.5 to 3.2 ms, `values-star` from 7.3 to 3.7 ms and `star-join` from 77.9 to 33.4 ms. The background read takes 3 to 71 ms, and the time to ready stays at 52 ms. |
+
+`group-avg` and `expr-agg-arg` at 10.5M are 7.6% and 10.6% slower cold in three pairs of 11
+samples, and 14% and 21% slower warm. They run a merge join of two scans and a grouping,
+read through no index join, and run 1.4% and 2.1% fewer instructions per request than
+main. A build with the first version of the lookahead ran them within 1% of main with the
+lookahead on and off. The difference therefore lies in code placement, and roadmap item
+NEW-ITEM-1 follows it up. The cold check before each fresh block's read accounts for the
+extra instructions of the warm point lookups, and item NEW-ITEM-2 moves it to the cache
+miss.
+
+The cold rows of `bench.sh` against Oxigraph, in two rounds of five restarts per engine on
+forge, give these medians and the §9 targets at 1.1 times Oxigraph's times of the same
+run.
+
+| Query, cold, ms | Oxigraph 1.05M | Sparkles 1.05M | Oxigraph 10.5M | Sparkles 10.5M | Targets |
+|---|---:|---:|---:|---:|---|
+| `star-lookup` | 21.2 | 12.4 | 19.0 | 10.0 | Met at both scales. |
+| `values-star` | 7.3 | 6.7 | 7.2 | 5.9 | Met at both scales. |
+| `employee-docs` | 19.2 | 9.2 | 16.0 | 10.1 | Met at both scales, and below Fluree's 10.2 ms at 1.05M from §9. |
+| `path-plus` | 2.7 | 3.3 | 2.2 | 3.3 | Not met. |
 
 ### Not done
 
-Phase 4, the 1.01B gates (A5 and its window sweep), the cold targets of
-`values-star`, `path-plus` and 10.5M `star-lookup`, cheaper join probes at planning time
-on a cold process, a per-query set of
-hinted blocks in the context to avoid a second hint of a block, I/O priority for
-read-ahead, and a `FILTER` constant collector beyond the common comparison nodes.
-`bench-regressions.py` gained `--io` on 2026-10-18 under roadmap item 1, which keeps each
-sample's server times and I/O profile. The
-Namespace screen still reports no I/O counters, and its primary metric excludes the plan time and serialization time in which
-the prefetch work runs. The profile reads `getrusage(RUSAGE_SELF)` for process-wide
-faults, and a per-operator `RUSAGE_THREAD` breakdown is not built. `/$/stats` has no I/O
-counters, which are available only through `profile=io` and `/$/metrics`.
+The 1.01B gates (A5 and its window sweep) and the cold `path-plus` target remain, under
+roadmap item 4. The rest of the follow-ups from the earlier phases also remain. These are
+cheaper join probes at planning time on a cold process, a per-query set of hinted blocks in
+the context to avoid a second hint of a block, I/O priority for read-ahead, and a `FILTER`
+constant collector beyond the common comparison nodes. `bench-regressions.py` has `--io`,
+which keeps each sample's server times and I/O profile, and `--prewarm`. The Namespace
+screen still reports no I/O counters, and its primary metric excludes the plan time and
+serialization time in which the prefetch work runs. The profile reads
+`getrusage(RUSAGE_SELF)` for process-wide faults, and a per-operator `RUSAGE_THREAD`
+breakdown is not built. `/$/stats` has no I/O counters, which are available only through
+`profile=io` and `/$/metrics`. The prewarm reads only the files of the generation and the
+block cache, so the result cache starts empty after a restart.

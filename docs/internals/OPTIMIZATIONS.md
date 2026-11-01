@@ -516,6 +516,20 @@ little and change nothing. Each one has the same answers with it on and off.
   each decodes the segments that can hold them, and this spreads that work over several
   cores when it comes to 32 segments or more. Reads through a view that keeps no blocks,
   such as an export, skip it.
+* **Whole blocks for large joins.** In index format 3 a lookup decodes the segments of
+  2,048 rows that can hold its keys, and a block turns dense, so that its readers decode
+  it whole, once a quarter of its segments were read one by one. An index join whose
+  first range in a block reaches a segment the cache does not hold looks ahead over the
+  join's later ranges in that block. When they span more than a quarter of its segments,
+  the join marks the block dense and reads it whole at once. The join prefetch skips a
+  join of more than 16,384 ranges, so without this a large join read a quarter of each
+  block by segments and then the whole block again. The lookahead runs once per block and
+  checks for cancellation as the join's reads do.
+* **Prewarm after a restart** (`serve --prewarm`). This is not an `Optimizations` flag.
+  The server records the decoded columns of each persistent dataset's block cache and
+  the resident pages of its other index files, and the next start reads them on a
+  background thread after it is ready. [Memory and caches](../USAGE.md#memory-and-caches)
+  describes it.
 * **Decoding the next cursor batch ahead** (`decode_ahead`). A result writer that reads
   a cursor decodes the terms of the next batch on another Rayon thread while it writes the
   current one. It writes the first batch before it pulls the second, so the first rows
