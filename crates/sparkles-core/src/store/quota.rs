@@ -279,9 +279,14 @@ impl Quota {
     /// One store's `annotations.bin` now holds `now` bytes of preallocated zeros after its
     /// last record, where it last reported `was` (see `Tail::take_prealloc`).
     pub(crate) fn move_ann_preallocated(&self, was: u64, now: u64) {
-        // added first, so the sum never passes below zero
-        self.ann_preallocated.fetch_add(now, Ordering::Relaxed);
-        self.ann_preallocated.fetch_sub(was, Ordering::Relaxed);
+        // one step, so no reader sees both or neither of the two amounts
+        if now >= was {
+            self.ann_preallocated
+                .fetch_add(now - was, Ordering::Relaxed);
+        } else {
+            self.ann_preallocated
+                .fetch_sub(was - now, Ordering::Relaxed);
+        }
     }
 
     /// A small commit grew the write-ahead log by `bytes`, its records and any zeros

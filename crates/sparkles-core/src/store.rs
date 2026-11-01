@@ -3622,9 +3622,13 @@ impl Store {
         let written = a.append(c.seq, ann.clone(), self.dataset_id, || {
             self.annotation_prealloc()
         });
-        // a failed append cut the file back, zeros included
+        // a failed append cut the file back, zeros included, which the cached size of
+        // the directory still holds
         let (was, now) = a.take_prealloc();
         self.quota.move_ann_preallocated(was, now);
+        if written.is_err() {
+            self.quota.invalidate();
+        }
         if let Some(w) = written? {
             self.quota.add(w.grew);
         }
@@ -3652,6 +3656,8 @@ impl Store {
         let undone = a.undo(seq);
         let (was, now) = a.take_prealloc();
         self.quota.move_ann_preallocated(was, now);
+        // the cut is not in the cached size of the directory
+        self.quota.invalidate();
         undone
     }
 
@@ -7420,11 +7426,13 @@ impl Drop for Store {
             w.trim_wal();
             if !w.poisoned {
                 self.snapshot().generation.dvocab.trim();
-                let mut a = self.annotations.lock();
-                a.trim();
-                let (was, now) = a.take_prealloc();
-                self.quota.move_ann_preallocated(was, now);
             }
+            // Branch stores share the quota, so a closing store takes back its zeros,
+            // and a poisoned one too, since its directory may be deleted next.
+            let mut a = self.annotations.lock();
+            a.trim();
+            let (was, now) = a.take_prealloc();
+            self.quota.move_ann_preallocated(was, now);
         }
         if let Some(log) = &self.changelog
             && let Err(e) = log.flush(true)

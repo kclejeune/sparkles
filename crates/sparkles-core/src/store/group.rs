@@ -635,16 +635,14 @@ impl Store {
         tail.release(&io);
         // every change of the annotations file reaches the quota, a failed write's too
         let ann_prealloc = (!anns.is_empty()).then(|| anns[0].tail.take_prealloc());
-        let direct = written.inspect_err(|_| {
+        let failed = |_: &Error| {
             if let Some((was, now)) = ann_prealloc {
                 self.quota.move_ann_preallocated(was, now);
+                self.quota.invalidate();
             }
-        })?;
-        let ann_written = ann_written.transpose().inspect_err(|_| {
-            if let Some((was, now)) = ann_prealloc {
-                self.quota.move_ann_preallocated(was, now);
-            }
-        })?;
+        };
+        let direct = written.inspect_err(failed)?;
+        let ann_written = ann_written.transpose().inspect_err(failed)?;
         #[cfg(test)]
         if ann_written.is_some_and(|w| w.direct)
             && let Some(g) = &self.group

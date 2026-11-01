@@ -125,6 +125,11 @@ pub(crate) struct Annotations {
     /// the zeros of files this store replaced that it last reported to the quota, which
     /// the next [`take_prealloc`](Self::take_prealloc) withdraws
     retired: u64,
+    /// a pruned file could not be opened after it replaced the old one: no record is
+    /// written until the store reopens
+    broken: bool,
+    #[cfg(test)]
+    fail_reopen: bool,
 }
 
 impl Annotations {
@@ -137,6 +142,9 @@ impl Annotations {
             digests,
             direct: false,
             retired: 0,
+            broken: false,
+            #[cfg(test)]
+            fail_reopen: false,
         }
     }
 
@@ -224,6 +232,9 @@ impl Annotations {
             digests,
             direct,
             retired: 0,
+            broken: false,
+            #[cfg(test)]
+            fail_reopen: false,
         })
     }
 
@@ -296,9 +307,19 @@ impl Annotations {
         Ok(queued)
     }
 
+    /// `Err` once a pruned file could not be opened, since the store can no longer
+    /// write a record that a reopen would find.
+    fn usable(&self) -> Result<()> {
+        if self.broken {
+            return Err(Error::Poisoned);
+        }
+        Ok(())
+    }
+
     /// The file's tail, creating the file with its header first if there is none yet
     /// (`None` for an in-memory store).
     fn ensure_file(&mut self, dataset_id: uuid::Uuid) -> Result<Option<Arc<Tail>>> {
+        self.usable()?;
         let Some(path) = &self.path else {
             return Ok(None);
         };
@@ -331,12 +352,13 @@ impl Annotations {
     }
 
     /// Cut the zeros preallocated after the records, before the store closes: a file that
-    /// is no longer written ends at its last record (an open cuts them as well). Nothing
-    /// is cut while a group commit fence still has records to write.
+    /// is no longer written ends at its last record (an open cuts them as well). The
+    /// writer takes no more commits, so no fence writes after this.
     pub fn trim(&mut self) {
-        if let Some(tail) = &self.tail
-            && tail.end() == self.len
-        {
+        // A record still queued after a failed fence is never written, and what a failed
+        // write left after the written end belongs to commits that were not acknowledged,
+        // which the next open cuts as well.
+        if let Some(tail) = &self.tail {
             let _ = tail.trim();
         }
     }
@@ -361,6 +383,12 @@ impl Annotations {
         if self.map.first_key_value().is_none_or(|(s, _)| *s >= cutoff) {
             return Ok(());
         }
+        self.usable()?;
+        if self.tail.as_ref().is_some_and(|t| t.end() != self.len) {
+            return Err(Error::Invalid(
+                "commit annotations cannot be pruned while a group commit fence has records to write".into(),
+            ));
+        }
         self.map = self.map.split_off(&cutoff);
         let Some(path) = &self.path else {
             return Ok(());
@@ -368,11 +396,6 @@ impl Annotations {
         let Some(tail) = &self.tail else {
             return Ok(());
         };
-        if tail.end() != self.len {
-            return Err(Error::Invalid(
-                "commit annotations cannot be pruned while a group commit fence has records to write".into(),
-            ));
-        }
         let flags = if self.digests { FLAG_DIGESTS } else { 0 };
         let mut buf = encode_header(dataset_id, flags).to_vec();
         for (seq, a) in &self.map {
@@ -381,11 +404,28 @@ impl Annotations {
         crate::store::write_atomic(path, &buf)?;
         // the old file's zeros are gone with it
         self.retired += tail.take_prealloc().0;
-        self.tail = None;
-        let f = OpenOptions::new().read(true).write(true).open(path)?;
-        self.len = buf.len() as u64;
-        self.tail = Some(Tail::new(f, path, self.direct, self.len));
-        Ok(())
+        #[cfg(test)]
+        let reopened = if self.fail_reopen {
+            Err(std::io::Error::other("injected reopen failure"))
+        } else {
+            OpenOptions::new().read(true).write(true).open(path)
+        };
+        #[cfg(not(test))]
+        let reopened = OpenOptions::new().read(true).write(true).open(path);
+        match reopened {
+            Ok(f) => {
+                self.len = buf.len() as u64;
+                self.tail = Some(Tail::new(f, path, self.direct, self.len));
+                Ok(())
+            }
+            Err(e) => {
+                // The old handle names the file the rename replaced, and creating the
+                // file again would erase the records that the new one holds, so no
+                // record is written until the store reopens.
+                self.broken = true;
+                Err(e.into())
+            }
+        }
     }
 
     /// In-memory stores forget the annotations of commits the catalog no longer has.
@@ -1001,6 +1041,54 @@ mod tests {
         let reopened = Annotations::open(root.path(), id, 2, false, true).unwrap();
         assert!(reopened.get(1).is_none());
         assert_eq!(reopened.get(2).unwrap().message.as_deref(), Some("two"));
+    }
+
+    /// A pruned file that cannot be opened after it replaced the old one leaves the
+    /// store unable to write records, rather than creating the file again over the
+    /// records it keeps.
+    #[test]
+    fn a_pruned_file_that_cannot_be_reopened_refuses_records() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut a = Annotations::open(root.path(), id, 0, false, true).unwrap();
+        let message = |m: &str| Annotation {
+            message: Some(Arc::from(m)),
+            digest: None,
+        };
+        for (seq, m) in [(1, "one"), (2, "two")] {
+            a.append(seq, message(m), id, || MAX_PREALLOC).unwrap();
+        }
+        a.fail_reopen = true;
+        assert!(a.prune_before(2, id).is_err());
+        assert!(a.append(3, message("three"), id, || MAX_PREALLOC).is_err());
+        assert!(a.append_queued(3, message("three"), id).is_err());
+        assert!(a.prune_before(3, id).is_err());
+        drop(a);
+        let reopened = Annotations::open(root.path(), id, 3, false, true).unwrap();
+        assert_eq!(reopened.get(2).unwrap().message.as_deref(), Some("two"));
+        assert!(reopened.get(3).is_none());
+    }
+
+    /// A close cuts the zeros even when a failed fence left a record queued that will
+    /// never be written, and reports that they are gone.
+    #[test]
+    fn a_close_after_a_failed_fence_cuts_the_zeros() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut a = Annotations::open(root.path(), id, 0, false, true).unwrap();
+        let message = |m: &str| Annotation {
+            message: Some(Arc::from(m)),
+            digest: None,
+        };
+        a.append(1, message("one"), id, || MAX_PREALLOC).unwrap();
+        let (_, zeros) = a.take_prealloc();
+        assert!(zeros > 0);
+        let _never_written = a.append_queued(2, message("two"), id).unwrap().unwrap();
+        a.trim();
+        assert_eq!(a.take_prealloc(), (zeros, 0));
+        let path = root.path().join(FILE);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(records_end(&bytes), Some(bytes.len()));
     }
 
     #[test]
