@@ -97,6 +97,17 @@ build community reports.
   label matches are ordered by how many triples name each one. The draft rules tell the
   model that the context is partial and to use one predicate per relation. This adds
   about 8% to a first-draft prompt and two to three bounded queries per linked entity.
+* Ask has four repair options. The exploration, on by default, drafts once more after a
+  draft gives no query or an empty result, with further link candidates and the
+  predicates the entities use. The shape check, multi-draft voting and type hints are off
+  by default. A dataset sets them under `repairs` in `assistant.json`, a request sets
+  `explore`, `shapeCheck`, `drafts` and `typeHints`, and `sparkles ask` takes
+  `--explore`, `--shape-check`, `--drafts N` and `--type-hints`, each with a `--no-`
+  form. Over three runs of 51 validation questions with Haiku 5.5, the exploration raised
+  the mean from 25.0 to 28.0 for 16% more cost per question, the shape check and voting
+  stayed within the baseline's spread, and type hints lowered it to 22.7. Voting costs
+  63% more per question. The
+  [results](../benchmarks/natural-language/RESULTS.md#ask-repair-options) give each run.
 * The extra kind preference recognizes the English words film, movie, book, novel,
   song, album, city, town, country, river and person through supported DBpedia,
   schema.org and FOAF class IRIs. Unknown class namespaces and incomplete or competing

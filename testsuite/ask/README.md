@@ -319,6 +319,15 @@ prompt leave the usage unknown, so the reply is charged its bound. The preflight
 structured-output request to each model, since Chat Completions has no free token
 count.
 
+`scripts/provider-spend openai --since DAY --ledger LEDGER` reads OpenAI's organization
+cost and usage reports by day and model and prints them beside the ledger's settlements.
+After the Luna baseline phases of 2026-11-01, OpenAI reported $0.8165 for `gpt-6-luna`
+in 704 requests against $0.8544 in the ledger, and the smoke requests of Terra and Sol
+matched to the cent. Luna's replies reported 4.58 million cache-write tokens of 5.07
+million prompt tokens, and the ledger charges them at 1.25 times input. It stands about
+4.6% above the bill, which suggests that some of those writes were billed at a lower
+rate. The provider never reported more than the ledger.
+
 ## A paid run
 
 `run.example.json` shows the run file. Copy it and set the paths. It holds the sets and

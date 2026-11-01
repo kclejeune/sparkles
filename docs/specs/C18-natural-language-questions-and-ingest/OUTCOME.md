@@ -1861,9 +1861,18 @@ on a predicate column or on rows the projection drops. The strict score stays th
 case that the secondary score changes. The comma-separated literal of db25-65 stays wrong
 under both scores.
 
-Two proposed levers were not tried. A repair probe that queries a linked resource's
-predicates after an empty result would repeat what the grounding now supplies before the
-draft, and high effort for Sonnet was left for a later run. Haiku at `2d43aa5a` scored
+High effort for Sonnet was left for a later run. Four repair turns were then built as
+Ask options and measured three times each with Haiku on 51 validation questions, the 35
+of the split and the 16 training questions that no tuning step had inspected case by
+case. The exploration drafts once more after a draft without a query or with an empty
+result, with further link candidates and the predicates the entities use, and it raised
+the mean from 25.0 to 28.0, so it is on by default. The shape check scored 25.0 and
+voting over three drafts 26.0 at 63% more cost per question, both within the baseline's
+spread of 2, and type hints scored 22.7, so all three are off by default. Each option is
+set from `assistant.json`, the ask request or the command line, and a sample value or a
+result row reaches a repair only when the dataset lets its providers receive rows. The
+[results](../../benchmarks/natural-language/RESULTS.md#ask-repair-options) give every
+run. Haiku at `2d43aa5a` scored
 24.0 on QALD over two runs against 28.0 over three at `7b3b6df5`, and 21 on db25 against
 19. The difference is within the noise of so few runs, and NEW-ITEM-2 tracks whether the
 grounding reordered for prompt caching costs accuracy. NEW-ITEM-1 tracks linking

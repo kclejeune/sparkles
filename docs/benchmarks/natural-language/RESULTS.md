@@ -233,6 +233,50 @@ keeps that attempt and its cost beside the full rerun. The
 under both scores, every case the secondary score changes, costs, token counts and source
 digests.
 
+#### Ask repair options
+
+Four repair turns of Ask were measured as separate options on Haiku 5.5. The exploration
+drafts once more after a draft gives no query or an empty result, with further link
+candidates and the predicates the entities use. The shape check repairs once when the
+result does not fit the question's form. Multi-draft voting asks three first drafts and
+keeps the one whose checked, complete result most of them share. Type hints link each
+mention with the classes the words around it name. Each option ran three times on an
+enlarged validation set of 51 questions, the 35 validation questions of the QALD split
+and the 16 training questions that no tuning step had inspected case by case. Every
+other training question had been read during tuning, so the set could not reach the
+intended 105. An option is on by default only when its mean gain passes the spread of
+the three baseline runs.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-01 on a development laptop that was running other work, with binaries built on atlas |
+| Build | Commit `dfc799dc`, one batch child per run with six questions at once |
+| Settings | Effort `medium`, a 200,000-token context and answered clarifications |
+| Questions | 51, with the moved IDs and the rule that chose them in the [paid record](../2026-11-01-ask-hillclimb-paid.json) |
+
+| Option | Strict score in three runs | Mean | Cost per question | Default |
+|---|---|---|---|---|
+| None | 25, 26 and 24 | 25.0 | $0.0019 | |
+| Exploration | 29, 28 and 27 | 28.0 | $0.0022 | On |
+| Shape check | 25, 25 and 25 | 25.0 | $0.0020 | Off |
+| Three drafts with a vote | 26, 25 and 27 | 26.0 | $0.0031 | Off |
+| Type hints | 23, 21 and 24 | 22.7 | $0.0021 | Off |
+| Exploration, shape check and three drafts | 29, 26 and 28 | 27.7 | $0.0035 | |
+
+The guarded secondary score equals the strict score in every run. The exploration gains
+3.0 questions, and its lowest run is above the highest baseline run, at about 16% more
+cost per question. It turns refusals into answers, which fall from 24 to 8 over the
+three runs. The shape check fires on at most 3 of the 51 questions in a run, so it
+cannot move the score much on this set, and it may help on data whose questions more often ask for counts or
+dates. Voting gains 1.0 question, inside the
+baseline's spread of 2, for 63% more cost per question. It may help a weaker model or a
+dataset whose drafts disagree more often. Type hints lose 2.3 questions, past the spread.
+More of their queries add a class constraint, and their empty results double from 11
+to 22 over the three runs. They may help on data whose labels are shared by many entities of different
+classes. The exploration with the shape check and voting scores no higher than the
+exploration alone and costs 59% more per question. Every option stays available through `assistant.json`, the ask request and
+the command line.
+
 ### Global answering
 
 Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four

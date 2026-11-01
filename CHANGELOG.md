@@ -650,6 +650,18 @@ through one such child in a 16G systemd scope, holds each case's projected cost 
 its line is sent and keeps the outputs in question order. Caches stay warm across a
 phase's questions, which changes latency but not answers.
 
+Ask has four repair options. The exploration, on by default, drafts once more after a
+draft gives no query or an empty result, with further link candidates and the predicates
+the entities use. The shape check repairs once when a result does not fit the
+question's form, `drafts` asks up to five first drafts and keeps the checked, complete
+result most of them share, and type hints link mentions with the classes the words
+around them name. These three are off by default. `assistant.json` sets the options
+under `repairs`, `POST /{ds}/ask` takes `explore`, `shapeCheck`, `drafts` and
+`typeHints`, and `sparkles ask` takes `--explore`, `--shape-check`, `--drafts N` and
+`--type-hints` with `--no-` forms. A request or a command line overrides the dataset. An
+exploration's sample values and a shape repair's rows reach the model only when the
+dataset's `send` policy lets the draft and repair providers receive rows.
+
 `scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
 file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1
 Sol through the Chat Completions API under a USD 40 wallet of its own. The proxy prices
