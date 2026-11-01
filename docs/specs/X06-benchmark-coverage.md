@@ -1847,6 +1847,18 @@ guard only against a slowdown that every process shows. The
 [baseline](../benchmarks/writes/RESULTS.md#incremental-view-gate-baseline) keeps every
 value and answer fingerprint.
 
+Item 473 adds `mise run bench:insn`, which counts the user-space instructions of the
+front-coded and FSST vocabulary readers and of opening a store with and without 2,000
+commits in its WAL, so that the reader changes of item 455 can be checked below timing
+noise. Each case checks its result against one computed another way and fails when other
+threads of the process use more than 20 ms of CPU time while it runs, since moved work
+would otherwise look like a saving. On forge the counts of one process repeated to a few
+hundredths of a percent, and the full front-coded scan moved by up to 11% between
+processes, so the gate compares ranges over five processes. Replay cost about 32,000
+instructions per commit. The
+[baseline](../benchmarks/engine/RESULTS.md#instruction-counts-of-vocabulary-scans-and-wal-replay)
+keeps every count.
+
 ### Scope changes
 
 **Further engines for comparison.** The second rule in §4 left commercial editions out of scope and did not run an engine whose terms forbid publishing results. Comparisons with Virtuoso Open Source and GraphDB Free, with Blazegraph at low priority, and with RDFox and Stardog after a check of their licenses for benchmark-publication clauses, are now planned under [ROADMAP](../ROADMAP.md) item 452 in this spec's Roadmap follow-ups. A measurement stays private when publication is forbidden.

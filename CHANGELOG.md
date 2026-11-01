@@ -42,6 +42,9 @@ universities.
 `mise run bench:incr` runs the incremental-view benchmarks in five processes, checks each
 view's rows against its query and records a forge baseline.
 
+`mise run bench:insn` counts the instructions of vocabulary scans and WAL replay with the
+CPU's performance counters, checks every result and records a forge baseline.
+
 ### Changed
 
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
