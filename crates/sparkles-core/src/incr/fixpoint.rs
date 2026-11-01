@@ -148,7 +148,8 @@ pub trait Program {
     /// The state was emptied.
     fn cleared(&mut self) {}
 
-    /// Write one fact with its record.
+    /// Write one fact with its record. A program that gives terms local ids must be
+    /// saved through a writer over the terms that hold those ids.
     fn save(&self, w: &mut Writer, f: &Self::Fact, r: &Self::Record) -> Result<()>;
 
     /// Read what [`save`](Self::save) wrote.
@@ -156,6 +157,12 @@ pub trait Program {
 
     /// The approximate memory of one held fact with its record.
     fn fact_bytes(&self) -> u64;
+
+    /// The approximate memory the program holds for the current pass beyond its facts,
+    /// such as memoized lookups, which counts against the budget while the pass runs.
+    fn scratch_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// One change of the operator's facts: the fact, its weight's change (`+1` when it
@@ -251,15 +258,26 @@ impl<P: Program> FixedPoint<P> {
         n * self.program.fact_bytes() + self.ann_bytes + self.ann.len() as u64 * 16
     }
 
+    /// Check the budget every 4096 facts.
     fn over(&self, max: Option<u64>) -> Result<()> {
-        if let Some(m) = max
-            && self.facts.len().is_multiple_of(4096)
-            && self.bytes() > m
-        {
+        if self.facts.len().is_multiple_of(4096) {
+            return self.check(max, 0);
+        }
+        Ok(())
+    }
+
+    /// Fail when the state, the program's scratch and `pending` bytes not yet stored
+    /// pass `max`.
+    fn check(&self, max: Option<u64>, pending: u64) -> Result<()> {
+        let Some(m) = max else {
+            return Ok(());
+        };
+        let used = self.bytes() + self.program.scratch_bytes() + pending;
+        if used > m {
             return Err(Error::BudgetExceeded(crate::error::Budget {
                 kind: crate::error::BudgetKind::Memory,
                 limit: m,
-                requested: self.bytes(),
+                requested: used,
             }));
         }
         Ok(())
@@ -310,8 +328,8 @@ impl<P: Program> FixedPoint<P> {
             }
         }
         let dirty: FxHashSet<P::Fact> = order.iter().copied().collect();
-        let anns = self.annotate(cx, &dirty)?;
-        Ok(order
+        let anns = self.annotate(cx, &dirty, max_bytes)?;
+        let out = order
             .into_iter()
             .map(|f| {
                 let ann = anns.as_ref().map(|m| {
@@ -325,7 +343,9 @@ impl<P: Program> FixedPoint<P> {
                     ann,
                 }
             })
-            .collect())
+            .collect();
+        self.check(max_bytes, 0)?;
+        Ok(out)
     }
 
     fn store_ann(&mut self, f: P::Fact, a: Ann) {
@@ -344,30 +364,32 @@ impl<P: Program> FixedPoint<P> {
     }
 
     /// The annotations of the facts of `dirty` from their records, premises first; the
-    /// other facts keep the annotations held. `None` without annotations.
+    /// other facts keep the annotations held. `None` without annotations. The
+    /// annotations made count against `max` with the state.
     fn annotate(
         &mut self,
         cx: &mut P::Cx<'_>,
         dirty: &FxHashSet<P::Fact>,
+        max: Option<u64>,
     ) -> Result<Option<FxHashMap<P::Fact, Ann>>> {
         if self.mode.is_none() {
             return Ok(None);
         }
         let mut done: FxHashMap<P::Fact, Ann> = FxHashMap::default();
-        let mut stack: Vec<P::Fact> = Vec::new();
+        let mut pending = 0u64;
+        // a depth-first walk over the records: a frame is a fact and whether its
+        // premises were scheduled, and `open` holds the facts whose premises are being
+        // annotated, so meeting one of them again is a cycle of records
+        let mut open: FxHashSet<P::Fact> = FxHashSet::default();
+        let mut stack: Vec<(P::Fact, bool)> = Vec::new();
         let mut prem = Vec::new();
         for &f in dirty {
             if done.contains_key(&f) {
                 continue;
             }
-            stack.push(f);
-            while let Some(&top) = stack.last() {
-                if stack.len() > self.facts.len() + 1 {
-                    return Err(Error::Corrupt(
-                        "a fixed point's records form a cycle".into(),
-                    ));
-                }
-                if done.contains_key(&top) {
+            stack.push((f, false));
+            while let Some(&(top, expanded)) = stack.last() {
+                if !expanded && done.contains_key(&top) {
                     stack.pop();
                     continue;
                 }
@@ -376,13 +398,24 @@ impl<P: Program> FixedPoint<P> {
                 })?;
                 prem.clear();
                 self.program.premises(&top, &r, &mut prem);
-                let missing: Vec<P::Fact> = prem
-                    .iter()
-                    .filter(|p| dirty.contains(*p) && !done.contains_key(*p))
-                    .copied()
-                    .collect();
-                if !missing.is_empty() {
-                    stack.extend(missing);
+                if !expanded {
+                    if !open.insert(top) {
+                        return Err(Error::Corrupt(
+                            "a fixed point's records form a cycle".into(),
+                        ));
+                    }
+                    stack.last_mut().expect("the frame").1 = true;
+                    let mut scheduled: FxHashSet<P::Fact> = FxHashSet::default();
+                    for p in &prem {
+                        if dirty.contains(p) && !done.contains_key(p) && scheduled.insert(*p) {
+                            if open.contains(p) {
+                                return Err(Error::Corrupt(
+                                    "a fixed point's records form a cycle".into(),
+                                ));
+                            }
+                            stack.push((*p, false));
+                        }
+                    }
                     continue;
                 }
                 let mut anns: Vec<&Ann> = Vec::with_capacity(prem.len());
@@ -395,10 +428,16 @@ impl<P: Program> FixedPoint<P> {
                     anns.push(a);
                 }
                 let a = self.program.annotate(cx, self.mode, &top, &r, &anns)?;
+                pending += a.bytes() + 16;
                 done.insert(top, a);
+                open.remove(&top);
                 stack.pop();
+                if done.len().is_multiple_of(4096) {
+                    self.check(max, pending)?;
+                }
             }
         }
+        self.check(max, pending)?;
         Ok(Some(done))
     }
 
@@ -525,6 +564,7 @@ impl<P: Program> FixedPoint<P> {
                 weight: 1,
                 ann: None,
             }));
+            self.check(max_bytes, 0)?;
             return Ok(out);
         }
         // the annotations of the facts whose records changed, of the facts whose
@@ -562,7 +602,7 @@ impl<P: Program> FixedPoint<P> {
                 }
             }
         }
-        let anns = self.annotate(cx, &dirty)?.unwrap_or_default();
+        let anns = self.annotate(cx, &dirty, max_bytes)?.unwrap_or_default();
         let fresh: FxHashSet<P::Fact> = added.iter().copied().collect();
         for f in dirty {
             let Some(a) = anns.get(&f).cloned() else {
@@ -584,6 +624,7 @@ impl<P: Program> FixedPoint<P> {
                 ann: Some(d),
             });
         }
+        self.check(max_bytes, 0)?;
         Ok(out)
     }
 

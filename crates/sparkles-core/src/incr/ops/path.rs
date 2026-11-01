@@ -91,6 +91,13 @@ struct Cache {
     edges: Option<Vec<Edge>>,
     /// the nodes that reach a node at a snapshot, the node itself among them
     reach: FxHashMap<(bool, Id, Id), Arc<[Id]>>,
+    /// the approximate memory of the memos above
+    bytes: u64,
+}
+
+/// The approximate memory of a memo entry: its key, its slot and a list of `n` ids.
+fn memo_bytes(n: usize) -> u64 {
+    32 + 16 + 16 + 8 * n as u64
 }
 
 fn side(w: Which) -> bool {
@@ -106,6 +113,11 @@ impl Closure {
             scope,
             cache: Cache::default(),
         }
+    }
+
+    /// Release the memos of the pass, so that they hold no memory between passes.
+    pub fn end(&mut self) {
+        self.cache = Cache::default();
     }
 
     /// Forget what the previous pass resolved.
@@ -184,6 +196,7 @@ impl Closure {
         v.sort_unstable();
         v.dedup();
         let v: Arc<[Id]> = v.into();
+        self.cache.bytes += memo_bytes(v.len());
         self.cache.next.insert(key, v.clone());
         Ok(v)
     }
@@ -260,6 +273,7 @@ impl Closure {
             let new = self.edge(p, Which::New, g, a, b)?;
             out.push((g, a, b, old, new));
         }
+        self.cache.bytes += 32 * out.len() as u64;
         self.cache.edges = Some(out.clone());
         Ok(out)
     }
@@ -282,6 +296,7 @@ impl Closure {
             }
         }
         let v: Arc<[Id]> = seen.into_iter().collect::<Vec<_>>().into();
+        self.cache.bytes += memo_bytes(v.len());
         self.cache.reach.insert(key, v.clone());
         Ok(v)
     }
@@ -487,6 +502,10 @@ impl Program for Closure {
         // the key, the record and the map's slot overhead
         24 + 8 + 8
     }
+
+    fn scratch_bytes(&self) -> u64 {
+        self.cache.bytes
+    }
 }
 
 /// A path with `+` or `*` between two ends.
@@ -613,6 +632,13 @@ impl PathOp {
 
     pub fn init_a(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         self.fixed.program.begin(p);
+        let out = self.init_rows(p, schema);
+        // the memos of the pass are released whether it succeeded or not
+        self.fixed.program.end();
+        out
+    }
+
+    fn init_rows(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         let ends = self.ends(p);
         let max = p.max_memory_bytes;
         let ch = self.fixed.build(p, max)?;
@@ -628,6 +654,12 @@ impl PathOp {
             return Ok(Vec::new());
         }
         self.fixed.program.begin(p);
+        let out = self.delta_rows(p, schema);
+        self.fixed.program.end();
+        out
+    }
+
+    fn delta_rows(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         let ends = self.ends(p);
         let max = p.max_memory_bytes;
         let ch = self.fixed.advance(p, max)?;
@@ -694,16 +726,18 @@ impl PathOp {
 
     /// Whether the active graph `g` exists for the circuit's reader at `w`, as the query
     /// engine decides it for a zero-length path from a constant end. A named graph
-    /// exists while it holds a quad and the reader may read it. The default graph exists
-    /// when the reader may read it, and the union default graph unless some named graph
-    /// holds a quad and the reader may read none of those that do.
+    /// exists while it holds a quad the reader may read, so a graph whose triples a
+    /// protection hides does not. The default graph exists when the reader may read it,
+    /// and the union default graph unless some named graph holds a quad and the reader
+    /// may read none of those that do.
     fn graph_exists(&self, p: &Pass, w: Which, g: Id) -> Result<bool> {
         let snap = p.snap(w);
         let access = p.access.as_ref().filter(|a| !a.reads_all());
         let readable = |g: Id| access.is_none_or(|a| a.readable_id(snap, g));
+        // the visible quads only: a scan skips the quads that protections hide
         let holds = |g: Id| -> Result<bool> {
             let mut found = false;
-            snap.scan(crate::index::Perm::Gspo, &[g.0], |_| {
+            p.scan(w, None, None, None, GraphSel::Exact(g), &mut |_| {
                 found = true;
                 Ok(false)
             })?;

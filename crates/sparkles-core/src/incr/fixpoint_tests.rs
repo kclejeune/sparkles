@@ -435,6 +435,74 @@ fn a_closure_over_its_budget_fails() {
     assert!(matches!(e, crate::Error::BudgetExceeded(_)), "{e:?}");
 }
 
+/// The walks a pass memoizes count against the budget while the pass runs and are
+/// released after it, so a commit of many steps that reach nothing neither keeps
+/// memory nor passes a small budget unnoticed.
+#[test]
+fn a_pass_releases_and_budgets_its_walks() {
+    let s = Store::in_memory(StoreOptions::default());
+    apply(&s, &[], &[(0, 1, 1, 0)]);
+    let parsed = sparql::parse_query(
+        &format!("{PREFIX}SELECT ?y WHERE {{ :n0 :p+ ?y }}"),
+        None,
+        &[],
+    )
+    .unwrap();
+    let edges: String = (0..5000)
+        .map(|i| format!("<{NS}c{i}> <{NS}p> <{NS}d{i}> . "))
+        .collect();
+    let insert = format!("INSERT DATA {{ {edges} }}");
+    // without a budget, the state after the pass is the state before it
+    let mut c = Circuit::new(compile(&parsed, None).unwrap(), None);
+    c.build(s.snapshot(), &Control::none()).unwrap();
+    let before = c.bytes();
+    sparql::update::update(&s, &insert, &QueryOptions::default()).unwrap();
+    step(&s, &mut c);
+    assert_eq!(c.bytes(), before);
+    assert!(result(&c).is_empty());
+    // with a budget the state fits but the pass's walks do not
+    let s = Store::in_memory(StoreOptions::default());
+    apply(&s, &[], &[(0, 1, 1, 0)]);
+    let mut c = Circuit::new(compile(&parsed, None).unwrap(), None);
+    c.max_memory_bytes = Some(16 << 10);
+    c.build(s.snapshot(), &Control::none()).unwrap();
+    sparql::update::update(&s, &insert, &QueryOptions::default()).unwrap();
+    let d = DeltaSet::read(&s, c.applied, &Control::none());
+    let Err(e) = c.advance(&d, &Control::none()) else {
+        panic!("the pass fits its budget");
+    };
+    assert!(matches!(e, crate::Error::BudgetExceeded(_)), "{e:?}");
+}
+
+/// The variables the compiler adds for a path's step cannot capture the query's own.
+#[test]
+fn step_variables_do_not_capture_query_variables() {
+    let queries = [
+        "SELECT ?__fp1x ?s ?o WHERE { GRAPH ?__fp1x { ?s :p+ ?o } }",
+        "SELECT ?__fp1y ?s ?o WHERE { GRAPH ?__fp1y { ?s :p+ ?o } }",
+        "SELECT ?__fp1x ?__fp1y WHERE { ?__fp1x :p* ?__fp1y }",
+        "SELECT ?s ?__fp1y WHERE { ?s :p+ ?o . ?o :q ?__fp1y }",
+    ];
+    let s = Store::in_memory(StoreOptions::default());
+    apply(
+        &s,
+        &[],
+        &[
+            (0, 0, 1, 1),
+            (1, 0, 2, 1),
+            (2, 1, 3, 1),
+            (0, 0, 1, 0),
+            (1, 1, 2, 0),
+        ],
+    );
+    for q in queries {
+        let c = circuit(&s, q, Provenance::None);
+        let want = oracle(&s, q, &c.columns(), c.kind);
+        assert!(!want.is_empty(), "{q}");
+        assert_eq!(result(&c), want, "{q}");
+    }
+}
+
 /// The quads of the model by fact key.
 fn keys(data: &BTreeSet<Quad>) -> BTreeMap<FactKey, Quad> {
     data.iter()
@@ -568,8 +636,37 @@ fn check_annotations(
     Ok(())
 }
 
+/// A reader of every graph whose protection hides the triples of one predicate.
+fn hiding(pred: &str) -> std::sync::Arc<crate::access::GraphAccess> {
+    use crate::access::{Caller, GraphAccess, Graphs, Limits, Protection, Rule, TripleRules};
+    let protection = Protection {
+        name: "hide".into(),
+        predicates: Some(vec![pred.into()]),
+        classes: None,
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    std::sync::Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: std::sync::Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    ))
+}
+
 /// Zero-length rows from a constant end depend on whether the reader can read the
-/// active graph, with the union default graph and without.
+/// active graph, and on the triples that protections hide in it, with the union default
+/// graph and without.
 #[test]
 fn zero_length_rows_follow_access_and_the_union_graph() {
     use crate::access::{GraphAccess, GraphRule, Graphs};
@@ -604,6 +701,8 @@ fn zero_length_rows_follow_access_and_the_union_graph() {
                 Graphs::none(),
             ))),
         ),
+        ("hiding q", Some(hiding("http://ex/q"))),
+        ("hiding p", Some(hiding("http://ex/p"))),
     ];
     let queries = [
         "SELECT ?y WHERE { :n0 :p* ?y }",

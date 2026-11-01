@@ -1060,8 +1060,11 @@ impl C {
         let subj = end(s, self)?;
         let obj = end(o, self)?;
         self.hidden += 1;
-        let xs = format!("__fp{}x", self.hidden);
-        let ys = format!("__fp{}y", self.hidden);
+        // `#` cannot occur in a SPARQL variable name, so these names never capture the
+        // query's variables; they appear only in the step's patterns, which are never
+        // written back as SPARQL
+        let xs = format!("#fp{}x", self.hidden);
+        let ys = format!("#fp{}y", self.hidden);
         let (xv, yv) = (
             TermPattern::Variable(Variable::new_unchecked(xs.clone())),
             TermPattern::Variable(Variable::new_unchecked(ys.clone())),
