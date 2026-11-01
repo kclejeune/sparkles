@@ -39,6 +39,7 @@
   "build": "debug test profile, mbx test -p sparkles-core --test w3c",
   "commit": "fcff390a7ab9a27f9a78a749c8d85db4d1204a62",
   "ended": "2026-11-01T03:49:47Z",
+  "record_rebuilt_by": "scripts/bench-gate.py at 3428e387 from the retained output.log",
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "suites": "Apache Jena checkout b1dcba53b5",
   "test_binary_sha256": "de47f08d37a38d086a0c02bef00ca9a36dd0fa6419a19dc7522521d83f9d07d8"
@@ -98,6 +99,7 @@
   "batch_rows": 4096,
   "execution": "streaming",
   "harness": "crates/sparkles-core/tests/w3c.rs, the streaming_ tests",
+  "host_independent": true,
   "threshold": 0.0
  },
  "suite": "w3c-sparql"

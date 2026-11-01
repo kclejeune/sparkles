@@ -327,6 +327,8 @@ operator that the cursors do not stream, which then runs eagerly on first demand
 counts are the measure that the executor merge drives to zero. The
 [run record](runs/2026-11-01-w3c-streaming-stanley/record.json) and its
 [log](runs/2026-11-01-w3c-streaming-stanley/output.log) hold the counts. `mise run test`
-runs the same tests in CI with Oxigraph's GeoSPARQL tests added. The streaming tests
+runs the same tests in CI with Oxigraph's GeoSPARQL tests added. A separate run with the
+`geo` feature gave 37 passes and the 7 listed failures of those tests in both modes, with
+no eager fallback. The streaming tests
 replace the cursor pass at 4,096 rows that `sparql_query_cursors` used to run, so CI
 runs about 10 seconds more of these tests than before.
