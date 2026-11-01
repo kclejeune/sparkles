@@ -90,6 +90,11 @@ fn metric(key: &str, value: f64, unit: &str, better: &str) {
 /// Append one check to `INCR_BENCH_JSON`: a condition the timings depend on, such as a
 /// maintained view equal to evaluating its query again.
 fn check(name: &str, ok: bool, detail: String) {
+    check_with(name, ok, detail, None);
+}
+
+/// `check` with a fingerprint, which a comparison requires to equal the baseline's.
+fn check_with(name: &str, ok: bool, detail: String, fingerprint: Option<String>) {
     use std::io::Write as _;
     if !ok {
         eprintln!("check failed: {name}: {detail}");
@@ -103,7 +108,10 @@ fn check(name: &str, ok: bool, detail: String) {
         .append(true)
         .open(path)
         .unwrap();
-    let line = serde_json::json!({ "check": name, "ok": ok, "detail": detail });
+    let mut line = serde_json::json!({ "check": name, "ok": ok, "detail": detail });
+    if let Some(fp) = fingerprint {
+        line["fingerprint"] = fp.into();
+    }
     writeln!(f, "{line}").unwrap();
 }
 
@@ -146,10 +154,26 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
     )
     .unwrap();
     let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
+    // the evaluated answer's variables and rows, which stay the same across builds, so that
+    // a change that breaks the view and its query alike still differs from the baseline
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for row in std::iter::once(&fresh.vars.join(" ")).chain(&want) {
+        for b in row.bytes().chain(*b"\n") {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let fingerprint = format!("{} rows, {h:016x}", want.len());
     let (ok, detail) = match read {
         Ok(r) if r.commit != snap.commit => (
             false,
             format!("the view is at commit {} of {}", r.commit, snap.commit),
+        ),
+        Ok(r) if r.columns != fresh.vars => (
+            false,
+            format!(
+                "the view's columns are {:?}, the query's {:?}",
+                r.columns, fresh.vars
+            ),
         ),
         Ok(r) => {
             let got = rows_of(&r.rows);
@@ -164,7 +188,7 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
         }
         Err(e) => (false, e.to_string()),
     };
-    check(&format!("{key}/answer"), ok, detail);
+    check_with(&format!("{key}/answer"), ok, detail, Some(fingerprint));
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
