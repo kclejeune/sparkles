@@ -18,7 +18,8 @@
 # WARM_DIGEST set to a command, such as `python3 scripts/bench-gate.py native-digest`, it is
 # run with the query file and every timed response, after each query's timed requests, and
 # results/warm-answers.tsv gets its output, so that the timed format's answers are checked
-# too. Progress goes to results/progress.log and results/done marks the end.
+# too. A response byte-identical to one already digested for the same query reuses that
+# digest. Progress goes to results/progress.log and results/done marks the end.
 #
 # With SPIN=1 (the default), a busy loop at the lowest priority (SCHED_IDLE) runs on the
 # server and client CPUs during the timed part. It keeps their vCPUs from halting between
@@ -59,6 +60,8 @@ trap 'fail "line $LINENO"' ERR
 # dynamically linked one (DYNAMIC_A, DYNAMIC_B) runs under this image's loader.
 # BIN[v] is the command that runs variant v.
 declare -A BIN
+# DIGESTS caches WARM_DIGEST output by query and response hash.
+declare -A DIGESTS=()
 for v in A B; do
   d=DYNAMIC_$v
   if [ "${!d:-1}" = 1 ]; then BIN[$v]="/lib64/ld-linux-x86-64.so.2 $v/sparkles"; else BIN[$v]=$v/sparkles; fi
@@ -224,8 +227,16 @@ for round in $(seq "$ROUNDS"); do
       done
       if [ -n "${WARM_DIGEST:-}" ]; then
         for rep in $(seq "$REPS"); do
-          # shellcheck disable=SC2086
-          printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$v" "$q" "$rep" "$($WARM_DIGEST "queries/$q.rq" "timed-$rep.json")" >> "$R/warm-answers.tsv"
+          # byte-identical responses to the same query have the same digest, so each
+          # distinct response is digested once per run of this script
+          key=missing
+          [ ! -f "timed-$rep.json" ] || key=$(sha256sum < "timed-$rep.json" | cut -c1-64)
+          key="$q/$key"
+          if [ -z "${DIGESTS[$key]+set}" ]; then
+            # shellcheck disable=SC2086
+            DIGESTS[$key]=$($WARM_DIGEST "queries/$q.rq" "timed-$rep.json")
+          fi
+          printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$v" "$q" "$rep" "${DIGESTS[$key]}" >> "$R/warm-answers.tsv"
           rm -f "timed-$rep.json"
         done
       fi
