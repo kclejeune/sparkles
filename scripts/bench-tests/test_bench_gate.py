@@ -589,6 +589,20 @@ class GateTests(unittest.TestCase):
             self.assertEqual(both, alone)
             self.assertNotEqual(alone[0].split(", ")[-1], alone[1].split(", ")[-1])
 
+    def test_cell_summary_reads_order_digests(self):
+        # a matrix cell's answers.tsv has a fifth column of order digests
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            res.joinpath("samples.tsv").write_text(
+                "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
+                "1\t1\tA\tsorted\t1\t1\t2\n1\t2\tB\tsorted\t1\t1\t2\n")
+            res.joinpath("answers.tsv").write_text("A\tsorted\t2\tx\tkeys:k\nB\tsorted\t2\tx\tkeys:j\n")
+            r = subprocess.run([sys.executable, str(SCRIPTS / "nsc-bench-summary.py"), d],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Answers differ or failed for: sorted", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

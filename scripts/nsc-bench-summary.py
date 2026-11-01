@@ -89,8 +89,10 @@ def main():
 
     answers = read_tsv(res / "answers.tsv")
     by_q = defaultdict(dict)
-    for v, q, n, h in answers:
-        by_q[q][v] = (n, h)
+    for row in answers:
+        # variant, query, rows, digest and, with ORDER_DIGEST, an order digest
+        v, q = row[:2]
+        by_q[q][v] = tuple(row[2:])
     diff = [q for q in order if len(set(by_q[q].values())) != 1 or "error" in str(by_q[q])]
     if answers:
         if diff:
