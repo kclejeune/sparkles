@@ -95,7 +95,14 @@ pub struct Origin {
     /// indices into [`Ontology::triples`]; empty for a declaration that the mapping
     /// implies (Table 6) and for the built-in declarations
     pub triples: Vec<usize>,
+    /// the axiom's main triple, among `triples`, for an axiom that has one (Tables 16
+    /// to 18): the triple that belongs to the axiom even when its subject is an
+    /// expression another axiom shares
+    pub main: Option<usize>,
 }
+
+/// The deepest nesting of class expressions and data ranges a read follows.
+pub const MAX_NESTING: usize = 128;
 
 /// The entity kinds an IRI is declared with or was typed with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -508,6 +515,7 @@ struct Parser<'a> {
     dr_memo: FxHashMap<BlankNode, Option<Parsed<DataRange>>>,
     /// parsing in progress, to stop on cycles
     active: FxHashSet<BlankNode>,
+    nesting_reported: bool,
     shared_warned: FxHashSet<BlankNode>,
     axioms: BTreeMap<Axiom, Vec<Origin>>,
     diags: Vec<Diagnostic>,
@@ -557,6 +565,7 @@ impl<'a> Parser<'a> {
             ce_memo: FxHashMap::default(),
             dr_memo: FxHashMap::default(),
             active: FxHashSet::default(),
+            nesting_reported: false,
             shared_warned: FxHashSet::default(),
             axioms: BTreeMap::new(),
             diags: Vec::new(),
@@ -596,6 +605,23 @@ impl<'a> Parser<'a> {
 
     fn warn(&mut self, code: &'static str, message: String, triples: Vec<usize>) {
         self.diag(Severity::Warning, code, message, triples);
+    }
+
+    /// An expression nested deeper than [`MAX_NESTING`]: it stays unmapped, once
+    /// reported, so that a long chain of blank nodes cannot exhaust the stack.
+    fn too_deep(&mut self, b: &BlankNode) {
+        if !self.nesting_reported {
+            self.nesting_reported = true;
+            self.diag(
+                Severity::Error,
+                "nesting",
+                format!(
+                    "the expression at _:{} is nested more than {MAX_NESTING} levels deep and is not read",
+                    b.as_str()
+                ),
+                Vec::new(),
+            );
+        }
     }
 
     // ---------------------------------------------------------------- lookups ------
@@ -814,6 +840,7 @@ impl<'a> Parser<'a> {
                     self.axioms.entry(ax).or_default().push(Origin {
                         graph: g,
                         triples: Vec::new(),
+                        main: None,
                     });
                     None
                 }
@@ -1449,6 +1476,10 @@ impl<'a> Parser<'a> {
                 if let Some(m) = self.dr_memo.get(b) {
                     return m.clone();
                 }
+                if self.active.len() >= MAX_NESTING {
+                    self.too_deep(b);
+                    return None;
+                }
                 if !self.active.insert(b.clone()) {
                     return None;
                 }
@@ -1593,6 +1624,10 @@ impl<'a> Parser<'a> {
             Term::BlankNode(b) => {
                 if let Some(m) = self.ce_memo.get(b) {
                     return m.clone();
+                }
+                if self.active.len() >= MAX_NESTING {
+                    self.too_deep(b);
+                    return None;
                 }
                 if !self.active.insert(b.clone()) {
                     return None;
@@ -1884,7 +1919,13 @@ impl<'a> Parser<'a> {
 
     // ------------------------------------------------------------------ axioms ------
 
-    fn commit(&mut self, kind: AxiomKind, annotations: BTreeSet<Annotation>, triples: Vec<usize>) {
+    fn commit(
+        &mut self,
+        kind: AxiomKind,
+        annotations: BTreeSet<Annotation>,
+        triples: Vec<usize>,
+        main: Option<usize>,
+    ) {
         for i in &triples {
             self.used[*i] = true;
         }
@@ -1895,7 +1936,11 @@ impl<'a> Parser<'a> {
         self.axioms
             .entry(Axiom { kind, annotations })
             .or_default()
-            .push(Origin { graph, triples });
+            .push(Origin {
+                graph,
+                triples,
+                main,
+            });
     }
 
     /// The axiom whose main triple is `i` (Tables 16 and 18), with the triples of its
@@ -2358,7 +2403,8 @@ impl<'a> Parser<'a> {
             ts.extend([ti, si, pi, oi]);
             ts.extend(ats);
             self.annotated_main.insert(m);
-            self.commit(kind, anns, ts);
+            ts.push(m);
+            self.commit(kind, anns, ts, Some(m));
         }
     }
 
@@ -2397,7 +2443,7 @@ impl<'a> Parser<'a> {
             ts.push(ti);
             let (anns, ats) = self.take_annotations(&xk);
             ts.extend(ats);
-            self.commit(kind, anns, ts);
+            self.commit(kind, anns, ts, None);
         }
     }
 
@@ -2505,7 +2551,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if let Some((kind, ts)) = self.axiom_of_main(i, false) {
-                self.commit(kind, BTreeSet::new(), ts);
+                self.commit(kind, BTreeSet::new(), ts, Some(i));
             }
         }
     }
@@ -2535,10 +2581,12 @@ impl<'a> Parser<'a> {
                     value,
                     annotations,
                 } = a.value;
+                let main = a.triples.first().copied();
                 self.commit(
                     AxiomKind::AnnotationAssertion(property, subject.clone(), value),
                     annotations,
                     a.triples,
+                    main,
                 );
             }
         }

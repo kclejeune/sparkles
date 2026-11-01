@@ -91,11 +91,18 @@ impl Dl {
                     composite.insert(a.clone());
                     composite.insert(a.inverse());
                 }
-                AxiomKind::DatatypeDefinition(d, _) => {
+                AxiomKind::DatatypeDefinition(d, r) => {
                     *dl.definitions.entry(d.as_str().to_string()).or_default() += 1;
-                    let used: BTreeSet<String> = datatypes(&ax.kind)
+                    // the datatypes of the definition's range, `d` itself included
+                    let mut sig = crate::model::Signature::default();
+                    sig.dr(r);
+                    let used: BTreeSet<String> = sig
+                        .0
                         .into_iter()
-                        .filter(|x| x != d.as_str())
+                        .filter_map(|e| match e {
+                            crate::model::Entity::Datatype(x) => Some(x.as_str().to_string()),
+                            _ => None,
+                        })
                         .collect();
                     defs.entry(d.as_str().to_string()).or_default().extend(used);
                 }

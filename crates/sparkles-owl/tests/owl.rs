@@ -959,3 +959,98 @@ mod random {
         }
     }
 }
+
+// ---- review regressions ----------------------------------------------------------
+
+#[test]
+fn deep_nesting_stays_unmapped() {
+    // a chain of complements far deeper than the read follows: no stack overflow
+    let mut body = decl(":A rdfs:subClassOf _:c0 .\n");
+    for i in 0..20_000 {
+        body.push_str(&format!(
+            "_:c{i} a owl:Class ; owl:complementOf _:c{} .\n",
+            i + 1
+        ));
+    }
+    body.push_str("_:c20000 a owl:Class ; owl:complementOf :B .\n");
+    let o = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || lenient(&body))
+        .unwrap()
+        .join()
+        .expect("the read does not overflow its stack");
+    assert!(o.diagnostics.iter().any(|d| d.code == "nesting"));
+    assert!(!o.unmapped.is_empty());
+    assert!(!report(&o, Profile::Dl).conforms);
+}
+
+#[test]
+fn mentions_reaches_annotation_values() {
+    let see = "http://example.org/E";
+    let o = strict(&decl(
+        "[] a owl:Axiom ; owl:annotatedSource :A ; owl:annotatedProperty rdfs:subClassOf ;
+            owl:annotatedTarget :B ; rdfs:seeAlso :E .
+         :A rdfs:subClassOf :B .
+         _:x rdfs:seeAlso :E .",
+    ));
+    let hits: Vec<String> = o
+        .axiom_set()
+        .filter(|a| a.mentions(see))
+        .map(|a| a.to_string())
+        .collect();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+}
+
+#[test]
+fn normal_forms_follow_the_reverse_mapping() {
+    let eq = Axiom::from(AxiomKind::EquivalentClasses(
+        [class("A"), class("B"), class("C")].into_iter().collect(),
+    ));
+    let read: BTreeSet<Axiom> = {
+        let mut fresh = 0;
+        let triples = write::axiom_triples(&eq, &mut || {
+            fresh += 1;
+            oxrdf::BlankNode::new_unchecked(format!("n{fresh}"))
+        });
+        let mut body = decl("");
+        for t in triples {
+            body.push_str(&format!("{t} .\n"));
+        }
+        strict(&body)
+            .axiom_set()
+            .filter(|a| a.axiom_type() == AxiomType::EquivalentClasses)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(eq.normal_forms().into_iter().collect::<BTreeSet<_>>(), read);
+    let inv = Axiom::from(AxiomKind::ObjectPropertyAssertion(
+        ObjectPropertyExpression::InverseOf(op("p")),
+        ind("a"),
+        ind("b"),
+    ));
+    assert_eq!(
+        inv.normal_forms(),
+        [Axiom::from(AxiomKind::ObjectPropertyAssertion(
+            ObjectPropertyExpression::Property(op("p")),
+            ind("b"),
+            ind("a"),
+        ))]
+    );
+}
+
+#[test]
+fn dl_refuses_a_datatype_defined_from_itself() {
+    let o = strict(&format!(
+        "{HEADER}:t a rdfs:Datatype .
+         :t owl:equivalentClass [ a rdfs:Datatype ; owl:datatypeComplementOf :t ] ."
+    ));
+    assert_profiles(&o, &[], &[(Profile::Dl, "§11")]);
+}
+
+#[test]
+fn el_ranges_pass_through_equivalent_properties() {
+    let o = strict(&decl(
+        ":s a owl:ObjectProperty . :r owl:propertyChainAxiom ( :p :q ) . :r owl:equivalentProperty :s . :s rdfs:range :A .",
+    ));
+    assert_profiles(&o, &[Profile::Dl], &[(Profile::El, "§2.2.6")]);
+}

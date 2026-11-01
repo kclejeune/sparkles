@@ -147,6 +147,23 @@ impl El {
                 AxiomKind::ObjectPropertyRange(ObjectPropertyExpression::Property(p), c) => {
                     direct.entry(p.clone()).or_default().insert(c.clone());
                 }
+                // equivalent properties are subproperties of each other
+                AxiomKind::EquivalentObjectProperties(ps) => {
+                    let named: Vec<&ObjectProperty> = ps
+                        .iter()
+                        .filter_map(|p| match p {
+                            ObjectPropertyExpression::Property(p) => Some(p),
+                            ObjectPropertyExpression::InverseOf(_) => None,
+                        })
+                        .collect();
+                    for a in &named {
+                        for b in &named {
+                            if a != b {
+                                sup.entry((*a).clone()).or_default().insert((*b).clone());
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }

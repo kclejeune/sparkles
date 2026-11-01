@@ -839,17 +839,71 @@ impl Axiom {
         s.0
     }
 
-    /// The IRIs the axiom mentions in any position, annotations included.
+    /// The IRIs the axiom mentions in any position, annotations and their values
+    /// included.
     pub fn mentions(&self, iri: &str) -> bool {
+        fn value(v: &AnnotationValue, iri: &str) -> bool {
+            matches!(v, AnnotationValue::Iri(v) if v.as_str() == iri)
+        }
+        fn annotation(a: &Annotation, iri: &str) -> bool {
+            value(&a.value, iri) || a.annotations.iter().any(|n| annotation(n, iri))
+        }
         self.signature().iter().any(|e| e.iri().as_str() == iri)
+            || self.annotations.iter().any(|a| annotation(a, iri))
             || match &self.kind {
-                AxiomKind::AnnotationAssertion(_, AnnotationSubject::Iri(s), v) => {
-                    s.as_str() == iri || matches!(v, AnnotationValue::Iri(v) if v.as_str() == iri)
+                AxiomKind::AnnotationAssertion(_, s, v) => {
+                    matches!(s, AnnotationSubject::Iri(s) if s.as_str() == iri) || value(v, iri)
                 }
                 AxiomKind::AnnotationPropertyDomain(_, d)
                 | AxiomKind::AnnotationPropertyRange(_, d) => d.as_str() == iri,
                 _ => false,
             }
+    }
+
+    /// The axioms the reverse mapping reads from this axiom's triples: an equivalence
+    /// or `SameIndividual` of more than two operands is written as pairwise triples and
+    /// read as one binary axiom per pair, and an object property assertion of an inverse
+    /// property is written and read as the assertion of the named property with the
+    /// individuals swapped. Every other axiom is its own normal form.
+    pub fn normal_forms(&self) -> Vec<Axiom> {
+        fn pairs<T: Clone + Ord>(
+            set: &BTreeSet<T>,
+            annotations: &BTreeSet<Annotation>,
+            f: impl Fn(BTreeSet<T>) -> AxiomKind,
+        ) -> Vec<Axiom> {
+            let items: Vec<&T> = set.iter().collect();
+            items
+                .windows(2)
+                .map(|w| Axiom {
+                    kind: f([w[0].clone(), w[1].clone()].into_iter().collect()),
+                    annotations: annotations.clone(),
+                })
+                .collect()
+        }
+        let a = &self.annotations;
+        match &self.kind {
+            AxiomKind::EquivalentClasses(s) if s.len() > 2 => {
+                pairs(s, a, AxiomKind::EquivalentClasses)
+            }
+            AxiomKind::EquivalentObjectProperties(s) if s.len() > 2 => {
+                pairs(s, a, AxiomKind::EquivalentObjectProperties)
+            }
+            AxiomKind::EquivalentDataProperties(s) if s.len() > 2 => {
+                pairs(s, a, AxiomKind::EquivalentDataProperties)
+            }
+            AxiomKind::SameIndividual(s) if s.len() > 2 => pairs(s, a, AxiomKind::SameIndividual),
+            AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::InverseOf(p), x, y) => {
+                vec![Axiom {
+                    kind: AxiomKind::ObjectPropertyAssertion(
+                        ObjectPropertyExpression::Property(p.clone()),
+                        y.clone(),
+                        x.clone(),
+                    ),
+                    annotations: a.clone(),
+                }]
+            }
+            _ => vec![self.clone()],
+        }
     }
 }
 
