@@ -101,6 +101,69 @@ impl DeltaSet {
         d
     }
 
+    /// The changes after commit `after` up to the store's head one commit at a time,
+    /// each set leading to the snapshot of its own commit (spec F13 §3.6). The
+    /// snapshots before the head are built from it by reversing the later commits'
+    /// changes ([`Snapshot::before_changes`]), so no history is read. `None` when some
+    /// commit's changes are not known, when the commits list more than
+    /// [`MAX_PASS_CHANGES`] changes together, or when a generation switch interrupts
+    /// the listing: a reader then evaluates again at the head.
+    pub fn steps(store: &Store, after: u64, control: &Control) -> Option<Steps> {
+        let snap = store.snapshot();
+        let mut commits = Vec::new();
+        if after >= snap.commit {
+            return Some(Steps { sets: Vec::new() });
+        }
+        let o = ChangesOptions {
+            max_commits: 1000,
+            cancel: Some(control.cancel.flag()),
+            deadline: control.deadline,
+            ..Default::default()
+        };
+        let mut at = after;
+        let mut listed = 0usize;
+        while at < snap.commit {
+            let page = store.commit_deltas(at, &o).ok()?;
+            if page.snapshot.generation.uid != snap.generation.uid || page.commits.is_empty() {
+                return None;
+            }
+            for c in page.commits {
+                if c.seq > snap.commit {
+                    break;
+                }
+                if !c.complete {
+                    return None;
+                }
+                listed += c.added.len() + c.removed.len();
+                at = c.seq;
+                commits.push(c);
+            }
+            if listed > MAX_PASS_CHANGES {
+                return None;
+            }
+        }
+        let mut sets = Vec::with_capacity(commits.len());
+        let mut top = snap;
+        for i in (0..commits.len()).rev() {
+            let before = if i == 0 { after } else { commits[i - 1].seq };
+            let c = &mut commits[i];
+            let d = DeltaSet {
+                after: before,
+                snapshot: top.clone(),
+                added: std::mem::take(&mut c.added),
+                removed: std::mem::take(&mut c.removed),
+                complete: true,
+                old: OnceLock::new(),
+            };
+            if i > 0 {
+                top = d.old().ok()?;
+            }
+            sets.push(d);
+        }
+        sets.reverse();
+        Some(Steps { sets })
+    }
+
     /// A set without changes that leads to `snap` (a build).
     pub fn at(snap: Arc<Snapshot>) -> DeltaSet {
         DeltaSet {
@@ -125,6 +188,12 @@ impl DeltaSet {
             .clone()
             .map_err(Error::Corrupt)
     }
+}
+
+/// The changes of a run of commits one commit at a time ([`DeltaSet::steps`]), in
+/// commit order. Each set's `after` is the previous set's commit.
+pub struct Steps {
+    pub sets: Vec<DeltaSet>,
 }
 
 /// What a pass did to a circuit.

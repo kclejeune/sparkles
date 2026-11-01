@@ -34,6 +34,35 @@ use std::path::{Path, PathBuf};
 const MAGIC: &[u8; 8] = b"SPKVIEW\0";
 /// The checkpoint format this release writes and reads.
 pub const FORMAT: u32 = 1;
+/// The format of internal circuits' checkpoints this release writes and reads
+/// ([`INTERNAL`]).
+pub const INTERNAL_FORMAT: u32 = 1;
+
+/// A kind of checkpoint file: its magic and the one format this release reads. Both
+/// kinds share the header layout above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kind {
+    pub magic: &'static [u8; 8],
+    pub format: u32,
+    /// what the file holds, for errors
+    pub what: &'static str,
+}
+
+/// The checkpoints of views, `views/{name}/main/state-{commit}.bin`.
+pub const VIEW: Kind = Kind {
+    magic: MAGIC,
+    format: FORMAT,
+    what: "view state",
+};
+
+/// The checkpoints of internal circuits (spec F13 §3.6),
+/// `circuits/{id}/main/state-{commit}.bin` with the magic `SPKCIRC\0`: the header
+/// above, then a body that [`super::internal`] lays out.
+pub const INTERNAL: Kind = Kind {
+    magic: b"SPKCIRC\0",
+    format: INTERNAL_FORMAT,
+    what: "internal circuit state",
+};
 const HEADER: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 4;
 
 /// Encodes a state, mapping ids to the keys of their terms.
@@ -255,9 +284,14 @@ fn crc32(b: &[u8]) -> u32 {
 
 /// The bytes of a checkpoint file.
 pub fn encode(h: &Header, body: &[u8]) -> Vec<u8> {
+    encode_as(VIEW, h, body)
+}
+
+/// The bytes of a checkpoint file of `kind`.
+pub fn encode_as(kind: Kind, h: &Header, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + body.len());
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&FORMAT.to_le_bytes());
+    out.extend_from_slice(kind.magic);
+    out.extend_from_slice(&kind.format.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(h.dataset.as_bytes());
     out.extend_from_slice(&h.commit.to_le_bytes());
@@ -271,15 +305,22 @@ pub fn encode(h: &Header, body: &[u8]) -> Vec<u8> {
 /// The header and body of a checkpoint file. A format newer than this release reads is
 /// [`Error::Unsupported`], and damage is [`Error::Corrupt`].
 pub fn decode(b: &[u8]) -> Result<(Header, &[u8])> {
-    if b.len() < 16 || &b[..8] != MAGIC {
-        return Err(Error::Corrupt("not a view state file".into()));
+    decode_as(VIEW, b)
+}
+
+/// [`decode`] for a checkpoint file of `kind`.
+pub fn decode_as(kind: Kind, b: &[u8]) -> Result<(Header, &[u8])> {
+    let what = kind.what;
+    if b.len() < 16 || &b[..8] != kind.magic {
+        return Err(Error::Corrupt(format!("not a {what} file")));
     }
     let format = u32::from_le_bytes(b[8..12].try_into().expect("4 bytes"));
-    if format != FORMAT {
+    if format != kind.format {
         return Err(Error::Unsupported(format!(
-            "the view state has format {format}; Sparkles {} reads format {FORMAT}. It was \
-             written by another release",
-            env!("CARGO_PKG_VERSION")
+            "the {what} has format {format}; Sparkles {} reads format {}. It was written \
+             by another release",
+            env!("CARGO_PKG_VERSION"),
+            kind.format
         )));
     }
     if b.len() < HEADER {
@@ -341,10 +382,22 @@ pub fn write(dir: &Path, h: &Header, body: &[u8]) -> Result<()> {
 /// temporary name and before it is renamed into place. A crash there leaves the
 /// temporary file, which [`list`] does not read and the next checkpoint removes.
 pub fn write_with(dir: &Path, h: &Header, body: &[u8], before_rename: impl FnOnce()) -> Result<()> {
+    write_as(VIEW, dir, h, body, before_rename)
+}
+
+/// [`write_with`] for a checkpoint file of `kind`. Older files of `kind` in this
+/// release's format are removed, and files of another kind or format are left alone.
+pub fn write_as(
+    kind: Kind,
+    dir: &Path,
+    h: &Header,
+    body: &[u8],
+    before_rename: impl FnOnce(),
+) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name(h.commit));
     let tmp = path.with_extension("tmp");
-    crate::store::write_synced(&tmp, &encode(h, body))?;
+    crate::store::write_synced(&tmp, &encode_as(kind, h, body))?;
     before_rename();
     std::fs::rename(&tmp, &path)?;
     crate::store::sync_dir(dir)?;
@@ -361,9 +414,9 @@ pub fn write_with(dir: &Path, h: &Header, body: &[u8], before_rename: impl FnOnc
             continue;
         }
         // a file another release wrote is left alone
-        let known = std::fs::read(&p)
-            .ok()
-            .is_some_and(|b| b.len() >= 12 && b[8..12] == FORMAT.to_le_bytes());
+        let known = std::fs::read(&p).ok().is_some_and(|b| {
+            b.len() >= 12 && &b[..8] == kind.magic && b[8..12] == kind.format.to_le_bytes()
+        });
         if known {
             let _ = std::fs::remove_file(p);
         }

@@ -101,7 +101,11 @@ impl Runtime {
             return;
         }
         self.checkpoint(store);
-        let cells: Vec<Arc<Cell>> = self.reg.lock().cells.drain().map(|(_, c)| c).collect();
+        let cells: Vec<Arc<Cell>> = {
+            let mut reg = self.reg.lock();
+            reg.internal.clear();
+            reg.cells.drain().map(|(_, c)| c).collect()
+        };
         for c in cells {
             let mut st = c.state.lock();
             for s in st.subs.drain(..) {
