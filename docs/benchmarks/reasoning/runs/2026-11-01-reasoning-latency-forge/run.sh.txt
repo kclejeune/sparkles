@@ -1,9 +1,0 @@
-  reasoning)
-    out=$R/reasoning; mkdir -p "$out"; started=$(date -u +%FT%TZ)
-    RAYON_NUM_THREADS=12 "$L/bin/reasoning_latency" 10 5 3 "$out/metrics.jsonl" 2>&1 | tee "$out/output.md"
-    python3 "$S/scripts/bench-gate.py" metrics "$out/metrics.jsonl" --gate reasoning-latency --suite lubm-style \
-      --scale "10 universities" --threshold 0.10 --out "$out/record.json" "${common[@]}" \
-      --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest binary_sha256="$(sha256sum "$L/bin/reasoning_latency" | cut -d' ' -f1)" \
-      --setting universities=10 --setting rounds=5 --setting reps=3 --setting threads=12 \
-      --setting harness=crates/sparkles-reasoner/examples/reasoning_latency.rs
-    ;;
