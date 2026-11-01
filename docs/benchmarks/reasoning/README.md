@@ -6,6 +6,8 @@ Read the [results](RESULTS.md), [run catalog](RUNS.json) and
 [shared reference setup](../reference/README.md). The
 [harness guide](../../BENCHMARKING.md) documents commands and output formats.
 
+The reasoning gate of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) records its baseline in [the results](RESULTS.md#query-time-reasoning-latency). A lane that changes the reasoner's query path, derivation on demand or RDFS on read runs `mise run bench:reasoning-latency` on forge and compares its record with that baseline through `scripts/bench-gate.py compare`.
+
 The result report is a manual import. A linked raw record supports only the measurements
 and metadata it contains. Missing build revisions, host details, durability settings or
 answer evidence remain unknown and must be supplied by a new run before a broader claim
