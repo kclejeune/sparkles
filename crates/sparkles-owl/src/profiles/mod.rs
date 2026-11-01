@@ -212,6 +212,20 @@ impl Checker {
         }
     }
 
+    /// Note a triple that maps to no axiom, such as an assertion triple streamed from a
+    /// store: it keeps the ontology out of OWL 2 DL, and so out of every profile.
+    pub fn unmapped(&mut self, t: &oxrdf::Triple, graph: Option<u32>) {
+        let v = Violation {
+            axiom: None,
+            graph,
+            rule: "OWL 2 Mapping to RDF Graphs §3".into(),
+            message: format!("the triple {t} maps to no axiom"),
+        };
+        for n in 0..self.profiles.len() {
+            self.push(n, v.clone());
+        }
+    }
+
     /// Finish the check: the restrictions of the whole ontology, and the reports.
     pub fn finish(mut self) -> Vec<Report> {
         let global = self.dl.finish();

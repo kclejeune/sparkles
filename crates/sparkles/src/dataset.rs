@@ -198,6 +198,10 @@ pub struct DatasetState {
     /// pagination cursors and to be maintained from later changes (at most
     /// [`SCHEMA_CACHE_ENTRIES`])
     pub schema_cache: Mutex<Vec<SchemaCacheEntry>>,
+    /// the last ontologies opened by callers who read every graph, most recently used
+    /// last (at most [`crate::handles::ontology::CACHE_ENTRIES`])
+    #[cfg(feature = "ontology")]
+    pub ontology_cache: Mutex<Vec<crate::handles::ontology::CacheEntry>>,
     /// the objects of predicates measured for reports of [`crate::schema::Basis::Statistics`]
     pub objects_cache: Mutex<ObjectsCache>,
     /// where a clone was made from (`origin.json`, or kept in memory for an in-memory
@@ -407,6 +411,8 @@ impl Dataset {
             validation: RwLock::new(validation),
             guard_error: RwLock::new(guard_error),
             schema_cache: Mutex::new(Vec::new()),
+            #[cfg(feature = "ontology")]
+            ontology_cache: Mutex::new(Vec::new()),
             objects_cache: Mutex::new(ObjectsCache::default()),
             origin,
             store,
