@@ -28,7 +28,9 @@ request or on every write, and the schema report counts what the data holds.
 * Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
   and `owl:sameAs` with closure operators instead of joins. An operator condenses the
   relation's strongly connected components and works out each component's reachable
-  set once, and `owl:sameAs` closes its classes with union-find. The rules stay in the
+  set once, and `owl:sameAs` closes its classes with union-find. OWL2Bench with 5
+  universities materializes under OWL 2 RL in 44 s at 9.5 GiB of RSS, and with 2 in 5 s
+  instead of 53 s ([results](../benchmarks/reasoning/RESULTS.md#owl2bench)). The rules stay in the
   program, so explanations and incremental maintenance still name them, and a run
   derives the same facts as one that evaluates them as joins. A program with a rule that
   is not monotonic, or one that reads lists and builds them in a rule head, evaluates
@@ -217,6 +219,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Reasoning and validation
 
+* The `owl-rl` profile has property chains of 2 and 3 properties and keys of 1 and 2,
+  roadmap item NEW-ITEM-1, and leaves out `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff`,
+  roadmap item NEW-ITEM-2. Its rule tests follow the Profiles tables rather than the
+  OWL 2 test cases, roadmap item NEW-ITEM-4.
+* Closure operators serve full materialization only. Incremental updates and query-time
+  reasoning evaluate transitive and equivalence rules as joins, roadmap item NEW-ITEM-5.
 * Inference is forward materialization, RDFS on read and derivation on demand.
   Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
   rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid

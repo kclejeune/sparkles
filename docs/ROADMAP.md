@@ -103,8 +103,6 @@ Wave A holds the work that most improves the engine against objective measures.
   delete dead and superseded paths, item 479 sets the first-release format cutoff, and
   items 480 to 484 consolidate the execution policy, the reasoning mode, request
   building, rank fusion and the commit publish tail.
-* The reasoning quick fixes of item 456 are items 485 to 487. They add closure operators,
-  the missing OWL 2 RL rules and cost-based rule-body planning.
 * The remaining Stage A parts of item 17 are items 414 to 417. They deliver internal
   circuits, the provenance algebra, reasoner witnesses and the fixed-point operator.
 * Small items that finish a capability run in free capacity, such as item 77.
@@ -235,7 +233,7 @@ not to every extension in a spec or to phases that have already shipped.
 |---|---|---|
 | **Performance** | 1 refreshes the evidence while 7 and 4 address their remaining gates. 501 removes the last device flush of an annotated fence, and 502 measures write-through fences in the drive's fast state. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
 | **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 414. | F14, C22, F13 |
-| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. Item 456 completes OWL 2 RL and rebuilds the reasoner core, starting with items 485 to 487. | F16, F17, F13, F18, F23 |
+| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. Item 456 rebuilds the reasoner core on the closure operators and OWL 2 RL rule set of items 485 and 486. | F16, F17, F13, F18, F23 |
 | **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, starting with items 474 to 484. Item 454 follows the executor merge, and 455 follows 4 and 14. | X14, X15, X16, X17, X05 |
 | **Ontology and data platform** | 71 is the root of the ontology workbench 457. Items 458 to 461 add the resource catalog, checks and protected merges, git sync and linked-data publishing once the policy plumbing of 480 to 483 has landed. | F21, F24, U12, C30, X18, C31, F25, C32 |
 | **Agent platform** | 462 adds tool profiles, review queues, handoff and framework adapters, starting with 488 to 490. Its data-change triggers wait for 339. | C33, C11, C17, C18 |
@@ -246,7 +244,6 @@ The workstreams depend on each other and on existing items as follows.
 ```mermaid
 flowchart LR
     G["452 · Benchmark gates"] --> XM["453 · Executor merge"]
-    G --> QF["485–487 · Reasoning quick fixes"]
     S1["474–478 · Cheap deletions"] --> XM
     FC["479 · Format cutoff"] --> XM
     PL["480–483 · Policy plumbing"] --> XM
@@ -257,8 +254,7 @@ flowchart LR
     FC --> I59["59 · Server binaries and images"]
     I4["4 · Cold sparse lookups"] --> SC
     I14["14 · Compaction and progress"] --> SC
-    QF --> RC["456 · F23 reasoner core"]
-    I9["9 · Materialization at scale"] --> RC
+    I9["9 · Materialization at scale"] --> RC["456 · F23 reasoner core"]
     RC --> IM["456 · Shared maintenance core"]
     I417["417 · Fixed-point operator"] --> IM
     IM --> IA["463 · Incremental algorithm results"]
@@ -439,7 +435,7 @@ continues within its caller-visible evidence and measured-latency scope.
 | 455 | **Storage consolidation.** The store still reads every pre-release format, keeps about 80 twin readers and publishes commits through three paths. The format cutoff of item 479, budgeted readers through one Control trait, the shared publish tail of item 484 and one load plan remove that duplication, and partitioned vocabularies with per-range generations make maintenance follow the size of a change. Tiered segments in X17 add an object-store tier, and the work follows items 446, 447, 4 and 14. | [X16](specs/X16-storage-consolidation/README.md) | XL | High |
 | 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress and the remaining binding and JVM surfaces for the existing algorithms remain. New algorithms belong to item 463. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
 | 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. Representatives would also let derivation on demand read equality without the `eq-rep-*` rules. Today a demand on a small view where `owl:sameAs` relates classes and properties can take much longer than materializing the whole view. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
-| 456 | **Reasoning engine.** OWL 2 RL is incomplete, transitive relations run through generic rules, rule planning is greedy, and the reasoner's maintenance is separate from the incremental core of F13. Items 485 to 487 add closure operators, the missing rules and cost-based rule-body planning first. A columnar derived tier, compact provenance, a native n-ary Datalog core, SHACL-AF and translated SWRL, SPIN and N3 follow, and the shared maintenance core comes after item 417's LUBM measurements. | [F23](specs/F23-reasoner-core/README.md) | XL | High |
+| 456 | **Reasoning engine.** OWL 2 RL is incomplete, transitive relations run through generic rules, rule planning is greedy, and the reasoner's maintenance is separate from the incremental core of F13. The closure operators and the OWL 2 RL rules of the Profiles tables are in place. A columnar derived tier, compact provenance, a native n-ary Datalog core, SHACL-AF and translated SWRL, SPIN and N3 follow, and the shared maintenance core comes after item 417's LUBM measurements. | [F23](specs/F23-reasoner-core/README.md) | XL | High |
 | 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit remains planned and waits for item 414. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 14 | **Compaction and operation progress.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. Shared controlled load and compaction progress must also reach the Node callbacks without weakening cancellation or memory budgets. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#operation-progress) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
@@ -493,10 +489,9 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 | 481 | **Typed reasoning mode and one inference view.** A typed reasoning mode and one inference view on `Dataset` replace about eight places that choose inferred data by string matching. Items 19 and 221 build on it. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
 | 482 | **Query request builder and caller context.** A library request builder with budgets and reasoning and a server caller context replace about 16 copies of the per-caller options recipe. The GraphRAG builder then applies the server's timeouts and limits. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
 | 483 | **Shared rank fusion and text hits.** One library rank-fusion function and one text-hit reader serve `spk:hybridSearch`, MCP search and the memory layer, which today generate `text:query` three times and fuse ranks five times. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
+| NEW-ITEM-1 | **Property chains and keys of any length.** The `owl-rl` profile has chain rules for 2 and 3 properties and key rules for 1 and 2, because each longer rule adds thousands of rules to the demand programs of query-time reasoning. Evaluate `owl:propertyChainAxiom` and `owl:hasKey` over their lists in the n-ary core, so that one rule covers every length. | [F23](specs/F23-reasoner-core/SPEC.md#core) | M | 456 |
+| NEW-ITEM-2 | **Literal value equality in OWL 2 RL.** `dt-type2`, `dt-eq` and `dt-diff` are left out, because as rules they would type every literal and relate every pair of literals with equal or different values. An operator that reads literal values from the dictionary could serve them, `owl:sameAs` between literals and the key and cardinality rules on literals. | [F23](specs/F23-reasoner-core/SPEC.md#core) | S–M | 456 |
 | 484 | **Shared commit publish tail, short-term half.** Extract the WAL transaction encoder, a snapshot builder and the shared publish tail from the three publish paths and the compaction writer. The long-term half, in which the group leader writes through the direct handles, waits for item 446. | [X16](specs/X16-storage-consolidation/SPEC.md#candidate-phases) | M | 455 |
-| 485 | **Closure operators.** Evaluate transitive, symmetric and equivalence relations, `subClassOf`, `subPropertyOf` and `sameAs` through SCC condensation with a linear closure and union-find, so that OWL2Bench under OWL RL completes at 5 universities and above. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | M | 456 |
-| 486 | **The missing OWL 2 RL rules.** Add `prp-key`, `cls-maxqc4`, the cardinality-zero rules, the datatype rules and property chains of any length. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | S | 456 |
-| 487 | **Cost-based rule-body planning.** Plan rule bodies with the SPARQL estimator's characteristic sets and probes, use DP for bodies of up to about six atoms, and replan when delta ratios shift. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | S | 456 |
 
 ### Remaining work for item 7
 
@@ -558,6 +553,7 @@ numbered item when it is ready to start.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
+| NEW-ITEM-4 | **The OWL 2 RL test cases.** The rule tests of `owl-rl` follow the OWL 2 Profiles tables, because the OWL 2 test-case repository was not reachable. Vendor the approved OWL 2 RL test cases from a mirror and run them as a conformance suite. | [F23](specs/F23-reasoner-core/SPEC.md#owl-2-rl-rules) | S |
 | 503 | **Prompt caching measurements.** The hit rate of Anthropic's prompt cache on real Ask, ingestion and GraphRAG calls, and Ask's accuracy with the grounding reordered for caching, have not been measured against a provider. A paired evaluation run and a two-call check of `cacheReadInputTokens` close it. | [C18](specs/C18-natural-language-questions-and-ingest/SPEC.md#36-structured-output-by-kind-and-small-models) | S |
 | 6 | **Ask evaluation on public benchmarks.** Runs of local and OpenAI-compatible models and an evaluation with independent roles remain, and LC-QuAD 2.0 waits for a Wikidata load from the full dump. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 28 | **Query by example** and Bloom-style search phrases. | [U03](specs/U03-query-by-example.md) | M |
@@ -595,6 +591,8 @@ spec sections.
 
 | # | Item | Spec | Size |
 |---|---|---|---|
+| NEW-ITEM-3 | **Charged predicate counts in the reasoner.** The reasoner's base caches the stored count of each predicate it probes for the whole run without a charge to the memory budget, and the closure operators charge their share only while they hold it, so a run that starts again without operators leaves those entries uncharged. Charge the cache where it grows. | [F23](specs/F23-reasoner-core/SPEC.md#closure-operators) | S |
+| NEW-ITEM-5 | **Closure operators beyond full materialization.** Incremental updates and query-time reasoning evaluate transitive and equivalence rules as joins, so an update or a demand that touches a long transitive relation repeats the cost the operators remove from a full run. Give the incremental core and the demand engine the same operators. | [F23](specs/F23-reasoner-core/SPEC.md#closure-operators) | M |
 | 445 | **First-call cost of a Python file-object load.** A one-triple load from a file object in a new process measured 6.4 ms on atlas, against 2.7 ms for the previous binding's transaction. Find where the 4 ms go, such as the start of the signal watcher and of the request's thread, and remove the fixed cost. | [Loading results](benchmarks/loading/RESULTS.md#python-file-objects) | S |
 | 1 | **Benchmark refresh.** Later X06 batches, BSBM at 100M, a rerun of the BSBM BI driver cells and the regeneration of the published tables remain. | [X06](specs/X06-benchmark-coverage.md), [F16](specs/F16-materialization-at-scale.md), [X08](specs/X08-disk-spill-and-server-memory.md#33-the-default-and-small-profiles) §3.3 | M |
 | 452 | **Benchmark gates and competitive coverage.** Several areas that the engine rewrites touch have no performance gate, and several comparisons are missing, such as a reasoning suite and BSBM Explore throughput. Items 469 to 473 add the gates before any rewrite. Competitive coverage then runs one benchmark at a time, weakest claims first, and each loss it finds becomes a Wave A item. | [X06](specs/X06-benchmark-coverage.md#benchmark-gates-and-competitive-coverage-workstream) | XL |
@@ -747,6 +745,9 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **485.** Closure operators for transitive and equivalence rules, `rdfs:subClassOf`, `rdfs:subPropertyOf` and `owl:sameAs`, so that OWL2Bench under OWL RL completes at 5 universities and above. [F23](specs/F23-reasoner-core/SPEC.md#outcome)
+- **486.** The OWL 2 RL rules of the Profiles tables, each with a test, with chains and keys bounded as items NEW-ITEM-1 and NEW-ITEM-2 describe. [F23](specs/F23-reasoner-core/SPEC.md#outcome)
+- **487.** Cost-based rule-body planning, built and measured and not adopted because it was no faster and used more memory. [PERFORMANCE-EXPERIMENTS.md](PERFORMANCE-EXPERIMENTS.md#reasoning) [F23](specs/F23-reasoner-core/SPEC.md#outcome)
 - **413.** Load-time checks of view definitions, the `COMPILER` version test and the views runtime split into modules. [F13](specs/F13-incremental-views-and-provenance.md#outcome)
 - **2.** Server-wide cache sizing and query memory pool. [X08](specs/X08-disk-spill-and-server-memory.md) Phase 1
 - **3.** Group commit as the default. [X09](specs/X09-group-commit-by-default.md)

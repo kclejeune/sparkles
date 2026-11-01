@@ -73,13 +73,43 @@ numbers, not forge numbers.
 |---|---:|---:|---:|
 | LUBM(100), `rdfs` | 8.6 s | 3,125 MiB | |
 | LUBM(1000), `rdfs`, 138,278,680 input triples | 90.9 s | 15,187 MiB | 55,069,413 |
-| OWL2Bench, 2 universities, `owl-rl` | 25.0 s | 1,892 MiB | 4,914,915 |
-| OWL2Bench, 5 universities, `owl-rl` | killed at 28 GiB after 12 min 50 s | | |
 
 *Measured on a Namespace instance at commit 0e0fa5b4.*
 
 [F16's Outcome](../../specs/F16-materialization-at-scale.md#outcome) has the method and the
 comparison with the reasoner that preceded it.
+
+<a id="owl2bench"></a>
+
+### OWL2Bench and closure operators
+
+Closure operators evaluate transitive and equivalence rules
+([F23](../../specs/F23-reasoner-core/SPEC.md#closure-operators)). The table compares
+`sparkles infer --full --max-inferred 0` with the operators against the build before them,
+which evaluates those rules as joins. Each run materialized a fresh copy of a store loaded
+from the same N-Triples on forge with 20 threads, alone and in a cgroup of 14 GiB without
+swap. Times include writing the inferred graph. The ranges cover three interleaved rounds,
+and a run that failed was not repeated.
+
+| Run | Joins | Joins, peak RSS | Operators | Operators, peak RSS | Derived triples |
+|---|---:|---:|---:|---:|---:|
+| OWL2Bench, 1 university, `owl-rl` | 5.30 to 5.61 s | 766 to 788 MiB | 1.31 to 1.39 s | 675 to 709 MiB | 1,400,688 |
+| OWL2Bench, 2 universities, `owl-rl` | 53.2 to 54.1 s | 1,526 to 1,568 MiB | 5.01 to 5.34 s | 1,296 to 1,396 MiB | 4,915,635 |
+| OWL2Bench, 5 universities, `owl-rl` | killed at 14 GiB after 13 min 38 s | | 43.8 to 44.9 s | 9.0 to 9.5 GiB | 52,966,139 |
+| OWL2Bench, 10 universities, `owl-rl` | killed at 14 GiB after 34 s | | killed at 14 GiB after 15 s | | |
+| LUBM(100), `owl-rl` | 16.1 to 16.2 s | 4,152 to 4,178 MiB | 15.5 to 15.6 s | 4,158 to 4,184 MiB | 10,907,379 |
+| LUBM(100), `rdfs` | 11.9 to 12.1 s | 3,076 to 3,137 MiB | 11.8 to 12.1 s | 3,083 to 3,120 MiB | |
+
+*Measured on forge with the base build at 04d49b57 and the operators at 29f54c39. The
+[record](../2026-11-01-reasoning-closures-forge.json) keeps every run.*
+
+The operators derive the same facts as joins. The derived counts above are those of the
+operators' build, whose OWL 2 RL rule set also gained the missing rules of the Profiles
+tables, which add 720 facts to each OWL2Bench run and 350 to LUBM(100). Within one build,
+`examples/lubm.rs` derived the same facts, with the same order-free digest, with and
+without the operators. OWL2Bench(10) needs more memory than forge has, and LUBM(100)
+gains nothing, because its transitive relations are short and its time goes to the
+other rules.
 
 ### Small incremental runs
 
