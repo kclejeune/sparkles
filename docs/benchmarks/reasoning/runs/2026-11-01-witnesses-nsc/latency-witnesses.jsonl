@@ -1,0 +1,298 @@
+{"better":"lower","key":"rdfs/materialize","unit":"ms","value":1652.889025}
+{"check":"rdfs/materialize/inferred","detail":"565906 inferred triples","fingerprint":"565906","ok":true}
+{"better":"lower","key":"owl-rl/materialize","unit":"ms","value":1420.9460090000002}
+{"check":"owl-rl/materialize/inferred","detail":"1233449 inferred triples","fingerprint":"1233449","ok":true}
+{"check":"rdfs/materialized/q1/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"rdfs/materialized/q2/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 13ddc834f9c9005d","ok":true}
+{"check":"rdfs/materialized/q3/answer","detail":"7 rows, materialized 7 rows","fingerprint":"7 rows, 75947a5ade204c37","ok":true}
+{"check":"rdfs/materialized/q4/answer","detail":"31 rows, materialized 31 rows","fingerprint":"31 rows, 51333bb1fbab6a90","ok":true}
+{"check":"rdfs/materialized/q5/answer","detail":"646 rows, materialized 646 rows","fingerprint":"646 rows, 437eebcde32e7278","ok":true}
+{"check":"rdfs/materialized/q6/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/materialized/q7/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 0de6d4ab1691c3a7","ok":true}
+{"check":"rdfs/materialized/q8/answer","detail":"8010 rows, materialized 8010 rows","fingerprint":"8010 rows, 4e3f4102416a6253","ok":true}
+{"check":"rdfs/materialized/q9/answer","detail":"1284 rows, materialized 1284 rows","fingerprint":"1284 rows, fd321e16b919b821","ok":true}
+{"check":"rdfs/materialized/q10/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/materialized/q11/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/materialized/q12/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, f748c2e1a7eeb710","ok":true}
+{"check":"rdfs/materialized/q13/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/materialized/q14/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/demand/q1/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"rdfs/demand/q2/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 13ddc834f9c9005d","ok":true}
+{"check":"rdfs/demand/q3/answer","detail":"7 rows, materialized 7 rows","fingerprint":"7 rows, 75947a5ade204c37","ok":true}
+{"check":"rdfs/demand/q4/answer","detail":"31 rows, materialized 31 rows","fingerprint":"31 rows, 51333bb1fbab6a90","ok":true}
+{"check":"rdfs/demand/q5/answer","detail":"646 rows, materialized 646 rows","fingerprint":"646 rows, 437eebcde32e7278","ok":true}
+{"check":"rdfs/demand/q6/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/demand/q7/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 0de6d4ab1691c3a7","ok":true}
+{"check":"rdfs/demand/q8/answer","detail":"8010 rows, materialized 8010 rows","fingerprint":"8010 rows, 4e3f4102416a6253","ok":true}
+{"check":"rdfs/demand/q9/answer","detail":"1284 rows, materialized 1284 rows","fingerprint":"1284 rows, fd321e16b919b821","ok":true}
+{"check":"rdfs/demand/q10/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/demand/q11/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/demand/q12/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, f748c2e1a7eeb710","ok":true}
+{"check":"rdfs/demand/q13/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/demand/q14/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/demand-cached/q1/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"rdfs/demand-cached/q2/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 13ddc834f9c9005d","ok":true}
+{"check":"rdfs/demand-cached/q3/answer","detail":"7 rows, materialized 7 rows","fingerprint":"7 rows, 75947a5ade204c37","ok":true}
+{"check":"rdfs/demand-cached/q4/answer","detail":"31 rows, materialized 31 rows","fingerprint":"31 rows, 51333bb1fbab6a90","ok":true}
+{"check":"rdfs/demand-cached/q5/answer","detail":"646 rows, materialized 646 rows","fingerprint":"646 rows, 437eebcde32e7278","ok":true}
+{"check":"rdfs/demand-cached/q6/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/demand-cached/q7/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 0de6d4ab1691c3a7","ok":true}
+{"check":"rdfs/demand-cached/q8/answer","detail":"8010 rows, materialized 8010 rows","fingerprint":"8010 rows, 4e3f4102416a6253","ok":true}
+{"check":"rdfs/demand-cached/q9/answer","detail":"1284 rows, materialized 1284 rows","fingerprint":"1284 rows, fd321e16b919b821","ok":true}
+{"check":"rdfs/demand-cached/q10/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/demand-cached/q11/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/demand-cached/q12/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, f748c2e1a7eeb710","ok":true}
+{"check":"rdfs/demand-cached/q13/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/demand-cached/q14/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/on-read/q1/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"rdfs/on-read/q2/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 13ddc834f9c9005d","ok":true}
+{"check":"rdfs/on-read/q3/answer","detail":"7 rows, materialized 7 rows","fingerprint":"7 rows, 75947a5ade204c37","ok":true}
+{"check":"rdfs/on-read/q4/answer","detail":"31 rows, materialized 31 rows","fingerprint":"31 rows, 51333bb1fbab6a90","ok":true}
+{"check":"rdfs/on-read/q5/answer","detail":"646 rows, materialized 646 rows","fingerprint":"646 rows, 437eebcde32e7278","ok":true}
+{"check":"rdfs/on-read/q6/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/on-read/q7/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 0de6d4ab1691c3a7","ok":true}
+{"check":"rdfs/on-read/q8/answer","detail":"8010 rows, materialized 8010 rows","fingerprint":"8010 rows, 4e3f4102416a6253","ok":true}
+{"check":"rdfs/on-read/q9/answer","detail":"1284 rows, materialized 1284 rows","fingerprint":"1284 rows, fd321e16b919b821","ok":true}
+{"check":"rdfs/on-read/q10/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/on-read/q11/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/on-read/q12/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, f748c2e1a7eeb710","ok":true}
+{"check":"rdfs/on-read/q13/answer","detail":"0 rows, materialized 0 rows","fingerprint":"0 rows, 7b6b7a25bdc77335","ok":true}
+{"check":"rdfs/on-read/q14/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"owl-rl/materialized/q1/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"owl-rl/materialized/q2/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 13ddc834f9c9005d","ok":true}
+{"check":"owl-rl/materialized/q3/answer","detail":"7 rows, materialized 7 rows","fingerprint":"7 rows, 75947a5ade204c37","ok":true}
+{"check":"owl-rl/materialized/q4/answer","detail":"31 rows, materialized 31 rows","fingerprint":"31 rows, 51333bb1fbab6a90","ok":true}
+{"check":"owl-rl/materialized/q5/answer","detail":"646 rows, materialized 646 rows","fingerprint":"646 rows, 437eebcde32e7278","ok":true}
+{"check":"owl-rl/materialized/q6/answer","detail":"103525 rows, materialized 103525 rows","fingerprint":"103525 rows, 4931e7e18170b32d","ok":true}
+{"check":"owl-rl/materialized/q7/answer","detail":"26 rows, materialized 26 rows","fingerprint":"26 rows, 81fd978c8d6498b6","ok":true}
+{"check":"owl-rl/materialized/q8/answer","detail":"10672 rows, materialized 10672 rows","fingerprint":"10672 rows, 0f913fbddf96dd11","ok":true}
+{"check":"owl-rl/materialized/q9/answer","detail":"2718 rows, materialized 2718 rows","fingerprint":"2718 rows, 41186e18c39645e6","ok":true}
+{"check":"owl-rl/materialized/q10/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"owl-rl/materialized/q11/answer","detail":"310 rows, materialized 310 rows","fingerprint":"310 rows, 7bf48b87bb3fd79c","ok":true}
+{"check":"owl-rl/materialized/q12/answer","detail":"21 rows, materialized 21 rows","fingerprint":"21 rows, 309869e5f32ab4d1","ok":true}
+{"check":"owl-rl/materialized/q13/answer","detail":"51 rows, materialized 51 rows","fingerprint":"51 rows, 95abca53477e222a","ok":true}
+{"check":"owl-rl/materialized/q14/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"owl-rl/demand/q1/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"owl-rl/demand/q2/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 13ddc834f9c9005d","ok":true}
+{"check":"owl-rl/demand/q3/answer","detail":"7 rows, materialized 7 rows","fingerprint":"7 rows, 75947a5ade204c37","ok":true}
+{"check":"owl-rl/demand/q4/answer","detail":"31 rows, materialized 31 rows","fingerprint":"31 rows, 51333bb1fbab6a90","ok":true}
+{"check":"owl-rl/demand/q5/answer","detail":"646 rows, materialized 646 rows","fingerprint":"646 rows, 437eebcde32e7278","ok":true}
+{"check":"owl-rl/demand/q6/answer","detail":"103525 rows, materialized 103525 rows","fingerprint":"103525 rows, 4931e7e18170b32d","ok":true}
+{"check":"owl-rl/demand/q7/answer","detail":"26 rows, materialized 26 rows","fingerprint":"26 rows, 81fd978c8d6498b6","ok":true}
+{"check":"owl-rl/demand/q8/answer","detail":"10672 rows, materialized 10672 rows","fingerprint":"10672 rows, 0f913fbddf96dd11","ok":true}
+{"check":"owl-rl/demand/q9/answer","detail":"2718 rows, materialized 2718 rows","fingerprint":"2718 rows, 41186e18c39645e6","ok":true}
+{"check":"owl-rl/demand/q10/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"owl-rl/demand/q11/answer","detail":"310 rows, materialized 310 rows","fingerprint":"310 rows, 7bf48b87bb3fd79c","ok":true}
+{"check":"owl-rl/demand/q12/answer","detail":"21 rows, materialized 21 rows","fingerprint":"21 rows, 309869e5f32ab4d1","ok":true}
+{"check":"owl-rl/demand/q13/answer","detail":"51 rows, materialized 51 rows","fingerprint":"51 rows, 95abca53477e222a","ok":true}
+{"check":"owl-rl/demand/q14/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"owl-rl/demand-cached/q1/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"owl-rl/demand-cached/q2/answer","detail":"22 rows, materialized 22 rows","fingerprint":"22 rows, 13ddc834f9c9005d","ok":true}
+{"check":"owl-rl/demand-cached/q3/answer","detail":"7 rows, materialized 7 rows","fingerprint":"7 rows, 75947a5ade204c37","ok":true}
+{"check":"owl-rl/demand-cached/q4/answer","detail":"31 rows, materialized 31 rows","fingerprint":"31 rows, 51333bb1fbab6a90","ok":true}
+{"check":"owl-rl/demand-cached/q5/answer","detail":"646 rows, materialized 646 rows","fingerprint":"646 rows, 437eebcde32e7278","ok":true}
+{"check":"owl-rl/demand-cached/q6/answer","detail":"103525 rows, materialized 103525 rows","fingerprint":"103525 rows, 4931e7e18170b32d","ok":true}
+{"check":"owl-rl/demand-cached/q7/answer","detail":"26 rows, materialized 26 rows","fingerprint":"26 rows, 81fd978c8d6498b6","ok":true}
+{"check":"owl-rl/demand-cached/q8/answer","detail":"10672 rows, materialized 10672 rows","fingerprint":"10672 rows, 0f913fbddf96dd11","ok":true}
+{"check":"owl-rl/demand-cached/q9/answer","detail":"2718 rows, materialized 2718 rows","fingerprint":"2718 rows, 41186e18c39645e6","ok":true}
+{"check":"owl-rl/demand-cached/q10/answer","detail":"3 rows, materialized 3 rows","fingerprint":"3 rows, 11d1f77102f822ea","ok":true}
+{"check":"owl-rl/demand-cached/q11/answer","detail":"310 rows, materialized 310 rows","fingerprint":"310 rows, 7bf48b87bb3fd79c","ok":true}
+{"check":"owl-rl/demand-cached/q12/answer","detail":"21 rows, materialized 21 rows","fingerprint":"21 rows, 309869e5f32ab4d1","ok":true}
+{"check":"owl-rl/demand-cached/q13/answer","detail":"51 rows, materialized 51 rows","fingerprint":"51 rows, 95abca53477e222a","ok":true}
+{"check":"owl-rl/demand-cached/q14/answer","detail":"78064 rows, materialized 78064 rows","fingerprint":"78064 rows, bfd487567cf232c2","ok":true}
+{"check":"rdfs/materialized/q1/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q2/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q3/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q4/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q5/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q6/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q7/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q8/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q9/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q10/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q11/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q12/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q13/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/materialized/q14/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q1/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q2/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q3/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q4/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q5/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q6/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q7/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q8/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q9/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q10/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q11/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q12/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q13/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand/q14/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q1/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q2/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q3/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q4/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q5/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q6/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q7/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q8/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q9/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q10/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q11/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q12/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q13/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/demand-cached/q14/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q1/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q2/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q3/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q4/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q5/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q6/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q7/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q8/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q9/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q10/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q11/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q12/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q13/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"rdfs/on-read/q14/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q1/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q2/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q3/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q4/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q5/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q6/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q7/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q8/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q9/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q10/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q11/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q12/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q13/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/materialized/q14/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q1/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q2/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q3/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q4/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q5/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q6/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q7/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q8/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q9/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q10/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q11/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q12/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q13/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand/q14/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q1/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q2/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q3/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q4/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q5/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q6/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q7/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q8/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q9/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q10/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q11/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q12/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q13/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"check":"owl-rl/demand-cached/q14/timed-answers","detail":"0 of 15 timed runs returned another answer","ok":true}
+{"better":"lower","key":"rdfs/materialized/q1","samples":[0.4478,0.0885,0.0337,0.2645,0.0405,0.0239,0.2657,0.0358,0.0234,0.2712,0.0413,0.0222,0.2739,0.0402,0.0225],"unit":"ms","value":0.040476}
+{"better":"lower","key":"rdfs/demand/q1","samples":[62.2358,32.3551,32.3692,33.4624,32.0347,32.403,32.9465,32.5873,32.2523,32.66,31.6005,32.0095,31.8865,32.1343,31.7266],"unit":"ms","value":32.355115}
+{"better":"lower","key":"rdfs/demand-cached/q1","samples":[32.4617,0.3029,0.2753,32.4092,0.3086,0.1691,31.1031,0.387,0.1818,31.8404,0.295,0.2591,31.9921,0.387,0.2267],"unit":"ms","value":0.30856999999999996}
+{"better":"lower","key":"rdfs/on-read/q1","samples":[0.3443,0.3424,0.2861,0.3241,0.279,0.2854,0.3617,0.2539,0.2384,0.429,0.2687,0.2648,0.3989,0.3013,0.277],"unit":"ms","value":0.286088}
+{"better":"lower","key":"rdfs/materialized/q2","samples":[0.9528,0.4284,0.3691,0.7568,0.3941,0.3533,0.7291,0.3484,0.3867,0.7571,0.4737,0.3567,0.7207,0.3684,0.3424],"unit":"ms","value":0.394052}
+{"better":"lower","key":"rdfs/demand/q2","samples":[44.5767,44.4617,43.0948,45.0332,45.8624,45.9381,46.5113,46.5685,45.4618,47.7773,48.8507,46.706,44.4141,44.9682,44.8419],"unit":"ms","value":45.461797}
+{"better":"lower","key":"rdfs/demand-cached/q2","samples":[44.4824,1.9492,1.8794,48.7566,2.3022,2.0587,45.9916,2.0619,1.9355,45.8483,2.2991,2.4476,44.935,2.0265,1.79],"unit":"ms","value":2.2990950000000003}
+{"better":"lower","key":"rdfs/on-read/q2","samples":[13.8687,9.3766,8.2057,12.0862,12.3165,8.6085,10.1334,9.1236,9.0361,11.0322,12.7263,8.4414,10.0832,8.2476,8.1117],"unit":"ms","value":9.376564}
+{"better":"lower","key":"rdfs/materialized/q3","samples":[0.2959,0.0434,0.0212,0.2634,0.0393,0.0198,0.2697,0.0391,0.02,0.2532,0.0276,0.0206,0.2594,0.0369,0.0208],"unit":"ms","value":0.039083}
+{"better":"lower","key":"rdfs/demand/q3","samples":[36.2641,39.0793,37.3082,33.8422,33.4151,33.3692,35.0808,34.4877,32.9327,33.5355,33.7083,33.4415,33.9178,33.3577,33.7344],"unit":"ms","value":33.734390000000005}
+{"better":"lower","key":"rdfs/demand-cached/q3","samples":[34.4252,0.3301,0.1696,34.9601,0.3235,0.1656,33.4901,0.298,0.1547,33.2289,0.3081,0.1717,32.8482,0.3991,0.2135],"unit":"ms","value":0.32354900000000003}
+{"better":"lower","key":"rdfs/on-read/q3","samples":[2.1223,1.6331,1.486,2.2329,1.6061,1.7386,2.1842,1.5595,1.5131,1.923,1.5451,1.4686,2.0388,1.7084,1.5764],"unit":"ms","value":1.633143}
+{"better":"lower","key":"rdfs/materialized/q4","samples":[0.6202,0.3333,0.169,0.3604,0.1143,0.1517,0.3551,0.1416,0.0824,0.3598,0.1483,0.1532,0.4183,0.1136,0.0706],"unit":"ms","value":0.15317799999999998}
+{"better":"lower","key":"rdfs/demand/q4","samples":[48.8493,47.7461,48.3165,40.4047,39.3616,39.919,39.7447,38.959,39.2504,39.9721,39.3126,39.0741,40.4796,41.6051,40.5107],"unit":"ms","value":39.972105}
+{"better":"lower","key":"rdfs/demand-cached/q4","samples":[43.7929,1.0713,0.7467,39.514,0.8315,0.6238,39.5936,0.7999,0.6275,40.0061,0.794,0.6982,39.2314,0.8125,0.6813],"unit":"ms","value":0.812468}
+{"better":"lower","key":"rdfs/on-read/q4","samples":[0.6777,0.5176,0.4257,0.5076,0.3823,0.323,0.5389,0.4028,0.3643,0.4865,0.3586,0.368,0.4648,0.4028,0.3511],"unit":"ms","value":0.402848}
+{"better":"lower","key":"rdfs/materialized/q5","samples":[0.3785,0.1168,0.0636,0.3011,0.1229,0.0758,0.2986,0.0786,0.0527,0.3423,0.0947,0.0527,0.3021,0.0963,0.0603],"unit":"ms","value":0.09631100000000001}
+{"better":"lower","key":"rdfs/demand/q5","samples":[42.1918,45.9571,43.6099,39.4578,39.22,39.0801,40.4956,40.6212,40.119,39.4118,38.9897,42.3472,39.1072,39.7384,40.3611],"unit":"ms","value":40.119005}
+{"better":"lower","key":"rdfs/demand-cached/q5","samples":[42.2659,1.1918,1.0959,40.3838,1.0866,1.0161,41.3546,1.1042,0.9711,41.4441,1.1106,0.9517,39.992,1.062,0.9633],"unit":"ms","value":1.1041569999999998}
+{"better":"lower","key":"rdfs/on-read/q5","samples":[6.6911,6.8205,7.0341,6.1625,5.9128,6.1167,5.8244,5.6053,5.5428,5.8321,5.8154,5.2378,5.7267,5.6463,5.8318],"unit":"ms","value":5.83178}
+{"better":"lower","key":"rdfs/materialized/q6","samples":[0.7636,0.7731,0.75,0.6944,0.6933,0.6911,0.7342,0.6731,0.6571,0.7423,0.693,0.6601,0.713,0.6909,0.6551],"unit":"ms","value":0.693294}
+{"better":"lower","key":"rdfs/demand/q6","samples":[82.7414,81.9434,82.5011,81.7894,80.8139,81.6577,80.7685,78.8971,78.3603,77.7979,80.5013,77.591,77.677,77.7566,78.0253],"unit":"ms","value":80.50131}
+{"better":"lower","key":"rdfs/demand-cached/q6","samples":[85.5041,40.2595,39.5702,79.7426,38.4103,39.2632,79.315,38.2468,38.0505,76.7855,40.1902,39.0541,76.9869,38.3366,38.2743],"unit":"ms","value":39.570201}
+{"better":"lower","key":"rdfs/on-read/q6","samples":[1.348,1.7089,1.5116,1.2327,1.1896,1.2141,1.3881,1.2409,1.1732,1.2339,1.1938,1.2323,1.2768,1.2313,1.2068],"unit":"ms","value":1.2326590000000002}
+{"better":"lower","key":"rdfs/materialized/q7","samples":[0.3693,0.0778,0.0491,0.5264,0.1016,0.1099,0.3326,0.0816,0.0423,0.3436,0.1252,0.0635,0.3522,0.0991,0.0491],"unit":"ms","value":0.101611}
+{"better":"lower","key":"rdfs/demand/q7","samples":[42.4092,41.9416,41.8315,40.2812,40.9968,40.585,41.0967,38.9323,39.5343,39.1463,40.1889,38.3893,38.4846,39.5177,37.9597],"unit":"ms","value":40.188915}
+{"better":"lower","key":"rdfs/demand-cached/q7","samples":[43.0636,0.5835,0.4414,39.0011,0.459,0.318,39.5163,0.5697,0.3394,39.1721,0.4576,0.3591,38.4005,0.5577,0.4145],"unit":"ms","value":0.55774}
+{"better":"lower","key":"rdfs/on-read/q7","samples":[2.2842,2.0343,1.8156,2.2109,1.8003,1.6852,2.1253,1.773,1.7037,2.0604,1.7111,1.6619,2.228,1.7357,1.6295],"unit":"ms","value":1.8003069999999999}
+{"better":"lower","key":"rdfs/materialized/q8","samples":[2.387,3.5056,1.9424,2.0198,1.8949,1.8847,2.2552,1.9459,1.834,2.0197,1.8671,1.8211,2.1097,1.9266,1.8136],"unit":"ms","value":1.942436}
+{"better":"lower","key":"rdfs/demand/q8","samples":[103.2562,110.0044,109.1296,100.0062,100.4506,101.8169,97.2634,99.6214,97.1215,100.4435,99.4162,98.449,101.5191,99.5546,99.5043],"unit":"ms","value":100.006165}
+{"better":"lower","key":"rdfs/demand-cached/q8","samples":[97.3449,51.8766,51.2027,88.7718,52.3795,51.839,86.211,48.6593,48.5541,99.5336,58.9979,57.0861,99.0779,57.7173,57.0435],"unit":"ms","value":57.086112}
+{"better":"lower","key":"rdfs/on-read/q8","samples":[11.1973,7.7049,12.6229,9.515,7.4026,7.1236,7.0664,6.8553,7.1452,9.6278,7.429,7.0095,9.2044,7.7123,7.5447],"unit":"ms","value":7.544673}
+{"better":"lower","key":"rdfs/materialized/q9","samples":[6.0852,5.6228,5.4858,6.6443,6.6308,8.782,6.0959,5.9603,6.3256,6.2399,6.1327,6.0166,6.0466,5.8589,5.6033],"unit":"ms","value":6.085178999999999}
+{"better":"lower","key":"rdfs/demand/q9","samples":[88.397,94.2299,94.7549,93.0998,94.3577,94.3228,84.5159,82.5171,82.2391,85.2227,81.7058,81.7459,83.1426,81.6393,81.4411],"unit":"ms","value":84.51591599999999}
+{"better":"lower","key":"rdfs/demand-cached/q9","samples":[96.5234,40.4911,37.3751,90.3397,35.9318,36.761,84.0313,34.5173,33.0856,80.5447,33.9251,33.29,84.1289,33.5552,34.4075],"unit":"ms","value":36.761007}
+{"better":"lower","key":"rdfs/on-read/q9","samples":[5.7434,5.0709,4.9103,5.3565,5.9304,4.8158,5.0976,4.7723,4.8552,5.0214,5.1061,5.3034,5.212,4.412,4.3007],"unit":"ms","value":5.070892}
+{"better":"lower","key":"rdfs/materialized/q10","samples":[0.3055,0.0588,0.0263,0.279,0.0488,0.0245,0.2805,0.049,0.0243,0.2672,0.041,0.0227,0.2767,0.0419,0.0221],"unit":"ms","value":0.048841999999999997}
+{"better":"lower","key":"rdfs/demand/q10","samples":[34.5204,35.5429,33.9071,33.4998,33.0266,32.5464,33.0142,32.6681,31.9392,32.8381,32.4495,32.6125,33.0532,32.6245,32.5815],"unit":"ms","value":32.838125000000005}
+{"better":"lower","key":"rdfs/demand-cached/q10","samples":[33.576,0.3321,0.2425,32.3605,0.3135,0.1601,32.2964,0.2706,0.1527,31.6453,0.3115,0.1578,32.1719,0.3153,0.1724],"unit":"ms","value":0.31346}
+{"better":"lower","key":"rdfs/on-read/q10","samples":[1.5191,1.3015,1.2308,1.6841,1.8012,1.3638,1.4401,1.2169,1.2087,1.518,1.7877,1.3089,1.4981,1.2664,1.1692],"unit":"ms","value":1.3638059999999999}
+{"better":"lower","key":"rdfs/materialized/q11","samples":[0.3095,0.0569,0.0265,0.2951,0.0618,0.0254,0.2697,0.0382,0.0221,0.2782,0.0504,0.0241,0.344,0.0542,0.0237],"unit":"ms","value":0.054192}
+{"better":"lower","key":"rdfs/demand/q11","samples":[33.6984,38.1604,33.7238,33.5923,32.2666,33.0442,32.8026,33.462,32.31,32.7985,33.2397,32.7391,32.4864,32.3809,31.7806],"unit":"ms","value":32.802597000000006}
+{"better":"lower","key":"rdfs/demand-cached/q11","samples":[33.9135,0.4974,0.3761,34.1125,0.3088,0.1643,32.3007,0.3358,0.1953,32.6252,0.3327,0.2393,32.0899,0.3,0.2209],"unit":"ms","value":0.33579200000000003}
+{"better":"lower","key":"rdfs/on-read/q11","samples":[0.2384,0.1608,0.1026,0.1178,0.0614,0.0922,0.1172,0.0713,0.0523,0.1293,0.0613,0.0521,0.145,0.0635,0.0537],"unit":"ms","value":0.092233}
+{"better":"lower","key":"rdfs/materialized/q12","samples":[0.2461,0.0432,0.0212,0.2594,0.0477,0.0222,0.2279,0.0348,0.0214,0.2741,0.0505,0.0238,0.224,0.0385,0.0198],"unit":"ms","value":0.043161000000000005}
+{"better":"lower","key":"rdfs/demand/q12","samples":[37.5196,37.522,37.2689,36.7334,36.3576,36.2968,37.0299,37.0386,35.4523,36.9138,36.6507,36.1877,36.8519,35.6997,35.8779],"unit":"ms","value":36.733415}
+{"better":"lower","key":"rdfs/demand-cached/q12","samples":[36.901,0.5828,0.324,35.6368,0.4965,0.4548,35.4402,0.4898,0.3752,35.4368,0.6247,0.5332,34.2002,0.4582,0.3847],"unit":"ms","value":0.5332330000000001}
+{"better":"lower","key":"rdfs/on-read/q12","samples":[0.1408,0.1073,0.0635,0.1785,0.0828,0.0565,0.1179,0.0612,0.0501,0.1581,0.0681,0.0569,0.1187,0.0595,0.0527],"unit":"ms","value":0.068118}
+{"better":"lower","key":"rdfs/materialized/q13","samples":[0.1992,0.0264,0.0141,0.2498,0.0328,0.0162,0.2338,0.0351,0.0182,0.1776,0.0453,0.0158,0.1958,0.0254,0.0147],"unit":"ms","value":0.032792}
+{"better":"lower","key":"rdfs/demand/q13","samples":[31.2621,30.2592,30.6063,33.4176,31.6675,30.273,31.0451,29.996,30.7536,30.5246,30.7162,30.6731,30.9271,30.6532,31.4061],"unit":"ms","value":30.716154999999997}
+{"better":"lower","key":"rdfs/demand-cached/q13","samples":[30.8635,0.2624,0.1258,31.9506,0.3309,0.2069,30.0783,0.3436,0.339,30.1877,0.3011,0.1827,30.4131,0.3765,0.1778],"unit":"ms","value":0.339007}
+{"better":"lower","key":"rdfs/on-read/q13","samples":[0.1469,0.0781,0.0537,0.1252,0.0619,0.1009,0.1479,0.1831,0.0839,0.1193,0.0703,0.0594,0.1369,0.0805,0.0618],"unit":"ms","value":0.083938}
+{"better":"lower","key":"rdfs/materialized/q14","samples":[0.7193,0.7126,0.9961,0.7842,0.7337,0.7333,0.7256,0.6851,0.6487,0.7255,0.6855,0.652,0.726,0.7221,0.6826],"unit":"ms","value":0.722078}
+{"better":"lower","key":"rdfs/demand/q14","samples":[33.3587,32.0292,31.8382,31.9868,31.2272,31.9194,31.3555,32.0976,31.0773,31.4136,31.6549,30.8192,31.5655,31.1092,31.1539],"unit":"ms","value":31.565502000000002}
+{"better":"lower","key":"rdfs/demand-cached/q14","samples":[31.7728,0.4317,0.5063,32.0894,0.4937,0.4212,31.3748,0.4184,0.3181,30.6561,0.4182,0.3673,31.5817,0.4094,0.3252],"unit":"ms","value":0.431743}
+{"better":"lower","key":"rdfs/on-read/q14","samples":[0.9973,0.9711,1.0804,1.1535,1.1793,1.0924,0.954,0.9477,0.9595,1.1477,1.0389,1.0765,1.1455,1.0996,1.0531],"unit":"ms","value":1.076464}
+{"better":"lower","key":"owl-rl/materialized/q1","samples":[0.0919,0.026,0.019,0.063,0.0214,0.0178,0.0621,0.021,0.0505,0.0715,0.0216,0.0177,0.2421,0.0341,0.0207],"unit":"ms","value":0.025998}
+{"better":"lower","key":"owl-rl/demand/q1","samples":[1631.3546,1584.1882,1567.1111,1582.028,1584.1699,1565.5051,1592.8015,1575.1937,1586.3245,1591.0378,1588.0163,1585.5712,1564.1302,1562.1812,1576.6409],"unit":"ms","value":1584.169857}
+{"better":"lower","key":"owl-rl/demand-cached/q1","samples":[1573.8791,1215.5203,1212.7229,1580.9787,1247.438,1258.6763,1584.1591,1233.9547,1235.1861,1575.255,1233.7218,1229.2177,1561.946,1233.094,1255.4964],"unit":"ms","value":1247.4379820000001}
+{"better":"lower","key":"owl-rl/materialized/q2","samples":[2.425,2.1105,1.9767,2.2385,2.0043,2.2664,2.243,2.0541,1.9667,2.2758,2.1063,1.9777,2.2348,2.0129,1.9689],"unit":"ms","value":2.1063229999999997}
+{"better":"lower","key":"owl-rl/demand/q2","samples":[1863.0296,1924.8738,1935.6706,1856.8799,1858.3434,1833.6192,1824.7972,1814.6129,1812.9029,1865.9083,1816.8821,1850.3492,1838.3596,1826.2368,1845.12],"unit":"ms","value":1845.1200110000002}
+{"better":"lower","key":"owl-rl/demand-cached/q2","samples":[1884.4665,2337.1666,2411.641,1823.4716,2343.7385,2323.6261,1822.1503,2311.6319,2340.6089,1858.2811,2292.1932,2289.7325,1832.913,2262.4653,2277.9054],"unit":"ms","value":2289.732519}
+{"better":"lower","key":"owl-rl/materialized/q3","samples":[0.0959,0.0259,0.0352,0.1123,0.0246,0.019,0.0906,0.0245,0.018,0.1057,0.0255,0.018,0.0956,0.0261,0.0199],"unit":"ms","value":0.025859}
+{"better":"lower","key":"owl-rl/demand/q3","samples":[1680.0912,1833.9156,1910.3008,1605.5604,1591.4505,1577.8579,1586.6024,1604.8359,1577.2473,1593.3106,1592.7417,1588.8781,1610.5474,1631.6207,1576.9899],"unit":"ms","value":1593.310622}
+{"better":"lower","key":"owl-rl/demand-cached/q3","samples":[1802.9447,1429.2537,1467.1679,1594.2075,1244.2473,1240.4293,1569.5256,1234.9207,1251.3683,1579.9771,1234.7611,1239.0822,1588.453,1238.0874,1226.2442],"unit":"ms","value":1251.368304}
+{"better":"lower","key":"owl-rl/materialized/q4","samples":[0.1961,0.1101,0.0718,0.159,0.0968,0.1167,0.1175,0.0613,0.0523,0.1179,0.062,0.0542,0.1152,0.085,0.0992],"unit":"ms","value":0.099206}
+{"better":"lower","key":"owl-rl/demand/q4","samples":[2069.2948,2065.1288,1953.5571,1730.0096,1730.7986,1759.3446,1709.9777,1715.2667,1705.2868,1719.5094,1726.889,1752.255,1703.9102,1725.1477,1719.8467],"unit":"ms","value":1726.888967}
+{"better":"lower","key":"owl-rl/demand-cached/q4","samples":[1862.6026,2413.815,2518.5939,1759.9894,2010.9439,2024.7023,1714.276,1993.3612,2009.415,1719.1328,2040.8618,2018.6429,1718.8789,1999.5428,1966.8735],"unit":"ms","value":1999.5427559999998}
+{"better":"lower","key":"owl-rl/materialized/q5","samples":[0.1399,0.1116,0.0883,0.2219,0.0977,0.0584,0.203,0.1144,0.0661,0.2062,0.1373,0.0647,0.2039,0.072,0.0968],"unit":"ms","value":0.11163999999999999}
+{"better":"lower","key":"owl-rl/demand/q5","samples":[1950.7594,1943.7518,1821.2216,1694.3922,1700.2342,1689.7975,1686.9166,1697.8127,1735.8732,1681.1641,1691.0394,1677.9667,1686.1303,1699.5331,1679.5645],"unit":"ms","value":1694.392231}
+{"better":"lower","key":"owl-rl/demand-cached/q5","samples":[1871.0028,1389.9517,1462.0372,1690.9361,1256.901,1271.682,1682.665,1233.4187,1223.2923,1687.2311,1255.4087,1234.4957,1665.447,1235.1345,1229.868],"unit":"ms","value":1271.6819850000002}
+{"better":"lower","key":"owl-rl/materialized/q6","samples":[0.9147,1.0837,1.0091,0.8643,0.8661,0.8567,0.8791,0.8843,0.8668,0.8637,0.8771,0.8845,0.8652,0.858,0.8886],"unit":"ms","value":0.8770889999999999}
+{"better":"lower","key":"owl-rl/demand/q6","samples":[1929.4521,1809.2526,1839.0727,1654.0748,1643.9755,1643.1689,1637.7004,1643.6499,1642.9376,1654.6519,1643.3575,1661.872,1644.2509,1650.7479,1653.2085],"unit":"ms","value":1650.747929}
+{"better":"lower","key":"owl-rl/demand-cached/q6","samples":[1780.2143,1224.0802,1131.6803,1675.1093,995.8559,992.6155,1632.8787,979.8815,986.6408,1654.1022,990.6096,984.5765,1633.2507,990.2437,988.5625],"unit":"ms","value":995.855935}
+{"better":"lower","key":"owl-rl/materialized/q7","samples":[0.145,0.0562,0.0443,0.1466,0.0969,0.0519,0.1304,0.0499,0.0378,0.1294,0.0513,0.0396,0.1784,0.0695,0.0409],"unit":"ms","value":0.056206}
+{"better":"lower","key":"owl-rl/demand/q7","samples":[1821.2659,1860.9954,1802.9225,1700.2436,1692.7785,1698.0086,1672.751,1682.1053,1689.8897,1688.879,1686.0817,1739.1406,1680.1081,1708.2701,1690.1135],"unit":"ms","value":1692.778471}
+{"better":"lower","key":"owl-rl/demand-cached/q7","samples":[1893.2111,2020.9235,1959.5287,1671.3761,1744.523,1748.089,1688.3122,1731.3753,1745.6463,1665.5399,1739.4193,1743.7115,1672.6331,1744.6798,1737.8838],"unit":"ms","value":1743.711511}
+{"better":"lower","key":"owl-rl/materialized/q8","samples":[3.2532,3.8128,2.3384,2.2203,2.1065,2.0639,2.1714,2.0642,2.0287,2.2,2.1097,2.0267,2.1401,2.0242,2.0405],"unit":"ms","value":2.109747}
+{"better":"lower","key":"owl-rl/demand/q8","samples":[1819.1921,1813.1025,1829.9303,1686.8502,1694.7403,1673.8081,1676.2391,1688.7734,1643.3473,1649.8205,1658.859,1650.3085,1672.2026,1668.2301,1662.0291],"unit":"ms","value":1673.80809}
+{"better":"lower","key":"owl-rl/demand-cached/q8","samples":[2093.091,2380.0402,2291.933,1925.4328,1997.1744,2058.6268,1936.0195,2028.4776,2022.2161,1927.9573,2056.3872,1999.6375,1919.393,2095.0804,2020.2263],"unit":"ms","value":2022.2161019999999}
+{"better":"lower","key":"owl-rl/materialized/q9","samples":[7.1602,6.9692,6.8721,6.7948,6.8439,7.0229,6.3178,6.3848,6.3247,6.7288,6.2033,5.9565,5.9498,5.5886,5.731],"unit":"ms","value":6.384811}
+{"better":"lower","key":"owl-rl/demand/q9","samples":[2107.6166,2122.8722,2165.3146,2073.1745,2000.3874,2065.3724,1943.3949,1925.2612,1969.4586,1956.5267,1973.079,1950.4326,1946.0099,1931.1584,1932.1469],"unit":"ms","value":1969.458637}
+{"better":"lower","key":"owl-rl/demand-cached/q9","samples":[2168.9155,2688.4862,2616.8009,2087.7515,2495.3004,2844.1828,1930.1886,2291.7116,2443.5034,1953.5486,2267.5447,2267.9517,1934.4186,2285.0642,2295.9159],"unit":"ms","value":2285.064201}
+{"better":"lower","key":"owl-rl/materialized/q10","samples":[0.0967,0.0271,0.0198,0.1495,0.0372,0.0232,0.1953,0.0362,0.0203,0.0892,0.0265,0.0198,0.0914,0.0258,0.0192],"unit":"ms","value":0.027121}
+{"better":"lower","key":"owl-rl/demand/q10","samples":[1755.939,1764.9928,1760.0148,1730.8225,1793.8521,1718.1359,1608.5085,1603.9567,1602.5262,1640.6198,1603.7062,1641.7513,1643.8315,1614.6041,1598.2913],"unit":"ms","value":1641.7513040000001}
+{"better":"lower","key":"owl-rl/demand-cached/q10","samples":[1753.9891,1348.4557,1353.6117,1698.4896,1316.6463,1286.7577,1624.8515,1226.8385,1236.094,1609.209,1235.6718,1220.1013,1636.2164,1241.1117,1234.3586],"unit":"ms","value":1316.6462530000001}
+{"better":"lower","key":"owl-rl/materialized/q11","samples":[0.1324,0.1065,0.1108,0.0841,0.108,0.0541,0.0728,0.0475,0.0594,0.0742,0.0479,0.0451,0.0758,0.0485,0.0454],"unit":"ms","value":0.07275699999999999}
+{"better":"lower","key":"owl-rl/demand/q11","samples":[1755.5703,1733.6865,1742.5416,1631.9772,1638.4671,1638.915,1583.0384,1577.984,1578.4881,1593.4432,1574.4285,1582.0513,1590.2138,1584.4833,1572.2749],"unit":"ms","value":1590.213817}
+{"better":"lower","key":"owl-rl/demand-cached/q11","samples":[1763.5928,1380.1323,1356.243,1667.3625,1275.6271,1293.5082,1577.9897,1231.6191,1230.0494,1604.7984,1232.0322,1243.8305,1612.7619,1233.4331,1240.4476],"unit":"ms","value":1293.508188}
+{"better":"lower","key":"owl-rl/materialized/q12","samples":[0.2587,0.1913,0.174,0.134,0.0684,0.0761,0.1211,0.0655,0.0579,0.1505,0.123,0.0721,0.1205,0.0648,0.0547],"unit":"ms","value":0.120546}
+{"better":"lower","key":"owl-rl/demand/q12","samples":[1954.2717,1894.1355,1879.9049,1828.9495,1787.3897,1777.8913,1707.163,1714.743,1721.6019,1741.723,1714.4852,1744.4046,1723.1677,1738.5414,1715.2601],"unit":"ms","value":1741.723034}
+{"better":"lower","key":"owl-rl/demand-cached/q12","samples":[2124.579,1945.1728,1807.4659,2062.1329,1878.2642,1853.2641,1954.4923,1738.1275,1742.0801,1961.6404,1760.0119,1774.9591,1957.1482,1740.8,1754.0798],"unit":"ms","value":1853.2641139999998}
+{"better":"lower","key":"owl-rl/materialized/q13","samples":[0.1435,0.0396,0.0254,0.1638,0.041,0.0248,0.156,0.0414,0.0283,0.1437,0.036,0.0234,0.1413,0.0364,0.0253],"unit":"ms","value":0.039564999999999996}
+{"better":"lower","key":"owl-rl/demand/q13","samples":[1760.4275,1716.9597,1778.162,1757.9415,1722.8926,1737.4386,1667.6228,1671.3942,1641.4958,1651.6642,1635.2861,1631.8621,1667.3554,1644.1204,1669.3234],"unit":"ms","value":1669.323407}
+{"better":"lower","key":"owl-rl/demand-cached/q13","samples":[1898.1112,1255.0652,1273.3369,1710.7266,1333.547,1386.3005,1705.0034,1262.8737,1234.0815,1643.3157,1230.0572,1233.2308,1647.0987,1241.3946,1234.5983],"unit":"ms","value":1273.336944}
+{"better":"lower","key":"owl-rl/materialized/q14","samples":[0.7173,0.6834,0.6469,0.7236,0.6874,0.6772,0.6628,0.657,0.6404,0.6693,0.7947,0.6414,0.6875,0.6481,0.6818],"unit":"ms","value":0.677234}
+{"better":"lower","key":"owl-rl/demand/q14","samples":[1607.3885,1610.7709,1601.693,1685.9492,1661.1187,1715.4556,1648.9802,1613.109,1602.3105,1621.6205,1568.2945,1591.3935,1592.8545,1614.9229,1593.4567],"unit":"ms","value":1610.770872}
+{"better":"lower","key":"owl-rl/demand-cached/q14","samples":[1636.9732,997.1153,996.0202,1650.6588,997.2489,995.2447,1601.2323,980.428,987.8146,1584.6796,987.2861,985.7305,1620.4961,983.4607,985.2987],"unit":"ms","value":996.020154}

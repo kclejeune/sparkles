@@ -99,6 +99,17 @@ request or on every write, and the schema report counts what the data holds.
   oracle checks. Diagnostics can attach a first support to each finding, and the UI
   previews a selected support fact's removal on a new branch before explicit application
   ([API.md](../API.md#minimal-justifications)).
+* A materialization can keep witnesses for each fact of its closure: up to a bound of
+  sets of input quads, each of which derives the fact, and whether others may exist
+  ([F18](../specs/F18-explanations-and-entailment-diffs.md#reasoner-witnesses-item-416)).
+  `ReasonOptions::witnesses` sets the bound, and incremental runs maintain them, deletions
+  included. A fact that is not truncated keeps exactly its minimal supports. They live
+  with the closure kept in memory, where `Cache::witnesses` and
+  `Cache::witness_dependents` read them, and they are off by default, so a run without
+  them does no work for them. Turning them on costs memory and time. At a bound of 8,
+LUBM with 10 universities took about ten times as long to materialize under RDFS and
+about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.75 GiB
+([results](../benchmarks/reasoning/RESULTS.md#reasoner-witnesses)).
 * Sparkles records the commit at which inferences were made, and only a later change to a
   graph the run read makes them stale. `GET /$/reason/{ds}`, dataset info, `/$/stats` and
   the `Sparkles-Inferences` header report freshness. Automatic re-runs are opt-in with
@@ -292,9 +303,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   their source revision and do not establish current-head performance.
 * The derived-table cache's budget accounting is item 192. DESCRIBE is refused under
   derivation on demand, item 193.
-* Provenance-based inferred visibility remains roadmap item 18. Query result cells do
-  not offer a Why? action,
-  item 285. `why_empty` adds hypotheses for a grounded failing intensional pattern.
+* Provenance-based inferred visibility, which reads the reasoner's witnesses, remains
+  roadmap item 18. Witness builds and updates take much longer than the closure, item
+  555, and their memory and their rebuild after the closure is read back from the
+  dataset are item 556. Every fact of a program with `noValue`, `listNotContains`,
+  default geometries, head actions or a list that is not plain is always truncated,
+  item 557. Query result cells do not offer a Why? action, item 285. `why_empty` adds hypotheses for a grounded failing intensional pattern.
   Abduction for patterns with unbound target variables remains item 286.
 * Derived facts use the ordinary inferred graph. A separate derived-fact layer and
   canonical `owl:sameAs` representatives are not built. Roadmap item 9.

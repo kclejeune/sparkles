@@ -471,3 +471,65 @@ fn a_restored_program_sees_its_constants_move() {
     .collect();
     assert_eq!(shown(&s.snapshot(), &back), want);
 }
+
+/// The witness that the fixed-point operator records for a triple and the witnesses the
+/// reasoner keeps for it (item 416) name input quads alike, and the operator's witness
+/// holds one of the reasoner's when the reasoner's are exact, since those are all the
+/// minimal supports.
+#[test]
+fn rule_witnesses_agree_with_the_reasoners() {
+    use crate::{Cache, Extras, Incremental, Profile, ReasonOptions, materialize_incremental};
+    let mut compared = 0;
+    for seed in 1..12u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x5851_f42d_4c95_7f2d));
+        let s = Store::in_memory(StoreOptions::default());
+        let init: Vec<T> = (0..8).map(|_| rng.triple()).collect();
+        apply(&s, &[], &init);
+        let fp = build(&s, Provenance::why());
+        let cache = Cache::default();
+        materialize_incremental(
+            &s,
+            &Profile::Rules(RULES.to_string()),
+            &Extras::default(),
+            Incremental {
+                since: None,
+                cache: Some(&cache),
+            },
+            &ReasonOptions {
+                witnesses: Some(256),
+                ..Default::default()
+            },
+        )
+        .expect("materialize");
+        let snap = s.snapshot();
+        for (f, _) in fp.facts() {
+            let term = |i: Id| fp.program.term(&snap, i).expect("a term");
+            let (Term::NamedNode(sub), Term::NamedNode(p)) = (term(f[0]), term(f[1])) else {
+                panic!("named nodes");
+            };
+            let t = oxrdf::Triple::new(sub, p, term(f[2]));
+            let Some(Ann::Why(w)) = fp.annotation(f) else {
+                panic!("not why");
+            };
+            let ours = w.supports[0].0.atoms();
+            let theirs = cache
+                .witnesses(&t)
+                .unwrap_or_else(|| panic!("seed {seed}: the reasoner keeps no witnesses for {t}"));
+            assert!(!theirs.annotation.witnesses.is_empty(), "seed {seed}: {t}");
+            if theirs.annotation.truncated {
+                continue;
+            }
+            compared += 1;
+            assert!(
+                theirs
+                    .annotation
+                    .witnesses
+                    .iter()
+                    .any(|x| x.atoms().iter().all(|a| ours.contains(a))),
+                "seed {seed}: {t}: the operator's {ours:?} holds none of {:?}",
+                theirs.annotation.witnesses
+            );
+        }
+    }
+    assert!(compared > 0);
+}

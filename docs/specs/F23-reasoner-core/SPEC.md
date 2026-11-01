@@ -118,7 +118,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 The quick-fixes phase is built. Roadmap items 485 and 486 shipped and item 487 was
-measured and not adopted. The core and convergence phases remain under
+measured and not adopted. The reasoner also records witnesses for F18 under item 416.
+The core and convergence phases remain under
 [item 456](../../ROADMAP.md).
 
 ### Closure operators
@@ -188,3 +189,21 @@ It derived the same facts, was slower on OWL2Bench with 1 university and no fast
 elsewhere, and raised LUBM(100)'s peak heap by 50 MiB.
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records the
 measurement.
+
+### Witnesses
+
+Item 416 gives the reasoner bounded witnesses per fact with F13's provenance algebra,
+off by default ([F18](../F18-explanations-and-entailment-diffs.md#reasoner-witnesses-item-416)).
+They are computed after the closure, from the rule instances that the backward plans of
+incremental maintenance find, and the engine's evaluation does not change. The closure
+operators keep no provenance of their own. Their facts take witnesses from the instances
+of the rules they evaluate, found as joins over the closure they built, so the result
+does not depend on how the closure was computed. The compact provenance of the core phase
+can later store these witnesses in columnar form, under roadmap item 556. With
+witnesses off, LUBM and OWL2Bench materializations derived the same facts with the same
+peak heap as the build before them. Their medians on a Namespace host ranged from 0.3%
+faster to 7% slower and their means were within 3%, although the path without witnesses
+only checks an option. Roadmap item 554 checks the difference on an Intel host.
+The [reasoning results](../../benchmarks/reasoning/RESULTS.md#reasoner-witnesses) give
+the measurements.
+

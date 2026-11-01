@@ -1,0 +1,102 @@
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1809 peak_heap_mib=389.6 vm_hwm=438968 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1856 peak_heap_mib=389.8 vm_hwm=442428 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1454 peak_heap_mib=389.8 vm_hwm=459712 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1381 peak_heap_mib=390.4 vm_hwm=457912 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=820 peak_heap_mib=267.7 vm_hwm=324844 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=924 peak_heap_mib=267.7 vm_hwm=316476 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3861 peak_heap_mib=992.5 vm_hwm=1047644 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3619 peak_heap_mib=992.4 vm_hwm=1051872 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1648 peak_heap_mib=390.2 vm_hwm=442256 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1560 peak_heap_mib=390.1 vm_hwm=441584 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1240 peak_heap_mib=390.0 vm_hwm=462912 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1228 peak_heap_mib=388.5 vm_hwm=461412 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=848 peak_heap_mib=267.6 vm_hwm=318884 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=920 peak_heap_mib=267.8 vm_hwm=319676 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3303 peak_heap_mib=992.4 vm_hwm=1050748 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3271 peak_heap_mib=992.4 vm_hwm=1051516 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1580 peak_heap_mib=390.5 vm_hwm=440684 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1650 peak_heap_mib=389.7 vm_hwm=430756 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1319 peak_heap_mib=389.8 vm_hwm=456236 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1318 peak_heap_mib=390.1 vm_hwm=461392 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=967 peak_heap_mib=267.8 vm_hwm=317844 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=941 peak_heap_mib=267.9 vm_hwm=318052 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3644 peak_heap_mib=992.4 vm_hwm=1048232 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3634 peak_heap_mib=992.4 vm_hwm=1026852 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1657 peak_heap_mib=390.1 vm_hwm=442260 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1605 peak_heap_mib=390.4 vm_hwm=445540 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1540 peak_heap_mib=390.1 vm_hwm=457600 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1268 peak_heap_mib=390.3 vm_hwm=455500 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=927 peak_heap_mib=267.7 vm_hwm=323692 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=931 peak_heap_mib=267.7 vm_hwm=319500 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3328 peak_heap_mib=992.3 vm_hwm=1050976 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3355 peak_heap_mib=992.3 vm_hwm=1048908 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1602 peak_heap_mib=390.1 vm_hwm=421664 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1563 peak_heap_mib=390.3 vm_hwm=440196 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1241 peak_heap_mib=388.1 vm_hwm=457416 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1397 peak_heap_mib=390.3 vm_hwm=464572 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=856 peak_heap_mib=267.7 vm_hwm=320984 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=926 peak_heap_mib=267.8 vm_hwm=326640 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3288 peak_heap_mib=992.4 vm_hwm=1024972 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3325 peak_heap_mib=992.3 vm_hwm=1051464 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1583 peak_heap_mib=389.7 vm_hwm=449508 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1558 peak_heap_mib=390.1 vm_hwm=437236 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1407 peak_heap_mib=390.0 vm_hwm=460416 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1240 peak_heap_mib=390.0 vm_hwm=462988 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=867 peak_heap_mib=267.8 vm_hwm=322868 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=909 peak_heap_mib=267.9 vm_hwm=320780 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3312 peak_heap_mib=992.5 vm_hwm=1045644 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3285 peak_heap_mib=992.6 vm_hwm=1048956 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1567 peak_heap_mib=390.4 vm_hwm=427452 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1591 peak_heap_mib=389.2 vm_hwm=442472 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1303 peak_heap_mib=388.0 vm_hwm=456384 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1279 peak_heap_mib=390.1 vm_hwm=463148 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=862 peak_heap_mib=267.8 vm_hwm=322124 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=943 peak_heap_mib=267.7 vm_hwm=324492 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3296 peak_heap_mib=992.5 vm_hwm=1054480 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3526 peak_heap_mib=992.5 vm_hwm=1053764 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1597 peak_heap_mib=389.8 vm_hwm=423332 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1550 peak_heap_mib=390.1 vm_hwm=446800 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1259 peak_heap_mib=390.0 vm_hwm=461168 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1408 peak_heap_mib=390.0 vm_hwm=462804 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=963 peak_heap_mib=267.6 vm_hwm=319008 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=869 peak_heap_mib=267.8 vm_hwm=319704 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3318 peak_heap_mib=992.5 vm_hwm=1054552 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3425 peak_heap_mib=992.3 vm_hwm=1044880 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1586 peak_heap_mib=390.2 vm_hwm=440984 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1567 peak_heap_mib=390.1 vm_hwm=422516 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1397 peak_heap_mib=389.8 vm_hwm=456092 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1279 peak_heap_mib=388.1 vm_hwm=455324 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=858 peak_heap_mib=267.7 vm_hwm=319184 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=939 peak_heap_mib=267.9 vm_hwm=318776 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3320 peak_heap_mib=992.5 vm_hwm=1050012 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3325 peak_heap_mib=992.4 vm_hwm=1052012 kB
+b lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1554 peak_heap_mib=390.1 vm_hwm=441192 kB
+a lubm10 w=off materialize rdfs threads=8 inferred=565906 iterations=5 ms=1556 peak_heap_mib=389.6 vm_hwm=441164 kB
+b lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1398 peak_heap_mib=389.8 vm_hwm=457160 kB
+a lubm10 w=off materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=1249 peak_heap_mib=389.8 vm_hwm=456660 kB
+b owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=835 peak_heap_mib=267.9 vm_hwm=323984 kB
+a owl2b1 w=off materialize owl-rl threads=8 inferred=1400688 iterations=6 ms=860 peak_heap_mib=267.7 vm_hwm=319980 kB
+b owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3391 peak_heap_mib=992.5 vm_hwm=1050084 kB
+a owl2b2 w=off materialize owl-rl threads=8 inferred=4915635 iterations=6 ms=3372 peak_heap_mib=992.4 vm_hwm=1050712 kB
+b lubm1 w=8 materialize rdfs threads=8 inferred=61796 iterations=5 ms=1230 peak_heap_mib=238.1 vm_hwm=366976 kB witnesses_ms=1055 witness_facts=74203 witness_truncated=28429 witnesses=246063 witness_evaluated=296461 witness_mib=58.1
+b lubm1 w=8 materialize owl-rl threads=8 inferred=132492 iterations=5 ms=5230 peak_heap_mib=457.9 vm_hwm=630356 kB witnesses_ms=4972 witness_facts=132492 witness_truncated=89285 witnesses=729859 witness_evaluated=543199 witness_mib=189.7
+b lubm10 w=8 materialize rdfs threads=8 inferred=565906 iterations=5 ms=15871 peak_heap_mib=1415.6 vm_hwm=2022628 kB witnesses_ms=13480 witness_facts=677738 witness_truncated=248201 witnesses=2139973 witness_evaluated=2739720 witness_mib=573.9
+b owl2b1 w=8 
+b lubm10 w=8 materialize owl-rl threads=8 inferred=1233449 iterations=5 ms=51077 peak_heap_mib=3285.5 vm_hwm=4603840 kB witnesses_ms=48795 witness_facts=1233449 witness_truncated=828320 witnesses=6763141 witness_evaluated=5098857 witness_mib=1752.8
+w=off keep rdfs threads=8 full method=full source= ms=1525 inferred=565906 peak_heap_mib=389.9 reasoner_peak_mib=129.8
+w=off keep rdfs threads=8 settle method=incremental source=store ms=226 inferred=565906 peak_heap_mib=172.6 reasoner_peak_mib=95.1
+w=off keep rdfs threads=8 kept_facts=677738 kept_closure_mib=82.7
+w=off keep rdfs threads=8 change method=incremental source=memory ms=12 inferred=566819 peak_heap_mib=37.0 reasoner_peak_mib=84.4
+w=off keep rdfs threads=8 revert method=incremental source=memory ms=10 inferred=565906 peak_heap_mib=3.3 reasoner_peak_mib=85.1
+w=off keep rdfs threads=8 change-again method=incremental source=memory ms=8 inferred=566819 peak_heap_mib=1.9 reasoner_peak_mib=85.3
+w=off keep rdfs threads=8 revert-from-store method=incremental source=store ms=176 inferred=565906 peak_heap_mib=98.9 reasoner_peak_mib=99.0
+w=off keep rdfs threads=8 vm_hwm=499816 kB
+w=8 keep rdfs threads=8 full method=full source= ms=14552 inferred=565906 peak_heap_mib=1416.0 reasoner_peak_mib=716.8 witnesses_ms=11429 witness_facts=677738 witness_truncated=248201 witnesses=2139973 witness_evaluated=2739720 witness_mib=573.9
+w=8 keep rdfs threads=8 settle method=incremental source=store ms=12048 inferred=565906 peak_heap_mib=1432.0 reasoner_peak_mib=732.8 witnesses_ms=11197 witness_facts=677738 witness_truncated=248203 witnesses=2139987 witness_evaluated=2739900 witness_mib=573.9
+w=8 keep rdfs threads=8 kept_facts=677738 kept_closure_mib=848.8
+w=8 keep rdfs threads=8 change method=incremental source=memory ms=5349 inferred=566819 peak_heap_mib=189.1 reasoner_peak_mib=725.9 witnesses_ms=4565 witness_facts=678540 witness_truncated=248523 witnesses=2140644 witness_evaluated=229976 witness_mib=574.0
+w=8 keep rdfs threads=8 revert method=incremental source=memory ms=4473 inferred=565906 peak_heap_mib=57.3 reasoner_peak_mib=726.0 witnesses_ms=3934 witness_facts=677738 witness_truncated=248203 witnesses=2139987 witness_evaluated=115481 witness_mib=574.0
+w=8 keep rdfs threads=8 change-again method=incremental source=memory ms=6580 inferred=566819 peak_heap_mib=153.6 reasoner_peak_mib=721.6 witnesses_ms=5747 witness_facts=678540 witness_truncated=248523 witnesses=2140644 witness_evaluated=230385 witness_mib=574.0
+w=8 keep rdfs threads=8 revert-from-store method=incremental source=store ms=13635 inferred=565906 peak_heap_mib=1274.6 reasoner_peak_mib=735.9 witnesses_ms=12615 witness_facts=677738 witness_truncated=248203 witnesses=2139987 witness_evaluated=2739900 witness_mib=573.9
+w=8 keep rdfs threads=8 vm_hwm=2512916 kB
+MATDONE

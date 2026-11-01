@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Item 416 A/B on a Namespace instance: materialization with witnesses off (A = 0dc27215,
+# B = lane tip), B with witnesses on, incremental runs, then the reasoning latency harness.
+set -uo pipefail
+L=$HOME/w; cd $L
+zstd -dc pkg.tar.zst | tar -x
+LD=/lib64/ld-linux-x86-64.so.2
+x() { local v=$1; shift; $LD $L/bin/$v/"$@"; }
+OUT=$L/out; mkdir -p $OUT data
+{ echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"; echo "cpus: $(nproc)"; free -m | head -2; uname -r; } > $OUT/env.txt
+x a lubm gen 10 data/lubm > /dev/null && x a lubm load data/lubm 10 data/lubm10 > /dev/null
+x a lubm gen 1 data/lubm1src > /dev/null && x a lubm load data/lubm1src 1 data/lubm1 > /dev/null
+for u in 1 2; do x a lubm loadfile data/owl2b$u owl2bench/owl2bench-$u.owl > /dev/null; done
+M=$OUT/mat.txt; : > $M
+run() { # variant db profile [witnesses]
+  rm -rf data/tmp; cp -r data/$2 data/tmp
+  if [ -n "${4:-}" ]; then r=$(SPARKLES_WITNESSES=$4 x $1 lubm materialize data/tmp $3 2>>$OUT/err.txt)
+  else r=$(x $1 lubm materialize data/tmp $3 2>>$OUT/err.txt); fi
+  echo "$1 $2 w=${4:-off} $r" >> $M
+}
+for round in 1 2 3 4 5 6 7 8 9 10; do
+  for case in "lubm10 rdfs" "lubm10 owl-rl" "owl2b1 owl-rl" "owl2b2 owl-rl"; do
+    set -- $case
+    if [ $((round % 2)) = 1 ]; then run a $1 $2; run b $1 $2; else run b $1 $2; run a $1 $2; fi
+  done
+done
+for case in "lubm1 rdfs" "lubm1 owl-rl" "lubm10 rdfs" "owl2b1 owl-rl" "lubm10 owl-rl"; do
+  set -- $case; (ulimit -v 11000000; run b $1 $2 8) || echo "b $1 $2 w=8 FAILED" >> $M
+done
+for w in off 8; do
+  for p in rdfs; do
+    rm -rf data/tmp; cp -r data/lubm10 data/tmp
+    if [ $w = 8 ]; then export SPARKLES_WITNESSES=8; else unset SPARKLES_WITNESSES; fi
+    (ulimit -v 11000000; x b lubm keep data/tmp $p 1000) 2>>$OUT/err.txt | sed "s/^/w=$w /" >> $M
+  done
+done
+unset SPARKLES_WITNESSES
+rm -rf data/tmp
+echo MATDONE >> $M
+for v in a b; do
+  RAYON_NUM_THREADS=12 x $v reasoning_latency 10 5 3 $OUT/lat-$v.jsonl > $OUT/lat-$v.md 2> $OUT/lat-$v.err
+done
+tar -czf $L/results.tgz -C $L out
+echo ALLDONE > $L/done

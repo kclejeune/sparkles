@@ -4,8 +4,9 @@
 >
 > **Phases:** Derivation trees, bounded why-not explanations, entailment diffs between
 > retained states and branch heads, write and merge previews, and minimal justifications
-> are available. Phase 3's provenance-aware inferred visibility and reviewed-only
-> protections remain planned and depend on F13's per-fact provenance.
+> are available. The reasoner records witnesses with F13's provenance algebra when a run
+> asks for them. Phase 3's provenance-aware inferred visibility and reviewed-only
+> protections, which read those witnesses, remain planned.
 >
 > **User docs:** [Explanations](../API.md#explanations),
 > [entailment diffs](../API.md#entailment-diffs),
@@ -600,6 +601,100 @@ The generated client types include candidates, blockers, missing-fact hypotheses
 read contexts, with a compile check that consumes the explanation fields.
 
 Phase 3 remains below item 18. No on-disk format changes are needed.
+
+### Reasoner witnesses, item 416
+
+The reasoner keeps the witnesses of §7.1 when `ReasonOptions::witnesses` names a bound,
+1 to 256. With no bound, the default, a run does no work for them. Item 18 Phase 3 turns
+them on for a dataset with a `"supported"` protection. The witnesses live with the
+closure that a `Cache` keeps between runs. `Cache::witnesses` returns a fact's minimal
+kept witnesses and whether it is truncated, `Cache::witness_dependents` returns the facts
+whose kept witnesses name an input quad, and the run report gives their counts, time and
+heap. Nothing is written to disk. A closure that the cache does not keep, or one read back
+from the dataset, has its witnesses built again from the closure by the next run that
+asks for them.
+
+A witness is a set of input quads named by F13's `FactKey`. With several input graphs a
+triple is named by the quad with the smallest key among the graphs that hold it, as F13
+does, and the witness moves to the next quad when that one goes. Rule instances have
+their premises' witnesses multiplied with `Witness::union`, and a fact's sum keeps an
+antichain, so no kept witness contains another. A recursive program has unbounded
+derivation counts, so each support counts once. The two rules of F13 §5.1 then hold in
+this form. A kept witness always derives its fact, and a fact that is not truncated keeps
+exactly its minimal supports, the minimal sets of input quads whose closure holds it. A
+fact is truncated when its own evaluation may have lost a support, or when a premise of
+one of its instances is truncated. Its evaluation loses supports when they pass the bound,
+when a rule instance's product passes its working bound of four times the bound or 16,384
+unions per premise, and when a fact has more than 4,096 instances. A fact with the empty
+support is exact whatever its premises keep. A program is not monotone when it uses `noValue` or `listNotContains`, when it
+synthesizes GeoSPARQL default geometries, or when a node of the closure has more than one
+`rdf:first` or `rdf:rest`. In each case a smaller set of facts can derive facts the
+closure lacks, also through intermediate facts it does not hold. A test that fails now can
+pass, a feature with fewer geometries gains a default one, and a tangled list can become
+plain with other members. Every fact of such a program is therefore truncated, and its
+rules that read RDF lists keep no witnesses. Programs with head actions or `makeTemp` are
+truncated too, since their instances do not show every support. Under such a program
+every asserted fact is truncated, because a hidden derivation may give it another minimal
+support.
+
+An incremental run keeps the witnesses that avoid the removed quads, which for a monotone
+program are exactly the minimal supports that remain. Before the deletion it finds the
+truncated facts that a removed fact reaches through truncated facts or facts that lose a
+kept witness. Those, the facts that lost a witness and the new facts are evaluated again
+with their truncation reset. When a fact stops being truncated, the truncated facts
+downstream are reset and evaluated again, so a cycle of truncated facts cannot keep its
+flag after its cause goes. A fact whose minimal supports fit the bound after an update is
+therefore exact, as a fresh build of the same closure keeps it. A changed RDF list cell
+under rules that read lists builds the witnesses again. With default geometries every
+update builds them again, because a deleted default geometry can return as a synthetic
+one and leave no removal for the update to follow.
+
+The closure operators of item 485 keep no provenance. Their rules stay in the program, so
+the witnesses of the facts they derive come from the rules' instances, found as joins over
+the closure the operators built. A fact on a long transitive chain has one minimal
+support per path and is often truncated.
+
+`crates/sparkles-reasoner/src/witness.rs` holds the tests. They compare witnesses against
+the minimal supports that the rules give over every subset of up to nine explicit facts,
+for builds under RDFS, RDFS simple and OWL 2 RL with and without closure operators, at
+bounds of 256, 8, 2 and 1, and for histories of insertions and deletions. After every
+update they check that each kept witness derives its fact, that an exact fact keeps
+exactly its minimal supports, and that every fact a fresh build keeps exactly is kept
+exactly and identically. `tests/witnesses.rs` checks the library surface, the move of a
+witness between input graphs and the bounds. The fixed-point operator of item 417 records
+one witness per fact for the same rules, and `fixpoint/tests.rs` checks that it names
+input quads with the same keys and holds one of the reasoner's witnesses whenever those
+are exact.
+
+The witnesses are charged to the run's memory budget as they grow, and a run past its
+`max_memory` stops with a memory error. The charge counts the nodes and supports that
+are kept, the tables by their capacity and the search state of each pass. It does not
+count the spare capacity of growing lists or the old table while a table is moved, so
+the allocated heap can exceed the charge by up to about twice the size of the largest
+growing list or table. The rule plans are charged once they are built, as incremental
+updates charge theirs. Roadmap item 558 addresses both. Kept witnesses that a later run does not use,
+because it keeps none or keeps another bound, are dropped before the kept closure is
+charged to that run.
+
+The witnesses trade memory and time for supported visibility, and the
+[reasoning results](../benchmarks/reasoning/RESULTS.md#reasoner-witnesses) give the
+measurements. At a bound of 8 on an 8-core Namespace host, LUBM with 10 universities took
+15.9 s to materialize under RDFS with witnesses against 1.6 s without them, and the
+witnesses held 574 MiB for 677,738 facts. Under OWL 2 RL the run took 51 s against 1.3 s,
+the witnesses held 1,753 MiB and 67% of the facts were truncated. OWL2Bench with one
+university did not fit in 11 GB of address space. A change of 1,000 triples over the kept
+RDFS closure took 5.3 s with witnesses against 12 ms without them, and the kept closure
+grew from 83 to 849 MiB. A run without witnesses derived the same facts with the same peak
+heap as the build before them. Roadmap items 555 and 556 address the time
+and the memory, and item 557 the facts that are truncated because their instances
+hide supports.
+
+The truncation flag is sound but not always the least one. A truncated premise keeps the
+first supports in a fixed order, and which supports those are can depend on the order in
+which facts are evaluated. Two builds of one closure can therefore flag a few different
+facts. The witnesses built after reading the LUBM closure back from the dataset flagged
+248,203 facts against 248,201 for the build from the run. Every fact that both builds
+keep exactly has the same witnesses in each.
 
 ### Phase 2, 2026-10-25
 

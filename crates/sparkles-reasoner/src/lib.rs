@@ -40,13 +40,16 @@ mod specialize;
 pub mod tables;
 mod terms;
 pub mod whynot;
+mod witness;
 
 pub use budget::MemoryExceeded as MemoryLimitExceeded;
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use inputs::{
     Fetched, GraphRef, Import, ImportMode, Inputs, LocationMapping, Resolved, fetch_imports,
 };
-pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES, literal_typings, literal_typings_controlled};
+pub use maintain::{
+    Cache, DEFAULT_CACHE_TRIPLES, FactWitnesses, literal_typings, literal_typings_controlled,
+};
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
 };
@@ -68,6 +71,7 @@ use std::time::Instant;
 use terms::{LocalTerm, Terms};
 
 pub use sparkles_core::INFERRED_GRAPH;
+pub use witness::{DEFAULT_MAX_WITNESSES, MAX_WITNESSES_LIMIT, WitnessReport};
 
 /// Full RDFS entailment (Jena `etc/rdfs.rules`, W3C RDF 1.1 Semantics rules).
 pub const RDFS_RULES: &str = include_str!("../rules/rdfs.rules");
@@ -192,6 +196,13 @@ pub struct ReasonOptions {
     /// ordinary rules, for differential tests and measurements.
     #[doc(hidden)]
     pub closure_operators: bool,
+    /// Keep up to this many witnesses per fact of the closure (spec F18 §7.1): sets of
+    /// input quads from which the rules derive the fact, kept with the provenance
+    /// algebra of F13 and maintained by incremental runs. They live with the closure a
+    /// [`Cache`] keeps, where [`Cache::witnesses`] reads them. `None`, the default, keeps
+    /// none, and a run then does no work for them. A protection that shows inferences
+    /// by their support turns them on.
+    pub witnesses: Option<usize>,
 }
 
 impl Default for ReasonOptions {
@@ -207,6 +218,7 @@ impl Default for ReasonOptions {
             threads: None,
             pool: None,
             closure_operators: true,
+            witnesses: None,
         }
     }
 }
@@ -223,6 +235,7 @@ impl fmt::Debug for ReasonOptions {
             .field("threads", &self.threads)
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
             .field("closure_operators", &self.closure_operators)
+            .field("witnesses", &self.witnesses)
             .finish()
     }
 }
@@ -263,6 +276,9 @@ pub struct ReasonReport {
     pub base_scans: u64,
     /// threads the rules were evaluated on
     pub threads: usize,
+    /// the witnesses the run built or updated, when [`ReasonOptions::witnesses`] asks
+    /// for them
+    pub witnesses: Option<WitnessReport>,
 }
 
 /// How a run materialized.
@@ -941,13 +957,30 @@ fn materialize_admitted(
         .filter(|t| !d.valid(t))
         .copied()
         .collect();
+    let (rules, iterations, budget) = (d.rules, d.iterations, d.budget.clone());
+    let (mut base_scans, threads) = (d.base_scans, d.threads);
+    let (closure, witnesses) = match wanted_witnesses(opts)? {
+        Some(max) => {
+            progress(opts, 0.9, "recording witnesses");
+            let mut c = d.into_closure()?;
+            let w =
+                exec.install(|| build_witnesses(&mut c, profile, extras, max, &budget, opts))?;
+            // the witness pass reads the input graphs too
+            if let Some(b) = c.graph.base() {
+                base_scans = base_scans.max(b.scans());
+            }
+            (ClosureState::Ready(c), Some(w))
+        }
+        None => (ClosureState::Derived(d), None),
+    };
     let done = Done {
-        rules: d.rules,
-        iterations: d.iterations,
-        budget: d.budget.clone(),
-        base_scans: d.base_scans,
-        threads: d.threads,
-        closure: Some(ClosureState::Derived(d)),
+        rules,
+        iterations,
+        budget,
+        base_scans,
+        threads,
+        closure: Some(closure),
+        witnesses,
         generalized,
         generalized_saved: None,
         written: w,
@@ -1044,10 +1077,49 @@ impl ClosureState {
     }
 }
 
+/// The bound of witnesses a run keeps, checked: none for an entailment analysis.
+fn wanted_witnesses(opts: &ReasonOptions) -> anyhow::Result<Option<usize>> {
+    match opts.witnesses {
+        Some(max) if opts.analysis.is_none() => {
+            witness::Witnesses::check_max(max)?;
+            Ok(Some(max))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The limits of the witness passes of a run.
+fn witness_limits(budget: &Arc<Budget>, opts: &ReasonOptions) -> engine::Limits {
+    engine::Limits {
+        max_iterations: opts.max_iterations,
+        max_inferred: opts.max_inferred,
+        cancel: opts.cancel.clone(),
+        progress: None,
+        budget: budget.clone(),
+        closures: false,
+    }
+}
+
+/// Build the witnesses of a closure.
+fn build_witnesses(
+    c: &mut incremental::Closure,
+    profile: &Profile,
+    extras: &Extras,
+    max: usize,
+    budget: &Arc<Budget>,
+    opts: &ReasonOptions,
+) -> anyhow::Result<witness::Witnesses> {
+    let rules = profile_rules(profile, extras)?;
+    let compiled = engine::compile(&rules, &c.terms, &mut Vec::new());
+    witness::Witnesses::build(c, &compiled, max, &witness_limits(budget, opts))
+}
+
 /// A run's result before its commit.
 struct Done {
     /// the closure, for the next incremental run
     closure: Option<ClosureState>,
+    /// the witnesses of the closure's facts, when the run keeps them
+    witnesses: Option<witness::Witnesses>,
     /// the run's memory, whose peak the report gives
     budget: Arc<Budget>,
     base_scans: u64,
@@ -1116,6 +1188,7 @@ fn finish(
     warnings.extend(done.warnings);
     let graphs = resolved.graph_set();
     let mut kept = false;
+    let witness_report = done.witnesses.as_ref().map(|w| w.report.clone());
     if let Some(state) = done.closure {
         let saved = maintain::save(
             store,
@@ -1143,6 +1216,7 @@ fn finish(
                 digest,
                 &graphs,
                 closure,
+                done.witnesses,
                 done.generalized,
                 &done.written.stored,
                 saved,
@@ -1172,6 +1246,7 @@ fn finish(
         peak_bytes: done.budget.peak() as u64,
         base_scans: done.base_scans,
         threads: done.threads,
+        witnesses: witness_report,
     };
     tracing::info!(
         profile = %report.profile,
@@ -1352,9 +1427,10 @@ fn update_closure(
     // on the run's threads: this thread may stand in for a parked worker of the pool
     // that called, so its parallel work must not go to that pool
     let run_ids = resolved.ids(snap);
+    let wanted = wanted_witnesses(opts)?;
     let prev = exec.install(|| {
         maintain::previous(
-            store, snap, since, digest, &graphs, &run_ids, inc.cache, raw, &budget,
+            store, snap, since, digest, &graphs, &run_ids, inc.cache, raw, &budget, wanted,
         )
     })?;
     let mut closure = prev.closure;
@@ -1382,19 +1458,38 @@ fn update_closure(
         closures: false,
     };
     let ch = &ch;
+    // the witnesses of the previous closure, when the run keeps witnesses with the same
+    // bound; otherwise they are built again after the update. With default geometries the
+    // change set no longer shows which input quads went away, since a removed default can
+    // come back as a synthetic one, so the witnesses are built again
+    let mut prior = match (wanted, prev.witnesses) {
+        (Some(max), Some(w)) if w.max() == max && !extras.geo_default_geometry => Some(w),
+        _ => None,
+    };
+    let wl = witness_limits(&budget, opts);
+    let mut prepared: Option<witness::Prepared> = None;
     progress(opts, 0.1, "updating the closure");
     let (up, threads) = exec.install(|| {
+        let has = prior.is_some();
+        let mut hook = |c: &mut incremental::Closure| -> anyhow::Result<()> {
+            if let Some(w) = prior.as_mut() {
+                prepared = Some(w.prepare(c, &compiled, &wl, &ch.base_removed, &ch.base_moved)?);
+            }
+            Ok(())
+        };
+        let hook: Option<incremental::BeforeDelete<'_>> = if has { Some(&mut hook) } else { None };
         let up = incremental::update(
             &mut closure,
             &compiled,
             &limits,
             &ch.base_added,
             &ch.base_removed,
+            hook,
         );
         (up, rayon::current_num_threads())
     });
     let up = up?;
-    let base_scans = base.scans();
+    let mut base_scans = base.scans();
     drop(base);
     let mut generalized = prev.generalized;
     let mut gen_changes = maintain::GeneralizedChanges::default();
@@ -1412,6 +1507,43 @@ fn update_closure(
         if !closure.explicit_held(t) && !closure.terms.valid(t) && generalized.insert(*t) {
             gen_changes.added.push(*t);
         }
+    }
+    let witnesses = match wanted {
+        None => None,
+        Some(max) => {
+            progress(opts, 0.75, "updating witnesses");
+            let updated = match (prior, prepared) {
+                (Some(mut w), Some(p)) => {
+                    let ok = exec.install(|| {
+                        w.update(
+                            &mut closure,
+                            &compiled,
+                            &wl,
+                            p,
+                            &ch.base_added,
+                            &ch.base_removed,
+                            &up.deleted,
+                            &added,
+                            &touched,
+                        )
+                    })?;
+                    ok.then_some(w)
+                }
+                _ => None,
+            };
+            match updated {
+                Some(w) => Some(w),
+                None => Some(
+                    exec.install(|| witness::Witnesses::build(&mut closure, &compiled, max, &wl))?,
+                ),
+            }
+        }
+    };
+    // the witness pass reads the input graphs too
+    if witnesses.is_some()
+        && let Some(b) = closure.graph.base()
+    {
+        base_scans = base_scans.max(b.scans());
     }
     progress(opts, 0.8, "writing inferred graph");
     let candidates = up
@@ -1444,6 +1576,7 @@ fn update_closure(
         base_scans,
         threads,
         closure: Some(ClosureState::Ready(closure)),
+        witnesses,
         generalized_saved: prev.saved.map(|m| (m, gen_changes)),
         generalized,
         written,
