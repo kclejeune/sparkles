@@ -635,7 +635,9 @@ answers come from one `Store::managed_snapshot` or from the registry the mutatio
 committed. A detach first checks that this build reads the recorded settings and
 otherwise changes nothing. A configuration interrupted between `evidence.json` and
 `managed.json` refuses every write until the next configuration, which is checked
-against the protection `managed.json` records and repairs the registry.
+against the protection `managed.json` records and repairs the registry. After an
+interrupted first configuration there is no `managed.json`, and the next configuration
+starts from no protection at revision 0, on the live dataset or after a reopen.
 All three routes need `admin`. A `format` or `profile` other than 1 answers
 `409 unsupported-profile`.
 

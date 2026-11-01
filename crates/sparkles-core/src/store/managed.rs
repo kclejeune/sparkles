@@ -250,9 +250,10 @@ impl Store {
 
     /// One coherent view of the dataset's registry: its graphs and the owner settings
     /// files it records, from a single load. `None` without a registry. A registry
-    /// whose owner settings file does not match its digest, which enabling the owner
-    /// again repairs, is returned as recorded in `managed.json` with the settings files
-    /// on disk and [`ManagedSnapshot::unavailable`] set. Any other registry that cannot
+    /// that enabling an owner again repairs, such as one whose owner settings file does
+    /// not match its digest or one whose change did not complete, is returned as
+    /// `managed.json` records it, or empty at revision 0 when there is no such file,
+    /// with the settings files on disk and [`ManagedSnapshot::unavailable`] set. Any other registry that cannot
     /// be enforced fails with `managed-unavailable`.
     pub fn managed_snapshot(&self) -> Result<Option<ManagedSnapshot>> {
         let Some(state) = self.managed_state() else {
@@ -268,24 +269,33 @@ impl Store {
                 reason,
                 repairable: true,
             } => {
-                let recorded = self
-                    .managed_root()
-                    .map(|root| recorded_entries(&root))
-                    .transpose()
-                    .ok()
-                    .flatten()
-                    .flatten();
-                match recorded {
-                    Some(i) => Ok(Some(ManagedSnapshot {
-                        graphs: i.graphs,
-                        settings: i.settings,
-                        unavailable: Some(reason.clone()),
-                    })),
-                    None => Err(ManagedError::error(
-                        ManagedErrorKind::Unavailable,
-                        reason.clone(),
-                    )),
-                }
+                // What `managed.json` records, or no registry at all when a first
+                // enablement stopped before writing it: the same state that enabling
+                // the owner again starts from.
+                let recorded = match self.managed_root() {
+                    Some(root) => recorded_entries(&root).map_err(|e| {
+                        ManagedError::error(
+                            ManagedErrorKind::Unavailable,
+                            format!("{reason}; {}: {e}", crate::managed::FILE),
+                        )
+                    })?,
+                    None => None,
+                };
+                let (graphs, settings) = match recorded {
+                    Some(i) => (i.graphs, i.settings),
+                    None => (
+                        ManagedGraphs {
+                            revision: 0,
+                            owners: BTreeMap::new(),
+                        },
+                        BTreeMap::new(),
+                    ),
+                };
+                Ok(Some(ManagedSnapshot {
+                    graphs,
+                    settings,
+                    unavailable: Some(reason.clone()),
+                }))
             }
             ManagedState::Unavailable { reason, .. } => Err(ManagedError::error(
                 ManagedErrorKind::Unavailable,

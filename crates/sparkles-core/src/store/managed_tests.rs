@@ -589,6 +589,55 @@ fn an_interrupted_enablement_recovers_safely() {
     assert_eq!(managed_code(upd(&s, &insert_t)), "profile-managed-graph");
 }
 
+/// A change that stops after its settings file, on the same live store, leaves a
+/// snapshot that enabling again at its revision repairs: empty at revision 0 for a
+/// first enablement, and the recorded registry otherwise.
+#[test]
+fn an_interrupted_change_is_repaired_on_the_live_store() {
+    let insert_t = format!("INSERT DATA {{ GRAPH <{T}> {{ <urn:x> <urn:p> 1 }} }}");
+    for first in [&b""[..], OLD] {
+        let (_dir, s) = setup();
+        if !first.is_empty() {
+            s.enable_managed(OwnerKind::Evidence, entry(&[M], first), first)
+                .unwrap();
+        }
+        s.set_failpoint(
+            "managed-settings-written",
+            Some(Arc::new(|_| panic!("interrupted"))),
+        );
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.enable_managed(OwnerKind::Evidence, entry(&[M, T], NEW), NEW)
+        }));
+        assert!(r.is_err());
+        s.set_failpoint("managed-settings-written", None);
+        assert_eq!(managed_code(upd(&s, &insert_t)), "managed-unavailable");
+        let snap = s.managed_snapshot().unwrap().unwrap();
+        assert!(snap.unavailable.is_some());
+        let expected = if first.is_empty() { 0 } else { 1 };
+        assert_eq!(snap.graphs.revision, expected);
+        assert_eq!(
+            snap.graphs.owner_of(M).is_some(),
+            !first.is_empty(),
+            "the recorded protection"
+        );
+        // a stale revision is still refused, the recorded one repairs
+        assert!(matches!(
+            s.enable_managed_at(OwnerKind::Evidence, entry(&[M, T], NEW), NEW, expected + 1),
+            Err(Error::Conflict(_))
+        ));
+        s.enable_managed_at(OwnerKind::Evidence, entry(&[M, T], NEW), NEW, expected)
+            .unwrap();
+        assert_eq!(managed_code(upd(&s, &insert_t)), "profile-managed-graph");
+        upd(&s, "INSERT DATA { GRAPH <urn:free> { <urn:x> <urn:p> 2 } }").unwrap();
+        let snap = s.managed_snapshot().unwrap().unwrap();
+        assert_eq!(
+            (snap.graphs.revision, snap.unavailable),
+            (expected + 1, None)
+        );
+        assert_eq!(&*snap.settings[&OwnerKind::Evidence], NEW);
+    }
+}
+
 #[test]
 fn backups_and_clones_keep_the_protection() {
     let (dir, s) = setup();
