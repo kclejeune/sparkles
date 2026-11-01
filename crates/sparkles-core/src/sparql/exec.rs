@@ -7165,21 +7165,28 @@ struct Graph<'a> {
     sweeps: &'a std::cell::Cell<usize>,
 }
 
-/// The growth of a neighbour buffer while one lookup or sweep fills it: the capacity
-/// added since it started is charged, and the deadline checked, every few thousand
-/// nodes. The charge ends with the lookup, once the closure charges what it keeps.
+/// The growth of a neighbour buffer while lookups or a sweep fill it: the capacity
+/// added since it started is charged every few thousand nodes, and the deadline is
+/// checked every few thousand nodes added or rows scanned, since one lookup may read
+/// millions of rows, kept or not. The charge ends with the expansion, once the closure
+/// charges what it keeps.
 struct Growth<'a> {
     ctx: &'a Ctx,
     held: super::ctx::Charge<'a>,
     charged: usize,
+    scanned: usize,
 }
 
 impl<'a> Growth<'a> {
-    fn new(ctx: &'a Ctx) -> Result<Self> {
+    /// A charge for the growth of `out` beyond its present capacity, which its owner
+    /// has charged already.
+    #[allow(clippy::ptr_arg)]
+    fn new(ctx: &'a Ctx, out: &Vec<u64>) -> Result<Self> {
         Ok(Self {
             ctx,
             held: ctx.charge(0)?,
-            charged: 0,
+            charged: out.capacity(),
+            scanned: 0,
         })
     }
 
@@ -7189,6 +7196,16 @@ impl<'a> Growth<'a> {
         if out.capacity() >= self.charged.saturating_add(4096) {
             self.held.add((out.capacity() - self.charged) as u64 * 8)?;
             self.charged = out.capacity();
+            self.ctx.check()?;
+        }
+        Ok(())
+    }
+
+    /// Count `rows` index rows read, and check the deadline every 65,536.
+    fn scan(&mut self, rows: usize) -> Result<()> {
+        let before = self.scanned;
+        self.scanned = self.scanned.saturating_add(rows);
+        if before / 65_536 != self.scanned / 65_536 {
             self.ctx.check()?;
         }
         Ok(())
@@ -7249,7 +7266,7 @@ impl Graph<'_> {
         let gc = perm.col_of(crate::index::G);
         let (first, last) = (frontier[0], frontier[frontier.len() - 1]);
         let mut j = 0;
-        let mut grown = Growth::new(self.ctx)?;
+        let mut grown = Growth::new(self.ctx, out)?;
         self.ctx.snap.scan_between_cols(
             perm,
             [p, first, 0, 0],
@@ -7262,6 +7279,7 @@ impl Graph<'_> {
             |c| {
                 match c {
                     Chunk::Block(b, s, e) => {
+                        grown.scan(e - s)?;
                         let (keys, vals, gs) =
                             (&b.cols[1][s..e], &b.cols[2][s..e], &b.cols[gc][s..e]);
                         let mut i = 0;
@@ -7285,6 +7303,7 @@ impl Graph<'_> {
                         }
                     }
                     Chunk::Row(k) => {
+                        grown.scan(1)?;
                         j += frontier[j..].partition_point(|&x| x < k[1]);
                         if j < frontier.len() && frontier[j] == k[1] && self.graph.accepts(k[gc]) {
                             out.push(k[2]);
@@ -7303,11 +7322,9 @@ impl Graph<'_> {
     /// the neighbour buffer's memory between lookups, since one level of a wide
     /// closure may hold millions of nodes.
     fn expand_each(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
-        let mut grown = Growth::new(self.ctx)?;
-        grown.charged = out.capacity();
+        let mut grown = Growth::new(self.ctx, out)?;
         for (i, &x) in frontier.iter().enumerate() {
-            out.extend(self.neighbours(x, forward)?);
-            grown.track(out)?;
+            self.neighbours_into(x, forward, out, &mut grown)?;
             if i % 1024 == 1023 {
                 self.ctx.check()?;
             }
@@ -7316,42 +7333,67 @@ impl Graph<'_> {
     }
 
     fn neighbours(&self, x: u64, forward: bool) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let mut grown = Growth::new(self.ctx, &out)?;
+        self.neighbours_into(x, forward, &mut out, &mut grown)?;
+        Ok(out)
+    }
+
+    /// Append the neighbours of `x` to `out`, whose growth `grown` charges.
+    fn neighbours_into(
+        &self,
+        x: u64,
+        forward: bool,
+        out: &mut Vec<u64>,
+        grown: &mut Growth<'_>,
+    ) -> Result<()> {
         if let Some((p, rev)) = self.spec.simple {
-            return self.seek(p, rev, x, forward);
+            return self.seek(p, rev, x, forward, out, grown);
         }
         if let Some(preds) = &self.spec.preds {
             // one lookup per predicate of the alternative, with a neighbour once per
             // predicate that links to it, as the union of the edge plan has it
-            let mut out = Vec::new();
             for &(p, rev) in preds {
-                out.extend(self.seek(p, rev, x, forward)?);
+                self.seek(p, rev, x, forward, out, grown)?;
             }
-            return Ok(out);
+            return Ok(());
         }
         let m = if forward { self.fwd } else { self.bwd };
-        Ok(m.and_then(|m| m.get(&x)).cloned().unwrap_or_default())
+        if let Some(ys) = m.and_then(|m| m.get(&x)) {
+            out.extend_from_slice(ys);
+            grown.track(out)?;
+        }
+        Ok(())
     }
 
-    /// The neighbours of `x` over predicate `p` (`rev`: its inverse), read by one
-    /// index lookup.
-    fn seek(&self, p: u64, rev: bool, x: u64, forward: bool) -> Result<Vec<u64>> {
+    /// Append the neighbours of `x` over predicate `p` (`rev`: its inverse) to `out`,
+    /// read by one index lookup. A hub's neighbours are charged, and the deadline
+    /// checked, as they are read, kept or not, since one lookup may read millions of
+    /// rows.
+    fn seek(
+        &self,
+        p: u64,
+        rev: bool,
+        x: u64,
+        forward: bool,
+        out: &mut Vec<u64>,
+        grown: &mut Growth<'_>,
+    ) -> Result<()> {
         let dir = forward != rev;
         // forward: (x p ?o) via PSO; backward: (?s p x) via POS
         let perm = if dir { Perm::Pso } else { Perm::Pos };
         let gc = perm.col_of(crate::index::G);
-        let mut out = Vec::new();
         let mask = if self.ctx.opt.selective_columns {
             (1 << 2) | (1 << gc)
         } else {
             crate::index::ALL_COLS
         };
         let (lo, hi) = (pad(&[p, x], 0), pad(&[p, x], u64::MAX));
-        // A hub's neighbours are charged and the deadline checked as they are read,
-        // since one lookup may return millions of them.
-        let mut grown = Growth::new(self.ctx)?;
+        let from = out.len();
         self.ctx.snap.scan_between_cols(perm, lo, hi, mask, |c| {
             match c {
                 Chunk::Block(b, s, e) => {
+                    grown.scan(e - s)?;
                     for i in s..e {
                         if self.graph.accepts(b.cols[gc][i]) {
                             out.push(b.cols[2][i]);
@@ -7359,16 +7401,25 @@ impl Graph<'_> {
                     }
                 }
                 Chunk::Row(k) => {
+                    grown.scan(1)?;
                     if self.graph.accepts(k[gc]) {
                         out.push(k[2]);
                     }
                 }
             }
-            grown.track(&out)?;
+            grown.track(out)?;
             Ok(true)
         })?;
-        out.dedup();
-        Ok(out)
+        // the same neighbour in several graphs of the active graph, once
+        let mut w = from;
+        for r in from..out.len() {
+            if w == from || out[r] != out[w - 1] {
+                out[w] = out[r];
+                w += 1;
+            }
+        }
+        out.truncate(w);
+        Ok(())
     }
 
     /// Nodes reachable from `start` according to min/max length (ARQ ranges: once per
@@ -9541,5 +9592,73 @@ mod limited_startup_tests {
     #[test]
     fn probe_prefix_keeps_the_expanding_consumer_within_its_budget() {
         expanding_consumer(true).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod path_lookup_tests {
+    use super::*;
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+
+    /// A lookup that reads many index rows checks the deadline even when the active
+    /// graph rejects every row, so that no neighbour is added to its buffer.
+    #[test]
+    fn lookup_checks_the_deadline_over_rejected_rows() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..200_000 {
+            let p = if i % 2 == 0 { "p" } else { "q" };
+            data.push_str(&format!("<urn:hub> <urn:{p}> <urn:n:{i}> <urn:g1> .\n"));
+        }
+        data.push_str("<urn:a> <urn:p> <urn:b> <urn:g2> .\n");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let mut ctx = Ctx::new(store.snapshot());
+        let term = |ctx: &Ctx, iri: &str| {
+            ctx.intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new(iri).unwrap()))
+                .0
+        };
+        let (hub, p, q, g2) = (
+            term(&ctx, "urn:hub"),
+            term(&ctx, "urn:p"),
+            term(&ctx, "urn:q"),
+            term(&ctx, "urn:g2"),
+        );
+        ctx.deadline = Some(Instant::now());
+        let v = ctx.var("t");
+        for (simple, preds) in [
+            (Some((p, false)), None),
+            (None, Some(vec![(p, false), (q, false)])),
+        ] {
+            let spec = PathSpec {
+                subj: PathEnd::Const(Id(hub)),
+                obj: PathEnd::Var(v),
+                min: 1,
+                max_one: false,
+                simple,
+                preds,
+                graph: GraphFilter::One(g2),
+                graph_var: None,
+                edge_vars: None,
+                count: None,
+                src: None,
+            };
+            let sweeps = std::cell::Cell::new(0);
+            let g = Graph {
+                ctx: &ctx,
+                spec: &spec,
+                graph: GraphFilter::One(g2),
+                fwd: None,
+                bwd: None,
+                sweeps: &sweeps,
+            };
+            assert!(matches!(g.neighbours(hub, true), Err(Error::Timeout)));
+        }
     }
 }

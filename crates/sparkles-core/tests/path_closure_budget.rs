@@ -273,7 +273,8 @@ fn bound_seed_alternative_closure_returns_the_same_answers() {
         .map(|s| format!("<urn:n:{s}>"))
         .collect::<Vec<_>>()
         .join(" ");
-    let cases: [(&str, &[(&str, bool)], usize); 5] = [
+    type Case<'a> = (&'a str, &'a [(&'a str, bool)], usize);
+    let cases: [Case; 5] = [
         ("(<urn:r>|<urn:d>)*", &[("r", false), ("d", false)], 0),
         ("(<urn:r>|<urn:d>)+", &[("r", false), ("d", false)], 1),
         ("(<urn:d>|^<urn:r>)*", &[("d", false), ("r", true)], 0),
@@ -399,5 +400,67 @@ fn one_hub_lookup_is_charged_as_it_is_read() {
                 r => panic!("{q} {mode:?}: {r:?}"),
             }
         }
+    }
+}
+
+#[test]
+fn neighbours_of_many_alternative_predicates_stay_charged_together() {
+    // Each of the 64 lookups fits the budget, and their neighbours together do not.
+    let mut data = String::new();
+    for p in 0..64 {
+        for i in 0..10_000 {
+            data.push_str(&format!("<urn:hub> <urn:p:{p}> <urn:n:{p}:{i}> .\n"));
+        }
+    }
+    let store = store(&data);
+    let alternative = (0..64)
+        .map(|p| format!("<urn:p:{p}>"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let q = format!("SELECT (COUNT(*) AS ?n) WHERE {{ <urn:hub> ({alternative})+ ?t }}");
+    let limit = 1u64 << 20;
+    let opts = QueryOptions {
+        max_memory_bytes: Some(limit),
+        no_cache: true,
+        ..Default::default()
+    };
+    for mode in MODES {
+        match run(&store, &q, &opts, mode) {
+            Err(Error::BudgetExceeded(b)) => {
+                assert_eq!(b.kind, BudgetKind::Memory, "{mode:?}");
+                assert!(b.requested < 4 * limit, "{mode:?}: {b:?}");
+            }
+            r => panic!("{mode:?}: {r:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_sweep_charges_only_the_capacity_it_adds() {
+    // The second level of 256 nodes is expanded by one sweep over the 65,536 edges
+    // between the two layers. The neighbour buffer the closure already holds is not
+    // charged a second time, so the closure fits a budget it fits without the sweep.
+    let mut data = String::new();
+    for a in 0..256 {
+        data.push_str(&format!("<urn:root> <urn:p> <urn:a:{a}> .\n"));
+        for b in 0..256 {
+            data.push_str(&format!("<urn:a:{a}> <urn:p> <urn:b:{b}> .\n"));
+        }
+    }
+    for b in 0..256 {
+        data.push_str(&format!("<urn:b:{b}> <urn:p> <urn:end> .\n"));
+    }
+    let store = store(&data);
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { <urn:root> <urn:p>* ?t }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(700 << 10),
+        no_cache: true,
+        ..Default::default()
+    };
+    for mode in MODES {
+        let Rows::Select(rows) = run(&store, q, &opts, mode).unwrap() else {
+            panic!()
+        };
+        assert!(rows[0][0].starts_with("\"514\""), "{mode:?}: {rows:?}");
     }
 }
