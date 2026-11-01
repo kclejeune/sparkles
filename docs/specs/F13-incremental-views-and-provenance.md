@@ -872,8 +872,9 @@ capabilities and remaining work are described by the spec status and Outcome.
 runtime into modules, was delivered on 2026-10-31, and so were the internal circuits of
 item 414, which [Internal circuits](#internal-circuits) records. The provenance algebra of
 item 415 was delivered on 2026-11-01, and [Provenance annotations](#provenance-annotations)
-records it. The rest of Phases 2 and 3 is not built, and [ROADMAP](../ROADMAP.md) item 17
-tracks it as items 416 to 429.
+records it. The fixed-point operator of item 417 was delivered on 2026-11-01, and
+[Fixed-point operator](#fixed-point-operator) records it. The rest of Phases 2 and 3 is
+not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 416 and 418 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
@@ -921,8 +922,9 @@ tracks it as items 416 to 429.
   by reversing the net changes in its delta (`Snapshot::before_changes`), so no history
   is read.
 - Operators that the circuit does not maintain become `recompute` nodes with their own
-  footprint. These are paths with `*`, `+` or `?` (paths without them are expanded into
-  joins and unions of at most 16 alternatives), `LIMIT` and `OFFSET`, a dataset clause,
+  footprint. These are paths with `?`, and the paths with `*` or `+` that the
+  [fixed-point operator](#fixed-point-operator) does not take (paths without them are
+  expanded into joins and unions of at most 16 alternatives), `LIMIT` and `OFFSET`, a dataset clause,
   the aggregates other than `COUNT`, `SUM` and `AVG`, correlated `EXISTS`, `LATERAL` and
   ARQ's other extensions, triple terms, property functions, a `GRAPH` inside another
   `GRAPH`, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and subqueries under
@@ -1337,6 +1339,115 @@ change only incremental circuits, gave a geometric mean of 0.987. The
 [writes benchmark](../benchmarks/writes/RESULTS.md#provenance-annotations) has the tables,
 and 529, 530 and 531 track the forge checks, the plain pattern
 order and faster annotated builds.
+
+### Fixed-point operator
+
+Item 417 delivers the fixed-point operator of §4.3 in `incr/fixpoint.rs`, maintains
+property paths with `+` and `*` through it in `incr/ops/path.rs`, and plugs the reasoner's
+forward rules into it in `sparkles-reasoner/src/fixpoint.rs`.
+
+- **Interface.** A `Program` names its derived facts, the base facts its rule instances
+  read, and the instances themselves through `axioms`, `consequences`, `prove`, `broken`
+  and `added`. `FixedPoint` keeps every derived fact with a record, the one instance that
+  derived it first. Records are well founded, since an instance is recorded only over
+  facts that held before it, so following them from any fact ends at base facts and no
+  fact in a cycle supports itself.
+- **Maintenance.** A pass deletes by backward and forward rederivation. The facts whose
+  recorded instance read a removed base fact are broken, and they and the facts whose
+  records depend on them are the candidates. Each candidate is first checked backward for
+  an instance at the new snapshot over facts that are not candidates. The instances over
+  added base facts then derive new facts, and forward chaining from everything kept or
+  derived proves the remaining candidates that still follow. The candidates left are
+  deleted. A fact with another derivation is never deleted and derived again, so the
+  operator's change holds only the facts that come and go, and a fact whose record is
+  intact is never checked.
+- **Paths.** A path `s step+ o` or `s step* o`, its inverse `^`, under `GRAPH` with a
+  constant or a variable, compiles to the operator when the step is a simple path, an
+  alternative of at most 16 sequences of IRIs and inverses, and each end is a variable,
+  an IRI or a literal other than the graph's variable. The facts are (graph, start, end),
+  recorded by the node before the end. With two variable ends every subject of a step
+  starts a walk, and with a constant end the walk starts there, backward for a constant
+  object. A pass finds the starts that reach a changed step by walking the steps backward
+  from it at both snapshots, so the step relation is probed from the store's
+  permutations and never copied. The walks a pass memoizes count against the budget
+  and are released when the pass ends. `*` adds the zero-length rows without state. They are
+  the nodes of the active graph for two variable ends, and for a constant end the
+  constant itself in each graph that exists under the reader's access, as the query
+  engine evaluates them, so a graph whose triples a protection hides does not exist. A path with `?`, a negated property set, a nested `*` or `+`, or
+  a blank node end is still a `recompute` node, and `explain` names the reason.
+- **Reasoner plug-in.** `RuleProgram` runs the forward Jena rules whose bodies are
+  triple patterns over at most four variables and whose heads use only body variables,
+  and refuses the others. Its facts are triples, indexed by predicate, by predicate and
+  subject, and by predicate and object, and a record names the rule and its variables.
+  Constants that the store lacks, in bodies and heads, are kept as local terms, so a
+  rule matches the triples another rule derives with them, and a pass that first meets
+  one in the store builds the program again. `RuleProgram::encode` and `decode`
+  checkpoint a fixed point with those terms. The reasoner's own maintenance is
+  unchanged. Moving it onto the operator is item 456's shared maintenance core, after item
+  547 measures the plug-in on LUBM.
+- **Provenance.** With a provenance setting a fact counts one derivation, its recorded
+  one, and its support is the union of the instances' supports along its record chain,
+  so the witness it reports is real. A fact whose record changes, and the facts recorded
+  under it, are annotated again in the pass. A path row of `*` without a step is
+  annotated by a quad of the active graph that names its node, and a constant end's row
+  is `one` in the default graph and unknown in a named graph, whose existence no single
+  quad witnesses. Rows report one witness rather than all of them, and complete witness
+  sets for fixed-point rows are item 543.
+- **Budget and state.** The operator counts about 40 bytes for each fact, and its rows
+  are counted again by an operator above it that keeps them, such as a join's
+  arrangement. Annotations count as they are made, and the budget is checked again at
+  the end of every build and pass. A build or pass that takes the circuit over its memory budget stops with
+  `BudgetExceeded`, and the view is `suspended` with `over-budget` as §3.5 describes for
+  every operator. This memory buys
+  passes that touch only the walks a change reaches.
+- **Checkpoints.** `VIEW_STATE` gains format 2, whose body ends with the operators'
+  fixed-point state, and `INTERNAL_CIRCUIT_STATE` gains formats 3 and 4, which add it to
+  formats 1 and 2. A circuit writes the lowest format that holds its state and reads only
+  its own, so a view without a path keeps format 1 and the format that older releases
+  read. A file of another known format is left for the next checkpoint to remove, and a
+  file of an unknown format is refused and left in place while the view is built from
+  the data. `COMPILER` is `f13-phase3-1`, so views that recomputed a path are built again
+  as maintained views.
+
+**Deviations.** Paths in a sequence with other steps, such as `:a/:b+`, are not compiled
+to the operator, and neither are `?` or nested closures, which item 544 tracks.
+A view's circuit sees only the commits its reader can read, so a constant end's
+zero-length row over the union default graph can stay stale when a named graph the reader
+cannot read gains or loses its last quad, until the next commit the reader sees. Item
+545 tracks it. A path whose ends are both variables walks from every start,
+and seeding walks from the bindings of the patterns joined with it is item 546.
+
+**Tests.** `incr/fixpoint_tests.rs` builds random graphs over a few nodes and two
+predicates with cycles and self-loops, and applies random histories of insertions and
+deletions to views over 37 path queries. The queries cover `+` and `*` with variable and
+constant ends, inverse and alternative steps, `GRAPH` with a constant and a variable,
+the union default graph, joins, `OPTIONAL`, `MINUS`, `EXISTS`, paths inside
+`FILTER NOT EXISTS` with and without `GRAPH`, a group, `DISTINCT` and `CONSTRUCT`. After every pass the rows are compared with the query evaluated
+again. Other tests delete the edges that close cycles and check that exactly the rows
+that no longer follow go, check the encoding across compaction, the memory budget, and
+that every reported `why` witness derives its row in each provenance mode, and compare
+zero-length rows under graph access and the union default graph. `runtime_tests.rs`
+restarts a path view from a format 2 checkpoint and refuses a checkpoint of the other
+format, and the generated circuit tests of Phase 1 now include path views and pass 3,000
+cases plain and masked. `sparkles-reasoner/src/fixpoint/tests.rs` maintains RDFS-style
+rules with cycles of classes and a symmetric relation against a naive closure, and checks
+that every witness derives its triple. Regressions from the review cover protections that
+hide every triple of a named graph, constants that only derived triples hold, a pass
+over many steps that reach nothing under a small budget, a rule body that repeats one
+premise, annotations over the budget, query variables named like the step's own, and a
+checkpoint of rules with local constants.
+
+**Measurements.** On an 8-vCPU Namespace instance at 200,000 people, four path views of
+the incremental benchmark passed in 0.02 to 0.24 ms at the 95th percentile, against 2.3 to
+82 ms when the same views evaluated their paths again, 100 to 2,200 times less. The state
+was up to 11% larger than a recomputed view's, and the builds of the two views with a
+constant end took 2.6 and 3.3 times as long, while the other two built faster. Item
+548 tracks faster builds. The five plain views kept their pass costs within the
+spread of five processes. Overdeleting as DRed does, which was measured and reverted,
+made a deletion inside a large `knows` component cost 441 ms, and
+[PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#incremental-views) records
+it. The [writes benchmark](../benchmarks/writes/RESULTS.md#property-path-views) has the
+table. Item 417 changed no code of the query engine, so no query screen ran.
 
 ### Maintained assessments and conservative dependencies
 

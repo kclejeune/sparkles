@@ -286,13 +286,9 @@ fn groups(gp: &GraphPattern) -> bool {
 }
 
 /// The kind of checkpoint a circuit writes and reads: format 2 when it keeps
-/// annotations, and format 1 otherwise.
+/// annotations and format 1 otherwise, and two more with a fixed-point operator.
 fn checkpoint_kind(c: &Circuit) -> persist::Kind {
-    if c.provenance().is_none() {
-        persist::INTERNAL
-    } else {
-        persist::INTERNAL_ANNOTATED
-    }
+    persist::internal_kind(!c.provenance().is_none(), c.has_fixpoint())
 }
 
 /// The directory of internal circuit `id`'s checkpoints.

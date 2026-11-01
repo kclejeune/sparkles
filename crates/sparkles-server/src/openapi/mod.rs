@@ -934,6 +934,11 @@ fn tags() -> J {
             "schema-discovery"
         ),
         t(
+            "Ontology",
+            "The OWL 2 axioms of a dataset's graphs, their profile checks and edits.",
+            "ontology"
+        ),
+        t(
             "Stored queries",
             "Named, parameterized queries of a dataset.",
             "stored-queries"

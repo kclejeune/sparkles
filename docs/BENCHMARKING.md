@@ -934,7 +934,9 @@ as a JSON line, and turns the lines into a gate record. It runs five processes b
 default, and `--processes` changes their number. The values are the build, query and pass
 times of five views, write latency and catch-up with 0, 10 and 100 views, the commit
 path with nothing subscribed and with a live query, a breakdown of a pass and the rounds
-of views over inferred data. Outside the timed intervals, each view's maintained rows are
+of views over inferred data. Four views with property paths over a tree of units add their
+build, query, pass and state values under `paths/`, with the workload fingerprint
+`paths/workload`. Outside the timed intervals, each view's maintained rows are
 checked against its query evaluated again at the same commit, the views with commits
 behind them are checked to have caught up, and the commit path is checked to have
 committed every write. `--people` sets the size, 200,000 people by default, and

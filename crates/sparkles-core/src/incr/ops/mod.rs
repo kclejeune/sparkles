@@ -11,6 +11,7 @@ pub mod group;
 pub mod join;
 pub mod linear;
 pub mod matching;
+pub mod path;
 pub mod recompute;
 pub mod template;
 
@@ -74,6 +75,7 @@ pub enum Op {
     Group(Box<group::Group>),
     Recompute(Box<recompute::Recompute>),
     Template(Box<template::Template>),
+    Path(Box<path::PathOp>),
 }
 
 impl Node {
@@ -93,6 +95,7 @@ impl Node {
             Op::Group(o) => o.init(p),
             Op::Recompute(o) => o.init(p, &schema),
             Op::Template(o) => o.init(p),
+            Op::Path(o) => o.init(p, &schema),
         }
     }
 
@@ -112,6 +115,7 @@ impl Node {
             Op::Group(o) => o.delta(p),
             Op::Recompute(o) => o.delta(p, &schema),
             Op::Template(o) => o.delta(p),
+            Op::Path(o) => o.delta(p, &schema),
         }
     }
 
@@ -133,6 +137,7 @@ impl Node {
             Op::Group(o) => o.init_a(p),
             Op::Recompute(o) => o.init_a(p, &schema),
             Op::Template(o) => o.init_a(p),
+            Op::Path(o) => o.init_a(p, &schema),
         }
     }
 
@@ -154,6 +159,7 @@ impl Node {
             Op::Group(o) => o.delta_a(p),
             Op::Recompute(o) => o.delta_a(p, &schema),
             Op::Template(o) => o.delta_a(p),
+            Op::Path(o) => o.delta_a(p, &schema),
         }
     }
 
@@ -163,6 +169,7 @@ impl Node {
     pub fn enable_prov(&mut self, mode: Provenance, next: &mut u32) {
         match &mut self.op {
             Op::Join(o) => o.enable_prov(mode),
+            Op::Path(o) => o.enable_prov(mode),
             Op::Match(o) if mode.is_none() => o.enable_prov(mode, u32::MAX),
             Op::Group(o) if mode.is_none() => o.enable_prov(mode, u32::MAX),
             Op::Match(o) => {
@@ -226,6 +233,9 @@ impl Node {
         if let Op::Bgp(b) = &self.op {
             out.push(&**b);
         }
+        if let Op::Path(o) = &self.op {
+            out.extend(o.bgps());
+        }
         for c in self.children() {
             out.extend(c.bgps());
         }
@@ -235,7 +245,7 @@ impl Node {
     /// The children of the node.
     pub fn children(&self) -> Vec<&Node> {
         match &self.op {
-            Op::Bgp(_) | Op::Values(_) | Op::Recompute(_) => vec![],
+            Op::Bgp(_) | Op::Values(_) | Op::Recompute(_) | Op::Path(_) => vec![],
             Op::Filter(o) => vec![&o.inner],
             Op::Extend(o) => vec![&o.inner],
             Op::Project(o) => vec![&o.inner],
@@ -250,7 +260,7 @@ impl Node {
 
     fn children_mut(&mut self) -> Vec<&mut Node> {
         match &mut self.op {
-            Op::Bgp(_) | Op::Values(_) | Op::Recompute(_) => vec![],
+            Op::Bgp(_) | Op::Values(_) | Op::Recompute(_) | Op::Path(_) => vec![],
             Op::Filter(o) => vec![&mut o.inner],
             Op::Extend(o) => vec![&mut o.inner],
             Op::Project(o) => vec![&mut o.inner],
@@ -272,6 +282,7 @@ impl Node {
             Op::Group(o) => o.bytes(),
             Op::Recompute(o) => o.bytes(self.schema.len()),
             Op::Template(o) => o.bytes(),
+            Op::Path(o) => o.bytes(),
             _ => 0,
         };
         own + self.children().iter().map(|c| c.bytes()).sum::<u64>()
@@ -286,6 +297,7 @@ impl Node {
             Op::Group(o) => o.save(w)?,
             Op::Recompute(o) => o.save(w)?,
             Op::Template(o) => o.save(w)?,
+            Op::Path(o) => o.save(w)?,
             _ => {}
         }
         for c in self.children() {
@@ -303,12 +315,19 @@ impl Node {
             Op::Group(o) => o.load(r)?,
             Op::Recompute(o) => o.load(r)?,
             Op::Template(o) => o.load(r)?,
+            Op::Path(o) => o.load(r)?,
             _ => {}
         }
         for c in self.children_mut() {
             c.load(r)?;
         }
         Ok(())
+    }
+
+    /// Whether the node or a node under it is a fixed-point operator, whose state
+    /// needs format 2 of a view's checkpoint (spec F13 §8.4).
+    pub fn has_fixpoint(&self) -> bool {
+        matches!(self.op, Op::Path(_)) || self.children().iter().any(|c| c.has_fixpoint())
     }
 
     /// Whether the node or a node under it is a `recompute` node.
@@ -343,6 +362,7 @@ impl Node {
             Op::Group(o) => ("Group", Some(o.describe(vars)), Mode::Incremental),
             Op::Recompute(o) => ("Recompute", Some(o.reason.clone()), Mode::Recompute),
             Op::Template(_) => ("Template", None, Mode::Incremental),
+            Op::Path(o) => ("FixedPoint", Some(o.describe()), Mode::Incremental),
         };
         PlanNode {
             operator: operator.to_string(),

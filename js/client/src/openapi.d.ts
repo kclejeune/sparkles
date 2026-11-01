@@ -2082,6 +2082,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Ontology summary
+         * @description The ontology header, the counts of declared entities by kind and of axioms by type in the terminology, the graphs read with the imports that resolved, the triples read, the unmapped triples and the diagnostics of the read. The entity tag names the commit read, and an edit's `If-Match` can name it.
+         */
+        get: operations["getOntology"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/axioms": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Ontology axioms
+         * @description The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.
+         */
+        get: operations["getOntologyAxioms"];
+        put?: never;
+        /**
+         * Add and remove axioms
+         * @description Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.
+         */
+        post: operations["editOntology"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check OWL 2 profiles
+         * @description One report per profile in `profiles` (`el`, `ql`, `rl`, `dl` or `all`; `dl` by default), over the terminology and, unless `assertions` is false, the assertions the store holds. Each report lists the violations with the rule of the OWL 2 Profiles or the structural specification that each breaks. The EL, QL and RL reports also list the OWL 2 DL violations.
+         */
+        post: operations["checkOntology"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/openapi.json": {
         parameters: {
             query?: never;
@@ -3759,6 +3823,26 @@ export interface paths {
          * @description The MCP tool `check_query` as the caller, over the caller's view. With `terms`, every constant IRI of the query is listed with its kind, label, count and whether it occurs.
          */
         post: operations["checkQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/claims/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Verify evidence references
+         * @description Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.
+         */
+        post: operations["resolveEvidence"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6235,6 +6319,104 @@ export interface components {
              * @description The hold's identity. A random one when absent.
              */
             id?: string;
+        };
+        /** @description Evidence references to verify at their exact retained views. */
+        EvidenceResolveRequest: {
+            /** @description The references, verified in order. Each names exactly one of `storedFact` and `record`. */
+            references: {
+                /** @description The caller's unique name of the reference, which an answer names. */
+                key: string;
+                record?: {
+                    /** @description The content digest the record must carry. */
+                    contentDigest?: string;
+                    /** @description The record's IRI. */
+                    iri: string;
+                    /** @description The kinds the record may have. Any profile kind when absent. */
+                    kinds?: ("SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal")[];
+                };
+                storedFact?: {
+                    /**
+                     * Format: uuid
+                     * @description The branch by identity: the dataset's id for `main`.
+                     */
+                    branchId: string;
+                    /** @description The exact commit of the branch that the fact is read at. */
+                    commit: number;
+                    /**
+                     * Format: uuid
+                     * @description The dataset by identity, never by name.
+                     */
+                    datasetId: string;
+                    /** @description The named graph's IRI. Absent or `null` for the default graph. */
+                    graph?: string | null;
+                    /** @description A source import's blank-node mapping. Refused as `unanchored-evidence` by this release. */
+                    importMap?: string;
+                    /** @description A stable reifier IRI that reifies the triple in the graph at the commit. Required when the triple has blank nodes. */
+                    reifier?: string;
+                    /** @description The expected triple as one N-Triples 1.2 statement without its final `.`. */
+                    triple: string;
+                };
+            }[];
+        };
+        /** @description The verified evidence references. */
+        EvidenceResolveResult: {
+            /** @description Every reference, verified, in request order. */
+            resolved: {
+                key: string;
+                record?: {
+                    contentDigest: string | null;
+                    /** @description The protected evidence graph that holds the record. */
+                    graph: string;
+                    iri: string;
+                    /** @enum {string} */
+                    kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal";
+                    receipt: {
+                        /**
+                         * Format: uuid
+                         * @description The branch it was published on.
+                         */
+                        branchId: string;
+                        /** @description The commit that published it. */
+                        commit: number;
+                        /**
+                         * Format: uuid
+                         * @description The dataset the record was published in.
+                         */
+                        datasetId: string;
+                        iri: string;
+                    };
+                    span: {
+                        /** @description The code point after the selection. */
+                        end: number;
+                        rendition: string;
+                        /** @description The first selected code point. */
+                        start: number;
+                        /** @description The digest of the selected text. */
+                        textDigest: string;
+                    } | null;
+                };
+                storedFact?: {
+                    /**
+                     * Format: uuid
+                     * @description The branch the reference names.
+                     */
+                    branchId: string;
+                    /** @description The commit the fact was verified at. */
+                    commit: number;
+                    /**
+                     * Format: uuid
+                     * @description The dataset's identity.
+                     */
+                    datasetId: string;
+                    graph: string | null;
+                    reifier: string | null;
+                    /**
+                     * Format: uuid
+                     * @description The branch whose history served the commit: the named branch, or the upstream that serves a commit at or below its starting point.
+                     */
+                    servedBy: string;
+                };
+            }[];
         };
         /** @description The evidence settings of a dataset, as `evidence.json` format 1 holds them. */
         EvidenceSettings: {
@@ -13723,7 +13905,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The id of the task, token or lock. */
+                /** @description The id of the task, token, lock or catalog resource. */
                 id: components["parameters"]["id"];
             };
             cookie?: never;
@@ -16156,6 +16338,252 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             502: components["responses"]["BadGateway"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOntology: {
+        parameters: {
+            query?: {
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+            };
+            header?: {
+                /** @description Entity tags, or `*`. */
+                "If-None-Match"?: components["parameters"]["ifNoneMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The summary. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The summary is still at the tagged commit. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOntologyAxioms: {
+        parameters: {
+            query?: {
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Axiom types, comma separated, such as `SubClassOf,EquivalentClasses`. */
+                type?: string;
+                /** @description An entity IRI the axioms mention. */
+                about?: string;
+                /** @description Also list the assertions the store holds. */
+                assertions?: boolean;
+                /** @description `json` (the default) or `ofn`. */
+                format?: "json" | "ofn";
+                /** @description The most axioms listed, from 1 to 10,000 (100 by default). */
+                limit?: number;
+                /** @description The axioms skipped. */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of axioms. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                    "text/owl-functional": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    editOntology: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+            };
+            header?: {
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The axioms. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    add?: Record<string, never>[];
+                    declare?: boolean;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    message?: string;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    remove?: Record<string, never>[];
+                    /** @description The graph that takes the added axioms. */
+                    target?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description What the edit did, with the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        absent?: string[];
+                        added?: number;
+                        committed?: boolean;
+                        declared?: string[];
+                        deleted?: number;
+                        inserted?: number;
+                        kept?: number;
+                        present?: number;
+                        removed?: number;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            422: components["responses"]["Unprocessable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    checkOntology: {
+        parameters: {
+            query?: {
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The ontology and the profiles. */
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description Check the assertions the store holds (the default). */
+                    assertions?: boolean;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @description The most violations each report lists (1,000 by default). */
+                    maxViolations?: number;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    profiles?: ("el" | "ql" | "rl" | "dl" | "all")[];
+                };
+            };
+        };
+        responses: {
+            /** @description The reports. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             default: components["responses"]["Error"];
         };
     };
@@ -20725,6 +21153,42 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveEvidence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Every reference, verified. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceResolveResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
             default: components["responses"]["Error"];
         };
     };

@@ -240,7 +240,8 @@ managed graph of the evidence owner and store canonical `evidence.json` bytes. A
 configuration never stops protecting a graph. A graph leaves protection only through
 `POST /$/evidence/{ds}/detach` or `sparkles::evidence::detach`, and the next
 configuration protects it again. Protection does not authenticate what a graph already
-holds. The typed operations that will use these settings remain under item 81.
+holds. Evidence resolution reads records from these graphs, and the typed operations
+that write them remain under item 81.
 
 [Evidence holds](../API.md#evidence-holds) keep the commits that evidence references
 name readable. A hold names commits of `main` or any branch by the branch's identity, and
@@ -259,19 +260,21 @@ The result keeps explicit requirements for references needing authorized runtime
 resolution. JSON selection uses the named lexical UTF-8 method and preserves exact
 retained value bytes. These local helpers provide no authenticated write or receipt.
 
-Trusted Rust adapters can retain actual catalog openings with
-`sparkles::managed_source::ResidentSourceOwner`. The lease keeps the original Dataset
-and resident branch alive without resolving a fresh name or opening a cold branch.
-Catalog disposal checks shared runtime ownership and preserves original owners on refusal.
-The [integration guide](../integrations/README.md#libraries-and-bindings) describes raw
-Strong and Weak aliases. These lifetime checks grant no read permission or durable retention.
+[Evidence resolution](../API.md#evidence-resolution) verifies references without
+writing. `POST /{ds}/claims/resolve` reads a stored fact at exactly the commit of the
+branch its identities name, through the caller's view of that dataset and branch, and a
+starting commit from the upstream that serves it. A record resolves only as an
+authenticated record of the protected evidence graphs with a receipt of this dataset,
+and a passage's selector is checked against its rendition's retained text. A missing,
+unretained and unreadable reference give the same `evidence-unavailable` answer. Rust
+applications use `sparkles::evidence::resolve::Resolution`, which shares one 64 MiB
+allowance, the deadline and cancellation across an operation's references.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks
 and the built-in disclosure guard under one memory cap and `Control`. It explicitly
 refuses unsupported providers, unresolved providers nested in retained rules and
-protection-pattern planning. C25 exact-reference
-resolution and guarded Dataset queries still require caller adoption under
-[item 395](../ROADMAP.md). A prepared visibility view provides no source authenticity,
+protection-pattern planning. Evidence resolution uses it, and guarded Dataset queries
+still require caller adoption under [item 395](../ROADMAP.md). A prepared visibility view provides no source authenticity,
 managed-write authority or proof that an unavailable reference is absent.
 
 Source revisions, renditions and passages retain exact identities and digests. Claim

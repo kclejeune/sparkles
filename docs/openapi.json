@@ -7397,6 +7397,328 @@
         ],
         "type": "object"
       },
+      "EvidenceResolveRequest": {
+        "additionalProperties": false,
+        "description": "Evidence references to verify at their exact retained views.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-resolution"
+        },
+        "properties": {
+          "references": {
+            "description": "The references, verified in order. Each names exactly one of `storedFact` and `record`.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "The caller's unique name of the reference, which an answer names.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "record": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "contentDigest": {
+                      "description": "The content digest the record must carry.",
+                      "pattern": "^sha256:[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "iri": {
+                      "description": "The record's IRI.",
+                      "type": "string"
+                    },
+                    "kinds": {
+                      "description": "The kinds the record may have. Any profile kind when absent.",
+                      "items": {
+                        "enum": [
+                          "SourceRevision",
+                          "Rendition",
+                          "Passage",
+                          "EvidenceRef",
+                          "Claim",
+                          "EvidenceLink",
+                          "Assessment",
+                          "Note",
+                          "Decision",
+                          "Task",
+                          "ReviewDecision",
+                          "IdentityProposal"
+                        ],
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "iri"
+                  ],
+                  "type": "object"
+                },
+                "storedFact": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "branchId": {
+                      "description": "The branch by identity: the dataset's id for `main`.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "commit": {
+                      "description": "The exact commit of the branch that the fact is read at.",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "datasetId": {
+                      "description": "The dataset by identity, never by name.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "graph": {
+                      "description": "The named graph's IRI. Absent or `null` for the default graph.",
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "importMap": {
+                      "description": "A source import's blank-node mapping. Refused as `unanchored-evidence` by this release.",
+                      "type": "string"
+                    },
+                    "reifier": {
+                      "description": "A stable reifier IRI that reifies the triple in the graph at the commit. Required when the triple has blank nodes.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The expected triple as one N-Triples 1.2 statement without its final `.`.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "datasetId",
+                    "branchId",
+                    "commit",
+                    "triple"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key"
+              ],
+              "type": "object"
+            },
+            "maxItems": 10000,
+            "type": "array"
+          }
+        },
+        "required": [
+          "references"
+        ],
+        "type": "object"
+      },
+      "EvidenceResolveResult": {
+        "additionalProperties": false,
+        "description": "The verified evidence references.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-resolution"
+        },
+        "properties": {
+          "resolved": {
+            "description": "Every reference, verified, in request order.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "record": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "contentDigest": {
+                      "oneOf": [
+                        {
+                          "description": "The record's content digest.",
+                          "pattern": "^sha256:[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "graph": {
+                      "description": "The protected evidence graph that holds the record.",
+                      "type": "string"
+                    },
+                    "iri": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "SourceRevision",
+                        "Rendition",
+                        "Passage",
+                        "EvidenceRef",
+                        "Claim",
+                        "EvidenceLink",
+                        "Assessment",
+                        "Note",
+                        "Decision",
+                        "Task",
+                        "ReviewDecision",
+                        "IdentityProposal"
+                      ],
+                      "type": "string"
+                    },
+                    "receipt": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "branchId": {
+                          "description": "The branch it was published on.",
+                          "format": "uuid",
+                          "type": "string"
+                        },
+                        "commit": {
+                          "description": "The commit that published it.",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "datasetId": {
+                          "description": "The dataset the record was published in.",
+                          "format": "uuid",
+                          "type": "string"
+                        },
+                        "iri": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "iri",
+                        "datasetId",
+                        "branchId",
+                        "commit"
+                      ],
+                      "type": "object"
+                    },
+                    "span": {
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "end": {
+                              "description": "The code point after the selection.",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "rendition": {
+                              "type": "string"
+                            },
+                            "start": {
+                              "description": "The first selected code point.",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "textDigest": {
+                              "description": "The digest of the selected text.",
+                              "pattern": "^sha256:[0-9a-f]{64}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "rendition",
+                            "start",
+                            "end",
+                            "textDigest"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "iri",
+                    "kind",
+                    "graph",
+                    "receipt",
+                    "contentDigest",
+                    "span"
+                  ],
+                  "type": "object"
+                },
+                "storedFact": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "branchId": {
+                      "description": "The branch the reference names.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "commit": {
+                      "description": "The commit the fact was verified at.",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "datasetId": {
+                      "description": "The dataset's identity.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "graph": {
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "reifier": {
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "servedBy": {
+                      "description": "The branch whose history served the commit: the named branch, or the upstream that serves a commit at or below its starting point.",
+                      "format": "uuid",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "datasetId",
+                    "branchId",
+                    "commit",
+                    "servedBy",
+                    "graph",
+                    "reifier"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "resolved"
+        ],
+        "type": "object"
+      },
       "EvidenceSettings": {
         "additionalProperties": false,
         "description": "The evidence settings of a dataset, as `evidence.json` format 1 holds them.",
@@ -33557,6 +33879,614 @@
         "x-sparkles-permission": "server-admin"
       }
     },
+    "/$/ontology/{ds}": {
+      "get": {
+        "description": "The ontology header, the counts of declared entities by kind and of axioms by type in the terminology, the graphs read with the imports that resolved, the triples read, the unmapped triples and the diagnostics of the read. The entity tag names the commit read, and an edit's `If-Match` can name it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "getOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The summary."
+          },
+          "304": {
+            "description": "The summary is still at the tagged commit."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Ontology summary",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/axioms": {
+      "get": {
+        "description": "The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "getOntologyAxioms",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "Axiom types, comma separated, such as `SubClassOf,EquivalentClasses`.",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An entity IRI the axioms mention.",
+            "in": "query",
+            "name": "about",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Also list the assertions the store holds.",
+            "in": "query",
+            "name": "assertions",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "`json` (the default) or `ofn`.",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "json",
+                "ofn"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most axioms listed, from 1 to 10,000 (100 by default).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The axioms skipped.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/owl-functional": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "One page of axioms."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Ontology axioms",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "editOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "add": {
+                    "items": {
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "declare": {
+                    "type": "boolean"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "remove": {
+                    "items": {
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "target": {
+                    "description": "The graph that takes the added axioms.",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The axioms.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "absent": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "added": {
+                      "type": "integer"
+                    },
+                    "committed": {
+                      "type": "boolean"
+                    },
+                    "declared": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "deleted": {
+                      "type": "integer"
+                    },
+                    "inserted": {
+                      "type": "integer"
+                    },
+                    "kept": {
+                      "type": "integer"
+                    },
+                    "present": {
+                      "type": "integer"
+                    },
+                    "removed": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "What the edit did, with the receipt when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Add and remove axioms",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
+    "/$/ontology/{ds}/check": {
+      "post": {
+        "description": "One report per profile in `profiles` (`el`, `ql`, `rl`, `dl` or `all`; `dl` by default), over the terminology and, unless `assertions` is false, the assertions the store holds. Each report lists the violations with the rule of the OWL 2 Profiles or the structural specification that each breaks. The EL, QL and RL reports also list the OWL 2 DL violations.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "checkOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "assertions": {
+                    "description": "Check the assertions the store holds (the default).",
+                    "type": "boolean"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "maxViolations": {
+                    "description": "The most violations each report lists (1,000 by default).",
+                    "maximum": 10000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "profiles": {
+                    "items": {
+                      "enum": [
+                        "el",
+                        "ql",
+                        "rl",
+                        "dl",
+                        "all"
+                      ],
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The ontology and the profiles.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The reports."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Check OWL 2 profiles",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/openapi.json": {
       "get": {
         "externalDocs": {
@@ -43537,6 +44467,93 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/{ds}/claims/resolve": {
+      "post": {
+        "description": "Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-resolution"
+        },
+        "operationId": "resolveEvidence",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceResolveRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceResolveResult"
+                }
+              }
+            },
+            "description": "Every reference, verified."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Verify evidence references",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/data": {
       "delete": {
         "description": "Deletes the graph. With a `text/csv` or `text/tab-separated-values` body and `mapping` or `base`, removes the mapped triples from the graph instead.",
@@ -50928,6 +51945,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#schema-discovery"
       },
       "name": "Schema"
+    },
+    {
+      "description": "The OWL 2 axioms of a dataset's graphs, their profile checks and edits.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+      },
+      "name": "Ontology"
     },
     {
       "description": "Named, parameterized queries of a dataset.",

@@ -435,6 +435,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("releaseEvidenceHold", "evidence.release_hold", |ds| {
             let _ = sparkles::evidence::release_hold(ds, any());
         }),
+        op!("resolveEvidence", "evidence.resolve", |ds| {
+            let _ = sparkles::evidence::resolve::Resolution::new(any())
+                .and_then(|mut r| r.all(None, ds, ds, &[], &mut |_, _| None));
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),
@@ -452,6 +456,24 @@ fn entries() -> Vec<(&'static str, Entry)> {
         }),
         op_if!("geo", "convertGeometries", "geo.convert", |_| {
             sparkles::geo::convert::convert(&[]);
+        }),
+        // ----------------------------------------------------------------- ontology
+        op_if!("ontology", "getOntology", "ontology.summary", |ds| {
+            if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                o.summary();
+            }
+        }),
+        op_if!("ontology", "getOntologyAxioms", "ontology.axioms", |ds| {
+            if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                o.ontology.axiom_set();
+                o.assertions(&any(), |_, _, _| Ok(true));
+            }
+        }),
+        op_if!("ontology", "checkOntology", "ontology.check", |ds| {
+            ds.ontology().check(&any(), &any(), &any());
+        }),
+        op_if!("ontology", "editOntology", "ontology.edit", |ds| {
+            ds.ontology().edit(&any(), &any(), &any());
         }),
         // ------------------------------------------------------------------- schema
         op!("getSchema", "schema.report", |ds| {

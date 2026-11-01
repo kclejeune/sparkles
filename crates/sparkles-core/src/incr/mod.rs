@@ -12,6 +12,7 @@
 
 pub mod circuit;
 pub mod compile;
+pub mod fixpoint;
 pub mod footprint;
 pub mod inference;
 pub mod internal;
@@ -27,6 +28,8 @@ pub mod zset;
 
 #[cfg(test)]
 mod definition_tests;
+#[cfg(test)]
+mod fixpoint_tests;
 #[cfg(test)]
 mod r#gen;
 #[cfg(test)]

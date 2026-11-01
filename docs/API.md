@@ -1802,6 +1802,88 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 `SRC` must be a database that no server has open. A run that stops before it finishes
 leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 
+## Ontology
+
+The design and its rationale are in [F21 Ontology API](specs/F21-ontology-api.md). The
+routes read the OWL 2 ontology of a dataset's graphs by the reverse mapping of the OWL 2
+Mapping to RDF Graphs, check it against the OWL 2 profiles and edit it through the
+forward mapping. Each route reads the graphs that `graph` names, which is repeatable and
+defaults to the default graph, with the imports that resolve to graphs of the dataset
+unless `imports=false`. `mode=strict` keeps every triple outside the mapping unmapped,
+and the default `mode=lenient` types undeclared entities from their use and says so in
+the diagnostics. The routes read with the caller's grants. An import of a graph the
+caller cannot read is not followed.
+
+`GET /$/ontology/{ds}` answers the ontology header, the counts of declared entities by
+kind and of axioms by type, the graphs read, the imports and whether each resolved, the
+number of triples read and unmapped, and the first 100 diagnostics. The counts cover the
+terminology, which is everything but the class and property assertions. Its `ETag` names
+the commit it read.
+
+```json
+{
+  "dataset": "uni",
+  "commit": 12,
+  "mode": "lenient",
+  "graphs": ["default"],
+  "imports": [],
+  "header": { "iri": "http://ex.org/uni", "versionIri": null, "imports": [], "annotations": ["Annotation(rdfs:label \"University\")"] },
+  "axioms": { "Declaration": 4, "SubClassOf": 2 },
+  "axiomCount": 6,
+  "entities": { "Class": 3, "ObjectProperty": 1 },
+  "triples": 13,
+  "unmapped": 0,
+  "diagnostics": { "warnings": 0, "errors": 0, "list": [] },
+  "cached": false
+}
+```
+
+`GET /$/ontology/{ds}/axioms` lists the axioms, 100 at a time by default and at most
+10,000 (`limit`, `offset`, and `next` in the answer). `type` keeps the axiom types it
+lists, comma separated, and `about` keeps the axioms that mention an IRI. An `about` IRI
+that the ontology neither declares nor uses is `404`. `assertions=true` adds the
+assertions the store holds, which the listing streams from the graphs. Each axiom comes
+in functional-style syntax (`ofn`), with the dataset's prefixes, and in its JSON form
+(`axiom`), with the graph it was read from. `format=ofn` answers one functional-style
+document of the page, as `text/owl-functional`.
+
+The JSON form of an axiom names its type and its operands. IRIs are strings, an
+anonymous individual is `_:label`, an inverse property is `{"inverseOf": IRI}` and a
+literal is `{"@value": …, "@type": …}` or `{"@value": …, "@language": …}`. A class
+expression other than a class is an object with its `type` and members such as
+`classes`, `property`, `class`, `cardinality`, `individual`, `range` and `value`.
+
+```json
+{ "type": "SubClassOf",
+  "subClass": "http://ex.org/Professor",
+  "superClass": { "type": "ObjectSomeValuesFrom", "property": "http://ex.org/teaches", "class": "http://ex.org/Course" },
+  "annotations": [{ "property": "http://www.w3.org/2000/01/rdf-schema#comment", "value": { "@value": "every professor teaches" } }] }
+```
+
+`POST /$/ontology/{ds}/check` takes `graph`, `imports`, `mode`, `profiles` (`el`, `ql`,
+`rl`, `dl` or `all`, with `dl` by default), `assertions` and `maxViolations`, and answers
+one report per profile. A report says whether the ontology conforms and lists at most
+`maxViolations` violations, 1,000 by default, with the total. Each violation has the rule
+it breaks, such as `OWL 2 Profiles §2.2.3`, a message, and the axiom and graph when the
+violation is one axiom's. The EL, QL and RL reports also list the OWL 2 DL violations,
+since each profile is a subset of OWL 2 DL. With `assertions: false` the check covers
+the terminology alone, which is faster on a large data graph.
+
+`POST /$/ontology/{ds}/axioms` adds the axioms of `add` and removes those of `remove` in
+one commit. A removed axiom takes its triples with it, including the blank nodes of its
+class expressions and lists, except those another axiom or triple still uses. Removing an
+axiom that the ontology does not hold is not an error, and the answer lists it under
+`absent`. A removal edits the graphs `graph` names and the graph `target` names. An
+axiom read only from an imported graph is `400` until `target` names that graph. An
+added axiom goes to the graph `target` names, the first graph read by default. The edit also declares the entities the added axioms use that the ontology does
+not declare, unless `declare` is false. Named individuals are not declared. The answer
+counts the axioms added, already present and removed, and the triples inserted, deleted
+and kept. The route takes the parameters of the other writes, such as `dryRun` and
+`receipt`, and an `If-Match` with the summary's tag. An axiom the forward mapping cannot
+write, such as a `DisjointClasses` of one class, is `400` with code `invalid-axiom`.
+Writing needs write access to the target graph, and a removal needs it on the graphs the
+removed triples are in.
+
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 
 | Method     | Path                  | Description |
@@ -3075,7 +3157,9 @@ receives the difference as a diff or a `reset`. Views and live queries never rea
 protects. `ORDER BY` without `LIMIT` does not change a view's rows and is
 ignored. Operators that the circuit cannot maintain run as
 `recompute` nodes, which evaluate their subtree again at each commit that touches it and
-subtract the previous output. Property paths with `*`, `+` or `?`, `LIMIT` and
+subtract the previous output. A property path with `+` or `*` over a step of IRIs,
+inverses, sequences and alternatives is maintained by a fixed-point operator, which the
+plan names `FixedPoint`. Other property paths with `*`, `+` or `?`, `LIMIT` and
 `OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, and `MINUS`, aggregates,
 `DISTINCT`, `VALUES` and subqueries under `GRAPH ?g` are recompute nodes. A `FILTER EXISTS`
 or `FILTER NOT EXISTS` whose `*`, `?` or `{0,n}` path ends at a variable of the outer rows
@@ -12071,6 +12155,80 @@ to another dataset keeps every past state of the dataset and its branches until 
 repaired, and acquisitions, releases and branch deletions answer `503
 holds-unavailable` meanwhile. A `holds.json` of a newer format refuses the dataset's
 open.
+
+### Evidence resolution
+
+`POST /{ds}/claims/resolve` verifies evidence references of the
+[evidence profile](ai/README.md#evidence-profile) without writing anything. It needs
+`read` on the dataset through the query endpoint and counts as a query. The design is in
+[C25 §3 and §8](specs/C25-evidence-and-assessments.md#3-references-and-source-spans).
+
+```json
+{
+  "references": [
+    {"key": "inventory", "storedFact": {
+      "datasetId": "6f1c…", "branchId": "6f1c…", "commit": 42,
+      "graph": "https://example.org/inventory",
+      "triple": "<https://example.org/host> <https://example.org/runs> <https://example.org/release>"}},
+    {"key": "bulletin", "record": {
+      "iri": "https://example.org/bulletin-r1", "kinds": ["SourceRevision"],
+      "contentDigest": "sha256:…"}}
+  ]
+}
+```
+
+A request names at most 10,000 references in at most 16 MiB, and each key is unique and
+at most 256 bytes. A `storedFact` names its dataset and branch by identity, and the
+dataset's own id names `main`. It is read at exactly that commit of that branch, never
+at the head or on another branch. A commit at or below a branch's starting point is read
+from the upstream that serves it, as [evidence holds](#evidence-holds) describe, and
+`servedBy` names that branch. The `graph` is the named graph's IRI, absent or `null` for
+the default graph. The `triple` is one N-Triples 1.2 statement without its final dot,
+so literals keep their datatype, language and direction and triple terms are allowed.
+A triple with blank nodes needs a `reifier`, a stable IRI that reifies one triple in the
+graph at that commit. The stored triple then matches the expected one up to a renaming
+of blank nodes. An `importMap` anchor is refused as `unanchored-evidence` in this
+release.
+
+The caller's access is decided before anything is read, on the dataset's and branch's
+current names, through the query endpoint. A renamed dataset or branch keeps resolving,
+and a new dataset or branch with an old name never satisfies an old reference. A
+dataset, branch, commit, graph or fact that does not exist, is no longer retained, or
+is hidden from the caller by its grants or triple protections all answer the same
+`422 evidence-unavailable` body, so a caller cannot tell them apart.
+
+A `record` names an authenticated profile record of the dataset that the route names, at
+the current state of the request's branch. The record is found by its `rdf:type` in the
+graphs that the [evidence settings](#evidence-settings) give a role other than
+`projections` and that the profile protects now. A copy in an ordinary or detached graph
+is not a profile record. A record has exactly one `ev:availabilityReceipt`, whose
+`ev:datasetId` and `ev:branchId` name this dataset and one of its branches and whose
+`ev:commit` names the publishing commit. `kinds` limits the record's kind, and
+`contentDigest` is compared with the record's `ev:contentDigest`. A passage's
+`oa:hasSelector` start and end are checked as Unicode code point offsets against its
+rendition's `ev:normalizedText`, and the digest of the selected text against its
+`ev:textDigest`.
+
+The answer `200` is `{"resolved": [...]}` with each reference in order, its `key` and
+its verified `storedFact` or `record`. The first reference that does not verify stops
+the request, and the answer is `{error, code, reference}`.
+
+| Status and code | Meaning |
+|---|---|
+| `422 evidence-unavailable` | The reference is missing, not retained, or unreadable by the caller. |
+| `422 incomplete-evidence` | Verification stopped within the 64 MiB resolution limit, or the caller's access policy cannot be prepared within it. This is not a finding that the fact is absent. |
+| `422 unanchored-evidence` | A triple with blank nodes has no stable reifier, or its reifier reifies more than one triple. |
+| `422 span-mismatch` | A passage selector or text digest does not match its rendition's retained text. |
+| `422 origin-not-reproduced` | A record's receipt is missing or names another dataset or an unknown branch. |
+| `409 immutable-record-conflict` | A record has another kind or digest than the reference expects, or is stored more than once. |
+
+A malformed reference is a `400` with code `invalid-reference` whose message starts with
+the field, such as `references[2].storedFact.triple`. The request deadline and
+cancellation keep their usual answers. One resolution reads each commit once and
+prepares the caller's view of it once, within a 64 MiB allowance shared by all its
+references. That allowance charges up to 2 KiB for each quad in a state's unindexed
+delta, so a state with tens of thousands of recent writes that compaction has not yet
+folded in may answer `incomplete-evidence`.
 
 ### Suggested examples
 

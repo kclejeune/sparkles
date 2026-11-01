@@ -43,6 +43,8 @@ impl<'a> CallerContext<'a> {
     /// The options of the queries of a background task the caller started: the server's
     /// budgets with the update timeout, which no task request parameter changes, and no
     /// grant of the memory pool, which the task takes when it starts.
+    // Only the GraphRAG builder starts such tasks, and it runs only behind the MCP tools.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) fn task_options(&self, cancel: Arc<AtomicBool>) -> QueryOptions {
         let mut opts = request_options(self.st, self.ds, &Params(Vec::new()));
         opts.timeout = self.st.limits.update_timeout;

@@ -13,6 +13,7 @@ mod algo_view;
 mod audit;
 mod branches;
 mod cli_grants;
+mod evidence;
 #[cfg(feature = "reasoning")]
 mod explain;
 #[cfg(feature = "shacl")]
@@ -28,6 +29,8 @@ mod limits;
 #[cfg(feature = "mcp")]
 mod mcp_oauth;
 mod oidc;
+#[cfg(feature = "ontology")]
+mod ontology;
 mod overview;
 mod paths;
 mod proxy;

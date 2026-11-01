@@ -428,6 +428,10 @@ run = "mbx test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 description = "shexTest conformance (syntax, negative syntax and structure, representation, validation) with the ShEx 2.2 tests under crates/sparkles-shex/tests/shex22"
 run = "mbx test -p sparkles-shex --test shextest -- --nocapture"
 
+[tasks."test:owl"]
+description = "The W3C OWL 2 test cases: strict reads, round trips and the OWL 2 DL, EL, QL and RL checks against each case's species and profiles, with the known differences in crates/sparkles-owl/tests/w3c_owl_known.txt"
+run = "export $(scripts/fetch-test-suites.sh | grep '^SPARKLES_OWL2_TESTS=') && mbx test -p sparkles-owl --test w3c_owl -- --nocapture"
+
 [tasks."test:csvw"]
 description = "W3C CSV on the Web conformance: the RDF tests of the CSVW test suite under testsuite/csvw, in minimal and standard mode"
 run = "mbx test -p sparkles-core --test csvw_conformance -- --nocapture"

@@ -23,7 +23,6 @@ pub mod evidence;
 pub mod fmt;
 pub mod forms;
 pub mod handles;
-pub mod managed_source;
 pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;
@@ -34,6 +33,11 @@ pub mod syntax;
 pub mod terms;
 pub mod valid_time;
 pub mod write_guard;
+
+/// The OWL 2 axiom model, mappings and profile checks (spec F21), which
+/// [`Dataset::ontology`] reads datasets with.
+#[cfg(feature = "ontology")]
+pub use sparkles_owl as owl;
 
 pub use catalog::{Catalog, CatalogOptions};
 pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};

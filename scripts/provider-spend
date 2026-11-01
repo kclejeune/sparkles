@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Read a model provider's daily cost and token reports, and compare them with ledgers.
+
+It asks the provider's administration API for cost and usage by day and model and prints
+one row per day and model. With `--ledger`, it also sums the settlements of evaluation
+ledgers by UTC day and model and prints the difference. It only reads, and it never
+prints the key.
+
+    fnox exec -- scripts/provider-spend openai --since 2026-11-01
+    fnox exec -- scripts/provider-spend anthropic --since 2026-10-24 \
+        --ledger ~/sparkles-ask-hillclimb-20261101/ledger/ledger.jsonl
+
+The OpenAI report needs `OPENAI_ADMIN_API_KEY`, and the Anthropic report needs
+`ANTHROPIC_ADMIN_API_KEY`, an Admin API key of a Console organization. Reports lag the
+calls by a few minutes, and a day that has not ended is partial.
+"""
+
+import argparse
+import collections
+import datetime
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+UTC = datetime.timezone.utc
+
+
+def get(url, headers):
+    req = urllib.request.Request(url, headers={"User-Agent": "sparkles-provider-spend/1", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read(2000).decode("utf-8", "replace")
+        sys.exit(f"provider-spend: {url.split('?')[0]} answered {e.code}: {body}")
+
+
+def pages(base, params, headers, cursor="page"):
+    while True:
+        out = get(base + "?" + urllib.parse.urlencode(params, doseq=True), headers)
+        yield out
+        if not out.get("has_more") or not out.get("next_page"):
+            return
+        params = {**params, cursor: out["next_page"]}
+
+
+def day_of(ts):
+    if isinstance(ts, (int, float)):
+        return datetime.datetime.fromtimestamp(ts, UTC).date().isoformat()
+    return ts[:10]
+
+
+def short_model(name):
+    """`claude-opus-5-5` and `Claude Opus 5.5` both become `claude-opus-5-5`."""
+    if not name:
+        return "-"
+    return name.strip().lower().replace(" ", "-").replace(".", "-")
+
+
+def openai(since, until):
+    key = os.environ.get("OPENAI_ADMIN_API_KEY")
+    if not key:
+        sys.exit("provider-spend: OPENAI_ADMIN_API_KEY is not set; run it under `fnox exec --`")
+    h = {"Authorization": f"Bearer {key}"}
+    span = {"start_time": int(since.timestamp()), "end_time": int(until.timestamp()), "bucket_width": "1d"}
+    rows = collections.defaultdict(lambda: collections.Counter())
+    for page in pages("https://api.openai.com/v1/organization/usage/completions", {**span, "group_by": ["model"], "limit": 31}, h):
+        for b in page.get("data", []):
+            for r in b.get("results", []):
+                c = rows[(day_of(b["start_time"]), short_model(r.get("model")))]
+                c["requests"] += r.get("num_model_requests", 0) or 0
+                c["input"] += (r.get("input_tokens", 0) or 0) - (r.get("input_cached_tokens", 0) or 0)
+                c["cache_read"] += r.get("input_cached_tokens", 0) or 0
+                c["output"] += r.get("output_tokens", 0) or 0
+    costs = collections.defaultdict(float)
+    for page in pages("https://api.openai.com/v1/organization/costs", {**span, "group_by": ["line_item"], "limit": 31}, h):
+        for b in page.get("data", []):
+            for r in b.get("results", []):
+                amount = (r.get("amount") or {}).get("value", 0) or 0
+                # A line item names its model first, as in "gpt-6.1-sol, input".
+                model = short_model((r.get("line_item") or "-").split(",")[0])
+                costs[(day_of(b["start_time"]), model)] += float(amount)
+    return rows, costs
+
+
+def anthropic(since, until):
+    key = os.environ.get("ANTHROPIC_ADMIN_API_KEY")
+    if not key:
+        sys.exit("provider-spend: ANTHROPIC_ADMIN_API_KEY is not set; run it under `fnox exec --`")
+    h = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    span = {"starting_at": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "ending_at": until.strftime("%Y-%m-%dT%H:%M:%SZ"), "bucket_width": "1d"}
+    rows = collections.defaultdict(lambda: collections.Counter())
+    for page in pages("https://api.anthropic.com/v1/organizations/usage_report/messages", {**span, "group_by[]": ["model"], "limit": 31}, h):
+        for b in page.get("data", []):
+            for r in b.get("results", []):
+                c = rows[(day_of(b["starting_at"]), short_model(r.get("model")))]
+                cc = r.get("cache_creation") or {}
+                c["input"] += r.get("uncached_input_tokens", 0) or 0
+                c["cache_write_5m"] += cc.get("ephemeral_5m_input_tokens", 0) or 0
+                c["cache_write_1h"] += cc.get("ephemeral_1h_input_tokens", 0) or 0
+                c["cache_read"] += r.get("cache_read_input_tokens", 0) or 0
+                c["output"] += r.get("output_tokens", 0) or 0
+    costs = collections.defaultdict(float)
+    for page in pages("https://api.anthropic.com/v1/organizations/cost_report", {**span, "group_by[]": ["description"], "limit": 31}, h):
+        for b in page.get("data", []):
+            for r in b.get("results", []):
+                # Amounts are decimal strings in cents.
+                costs[(day_of(b["starting_at"]), short_model(r.get("model")))] += float(r.get("amount", 0) or 0) / 100
+    return rows, costs
+
+
+def ledgers(paths):
+    """Settled nanodollars by (UTC day, model) over evaluation ledgers."""
+    out = collections.defaultdict(int)
+    for p in paths:
+        models = {}
+        with open(os.path.expanduser(p)) as f:
+            for line in f:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if o.get("op") == "reserve":
+                    models[o["id"]] = o.get("model")
+                elif o.get("op") == "settle" and o.get("cost") is not None:
+                    out[(day_of(o["at"]), short_model(models.get(o["id"])))] += o["cost"]
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("provider", choices=("openai", "anthropic"))
+    ap.add_argument("--since", required=True, help="first UTC day, YYYY-MM-DD")
+    ap.add_argument("--until", help="UTC day after the last, YYYY-MM-DD (default: tomorrow)")
+    ap.add_argument("--ledger", action="append", default=[], help="an evaluation ledger to compare (repeatable)")
+    ap.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    a = ap.parse_args()
+    since = datetime.datetime.fromisoformat(a.since).replace(tzinfo=UTC)
+    until = (
+        datetime.datetime.fromisoformat(a.until).replace(tzinfo=UTC)
+        if a.until
+        else datetime.datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+    )
+    rows, costs = (openai if a.provider == "openai" else anthropic)(since, until)
+    led = ledgers(a.ledger)
+    keys = sorted(set(rows) | set(costs) | set(led))
+    report = []
+    for k in keys:
+        r = {"day": k[0], "model": k[1], "providerUsd": round(costs.get(k, 0.0), 4), **rows.get(k, {})}
+        if a.ledger:
+            r["ledgerUsd"] = round(led.get(k, 0) / 1e9, 4)
+            r["diffUsd"] = round(r["ledgerUsd"] - r["providerUsd"], 4)
+        report.append(r)
+    if a.json:
+        json.dump(report, sys.stdout, indent=1)
+        print()
+        return
+    cols = ["day", "model", "providerUsd"] + (["ledgerUsd", "diffUsd"] if a.ledger else [])
+    tok = ["requests", "input", "cache_write_5m", "cache_write_1h", "cache_read", "output"]
+    tok = [t for t in tok if any(t in r for r in report)]
+    print("\t".join(cols + tok))
+    for r in report:
+        print("\t".join(str(r.get(c, 0)) for c in cols + tok))
+    print("\t".join(["total", "", f"{sum(r['providerUsd'] for r in report):.2f}"] + ([f"{sum(r['ledgerUsd'] for r in report):.2f}", f"{sum(r['diffUsd'] for r in report):.2f}"] if a.ledger else [])))
+
+
+if __name__ == "__main__":
+    main()

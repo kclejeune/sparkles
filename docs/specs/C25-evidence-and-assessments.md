@@ -505,13 +505,11 @@ settings enter the same gate before their branch locks. Store resources and bran
 locks are destroyed before the final root lease. A retained persistent member or
 branch set can therefore outlive main without releasing process exclusion early.
 
-The resident source ownership prerequisite supplies core SourceOwner and ArcSourceOwner
-and the facade ResidentSourceOwner. A facade lease retains the catalog's original Dataset,
-including its Own(Store) payload, and an exact already resident branch Arc. It opens no
-cold branch and constructs no branch Dataset or Runtime. Getters borrow the retained
-values once before operation exclusion. The exact opening and private family identity
-are checked separately from stored UUIDs. This is a lifetime bridge, not authorization,
-routing authenticity, protected publication or durable retention.
+An earlier resident source ownership prerequisite supplied lifetime leases of exact
+catalog openings for typed writers. Neither the evidence runtime nor C26 adopted them,
+because resolution reads retained commits by identity through the catalog and holds
+instead of keeping openings alive, so they were removed with the retained-reference
+step below.
 
 Catalog deletion, persistent rename and backup replacement now use a final reversible
 runtime close proof before filesystem publication. Nonblocking admission on the existing
@@ -770,17 +768,110 @@ and releases with commits and compactions and finds no held commit unreadable. H
 tests cover acquisition, idempotence, paging, branch filters, deletion of a held
 branch, release and each refusal.
 
+Retained-reference and record resolution is the fourth Phase 2 step and the first
+production caller of [C29](C29-bounded-view-preparation/README.md).
+`sparkles_core::evidence::resolve::Resolver` verifies the references of one operation
+under one `Preparation` of 64 MiB with the request deadline and cancellation, and
+`sparkles::evidence::resolve::Resolution` adds the catalog. A stored fact names its
+dataset and branch by UUID. The dataset is found among the catalog's registered datasets
+with `Catalog::try_get_by_id`, and the branch among the dataset's listed branches. The
+caller decides access on their current names before anything is read, so a renamed
+dataset or branch keeps resolving and a recreated name never does. An anchor that the reference alone refuses is refused
+before the dataset is looked up, so its answer does not depend on whether the dataset
+exists.
+`Store::snapshot_of_branch_limited` then reads exactly the referenced commit within the
+remaining allowance, without opening a cold branch store, and never another branch or the
+head. A commit at or below a branch's starting point, including a held starting commit
+that the branch no longer keeps, is read from the upstream that serves it, and the result
+names that serving branch. The snapshot's conservative delta charge stays reserved while
+its view is kept, and `GraphAccess::masked_controlled` prepares the caller's graph
+policy and triple mask under the same allowance. Each commit is prepared once per
+operation and shared by its references.
+
+A guard decided at the snapshot, such as the GraphRAG disclosure guard, is bound by
+that preparation before the graph is checked. A ground fact is found by controlled term
+lookups and one quad probe in the prepared view,
+and a named reifier must reify that triple in the same graph. A fact with blank nodes
+needs a reifier. The one triple term it reifies in the graph must match the expected
+triple up to a consistent renaming of blank nodes, and that stored triple must be
+asserted there. A blank-containing fact without a reifier, a reifier of more than one
+triple and an import-mapping anchor are `unanchored-evidence`, and the first two of these
+are decided from the reference before anything is read. A missing dataset, branch, commit,
+graph, term, fact or reifier and one the caller cannot read all give the same
+`evidence-unavailable` error and message. The resolution's memory limit and an access
+policy that this bounded entry point cannot prepare, such as a protection pattern, give
+`incomplete-evidence` and never read as absence. The request deadline and cancellation
+keep the request error contract.
+
+A record reference names an IRI, its allowed kinds and an optional content digest, and
+resolves at the current state of the requesting branch. The record must have exactly one
+profile class in exactly one graph that the evidence settings give a role other than
+`projections` and that the evidence owner protects now. A copy in an ordinary or detached
+graph is not a profile record. The record carries exactly one `ev:availabilityReceipt`
+whose `ev:datasetId`, `ev:branchId` and `ev:commit` name this dataset, a branch it lists,
+retired or recorded as deleted, and the publishing commit. That is the receipt layout the
+typed writers record. A missing receipt, or one naming another dataset or an unknown
+branch, is `origin-not-reproduced`, as after a restore into another identity. Another
+kind, another content digest, two digests or a second copy of the record is
+`immutable-record-conflict`. A passage's single selector start and end are Unicode code
+point offsets into its rendition's single `ev:normalizedText`. That rendition must itself
+resolve as an authenticated record, and the digest of the selected text must equal the
+passage's `ev:textDigest`, or the answer is `span-mismatch`. The text is read as its
+stored bytes under the allowance rather than decoded as a term. The registry is read
+from the running state without a copy, and its settings decoding is charged before it
+allocates. Each record reads the running registry again, so a detach or another
+management change made during one resolution applies to its later records.
+
+A graph that the caller's grants refuse is refused before any history is read. A
+GraphRAG disclosure guard is decided only once the view is bound to its snapshot, so the
+check made before the read treats each undecided guard as passing and applies every
+other rule.
+
+`POST /{ds}/claims/resolve` exposes both reference forms. It needs `read` on `{ds}`
+through the query endpoint and builds each referenced dataset's view with the server's
+caller context, once per dataset and branch for the request, and a client that
+disconnects cancels it. It answers every verified reference in order, or the first one that
+does not verify with its code and key. The six outcomes have the stable codes above, with
+`422` for all but `immutable-record-conflict`, which is `409`. Malformed references are
+field-specific `400` errors.
+
+Tests cover exact commits against later heads, the default and named graphs, literal
+datatypes and languages, triple terms, renamed, deleted and recreated branches and
+datasets, starting commits served by the upstream, a held starting commit after its
+history was trimmed, graph grants, guards decided at the snapshot, static graph
+denials under an undecided guard with an allowance too small for the view, triple protections,
+blank nodes with and without reifiers, the allowance and cancellation, branch lookups
+while the branch table is held, view reuse, the record kinds, digests, receipts, detached
+and ordinary copies, a detach between two records of one resolution, passages with code point selectors over a 4 MiB rendition, and the
+HTTP route with and without authentication. The unauthorized and missing answers are
+compared byte for byte, including for references refused from their anchor alone.
+
+#### Resolution decisions
+
+1. **Receipt verification.** The receipt check is a lineage check that does not read
+   history, so a record stays verifiable after retention trims its publishing commit.
+   It cannot tell a record that a typed writer published from one written with a
+   correct-looking receipt while its graph was detached. The authenticated typed writer
+   of the next step must record an operation marker that makes that distinction.
+2. **Delta charge.** The 64 MiB allowance uses C29's conservative 2 KiB charge for
+   each quad of a state's unindexed delta, so a state with tens of thousands of writes
+   since its last compaction can answer `incomplete-evidence`. Roadmap item 542
+   tracks a tighter charge for shared live states.
+3. **Source leases.** The resident source lease family was removed rather than adopted.
+   [C26](C26-durable-jobs-and-delivery.md) does not use it.
+4. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
+   and the bindings for roadmap item 509.
+
 Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
-and claim creation with authenticated availability and guarded metadata, exact retained
-reference resolution, reader admission, idempotency, review, support ownership,
-projections and reversible identity decisions. The shared managed-write and admission
-boundary described above is the one C26 reuses for its control graphs. Phase 3 integrates the new records with C17/C18, F22 and C22.
+and claim creation with authenticated availability and guarded metadata, idempotency,
+review, support ownership, projections and reversible identity decisions. The shared
+managed-write and admission boundary described above is the one C26 reuses for its
+control graphs. Phase 3 integrates the new records with C17/C18, F22 and C22.
 The state-machine, authorization, direct-write, crash and retry acceptance cases remain
 required before those runtime phases are complete.
 
-Exact retained-reference resolution additionally uses item 395 and
-[C29](C29-bounded-view-preparation/README.md) for bounded history and permission
-preparation. A point-only reader does not complete the general guarded-view contract.
+Retained-reference resolution uses C29's bounded history and controlled permission
+preparation. Guarded Dataset queries and U02 readers still adopt them under item 395.
 
 ### Scope changes
 

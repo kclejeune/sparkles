@@ -98,11 +98,12 @@ impl Runtime {
     /// Load the newest checkpoint of a view that this release reads into `cell`.
     pub(super) fn recover(&self, store: &Store, cell: &Cell, dir: &std::path::Path, name: &str) {
         let snap = store.snapshot();
+        let kind = persist::view_kind(cell.state.lock().circuit.has_fixpoint());
         for (commit, path) in persist::list(dir) {
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let (h, body) = match persist::decode(&bytes) {
+            let (h, body) = match persist::decode_as(kind, &bytes) {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(

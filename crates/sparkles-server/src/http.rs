@@ -55,6 +55,35 @@ mod gsp_csv;
 pub(crate) mod lint;
 mod live;
 mod mappings;
+#[cfg(feature = "ontology")]
+pub(crate) mod ontology;
+#[cfg(not(feature = "ontology"))]
+mod ontology {
+    use super::*;
+
+    fn not_built() -> ApiResult {
+        Err(err(
+            StatusCode::NOT_IMPLEMENTED,
+            "built without the `ontology` feature",
+        ))
+    }
+
+    pub(super) async fn summary() -> ApiResult {
+        not_built()
+    }
+
+    pub(super) async fn axioms() -> ApiResult {
+        not_built()
+    }
+
+    pub(super) async fn check() -> ApiResult {
+        not_built()
+    }
+
+    pub(super) async fn edit() -> ApiResult {
+        not_built()
+    }
+}
 mod patch;
 mod queries;
 mod views;
@@ -142,6 +171,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/constraints", get(schema::constraints))
         .route("/$/schema/{ds}/profiles", get(schema::profiles))
         .route("/$/schema/{ds}/diff", get(schema::diff))
+        .route("/$/ontology/{ds}", get(ontology::summary))
+        .route(
+            "/$/ontology/{ds}/axioms",
+            get(ontology::axioms).post(ontology::edit),
+        )
+        .route("/$/ontology/{ds}/check", post(ontology::check))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
         .route("/$/forms/{ds}", get(forms_model))
@@ -928,6 +963,18 @@ impl From<anyhow::Error> for ApiError {
 
 pub(crate) type ApiResult<T = Response> = Result<T, ApiError>;
 
+/// The dataset `name` itself, `main`, whatever branch the request chose.
+pub(crate) fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
+    match st.lookup(name) {
+        crate::state::Lookup::Open(ds) => Ok(ds),
+        crate::state::Lookup::Unavailable(u) => Err(unavailable_error(name, &u)),
+        crate::state::Lookup::Missing => Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no such dataset: /{name}"),
+        )),
+    }
+}
+
 pub(crate) fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
     let ds = match st.lookup(name) {
         crate::state::Lookup::Open(ds) => ds,
@@ -1001,6 +1048,11 @@ pub(crate) async fn blocking<T: Send + 'static>(
 pub(crate) struct Params(Vec<(String, String)>);
 
 impl Params {
+    /// No parameters, for a route whose options come from the server alone.
+    pub(crate) fn empty() -> Params {
+        Params(Vec::new())
+    }
+
     pub(crate) fn from_query(uri: &Uri) -> Params {
         Params(
             uri.query()

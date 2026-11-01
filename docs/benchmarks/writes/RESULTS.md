@@ -801,6 +801,54 @@ circuits. It gave a geometric mean of 0.987, with no query slower by 10% or more
 `types-grouped` measured 6.4% slower at 0.017 ms and `order-by-full` 2.0% slower, and
 Item 529 covers both.
 
+#### Property path views
+
+`path_pass_against_recompute` in `crates/sparkles-core/tests/incr_bench.rs` measures the
+property paths of [F13 §4.3](../../specs/F13-incremental-views-and-provenance.md#fixed-point-operator).
+It adds a tree of units with a fan-out of 4 over a tenth of the people, with each person
+in one unit, to the data of the other tests. `reach-one` is `:p0 :knows+ ?q`, which
+reaches nearly every person, `unit-ancestors` is `?u :partOf+ ?a` over the whole tree,
+`under-root` is `?u :partOf* :u0`, and `people-under` counts the people under each unit
+through a join with `:partOf+`. Each view then takes 200 commits that cycle through five
+kinds: a `knows` edge to a new person, the removal of a `knows` edge, a unit moved under
+another unit, a new unit with a member, and an unrelated quad. Two commits in five
+therefore change a view's path, and the median pass of a recomputed view mostly measures
+the commits it skips.
+
+The runs used one 8-vCPU Namespace instance at 200,000 people, with each process pinned
+to 6 CPUs. The baseline is commit `0dc27215`, where paths with `+` and `*` are `recompute`
+nodes, and the candidate maintains them with the fixed-point operator. Each figure is the
+median over five processes of each build, which ran in alternating order, and every
+view's rows matched its query evaluated again.
+
+| View | Query ms | Recompute pass p95 ms | Maintained pass median ms | Maintained pass p95 ms | Build ms, recompute then maintained | State MiB, recompute then maintained |
+|---|--:|--:|--:|--:|--:|--:|
+| `reach-one` | 16.0 | 59.6 | 0.002 | 0.027 | 53 then 176 | 18.3 then 17.9 |
+| `unit-ancestors` | 43.4 | 73.2 | 0.002 | 0.067 | 68 then 16 | 14.4 then 16.0 |
+| `under-root` | 0.70 | 2.30 | 0.006 | 0.023 | 2.9 then 7.7 | 1.8 then 2.0 |
+| `people-under` | 61.4 | 82.2 | 0.026 | 0.235 | 664 then 523 | 16.3 then 17.8 |
+
+A pass that changes a path costs 0.02 to 0.24 ms where evaluating the query again costs
+2.3 to 82 ms, between 100 and 2,200 times less. A deleted `knows` edge inside the large
+component of `reach-one` keeps every person that another path still reaches, so its pass
+checks only the walks recorded through the edge. The maintained state is up to 11% larger,
+since the operator keeps each reachable pair with its record, about 40 bytes, beside the
+rows that a recomputed view also keeps. This memory buys passes that follow only the
+walks a change reaches.
+
+The maintained build of `reach-one` takes 3.3 times as long as the recomputed one, and that
+of `under-root` 2.6 times, because the operator records a derivation for each reachable
+node where the query engine only walks. Builds of the other two views are faster, since
+the recomputed build of `unit-ancestors` evaluates the path from every node. Item
+548 tracks faster builds of the operator. The five plain views of
+`pass_against_recompute` kept their pass medians and p95 within the range of the five
+processes, and no metric of the other tests moved by more than the spread of the runs.
+
+The [run record](runs/2026-11-01-property-paths-nsc/README.md) holds the raw output of
+every process, the comparison of the two builds and the commands. It also holds three
+runs of the overdeletion experiment that
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#incremental-views) records.
+
 ### Incremental view gate baseline
 
 `mise run bench:incr` is the rewrite gate of incremental view maintenance, as

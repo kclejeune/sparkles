@@ -8,6 +8,7 @@ mod canonical;
 mod model;
 mod prepare;
 mod primitives;
+pub mod resolve;
 mod settings;
 mod structured;
 

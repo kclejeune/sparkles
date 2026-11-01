@@ -28,6 +28,7 @@ oxiri.workspace = true
 oxilangtag.workspace = true
 # the satellites behind the features of the same names
 sparkles-reasoner = { workspace = true, optional = true }
+sparkles-owl = { workspace = true, optional = true }
 sparkles-shacl = { workspace = true, optional = true }
 sparkles-shex = { workspace = true, optional = true }
 sparkles-graphql = { workspace = true, optional = true }
@@ -58,6 +59,8 @@ brotli = ["sparkles-core/brotli"]
 failpoints = ["sparkles-core/failpoints"]
 # the reasoner's closure cache, and later its handle (RDFS on read needs no feature)
 reasoning = ["dep:sparkles-reasoner"]
+# the OWL 2 ontology of a dataset: `ds.ontology()` and `sparkles::owl` (spec F21)
+ontology = ["dep:sparkles-owl", "reasoning"]
 # SHACL write guards
 shacl = ["dep:sparkles-shacl"]
 # ShEx write guards
@@ -85,6 +88,7 @@ full = [
     "zstd",
     "brotli",
     "reasoning",
+    "ontology",
     "shacl",
     "shex",
     "backup",

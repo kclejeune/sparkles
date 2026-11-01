@@ -1,5 +1,6 @@
 //! The handles of a [`Dataset`]: small objects for snapshots, history, indexes,
-//! settings, schema, stored queries, reasoning, validation, GraphQL and backups.
+//! settings, schema, stored queries, reasoning, validation, GraphQL, backups and the
+//! OWL 2 ontology.
 //!
 //! Each handle holds a clone of the dataset, which is an `Arc`, so handles are `Clone`,
 //! `Send`, `Sync` and `'static`. Their verbs are fixed: `list` returns everything, `get`
@@ -31,6 +32,8 @@ pub mod graphql;
 pub mod history;
 pub mod indexes;
 pub mod mappings;
+#[cfg(feature = "ontology")]
+pub mod ontology;
 pub mod queries;
 pub mod reasoning;
 pub mod schema;

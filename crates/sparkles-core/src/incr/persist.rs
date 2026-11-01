@@ -11,7 +11,7 @@
 //! | bytes | field |
 //! |---|---|
 //! | 8 | magic `SPKVIEW\0` |
-//! | 4 | format (u32 LE), 1 |
+//! | 4 | format (u32 LE), 1, or 2 for a circuit with a fixed-point operator |
 //! | 4 | flags (u32 LE), 0 |
 //! | 16 | the dataset's UUID |
 //! | 8 | the commit the state reflects (u64 LE) |
@@ -21,7 +21,11 @@
 //! | … | body: the term table (varint count, then varint length and key each), then the operators' states |
 //!
 //! A reader refuses a format it does not know with [`Error::Unsupported`], and the view
-//! is then built from scratch while the file is left in place.
+//! is then built from scratch while the file is left in place. A circuit writes format 2
+//! when it has a fixed-point operator (spec F13 §4.3), whose state follows the other
+//! operators' in the body, and format 1 otherwise, so a view without one keeps the format
+//! that older releases read. Each circuit reads only its own format: a file of the other
+//! is left for the next checkpoint to remove, and the view is built from the data.
 
 use super::terms::Terms;
 use super::zset::{Row, ZSet};
@@ -32,13 +36,17 @@ use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"SPKVIEW\0";
-/// The checkpoint format this release writes and reads.
-pub const FORMAT: u32 = 1;
+/// The newest view checkpoint format this release writes and reads: format 2 holds a
+/// circuit with a fixed-point operator and format 1 one without.
+pub const FORMAT: u32 = 2;
+/// The view checkpoint formats this release reads.
+pub const FORMATS: &[u32] = &[1, 2];
 /// The newest format of internal circuits' checkpoints this release writes and reads:
-/// format 2 holds a circuit with annotations (spec F13 §5) and format 1 one without.
-pub const INTERNAL_FORMAT: u32 = 2;
+/// format 2 holds a circuit with annotations (spec F13 §5) and format 1 one without,
+/// and formats 3 and 4 do the same for a circuit with a fixed-point operator.
+pub const INTERNAL_FORMAT: u32 = 4;
 /// The formats of internal circuits' checkpoints this release reads.
-pub const INTERNAL_FORMATS: &[u32] = &[1, 2];
+pub const INTERNAL_FORMATS: &[u32] = &[1, 2, 3, 4];
 
 /// A kind of checkpoint file: its magic, the format a writer of this kind emits, and
 /// the formats this release reads. Every kind shares the header layout above.
@@ -52,13 +60,26 @@ pub struct Kind {
     pub what: &'static str,
 }
 
-/// The checkpoints of views, `views/{name}/main/state-{commit}.bin`.
+/// The checkpoints of views without a fixed-point operator,
+/// `views/{name}/main/state-{commit}.bin`.
 pub const VIEW: Kind = Kind {
     magic: MAGIC,
-    format: FORMAT,
-    reads: &[FORMAT],
+    format: 1,
+    reads: FORMATS,
     what: "view state",
 };
+
+/// The checkpoints of views with a fixed-point operator, in format 2 under the same
+/// name and magic as [`VIEW`].
+pub const VIEW_FIXPOINT: Kind = Kind {
+    format: FORMAT,
+    ..VIEW
+};
+
+/// The kind of checkpoint a view's circuit writes and reads.
+pub fn view_kind(fixpoint: bool) -> Kind {
+    if fixpoint { VIEW_FIXPOINT } else { VIEW }
+}
 
 /// The checkpoints of internal circuits without annotations (spec F13 §3.6),
 /// `circuits/{id}/main/state-{commit}.bin` with the magic `SPKCIRC\0`: the header
@@ -73,9 +94,18 @@ pub const INTERNAL: Kind = Kind {
 /// The checkpoints of internal circuits that keep annotations, in format 2 under the
 /// same name and magic as [`INTERNAL`].
 pub const INTERNAL_ANNOTATED: Kind = Kind {
-    format: INTERNAL_FORMAT,
+    format: 2,
     ..INTERNAL
 };
+
+/// The kind of checkpoint an internal circuit writes and reads: format 1 plus one with
+/// annotations and plus two with a fixed-point operator.
+pub fn internal_kind(annotated: bool, fixpoint: bool) -> Kind {
+    Kind {
+        format: 1 + u32::from(annotated) + 2 * u32::from(fixpoint),
+        ..INTERNAL
+    }
+}
 const HEADER: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 4;
 
 /// Encodes a state, mapping ids to the keys of their terms.

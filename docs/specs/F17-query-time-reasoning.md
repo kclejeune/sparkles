@@ -978,6 +978,20 @@ runs of `every_inferred_triple_has_a_sound_demand_tree`, the test took 214 s and
 before these changes and 107 s and 167 s after, with the host's one-minute load between
 16 and 47.
 
+### Fixed-point operator for Phase 3
+
+Roadmap item 417 delivered the fixed-point operator that §6.3 builds on, recorded in
+[F13's Outcome](F13-incremental-views-and-provenance.md#fixed-point-operator). The
+reasoner plugs into it through `RuleProgram` in `crates/sparkles-reasoner/src/fixpoint.rs`,
+which runs forward Jena rules whose bodies are triple patterns over at most four variables
+and whose heads use only body variables. Constants the store lacks are kept as local
+terms, which its checkpoints carry. The operator keeps each derived triple with the
+rule instance that derived it first and maintains deletions by backward and forward
+rederivation, so cycles of classes and symmetric relations need no counts. Tests check
+random histories against a naive closure and check that each `why` witness derives its
+triple. Tables are not views on the operator, and Phase 3 remains to build them from the
+demand program with its seeds fixed.
+
 ### Scope changes
 
 **OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 DL or EL reasoning. OWL 2 EL classification is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md). OWL 2 DL reasoning stays a non-goal of this spec.
