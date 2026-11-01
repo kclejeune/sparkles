@@ -189,8 +189,10 @@ so the report, the case files and `replies.jsonl` keep question order. A batch c
 holds a database directory's lock, so the cases are scored after it ends. A line that
 the child's input does not take, because the input closed or the child stopped
 reading, goes to the next child, and the results of the lines the child did take are
-still read to its end. When the child dies or a line passes its deadline, the cases in
-flight that got no result fail as `killed` or `timeout` and a new child asks the rest.
+still read to its end. When the kernel or a memory cap kills the child, or a line
+passes its deadline, the cases in flight that got no result fail as `killed` or
+`timeout` and a new child asks the rest. A child that ends in any other way while lines
+are in flight, or prints a result line longer than 4 MiB, ends the run.
 Writes, waits and the proxy's drain of a case's requests all end at the phase
 deadline, and a run that ends with an error keeps every case that finished, unscored.
 A case's wall time is its result's `usage.elapsedMs`.
