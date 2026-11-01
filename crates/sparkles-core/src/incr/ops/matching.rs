@@ -10,8 +10,9 @@
 
 use super::super::pass::{Pass, Which};
 use super::super::persist::{Reader, Writer};
+use super::super::prov::{self, AChanges, Ann, AnnMap, Provenance};
 use super::super::zset::{Changes, Row, consolidate, row_bytes};
-use super::{Arrangement, Merge, Node, side_matches};
+use super::{Arrangement, Merge, Node, absorb_side, side_matches, side_matches_a};
 use crate::error::Result;
 use crate::id::Id;
 use rustc_hash::FxHashMap;
@@ -56,6 +57,14 @@ pub struct MatchOp {
     lstate: FxHashMap<Row, FxHashMap<Row, (i64, i64)>>,
     lrows: usize,
     rarr: Option<Arrangement>,
+    /// the annotations of the left rows, when the circuit keeps them (spec F13 §5)
+    lann: Option<AnnMap>,
+    /// for `EXISTS`, the sum of the annotations of each left row's matches
+    sann: Option<AnnMap>,
+    rann: Option<AnnMap>,
+    /// the number of the operator's negative condition (spec F13 §5.2)
+    pub cond: u32,
+    prov: Provenance,
 }
 
 impl MatchOp {
@@ -74,7 +83,297 @@ impl MatchOp {
             lstate: FxHashMap::default(),
             lrows: 0,
             rarr,
+            lann: None,
+            sann: None,
+            rann: None,
+            cond: u32::MAX,
+            prov: Provenance::None,
         }
+    }
+
+    pub fn enable_prov(&mut self, mode: Provenance, cond: u32) {
+        self.prov = mode;
+        self.cond = cond;
+        self.lann = Some(AnnMap::default());
+        self.sann = (self.mode == MatchMode::Exists).then(AnnMap::default);
+        self.rann = self.rarr.is_some().then(AnnMap::default);
+    }
+
+    /// [`matching`](Self::matching) with the annotations of the right rows.
+    fn matching_a(&self, p: &mut Pass, w: Which, a: &Row) -> Result<AChanges> {
+        let key = self.m.key_left(a);
+        let seed = self.m.seed_right(a);
+        let cands = side_matches_a(
+            p,
+            &self.right,
+            self.rarr.as_ref(),
+            self.rann.as_ref(),
+            w,
+            &key,
+            &seed,
+        )?;
+        let pairs: Vec<(Row, Row)> = cands
+            .iter()
+            .map(|(b, _, _)| (a.clone(), b.clone()))
+            .collect();
+        let keep = self.conditions(p, &pairs)?;
+        Ok(cands
+            .into_iter()
+            .zip(keep)
+            .filter(|(_, k)| *k)
+            .map(|(c, _)| c)
+            .collect())
+    }
+
+    /// The annotation of left row `a` alone in the output, from its annotation `la`
+    /// and, for `EXISTS`, the sum `sa` of its matches': the product with its matches
+    /// for `EXISTS`, and with the condition that nothing matches otherwise.
+    fn alone_ann(&self, p: &mut Pass, a: &Row, la: &Ann, sa: &Ann) -> Ann {
+        match self.mode {
+            MatchMode::Exists => la.mul(sa),
+            _ => {
+                let vals: Vec<(u32, Id)> = self
+                    .m
+                    .shared
+                    .iter()
+                    .map(|&(i, _)| (self.left.schema[i], a[i]))
+                    .collect();
+                la.mul(&p.absent_ann(self.cond, &vals))
+            }
+        }
+    }
+
+    /// [`init`](Self::init) with annotations.
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let mode = p.prov;
+        let l = prov::consolidate(self.left.init_a(p)?);
+        let r = prov::consolidate(self.right.init_a(p)?);
+        let r = match (&mut self.rarr, &mut self.rann) {
+            (Some(a), Some(m)) => {
+                a.clear();
+                m.clear();
+                absorb_side(a, m, r, mode)
+            }
+            _ => r,
+        };
+        let mut rindex: FxHashMap<Row, Vec<usize>> = FxHashMap::default();
+        for (i, (b, _, _)) in r.iter().enumerate() {
+            rindex.entry(self.m.key_right(b)).or_default().push(i);
+        }
+        self.lstate.clear();
+        self.lrows = 0;
+        let mut lann = std::mem::take(&mut self.lann).unwrap_or_default();
+        let mut sann = std::mem::take(&mut self.sann);
+        lann.clear();
+        if let Some(s) = sann.as_mut() {
+            s.clear();
+        }
+        let mut out = AChanges::new();
+        for (a, wa, aa) in l {
+            p.tick()?;
+            prov::absorb_row(&mut lann, &a, aa, mode);
+            if wa == 0 {
+                continue;
+            }
+            let la = prov::get(&lann, &a, mode);
+            let cands: Vec<&(Row, i64, Ann)> = rindex
+                .get(&self.m.key_left(&a))
+                .into_iter()
+                .flatten()
+                .map(|&i| &r[i])
+                .collect();
+            let pairs: Vec<(Row, Row)> = cands
+                .iter()
+                .map(|(b, _, _)| (a.clone(), b.clone()))
+                .collect();
+            let keep = self.conditions(p, &pairs)?;
+            let mut m = 0;
+            let mut sum = Ann::zero(mode);
+            for ((b, wb, ab), k) in cands.into_iter().zip(keep) {
+                if k {
+                    m += wb;
+                    if self.mode == MatchMode::LeftJoin {
+                        out.push((self.m.merge(&a, b), wa * wb, la.mul(ab)));
+                    } else if self.mode == MatchMode::Exists {
+                        sum.add_assign(ab);
+                    }
+                }
+            }
+            let sa = match sann.as_mut() {
+                Some(s) => {
+                    prov::absorb_row(s, &a, sum, mode);
+                    prov::get(s, &a, mode)
+                }
+                None => sum,
+            };
+            self.set(&a, (wa, m));
+            if self.mode.alone(m) {
+                let ann = self.alone_ann(p, &a, &la, &sa);
+                out.push((self.out_row(&a), wa, ann));
+            }
+        }
+        self.lann = Some(lann);
+        self.sann = sann;
+        Ok(out)
+    }
+
+    /// [`delta`](Self::delta) with annotations. Each input's change is absorbed into
+    /// the state that keeps it, and the output's change is the change of what the
+    /// states give: the joined rows of an `OPTIONAL` as a join's are, and the rows
+    /// alone as the difference of their annotations before and after.
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let mode = p.prov;
+        let dl = prov::consolidate(self.left.delta_a(p)?);
+        let dr = prov::consolidate(self.right.delta_a(p)?);
+        let lj = self.mode == MatchMode::LeftJoin;
+        let ex = self.mode == MatchMode::Exists;
+        // the left rows each right change matches, by the counts before the changes
+        let mut touched: FxHashMap<Row, (i64, i64)> = FxHashMap::default();
+        let mut hits: Vec<(Row, usize)> = Vec::new();
+        for (i, (b, _, _)) in dr.iter().enumerate() {
+            p.tick()?;
+            let cands = self.left_for(b);
+            let pairs: Vec<(Row, Row)> =
+                cands.iter().map(|(a, _)| (a.clone(), b.clone())).collect();
+            let keep = self.conditions(p, &pairs)?;
+            for ((a, v), k) in cands.into_iter().zip(keep) {
+                if k {
+                    hits.push((a.clone(), i));
+                    touched.entry(a).or_insert(v);
+                }
+            }
+        }
+        for (a, _, _) in &dl {
+            if !touched.contains_key(a) {
+                let v = self.get(a);
+                touched.insert(a.clone(), v);
+            }
+        }
+        let mut lann = std::mem::take(&mut self.lann).unwrap_or_default();
+        let mut sann = std::mem::take(&mut self.sann);
+        // the annotations before the changes
+        let before: FxHashMap<Row, (Ann, Ann)> = touched
+            .keys()
+            .map(|a| {
+                let la = prov::get(&lann, a, mode);
+                let sa = sann
+                    .as_ref()
+                    .map_or_else(|| Ann::zero(mode), |s| prov::get(s, a, mode));
+                (a.clone(), (la, sa))
+            })
+            .collect();
+        let mut dw: FxHashMap<Row, i64> = FxHashMap::default();
+        let dl: AChanges = dl
+            .into_iter()
+            .map(|(a, wa, aa)| {
+                *dw.entry(a.clone()).or_insert(0) += wa;
+                let e = prov::absorb_row(&mut lann, &a, aa, mode);
+                (a, wa, e)
+            })
+            .collect();
+        let mut out = AChanges::new();
+        // the joined part: ΔL ⋈ R_old
+        if lj {
+            for (a, wa, aa) in &dl {
+                for (b, wb, ab) in self.matching_a(p, Which::Old, a)? {
+                    out.push((self.m.merge(a, &b), wa * wb, aa.mul(&ab)));
+                }
+            }
+        }
+        let dr = match (&mut self.rarr, &mut self.rann) {
+            (Some(a), Some(m)) => absorb_side(a, m, dr, mode),
+            _ => dr,
+        };
+        let mut dm: FxHashMap<Row, i64> = FxHashMap::default();
+        let mut ds: FxHashMap<Row, Ann> = FxHashMap::default();
+        for (a, i) in hits {
+            let (_, wb, ab) = &dr[i];
+            *dm.entry(a.clone()).or_insert(0) += wb;
+            if ex {
+                ds.entry(a)
+                    .or_insert_with(|| Ann::zero(mode))
+                    .add_assign(ab);
+            }
+        }
+        #[allow(clippy::type_complexity)]
+        let mut new: Vec<(Row, (i64, i64), (i64, i64))> = Vec::with_capacity(touched.len());
+        for (a, (ow, om)) in touched {
+            let nw = ow + dw.get(&a).copied().unwrap_or(0);
+            let nm = if ow != 0 {
+                if let (Some(s), Some(d)) = (sann.as_mut(), ds.remove(&a)) {
+                    prov::absorb_row(s, &a, d, mode);
+                }
+                om + dm.get(&a).copied().unwrap_or(0)
+            } else if nw != 0 {
+                let ms = self.matching_a(p, Which::New, &a)?;
+                if let Some(s) = sann.as_mut() {
+                    let mut sum = Ann::zero(mode);
+                    for (_, _, ab) in &ms {
+                        sum.add_assign(ab);
+                    }
+                    s.remove(&a);
+                    prov::absorb_row(s, &a, sum, mode);
+                }
+                ms.iter().map(|(_, w, _)| w).sum()
+            } else {
+                0
+            };
+            if nw == 0
+                && let Some(s) = sann.as_mut()
+            {
+                s.remove(&a);
+            }
+            new.push((a, (ow, om), (nw, nm)));
+        }
+        for (a, _, v) in &new {
+            self.set(a, *v);
+        }
+        // the joined part: L_new ⋈ ΔR
+        if lj {
+            for (b, wb, ab) in &dr {
+                let cands = self.left_for(b);
+                let pairs: Vec<(Row, Row)> =
+                    cands.iter().map(|(a, _)| (a.clone(), b.clone())).collect();
+                let keep = self.conditions(p, &pairs)?;
+                for ((a, (wa, _)), k) in cands.into_iter().zip(keep) {
+                    if k {
+                        let la = prov::get(&lann, &a, mode);
+                        out.push((self.m.merge(&a, b), wa * wb, la.mul(ab)));
+                    }
+                }
+            }
+        }
+        // rows that move in or out of the part without a match, or whose annotation
+        // there changes
+        for (a, (ow, om), (nw, nm)) in new {
+            let was = ow != 0 && self.mode.alone(om);
+            let is = nw != 0 && self.mode.alone(nm);
+            let before_w = if was { ow } else { 0 };
+            let after_w = if is { nw } else { 0 };
+            let zero = Ann::zero(mode);
+            let (ola, osa) = &before[&a];
+            let old = if was {
+                self.alone_ann(p, &a, ola, osa)
+            } else {
+                zero.clone()
+            };
+            let now = if is {
+                let la = prov::get(&lann, &a, mode);
+                let sa = sann
+                    .as_ref()
+                    .map_or_else(|| Ann::zero(mode), |s| prov::get(s, &a, mode));
+                self.alone_ann(p, &a, &la, &sa)
+            } else {
+                zero
+            };
+            let d = now.sub(&old);
+            if before_w != after_w || !d.is_zero() {
+                out.push((self.out_row(&a), after_w - before_w, d));
+            }
+        }
+        self.lann = Some(lann);
+        self.sann = sann;
+        Ok(out)
     }
 
     fn get(&self, a: &Row) -> (i64, i64) {
@@ -299,9 +598,19 @@ impl MatchOp {
     }
 
     pub fn bytes(&self) -> u64 {
-        self.lrows as u64 * (row_bytes(self.left.schema.len()) + 8)
+        let lw = self.left.schema.len();
+        self.lrows as u64 * (row_bytes(lw) + 8)
             + self.lstate.len() as u64 * row_bytes(self.m.key.len())
             + self.rarr.as_ref().map_or(0, |a| a.bytes())
+            + [&self.lann, &self.sann]
+                .into_iter()
+                .flatten()
+                .map(|m| prov::map_bytes(m, lw))
+                .sum::<u64>()
+            + self
+                .rann
+                .as_ref()
+                .map_or(0, |m| prov::map_bytes(m, self.right.schema.len()))
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {
@@ -316,6 +625,9 @@ impl MatchOp {
         if let Some(a) = &self.rarr {
             a.save(w)?;
         }
+        for m in [&self.lann, &self.sann, &self.rann].into_iter().flatten() {
+            prov::save_map(w, m)?;
+        }
         Ok(())
     }
 
@@ -325,12 +637,24 @@ impl MatchOp {
         let n = r.u64()?;
         for _ in 0..n {
             let a = r.row()?;
+            if a.len() != self.left.schema.len() {
+                return Err(crate::error::Error::Corrupt(
+                    "a view's state holds a row of another width".into(),
+                ));
+            }
             let w = r.i64()?;
             let m = r.i64()?;
             self.set(&a, (w, m));
         }
         if let Some(a) = &mut self.rarr {
             a.load(r)?;
+        }
+        let mode = self.prov;
+        for m in [&mut self.lann, &mut self.sann, &mut self.rann]
+            .into_iter()
+            .flatten()
+        {
+            *m = prov::load_map(r, mode)?;
         }
         Ok(())
     }

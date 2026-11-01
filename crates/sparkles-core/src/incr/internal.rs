@@ -27,8 +27,12 @@
 //! complete.
 //!
 //! **Checkpoint.** `<root>/circuits/{id}/main/state-{commit}.bin` with the header of
-//! [`persist`](super::persist) under the magic `SPKCIRC\0` and format
-//! [`INTERNAL_FORMAT`](super::persist::INTERNAL_FORMAT). The body is the circuit's
+//! [`persist`](super::persist) under the magic `SPKCIRC\0`. Format 1 holds a circuit
+//! without annotations, and format 2
+//! ([`INTERNAL_FORMAT`](super::persist::INTERNAL_FORMAT)) one that keeps them: its
+//! circuit state ends with the annotations of each operator's state and of the result
+//! (spec F13 §5). A circuit writes the lowest format that holds its state, and reads
+//! only that format. The body is the circuit's
 //! state as a view checkpoint holds it, as a length and its bytes, then a sink byte
 //! (0 rows, 1 accumulator) and, for an accumulator, the commit its counts start after,
 //! the unknown ranges (count, then each range's first and last commit), the keys
@@ -109,6 +113,9 @@ pub struct InternalSpec {
     pub sink: Sink,
     /// The budget of the circuit's state and, for an accumulator, of its counts.
     pub max_memory_bytes: u64,
+    /// The annotation the circuit keeps for each row (spec F13 §5), which
+    /// [`InternalCircuit::annotated_rows`] reads. Only the rows sink keeps one.
+    pub provenance: super::prov::Provenance,
 }
 
 impl InternalSpec {
@@ -119,6 +126,7 @@ impl InternalSpec {
             query: query.into(),
             sink: Sink::Rows,
             max_memory_bytes: super::views::DEFAULT_MEMORY_BYTES,
+            provenance: super::prov::Provenance::None,
         }
     }
 
@@ -136,6 +144,7 @@ impl InternalSpec {
                 key: key.into_iter().map(Into::into).collect(),
             },
             max_memory_bytes: super::views::DEFAULT_MEMORY_BYTES,
+            provenance: super::prov::Provenance::None,
         }
     }
 
@@ -144,6 +153,22 @@ impl InternalSpec {
         self.max_memory_bytes = bytes;
         self
     }
+
+    /// The same spec keeping annotation `p` for each row.
+    pub fn with_provenance(mut self, p: super::prov::Provenance) -> InternalSpec {
+        self.provenance = p;
+        self
+    }
+}
+
+/// An internal circuit's rows with their annotations
+/// ([`InternalCircuit::annotated_rows`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnotatedRows {
+    pub commit: u64,
+    pub columns: Vec<String>,
+    /// each row's terms with its multiplicity and its annotation
+    pub rows: Vec<(Vec<Option<Term>>, u64, super::prov::Annotation)>,
 }
 
 /// The changed facts per key after a commit ([`InternalCircuit::counts`]).

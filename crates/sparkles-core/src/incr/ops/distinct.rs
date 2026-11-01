@@ -5,6 +5,7 @@
 
 use super::super::pass::Pass;
 use super::super::persist::{Reader, Writer};
+use super::super::prov::AChanges;
 use super::super::zset::{Changes, ZSet};
 use super::Node;
 use crate::error::Result;
@@ -38,6 +39,36 @@ impl Distinct {
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
         let c = self.inner.delta(p)?;
         Ok(self.apply(c))
+    }
+
+    /// [`apply`](Self::apply) with annotations: a row's annotation is the sum of its
+    /// input rows' annotations, so every annotation change passes, with the weight's
+    /// crossing when there is one.
+    fn apply_a(&mut self, c: AChanges) -> AChanges {
+        let mut out = AChanges::new();
+        for (r, w, a) in c {
+            let (old, new) = self.weights.add(r.clone(), w);
+            let d = match (old > 0, new > 0) {
+                (false, true) => 1,
+                (true, false) => -1,
+                _ => 0,
+            };
+            if d != 0 || !a.is_zero() {
+                out.push((r, d, a));
+            }
+        }
+        out
+    }
+
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        self.weights = ZSet::new();
+        let c = self.inner.init_a(p)?;
+        Ok(self.apply_a(c))
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.delta_a(p)?;
+        Ok(self.apply_a(c))
     }
 
     pub fn bytes(&self) -> u64 {

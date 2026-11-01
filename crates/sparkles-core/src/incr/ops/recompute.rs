@@ -6,6 +6,7 @@
 use super::super::footprint::{Footprint, Resolved};
 use super::super::pass::Pass;
 use super::super::persist::{Reader, Writer};
+use super::super::prov::{AChanges, Ann};
 use super::super::zset::{Changes, ZSet};
 use crate::error::Result;
 use spargebra::algebra::{GraphPattern, QueryDataset};
@@ -61,6 +62,26 @@ impl Recompute {
         let d = now.minus(&self.prev);
         self.prev = now;
         Ok(d)
+    }
+
+    /// [`init`](Self::init) with annotations. The query engine does not report a row's
+    /// derivations, so every derivation's atoms are unknown.
+    pub fn init_a(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
+        let mode = p.prov;
+        Ok(self
+            .init(p, schema)?
+            .into_iter()
+            .map(|(r, w)| (r, w, Ann::unknown(mode, w)))
+            .collect())
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
+        let mode = p.prov;
+        Ok(self
+            .delta(p, schema)?
+            .into_iter()
+            .map(|(r, w)| (r, w, Ann::unknown(mode, w)))
+            .collect())
     }
 
     pub fn bytes(&self, width: usize) -> u64 {

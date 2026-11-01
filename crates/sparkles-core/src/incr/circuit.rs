@@ -7,6 +7,7 @@ use super::inference::{Inference, InferredFootprint};
 use super::ops::{Node, PlanNode};
 use super::pass::{Pass, PassStats, Vis};
 use super::persist::{Reader, Writer};
+use super::prov::{self, AChanges, AnnMap, Annotation, FactCache, FactKey, Provenance};
 use super::terms::Terms;
 use super::zset::{Changes, Row, ZSet, consolidate};
 use crate::access::GraphAccess;
@@ -287,6 +288,18 @@ pub struct Circuit {
     /// such as an internal circuit's accumulator, sets it to `false`: the result then
     /// stays empty, and the operators keep only the state they need.
     pub keep_result: bool,
+    /// the annotation the circuit keeps besides the weights (spec F13 §5)
+    prov: Provenance,
+    /// the annotations of the result's rows
+    ann: AnnMap,
+    facts: FactCache,
+}
+
+/// Annotated changes split into the weights' changes, consolidated, and the changes
+/// themselves.
+fn split(c: AChanges) -> (Changes, AChanges) {
+    let w = consolidate(c.iter().map(|(r, w, _)| (r.clone(), *w)).collect());
+    (w, c)
 }
 
 impl Circuit {
@@ -314,7 +327,152 @@ impl Circuit {
             dataset: c.dataset,
             inferred: InferredFootprint::default(),
             keep_result: true,
+            prov: Provenance::None,
+            ann: AnnMap::default(),
+            facts: FactCache::default(),
         }
+    }
+
+    /// Keep annotation `mode` from the next build on (spec F13 §5). The circuit must
+    /// be built after this, and a state of another setting is not loaded.
+    pub fn set_provenance(&mut self, mode: Provenance) -> Result<()> {
+        mode.check()?;
+        self.prov = mode;
+        self.ann.clear();
+        self.facts.clear();
+        if !mode.is_none() {
+            let mut next = 0;
+            self.root.enable_prov(mode, &mut next);
+        }
+        Ok(())
+    }
+
+    pub fn provenance(&self) -> Provenance {
+        self.prov
+    }
+
+    /// The annotation of a row of the result, as a reader sees it.
+    pub fn annotation(&self, row: &[Id]) -> Option<Annotation> {
+        if self.prov.is_none() {
+            return None;
+        }
+        let max = self.prov.max_witnesses();
+        Some(
+            self.ann
+                .get(row)
+                .map_or_else(|| prov::Ann::zero(self.prov).report(max), |a| a.report(max)),
+        )
+    }
+
+    /// The whole result as terms with each row's annotation (`None` without
+    /// provenance).
+    pub fn annotated_rows(&self) -> Vec<(Vec<Option<Term>>, i64, Option<Annotation>)> {
+        let Some(snap) = &self.snap else {
+            return Vec::new();
+        };
+        self.result
+            .iter()
+            .map(|(r, w)| {
+                (
+                    r.iter().map(|&i| self.terms.term(snap, i)).collect(),
+                    w,
+                    self.annotation(r),
+                )
+            })
+            .collect()
+    }
+
+    /// The result's rows with their annotations as the state keeps them, for tests.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn raw_annotations(&self) -> Vec<(Vec<Option<Term>>, i64, Option<prov::Ann>)> {
+        let Some(snap) = &self.snap else {
+            return Vec::new();
+        };
+        self.result
+            .iter()
+            .map(|(r, w)| {
+                (
+                    r.iter().map(|&i| self.terms.term(snap, i)).collect(),
+                    w,
+                    (!self.prov.is_none()).then(|| prov::get(&self.ann, r, self.prov)),
+                )
+            })
+            .collect()
+    }
+
+    /// The negative conditions that witnesses name ([`prov::Absence::node`]): each
+    /// number with its operator, the variables it binds and the pattern that must have
+    /// no match.
+    pub fn conditions(&self) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        if !self.prov.is_none() {
+            self.root.conditions(&self.vars, &mut out);
+        }
+        out
+    }
+
+    /// The quads that fact keys name, read through the circuit's snapshot and access:
+    /// each key with its subject, predicate, object and graph (`None`: the default
+    /// graph), or `None` when the snapshot holds no quad of the circuit's patterns with
+    /// that key, such as a quad removed since.
+    #[allow(clippy::type_complexity)]
+    pub fn resolve_facts(
+        &self,
+        keys: &[FactKey],
+        control: &Control,
+    ) -> Result<Vec<(FactKey, Option<([Term; 3], Option<Term>)>)>> {
+        let mut found: FxHashMap<FactKey, [Id; 4]> = FxHashMap::default();
+        let Some(snap) = self.snap.clone() else {
+            return Ok(keys.iter().map(|k| (*k, None)).collect());
+        };
+        let wanted: rustc_hash::FxHashSet<FactKey> = keys.iter().copied().collect();
+        let mut terms = self.terms.clone();
+        let vis = Vis::new(self.access.as_ref(), &snap);
+        let mut p = Pass::new(
+            snap.clone(),
+            None,
+            &[],
+            &[],
+            &mut terms,
+            &vis,
+            self.access.clone(),
+            control,
+            &self.vars,
+        );
+        for b in self.root.bgps() {
+            if found.len() == wanted.len() {
+                break;
+            }
+            let mut quads = Vec::new();
+            b.visit(&p, super::pass::Which::New, &mut |q| {
+                quads.push(q);
+                Ok(true)
+            })?;
+            for q in quads {
+                p.tick()?;
+                let k = p.fact_key(&q);
+                if wanted.contains(&k) {
+                    found.insert(k, q);
+                }
+            }
+        }
+        drop(p);
+        let term = |i: Id| self.terms.term(&snap, i);
+        Ok(keys
+            .iter()
+            .map(|k| {
+                let q = found.get(k).and_then(|q| {
+                    let g = if q[3] == Id::DEFAULT_GRAPH {
+                        None
+                    } else {
+                        Some(term(q[3])?)
+                    };
+                    Some(([term(q[0])?, term(q[1])?, term(q[2])?], g))
+                });
+                (*k, q)
+            })
+            .collect())
     }
 
     /// The names of the result's columns.
@@ -332,7 +490,11 @@ impl Circuit {
 
     /// The approximate memory of the state and the result.
     pub fn bytes(&self) -> u64 {
-        self.root.bytes() + self.result.bytes(self.root.schema.len()) + self.terms.bytes()
+        self.root.bytes()
+            + self.result.bytes(self.root.schema.len())
+            + self.terms.bytes()
+            + prov::map_bytes(&self.ann, self.root.schema.len())
+            + self.facts.bytes()
     }
 
     fn pass<'a>(
@@ -358,7 +520,33 @@ impl Circuit {
         p.max_memory_bytes = self.max_memory_bytes;
         p.base = self.base.clone();
         p.inference = self.inference.clone();
+        p.prov = self.prov;
+        if !self.prov.is_none() {
+            p.facts = Some(&mut self.facts);
+        }
         (p, &mut self.root)
+    }
+
+    /// Run the root's delta, with annotations when the circuit keeps them.
+    fn run_delta(root: &mut Node, p: &mut Pass) -> Result<(Changes, Option<AChanges>)> {
+        if p.prov.is_none() {
+            return Ok((consolidate(root.delta(p)?), None));
+        }
+        let (w, a) = split(root.delta_a(p)?);
+        Ok((w, Some(a)))
+    }
+
+    /// Add the annotations' changes to the result's.
+    fn absorb(&mut self, a: Option<AChanges>) {
+        let Some(a) = a else {
+            return;
+        };
+        if !self.keep_result {
+            return;
+        }
+        for (r, _, d) in a {
+            prov::absorb_row(&mut self.ann, &r, d, self.prov);
+        }
     }
 
     /// Evaluate the circuit from scratch at `snap`.
@@ -367,8 +555,14 @@ impl Circuit {
         // the schema may have changed in changes no pass saw
         self.inferred = InferredFootprint::default();
         let vis = Vis::new(self.access.as_ref(), &snap);
+        self.facts.clear();
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
-        let out = root.init(&mut p)?;
+        let (out, ann) = if p.prov.is_none() {
+            (root.init(&mut p)?, None)
+        } else {
+            let (w, a) = split(root.init_a(&mut p)?);
+            (w, Some(a))
+        };
         let stats = p.stats;
         drop(p);
         self.result = if self.keep_result {
@@ -376,6 +570,8 @@ impl Circuit {
         } else {
             ZSet::new()
         };
+        self.ann.clear();
+        self.absorb(ann);
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
@@ -394,6 +590,9 @@ impl Circuit {
         let mut w = Writer::new(snap, &self.terms);
         w.zset(&self.result)?;
         self.root.save(&mut w)?;
+        if !self.prov.is_none() {
+            prov::save_map(&mut w, &self.ann)?;
+        }
         Ok(w.finish())
     }
 
@@ -403,6 +602,11 @@ impl Circuit {
         let mut r = Reader::new(body, snap, &mut terms)?;
         self.result = r.zset()?;
         self.root.load(&mut r)?;
+        if !self.prov.is_none() {
+            self.ann = prov::load_map(&mut r, self.prov)?;
+        }
+        // ids change with the id space
+        self.facts.clear();
         if !r.done() {
             return Err(Error::Corrupt("a view's state has trailing bytes".into()));
         }
@@ -495,13 +699,13 @@ impl Circuit {
             let (mut p, root) =
                 self.pass(snap.clone(), Some(old), &d.added, &d.removed, &vis, control);
             p.full = true;
-            let out = root.delta(&mut p)?;
+            let (out, ann) = Self::run_delta(root, &mut p)?;
             let stats = p.stats;
             drop(p);
-            let out = consolidate(out);
             if self.keep_result {
                 self.result.apply(&out);
             }
+            self.absorb(ann);
             self.applied = snap.commit;
             self.snap = Some(snap);
             self.last = stats;
@@ -538,13 +742,13 @@ impl Circuit {
         }
         let old = d.old()?;
         let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
-        let out = root.delta(&mut p)?;
+        let (out, ann) = Self::run_delta(root, &mut p)?;
         let stats = p.stats;
         drop(p);
-        let out = consolidate(out);
         if self.keep_result {
             self.result.apply(&out);
         }
+        self.absorb(ann);
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;

@@ -496,7 +496,7 @@ fn unknown_checkpoint_formats_are_refused() {
         },
         b"",
     );
-    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
     let file = state.join(super::persist::file_name(s.snapshot().commit));
     std::fs::write(&file, &bytes).unwrap();
     let rt = runtime(&s, Some(dir.path().to_path_buf()));
@@ -834,4 +834,96 @@ fn the_union_default_graph_setting_keeps_its_own_checkpoints() {
         .unwrap();
     assert_eq!(rt.stats(&s).loaded, 0, "built again for the other setting");
     assert_eq!(c.rows().unwrap().rows.len(), 1);
+}
+
+/// A rows circuit with provenance checkpoints its annotations in format 2, reloads them
+/// after a restart, resolves its fact keys, and is refused as an accumulator.
+#[test]
+fn provenance_survives_a_restart_in_format_2() {
+    use super::prov::{Atom, FactKey, Provenance};
+    let dir = tempfile::tempdir().unwrap();
+    let query = format!("{PREFIX}SELECT ?t ?m WHERE {{ ?m org:memberOf ?t . ?m :age ?a }}");
+    let spec = || InternalSpec::rows("members", query.clone()).with_provenance(Provenance::why());
+    let before = {
+        let s = persistent(dir.path(), true);
+        load(&s);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        let c = rt
+            .attach_internal(&s, spec(), InternalAccess::everything())
+            .expect("attach");
+        upd(&s, "INSERT DATA { :d org:memberOf :t2 . :d :age 20 }");
+        upd(&s, "DELETE DATA { :a :age 30 }");
+        rt.round(&s);
+        let rows = c.annotated_rows().expect("rows");
+        assert_eq!(rows.rows.len(), 3);
+        for (_, n, a) in &rows.rows {
+            assert_eq!(
+                (*n, a.count, a.witnesses.len(), a.truncated),
+                (1, 1, 1, false)
+            );
+            assert_eq!(a.witnesses[0].len(), 2);
+        }
+        // the witness of :d resolves to its two quads
+        let d = rows
+            .rows
+            .iter()
+            .find(|(r, _, _)| name(&r[1]) == "d")
+            .expect(":d");
+        let keys: Vec<FactKey> = d.2.witnesses[0]
+            .atoms()
+            .iter()
+            .filter_map(|a| match a {
+                Atom::Fact(k) => Some(*k),
+                Atom::Absent(_) => None,
+            })
+            .collect();
+        let quads = c.resolve(&keys).expect("resolve");
+        assert!(quads.iter().all(|(_, q)| {
+            q.as_ref()
+                .is_some_and(|(t, _)| name(&Some(t[0].clone())) == "d")
+        }));
+        rt.checkpoint(&s);
+        let files = super::persist::list(&dir.path().join("circuits/members/main"));
+        let bytes = std::fs::read(&files[0].1).unwrap();
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes(), "format 2");
+        assert!(super::persist::decode_as(super::persist::INTERNAL, &bytes).is_err());
+        rows
+    };
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    let c = rt
+        .attach_internal(&s, spec(), InternalAccess::everything())
+        .expect("attach");
+    assert_eq!(rt.stats(&s).loaded, 1, "the checkpoint loads");
+    let mut a = c.annotated_rows().unwrap().rows;
+    let mut b = before.rows;
+    a.sort_by_key(|r| format!("{r:?}"));
+    b.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(a, b);
+    // a circuit without provenance reads a checkpoint of its own format only
+    drop(c);
+    rt.round(&s);
+    let plain = rt
+        .attach_internal(
+            &s,
+            InternalSpec::rows("members", query.clone()),
+            InternalAccess::everything(),
+        )
+        .expect("attach");
+    assert_eq!(
+        rt.stats(&s).loaded,
+        1,
+        "the annotated checkpoint is not loaded"
+    );
+    assert!(plain.annotated_rows().is_err());
+    // an accumulator keeps no rows to annotate, and the bound is checked
+    for bad in [
+        InternalSpec::accumulator("acc", FACTS, ["s"]).with_provenance(Provenance::Count),
+        InternalSpec::rows("w0", FACTS).with_provenance(Provenance::Why { max_witnesses: 0 }),
+    ] {
+        assert!(
+            rt.attach_internal(&s, bad, InternalAccess::everything())
+                .is_err()
+        );
+    }
 }

@@ -16,6 +16,7 @@ pub mod template;
 
 use super::pass::Pass;
 use super::persist::{Reader, Writer};
+use super::prov::{self, AChanges, AnnMap, Provenance};
 use super::zset::{Changes, Row, row_bytes};
 use crate::error::Result;
 use crate::id::Id;
@@ -112,6 +113,113 @@ impl Node {
             Op::Recompute(o) => o.delta(p, &schema),
             Op::Template(o) => o.delta(p),
         }
+    }
+
+    /// [`init`](Self::init) with annotations (spec F13 §5): the rows with their
+    /// weights and the annotations of the circuit's provenance setting.
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        p.control.check()?;
+        let schema = self.schema.clone();
+        match &mut self.op {
+            Op::Bgp(o) => o.init_a(p),
+            Op::Filter(o) => o.init_a(p),
+            Op::Extend(o) => o.init_a(p),
+            Op::Project(o) => o.init_a(p),
+            Op::Union(o) => o.init_a(p),
+            Op::Values(o) => o.init_a(p),
+            Op::Join(o) => o.init_a(p),
+            Op::Match(o) => o.init_a(p),
+            Op::Distinct(o) => o.init_a(p),
+            Op::Group(o) => o.init_a(p),
+            Op::Recompute(o) => o.init_a(p, &schema),
+            Op::Template(o) => o.init_a(p),
+        }
+    }
+
+    /// [`delta`](Self::delta) with annotations: each change carries the change of its
+    /// row's annotation, and a change may move the annotation alone.
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        p.control.check()?;
+        let schema = self.schema.clone();
+        match &mut self.op {
+            Op::Bgp(o) => o.delta_a(p),
+            Op::Filter(o) => o.delta_a(p),
+            Op::Extend(o) => o.delta_a(p),
+            Op::Project(o) => o.delta_a(p),
+            Op::Union(o) => o.delta_a(p),
+            Op::Values(_) => Ok(Vec::new()),
+            Op::Join(o) => o.delta_a(p),
+            Op::Match(o) => o.delta_a(p),
+            Op::Distinct(o) => o.delta_a(p),
+            Op::Group(o) => o.delta_a(p),
+            Op::Recompute(o) => o.delta_a(p, &schema),
+            Op::Template(o) => o.delta_a(p),
+        }
+    }
+
+    /// Give the node and its children the state of annotation `mode`. Negating
+    /// operators and implicit groups are numbered in preorder from `next`, which names
+    /// their conditions ([`prov::Absence`]).
+    pub fn enable_prov(&mut self, mode: Provenance, next: &mut u32) {
+        match &mut self.op {
+            Op::Join(o) => o.enable_prov(mode),
+            Op::Match(o) => {
+                o.enable_prov(mode, *next);
+                *next += 1;
+            }
+            Op::Group(o) if o.implicit => {
+                o.enable_prov(mode, *next);
+                *next += 1;
+            }
+            Op::Group(o) => o.enable_prov(mode, u32::MAX),
+            _ => {}
+        }
+        for c in self.children_mut() {
+            c.enable_prov(mode, next);
+        }
+    }
+
+    /// The negative conditions of the node and its children: each number with the
+    /// operator and the pattern that must have no match.
+    pub fn conditions(&self, vars: &[String], out: &mut Vec<(u32, String)>) {
+        match &self.op {
+            Op::Match(o) if o.cond != u32::MAX => {
+                let names: Vec<String> =
+                    o.m.shared
+                        .iter()
+                        .map(|&(i, _)| format!("?{}", vars[o.left.schema[i] as usize]))
+                        .collect();
+                out.push((
+                    o.cond,
+                    format!(
+                        "{} on [{}]: {}",
+                        o.mode.name(),
+                        names.join(" "),
+                        describe(&o.right, vars)
+                    ),
+                ));
+            }
+            Op::Group(o) if o.cond != u32::MAX => out.push((
+                o.cond,
+                format!("Group without rows: {}", describe(&o.inner, vars)),
+            )),
+            _ => {}
+        }
+        for c in self.children() {
+            c.conditions(vars, out);
+        }
+    }
+
+    /// The patterns of the node and its children, for resolving fact keys.
+    pub fn bgps(&self) -> Vec<&bgp::Bgp> {
+        let mut out = Vec::new();
+        if let Op::Bgp(b) = &self.op {
+            out.push(&**b);
+        }
+        for c in self.children() {
+            out.extend(c.bgps());
+        }
+        out
     }
 
     /// The children of the node.
@@ -438,11 +546,76 @@ impl Arrangement {
         let n = r.u64()?;
         for _ in 0..n {
             let row = r.row()?;
+            if row.len() != self.width {
+                return Err(crate::error::Error::Corrupt(
+                    "a view's state holds a row of another width".into(),
+                ));
+            }
             let w = r.i64()?;
             self.add(&row, w);
         }
         Ok(())
     }
+}
+
+/// A plan's text in one line, for describing conditions.
+fn describe(n: &Node, vars: &[String]) -> String {
+    let plan = n.plan(vars);
+    fn line(p: &PlanNode) -> String {
+        let mut s = p.operator.clone();
+        if let Some(d) = &p.detail {
+            s.push_str(&format!("({d})"));
+        }
+        if !p.children.is_empty() {
+            let c: Vec<String> = p.children.iter().map(line).collect();
+            s.push_str(&format!("[{}]", c.join(", ")));
+        }
+        s
+    }
+    line(&plan)
+}
+
+/// [`side_matches`] with annotations: an arrangement's rows carry the annotations of
+/// `ann`, and a pattern's rows the quads they matched.
+#[allow(clippy::too_many_arguments)]
+pub fn side_matches_a(
+    p: &mut Pass,
+    node: &Node,
+    arr: Option<&Arrangement>,
+    ann: Option<&AnnMap>,
+    which: super::pass::Which,
+    key: &[Id],
+    seed: &[(usize, Id)],
+) -> Result<AChanges> {
+    match (arr, ann) {
+        (Some(a), Some(m)) => Ok(a
+            .get(key)
+            .map(|(r, w)| (r.clone(), w, prov::get(m, r, p.prov)))
+            .collect()),
+        _ => match node.as_bgp() {
+            Some(b) => b.probe_a(p, which, seed),
+            None => Err(crate::error::Error::Corrupt(
+                "a join side without annotated state is not a pattern".into(),
+            )),
+        },
+    }
+}
+
+/// Add annotated changes to an arrangement and its annotations, returning the
+/// effective changes (one per change, in order).
+pub fn absorb_side(
+    arr: &mut Arrangement,
+    ann: &mut AnnMap,
+    c: AChanges,
+    mode: Provenance,
+) -> AChanges {
+    c.into_iter()
+        .map(|(r, w, a)| {
+            arr.add(&r, w);
+            let e = prov::absorb_row(ann, &r, a, mode);
+            (r, w, e)
+        })
+        .collect()
 }
 
 /// The rows of one side of a join that can match a row of the other side: from the

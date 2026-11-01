@@ -354,15 +354,17 @@ pub const VIEW_STATE: FileKind = FileKind {
 };
 
 /// The checkpoints of the internal circuits that server code attaches (spec F13 §3.6).
-/// A version this build does not read is left in place and the circuit is built again
-/// from the data.
+/// Version 1 holds a circuit without annotations and version 2 one that keeps the
+/// provenance annotations of spec F13 §5, and a circuit writes the lowest version that
+/// holds its state. A version this build does not read is left in place and the
+/// circuit is built again from the data.
 pub const INTERNAL_CIRCUIT_STATE: FileKind = FileKind {
     id: "internal-circuit-state",
     files: "circuits/ID/BRANCH/state-COMMIT.bin",
     marker: "the u32 after the `SPKCIRC` magic; another version is ignored and the circuit rebuilt",
     class: Class::Derived,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The spill files of cursor operators that outgrow their memory budget. Only the
@@ -1019,6 +1021,10 @@ mod tests {
         assert_eq!(
             INTERNAL_CIRCUIT_STATE.writes,
             crate::incr::persist::INTERNAL_FORMAT
+        );
+        assert_eq!(
+            INTERNAL_CIRCUIT_STATE.reads,
+            crate::incr::persist::INTERNAL_FORMATS
         );
         assert_eq!(
             crate::incr::views::PAUSED_FORMAT,

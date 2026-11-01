@@ -34,16 +34,20 @@ use std::path::{Path, PathBuf};
 const MAGIC: &[u8; 8] = b"SPKVIEW\0";
 /// The checkpoint format this release writes and reads.
 pub const FORMAT: u32 = 1;
-/// The format of internal circuits' checkpoints this release writes and reads
-/// ([`INTERNAL`]).
-pub const INTERNAL_FORMAT: u32 = 1;
+/// The newest format of internal circuits' checkpoints this release writes and reads:
+/// format 2 holds a circuit with annotations (spec F13 §5) and format 1 one without.
+pub const INTERNAL_FORMAT: u32 = 2;
+/// The formats of internal circuits' checkpoints this release reads.
+pub const INTERNAL_FORMATS: &[u32] = &[1, 2];
 
-/// A kind of checkpoint file: its magic and the one format this release reads. Both
-/// kinds share the header layout above.
+/// A kind of checkpoint file: its magic, the format a writer of this kind emits, and
+/// the formats this release reads. Every kind shares the header layout above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Kind {
     pub magic: &'static [u8; 8],
     pub format: u32,
+    /// the formats this release reads, `format` among them
+    pub reads: &'static [u32],
     /// what the file holds, for errors
     pub what: &'static str,
 }
@@ -52,16 +56,25 @@ pub struct Kind {
 pub const VIEW: Kind = Kind {
     magic: MAGIC,
     format: FORMAT,
+    reads: &[FORMAT],
     what: "view state",
 };
 
-/// The checkpoints of internal circuits (spec F13 §3.6),
+/// The checkpoints of internal circuits without annotations (spec F13 §3.6),
 /// `circuits/{id}/main/state-{commit}.bin` with the magic `SPKCIRC\0`: the header
 /// above, then a body that [`super::internal`] lays out.
 pub const INTERNAL: Kind = Kind {
     magic: b"SPKCIRC\0",
-    format: INTERNAL_FORMAT,
+    format: 1,
+    reads: INTERNAL_FORMATS,
     what: "internal circuit state",
+};
+
+/// The checkpoints of internal circuits that keep annotations, in format 2 under the
+/// same name and magic as [`INTERNAL`].
+pub const INTERNAL_ANNOTATED: Kind = Kind {
+    format: INTERNAL_FORMAT,
+    ..INTERNAL
 };
 const HEADER: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 4;
 
@@ -316,12 +329,20 @@ pub fn decode_as(kind: Kind, b: &[u8]) -> Result<(Header, &[u8])> {
     }
     let format = u32::from_le_bytes(b[8..12].try_into().expect("4 bytes"));
     if format != kind.format {
-        return Err(Error::Unsupported(format!(
-            "the {what} has format {format}; Sparkles {} reads format {}. It was written \
-             by another release",
-            env!("CARGO_PKG_VERSION"),
-            kind.format
-        )));
+        let reads: Vec<String> = kind.reads.iter().map(|f| f.to_string()).collect();
+        return Err(if kind.reads.contains(&format) {
+            Error::Unsupported(format!(
+                "the {what} has format {format}, and this circuit's state is format {}",
+                kind.format
+            ))
+        } else {
+            Error::Unsupported(format!(
+                "the {what} has format {format}; Sparkles {} reads formats {}. It was \
+                 written by another release",
+                env!("CARGO_PKG_VERSION"),
+                reads.join(" and ")
+            ))
+        });
     }
     if b.len() < HEADER {
         return Err(Error::Corrupt(
@@ -385,8 +406,8 @@ pub fn write_with(dir: &Path, h: &Header, body: &[u8], before_rename: impl FnOnc
     write_as(VIEW, dir, h, body, before_rename)
 }
 
-/// [`write_with`] for a checkpoint file of `kind`. Older files of `kind` in this
-/// release's format are removed, and files of another kind or format are left alone.
+/// [`write_with`] for a checkpoint file of `kind`. Older files of `kind` in a format
+/// this release reads are removed, and files of another kind or format are left alone.
 pub fn write_as(
     kind: Kind,
     dir: &Path,
@@ -397,11 +418,16 @@ pub fn write_as(
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name(h.commit));
     let tmp = path.with_extension("tmp");
+    let ours = |b: &[u8]| {
+        b.len() >= 12
+            && &b[..8] == kind.magic
+            && kind
+                .reads
+                .contains(&u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")))
+    };
     // a file of the same commit that another release wrote is left in place
     if let Ok(existing) = std::fs::read(&path)
-        && !(existing.len() >= 12
-            && &existing[..8] == kind.magic
-            && existing[8..12] == kind.format.to_le_bytes())
+        && !ours(&existing)
     {
         return Err(Error::Unsupported(format!(
             "{} holds a {} this release does not write over",
@@ -426,9 +452,7 @@ pub fn write_as(
             continue;
         }
         // a file another release wrote is left alone
-        let known = std::fs::read(&p).ok().is_some_and(|b| {
-            b.len() >= 12 && &b[..8] == kind.magic && b[8..12] == kind.format.to_le_bytes()
-        });
+        let known = std::fs::read(&p).ok().is_some_and(|b| ours(&b));
         if known {
             let _ = std::fs::remove_file(p);
         }

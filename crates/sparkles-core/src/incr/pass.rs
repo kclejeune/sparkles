@@ -140,6 +140,10 @@ pub struct Pass<'a> {
     pub base: Option<oxiri::Iri<String>>,
     /// the dataset's inference, which evaluations read with
     pub inference: Option<Arc<super::inference::Inference>>,
+    /// the annotation the circuit keeps (spec F13 §5)
+    pub prov: super::prov::Provenance,
+    /// the keys of quads met so far, when the circuit keeps an annotation
+    pub facts: Option<&'a mut super::prov::FactCache>,
     ctx: Option<Ctx>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
@@ -174,6 +178,8 @@ impl<'a> Pass<'a> {
             max_memory_bytes: None,
             base: None,
             inference: None,
+            prov: super::prov::Provenance::None,
+            facts: None,
             ctx: None,
             union_changes: None,
             work: 0,
@@ -194,6 +200,56 @@ impl<'a> Pass<'a> {
             Which::New => &self.new,
             Which::Old => self.old.as_ref().unwrap_or(&self.new),
         }
+    }
+
+    /// The key of quad `q` of this pass's id space (spec F13 §5.1).
+    pub fn fact_key(&mut self, q: &[Id; 4]) -> super::prov::FactKey {
+        if let Some(k) = self.facts.as_ref().and_then(|f| f.get(q)) {
+            return k;
+        }
+        let key = |i: Id| self.terms.key(&self.new, i).unwrap_or_default();
+        let g = (q[3] != Id::DEFAULT_GRAPH).then(|| key(q[3]));
+        let k = super::prov::FactKey::of_keys(&key(q[0]), &key(q[1]), &key(q[2]), g.as_deref());
+        if let Some(f) = self.facts.as_mut() {
+            f.insert(*q, k);
+        }
+        k
+    }
+
+    /// The annotation of one derivation that matched `quads`.
+    pub fn fact_ann(&mut self, quads: &[[Id; 4]]) -> super::prov::Ann {
+        let atoms = match self.prov {
+            super::prov::Provenance::Count => Vec::new(),
+            _ => quads
+                .iter()
+                .map(|q| super::prov::Atom::Fact(self.fact_key(q)))
+                .collect(),
+        };
+        super::prov::Ann::derivation(self.prov, atoms)
+    }
+
+    /// The annotation of one derivation that holds because operator `node` has no
+    /// match for the values `vals` of circuit variables (spec F13 §5.2).
+    pub fn absent_ann(&mut self, node: u32, vals: &[(u32, Id)]) -> super::prov::Ann {
+        let atoms = match self.prov {
+            super::prov::Provenance::Count => Vec::new(),
+            _ => {
+                let keys: Vec<(&str, Option<Vec<u8>>)> = vals
+                    .iter()
+                    .map(|&(v, i)| {
+                        let k = (!i.is_undef())
+                            .then(|| self.terms.key(&self.new, i).unwrap_or_default());
+                        (self.vars[v as usize].as_str(), k)
+                    })
+                    .collect();
+                let refs: Vec<(&str, Option<&[u8]>)> =
+                    keys.iter().map(|(n, k)| (*n, k.as_deref())).collect();
+                vec![super::prov::Atom::Absent(super::prov::Absence::of_keys(
+                    node, &refs,
+                ))]
+            }
+        };
+        super::prov::Ann::derivation(self.prov, atoms)
     }
 
     /// The id of a constant at this pass (`None`: no quad holds it).

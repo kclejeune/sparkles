@@ -19,6 +19,7 @@ pub mod live;
 pub mod ops;
 pub mod pass;
 pub mod persist;
+pub mod prov;
 pub mod runtime;
 pub mod terms;
 pub mod views;
@@ -31,6 +32,8 @@ mod r#gen;
 #[cfg(test)]
 mod internal_tests;
 #[cfg(test)]
+mod prov_tests;
+#[cfg(test)]
 mod runtime_tests;
 #[cfg(test)]
 mod tests;
@@ -38,9 +41,10 @@ mod tests;
 pub use circuit::{Circuit, DeltaSet};
 pub use compile::{Compiled, Kind, compile};
 pub use inference::Inference;
-pub use internal::{Counts, InternalAccess, InternalRows, InternalSpec, Sink};
+pub use internal::{AnnotatedRows, Counts, InternalAccess, InternalRows, InternalSpec, Sink};
 pub use live::{LiveEvent, LiveOptions, LiveQuery, LiveRow};
 pub use ops::{Mode, PlanNode};
+pub use prov::{Absence, Annotation, Atom, FactKey, Provenance, Witness};
 pub use runtime::{Host, InternalCircuit, OpenHost, Runtime, RuntimeOptions, RuntimeStats};
 pub use views::{ViewDef, ViewInfo, ViewState};
 
