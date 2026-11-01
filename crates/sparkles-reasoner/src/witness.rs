@@ -442,7 +442,13 @@ impl<'a> Cx<'a> {
     ) -> Cx<'a> {
         let negated = rules
             .iter()
-            .map(|r| r.builtins.iter().any(|b| b.kind == BuiltinKind::NoValue))
+            .map(|r| {
+                // a rule that tests for absent data, whose supports can be smaller than
+                // the data it reads
+                r.builtins
+                    .iter()
+                    .any(|b| matches!(b.kind, BuiltinKind::NoValue | BuiltinKind::ListNotContains))
+            })
             .collect();
         let opaque = rules.iter().enumerate().any(|(ri, r)| {
             r.builtins.iter().any(|b| b.kind == BuiltinKind::MakeTemp)
@@ -542,13 +548,15 @@ impl<'a> Cx<'a> {
             let Some(mut b) = bind_head(rule, hi, pre, t) else {
                 continue;
             };
+            // a rule with a negation may derive the fact from fewer facts than the closure
+            // holds, also when its negation fails now: its supports are not shown
+            if self.negated[ri] {
+                f.unknown = true;
+                continue;
+            }
             let m = std::mem::take(memo);
             let (failed, m) = {
                 let mut sink = |body: &[Triple], implicit: &[Triple], vals: &[u64]| -> bool {
-                    if self.negated[ri] {
-                        f.unknown = true;
-                        return true;
-                    }
                     // an instance that uses its own head adds no support
                     if body.iter().chain(implicit).any(|u| *u == t) {
                         return true;
@@ -1234,6 +1242,8 @@ impl Witnesses {
             return Ok(false);
         }
         // the supports that name a quad that is gone
+        // the seeds are charged as they are collected, until the pass charges its queue
+        let mut sh = Held::new(&limits.budget);
         let mut seeds: Vec<u32> = Vec::new();
         for k in &prep.dead {
             let Some(v) = self.rev.remove(k) else {
@@ -1250,6 +1260,7 @@ impl Witnesses {
                 n.w.retain(|x| x.atoms().binary_search(&Atom::Fact(*k)).is_err());
                 if n.w.len() != before {
                     self.node_bytes -= bytes - n.bytes();
+                    sh.try_grow(4)?;
                     seeds.push(i);
                 }
             }
@@ -1269,9 +1280,11 @@ impl Witnesses {
             if n.live {
                 n.trunc = false;
                 n.local = false;
+                sh.try_grow(4)?;
                 seeds.push(i);
             }
         }
+        sh.try_grow(4 * prep.rekeyed.len())?;
         seeds.extend(prep.rekeyed.iter().copied());
         for t in inserted {
             if !c.graph.contains(t) {
@@ -1281,11 +1294,13 @@ impl Witnesses {
             if kind(c, t) == Kind::Base {
                 self.nodes[i as usize].key = Some(fact_key(c, t));
             }
+            sh.try_grow(4)?;
             seeds.push(i);
             self.held.budget().check()?;
         }
         for t in added.iter().chain(touched) {
             if c.graph.contains(t) {
+                sh.try_grow(4)?;
                 seeds.push(self.add_node(*t, None));
                 self.held.budget().check()?;
             }
@@ -1297,6 +1312,7 @@ impl Witnesses {
                 && self.nodes[i as usize].key.is_none()
             {
                 self.nodes[i as usize].key = Some(fact_key(c, t));
+                sh.try_grow(4)?;
                 seeds.push(i);
             }
         }

@@ -465,3 +465,46 @@ fn discarded_witnesses_release_their_memory() {
     assert!(!got.annotation.truncated);
     assert_eq!(got.annotation.witnesses.len(), 1);
 }
+
+/// Regression (twelfth review of item 416): a rule that tests for absent data can derive
+/// a fact from fewer facts than the closure holds, also when its test fails now, so the
+/// facts it may derive are truncated.
+#[test]
+fn rules_with_negation_truncate_their_heads() {
+    let s = Store::in_memory(StoreOptions::default());
+    let facts = [
+        t("s", "marker", "yes"),
+        t("s", "blocked", "yes"),
+        t("s", "target", "yes"),
+    ];
+    change(&s, None, &facts, &[]);
+    let rules = Profile::Rules(format!(
+        "[n: (?s <{EX}marker> <{EX}yes>) noValue(?s <{EX}blocked> <{EX}yes>) -> (?s <{EX}target> <{EX}yes>)]"
+    ));
+    let cache = Cache::default();
+    run_with(&s, &rules, None, &cache, &with(8)).unwrap_or_else(|e| panic!("{e:#}"));
+    let got = cache.witnesses(&facts[2]).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+
+    let s = Store::in_memory(StoreOptions::default());
+    let first = format!("{RDF}first");
+    let rest = format!("{RDF}rest");
+    let nil = format!("{RDF}nil");
+    change(
+        &s,
+        None,
+        &[
+            t("s", "list", "l"),
+            t("l", &first, "a"),
+            t("l", &rest, &nil),
+        ],
+        &[],
+    );
+    let rules = Profile::Rules(format!(
+        "[l: (?s <{EX}list> ?l) listNotContains(?l, <{EX}b>) -> (?s <{EX}target> <{EX}yes>)]"
+    ));
+    let cache = Cache::default();
+    run_with(&s, &rules, None, &cache, &with(8)).unwrap_or_else(|e| panic!("{e:#}"));
+    let got = cache.witnesses(&t("s", "target", "yes")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+}

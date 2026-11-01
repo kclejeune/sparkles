@@ -626,9 +626,11 @@ fact is truncated when its own evaluation may have lost a support, or when a pre
 one of its instances is truncated. Its evaluation loses supports when they pass the bound,
 when a rule instance's product passes its working bound of four times the bound or 16,384
 unions per premise, and when a fact has more than 4,096 instances. A fact with the empty
-support is exact whatever its premises keep. Facts derived through `noValue`, the
-GeoSPARQL default geometries and programs with head actions or `makeTemp` are truncated,
-since their instances do not show every support. Under such a program every asserted
+support is exact whatever its premises keep. A fact that a rule with `noValue` or
+`listNotContains` can derive is truncated, also when the rule's test fails now, since a
+smaller set of facts may pass it. Facts derived through the GeoSPARQL default geometries
+and programs with head actions or `makeTemp` are truncated, since their instances do not
+show every support. Under such a program every asserted
 fact is truncated too, because a hidden derivation may give it another minimal support.
 
 An incremental run keeps the witnesses that avoid the removed quads, which for a monotone
