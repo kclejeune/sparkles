@@ -78,7 +78,21 @@ for v in $VARIANTS; do
         --embed-from urn:wb:p >> "$R/load-$b.log" 2>&1 ;;
       *) false ;;
     esac || fail "index ${INDEX:-none} on $b, see load-$b.log"
-    log "$b loaded, index ${INDEX:-none}"
+    # async:N defines N table views over the writers' literal predicate, each its own
+    # circuit, which every serial-literal and writers commit touches
+    case ${VIEWS:-none} in
+      none) ;;
+      async:*)
+        for i in $(seq "${VIEWS#async:}"); do
+          # shellcheck disable=SC2046 # the loader is a command line
+          taskset -c "$ALL" $(loader "${!d}" "$b/sparkles") views put --loc "stores/$b" "v$i" \
+            "SELECT ?s ?o WHERE { ?s <urn:wb:p> ?o FILTER(?o != \"view $i\") }" --wait 600 \
+            >> "$R/load-$b.log" 2>&1 || fail "view v$i on $b, see load-$b.log"
+        done
+        ;;
+      *) fail "unknown views ${VIEWS}" ;;
+    esac
+    log "$b loaded, index ${INDEX:-none}, views ${VIEWS:-none}"
   fi
 done
 
