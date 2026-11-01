@@ -459,29 +459,48 @@ fn term_str(t: &Option<Term>) -> Option<String> {
     }
 }
 
-/// A licence page or IRI for comparison. The SPDX licence pages and IRIs of one
-/// identifier compare equal whatever their scheme, `.html` suffix and case; any other
-/// IRI compares exactly.
-fn licence_key(s: &str) -> String {
-    let bare = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-        .unwrap_or(s);
-    match bare.strip_prefix("spdx.org/licenses/") {
-        Some(id) => {
-            let id = id.trim_end_matches('/');
-            let id = id.strip_suffix(".html").unwrap_or(id);
-            format!("spdx:{}", id.to_ascii_lowercase())
+/// A licence page or IRI for comparison.
+#[derive(PartialEq, Eq)]
+enum LicenceKey {
+    /// an SPDX licence page or IRI, by identifier: its scheme, the host's case, a
+    /// trailing `.html` and the identifier's case do not matter
+    Spdx(String),
+    /// any other IRI, compared exactly
+    Iri(String),
+}
+
+fn licence_key(s: &str) -> LicenceKey {
+    if let Ok(u) = url::Url::parse(s)
+        && matches!(u.scheme(), "http" | "https")
+        && u.host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("spdx.org"))
+        && u.query().is_none()
+        && u.fragment().is_none()
+        && let Some(id) = u.path().strip_prefix("/licenses/")
+    {
+        let id = id.trim_end_matches('/');
+        let id = id.strip_suffix(".html").unwrap_or(id);
+        if !id.is_empty() && !id.contains('/') {
+            return LicenceKey::Spdx(id.to_ascii_lowercase());
         }
-        None => s.to_string(),
     }
+    LicenceKey::Iri(s.to_string())
 }
 
 /// Whether a header's version IRI names `version`: one of its path segments, or its
-/// fragment, is exactly the version.
+/// fragment, is exactly the version. The authority and the query never match.
 fn names_version(iri: &str, version: &str) -> bool {
-    let path = iri.split_once("://").map_or(iri, |(_, rest)| rest);
-    path.split(['/', '#', '?']).any(|seg| seg == version)
+    let Ok(u) = url::Url::parse(iri) else {
+        return false;
+    };
+    let path = u.path();
+    let segments: Vec<&str> = if u.cannot_be_a_base() {
+        // such as `urn:example:vocab:1.0`
+        path.split([':', '/']).collect()
+    } else {
+        path.split('/').collect()
+    };
+    segments.contains(&version) || u.fragment() == Some(version)
 }
 
 /// Where a graph's header disagrees with the record of the current version.
@@ -507,7 +526,7 @@ pub(super) fn disagreements(r: &Resource, h: &BTreeMap<&str, Option<String>>) ->
     }
     if let Some(lic) = h["license"].as_deref() {
         let l = r.licence_of(cur);
-        let known: Vec<String> = [l.spdx_iri(), l.page(), l.url.map(str::to_string)]
+        let known: Vec<LicenceKey> = [l.spdx_iri(), l.page(), l.url.map(str::to_string)]
             .into_iter()
             .flatten()
             .map(|s| licence_key(&s))
@@ -687,8 +706,19 @@ fn plan_install(st: &AppState, target: &crate::state::Dataset, id: &str) -> ApiR
             ),
         ));
     }
-    let etag = crate::settings::resolved(st, target, &crate::settings::prefixes::PREFIXES).etag;
-    let have = crate::settings::prefixes::effective(st, target);
+    // the bindings and their entity tag come from one read, so the write's precondition
+    // names exactly the state the plan saw
+    let resolved = crate::settings::resolved(st, target, &crate::settings::prefixes::PREFIXES);
+    let etag = resolved.etag;
+    let have: BTreeMap<String, String> = resolved
+        .effective
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut plan = Plan {
         planned: Vec::new(),
         conflicts: Vec::new(),

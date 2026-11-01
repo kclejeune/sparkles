@@ -1099,4 +1099,29 @@ fn headers_compare_whole_versions_and_exact_licence_urls() {
         header(Some("1.0"), None, Some("http://ex/Terms/A")).len(),
         1
     );
+    // the query and the authority never name the version
+    assert_eq!(
+        header(None, Some("https://ex/releases/2.0?redirect=/1.0/v"), None).len(),
+        1
+    );
+    assert_eq!(header(None, Some("https://1.0/vocab"), None).len(), 1);
+    assert_eq!(header(None, Some("https://ex/vocab#1.0"), None).len(), 0);
+    assert_eq!(header(None, Some("urn:ex:vocab:1.0"), None).len(), 0);
+    // SPDX pages compare by identifier, and nothing else collides with them
+    let mut mit = find(&c, "osm").unwrap().clone();
+    mit.input.license = Some("MIT".into());
+    mit.versions.clear();
+    let lic = |l: &str| {
+        let mut h = BTreeMap::new();
+        for k in ["versionInfo", "versionIRI", "prefix", "namespace"] {
+            h.insert(k, None);
+        }
+        h.insert("license", Some(l.to_string()));
+        super::http::disagreements(&mit, &h).len()
+    };
+    assert_eq!(lic("https://SPDX.org/licenses/MIT.html"), 0);
+    assert_eq!(lic("http://spdx.org/licenses/mit"), 0);
+    assert_eq!(lic("spdx:mit"), 1);
+    assert_eq!(lic("https://spdx.org/licenses/MIT.html?x=1"), 1);
+    assert_eq!(lic("https://spdx.org/licenses/Apache-2.0"), 1);
 }

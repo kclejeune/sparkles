@@ -5032,7 +5032,8 @@ of those graphs, with its `owl:versionIRI`, `owl:versionInfo`, `dct:license`,
 runs with the caller's grants and the server's query timeout and budgets, and rate
 limits and memory admission count it as a query. Each graph lists its `disagreements`
 with the current version's record, and nothing changes. `owl:versionInfo` must equal the
-current version, and without it one segment of the version IRI must. SPDX licence pages
+current version, and without it one segment of the version IRI's path, or its
+fragment, must. SPDX licence pages
 compare by identifier, and other licence IRIs compare exactly.
 
 `POST /$/resources/{id}/install/{ds}` binds the namespaces of the vocabulary, and of the

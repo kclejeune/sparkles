@@ -165,7 +165,7 @@ which is the `owl:Ontology` or `skos:ConceptScheme` with its `owl:versionIRI`,
 graph's dataset, so it reads only what the caller may query, under the server's query
 timeout and budgets, and the rate limits and memory admission count it as a query.
 `owl:versionInfo` must equal the current version, and without it one segment of the
-version IRI must. SPDX licence pages compare by identifier, and any other licence IRI
+version IRI's path, or its fragment, must. SPDX licence pages compare by identifier, and any other licence IRI
 compares exactly. It reports where the header disagrees with the current version
 record, and it changes nothing.
 
