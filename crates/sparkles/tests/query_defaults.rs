@@ -321,3 +321,52 @@ fn query_requests_apply_budgets_reasoning_and_cancellation() {
     assert_eq!(ds.query_with(all, &off).unwrap().len(), 3);
     assert!(std::sync::Arc::ptr_eq(opts.cancel.as_ref().unwrap(), &flag));
 }
+
+/// A view replaces the reasoning that options had: off removes a query-time reasoner as
+/// well as the inferred data, and options without the dataset's defaults get them before
+/// the view applies, so the dataset does not fill the inferences back in.
+#[cfg(feature = "reasoning")]
+#[test]
+fn views_replace_earlier_reasoning_and_resolve_defaults_first() {
+    use sparkles::QueryRequest;
+    use sparkles::reasoning::{Demand, ReasoningMode};
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<urn:child> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:parent> .
+         <urn:s> a <urn:child> .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Graph("default".into()))
+        .unwrap();
+    let demand = ds
+        .inference_view(ReasoningMode::Demand(Demand {
+            profile: Some(sparkles::reasoning::reasoner::Profile::Rdfs),
+            max_derived: None,
+        }))
+        .unwrap();
+    let off = ds.inference_view(ReasoningMode::Off).unwrap();
+    let materialized = ds.inference_view(ReasoningMode::Materialized).unwrap();
+    let opts = QueryRequest::new(&ds)
+        .with_reasoning(&demand)
+        .with_reasoning(&off)
+        .build();
+    assert!(opts.reasoning.is_none() && opts.rdfs.is_none());
+    assert!(!ds.query_with(ASK, &opts).unwrap().boolean);
+    let opts = QueryRequest::new(&ds)
+        .with_reasoning(&demand)
+        .with_reasoning(&materialized)
+        .build();
+    assert!(opts.reasoning.is_none() && opts.rdfs.is_some());
+    // options that do not hold the defaults yet
+    let opts = QueryRequest::from_options(QueryOptions::default())
+        .with_reasoning(&off)
+        .build();
+    assert!(!ds.query_with(ASK, &opts).unwrap().boolean);
+    let opts = QueryRequest::from_options(QueryOptions::default())
+        .with_reasoning(&materialized)
+        .build();
+    assert!(ds.query_with(ASK, &opts).unwrap().boolean);
+}

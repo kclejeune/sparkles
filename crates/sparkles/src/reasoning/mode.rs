@@ -113,18 +113,25 @@ impl InferenceView {
         opts
     }
 
-    /// Change `opts` as the mode changes the dataset's defaults. Off leaves the
-    /// materialized inferences and RDFS on read out, and demand installs the query-time
-    /// reasoner, which reads the asserted data alone. Materialized reasoning keeps what
-    /// `opts` already read, so a caller's own RDFS on read stays.
+    /// Change `opts` as the mode changes the dataset's defaults. Options that do not hold
+    /// the dataset's defaults yet get them first, so that the dataset cannot fill in
+    /// inferred data later. Off leaves the materialized inferences, RDFS on read and any
+    /// query-time reasoner out, and demand installs the query-time reasoner, which reads
+    /// the asserted data alone. Materialized reasoning removes a query-time reasoner and
+    /// keeps the rest of what `opts` read, so a caller's own RDFS on read stays.
     pub fn apply(&self, opts: &mut QueryOptions) {
+        if !opts.defaults_applied {
+            *opts = self.dataset.with_query_defaults(opts).into_owned();
+        }
         match &self.mode {
             ReasoningMode::Off => {
                 opts.default_graph_extra.clear();
                 opts.rdfs = None;
+                opts.reasoning = None;
             }
             ReasoningMode::Demand(_) => opts.reasoning = self.provider.clone(),
-            ReasoningMode::Materialized | ReasoningMode::Auto => {}
+            ReasoningMode::Materialized => opts.reasoning = None,
+            ReasoningMode::Auto => {}
         }
     }
 

@@ -407,7 +407,9 @@ fn ranks(
     };
     let cg = graph.and_then(|g| t.col_of(g));
     let mut values: FxHashMap<Id, f64> = FxHashMap::default();
-    let mut hits: Vec<(Key, f64)> = Vec::with_capacity(t.len());
+    // the best score of each key, kept as the rows are read
+    let mut best: FxHashMap<Key, f64> = FxHashMap::default();
+    let better = |a: f64, b: f64| if lower_better { a < b } else { a > b };
     for r in 0..t.len() {
         if r % 4096 == 4095 {
             ctx.check()?;
@@ -418,9 +420,19 @@ fn ranks(
             Some(Value::Double(d)) => f64::from(d),
             _ => f64::NAN,
         });
-        hits.push(((t.get(r, cs), cg.map_or(Id::UNDEF, |c| t.get(r, c))), v));
+        if v.is_nan() {
+            continue;
+        }
+        let key = (t.get(r, cs), cg.map_or(Id::UNDEF, |c| t.get(r, c)));
+        best.entry(key)
+            .and_modify(|b| {
+                if better(v, *b) {
+                    *b = v
+                }
+            })
+            .or_insert(v);
     }
-    Ok(crate::rank::competition_ranks(hits, lower_better))
+    Ok(crate::rank::competition_ranks(best, lower_better))
 }
 
 type Counters = serde_json::Map<String, serde_json::Value>;
