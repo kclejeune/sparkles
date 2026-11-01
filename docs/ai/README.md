@@ -229,9 +229,18 @@ existing memory records. Rust applications select them with
 `sparkles::evidence::profile(1)`. Unknown versions return `None`. The CLI can validate
 profile RDF with `sparkles shacl` and run the supplied queries with `sparkles query`.
 
-Rust configuration adapters can decode `sparkles_core::evidence::Settings` and obtain
-canonical bytes and a digest. These helpers enforce version and graph-set bounds but
-do not select an authoritative configuration or authorize managed writes.
+A dataset's [evidence settings](../API.md#evidence-settings) name the graphs of six
+roles and the named review policies. The roles hold source records, proposals, review
+decisions, acceptance supports, identity records and dedicated projections. Each policy
+names its admitted claim kinds, required scope predicates, conflict mode, evidence
+boundary and the decisions, supports and projection graphs it uses. Administrators
+record them with `PUT /$/evidence/{ds}/settings`, and Rust applications with
+`sparkles::evidence::configure`. Enabled settings protect every graph of every role as a
+managed graph of the evidence owner and store canonical `evidence.json` bytes. A
+configuration never stops protecting a graph. A graph leaves protection only through
+`POST /$/evidence/{ds}/detach` or `sparkles::evidence::detach`, and the next
+configuration protects it again. Protection does not authenticate what a graph already
+holds. The typed operations that will use these settings remain under item 81.
 
 Rust importers can prepare typed batches with `sparkles_core::evidence::prepare_input`.
 It checks local content digests and retained text or JSON selectors within its bounds.
@@ -274,8 +283,8 @@ ordinary writes. Only a transaction that carries the owner's `ManagedWrite` capa
 can change the owner's graphs. Its commit is published alone, and
 `WriteTxn::managed_stamp` gives its exact sequence number and time in advance. In
 library mode the capability guards against mistakes, not against code in the same
-process. No typed evidence operation uses it so far, so profile records remain
-ordinary RDF until one is enabled.
+process. No typed evidence operation uses it so far, so profile records in managed
+graphs are protected from ordinary writes but remain unauthenticated RDF.
 
 These resources are ordinary caller-visible data under the existing access policy.
 Their shapes check structure, while the fixtures independently check source bytes and

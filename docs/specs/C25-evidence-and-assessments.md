@@ -611,6 +611,70 @@ Strict core lint checks pass for all targets in both feature configurations. The
 original implementation fails the control's assertion that the root stays locked
 while a member outlives main.
 
+Evidence settings administration is the second Phase 2 step. `evidence.json` format 1
+and profile 1 hold six roles and named review policies. `sourceRecords` and
+`proposals` keep their meaning, and `decisions`, `supports`, `identity` and
+`projections` hold review decisions, acceptance supports, identity records and accepted
+projections. A projection graph has no other role. Each policy has a `version`, its
+`admittedKinds`, its `requiredScope` predicates, a `conflicts` mode of `refuse` or
+`admitLabelled`, an evidence `boundary` of source-record and proposal graphs, and the
+`decisions`, `supports` and `output` graphs it uses. Each projection graph is the output
+of one policy. Canonical bytes sort every set and key and name every member, and the
+four later roles and `policies` default to empty when an object leaves them out.
+
+`sparkles::evidence::configure` and `PUT /$/evidence/{ds}/settings` validate complete
+settings and hand every graph of every enabled role to the evidence owner through the
+managed-graph registry, with the canonical bytes as `evidence.json`. A configuration
+never stops protecting a graph. A graph leaves protection only through
+`sparkles::evidence::detach` or `POST /$/evidence/{ds}/detach`, which keeps it in its
+role, and the next configuration protects it again. The registry change uses
+`Store::enable_managed_at`, which refuses a revision other than the one the
+configuration read, so concurrent configurations and detaches never undo each other.
+All three routes need `admin`. A `format` or `profile` other than 1 answers
+`409 unsupported-profile`.
+
+Tests cover canonical goldens computed independently, policy reference and dedication
+rules, duplicate policy names, refusal of weakening, detach and protection again,
+stale revisions, persistent reopen, a later settings profile that refuses every write,
+concurrent configuration and detach, and the HTTP routes.
+
+#### Settings decisions
+
+The open questions of this step were decided as follows.
+
+1. **Additive amendment.** No release carries `evidence.json`, so the new roles and
+   `policies` amend format 1 and profile 1 instead of starting a profile 2. Objects
+   written with only the first two roles still read.
+2. **Policy references.** A policy names exactly one decisions graph, one supports graph
+   and one output graph of the matching roles. Review permission then reduces to update
+   grants on those graphs and read access to the evidence, as §7 requires, without a
+   separate reviewer list. The boundary is limited to source-record and proposal
+   graphs and is checked statically here. Per-review containment belongs to the review
+   operation.
+3. **Scope constraints.** `requiredScope` lists the scope predicates an admitted claim
+   must carry. Value constraints on those predicates are domain policy and stay with
+   the application.
+4. **No weakening.** Configuration only adds protection. Removing a protected graph
+   from every role or disabling the profile while it protects a graph is a conflict,
+   so a client that sends stale settings cannot silently drop protection. Detaching is
+   explicit and per graph.
+5. **Protection is not authentication.** Placing a graph under management, first or
+   again after a detach, does not vouch for what it holds. Typed operations will trust a
+   record only through its verified publication origin, as §7 requires, so records
+   written while a graph was ordinary never become authenticated by protecting it.
+6. **Disabled settings.** A dataset that was never configured stores no disabled
+   settings. Defaults write nothing and anything else is refused, so a configuration
+   never raises the reader for data that protects nothing.
+7. **Disclosure.** Reading the settings needs `admin`, because they name protected
+   graphs and policies that graph-limited readers may not see. Typed operations will
+   advertise their capability separately.
+8. **C19 layering.** `evidence.json` holds the complete canonical object whose digest
+   `managed.json` records, so the settings are not a C19 layered kind in this step.
+   Declared settings and drift refusal are roadmap item NEW-ITEM-1.
+9. **Vocabulary.** Terms for supports, withdrawals, resolution maps, operations and
+   receipts are added with the operations that write those records, so that their
+   shapes and fixtures are tested against real output.
+
 Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
 and claim creation with authenticated availability and guarded metadata, exact retained
 reference resolution, reader admission, idempotency, review, support ownership,
