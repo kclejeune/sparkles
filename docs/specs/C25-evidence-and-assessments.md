@@ -713,8 +713,10 @@ serves a held commit. `sparkles check` counts holds among the generations it rep
 retained. An in-memory store keeps the held states beside its window. A branch that a
 hold names is refused deletion as `branch-held`, and `DeleteOptions::release_holds`,
 `?releaseHolds=true` and `sparkles branch delete --release-holds` release those holds
-first. The hold routes and a branch deletion that releases holds need `admin` on every branch and graph of the dataset. Holds of a retired
-upstream stay, since only a branch that started from it can name them.
+first. The hold routes and a branch deletion that releases holds need `admin` on every
+branch and graph of the dataset, through a grant without a branch list or with the
+branch pattern `*`. Holds of a retired upstream stay, since only a branch that started
+from it can name them.
 
 The ordering argument is as follows. An acquisition resolves the commits under the
 branch table, opens the stores that serve them, takes the holds' lock and checks again

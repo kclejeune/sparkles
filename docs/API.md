@@ -11897,7 +11897,10 @@ in-memory dataset. Together they name at most 65,536 commits. The design is in
 | `POST /$/evidence/{ds}/holds` | `admin` on the dataset | Acquires `{id?, commits: [{branch?, branchId?, commit}]}` and answers `201` with the hold. |
 | `DELETE /$/evidence/{ds}/holds/{id}` | `admin` on the dataset | Releases the hold, `204`, or `404` when there is none. |
 
-The three routes need `admin` on every branch and graph of the dataset, because holds name commits of any branch and decide what history is retained. A grant limited to some branches or graphs does not give it.
+The three routes need `admin` on every branch and graph of the dataset, because holds
+name commits of any branch and decide what history is retained. A grant without a
+branch list or with the branch pattern `*` reaches every branch. A grant limited to
+some branches or graphs does not give it.
 
 A hold is `{id, owner, created, commits}`, and each commit is `{branch, branchId,
 commit}`, where `branch` is `null` once the branch is deleted. A request names each
@@ -11908,8 +11911,11 @@ arrives, and the first hold raises the dataset reader to 7. The same `id` with t
 commits answers `200` with the existing hold. Other commits under that `id` are a `409`
 with code `hold-conflict`, and more than 65,536 held commits in the dataset are a `409`
 with code `holds-limit`. A commit that is no longer readable is `410 history-gone`, and
-a branch that is not listed is `404 no-such-branch`. A failed acquisition records
-nothing. A release is durable before the commits it held can be collected, and the next
+a branch that is not listed is `404 no-such-branch`. An acquisition refused for one of
+these reasons records nothing. An acquisition that fails with a `5xx` error while it
+replaces `holds.json` may have recorded the hold, so the server keeps protecting it.
+Repeat the acquisition to make it durable, release it, or let reconciliation remove it.
+A release is durable before the commits it held can be collected, and the next
 collection removes what only the hold kept.
 
 A branch that a hold names is deleted only with `?releaseHolds=true`, which releases

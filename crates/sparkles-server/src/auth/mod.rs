@@ -145,6 +145,15 @@ pub fn split_branch(ds: &str) -> (&str, &str) {
     ds.split_once('@').unwrap_or((ds, sparkles::branch::MAIN))
 }
 
+/// Whether branch patterns `patterns` cover every branch: `None`, or a pattern of
+/// nothing but `*`, which matches any name.
+fn every_branch(patterns: &Option<Vec<String>>) -> bool {
+    patterns.as_ref().is_none_or(|ps| {
+        ps.iter()
+            .any(|p| !p.is_empty() && p.bytes().all(|b| b == b'*'))
+    })
+}
+
 /// Whether branch patterns `patterns` (`None`: every branch) cover `branch`.
 fn branch_covered(patterns: &Option<Vec<String>>, branch: &str) -> bool {
     branch == "*"
@@ -323,7 +332,8 @@ impl Grants {
     }
 
     /// The highest level granted on every branch of dataset `ds` at once: by a grant
-    /// without a branch list, or by `server-admin`.
+    /// without a branch list or with a pattern that matches every name, such as `*`,
+    /// or by `server-admin`.
     pub fn every_branch_level(&self, ds: &str) -> Option<Level> {
         if self.server.contains(&ServerPerm::ServerAdmin) {
             return Some(Level::Admin);
@@ -337,7 +347,7 @@ impl Grants {
         let restricted = self
             .restricted
             .iter()
-            .filter(|r| r.branches.is_none() && glob(&r.dataset, name))
+            .filter(|r| every_branch(&r.branches) && glob(&r.dataset, name))
             .map(|r| r.level);
         full.chain(restricted).max()
     }
@@ -1173,7 +1183,7 @@ mod every_branch_tests {
     /// Source holds need admin on every branch: a grant limited to some branches does
     /// not give it, even when it names `main` (spec C25 §7).
     #[test]
-    fn only_grants_without_a_branch_list_cover_every_branch() {
+    fn only_grants_reaching_every_branch_cover_every_branch() {
         let main_only = Grants {
             restricted: vec![restricted(Some(&["main"]), Level::Admin)],
             ..Default::default()
@@ -1185,6 +1195,17 @@ mod every_branch_tests {
             ..Default::default()
         };
         assert_eq!(all.every_branch_level("d@dev"), Some(Level::Admin));
+        // a wildcard branch list is every branch, a narrower pattern is not
+        let wildcard = Grants {
+            restricted: vec![restricted(Some(&["dev", "*"]), Level::Admin)],
+            ..Default::default()
+        };
+        assert_eq!(wildcard.every_branch_level("d"), Some(Level::Admin));
+        let prefixed = Grants {
+            restricted: vec![restricted(Some(&["release-*"]), Level::Admin)],
+            ..Default::default()
+        };
+        assert_eq!(prefixed.every_branch_level("d"), None);
         let full = Grants {
             datasets: vec![("d".into(), Level::Write)],
             ..Default::default()

@@ -91,8 +91,11 @@ impl Store {
     /// owner and commits again returns the existing hold. A different owner or set of
     /// commits is a `hold-conflict`, and more than [`holds::MAX_COMMITS`] held commits
     /// in all is `holds-limit`. A commit that is no longer readable is `410
-    /// history-gone`, and a branch that is not listed is `no-such-branch`. A failed
-    /// acquisition leaves the holds as they were.
+    /// history-gone`, and a branch that is not listed is `no-such-branch`. These
+    /// refusals leave the holds as they were. An I/O error while `holds.json` is
+    /// replaced may leave the hold recorded, so the store keeps protecting it: repeating
+    /// the acquisition makes it durable, and a release or [`Store::reconcile_holds`]
+    /// removes it.
     pub fn acquire_hold(
         &self,
         owner: OwnerKind,
