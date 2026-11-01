@@ -116,6 +116,27 @@ class GateTests(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("slower, short", r.stdout)
 
+    def test_process_ranges_must_separate(self):
+        with tempfile.TemporaryDirectory() as d:
+            def runs(name, values):
+                files = []
+                for i, v in enumerate(values):
+                    f = Path(d) / f"{name}{i}.jsonl"
+                    f.write_text(json.dumps({"key": "x", "value": v, "unit": "instructions", "better": "lower"}) + "\n"
+                                 + json.dumps({"check": "x/result", "ok": True, "fingerprint": "7"}) + "\n")
+                    files.append(f)
+                out = Path(d) / f"{name}.json"
+                r = run("metrics", *files, "--gate", "insn-screen", "--out", out, "--threshold", 0)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                return out
+            base = runs("base", [100, 103, 101])
+            rec = json.loads(base.read_text())
+            self.assertEqual(rec["metrics"][0]["value"], 101)
+            self.assertEqual(rec["metrics"][0]["range"], [100, 103])
+            self.assertEqual(rec["settings"]["processes"], 3)
+            self.assertEqual(run("compare", base, runs("overlap", [102, 104, 103])).returncode, 0)
+            self.assertEqual(run("compare", base, runs("apart", [104, 105, 104])).returncode, 1)
+
     def test_floor_skips_short_baselines(self):
         with tempfile.TemporaryDirectory() as d:
             base = metrics_record(d, "base", [{"key": "tiny", "value": 0.1, "unit": "ms", "better": "lower"}])

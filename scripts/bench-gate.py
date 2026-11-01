@@ -2,7 +2,7 @@
 """Gate records of the performance gates that guard engine rewrites (ROADMAP items 469-473).
 
     bench-gate.py executors OUT --out record.json      # scripts/bench-executors.sh results
-    bench-gate.py metrics FILE.jsonl --gate NAME --out record.json [--manifest K=V ...]
+    bench-gate.py metrics FILE.jsonl... --gate NAME --out record.json [--manifest K=V ...]
     bench-gate.py w3c LOG --out record.json [--manifest K=V ...]   # test:w3c:streaming output
     bench-gate.py compare BASELINE CANDIDATE [--threshold F] [--floor V] [--keys REGEX]
     bench-gate.py catalog RECORD                       # add it to its workload's RUNS.json
@@ -23,7 +23,10 @@ A gate record is one JSON object:
 
 `metrics` reads JSON lines of {key, value, unit, better, samples?} or {check, ok, detail}
 that a Rust harness wrote, such as `incr_bench.rs` with INCR_BENCH_JSON or the
-instruction-count screen with INSN_SCREEN_JSON.
+instruction-count screen with INSN_SCREEN_JSON. Several files are runs of the same
+harness in separate processes: a metric's value is then the median of the runs and its
+`range` the smallest and largest, and a check must hold in every run with one
+fingerprint.
 
 `w3c` reads the per-suite summaries of `mise run test:w3c:streaming`: for each suite the
 passed tests (more is better), the queries that needed eager fallback (fewer is better)
@@ -35,7 +38,8 @@ their ratio, oriented so that a ratio above 1 is a slowdown or a loss. It exits 
 status 1 when a ratio above 1 reaches 1 + threshold, when the candidate lacks a metric of
 the baseline, when a check of the candidate fails or when a fingerprint differs from the
 baseline's. The threshold comes from the baseline's settings unless --threshold is
-given, and a baseline's `short_below` and `short_threshold` settings give timings below
+given. When both records hold a metric's range over several processes, a slowdown
+counts only if the ranges do not overlap. A baseline's `short_below` and `short_threshold` settings give timings below
 that many milliseconds their own threshold. It refuses two records whose suite, scale,
 workload settings, host or metric units differ, unless --allow-different is given; a
 record whose settings say `host_independent` may come from another host. --floor V ignores metrics whose
@@ -261,9 +265,10 @@ def executors(args):
 
 # ----------------------------------------------------------------------- metrics (JSONL)
 
-def metrics(args):
+def read_lines(path):
+    """The metrics and checks of one JSON-lines file."""
     ms, checks = [], []
-    for n, line in enumerate(Path(args.file).read_text().splitlines(), 1):
+    for n, line in enumerate(Path(path).read_text().splitlines(), 1):
         if not line.strip():
             continue
         row = json.loads(line)
@@ -275,16 +280,55 @@ def metrics(args):
         else:
             for k in ("key", "value", "unit", "better"):
                 if k not in row:
-                    fail(f"{args.file}:{n}: a metric needs {k}")
+                    fail(f"{path}:{n}: a metric needs {k}")
             ms.append(row)
+    return ms, checks
+
+
+def merge_processes(runs):
+    """Combine the runs of several processes: each metric's value is the median of the
+    processes' values and `range` their smallest and largest; a check holds when it held
+    in every process with one fingerprint."""
+    ms, checks = {}, {}
+    for run_ms, run_checks in runs:
+        for m in run_ms:
+            ms.setdefault(m["key"], []).append(m)
+        for c in run_checks:
+            checks.setdefault(c["name"], []).append(c)
+    out_ms = []
+    for key, rows in ms.items():
+        if len(rows) != len(runs):
+            fail(f"metric {key} is in {len(rows)} of {len(runs)} runs")
+        values = [r["value"] for r in rows]
+        m = dict(rows[0])
+        m["value"] = statistics.median(values)
+        m["range"] = [min(values), max(values)]
+        m["samples"] = [x for r in rows for x in r.get("samples", [r["value"]])]
+        out_ms.append(m)
+    out_checks = []
+    for name, rows in checks.items():
+        c = dict(rows[0])
+        fps = {r.get("fingerprint") for r in rows}
+        c["ok"] = all(r["ok"] for r in rows) and len(rows) == len(runs) and len(fps) == 1
+        if not c["ok"]:
+            c["detail"] = [r.get("detail") for r in rows]
+        out_checks.append(c)
+    return out_ms, out_checks
+
+
+def metrics(args):
+    runs = [read_lines(f) for f in args.file]
+    ms, checks = runs[0] if len(runs) == 1 else merge_processes(runs)
     extra = parse_kv(args.manifest)
     settings = parse_kv(args.setting)
     settings["threshold"] = args.threshold
+    if len(runs) > 1:
+        settings["processes"] = len(runs)
     record = {"gate_record": VERSION, "gate": args.gate, "kind": "gate-record",
               "suite": args.suite or args.gate, "scale": args.scale, "host": host_info(),
               "manifest": extra, "settings": settings, "metrics": ms, "checks": checks}
     write_record(record, args.out)
-    print(f"{len(ms)} metrics and {len(checks)} checks into {args.out}")
+    print(f"{len(ms)} metrics and {len(checks)} checks from {len(runs)} runs into {args.out}")
 
 
 # ------------------------------------------------------------------- w3c (item 470)
@@ -381,6 +425,12 @@ def compare(args):
         short = short_below is not None and m["unit"] == "ms" and m["value"] < float(short_below)
         limit = short_threshold if short else threshold
         flag = ("slower, short" if short else "slower") if ratio > 1 and ratio >= 1 + limit else ""
+        # values from several processes count only when their ranges do not overlap
+        if flag and "range" in m and "range" in c:
+            lo, hi = m["range"]
+            clo, chi = c["range"]
+            if (m["better"] == "lower" and clo <= hi) or (m["better"] == "higher" and chi >= lo):
+                flag = ""
         if flag:
             bad.append(key)
         rows.append((key, m["value"], c["value"], ratio, flag))
@@ -459,7 +509,7 @@ def main():
     p.add_argument("dir")
     p.add_argument("--out", required=True)
     p = sub.add_parser("metrics")
-    p.add_argument("file")
+    p.add_argument("file", nargs="+")
     p.add_argument("--gate", required=True, choices=sorted(GATES))
     p.add_argument("--out", required=True)
     p.add_argument("--suite")
