@@ -108,8 +108,8 @@ operators' build, whose OWL 2 RL rule set also gained the missing rules of the P
 tables, which add 720 facts to each OWL2Bench run and 350 to LUBM(100). Within one build,
 `examples/lubm.rs` derived the same facts, with the same order-free digest, with and
 without the operators. OWL2Bench(10) exceeded the 14 GiB run limit with or without the operators, and with the
-operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally, so its
-closure is bound by the memory of the derived facts rather than by joins. LUBM(100)
+operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally. Where
+that memory goes has not been profiled, and roadmap item NEW-ITEM-6 covers it. LUBM(100)
 gains nothing, because its transitive relations are short and its time goes to the
 other rules.
 

@@ -862,5 +862,70 @@
     "output_lines": 862
    }
   ]
+ },
+ "reasoner_bench": {
+  "command": "examples/reasoner-bench 1000000 P (mise run bench:reasoner), three interleaved rounds",
+  "runs": [
+   {
+    "build": "base",
+    "profile": "rdfs",
+    "reasoning_ms": [
+     1331,
+     1352,
+     1336
+    ],
+    "materialize_ms": [
+     2743,
+     2792,
+     2753
+    ],
+    "inferred": 2751996
+   },
+   {
+    "build": "new",
+    "profile": "rdfs",
+    "reasoning_ms": [
+     1324,
+     1288,
+     1313
+    ],
+    "materialize_ms": [
+     2706,
+     2719,
+     2693
+    ],
+    "inferred": 2751996
+   },
+   {
+    "build": "base",
+    "profile": "owl-rl",
+    "reasoning_ms": [
+     1331,
+     1334,
+     1330
+    ],
+    "materialize_ms": [
+     2720,
+     2711,
+     2702
+    ],
+    "inferred": 2752167
+   },
+   {
+    "build": "new",
+    "profile": "owl-rl",
+    "reasoning_ms": [
+     1294,
+     1314,
+     1445
+    ],
+    "materialize_ms": [
+     2784,
+     2711,
+     2712
+    ],
+    "inferred": 2752351
+   }
+  ]
  }
 }

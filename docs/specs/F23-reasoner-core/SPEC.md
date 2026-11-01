@@ -151,8 +151,8 @@ both ways, 2.6 to 2.7 s for OWL 2 RL and 1.3 s for RDFS, because its transitive 
 are small. With `sparkles infer`, OWL2Bench with 5 universities now completes in 44 s at 9.5 GiB
 of RSS, where the joins ran out of 14 GiB after 13 minutes, and with 2 universities it
 takes 5.0 to 5.3 s against 53 s. OWL2Bench with 10 universities exceeded the 14 GiB run limit with or without the
-operators, and with them a 28 GiB limit on a development host, so it is bound by the
-memory of its derived facts, which the columnar derived tier addresses.
+operators, and with them a 28 GiB limit on a development host. Where that memory goes
+has not been profiled, and roadmap item NEW-ITEM-6 covers it.
 [The reasoning results](../../benchmarks/reasoning/RESULTS.md#owl2bench) give every run.
 
 ### OWL 2 RL rules
@@ -173,7 +173,7 @@ NEW-ITEM-1 covers them in the n-ary core. The compact query session now admits 1
 distinct terms, because the new axioms' constants passed the previous 64. Query-time
 reasoning under OWL 2 RL is no slower for the larger demand programs. Four OWL2Bench
 queries over 1 university, each in its own process, took 77 to 87 s against 230 to 240 s
-before, with the same answers. A work split
+before, and returned the same number of result lines. A work split
 tries up to four atom steps for one that gives enough items, which keeps `prp-key`'s
 first step from running on one thread.
 
