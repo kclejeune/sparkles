@@ -557,10 +557,26 @@ pub fn check_version(kind: Kind, v: &VersionInput) -> Result<()> {
             "graphs of a version belong to dataset resources; a vocabulary lists the graphs that hold it on the resource",
         ));
     }
+    let mut pins = BTreeSet::new();
+    for p in &v.imports {
+        if !pins.insert(p) {
+            return Err(invalid(format!(
+                "imports: {} {} is listed twice",
+                p.resource, p.version
+            )));
+        }
+    }
     let mut seen = BTreeSet::new();
     for g in &v.graphs {
         iri("graphs.graph", &g.graph)?;
         list("graphs.sources", &g.sources)?;
+        let mut sources = BTreeSet::new();
+        if let Some(p) = g.sources.iter().find(|p| !sources.insert(*p)) {
+            return Err(invalid(format!(
+                "graphs.sources of {}: {} {} is listed twice",
+                g.graph, p.resource, p.version
+            )));
+        }
         if !seen.insert(&g.graph) {
             return Err(invalid(format!("graphs: {} is listed twice", g.graph)));
         }
@@ -739,13 +755,27 @@ impl Resources {
         let Some(path) = &self.path else {
             return Ok(mem.clone());
         };
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(CatalogFile::default());
             }
             Err(e) => return Err(Error::Unreadable(format!("{}: {e}", path.display()))),
         };
+        // read at most one byte past the limit, so an oversized file is refused without
+        // reading it whole
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_FILE_BYTES as u64 + 1),
+            &mut bytes,
+        )
+        .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(Error::Unreadable(format!(
+                "{} is larger than the {MAX_FILE_BYTES} bytes a catalog may take",
+                path.display()
+            )));
+        }
         let c: CatalogFile = sparkles::formats::settings_from_slice(FILE, &bytes)
             .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
         check(&c).map_err(|e| Error::Unreadable(format!("{}: {}", path.display(), message(&e))))?;

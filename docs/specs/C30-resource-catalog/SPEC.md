@@ -110,7 +110,9 @@ A licence is an SPDX licence expression of identifiers, `LicenseRef-` references
 `AND`, `OR`, `WITH`, `+` and parentheses. A built-in table sorts the common data and
 software licences into the four classes of open, attribution, share-alike and
 restricted. An expression that names an identifier outside the table, or a
-`LicenseRef-`, needs an explicit class. `A AND B` takes the more restrictive class and
+`LicenseRef-`, needs an explicit class. A class given for an expression that the table
+classifies, or for `NOASSERTION` and `NONE`, must restate the table's class, so a record
+cannot loosen it. `WITH` follows a single licence. `A AND B` takes the more restrictive class and
 `A OR B` the less restrictive one, and `WITH` keeps the class of its licence. A missing
 licence, `NOASSERTION` and `NONE` have the class unknown. Unknown and restricted data is
 not redistributable.
@@ -147,7 +149,9 @@ its kind. Each version is `urn:x-sparkles:resource:{id}/{version}`, linked with
 `dcat:mediaType`, `dcat:byteSize` and an `spdx:checksum`. A licence is `dct:license`,
 which is the SPDX licence page for a single listed identifier and a
 `dct:LicenseDocument` labelled with the expression otherwise. Imports and graph sources
-are `prov:wasDerivedFrom`, and a dataset version's graphs are `dct:hasPart`. A
+are `prov:wasDerivedFrom`. Each graph of a dataset version is a `void:Dataset` of that
+version, linked with `dct:hasPart` and naming its graph with `dct:identifier`, so two
+versions that reuse a graph IRI keep their own sources. A
 namespace is `vann:preferredNamespacePrefix` and `vann:preferredNamespaceUri`, and a
 vocabulary's graph location is a `void:Dataset` with `void:inDataset`. The Croissant
 export for ML consumers is NEW-ITEM-2.
@@ -159,14 +163,19 @@ which is the `owl:Ontology` or `skos:ConceptScheme` with its `owl:versionIRI`,
 `owl:versionInfo`, `dct:license`, `dct:title`, `vann:preferredNamespacePrefix` and
 `vann:preferredNamespaceUri`. It runs the read through the caller context of the
 graph's dataset, so it reads only what the caller may query, under the server's query
-timeout and budgets. It reports where the header disagrees with the current version
+timeout and budgets, and the rate limits and memory admission count it as a query.
+`owl:versionInfo` must equal the current version, and without it one segment of the
+version IRI must. SPDX licence pages compare by identifier, and any other licence IRI
+compares exactly. It reports where the header disagrees with the current version
 record, and it changes nothing.
 
 `POST /$/resources/{id}/install/{ds}` installs the namespaces of a vocabulary, and of
 the vocabularies its current version imports transitively, as prefixes of the dataset in
 one write. The write goes through the prefixes settings kind, so it honours the
 operator's locks and the prefix limit. A prefix that the dataset already binds to a
-different IRI is a `409 prefix-conflict` unless the request sets `replace=true`.
+different IRI is a `409 prefix-conflict` unless the request sets `replace=true`. The
+write carries the entity tag of the prefixes the install read, so a concurrent prefix
+write makes the install plan again instead of overwriting a binding it did not see.
 Loading the vocabulary graphs themselves and the C20 prefix sets of prefix.cc and
 Bioregistry needs the fetch of the source store and stays with the bundle phase.
 
@@ -185,9 +194,9 @@ with an unknown format, or one that does not parse, is never rewritten. Every ca
 route then answers `503 catalog-unreadable` with the reason, and the server keeps
 serving its datasets. A missing file is an empty catalog, and a server without a data
 directory keeps its catalog in memory. The file is written atomically. Each write checks
-the whole catalog. The catalog refuses more than 4,096 resources, 1,000 versions of a
+the whole catalog. A version names each import and each graph source once. The catalog refuses more than 4,096 resources, 1,000 versions of a
 resource, 256 namespaces, distributions, imports or graphs on one record and a file
-larger than 16 MiB.
+larger than 16 MiB, which it reads no further than the limit.
 
 ### Tests and gates
 

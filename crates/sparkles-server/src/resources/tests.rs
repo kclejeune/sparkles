@@ -9,6 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use serde_json::{Value as J, json};
 use sparkles::io::Source;
 use sparkles::store::StoreOptions;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -877,4 +878,225 @@ async fn a_vocabulary_installs_its_namespaces_and_its_imports() {
     assert_eq!(r.code(), "not-a-vocabulary");
     let r = send(&s.app, req("POST", "/$/resources/exv/install/nope", None)).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
+// ------------------------------------------------------- review regressions ------
+
+#[test]
+fn shared_imports_are_expanded_once() {
+    let r = Resources::in_dir(Path::new(""));
+    // each vocabulary imports every earlier one, which a walk without a visited set of
+    // pins expands exponentially
+    for i in 0..24 {
+        let mut v = input(Kind::Vocabulary, &format!("V{i}"));
+        v.namespaces.push(Namespace {
+            prefix: format!("v{i}"),
+            iri: format!("http://ex/v{i}#"),
+        });
+        let mut ver = version("1");
+        ver.imports = (0..i).map(|j| pin(&format!("v{j}"), "1")).collect();
+        r.create(&format!("v{i}"), v, vec![ver], "a").unwrap();
+    }
+    let c = r.read().unwrap();
+    let start = std::time::Instant::now();
+    let b = super::http::bundle(&c, find(&c, "v23").unwrap());
+    assert_eq!(b.len(), 24);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let rep = report::license_report(&c, "v23", None, license::Policy::Warn).unwrap();
+    assert_eq!(rep.obligations.len(), 24);
+    // a version names a pin once
+    let mut dup = version("2");
+    dup.imports = vec![pin("v0", "1"), pin("v0", "1")];
+    assert!(message(&r.add_version("v1", dup, "a").unwrap_err()).contains("twice"));
+}
+
+#[tokio::test]
+async fn sentinels_and_listed_licences_keep_their_class() {
+    let s = server(false, license::Policy::Enforce);
+    for (lic, class) in [
+        ("NONE", "open"),
+        ("NOASSERTION", "open"),
+        ("CC-BY-4.0", "open"),
+    ] {
+        let r = send(
+            &s.app,
+            req(
+                "POST",
+                "/$/resources",
+                Some(json!({"id": "x", "kind": "source", "title": "X",
+                    "license": lic, "licenseClass": class})),
+            ),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{lic}: {}", r.text());
+    }
+    let r = send(
+        &s.app,
+        req(
+            "POST",
+            "/$/resources",
+            Some(
+                json!({"id": "x", "kind": "source", "title": "X", "license": "NONE",
+                "versions": [{"version": "1"}]}),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let rep = send(&s.app, req("GET", "/$/resources/x/license", None))
+        .await
+        .json();
+    assert_eq!(
+        (rep["class"].as_str(), rep["verdict"].as_str()),
+        (Some("unknown"), Some("refuse"))
+    );
+}
+
+#[tokio::test]
+async fn an_install_plans_again_after_a_concurrent_prefix_write() {
+    let s = server(false, license::Policy::Warn);
+    let base = json!({"id": "base", "kind": "vocabulary", "title": "Base",
+        "namespaces": [{"prefix": "base", "iri": "http://ex/base#"}],
+        "versions": [{"version": "1"}]});
+    send(&s.app, req("POST", "/$/resources", Some(base))).await;
+    let ds = s.st.get("ds").unwrap();
+    super::http::BEFORE_INSTALL_WRITE.lock().insert(
+        "ds".into(),
+        Box::new(move || {
+            crate::settings::prefixes::store_layer(&ds, &json!({"base": "http://elsewhere/"}))
+                .unwrap();
+        }),
+    );
+    let r = send(&s.app, req("POST", "/$/resources/base/install/ds", None)).await;
+    assert_eq!(
+        (r.status, r.code().as_str()),
+        (StatusCode::CONFLICT, "prefix-conflict"),
+        "{}",
+        r.text()
+    );
+    let p = send(&s.app, req("GET", "/$/prefixes/ds", None))
+        .await
+        .json();
+    assert_eq!(p["prefixes"]["base"], "http://elsewhere/");
+}
+
+#[test]
+fn versions_that_reuse_a_graph_keep_their_own_sources() {
+    let r = sample();
+    let mut ds = input(Kind::Dataset, "Built");
+    ds.license = Some("CC0-1.0".into());
+    let graph = |src: &str| GraphRecord {
+        graph: "http://ex/g".into(),
+        sources: vec![pin("osm", src)],
+    };
+    let mut v1 = version("1");
+    v1.graphs.push(graph("2024"));
+    let mut v2 = version("2");
+    v2.graphs.push(graph("2025"));
+    r.create("built", ds, vec![v1, v2], "a").unwrap();
+    let c = r.read().unwrap();
+    let nt = rdf::describe(&c, Some("built"), oxrdfio::RdfFormat::NTriples);
+    let triples: Vec<oxrdf::Triple> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
+        .for_slice(nt.as_bytes())
+        .map(|q| oxrdf::Triple::from(q.unwrap()))
+        .collect();
+    let objects = |s: &oxrdf::NamedOrBlankNode, p: &str| -> Vec<oxrdf::Term> {
+        triples
+            .iter()
+            .filter(|t| &t.subject == s && t.predicate.as_str() == p)
+            .map(|t| t.object.clone())
+            .collect()
+    };
+    for (v, src) in [("1", "2024"), ("2", "2025")] {
+        let me = oxrdf::NamedOrBlankNode::from(oxrdf::NamedNode::new_unchecked(rdf::version_iri(
+            "built", v,
+        )));
+        let parts = objects(&me, "http://purl.org/dc/terms/hasPart");
+        assert_eq!(parts.len(), 1, "{nt}");
+        let part = match &parts[0] {
+            oxrdf::Term::BlankNode(b) => oxrdf::NamedOrBlankNode::from(b.clone()),
+            t => panic!("{t}"),
+        };
+        let from = objects(&part, "http://www.w3.org/ns/prov#wasDerivedFrom");
+        assert_eq!(
+            from,
+            [oxrdf::Term::from(oxrdf::NamedNode::new_unchecked(
+                rdf::version_iri("osm", src)
+            ))]
+        );
+    }
+}
+
+#[test]
+fn an_oversized_file_is_refused_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = Resources::in_dir(dir.path());
+    let f = dir.path().join(FILE);
+    let mut big = br#"{"format": 1, "resources": []}"#.to_vec();
+    big.resize(MAX_FILE_BYTES + 10, b' ');
+    std::fs::write(&f, &big).unwrap();
+    assert!(matches!(r.read(), Err(Error::Unreadable(m)) if m.contains("larger")));
+    assert!(
+        r.create("s", input(Kind::Source, "S"), Vec::new(), "a")
+            .is_err()
+    );
+    assert_eq!(std::fs::metadata(&f).unwrap().len(), big.len() as u64);
+}
+
+#[test]
+fn header_reads_count_as_queries() {
+    let c = crate::ratelimit::classify(
+        Some("/$/resources/{id}/header"),
+        &axum::http::Method::GET,
+        &"/$/resources/x/header".parse().unwrap(),
+        &axum::http::HeaderMap::new(),
+    );
+    assert!(matches!(c, Some(crate::ratelimit::Class::Query)));
+}
+
+#[test]
+fn headers_compare_whole_versions_and_exact_licence_urls() {
+    let r = sample();
+    let mut v = version("1.0");
+    v.license = Some("LicenseRef-terms".into());
+    v.license_class = Some(license::Class::Restricted);
+    v.license_url = Some("https://ex/Terms/A".into());
+    r.add_version("exv", v, "a").unwrap();
+    let c = r.read().unwrap();
+    let exv = find(&c, "exv").unwrap();
+    let header = |info: Option<&str>, iri: Option<&str>, lic: Option<&str>| {
+        let mut h = BTreeMap::new();
+        for (k, v) in [
+            ("versionInfo", info),
+            ("versionIRI", iri),
+            ("license", lic),
+            ("prefix", None),
+            ("namespace", None),
+        ] {
+            h.insert(k, v.map(str::to_string));
+        }
+        super::http::disagreements(exv, &h)
+    };
+    assert_eq!(
+        header(None, Some("https://ex/releases/1.0/v.ttl"), None).len(),
+        0
+    );
+    assert_eq!(
+        header(None, Some("https://ex/releases/11.0"), None).len(),
+        1
+    );
+    // versionInfo decides even when the IRI names the version
+    assert_eq!(header(Some("2.0"), Some("https://ex/1.0"), None).len(), 1);
+    assert_eq!(
+        header(Some("1.0"), None, Some("https://ex/Terms/A")).len(),
+        0
+    );
+    assert_eq!(
+        header(Some("1.0"), None, Some("https://ex/Terms/a")).len(),
+        1
+    );
+    assert_eq!(
+        header(Some("1.0"), None, Some("http://ex/Terms/A")).len(),
+        1
+    );
 }

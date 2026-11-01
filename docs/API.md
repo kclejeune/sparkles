@@ -4982,7 +4982,8 @@ in DCAT 3. The catalog is `urn:x-sparkles:resources`, a `dcat:Catalog`, and a re
 version is `urn:x-sparkles:resource:{id}/{version}`, linked by `dcat:hasVersion`,
 `dcat:hasCurrentVersion` and `dcat:previousVersion`. Distributions carry
 `dcat:downloadURL`, `dcat:mediaType`, `dcat:byteSize` and an `spdx:checksum`. Imports and
-graph sources are `prov:wasDerivedFrom`, and namespaces are
+graph sources are `prov:wasDerivedFrom`. Each graph of a dataset version is a
+`void:Dataset` of that version that names its graph with `dct:identifier`. Namespaces are
 `vann:preferredNamespacePrefix` and `vann:preferredNamespaceUri`.
 
 A catalog file of a format this build does not read, or one that does not parse, is left
@@ -4994,7 +4995,9 @@ serving.
 A licence is an SPDX licence expression, such as `CC-BY-4.0`, `ODbL-1.0 AND CC-BY-4.0`
 or `LicenseRef-imdb`. A built-in table sorts the common data and software licences into
 four classes, which are `open`, `attribution`, `share-alike` and `restricted`. An
-identifier outside the table and every `LicenseRef-` need `licenseClass`. `AND` takes
+identifier outside the table and every `LicenseRef-` need `licenseClass`. A
+`licenseClass` given for an expression the table classifies, including `NOASSERTION` and
+`NONE`, must restate the table's class. `WITH` follows a single licence. `AND` takes
 the more restrictive class and `OR` the less restrictive one. A missing licence,
 `NOASSERTION` and `NONE` have the class `unknown`. Data whose class is `restricted` or
 `unknown` may not be redistributed.
@@ -5026,15 +5029,20 @@ namespace IRI belong to one vocabulary of the server, and a second claim is
 `GET /$/resources/{id}/header` reads the `owl:Ontology` or `skos:ConceptScheme` of each
 of those graphs, with its `owl:versionIRI`, `owl:versionInfo`, `dct:license`,
 `dct:title`, `vann:preferredNamespacePrefix` and `vann:preferredNamespaceUri`. The read
-runs with the caller's grants and the server's query timeout and budgets. Each graph
-lists its `disagreements` with the current version's record, and nothing changes.
+runs with the caller's grants and the server's query timeout and budgets, and rate
+limits and memory admission count it as a query. Each graph lists its `disagreements`
+with the current version's record, and nothing changes. `owl:versionInfo` must equal the
+current version, and without it one segment of the version IRI must. SPDX licence pages
+compare by identifier, and other licence IRIs compare exactly.
 
 `POST /$/resources/{id}/install/{ds}` binds the namespaces of the vocabulary, and of the
 vocabularies its current version imports, as prefixes of the dataset in one write of the
 `prefixes` settings kind. The write honours the operator's locks and `--max-prefixes`.
 A prefix that the dataset binds to another IRI is `409 prefix-conflict` with the
 `conflicts`, unless the request sets `replace=true`. The answer lists the prefixes it
-`installed`, those it `replaced` and those that were `unchanged`.
+`installed`, those it `replaced` and those that were `unchanged`. A prefix write that
+lands between the install's read and its write makes the install read again, so it
+never overwrites a binding it did not check.
 
 ## Backup repositories
 

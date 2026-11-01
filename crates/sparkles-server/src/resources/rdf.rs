@@ -4,7 +4,9 @@
 //! `urn:x-sparkles:resource:{id}`, a `dcat:Dataset` whose `dct:type` names its kind, and a
 //! version is `urn:x-sparkles:resource:{id}/{version}`, linked with `dcat:hasVersion`,
 //! `dct:isVersionOf`, `dcat:hasCurrentVersion` and `dcat:previousVersion`. Imports and
-//! graph sources are `prov:wasDerivedFrom` of the pinned version.
+//! graph sources are `prov:wasDerivedFrom` of the pinned version, and each graph of a
+//! dataset version is a `void:Dataset` of that version that names its graph with
+//! `dct:identifier`.
 
 use super::{CatalogFile, Resource, Version};
 use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
@@ -150,12 +152,16 @@ fn version(out: &mut Out, r: &Resource, v: &Version, prev: Option<&Version>) {
             n(&version_iri(&p.resource, &p.version)),
         );
     }
+    // each version's graph is a node of its own, so that versions that reuse a graph IRI
+    // keep their own sources
     for g in &v.input.graphs {
-        let graph = n(&g.graph);
-        out.add(me.clone(), t(DCT, "hasPart"), graph.clone());
+        let b = BlankNode::default();
+        out.add(me.clone(), t(DCT, "hasPart"), b.clone());
+        out.add(b.clone(), t(RDF, "type"), t(VOID, "Dataset"));
+        out.typed(b.clone(), t(DCT, "identifier"), &g.graph, "anyURI");
         for p in &g.sources {
             out.add(
-                graph.clone(),
+                b.clone(),
                 t(PROV, "wasDerivedFrom"),
                 n(&version_iri(&p.resource, &p.version)),
             );

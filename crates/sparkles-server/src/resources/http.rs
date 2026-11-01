@@ -459,30 +459,49 @@ fn term_str(t: &Option<Term>) -> Option<String> {
     }
 }
 
-/// A licence page or IRI without its scheme, `.html` and case, for comparison.
+/// A licence page or IRI for comparison. The SPDX licence pages and IRIs of one
+/// identifier compare equal whatever their scheme, `.html` suffix and case; any other
+/// IRI compares exactly.
 fn licence_key(s: &str) -> String {
-    let s = s
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    s.trim_end_matches(".html").to_ascii_lowercase()
+    let bare = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    match bare.strip_prefix("spdx.org/licenses/") {
+        Some(id) => {
+            let id = id.trim_end_matches('/');
+            let id = id.strip_suffix(".html").unwrap_or(id);
+            format!("spdx:{}", id.to_ascii_lowercase())
+        }
+        None => s.to_string(),
+    }
+}
+
+/// Whether a header's version IRI names `version`: one of its path segments, or its
+/// fragment, is exactly the version.
+fn names_version(iri: &str, version: &str) -> bool {
+    let path = iri.split_once("://").map_or(iri, |(_, rest)| rest);
+    path.split(['/', '#', '?']).any(|seg| seg == version)
 }
 
 /// Where a graph's header disagrees with the record of the current version.
-fn disagreements(r: &Resource, h: &BTreeMap<&str, Option<String>>) -> Vec<String> {
+pub(super) fn disagreements(r: &Resource, h: &BTreeMap<&str, Option<String>>) -> Vec<String> {
     let mut out = Vec::new();
     let cur = r.current();
     if let Some(cur) = cur {
         let v = &cur.input.version;
         let info = h["versionInfo"].as_deref();
         let viri = h["versionIRI"].as_deref();
-        let says = info.is_some() || viri.is_some();
-        let agrees = info == Some(v.as_str())
-            || viri.is_some_and(|i| i.trim_end_matches('/').ends_with(v.as_str()));
-        if says && !agrees {
+        // owl:versionInfo names the version exactly; without it, the version IRI must
+        // hold the version as a whole segment
+        let differs = match (info, viri) {
+            (Some(i), _) => (i != v.as_str()).then(|| i.to_string()),
+            (None, Some(i)) => (!names_version(i, v)).then(|| i.to_string()),
+            (None, None) => None,
+        };
+        if let Some(named) = differs {
             out.push(format!(
-                "the header names version {}, the catalog's current version is {v}",
-                info.or(viri).unwrap_or_default()
+                "the header names version {named}, the catalog's current version is {v}"
             ));
         }
     }
@@ -608,36 +627,102 @@ async fn header_read(
 // ------------------------------------------------------------------ install ------
 
 /// The namespaces of a vocabulary and of the vocabularies its current version imports,
-/// transitively.
-fn bundle(c: &CatalogFile, r: &Resource) -> Vec<(String, String, String)> {
+/// transitively. Each pinned version is expanded once, so shared imports cost one visit.
+pub(super) fn bundle(c: &CatalogFile, r: &Resource) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut todo = vec![r.id.clone()];
-    let mut pins: Vec<super::Pin> = r
-        .current()
-        .map(|v| v.input.imports.clone())
-        .unwrap_or_default();
-    while let Some(id) = todo.pop() {
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        if let Some(t) = find(c, &id).filter(|t| t.input.kind == Kind::Vocabulary) {
+    let mut resources = BTreeSet::new();
+    let mut pins = BTreeSet::new();
+    let mut add = |t: &Resource, out: &mut Vec<(String, String, String)>| {
+        if t.input.kind == Kind::Vocabulary && resources.insert(t.id.clone()) {
             for n in &t.input.namespaces {
                 out.push((n.prefix.clone(), n.iri.clone(), t.id.clone()));
             }
         }
-        while let Some(p) = pins.pop() {
-            if let Some(v) = find(c, &p.resource).and_then(|t| t.version(&p.version)) {
-                pins.extend(v.input.imports.iter().cloned());
-            }
-            todo.push(p.resource);
+    };
+    add(r, &mut out);
+    let mut todo: Vec<super::Pin> = r
+        .current()
+        .map(|v| v.input.imports.clone())
+        .unwrap_or_default();
+    while let Some(p) = todo.pop() {
+        if !pins.insert(p.clone()) {
+            continue;
+        }
+        let Some(t) = find(c, &p.resource) else {
+            continue;
+        };
+        add(t, &mut out);
+        if let Some(v) = t.version(&p.version) {
+            todo.extend(
+                v.input
+                    .imports
+                    .iter()
+                    .filter(|q| !pins.contains(*q))
+                    .cloned(),
+            );
         }
     }
     out
 }
 
+/// What an install binds, decided from one state of the dataset's prefixes.
+struct Plan {
+    planned: Vec<(String, String)>,
+    conflicts: Vec<Value>,
+    unchanged: Vec<Value>,
+    /// the entity tag of the prefixes the plan was made from
+    etag: String,
+}
+
+fn plan_install(st: &AppState, target: &crate::state::Dataset, id: &str) -> ApiResult<Plan> {
+    let c = store(st).read()?;
+    let r = find(&c, id).ok_or_else(|| super::no_such(id))?;
+    if r.input.kind != Kind::Vocabulary {
+        return Err(err_code(
+            StatusCode::CONFLICT,
+            "not-a-vocabulary",
+            format!(
+                "{id} is a {}; only a vocabulary has namespaces to install",
+                r.input.kind.as_str()
+            ),
+        ));
+    }
+    let etag = crate::settings::resolved(st, target, &crate::settings::prefixes::PREFIXES).etag;
+    let have = crate::settings::prefixes::effective(st, target);
+    let mut plan = Plan {
+        planned: Vec::new(),
+        conflicts: Vec::new(),
+        unchanged: Vec::new(),
+        etag,
+    };
+    for (prefix, iri, from) in bundle(&c, r) {
+        match have.get(&prefix) {
+            Some(old) if *old == iri => plan.unchanged.push(json!({"prefix": prefix, "iri": iri})),
+            Some(old) => {
+                plan.conflicts
+                    .push(json!({"prefix": prefix, "iri": iri, "bound": old, "resource": from}));
+                plan.planned.push((prefix, iri));
+            }
+            None => plan.planned.push((prefix, iri)),
+        }
+    }
+    Ok(plan)
+}
+
+/// Test hooks that run once between an install's plan and its write, by dataset.
+#[cfg(test)]
+pub(super) static BEFORE_INSTALL_WRITE: parking_lot::Mutex<
+    BTreeMap<String, Box<dyn FnOnce() + Send>>,
+> = parking_lot::Mutex::new(BTreeMap::new());
+
+/// How often an install plans again when another write changed the prefixes between its
+/// plan and its write.
+const INSTALL_ATTEMPTS: usize = 4;
+
 /// `POST /$/resources/{id}/install/{ds}`: bind the namespaces of a vocabulary and of its
-/// imports as prefixes of a dataset in one write.
+/// imports as prefixes of a dataset in one write. The write carries the entity tag of
+/// the prefixes the plan read, so a concurrent change makes it plan again rather than
+/// overwrite a binding it did not see.
 async fn install(
     State(st): St,
     Path((id, ds_name)): Path<(String, String)>,
@@ -650,90 +735,82 @@ async fn install(
         .is_some_and(|v| v == "true" || v == "1");
     let ds = crate::http::dataset(&st, &ds_name)?;
     let target = ds.main().unwrap_or_else(|| ds.clone());
-    let (planned, conflicts, unchanged) = {
-        let st = st.clone();
-        let target = target.clone();
-        let id = id.clone();
-        blocking(move || {
-            let c = store(&st).read()?;
-            let r = find(&c, &id).ok_or_else(|| super::no_such(&id))?;
-            if r.input.kind != Kind::Vocabulary {
-                return Err(err_code(
-                    StatusCode::CONFLICT,
-                    "not-a-vocabulary",
-                    format!(
-                        "{id} is a {}; only a vocabulary has namespaces to install",
-                        r.input.kind.as_str()
+    let mut attempt = 0;
+    let plan = loop {
+        attempt += 1;
+        let plan = {
+            let (st, target, id) = (st.clone(), target.clone(), id.clone());
+            blocking(move || plan_install(&st, &target, &id)).await?
+        };
+        if !plan.conflicts.is_empty() && !replace {
+            return Err(crate::http::err_body(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": format!(
+                        "{} binds a prefix of the vocabulary to another IRI; set replace=true to rebind it",
+                        target.name
                     ),
-                ));
-            }
-            let have = crate::settings::prefixes::effective(&st, &target);
-            let mut planned = Vec::new();
-            let mut conflicts = Vec::new();
-            let mut unchanged = Vec::new();
-            for (prefix, iri, from) in bundle(&c, r) {
-                match have.get(&prefix) {
-                    Some(old) if *old == iri => {
-                        unchanged.push(json!({"prefix": prefix, "iri": iri}))
-                    }
-                    Some(old) => {
-                        conflicts.push(
-                            json!({"prefix": prefix, "iri": iri, "bound": old, "resource": from}),
-                        );
-                        planned.push((prefix, iri));
-                    }
-                    None => planned.push((prefix, iri)),
-                }
-            }
-            Ok((planned, conflicts, unchanged))
-        })
-        .await?
-    };
-    if !conflicts.is_empty() && !replace {
-        return Err(crate::http::err_body(
-            StatusCode::CONFLICT,
-            json!({
-                "error": format!(
-                    "{} binds a prefix of the vocabulary to another IRI; set replace=true to rebind it",
-                    target.name
-                ),
-                "code": "prefix-conflict",
-                "conflicts": conflicts,
-            }),
-        ));
-    }
-    if !planned.is_empty() {
-        let body: serde_json::Map<String, Value> = planned
+                    "code": "prefix-conflict",
+                    "conflicts": plan.conflicts,
+                }),
+            ));
+        }
+        if plan.planned.is_empty() {
+            break plan;
+        }
+        let body: serde_json::Map<String, Value> = plan
+            .planned
             .iter()
             .map(|(p, i)| (p.clone(), Value::String(i.clone())))
             .collect();
         let bytes = serde_json::to_vec(&Value::Object(body)).unwrap_or_default();
-        crate::settings::http::write(
+        #[cfg(test)]
+        {
+            let hook = BEFORE_INSTALL_WRITE.lock().remove(&target.name);
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut h = HeaderMap::new();
+        if let Ok(v) = HeaderValue::from_str(&plan.etag) {
+            h.insert(header::IF_MATCH, v);
+        }
+        match crate::settings::http::write(
             st.clone(),
             target.clone(),
             &crate::settings::prefixes::PREFIXES,
             crate::settings::http::Write::Patch(bytes.into()),
-            &HeaderMap::new(),
+            &h,
         )
-        .await?;
-    }
+        .await
+        {
+            Ok(_) => break plan,
+            Err(e)
+                if e.status() == StatusCode::PRECONDITION_FAILED && attempt < INSTALL_ATTEMPTS =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
     tracing::info!(
         target: "sparkles::audit",
         event = "resource_install",
         resource = id.as_str(),
         dataset = target.name.as_str(),
-        prefixes = planned.len(),
+        prefixes = plan.planned.len(),
         principal = p.id().as_str()
     );
-    let installed: Vec<Value> = planned
+    let installed: Vec<Value> = plan
+        .planned
         .iter()
         .map(|(p, i)| json!({"prefix": p, "iri": i}))
         .collect();
     Ok(Json(json!({
         "dataset": target.name,
         "installed": installed,
-        "replaced": conflicts,
-        "unchanged": unchanged,
+        "replaced": plan.conflicts,
+        "unchanged": plan.unchanged,
     }))
     .into_response())
 }

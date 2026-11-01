@@ -130,6 +130,11 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
 }
 
+/// Whether `s` is an operator of the expression syntax.
+fn operator(s: &str) -> bool {
+    matches!(s, "AND" | "OR" | "WITH")
+}
+
 /// Whether `s` is an SPDX idstring: letters, digits, `.` and `-`.
 fn idstring(s: &str) -> bool {
     !s.is_empty()
@@ -196,15 +201,19 @@ impl Parser {
         }
         Ok(e)
     }
-    // with := atom ("WITH" exception)?
+    // with := atom ("WITH" exception)?, where only a simple licence takes WITH
     fn with(&mut self) -> Result<Expr, String> {
+        let simple = self.peek() != Some("(");
         let e = self.atom()?;
         if self.peek() == Some("WITH") {
+            if !simple {
+                return Err("WITH follows a single licence, not a parenthesized expression".into());
+            }
             self.at += 1;
             let x = self
                 .next()
                 .ok_or("WITH needs an exception identifier after it")?;
-            if !idstring(&x) {
+            if !idstring(&x) || operator(&x) {
                 return Err(format!("{x:?} is not an exception identifier"));
             }
             return Ok(Expr::With(Box::new(e), x));
@@ -319,8 +328,19 @@ impl Licence<'_> {
             return Ok(self.class.unwrap_or(Class::Unknown));
         };
         let expr = parse(e)?;
-        if let Some(c) = self.class {
-            return Ok(c);
+        match (expr.class(), self.class) {
+            // the table classifies the expression, and NOASSERTION and NONE are unknown,
+            // so a given class may only restate it
+            (Ok(t), Some(c)) if t != c => {
+                return Err(format!(
+                    "the built-in table classifies {e} as {}; leave licenseClass out or give {}",
+                    t.as_str(),
+                    t.as_str()
+                ));
+            }
+            (Ok(t), _) => return Ok(t),
+            (Err(_), Some(c)) => return Ok(c),
+            (Err(_), None) => {}
         }
         expr.class().map_err(|id| {
             format!(
@@ -413,6 +433,9 @@ mod tests {
             "M I T",
             "a/b",
             "DocumentRef-x:MIT",
+            "(MIT OR Apache-2.0) WITH Classpath-exception-2.0",
+            "MIT WITH AND",
+            "MIT WITH OR",
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
@@ -445,6 +468,25 @@ mod tests {
         };
         assert_eq!(r.class(), Ok(Class::Restricted));
         assert_eq!(Licence::default().class(), Ok(Class::Unknown));
+        // a given class cannot change what the table or a sentinel says
+        for (e, c) in [
+            ("NONE", Class::Open),
+            ("NOASSERTION", Class::Open),
+            ("CC-BY-4.0", Class::Open),
+        ] {
+            let l = Licence {
+                expression: Some(e),
+                class: Some(c),
+                url: None,
+            };
+            assert!(l.class().unwrap_err().contains("built-in table"), "{e}");
+        }
+        let same = Licence {
+            expression: Some("CC-BY-4.0"),
+            class: Some(Class::Attribution),
+            url: None,
+        };
+        assert_eq!(same.class(), Ok(Class::Attribution));
         let cc = Licence {
             expression: Some("cc-by-4.0"),
             ..Default::default()

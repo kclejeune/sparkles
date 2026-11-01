@@ -148,6 +148,8 @@ pub fn classify(
             || admin == "reason/{ds}/justify"
             || admin == "graphql/{ds}/draft"
             || admin == "commits/{ds}/timeline"
+            // a vocabulary header reads graphs of the datasets that hold it
+            || admin == "resources/{id}/header"
         {
             return Some(Class::Query);
         }

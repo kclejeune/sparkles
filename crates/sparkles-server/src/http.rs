@@ -501,6 +501,11 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    /// The response's status.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.0
+    }
+
     pub(crate) fn audit_code(&self) -> &str {
         self.1
             .get("code")
