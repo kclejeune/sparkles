@@ -14,24 +14,35 @@
 //! | +2, +n | message length (u16 LE) and UTF-8 bytes (when flagged) |
 //! | +4 | CRC-32 of the bytes before it |
 //!
-//! An ordinary commit appends and syncs its record *before* the commit point (the WAL
+//! An ordinary commit appends its record durably *before* the commit point (the WAL
 //! write, or the `CURRENT` switch of a bulk commit), so a durable commit always has its
 //! annotation. When the sync of an ordinary commit's WAL records fails, the commit may
 //! still come back at the next open, so its record is not taken back. The writer refuses
 //! further commits, and the next open drops the record if the commit did not survive. A
-//! commit of a group (see `store/group.rs`) appends its record without a
-//! sync, before it writes its WAL records, and the group's fence syncs the file together
-//! with the log. An acknowledged commit therefore has its annotation too, but a commit
-//! that was not acknowledged can reach the disk without it. Its commit record carries
-//! the `WAL_FLAG_ANNOTATED` bit, and the next open truncates the log from the first
-//! such commit whose record is missing, when no later commit shows it was durable.
+//! commit of a group (see `store/group.rs`) only queues its record. The leader of its
+//! fence writes the records of the whole prefix at the file's written end, at the same
+//! time as the prefix's WAL records and terms, and acknowledges the commits only after all
+//! three writes are durable. An acknowledged commit therefore has its annotation too, but
+//! a commit that was not acknowledged can reach the disk without it. Its commit record
+//! carries the `WAL_FLAG_ANNOTATED` bit, and the next open truncates the log from the
+//! first such commit whose record is missing, when no later commit shows it was durable.
+//!
+//! Records are written the way the log writes its own (see `store::wal::DirectLog`). The
+//! file grows in steps of zero bytes, which a buffered write and `fdatasync` make durable
+//! with the records that needed the growth. Records that fit in those zeros are written
+//! through a second handle opened with `O_DIRECT | O_DSYNC`, which overwrites allocated
+//! blocks, changes no file size and on a device with FUA persists without a cache flush.
+//! A reader stops at the first record that does not decode, so the zeros read as the end
+//! of the records, as a tail that a crash cut short always did. The format is unchanged.
 //!
 //! A record whose commit never became durable has a `seq` above the head found at the
-//! next open, which truncates it away. A torn or damaged tail is truncated too.
+//! next open, which truncates it away. A torn or damaged tail is truncated too, and so
+//! are the preallocated zeros.
 //! In-memory stores keep annotations in memory only.
 
 use crate::commit::{CommitInfo, rfc3339_ms};
 use crate::error::{Error, Result};
+use crate::store::wal::{self, Direct, DirectLog};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -49,6 +60,10 @@ const REC_DIGEST: u8 = 2;
 
 /// Longest commit message, in bytes of UTF-8.
 pub const MAX_MESSAGE_BYTES: usize = 1024;
+
+/// The most the file grows ahead of its records at once. A step is the file's own length,
+/// and at least the log's smallest step, up to this.
+pub(crate) const MAX_PREALLOC: u64 = 256 << 10;
 
 /// What is recorded about one commit besides its catalog record.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -97,32 +112,39 @@ pub fn validate_message(m: &str) -> Result<Option<Arc<str>>> {
 /// `annotations.bin` for persistent stores.
 pub(crate) struct Annotations {
     path: Option<PathBuf>,
-    file: Option<Arc<File>>,
-    /// bytes of the file that hold complete, valid records
+    /// the file's written end, once the file exists
+    tail: Option<Arc<Tail>>,
+    /// where the next record goes: the end of the written records and of those queued
+    /// for a group commit fence
     len: u64,
     map: BTreeMap<u64, Annotation>,
     /// compute change digests for new commits
     digests: bool,
+    /// write records that fit in preallocated space through `O_DIRECT | O_DSYNC`
+    direct: bool,
 }
 
 impl Annotations {
     pub fn memory(digests: bool) -> Annotations {
         Annotations {
             path: None,
-            file: None,
+            tail: None,
             len: 0,
             map: BTreeMap::new(),
             digests,
+            direct: false,
         }
     }
 
     /// Open (or create) `<root>/annotations.bin`, keeping the records of commits up to
     /// `head`. `digests` turns digests on; once on, they stay on (the header flag).
+    /// `direct` lets records that fit in preallocated space be written through.
     pub fn open(
         root: &Path,
         dataset_id: uuid::Uuid,
         head: u64,
         digests: bool,
+        direct: bool,
     ) -> Result<Annotations> {
         let path = root.join(FILE);
         let mut buf = Vec::new();
@@ -165,7 +187,7 @@ impl Annotations {
         let digests = flags & FLAG_DIGESTS != 0;
         // only a database with annotations (or digests) gets the file
         let need_file = !buf.is_empty() || digests;
-        let mut file = None;
+        let mut tail = None;
         let mut len = 0;
         if need_file {
             let mut f = OpenOptions::new()
@@ -188,14 +210,15 @@ impl Annotations {
             f.sync_all()?;
             crate::store::sync_dir(root)?;
             len = good as u64;
-            file = Some(Arc::new(f));
+            tail = Some(Tail::new(f, &path, direct, len));
         }
         Ok(Annotations {
             path: Some(path),
-            file,
+            tail,
             len,
             map,
             digests,
+            direct,
         })
     }
 
@@ -208,71 +231,95 @@ impl Annotations {
     }
 
     /// Record `a` for commit `seq` (the next commit, not yet durable) and, for a
-    /// persistent store, sync it to disk. Undo it with [`Annotations::undo`] when the
-    /// commit fails before any of its WAL records is written.
-    pub fn append(&mut self, seq: u64, a: Annotation, dataset_id: uuid::Uuid) -> Result<()> {
-        if let Some((f, at)) = self.append_unsynced(seq, a, dataset_id)?
-            && let Err(e) = f.sync_data()
-        {
-            // leave no record behind that may not be on the disk, and keep the header
-            // that this very append may have created
-            let _ = f.set_len(at);
-            self.len = at;
-            self.map.remove(&seq);
-            return Err(e.into());
-        }
-        Ok(())
-    }
-
-    /// Record `a` for commit `seq` without syncing it, and return the file to sync with
-    /// the offset the record starts at (none when there is nothing to sync: an empty
-    /// annotation, or a store without a file). The caller syncs the file before it
-    /// acknowledges the commit. Ordinary append rolls back to the offset on sync failure.
-    /// A failed grouped fence poisons the writer and keeps the records until reopen.
-    /// The offset is taken after the file's creation, so a rollback keeps the header.
-    /// The record is written at its own offset, so the descriptor can be shared with the
-    /// thread that syncs. The file's creation, which happens with the first record, is
-    /// synced here.
-    pub fn append_unsynced(
+    /// persistent store, write it durably. Undo it with [`Annotations::undo`] when the
+    /// commit fails before any of its WAL records is written. `prealloc` gives the most
+    /// the file may grow ahead of the record, and is asked only when it must grow. `None`
+    /// when nothing was written (an empty annotation, or a store without a file).
+    pub fn append(
         &mut self,
         seq: u64,
         a: Annotation,
         dataset_id: uuid::Uuid,
-    ) -> Result<Option<(Arc<File>, u64)>> {
+        prealloc: impl FnOnce() -> u64,
+    ) -> Result<Option<Written>> {
         if a.is_empty() {
             return Ok(None);
         }
-        let mut synced = None;
-        if let Some(path) = &self.path {
-            if self.file.is_none() {
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .read(true)
-                    .write(true)
-                    .open(path)?;
-                let flags = if self.digests { FLAG_DIGESTS } else { 0 };
-                f.write_all(&encode_header(dataset_id, flags))?;
-                f.sync_all()?;
-                if let Some(dir) = path.parent() {
-                    crate::store::sync_dir(dir)?;
-                }
-                self.len = HEADER as u64;
-                self.file = Some(Arc::new(f));
+        let Some(tail) = self.ensure_file(dataset_id)? else {
+            self.map.insert(seq, a);
+            return Ok(None);
+        };
+        let rec = encode_record(seq, &a);
+        let at = self.len;
+        match tail.write(at, &rec, prealloc) {
+            Ok(w) => {
+                self.len += rec.len() as u64;
+                self.map.insert(seq, a);
+                Ok(Some(w))
             }
-            let rec = encode_record(seq, &a);
-            let f = self.file.as_ref().expect("opened above");
-            let at = self.len;
-            if let Err(e) = crate::store::wal::write_all_at(f, &rec, at) {
-                // leave no partial record behind
-                let _ = f.set_len(at);
-                return Err(e.into());
+            Err(e) => {
+                // leave no record behind that may not be on the disk, and keep the
+                // header that this very append may have created
+                let _ = tail.cut(at, false);
+                Err(e)
             }
-            self.len += rec.len() as u64;
-            synced = Some((f.clone(), at));
         }
+    }
+
+    /// Record `a` for commit `seq` of a group and queue its record for the commit's
+    /// fence, which writes it with [`write_queued`] before it acknowledges the commit
+    /// (none when there is nothing to write: an empty annotation, or a store without a
+    /// file). The record takes its place in the file now, so the records of later commits
+    /// follow it. A failed fence poisons the writer and keeps the records until reopen.
+    /// The file's creation, which happens with the first record, is synced here.
+    pub fn append_queued(
+        &mut self,
+        seq: u64,
+        a: Annotation,
+        dataset_id: uuid::Uuid,
+    ) -> Result<Option<Queued>> {
+        if a.is_empty() {
+            return Ok(None);
+        }
+        let queued = self.ensure_file(dataset_id)?.map(|tail| {
+            let data = encode_record(seq, &a);
+            let at = self.len;
+            self.len += data.len() as u64;
+            Queued { tail, at, data }
+        });
         self.map.insert(seq, a);
-        Ok(synced)
+        Ok(queued)
+    }
+
+    /// The file's tail, creating the file with its header first if there is none yet
+    /// (`None` for an in-memory store).
+    fn ensure_file(&mut self, dataset_id: uuid::Uuid) -> Result<Option<Arc<Tail>>> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+        if self.tail.is_none() {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(path)?;
+            let flags = if self.digests { FLAG_DIGESTS } else { 0 };
+            f.write_all(&encode_header(dataset_id, flags))?;
+            f.sync_all()?;
+            if let Some(dir) = path.parent() {
+                crate::store::sync_dir(dir)?;
+            }
+            self.len = HEADER as u64;
+            self.tail = Some(Tail::new(f, path, self.direct, self.len));
+        }
+        Ok(self.tail.clone())
+    }
+
+    /// The zero bytes preallocated after the written records, which are on disk but are
+    /// not data.
+    pub fn preallocated(&self) -> u64 {
+        self.tail.as_ref().map_or(0, |t| t.preallocated())
     }
 
     /// Take back the annotation of `seq`, appended for a commit that did not happen.
@@ -281,11 +328,10 @@ impl Annotations {
         let Some(a) = self.map.remove(&seq) else {
             return Ok(());
         };
-        if let Some(f) = self.file.as_mut() {
+        if let Some(tail) = &self.tail {
             let n = encode_record(seq, &a).len() as u64;
             self.len -= n;
-            f.set_len(self.len)?;
-            f.sync_data()?;
+            tail.cut_synced(self.len)?;
         }
         Ok(())
     }
@@ -300,8 +346,13 @@ impl Annotations {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        if self.file.is_none() {
+        let Some(tail) = &self.tail else {
             return Ok(());
+        };
+        if tail.end() != self.len {
+            return Err(Error::Invalid(
+                "commit annotations cannot be pruned while a group commit fence has records to write".into(),
+            ));
         }
         let flags = if self.digests { FLAG_DIGESTS } else { 0 };
         let mut buf = encode_header(dataset_id, flags).to_vec();
@@ -309,10 +360,9 @@ impl Annotations {
             buf.extend_from_slice(&encode_record(*seq, a));
         }
         crate::store::write_atomic(path, &buf)?;
-        self.file = Some(Arc::new(
-            OpenOptions::new().read(true).write(true).open(path)?,
-        ));
+        let f = OpenOptions::new().read(true).write(true).open(path)?;
         self.len = buf.len() as u64;
+        self.tail = Some(Tail::new(f, path, self.direct, self.len));
         Ok(())
     }
 
@@ -322,6 +372,189 @@ impl Annotations {
             self.map = self.map.split_off(&seq);
         }
     }
+}
+
+/// A record queued for a group commit fence: its bytes and where they go in the file.
+pub(crate) struct Queued {
+    pub tail: Arc<Tail>,
+    pub at: u64,
+    pub data: Vec<u8>,
+}
+
+/// What a durable write of records did to the file.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Written {
+    /// the bytes the file grew by, its records and the zeros preallocated after them
+    pub grew: u64,
+    /// the zero bytes preallocated after the records now
+    pub preallocated: u64,
+    /// the records went through the write-through handle
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub direct: bool,
+}
+
+/// The written end of `annotations.bin`, which every write of records goes through. An
+/// ordinary commit writes its own record here, and the leader of a group commit fence
+/// writes its prefix's records. Records are written in the order of their places in the
+/// file, each write starts where the last one ended, and past `end` the file holds only
+/// preallocated zeros, as [`DirectLog::write`] requires.
+pub(crate) struct Tail {
+    io: parking_lot::Mutex<TailIo>,
+}
+
+struct TailIo {
+    file: File,
+    /// the path the write-through handle opens (`None`: direct writes are off)
+    path: Option<PathBuf>,
+    /// the file's length: past `end` it holds preallocated zero bytes
+    alloc: u64,
+    /// the bytes of records written to the file, where the next write starts
+    end: u64,
+    direct: Direct,
+}
+
+impl Tail {
+    fn new(file: File, path: &Path, direct: bool, len: u64) -> Arc<Tail> {
+        Arc::new(Tail {
+            io: parking_lot::Mutex::new(TailIo {
+                file,
+                path: direct.then(|| path.to_path_buf()),
+                alloc: len,
+                end: len,
+                direct: Direct::Untried,
+            }),
+        })
+    }
+
+    fn end(&self) -> u64 {
+        self.io.lock().end
+    }
+
+    fn preallocated(&self) -> u64 {
+        let io = self.io.lock();
+        io.alloc - io.end
+    }
+
+    /// Write the records `data` at `at`, the file's written end, durably. When they fit
+    /// in the preallocated zeros, they go through the write-through handle. Otherwise
+    /// they are written with a buffered write, followed by up to `prealloc()` zero bytes
+    /// when the file must grow, and synchronized with `fdatasync`. A failure leaves the
+    /// file in an unknown state after `at`.
+    pub(crate) fn write(
+        &self,
+        at: u64,
+        data: &[u8],
+        prealloc: impl FnOnce() -> u64,
+    ) -> Result<Written> {
+        let mut guard = self.io.lock();
+        let io = &mut *guard;
+        if io.end != at {
+            return Err(Error::Corrupt(format!(
+                "a commit annotation would be written at byte {at} of annotations.bin, which is written up to byte {}",
+                io.end
+            )));
+        }
+        let end = at + data.len() as u64;
+        if DirectLog::fits(at, data.len(), io.alloc)
+            && let Some(direct) = io.direct.handle(io.path.as_deref(), &io.file)
+        {
+            if direct.write(at, data)? {
+                io.end = end;
+                return Ok(Written {
+                    grew: 0,
+                    preallocated: io.alloc - end,
+                    direct: true,
+                });
+            }
+            // the file system refused direct I/O: buffered from now on
+            io.direct = Direct::Off;
+        }
+        // the handle's copy of the last block no longer holds what the file holds
+        if let Direct::Open(d) = &mut io.direct {
+            d.invalidate();
+        }
+        let before = io.alloc;
+        let cap = if end > io.alloc { prealloc() } else { 0 };
+        wal::write_commit(&io.file, at, &mut io.alloc, data, cap)?;
+        io.file.sync_data()?;
+        io.end = end;
+        Ok(Written {
+            grew: io.alloc - before,
+            preallocated: io.alloc - end,
+            direct: false,
+        })
+    }
+
+    /// Cut the file back to `at` after a failed write, with its preallocation, and
+    /// synchronize the cut when `sync` is set.
+    fn cut(&self, at: u64, sync: bool) -> std::io::Result<()> {
+        let mut io = self.io.lock();
+        io.end = at;
+        let cut = io.file.set_len(at);
+        match &cut {
+            Ok(()) => {
+                io.alloc = at;
+                if let Direct::Open(d) = &mut io.direct {
+                    d.invalidate();
+                }
+            }
+            // the bytes after `at` are unknown, so no direct write may assume zeros
+            Err(_) => io.direct = Direct::Off,
+        }
+        cut?;
+        if sync {
+            io.file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// [`cut`](Self::cut) back to `at`, the start of the last record written, durably.
+    fn cut_synced(&self, at: u64) -> std::io::Result<()> {
+        self.cut(at, true)
+    }
+}
+
+/// Write the records that a group commit fence's commits queued, in the order of the
+/// prefix, at the file's written end (see [`Tail::write`]). They must follow each other
+/// and the records written before them, or nothing is written.
+pub(crate) fn write_queued(records: &[&Queued], prealloc: u64) -> Result<Written> {
+    let first = records[0];
+    if records.windows(2).any(|w| {
+        w[1].at != w[0].at + w[0].data.len() as u64 || !Arc::ptr_eq(&w[0].tail, &w[1].tail)
+    }) {
+        return Err(Error::Corrupt(
+            "the commit annotations of a group commit fence do not follow each other".into(),
+        ));
+    }
+    let joined;
+    let data: &[u8] = if records.len() == 1 {
+        &first.data
+    } else {
+        joined = records
+            .iter()
+            .flat_map(|q| q.data.iter().copied())
+            .collect::<Vec<u8>>();
+        &joined
+    };
+    first.tail.write(first.at, data, || prealloc)
+}
+
+/// The bytes of the record of an annotation with `message` and, when `digest` is set, a
+/// change digest (0 when it has neither, since such a commit has no record).
+pub(crate) fn record_len(message: Option<&str>, digest: bool) -> u64 {
+    if message.is_none() && !digest {
+        return 0;
+    }
+    let message = message.map_or(0, |m| 2 + m.len().min(u16::MAX as usize));
+    (8 + 1 + if digest { 32 } else { 0 } + message + 4) as u64
+}
+
+/// Where the complete, valid records of an annotations file's content end (past it lie
+/// preallocated zeros or a torn tail), or `None` for a file without a valid header.
+#[cfg(test)]
+pub(crate) fn records_end(buf: &[u8]) -> Option<usize> {
+    decode_header(buf)?;
+    Some(decode_records(buf, None).1)
 }
 
 /// The commits that have an annotation in `<root>/annotations.bin`, for the replay of the

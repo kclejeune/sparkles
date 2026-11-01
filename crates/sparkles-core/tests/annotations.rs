@@ -160,6 +160,8 @@ fn annotations_of_commits_that_did_not_survive_are_dropped() {
     )
     .unwrap();
     drop(s);
+    // an open cuts the zeros that the file preallocated after its records
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
     let side = root.join(annotations::FILE);
     let len = std::fs::metadata(&side).unwrap().len();
     std::fs::OpenOptions::new()

@@ -74,6 +74,8 @@ pub(crate) struct Quota {
     preallocated: AtomicU64,
     /// the same after the last chunk of the delta vocabulary
     vocab_preallocated: AtomicU64,
+    /// the same after the last record of `annotations.bin`
+    ann_preallocated: AtomicU64,
     /// the records of grouped commits queued for their fence, which the leader writes to
     /// the log later: counted as if they were in it
     queued: AtomicU64,
@@ -104,6 +106,7 @@ impl Quota {
             excluded: Mutex::new(None),
             preallocated: AtomicU64::new(0),
             vocab_preallocated: AtomicU64::new(0),
+            ann_preallocated: AtomicU64::new(0),
             queued: AtomicU64::new(0),
             promised: AtomicU64::new(0),
             measures: AtomicU64::new(0),
@@ -139,11 +142,12 @@ impl Quota {
             // this walk was reading the directory sees it change
             self.measures.fetch_add(1, Ordering::Relaxed);
         }
-        // the zero bytes preallocated after the last commit of the log, and after the
-        // last chunk of the delta vocabulary, are not data
+        // the zero bytes preallocated after the last commit of the log, after the last
+        // chunk of the delta vocabulary and after the last annotation record are not data
         (self.used.load(Ordering::Relaxed) + self.queued.load(Ordering::Relaxed)).saturating_sub(
             self.preallocated.load(Ordering::Relaxed)
-                + self.vocab_preallocated.load(Ordering::Relaxed),
+                + self.vocab_preallocated.load(Ordering::Relaxed)
+                + self.ann_preallocated.load(Ordering::Relaxed),
         )
     }
 
@@ -209,14 +213,16 @@ impl Quota {
 
     /// A fence wrote the commits of `reservations`: their bytes leave the queued count as
     /// the files' growth `grew` enters the measured one, with the new preallocated space
-    /// of the log and the vocabulary. One step under the measurement's lock, so that no
-    /// use of the quota counts the prefix twice or not at all.
+    /// of the log, the vocabulary and, when the fence wrote annotation records, the
+    /// annotations file. One step under the measurement's lock, so that no use of the
+    /// quota counts the prefix twice or not at all.
     pub(crate) fn written<'a>(
         &self,
         reservations: impl IntoIterator<Item = &'a Reservation>,
         grew: u64,
         preallocated: u64,
         vocab_preallocated: u64,
+        ann_preallocated: Option<u64>,
     ) {
         let _m = self.measured.lock();
         let released: u64 = reservations.into_iter().map(Reservation::take).sum();
@@ -224,6 +230,9 @@ impl Quota {
         self.add(grew);
         self.set_preallocated(preallocated);
         self.set_vocab_preallocated(vocab_preallocated);
+        if let Some(bytes) = ann_preallocated {
+            self.set_ann_preallocated(bytes);
+        }
     }
 
     fn dequeue(&self, bytes: u64) {
@@ -258,6 +267,17 @@ impl Quota {
     /// The delta vocabulary now holds `bytes` of preallocated zeros after its last chunk.
     pub(crate) fn set_vocab_preallocated(&self, bytes: u64) {
         self.vocab_preallocated.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The zero bytes preallocated after the last record of `annotations.bin`.
+    #[cfg(test)]
+    pub(crate) fn ann_preallocated(&self) -> u64 {
+        self.ann_preallocated.load(Ordering::Relaxed)
+    }
+
+    /// `annotations.bin` now holds `bytes` of preallocated zeros after its last record.
+    pub(crate) fn set_ann_preallocated(&self, bytes: u64) {
+        self.ann_preallocated.store(bytes, Ordering::Relaxed);
     }
 
     /// A small commit grew the write-ahead log by `bytes`, its records and any zeros
