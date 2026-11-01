@@ -165,11 +165,17 @@ p.add_argument('--keep-going', action='store_true',
                help='record a query whose request fails as {"error": ...} and go on to the next query')
 p.add_argument('--serve-arg', action='append', default=[],
                help='a flag for `sparkles serve`, repeated for each word, for example --serve-arg=--memory-profile --serve-arg=small')
+p.add_argument('--prewarm', action='store_true',
+               help='cold samples from servers started with --prewarm: a warm pass per query records the list, '
+                    'and each sample is timed after the background prewarm has finished (spec X07 section 7)')
 p.add_argument('--io', action='store_true',
                help='ask for profile=io in the native format and keep each sample\'s io object and server times')
 a = p.parse_args()
 if a.io:
     a.format = 'application/x-sparkles+json'
+if a.prewarm:
+    a.cold = True
+    a.serve_arg.append('--prewarm')
 if a.runs < 1 or a.warmup < 0:
     p.error('--runs must be positive and --warmup must be nonnegative')
 if not Path(a.db).is_dir():
@@ -196,11 +202,14 @@ def start():
         stdout=log, stderr=log,
         preexec_fn=lambda: os.sched_setaffinity(0, server_cpus))
     log.close()
+    t0 = time.perf_counter()
     for _ in range(600):
         if proc.poll() is not None:
             raise RuntimeError(f'server exited: {work / "server.log"}')
         try:
             urllib.request.urlopen(f'http://127.0.0.1:{a.port}/$/ready', timeout=1).close()
+            global ready_ms
+            ready_ms = (time.perf_counter() - t0) * 1000
             return proc
         except Exception:
             time.sleep(.05)
@@ -224,6 +233,27 @@ def evict():
             finally:
                 os.close(fd)
 
+ready_ms = None
+
+def wait_prewarm(offset):
+    """Wait until the server log, past `offset`, says that the prewarm finished, and
+    return the prewarm's time in ms from the log."""
+    import re
+    for _ in range(12000):
+        text = (work / 'server.log').read_bytes()[offset:].decode(errors='replace')
+        m = re.search(r'prewarm finished in ([0-9.]+)(ms|s|µs|us)', text)
+        if m:
+            v = float(m.group(1))
+            return v * {'ms': 1, 's': 1000, 'µs': 1e-3, 'us': 1e-3}[m.group(2)]
+        time.sleep(.01)
+    raise RuntimeError('the prewarm did not finish')
+
+def log_size():
+    try:
+        return (work / 'server.log').stat().st_size
+    except FileNotFoundError:
+        return 0
+
 result = {}
 proc = None
 try:
@@ -235,11 +265,35 @@ try:
             headers={'Content-Type': 'application/sparql-query',
                      'Accept': a.format})
         times, digests, sizes, metas = [], [], [], []
+        readies, prewarms = [], []
         failed = None
-        for i in range(a.runs + (0 if a.cold else a.warmup)):
+        if a.prewarm:
+            # a pass that leaves this query's blocks and pages in the list at shutdown,
+            # starting from no list, so that no other query's list carries over
+            (Path(a.db) / 'prewarm.json').unlink(missing_ok=True)
+            evict()
+            proc = start()
+            try:
+                for _ in range(max(a.warmup, 1)):
+                    urllib.request.urlopen(req, timeout=600).read()
+            except (urllib.error.URLError, TimeoutError) as e:
+                if not a.keep_going:
+                    raise
+                failed = str(getattr(e, 'code', '') or e)
+            stop(proc)
+            proc = None
+            # every sample reads the seed's list, not one its predecessor rewrote
+            seed = (Path(a.db) / 'prewarm.json').read_bytes() if failed is None else None
+        for i in range(0 if failed is not None else a.runs + (0 if a.cold else a.warmup)):
             if a.cold:
+                if a.prewarm:
+                    (Path(a.db) / 'prewarm.json').write_bytes(seed)
                 evict()
+                offset = log_size()
                 proc = start()
+                readies.append(ready_ms)
+                if a.prewarm:
+                    prewarms.append(wait_prewarm(offset))
             before = time.perf_counter()
             try:
                 with urllib.request.urlopen(req, timeout=600) as response:
@@ -284,6 +338,10 @@ try:
         result[name] = {'ms': times, 'median': statistics.median(times),
                         'mean': statistics.mean(times), 'stdev': statistics.stdev(times) if len(times) > 1 else 0,
                         'hashes': sorted(set(digests)), 'rows': sorted(set(sizes))}
+        if a.cold:
+            result[name]['ready_ms'] = readies
+        if a.prewarm:
+            result[name]['prewarm_ms'] = prewarms
         if a.io:
             # per sample: the server's own times and the I/O profile (docs/API.md, the I/O profile)
             result[name]['meta'] = metas

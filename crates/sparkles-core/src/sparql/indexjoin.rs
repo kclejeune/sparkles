@@ -1414,6 +1414,8 @@ fn read_ranges_gallop(
     // where the range before ended
     let mut b = 0usize;
     let mut cur: Option<(usize, usize, Block)> = None;
+    // the last block whose ranges ahead `segment_part` walked
+    let mut looked = usize::MAX;
     let mut row = 0usize;
     let mut seen = 0usize;
     for r in 0..ranges.len() {
@@ -1470,16 +1472,29 @@ fn read_ranges_gallop(
                 (Some((cb, cp, held)), _)
                     if *cb == x && *cp != 0 && lead_cmp(held, held.len() - 1, &lo, d).is_ge() =>
                 {
-                    *cp
+                    // a range that runs on into later segments, which may be cold, has the
+                    // walk of `segment_part` over all of them before it reads any row
+                    let s = *cp - 1;
+                    let mut end = s + 1;
+                    while !idx.last_segment(x, end - 1) && idx.segment_first(x, end) <= hi {
+                        end += 1;
+                    }
+                    if end > s + 1 {
+                        segment_part(ctx, idx, ranges, (r, x), mask, Some((s, end)), &mut looked)?
+                    } else {
+                        *cp
+                    }
                 }
                 // another segment of the held block, whose columns the cache did not hold
                 // whole when it was read
                 (Some((cb, cp, _)), _) if *cb == x && *cp != 0 => {
-                    idx.segment_span(x, &lo, &hi).map_or(0, |(s0, _)| s0 + 1)
+                    let span = idx.segment_span(x, &lo, &hi);
+                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)?
                 }
-                _ => idx
-                    .read_span(&ctx.snap.cache, x, &lo, &hi, mask)
-                    .map_or(0, |(s0, _)| s0 + 1),
+                _ => {
+                    let span = idx.read_span(&ctx.snap.cache, x, &lo, &hi, mask);
+                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)?
+                }
             };
             let from = match &cur {
                 Some((cb, cp, _)) if *cb == x && *cp == part => Some(row),
@@ -1545,6 +1560,93 @@ fn read_ranges_gallop(
     }
     ctx.check_output(total(out), width)?;
     Ok(())
+}
+
+/// The part of block `x` that the reader of range `r` holds next: 0 for the whole
+/// columns, or one more than the first segment of `span`. At the first range of a block
+/// whose span has a cold segment, it reads the block whole when the ranges ahead read
+/// much of it ([`dense_ahead`]), instead of segment by segment until it turns dense,
+/// which a join of more ranges than its prefetch takes (`PREFETCH_RANGES`) would
+/// otherwise do in every block. `looked` keeps that walk to once per block.
+#[inline(always)]
+fn segment_part(
+    ctx: &Ctx,
+    idx: &crate::index::PermIndex,
+    ranges: &Ranges,
+    (r, x): (usize, usize),
+    mask: ColMask,
+    span: Option<(usize, usize)>,
+    looked: &mut usize,
+) -> Result<usize> {
+    let Some((s0, s1)) = span else {
+        return Ok(0);
+    };
+    if *looked != x {
+        return first_look(ctx, idx, ranges, (r, x), mask, (s0, s1), looked);
+    }
+    Ok(s0 + 1)
+}
+
+/// The part of [`segment_part`] at a block's first range with a cold segment, kept out of
+/// line so that the code of the reader's loop does not grow with it.
+#[cold]
+#[inline(never)]
+fn first_look(
+    ctx: &Ctx,
+    idx: &crate::index::PermIndex,
+    ranges: &Ranges,
+    (r, x): (usize, usize),
+    mask: ColMask,
+    (s0, s1): (usize, usize),
+    looked: &mut usize,
+) -> Result<usize> {
+    // a range's span starts at the segment before its first key's, which a reader of the
+    // range before has often just read, so any cold segment of the span counts
+    if (s0..s1).any(|s| !ctx.snap.cache.has_segment(idx, x, s, mask)) {
+        *looked = x;
+        if dense_ahead(ctx, idx, ranges, r, x)? {
+            idx.mark_dense(x);
+            return Ok(0);
+        }
+    }
+    Ok(s0 + 1)
+}
+
+/// Whether the ranges from `r` on that lie in block `x` read more than a quarter of its
+/// segments, so that the reader should read the block whole now instead of reading
+/// segments one by one until the block turns dense (spec X07 §6.5). Ranges come in key
+/// order, so the walk stops at the first range past the block, or as soon as the answer
+/// is known. Many ranges in a few segments make a long walk, which checks the request
+/// every `PREFETCH_CHECK_STEPS` ranges.
+#[cold]
+#[inline(never)]
+fn dense_ahead(
+    ctx: &Ctx,
+    idx: &crate::index::PermIndex,
+    ranges: &Ranges,
+    r: usize,
+    x: usize,
+) -> Result<bool> {
+    let limit = idx.dense_limit(x);
+    let last = idx.blocks[x].last;
+    let mut seen = 0u64;
+    for i in r..ranges.len() {
+        if (i - r) % PREFETCH_CHECK_STEPS as usize == PREFETCH_CHECK_STEPS as usize - 1 {
+            ctx.check()?;
+        }
+        let (lo, hi) = ranges.get(i);
+        if lo > last {
+            break;
+        }
+        match idx.segment_span(x, &lo, &hi) {
+            None => return Ok(true),
+            Some((s0, s1)) => seen |= ((1u64 << (s1 - s0)) - 1) << s0,
+        }
+        if seen.count_ones() as usize > limit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Append row `k` of range `r` to its pattern's table if it passes `rule` (see
@@ -2306,5 +2408,268 @@ mod combine_tests {
             ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
             assert!(matches!(run(&ctx, &left, right), Err(Error::Timeout)));
         }
+    }
+}
+
+#[cfg(test)]
+mod dense_ahead_tests {
+    use super::*;
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+
+    /// A segmented generation with one predicate over 80,000 subjects, and a block of its
+    /// PSO rows that holds many segments.
+    fn store() -> (tempfile::TempDir, Store) {
+        store_of(1)
+    }
+
+    /// [`store`] with `rows` values per subject, so that subjects cross segment bounds.
+    fn store_of(rows: usize) -> (tempfile::TempDir, Store) {
+        store_with(|_| rows)
+    }
+
+    /// [`store`] with `rows(i)` values for subject `i`.
+    fn store_with(rows: impl Fn(u64) -> usize) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let mut nt = String::new();
+        for i in 0..80_000u64 {
+            for v in 0..rows(i) {
+                nt.push_str(&format!("<http://e/s{i:06}> <http://e/p> \"v{i}-{v}\" .\n"));
+            }
+        }
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        (dir, s)
+    }
+
+    #[test]
+    fn many_keys_in_a_block_read_it_whole_and_few_keys_read_segments() {
+        let (_dir, s) = store();
+        let snap = s.snapshot();
+        let idx = snap.perm(Perm::Pso);
+        assert!(idx.segmented());
+        let b = (0..idx.blocks.len())
+            .find(|&b| idx.segment_count(b).is_some_and(|n| n >= 8))
+            .expect("a block of 8 segments or more");
+        let ctx = Ctx::new(snap.clone());
+        let blk = idx.decode_block(b).unwrap();
+        let p = blk.key(0)[0];
+        let subjects: Vec<u64> = (0..blk.len()).map(|y| blk.key(y)[1]).collect();
+        // one key per segment, in every segment: more than a quarter of the segments
+        let n = idx.segment_count(b).unwrap();
+        let rows = blk.len().div_ceil(n);
+        let spread: Vec<u64> = subjects.iter().step_by(rows).copied().collect();
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &spread,
+        };
+        assert!(dense_ahead(&ctx, idx, &ranges, 0, b).unwrap());
+        // keys in the first segment only, and a single key, read their segments
+        let first: Vec<u64> = subjects[..rows.min(50)].to_vec();
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &first,
+        };
+        assert!(!dense_ahead(&ctx, idx, &ranges, 0, b).unwrap());
+        let one = [subjects[rows * 2]];
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &one,
+        };
+        assert!(!dense_ahead(&ctx, idx, &ranges, 0, b).unwrap());
+        // the walk starts at the range it is given: from the last key of the spread on,
+        // only one segment is left
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &spread,
+        };
+        assert!(!dense_ahead(&ctx, idx, &ranges, spread.len() - 1, b).unwrap());
+        // a long walk over many ranges in few segments answers a cancelled request
+        let few: Vec<u64> = subjects[..rows].to_vec();
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &few,
+        };
+        ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(few.len() > PREFETCH_CHECK_STEPS as usize);
+        assert!(matches!(
+            dense_ahead(&ctx, idx, &ranges, 0, b),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    /// The segments of block `b` that the cache holds one by one.
+    fn single_segments(snap: &crate::store::Snapshot, b: usize) -> usize {
+        let idx = snap.perm(Perm::Pso);
+        snap.cache.held_parts(&[idx])[0]
+            .iter()
+            .filter(|&&(blk, part, _)| blk as usize == b && part != 0)
+            .count()
+    }
+
+    #[test]
+    fn a_join_reads_a_block_whole_at_its_first_cold_segment() {
+        for preseed in [false, true] {
+            let (_dir, s) = store();
+            let snap = s.snapshot();
+            let idx = snap.perm(Perm::Pso);
+            let b = (0..idx.blocks.len())
+                .find(|&b| idx.segment_count(b).is_some_and(|n| n >= 8))
+                .expect("a block of 8 segments or more");
+            let blk = idx.decode_block(b).unwrap();
+            let p = blk.key(0)[0];
+            let n = idx.segment_count(b).unwrap();
+            let rows = blk.len().div_ceil(n);
+            let keys: Vec<u64> = (0..blk.len())
+                .step_by(rows)
+                .map(|y| blk.key(y)[1])
+                .collect();
+            let ranges = Ranges::Keys {
+                prefix: &[p],
+                keys: &keys,
+            };
+            let mask = 0b111;
+            // the first segment warm, the others cold: the walk runs at the next one
+            if preseed {
+                snap.cache.get_segment(idx, b, 0, mask, false).unwrap();
+            }
+            let ctx = Ctx::new(snap.clone());
+            let rule = RowRule {
+                graph: &GraphFilter::All,
+                graph_col: Perm::Pso.col_of(G),
+                eqs: &[],
+                dedup: false,
+            };
+            let mut out = vec![Table::new(vec![0])];
+            let mut stats = Stats::default();
+            read_ranges_gallop(
+                &ctx,
+                Perm::Pso,
+                &ranges,
+                &[vec![2]],
+                &rule,
+                &mut out,
+                &mut stats,
+            )
+            .unwrap();
+            assert_eq!(out[0].len(), keys.len());
+            assert!(idx.is_dense(b));
+            assert!(snap.cache.has_cols(idx, b, mask));
+            // no segment past the preseeded one was decoded on its own
+            assert_eq!(
+                single_segments(&snap, b),
+                preseed as usize,
+                "preseed {preseed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_range_that_runs_on_from_a_warm_segment_into_a_cold_one_has_the_walk() {
+        let (_dir, s) = store_of(3);
+        let snap = s.snapshot();
+        let idx = snap.perm(Perm::Pso);
+        let b = (0..idx.blocks.len())
+            .find(|&b| idx.segment_count(b).is_some_and(|n| n >= 8))
+            .expect("a block of 8 segments or more");
+        let blk = idx.decode_block(b).unwrap();
+        let p = blk.key(0)[0];
+        let n = idx.segment_count(b).unwrap();
+        let (_, end0) = idx.segment_rows(b, 0);
+        // the subject in the last row of segment 0 has rows in segment 1 too
+        let straddle = blk.key(end0 - 1)[1];
+        assert_eq!(blk.key(end0)[1], straddle, "a subject across the bound");
+        let mut keys = vec![blk.key(0)[1], straddle];
+        for t in 2..n {
+            let (r0, _) = idx.segment_rows(b, t);
+            keys.push(blk.key(r0 + 1)[1]);
+        }
+        keys.dedup();
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &keys,
+        };
+        let mask = 0b111;
+        snap.cache.get_segment(idx, b, 0, mask, false).unwrap();
+        let ctx = Ctx::new(snap.clone());
+        let rule = RowRule {
+            graph: &GraphFilter::All,
+            graph_col: Perm::Pso.col_of(G),
+            eqs: &[],
+            dedup: false,
+        };
+        let mut out = vec![Table::new(vec![0])];
+        let mut stats = Stats::default();
+        read_ranges_gallop(
+            &ctx,
+            Perm::Pso,
+            &ranges,
+            &[vec![2]],
+            &rule,
+            &mut out,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out[0].len(), keys.len() * 3);
+        assert!(snap.cache.has_cols(idx, b, mask));
+        // segment 1 was not decoded on its own before the block was read whole
+        assert_eq!(single_segments(&snap, b), 1);
+    }
+
+    #[test]
+    fn a_range_over_several_warm_segments_into_a_cold_one_has_the_walk() {
+        // subject 1 has 5,000 rows, from segment 0 of block 0 into segment 2
+        let (_dir, s) = store_with(|i| if i == 1 { 5000 } else { 1 });
+        let snap = s.snapshot();
+        let idx = snap.perm(Perm::Pso);
+        let b = 0;
+        let n = idx.segment_count(b).unwrap();
+        assert!(n >= 8);
+        let blk = idx.decode_block(b).unwrap();
+        let p = blk.key(0)[0];
+        let big = blk.key(1)[1];
+        let (r2, _) = idx.segment_rows(b, 2);
+        assert_eq!(blk.key(r2)[1], big, "subject 1 reaches segment 2");
+        let mut keys = vec![blk.key(0)[1], big];
+        for t in 3..n {
+            let (r0, _) = idx.segment_rows(b, t);
+            keys.push(blk.key(r0 + 1)[1]);
+        }
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &keys,
+        };
+        let mask = 0b111;
+        for seg in 0..2 {
+            snap.cache.get_segment(idx, b, seg, mask, false).unwrap();
+        }
+        let ctx = Ctx::new(snap.clone());
+        let rule = RowRule {
+            graph: &GraphFilter::All,
+            graph_col: Perm::Pso.col_of(G),
+            eqs: &[],
+            dedup: false,
+        };
+        let mut out = vec![Table::new(vec![0])];
+        let mut stats = Stats::default();
+        read_ranges_gallop(
+            &ctx,
+            Perm::Pso,
+            &ranges,
+            &[vec![2]],
+            &rule,
+            &mut out,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out[0].len(), keys.len() - 1 + 5000);
+        assert!(snap.cache.has_cols(idx, b, mask));
+        // segment 2 was not decoded on its own before the block was read whole
+        assert_eq!(single_segments(&snap, b), 2);
     }
 }

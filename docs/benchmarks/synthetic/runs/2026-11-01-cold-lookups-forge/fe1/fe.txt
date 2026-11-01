@@ -1,0 +1,13 @@
+1 base group-avg ms_per_req=46398us
+1 base expr-agg-arg ms_per_req=29315us
+1 fin group-avg ms_per_req=51036us
+1 fin expr-agg-arg ms_per_req=34228us
+1 att1 group-avg ms_per_req=46265us
+1 att1 expr-agg-arg ms_per_req=29285us
+2 base group-avg ms_per_req=45901us
+2 base expr-agg-arg ms_per_req=29479us
+2 fin group-avg ms_per_req=50821us
+2 fin expr-agg-arg ms_per_req=33987us
+2 att1 group-avg ms_per_req=46031us
+2 att1 expr-agg-arg ms_per_req=29654us
+done

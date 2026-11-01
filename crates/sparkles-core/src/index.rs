@@ -2304,6 +2304,11 @@ impl BlockCache {
         }
         self.usage().entries as usize
     }
+    /// The bytes the underlying cache holds for all its views together, which unlike
+    /// [`bytes`](Self::bytes) of a shared view costs no walk over the entries.
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.cache.weight()
+    }
     /// The bytes the underlying cache may hold, shared with other views or not.
     pub fn capacity(&self) -> u64 {
         self.cache.capacity()
@@ -2311,6 +2316,40 @@ impl BlockCache {
     /// The namespace of this view's entries.
     pub fn namespace(&self) -> u32 {
         self.ns
+    }
+
+    /// The decoded parts of the blocks of `perms` that this view holds, for a prewarm
+    /// list (spec X07 §7): per permutation, `(block, part, mask)` in block order, where
+    /// part 0 stands for whole columns, part `s + 1` for segment `s`, and `mask` holds
+    /// the columns the cache has of that part.
+    pub(crate) fn held_parts(&self, perms: &[&PermIndex]) -> Vec<Vec<(u32, u32, ColMask)>> {
+        let mut held: Vec<std::collections::BTreeMap<(u32, u32), ColMask>> =
+            vec![Default::default(); perms.len()];
+        for ((uid, bs, c), _) in self.cache.iter() {
+            if c >> 8 != self.ns {
+                continue;
+            }
+            if let Some(i) = perms.iter().position(|p| p.uid == uid) {
+                let part = bs & ((1 << SEG_KEY_BITS) - 1);
+                *held[i].entry((bs >> SEG_KEY_BITS, part)).or_default() |= 1 << (c & 3);
+            }
+        }
+        held.into_iter()
+            .map(|m| m.into_iter().map(|((b, p), mask)| (b, p, mask)).collect())
+            .collect()
+    }
+
+    /// Decode segment `s` of block `b` with the columns in `mask` into the cache for a
+    /// prewarm, without counting it toward the block's limit of segments read one by one:
+    /// a restored segment says nothing about how the next queries read the block.
+    pub(crate) fn prewarm_segment(
+        &self,
+        idx: &PermIndex,
+        b: usize,
+        s: usize,
+        mask: ColMask,
+    ) -> Result<()> {
+        self.segment_counted(idx, b, s, mask, true, false).map(drop)
     }
     fn usage(&self) -> NamespaceUsage {
         let mut u = NamespaceUsage::default();

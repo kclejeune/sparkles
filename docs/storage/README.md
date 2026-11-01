@@ -54,6 +54,21 @@ These read paths are tuned for queries over data that is not yet in memory
   repeat of a query makes no read hint.
 * Index joins decode the columns they need on a separate pool, and optional warmup
   observes cancellation and deadlines. Each step has its own `Optimizations` flag.
+* A point lookup in index format 3 decodes the frames of 2,048 rows that can hold its
+  keys. An index join whose keys in one block span more than a quarter of the block's
+  frames reads the block whole at its first cold frame, so a large join does not read
+  frames one by one before it reads their block again.
+* `sparkles serve --prewarm` records, at shutdown and every `--prewarm-interval` seconds,
+  the decoded blocks that each persistent dataset's block cache holds
+  and the pages of its vocabulary and frame directories that are in the page cache. The
+  next start with `--prewarm` reads them in the background once the server is ready, at
+  a lower CPU priority than requests. The list is `prewarm.json` in the database
+  directory. A list for another generation is ignored, and a list of an unknown version
+  is refused with a warning while the dataset serves as usual. Recording takes page
+  residency from the page cache, so a list written soon after a load holds every page
+  the load left there, up to 4 GiB. On forge at 10.5M, with the list of a warm pass, cold
+  `star-lookup` takes 3.3 ms instead of 11.4 ms and `star-join` 33 ms instead of 78 ms,
+  after a background read of 15 and 71 ms. The interval is 300 seconds by default.
 * `profile=io` on a query returns its phase times, the index columns it decoded, the
   bytes it requested and sampled page residency, for callers with the `metrics`
   permission. `/$/metrics` counts decoded columns, read-ahead bytes and vocabulary
@@ -324,10 +339,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Vocabulary codec and predicate-pattern choices have no dataset-local layered settings.
   Roadmap item 343 adds settings for subsequent builds and compactions while retaining
   each existing generation's recorded format.
-* Cold `values-star` and `path-plus` were slower than Oxigraph at 1.05M and 10.5M, as was
-  cold `star-lookup` at 10.5M, and that comparison has not been repeated on index format
-  3. Index format 3 makes cold `star-join` at 10.5M 6% to 8% slower. Dense reads on the
-  1.01B dataset are unmeasured. Roadmap item 4.
+* Cold `path-plus` takes 3.3 ms against Oxigraph's 2.7 ms at 1.05M and 2.2 ms at 10.5M.
+  Cold `star-lookup`, `values-star` and `employee-docs` are faster than Oxigraph at both
+  scales. Dense reads on the 1.01B dataset are unmeasured. Roadmap item 4.
+* Warm point lookups run 1.6% to 2.5% more instructions per request for the index join's
+  check of cold segments. Roadmap item 516.
+* The prewarm restores the block cache and the pages of the generation's files. It does
+  not restore the result cache, and it reads data that the next queries may never touch.
+  Its list holds at most 4 GiB of pages.
 * Group commit on datasets with a full-text, spatial or embedding index meets its gates
   ([X09](../specs/X09-group-commit-by-default.md#phase-4)). A serial commit pays 0.1% to
   0.3% more instructions for the group's admission checks, and spatial readers at 1.05M
@@ -406,7 +425,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item 496](../ROADMAP.md), [item 497](../ROADMAP.md), [item 498](../ROADMAP.md), [item 501](../ROADMAP.md), [item 502](../ROADMAP.md).
+The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item 496](../ROADMAP.md), [item 497](../ROADMAP.md), [item 498](../ROADMAP.md), [item 501](../ROADMAP.md), [item 502](../ROADMAP.md), [item 516](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

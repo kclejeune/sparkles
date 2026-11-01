@@ -70,6 +70,7 @@ mod patch_apply;
 mod preflight_tests;
 mod preparation;
 mod preview;
+pub mod prewarm;
 mod quota;
 mod replay;
 mod schedule;

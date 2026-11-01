@@ -65,6 +65,7 @@ mod outbound;
 mod patch_cmd;
 #[cfg(feature = "auth")]
 mod ping_cmd;
+mod prewarm;
 mod projection;
 mod queries_cmd;
 mod quota_cmd;
@@ -1061,6 +1062,14 @@ enum Cmd {
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
+        /// Record the index blocks and file pages that each persistent dataset used, at
+        /// shutdown and every --prewarm-interval seconds, and after a start is ready read
+        /// the ones recorded before in the background (off by default)
+        #[arg(long)]
+        prewarm: bool,
+        /// Seconds between two recordings of the prewarm lists (with --prewarm)
+        #[arg(long, value_name = "SECONDS", default_value_t = 300.0)]
+        prewarm_interval: f64,
         /// Enable full-text search for a dataset: NAME, or NAME=CONFIG.json
         #[arg(long)]
         text: Vec<String>,
@@ -2693,6 +2702,8 @@ fn run() -> Result<()> {
             ask_history_days,
             load_dir,
             idle_release_ms,
+            prewarm,
+            prewarm_interval,
             mut text,
             mut geo,
             validate,
@@ -3223,6 +3234,11 @@ fn run() -> Result<()> {
             rayon::broadcast(|_| ());
             alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
+            // at least a second, and small enough for an `Instant` deadline
+            let prewarm_interval = match Duration::try_from_secs_f64(prewarm_interval) {
+                Ok(d) if (1.0..=1e9).contains(&prewarm_interval) => d,
+                _ => bail!("--prewarm-interval expects a number of seconds from 1 to 1e9"),
+            };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)
                 .enable_all()
@@ -3247,6 +3263,8 @@ fn run() -> Result<()> {
             let startup_slot: Arc<parking_lot::Mutex<Option<startup::Startup>>> =
                 Default::default();
             let startup_after = startup_slot.clone();
+            let prewarm_slot: Arc<parking_lot::Mutex<Option<prewarm::Worker>>> = Default::default();
+            let prewarm_after = prewarm_slot.clone();
             let mut open_options = startup::Options::default();
             if let Some(n) = open_threads {
                 open_options.threads = n as usize;
@@ -3356,6 +3374,9 @@ fn run() -> Result<()> {
                         notify.notify_one();
                     });
                 let stop_opening = opening.stop_flag();
+                if prewarm {
+                    *prewarm_slot.lock() = prewarm::start(st.clone(), prewarm_interval);
+                }
                 *startup_slot.lock() = Some(opening);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
@@ -3447,6 +3468,13 @@ fn run() -> Result<()> {
                 s.stop_and_join();
             }
             auth::flush(&st_after);
+            if prewarm {
+                // the worker holds the server's state: it ends before the last recording
+                if let Some(w) = prewarm_after.lock().take() {
+                    w.stop_and_join();
+                }
+                prewarm::record_all(&st_after);
+            }
             // flush spans and metrics of the last requests (bounded)
             otel_guard.shutdown();
             match fatal_after.lock().take() {

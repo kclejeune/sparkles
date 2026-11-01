@@ -261,13 +261,61 @@ comparable with the `bench.sh` times above.
 
 *Measured on forge on 2026-10-23, with the format 3 build at commit e86a371a.*
 
-`star-join` at 10.5M is the one cold query that is slower, by 6% to 8% in two runs of 12
-rounds. Its index join reads up to a quarter of a block's segments one by one before the
-block is read whole, and [X07](../../specs/X07-cold-sparse-reads.md#phase-3-results) records the
-fixes that were tried. Warm instruction counts per request stay within 0.969 to 1.024 of
+In the build that introduced format 3, `star-join` at 10.5M was 6% to 8% slower than on
+unsegmented blocks, because its index join read up to a quarter of a block's segments one
+by one before it read the block whole. The join now looks ahead over its ranges at the
+first cold segment of a block and reads the block whole at once when they span more than
+a quarter of it. Warm instruction counts per request stay within 0.969 to 1.024 of
 unsegmented blocks, and a warm pass makes no read hint. The store at 10.5M grows by 3.0%,
 from 300.6 MB to 309.7 MB, and the load takes 3.7 seconds with a peak of about 2.05 GB
 either way.
+
+| Cold, forge, 10.5M, median ms | Unsegmented | Format 3 before the lookahead | Format 3 with it |
+|---|---:|---:|---:|
+| `star-join` | 77.8 | 83.8 to 85.7 | 76.9 to 78.5 |
+| `star-lookup` | 20.9 | 11.1 to 11.8 | 10.9 to 11.6 |
+| `employee-docs` | 15.0 | 10.3 to 11.0 | 10.1 to 10.6 |
+| `knows-reach` | 215.2 | 201.2 to 202.0 | 199.5 to 201.4 |
+
+*Measured on forge on 2026-11-01 with `bench-regressions.py --cold`, 7 or 11 samples in
+interleaved rounds of A, B, B and A. The unsegmented column comes from the build at
+72d85c7f on its own store, and the format 3 columns from 04d49b57 and from 38deb1e8 and
+cd46d9c3, which differ only in the inlining of the lookahead.*
+
+The same build ran the cold rows of `bench.sh` against Oxigraph on forge, in two rounds of
+five restarts per engine and query. Sparkles leads on the three point lookups and still
+loses `path-plus`.
+
+| Cold, `bench.sh`, median of 10, ms | Oxigraph 1.05M | Sparkles 1.05M | Oxigraph 10.5M | Sparkles 10.5M |
+|---|---:|---:|---:|---:|
+| `star-lookup` | 21.2 | **12.4** | 19.0 | **10.0** |
+| `values-star` | 7.3 | **6.7** | 7.2 | **5.9** |
+| `employee-docs` | 19.2 | **9.2** | 16.0 | **10.1** |
+| `path-plus` | **2.7** | 3.3 | **2.2** | 3.3 |
+| `star-join` | 1,165.6 | **19.3** | 12,176.3 | **87.8** |
+
+*Measured on forge on 2026-11-01 at commit 38deb1e8, with Oxigraph from the repository's
+pinned packages. These rows come from a separate run from the 28-query table above.*
+
+`serve --prewarm` restarts with the blocks and pages that the last run used. Each sample
+below starts a fresh server on an evicted store with the list that a warm pass of the same
+query recorded, and waits for the background read to finish before it sends the query.
+The time to ready stays at 52 ms with and without the prewarm.
+
+| Cold, forge, median ms | 1.05M off | 1.05M on | Prewarm read | 10.5M off | 10.5M on | Prewarm read |
+|---|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | 12.7 | **3.5** | 18.8 | 11.4 | **3.3** | 15.3 |
+| `values-star` | 7.2 | **3.9** | 5.7 | 7.3 | **3.7** | 5.7 |
+| `employee-docs` | 9.2 | **3.6** | 9.2 | 10.5 | **3.2** | 12.3 |
+| `path-plus` | 3.7 | 3.5 | 2.7 | 3.4 | 3.3 | 2.8 |
+| `star-join` | 21.5 | **11.4** | 18.5 | 77.9 | **33.4** | 71.1 |
+
+The final build runs `group-avg` and `expr-agg-arg` at 10.5M within 0.5% of main warm and
+no slower cold, with the instructions and cycles of main. Warm point lookups run 1.6% to 2.5%
+more instructions for the check of cold segments, which
+[item 516](../../ROADMAP.md#performance-follow-ups) covers.
+The [immutable run record](runs/2026-11-01-cold-lookups-forge/validation.json) holds the
+revisions, binary hashes, scripts, compressed samples and answer hashes of every step.
 
 ## Separate Wally optional-chain profile
 

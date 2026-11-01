@@ -1,0 +1,223 @@
+{
+  "format_version": 1,
+  "kind": "pinned_internal_ab_and_cold_engine_comparison",
+  "item": 4,
+  "spec": "docs/specs/X07-cold-sparse-reads.md",
+  "host": "forge",
+  "cpu": "13th Gen Intel Core i5-13500",
+  "kernel": "7.2.9",
+  "revisions": {
+    "base": {
+      "commit": "04d49b57",
+      "role": "main before the lane"
+    },
+    "fin": {
+      "commit": "38deb1e8",
+      "role": "the lane's code tip: serve --prewarm and the join lookahead"
+    },
+    "pre3": {
+      "commit": "72d85c7f",
+      "role": "the last build before index format 3, which loaded the unsegmented stores db10m-u and db1m-u"
+    },
+    "exp": {
+      "commit": "04d49b57",
+      "role": "base with an uncommitted first version of the join lookahead and an XNOLOOK environment switch that turns it off, used only for look-agg"
+    },
+    "att1": {
+      "commit": "cd46d9c3",
+      "role": "the final code: 38deb1e8 with the lookahead's first look and walk kept out of line and cold"
+    }
+  },
+  "binary_sha256": {
+    "base": "8a93ee7563cba3146ff8e6bac471791eed7c4b02bcad8dcc29178778c1a85678",
+    "fin": "6d5a229d006267d8dd0d7ef645c1bb2a67249722417dd3c140f905628b31291c",
+    "pre3": "dff16e58146988684469c3be07e1681473aeb9bff6859445987cc1a1fc1b4323",
+    "exp": "c9f17d0a28c2fb261f931fa2c396955312102eb3ffeeb0ccd6ceb7c48fe5d498",
+    "att1": "0813b9f69f4874596efff7c4fc74e598deb114f608ba34eb8b513ff1b387d61c"
+  },
+  "compiler_provenance": "GCC 15.3.0, clang 23.1.0git, LLD 23.1.1, rustc 1.99.1 (58cf8f9c3 2026-10-13); the .comment sections of the five binaries are identical. Built on forge with mbx build --release -p sparkles-server --bin sparkles in nix develop.",
+  "stores": "db10m and db1m are format 3 stores loaded by base from the synthetic generator at 10.5M and 1.05M triples; db10m-u and db1m-u are unsegmented stores loaded by pre3.",
+  "locks": "Every step held ~/lanes/.heavy.lock on forge; no other build or benchmark ran during a step.",
+  "methods": {
+    "ab": "scripts/ab.sh: interleaved rounds of A, B, B and A, each a bench-regressions.py run with --cold N (a fresh server per sample after evicting the store with posix_fadvise DONTNEED) or --warmup 3 and N warm samples, server pinned to CPUs 0-11, port 43800.",
+    "prewarm": "bench-regressions.py --prewarm: a seed pass per query records prewarm.json from a warm server, the list is restored before each sample, and each cold sample starts a server with --prewarm and waits for its 'prewarm finished' log line before the query; ready_ms and prewarm_ms are kept per sample.",
+    "insn": "scripts/insn.sh: a warm server per binary and round, three warm-up requests per query, then perf stat -e instructions:u on the server process over 20 requests. scripts/insn.sh in this record points perf at a GC root; the first insn step used the same perf build from the store directly.",
+    "engines": "scripts/plan3.sh: scripts/bench.sh MODE=cold COLD_RUNS=5 SKIP_LOAD=1 for Oxigraph from the repository's pinned packages, fin and base, in two rounds per scale with the engines in turn.",
+    "fe": "scripts/fe.sh: a warm server per binary and round, three warm-up requests, then perf stat over 20 requests with user-mode cycles, instructions, frontend_retired.any_dsb_miss, frontend_retired.l1i_miss, frontend_retired.itlb_miss, dsb2mite_switches.penalty_cycles, br_misp_retired.all_branches, topdown-fe-bound and slots on the P-cores."
+  },
+  "steps": {
+    "suite10": "base against fin, 28 queries, 10.5M, 7 cold samples, 2 pairs",
+    "suite1": "base against fin, 28 queries, 1.05M, 7 cold samples, 1 pair",
+    "unseg-fin": "pre3 on the unsegmented store against fin on format 3, 10.5M, 11 cold samples, 2 pairs",
+    "prewarm10": "fin against fin with --prewarm, 10.5M, 7 cold samples, 1 pair",
+    "prewarm1": "fin against fin with --prewarm, 1.05M, 7 cold samples, 1 pair",
+    "warm10": "base against fin, 27 queries without export, 10.5M, 21 warm samples, 2 pairs",
+    "flag10": "base against fin, the queries suite10 flagged, 10.5M, 11 cold samples, 3 pairs",
+    "flag1": "base against fin, the queries suite1 flagged, 1.05M, 11 cold samples, 3 pairs",
+    "look-agg": "exp with XNOLOOK=1 against exp, 10.5M, 7 cold samples, 2 pairs",
+    "prof-base-agg, prof-fin-agg": "profile=io of group-avg, expr-agg-arg, values-star and path-plus, 3 cold samples",
+    "insn": "base and fin, 2 rounds",
+    "bench-<scale>-<engine>-<round>": "bench.sh cold rows of five queries",
+    "fe1": "front-end counters of base, fin and att1, 2 rounds",
+    "att1-warm": "base against att1, 5 queries, 10.5M, 21 warm samples, 2 pairs",
+    "att1-cold": "base against att1, 5 queries, 10.5M, 11 cold samples, 2 pairs",
+    "att1-suite10": "base against att1, 28 queries, 10.5M, 7 cold samples, 2 pairs",
+    "att1-warm10": "base against att1, 27 queries, 10.5M, 21 warm samples, 2 pairs",
+    "att1-warmflag": "base against att1, the queries att1-warm10 flagged and the two placement queries, 10.5M, 21 warm samples, 4 pairs",
+    "insn-att1": "instructions per request of base, fin and att1, 2 rounds"
+  },
+  "correctness": "Every A/B step's summary lists one answer hash per query across both sides (column 'hashes'). bench.sh checks row agreement across the engines before timing.",
+  "results": {
+    "cold_10m_star_join_ms": {
+      "base": 83.81,
+      "fin": 78.34,
+      "pre3_unsegmented": 77.79,
+      "fin_in_unseg_step": 78.53
+    },
+    "cold_engines_median_ms": {
+      "10.5M": {
+        "star-lookup": [
+          19.02,
+          10.02,
+          10.67
+        ],
+        "values-star": [
+          7.17,
+          5.87,
+          6.22
+        ],
+        "employee-docs": [
+          16.0,
+          10.05,
+          9.91
+        ],
+        "path-plus": [
+          2.22,
+          3.3,
+          3.26
+        ],
+        "star-join": [
+          12176.27,
+          87.77,
+          90.49
+        ]
+      },
+      "1.05M": {
+        "star-lookup": [
+          21.21,
+          12.41,
+          12.08
+        ],
+        "values-star": [
+          7.29,
+          6.74,
+          6.58
+        ],
+        "employee-docs": [
+          19.18,
+          9.16,
+          9.12
+        ],
+        "path-plus": [
+          2.67,
+          3.3,
+          3.62
+        ],
+        "star-join": [
+          1165.59,
+          19.31,
+          19.79
+        ]
+      },
+      "order": [
+        "oxigraph",
+        "fin",
+        "base"
+      ]
+    },
+    "insn_per_request": {
+      "group-avg": [
+        535704943,
+        528080858
+      ],
+      "expr-agg-arg": [
+        290950954,
+        284692053
+      ],
+      "star-lookup": [
+        1661558,
+        1691144
+      ],
+      "employee-docs": [
+        877399,
+        902113
+      ],
+      "star-join": [
+        758543310,
+        759297821
+      ],
+      "order": [
+        "base",
+        "fin"
+      ]
+    },
+    "placement": {
+      "warm_ms_base_fin_att1": {
+        "group-avg": [
+          40.12,
+          45.72,
+          40.12
+        ],
+        "expr-agg-arg": [
+          23.61,
+          28.48,
+          23.93
+        ]
+      },
+      "cycles_per_request_base_fin_att1": {
+        "group-avg": [
+          155000000.0,
+          174000000.0,
+          156000000.0
+        ],
+        "expr-agg-arg": [
+          90000000.0,
+          108000000.0,
+          90900000.0
+        ]
+      },
+      "instructions_ratio_to_base_fin_att1": {
+        "group-avg": [
+          0.9852,
+          1.0
+        ],
+        "expr-agg-arg": [
+          0.9782,
+          1.0
+        ],
+        "star-lookup": [
+          1.0153,
+          1.0155
+        ],
+        "employee-docs": [
+          1.0281,
+          1.0249
+        ],
+        "star-join": [
+          1.001,
+          0.9986
+        ]
+      }
+    },
+    "cold_10m_star_join_ms_att1": {
+      "base": [
+        85.74,
+        85.84
+      ],
+      "att1": [
+        76.93,
+        79.62
+      ]
+    }
+  }
+}

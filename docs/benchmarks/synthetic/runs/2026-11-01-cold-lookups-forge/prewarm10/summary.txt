@@ -1,0 +1,6 @@
+query               A med    B med    B/A  hashes  rounds A | rounds B
+star-lookup         11.40     3.34  0.293  1  [11.5, 11.3] | [3.2, 3.4]  prewarm med 15.3 ms
+values-star          7.30     3.74  0.512  1  [7.3, 7.4] | [3.5, 3.9]  prewarm med 5.7 ms
+employee-docs       10.52     3.18  0.303  1  [10.5, 10.5] | [3.2, 3.2]  prewarm med 12.3 ms
+path-plus            3.38     3.34  0.988  1  [3.3, 3.6] | [3.3, 3.4]  prewarm med 2.8 ms
+star-join           77.91    33.37  0.428  1  [78.0, 77.6] | [32.4, 34.7]  prewarm med 71.1 ms
