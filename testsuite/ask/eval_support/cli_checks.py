@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import pathlib
+import re
 import tempfile
 import threading
 import time
@@ -125,7 +126,17 @@ class FakeAnthropic:
                 if owner.mode == "schema-reject" and "format" in output:
                     return self.send_json(400, b'{"error":{"message":"no schema"}}')
                 user = body["messages"][0]["content"]
-                question = user.split("\n", 1)[0].removeprefix("Question: ").strip()
+                if isinstance(user, list):
+                    # A prompt marked for the cache arrives as text blocks.
+                    user = "".join(
+                        b.get("text", "") for b in user if isinstance(b, dict)
+                    )
+                asked = re.search(r"^Question: (.*)$", user, re.M)
+                question = (
+                    asked[1].strip()
+                    if asked
+                    else user.split("\n", 1)[0].removeprefix("Question: ").strip()
+                )
                 q = owner.questions.get(question)
                 if "rows of a query result" in body.get("system", ""):
                     content = {
