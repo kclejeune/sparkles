@@ -80,6 +80,15 @@ raise SystemExit(subprocess.run([os.environ['BUILD_TEST_CP'],*sys.argv[1:]]).ret
         self.assertFalse(Path(str(self.output) + ".tmp").exists())
         self.assertFalse((self.root / "lease").exists())
 
+    def test_overlapping_builds_of_one_output_use_separate_temporary_files(self):
+        self.output.parent.mkdir()
+        other = Path(str(self.output) + ".tmp")
+        other.write_bytes(b"partial copy of an overlapping build")
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_bytes(), b"complete native binary")
+        self.assertEqual(other.read_bytes(), b"partial copy of an overlapping build")
+
     def test_output_overrides_refuse_before_any_build(self):
         for option in ("--target-dir=x", "--target-dir", "--target=x", "--profile=x",
                        "--manifest-path=x", "--config=build.target-dir=x",

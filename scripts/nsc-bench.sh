@@ -198,8 +198,10 @@ binary() {
         mkdir -p "$SRC_TMP/ui/build"
         echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
           > "$SRC_TMP/ui/build/index.html"
-        # The build must not inherit the lock descriptor, or a process it leaves behind would
-        # keep the lock after this run ends.
+        # The build does not inherit the lock descriptor, so a process it leaves behind cannot
+        # hold the lock after this run ends. A build that outlives a killed run can then
+        # overlap the next one, which is harmless because each uses its own source tree and
+        # temporary file names.
         # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
         (cd "$SRC_TMP" && bash "$ROOT/scripts/nsc-build.sh" "$bin" $CARGO_ARGS) {lock}>&- \
           > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
@@ -210,8 +212,8 @@ binary() {
           echo "cc: $(cc --version 2> /dev/null | head -1)"
           echo "c++: $(c++ --version 2> /dev/null | head -1)"
           (cd "$SRC_TMP" && rustc -V)
-        } > "$entry/build.txt.tmp"
-        mv "$entry/build.txt.tmp" "$entry/build.txt"
+        } > "$entry/build.txt.tmp.$$"
+        mv "$entry/build.txt.tmp.$$" "$entry/build.txt"
         cleanup_src
       fi
       exec {lock}>&-
