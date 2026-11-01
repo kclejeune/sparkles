@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -79,6 +80,15 @@ raise SystemExit(subprocess.run([os.environ['BUILD_TEST_CP'],*sys.argv[1:]]).ret
         self.assertFalse(Path(str(self.output) + ".tmp").exists())
         self.assertFalse((self.root / "lease").exists())
 
+    def test_overlapping_builds_of_one_output_use_separate_temporary_files(self):
+        self.output.parent.mkdir()
+        other = Path(str(self.output) + ".tmp")
+        other.write_bytes(b"partial copy of an overlapping build")
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_bytes(), b"complete native binary")
+        self.assertEqual(other.read_bytes(), b"partial copy of an overlapping build")
+
     def test_output_overrides_refuse_before_any_build(self):
         for option in ("--target-dir=x", "--target-dir", "--target=x", "--profile=x",
                        "--manifest-path=x", "--config=build.target-dir=x",
@@ -122,6 +132,8 @@ import json,os,pathlib,subprocess,sys
 args=sys.argv[1:]
 with open(os.environ['CACHE_TEST_CALLS'],'a') as stream:stream.write(json.dumps(args)+'\\n')
 if args[:2]==['sparkles-task','--']:raise SystemExit(subprocess.run(args[2:]).returncode)
+import time
+time.sleep(float(os.environ.get('CACHE_TEST_DELAY','0')))
 pathlib.Path('target/release').mkdir(parents=True,exist_ok=True)
 pathlib.Path('target/release/sparkles').write_text('built with '+' '.join(args[4:]))
 pathlib.Path('target/release/sparkles').chmod(0o755)
@@ -186,6 +198,44 @@ a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a
         self.assertEqual(self.bench()[0], "built with ")
         self.assertEqual(self.builds(), 1)
         self.assertIn("cargo args: \n", (entry / "build.txt").read_text())
+
+    def test_a_build_reclaims_trees_left_by_killed_runs(self):
+        abandoned = self.cache / "src" / f"{self.sha}.abandon1"
+        abandoned.mkdir(parents=True)
+        (abandoned / "partial").write_text("archive of a run killed with SIGKILL")
+        self.assertEqual(self.bench()[0], "built with ")
+        self.assertEqual(list((self.cache / "src").iterdir()), [])
+
+    def test_a_run_waits_while_another_process_holds_the_entry_lock(self):
+        (self.cache / "locks").mkdir(parents=True)
+        holder = subprocess.Popen(["flock", str(self.cache / "locks" / f"{self.sha}.lock"),
+                                   "sleep", "2"])
+        self.addCleanup(holder.wait)
+        time.sleep(0.5)
+        started = time.monotonic()
+        self.assertEqual(self.bench()[0], "built with ")
+        self.assertGreater(time.monotonic() - started, 1.0)
+
+    def start(self, tag):
+        out = self.root / f"out-{tag}"
+        return out, subprocess.Popen(
+            ["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out), self.sha, self.sha],
+            env=dict(self.env, CACHE_TEST_DELAY="1.5"), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+
+    def test_concurrent_runs_of_one_commit_build_it_once(self):
+        runs = [self.start("first")]
+        time.sleep(0.5)  # the first run is inside its build when the second starts
+        runs.append(self.start("second"))
+        for out, process in runs:
+            _, stderr = process.communicate(timeout=60)
+            # Both runs stop at the compiler check, after staging a complete binary.
+            self.assertIn("not built with the same known compilers", stderr)
+            self.assertNotIn("build of", stderr)
+            self.assertEqual((out / "stage/bin-A.zst").read_text(), "built with ")
+        self.assertEqual(self.builds(), 1)
+        leftovers = [p.name for p in (self.cache / "src").iterdir()]
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

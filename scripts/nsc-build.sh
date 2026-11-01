@@ -43,6 +43,8 @@ output=$1
 shift
 mbx build --release -p sparkles-server "$@"
 mkdir -p "$(dirname "$output")"
-cp target/release/sparkles "$output.tmp"
-mv "$output.tmp" "$output"
+# A private temporary name keeps overlapping builds of one output from clobbering each other.
+tmp=$output.tmp.$$
+cp target/release/sparkles "$tmp"
+mv "$tmp" "$output"
 BUILD
