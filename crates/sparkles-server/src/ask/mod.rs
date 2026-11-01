@@ -1139,7 +1139,17 @@ impl Asking<'_, '_> {
         let inferred = (self.o.reasoning != Some(true))
             .then(|| format!(" FILTER(?{{g}} != <{}>)", crate::http::INFERRED_GRAPH))
             .unwrap_or_default();
+        // A union with GRAPH patterns costs a scan of every named graph for each pattern,
+        // so it is used only when the caller can read a named graph at all.
+        let named = run(format!(
+            "SELECT ?g WHERE {{ GRAPH ?g {{ ?s ?p ?o }}{} }} LIMIT 1",
+            inferred.replace("{g}", "g")
+        ))
+        .is_none_or(|v| v["rows"].as_array().is_none_or(|rows| !rows.is_empty()));
         let view = |pattern: &str, g: &str| -> String {
+            if !named {
+                return format!("{{ {pattern} }}");
+            }
             format!(
                 "{{ {{ {pattern} }} UNION {{ GRAPH ?{g} {{ {pattern} }}{} }} }}",
                 inferred.replace("{g}", g)
