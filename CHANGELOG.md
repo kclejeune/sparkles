@@ -30,6 +30,10 @@ function tests and Oxigraph's GeoSPARQL tests run with `execution=streaming` in
 that fall back to eager execution. `scripts/bench-gate.py` writes versioned gate records
 and compares a candidate's record with a recorded baseline.
 
+`mise run bench:executors` runs the 31 synthetic queries with eager and streaming
+execution at 1.05M and 10.5M triples, with 12 threads and with one, checks that both
+modes agree and records a forge baseline for the unified executor.
+
 `mise run bench:reasoning-latency` times derivation on demand and RDFS on read against
 materialized inferences on the 14 LUBM queries and checks every answer. Its forge
 baseline shows OWL RL derivation on demand taking about two seconds per query at 10

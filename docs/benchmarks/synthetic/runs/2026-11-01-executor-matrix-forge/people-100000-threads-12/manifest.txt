@@ -1,0 +1,11 @@
+binary: /home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57
+binary sha256: 34aa23f8e08949fd166863059128e1afa3108501fb171b65d75494b0ba09e0fd
+binary commit: 04d49b57
+version: sparkles 0.1.0
+scripts commit: unknown
+scripts dirty: 0
+host: forge
+started: 2026-11-01T04:47:16Z
+settings: 31 queries, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server process, RAYON_NUM_THREADS=12, server CPU 0-11, client CPU 12, spinners off, execution eager,streaming
+A: /home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57
+B: /home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57

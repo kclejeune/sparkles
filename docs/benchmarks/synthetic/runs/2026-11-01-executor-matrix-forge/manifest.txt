@@ -1,0 +1,14 @@
+binary: /home/kclejeune/lanes/ws1a-gates-469-473/bin/sparkles-04d49b57
+binary sha256: 34aa23f8e08949fd166863059128e1afa3108501fb171b65d75494b0ba09e0fd
+binary commit: 04d49b57
+version: sparkles 0.1.0
+rustc: rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+scripts commit: unknown
+scripts dirty: 0
+host: forge
+started: 2026-11-01T04:47:16Z
+settings: 31 queries, scales 100000 1000000 people, threads 12 1, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server
+variants: A execution=eager, B execution=streaming, one binary and one shared store
+load before: 2.37 2.13 2.52 1/584 18581
+ended: 2026-11-01T05:47:10Z
+load after: 3.14 3.28 2.83 1/599 124238

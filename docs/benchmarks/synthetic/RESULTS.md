@@ -351,3 +351,64 @@ faster in both builds. The
 [immutable run record](runs/2026-10-31-values-star-startup-forge/validation.json)
 holds the revisions, binary hashes, settings, per-round ratios and compressed request
 samples. These are internal comparisons and make no cross-engine claim.
+
+## Eager-against-cursor matrix
+
+`mise run bench:executors` is the rewrite gate of the executor paths and the oracle of
+the unified executor (ROADMAP item 453), as
+[BENCHMARKING.md](../../BENCHMARKING.md#the-eager-against-cursor-matrix) describes. Its
+baseline ran on forge alone with a release build of 04d49b57. It ran the 31 queries of
+`scripts/bench.sh` with `execution=eager` and with `execution=streaming` at 1.05M and
+10.5M triples, with 12 Rayon threads and with one. In every cell the two modes returned
+the same answer to every query, and for `export-500k`, a LIMIT without ORDER BY, the same
+number of rows. The [run record](runs/2026-11-01-executor-matrix-forge/record.json) holds
+every sample, and its [summary](runs/2026-11-01-executor-matrix-forge/summary.md) lists
+each cell's wall and execution times.
+
+The table gives each query's median eager wall time in milliseconds and the ratio of the
+streaming wall time to it, so a ratio above 1 means streaming execution was slower.
+
+| Query | 1.05M, 12 threads | ratio | 1.05M, 1 thread | ratio | 10.5M, 12 threads | ratio | 10.5M, 1 thread | ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| class-predicate-list | 1.67 | 1.13 | 2.8 | 1.00 | 11.3 | 1.05 | 11.3 | 1.04 |
+| class-predicates | 1.69 | 1.13 | 2.8 | 1.00 | 11.4 | 1.05 | 11.4 | 1.04 |
+| contains | 1.38 | 1.13 | 3.59 | 1.06 | 4.78 | 1.07 | 25 | 1.01 |
+| count-all | 0.45 | 1.63 | 1.97 | 1.00 | 0.418 | 1.80 | 1.97 | 1.00 |
+| distinct-join | 4.86 | 1.15 | 5.15 | 1.09 | 45 | 1.00 | 44.4 | 1.04 |
+| distinct-obj | 0.464 | 1.70 | 1.95 | 1.01 | 0.421 | 1.88 | 1.97 | 0.99 |
+| employee-docs | 0.646 | 1.45 | 1.98 | 1.00 | 0.664 | 1.42 | 1.95 | 1.02 |
+| exists-join | 1.86 | 1.16 | 2.8 | 1.00 | 9.86 | 1.01 | 9.96 | 0.99 |
+| export-500k | 250 | 1.20 | 266 | 1.40 | 258 | 1.15 | 273 | 1.35 |
+| expr-agg-arg | 3.89 | 0.79 | 3.86 | 0.82 | 30.5 | 0.82 | 30.9 | 0.79 |
+| expr-bind-group | 1.46 | 0.96 | 1.97 | 1.00 | 5.51 | 0.82 | 6.91 | 0.66 |
+| expr-order-key | 1.99 | 1.10 | 2.8 | 1.00 | 12.7 | 0.94 | 14 | 0.83 |
+| group-avg | 5.08 | 0.94 | 5.43 | 0.89 | 51.4 | 0.82 | 48.6 | 0.84 |
+| knows-reach | 12.9 | 1.00 | 12.8 | 0.99 | 147 | 0.98 | 142 | 0.97 |
+| lang-filter | 1.33 | 1.17 | 2.8 | 1.00 | 3.57 | 1.06 | 17.1 | 1.00 |
+| minus | 0.987 | 1.23 | 1.97 | 1.00 | 4.11 | 0.86 | 4.47 | 0.82 |
+| not-exists | 1.55 | 1.13 | 1.97 | 1.00 | 11 | 0.93 | 11 | 0.90 |
+| optional-chain | 14.6 | 1.28 | 15.4 | 1.43 | 173 | 1.06 | 151 | 1.46 |
+| optional-count | 1.23 | 1.22 | 1.97 | 1.00 | 6.33 | 0.98 | 6.62 | 0.94 |
+| order-by-full | 48.5 | 1.17 | 85.1 | 1.20 | 640 | 1.08 | 1,192 | 1.06 |
+| path-plus | 0.481 | 1.33 | 1.97 | 1.00 | 0.457 | 1.76 | 1.97 | 1.00 |
+| predicate-counts | 0.475 | 1.45 | 1.97 | 1.00 | 0.442 | 1.80 | 1.97 | 0.99 |
+| predicate-subjects | 0.449 | 1.60 | 1.97 | 1.00 | 0.449 | 1.76 | 1.98 | 1.00 |
+| range-topk | 1.53 | 0.99 | 1.98 | 1.00 | 3.55 | 1.11 | 7.15 | 0.95 |
+| regex-iri | 1.62 | 1.20 | 4.76 | 1.03 | 6.82 | 1.08 | 37.2 | 1.02 |
+| star-join | 4.92 | 1.35 | 5.05 | 1.27 | 34.8 | 1.30 | 37 | 1.45 |
+| star-lookup | 0.772 | 1.36 | 1.98 | 1.00 | 0.766 | 1.43 | 1.98 | 1.00 |
+| subquery-agg | 0.82 | 1.31 | 1.97 | 1.00 | 1.46 | 1.35 | 2.83 | 1.02 |
+| two-hop-count | 1.95 | 1.17 | 3.88 | 1.01 | 12.5 | 1.01 | 29.2 | 1.00 |
+| types-grouped | 0.525 | 1.58 | 1.97 | 0.99 | 0.533 | 1.58 | 1.94 | 1.02 |
+| values-star | 0.639 | 1.37 | 1.95 | 1.02 | 0.65 | 1.42 | 1.98 | 1.00 |
+| **geometric mean** | | 1.22 | | 1.03 | | 1.17 | | 0.99 |
+
+With 12 threads, a streamed response costs about 0.3 ms more wall time than an eager one
+on the shortest queries, such as `count-all`, `distinct-obj` and `predicate-counts`,
+while the server's execution times of the two modes differ by hundredths of a
+millisecond. The one-thread cells hide this cost under their wall-time floor of about
+2 ms. Streaming is also slower end to end on the large answers of `export-500k`,
+`optional-chain`, `star-join` and `order-by-full`, by 6% to 46%, where much of the time goes to writing the rows. It is faster on the
+grouped aggregates `expr-agg-arg` and `group-avg` in every cell and, at 10.5M triples, on
+`expr-bind-group`, `minus`, `not-exists` and `expr-order-key`. Item NEW-ITEM-3 covers the streamed response's fixed cost and its
+losses on large answers, which the merged executor must not inherit.

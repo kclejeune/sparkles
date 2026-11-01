@@ -1805,6 +1805,17 @@ and 455 must pass, as the first phase of item 452's workstream.
 threshold, and `scripts/bench-gate.py compare` checks a candidate's gate record against
 the recorded baseline.
 
+Item 469 adds `mise run bench:executors`, which runs the 31 queries of `scripts/bench.sh`
+with eager and streaming execution at 1.05M and 10.5M triples, with 12 threads and with
+one, on one host and one shared store, and checks that both modes return the same
+answers. The roadmap item named 33 queries, and the suite holds 31. On forge both modes
+agreed on every query. With 12 threads streaming execution was slower end to end by a
+geometric mean of 22% at 1.05M triples and 17% at 10.5M, mostly from a fixed cost of
+about 0.3 ms per streamed response and from writing large answers, which item NEW-ITEM-3
+investigates. The
+[baseline](../benchmarks/synthetic/RESULTS.md#eager-against-cursor-matrix) is the oracle
+of item 453, which takes the faster mode of each query.
+
 Item 470 runs the W3C query evaluation suites with `execution=streaming`. All SPARQL
 1.0, 1.1 and 1.2 query evaluation tests, Jena's CDT tests and ARQ's property function
 tests pass in that mode with the default run's known-failure lists. The SPARQL suites
