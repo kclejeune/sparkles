@@ -301,7 +301,7 @@ impl Store {
         }
         self.persist_holds(&next)?;
         self.failpoint("holds-release-published");
-        self.install_holds(&mut *state, next, &touched);
+        self.install_holds(&mut state, next, &touched);
         drop(state);
         self.collect_members(&touched);
         Ok(ids)

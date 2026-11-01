@@ -2439,7 +2439,7 @@ impl Store {
             }
             self.persist_holds(&kept)?;
             self.failpoint("branch-delete-holds-released");
-            self.install_holds(&mut *holds, kept, &touched);
+            self.install_holds(&mut holds, kept, &touched);
         }
         let mut next = t.clone();
         next.branches.retain(|b| b.id != e.id);
