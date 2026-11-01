@@ -118,6 +118,21 @@ def drop_empty(rel, gold=True):
 
 
 INTEGER = re.compile(r"[+-]?[0-9]+")
+# The value spaces of the integer subtypes, as XML Schema 1.1 Part 2 defines them.
+INTEGER_RANGES = {
+    XSD + "nonPositiveInteger": (None, 0),
+    XSD + "negativeInteger": (None, -1),
+    XSD + "long": (-(2**63), 2**63 - 1),
+    XSD + "int": (-(2**31), 2**31 - 1),
+    XSD + "short": (-(2**15), 2**15 - 1),
+    XSD + "byte": (-128, 127),
+    XSD + "nonNegativeInteger": (0, None),
+    XSD + "unsignedLong": (0, 2**64 - 1),
+    XSD + "unsignedInt": (0, 2**32 - 1),
+    XSD + "unsignedShort": (0, 2**16 - 1),
+    XSD + "unsignedByte": (0, 255),
+    XSD + "positiveInteger": (1, None),
+}
 DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
 FLOATING = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
@@ -133,11 +148,20 @@ def numeric_value(cell):
             return None
         value = float(text)
         if datatype == XSD + "float":
-            value = struct.unpack("f", struct.pack("f", value))[0]
+            try:
+                value = struct.unpack("f", struct.pack("f", value))[0]
+            except OverflowError:
+                return None
         return fractions.Fraction(value) if math.isfinite(value) else None
     if datatype == XSD + "decimal":
         return fractions.Fraction(text) if DECIMAL.fullmatch(text) else None
-    return fractions.Fraction(int(text)) if INTEGER.fullmatch(text) else None
+    if not INTEGER.fullmatch(text):
+        return None
+    value = int(text)
+    low, high = INTEGER_RANGES.get(datatype, (None, None))
+    if (low is not None and value < low) or (high is not None and value > high):
+        return None
+    return fractions.Fraction(value)
 
 
 def literal_text(cell):
@@ -262,9 +286,10 @@ def flags(gold, got, detail, predicates):
         return out
     extra = [j for j in range(len(got.variables)) if j not in mapping]
     for j in extra:
-        values = {r[j][1] for r in got.rows if r[j][0] == "uri"}
-        if not values:
+        cells = [r[j] for r in got.rows if r[j] != UNBOUND]
+        if not cells or any(c[0] != "uri" for c in cells):
             continue
+        values = {c[1] for c in cells}
         found = predicates(sorted(values)) if len(values) <= 200 else None
         if found is None:
             out.append("predicate_column_unknown")

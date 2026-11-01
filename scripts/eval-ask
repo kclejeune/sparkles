@@ -526,7 +526,8 @@ class Runner:
             values = " ".join(f"<{i}>" for i in iris[k : k + 100])
             text = (
                 f"SELECT ?s ?l WHERE {{ VALUES ?s {{ {values} }} VALUES ?p {{ {preds} }} "
-                f"?s ?p ?l FILTER(isLiteral(?l) && STR(?l) IN ({strings})) }}"
+                "{ ?s ?p ?l } UNION { GRAPH ?g { ?s ?p ?l } } "
+                f"FILTER(isLiteral(?l) && STR(?l) IN ({strings})) }}"
             )
             try:
                 rel, _ = self.query(text, "labels")
@@ -541,11 +542,15 @@ class Runner:
 
     def predicates(self, iris):
         """The subset of `iris` used as a predicate in the set's data, or None."""
-        iris = [i for i in iris if self.safe_iri(i)]
+        if not all(self.safe_iri(i) for i in iris):
+            return None
         if not iris:
             return set()
         values = " ".join(f"<{i}>" for i in iris)
-        text = f"SELECT DISTINCT ?p WHERE {{ VALUES ?p {{ {values} }} FILTER EXISTS {{ ?s ?p ?o }} }}"
+        text = (
+            f"SELECT DISTINCT ?p WHERE {{ VALUES ?p {{ {values} }} "
+            "FILTER EXISTS { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } } }"
+        )
         try:
             rel, _ = self.query(text, "predicates")
         except HarnessFault:

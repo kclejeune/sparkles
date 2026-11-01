@@ -70,6 +70,11 @@ class GuardedScore(unittest.TestCase):
         big = rel(["n"], [lit("9007199254740993", "integer")])
         self.assertFalse(lenient(big, rel(["c"], [lit("9007199254740993", "double")]), {}))
         self.assertTrue(lenient(rel(["n"], [lit("0.5", "decimal")]), rel(["c"], [lit("5E-1", "float")]), {}))
+        self.assertIsNone(guarded.numeric_value(("literal", "1e39", XSD + "float")))
+        self.assertIsNone(guarded.numeric_value(("literal", "-1e39", XSD + "float")))
+        self.assertFalse(lenient(rel(["n"], [lit("-1", "integer")]), rel(["c"], [lit("-1", "unsignedInt")]), {}))
+        self.assertFalse(lenient(rel(["n"], [lit("128", "integer")]), rel(["c"], [lit("128", "byte")]), {}))
+        self.assertTrue(lenient(rel(["n"], [lit("127", "integer")]), rel(["c"], [lit("127", "byte")]), {}))
 
     def test_a_label_names_a_gold_iri_only_when_unambiguous(self):
         gold = rel(["uri"], [uri("ex:Pinta_(ship)")], [uri("ex:Nina")])
@@ -118,6 +123,12 @@ class GuardedScore(unittest.TestCase):
         self.assertEqual(guarded.flags(gold, got, d, lambda iris: set(iris)), ["predicate_column"])
         self.assertEqual(guarded.flags(gold, got, d, lambda iris: set()), [])
         self.assertEqual(guarded.flags(gold, got, d, lambda iris: None), ["predicate_column_unknown"])
+        # a mixed column is not a predicate column
+        two = rel(["x"], [uri("ex:a")], [uri("ex:b")])
+        mixed = rel(["x", "p"], [uri("ex:a"), uri("ex:p")], [uri("ex:b"), lit("note")])
+        ok, d = guarded.compare(two, mixed)
+        self.assertTrue(ok)
+        self.assertEqual(guarded.flags(two, mixed, d, lambda iris: set(iris)), [])
         many = rel(["x", "p"], *[[uri("ex:a"), uri(f"ex:p{i}")] for i in range(201)])
         ok, d = guarded.compare(gold, many)
         self.assertIn("predicate_column_unknown", guarded.flags(gold, many, d, lambda iris: set(iris)))
@@ -154,6 +165,33 @@ class GuardedScore(unittest.TestCase):
         # an entry for another gold text with the same id does not apply
         self.assertIsNone(guarded.errata_exclusion(dict(q, gold=q["gold"] + " "), gold, named))
         self.assertTrue(guarded.load_errata())
+
+
+class GroundingRecall(unittest.TestCase):
+    def test_one_report_of_one_pair_per_set(self):
+        import json
+        import grounding_recall
+
+        qset = {"questions": [{"id": "a", "kind": "answerable", "question": "Q?",
+                               "gold": "SELECT ?x WHERE { ?x <http://ex.org/p> <http://ex.org/resource/R> }"}]}
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            (p / "replies.jsonl").write_text(json.dumps({"case": "c1", "status": 200, "request": {
+                "system": "You translate", "messages": [{"content": "<http://ex.org/p> Question: Q?"}]}, "reply": {}}) + "\n")
+            (p / "s").mkdir()
+            report = {"pairs": ["m"], "cases": [{"id": "a", "case": "c1", "pair": "m"}]}
+            (p / "s" / "report.json").write_text(json.dumps(report))
+            rows = grounding_recall.recall(qset, p)
+            self.assertEqual(rows["a"]["missingSchema"], [])
+            self.assertEqual(rows["a"]["missingResources"], ["http://ex.org/resource/R"])
+            (p / "t").mkdir()
+            (p / "t" / "report.json").write_text(json.dumps(report))
+            with self.assertRaises(ValueError):
+                grounding_recall.recall(qset, p)
+            (p / "t" / "report.json").unlink()
+            (p / "s" / "report.json").write_text(json.dumps(dict(report, pairs=["m", "n"])))
+            with self.assertRaises(ValueError):
+                grounding_recall.recall(qset, p)
 
 
 class KilledChild(unittest.TestCase):

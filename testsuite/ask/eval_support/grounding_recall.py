@@ -108,7 +108,16 @@ def prompt_prefixes(text):
 
 def recall(qset, run_dir):
     run_dir = pathlib.Path(run_dir)
-    report = json.load(open(next(run_dir.glob("*/report.json"))))
+    # The one report whose questions all belong to this set. A run of several sets
+    # or several pairs is refused rather than mixed.
+    reports = [json.load(open(p)) for p in run_dir.glob("*/report.json")]
+    ids = {q["id"] for q in qset["questions"]}
+    matching = [r for r in reports if {c["id"] for c in r["cases"]} <= ids]
+    if len(matching) != 1:
+        raise ValueError(f"{run_dir}: {len(matching)} reports match the set; give a run of one set")
+    report = matching[0]
+    if len(report.get("pairs") or []) != 1:
+        raise ValueError(f"{run_dir}: the run has several pairs; recall is per pair")
     by_case = drafts(run_dir / "replies.jsonl")
     header = prefix_header(qset.get("prefixes", {}))
     qs = {q["id"]: q for q in qset["questions"]}
