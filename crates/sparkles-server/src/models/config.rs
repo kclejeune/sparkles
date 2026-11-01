@@ -546,6 +546,7 @@ pub const PROVIDER_MEMBERS: &[&str] = &[
     "structuredOutput",
     "pricing",
     "requestTimeoutSecs",
+    "reasoningEffort",
     "numCtx",
     "repo",
     "revision",
@@ -1248,6 +1249,15 @@ mod tests {
         .unwrap();
         let o = &c.providers["o"];
         assert_eq!(o.model("r").reasoning_effort, Some(Effort::Medium));
+        // a provider's effort is the default of its models
+        let d = ModelsConfig::parse(
+            r#"{"providers":{"o":{"kind":"openai","endpoint":"https://x","reasoningEffort":"high","models":{"m":{}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            d.providers["o"].model("m").reasoning_effort,
+            Some(Effort::High)
+        );
         assert_eq!(o.model("r").temperature, None);
         assert_eq!(o.model("rt").temperature, Some(1.0));
         assert_eq!(o.model("t").temperature, Some(0.0));
@@ -1258,7 +1268,7 @@ mod tests {
             } } });
             let e = ModelsConfig::parse(&v.to_string()).unwrap_err();
             assert!(
-                format!("{e:#}").contains("reasoningEffort"),
+                format!("{e:#}").contains("applies to the openai and anthropic kinds only"),
                 "{kind}: {e:#}"
             );
         }
