@@ -754,13 +754,13 @@ fn closure_operators_stop_at_the_candidate_limit() {
 }
 
 /// A closure operator charges its scratch arrays: a reverse star of 200,000 edges, which
-/// derives nothing, stays within its memory limit or fails with it.
+/// derives nothing, builds its graph in about 9 MB and then needs about 16 MB for the
+/// components and reachable sets, so a limit of 12 MiB stops it within the limit. When
+/// the scratch arrays were not charged, the run passed the limit at 12.6 MB and succeeded.
 #[test]
 fn closure_operators_charge_their_scratch() {
     let _one = one_at_a_time();
-    const LIMIT: usize = 8 << 20;
-    // the store's blocks a scan decodes, the evaluation state and the error
-    const SLACK: usize = 1 << 20;
+    const LIMIT: usize = 12 << 20;
     let s = Store::in_memory(StoreOptions::default());
     let mut ttl = String::new();
     for i in 0..200_000 {
@@ -769,20 +769,51 @@ fn closure_operators_charge_their_scratch() {
     load(&s, &ttl);
     s.flush_change_log().unwrap();
     let rules = Profile::Rules(CHAIN_RULE.into());
-    let opts = limited(Some(LIMIT));
     let snap = s.snapshot();
     // a first run warms the store's caches
-    let _ = infer(snap.clone(), &rules, &opts);
+    let _ = infer(snap.clone(), &rules, &limited(None));
     let before = NOW.load(Ordering::SeqCst);
     PEAK.store(before, Ordering::SeqCst);
-    let run = infer(snap, &rules, &opts);
+    let run = infer(snap, &rules, &limited(Some(LIMIT)));
     let over = PEAK.load(Ordering::SeqCst) - before;
     eprintln!("the run allocated {over} bytes beyond what it started with");
-    if let Err(e) = &run {
-        assert!(e.to_string().contains("memory limit"), "{e:#}");
+    let Err(e) = run else {
+        panic!("the scratch arrays fit the limit of {LIMIT} bytes");
+    };
+    assert!(e.to_string().contains("memory limit"), "{e:#}");
+    assert!(
+        over <= LIMIT,
+        "the run allocated {over} bytes for a limit of {LIMIT}"
+    );
+}
+
+/// The graph an operator builds charges each growth of its buffers before it reserves
+/// it: a limit of 4 MiB stops the reverse star's graph within the limit. When the
+/// buffers were charged every 65,536 edges, the run allocated 8.8 MB first.
+#[test]
+fn closure_graphs_charge_before_growing() {
+    let _one = one_at_a_time();
+    const LIMIT: usize = 4 << 20;
+    // the store's blocks a scan decodes and the evaluation state
+    const SLACK: usize = 512 << 10;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::new();
+    for i in 0..200_000 {
+        ttl.push_str(&format!("ex:l{i} ex:r ex:hub .\n"));
     }
+    load(&s, &ttl);
+    s.flush_change_log().unwrap();
+    let rules = Profile::Rules(CHAIN_RULE.into());
+    let snap = s.snapshot();
+    let _ = infer(snap.clone(), &rules, &limited(None));
+    let before = NOW.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let e = infer(snap, &rules, &limited(Some(LIMIT))).unwrap_err();
+    let over = PEAK.load(Ordering::SeqCst) - before;
+    eprintln!("the failed run allocated {over} bytes beyond what it started with");
+    assert!(e.to_string().contains("memory limit"), "{e:#}");
     assert!(
         over <= LIMIT + SLACK,
-        "the run allocated {over} bytes for a limit of {LIMIT}"
+        "the failed run allocated {over} bytes for a limit of {LIMIT}"
     );
 }

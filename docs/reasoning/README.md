@@ -31,7 +31,9 @@ request or on every write, and the schema report counts what the data holds.
   set once, and `owl:sameAs` closes its classes with union-find. The rules stay in the
   program, so explanations and incremental maintenance still name them, and a run
   derives the same facts as one that evaluates them as joins. A program with a rule that
-  is not monotonic evaluates every rule as a join.
+  is not monotonic, or one that reads lists and builds them in a rule head, evaluates
+  every rule as a join. A run whose rules read lists and derive list facts through a
+  property, such as a subproperty of `rdf:first`, starts again without the operators.
 * Each iteration merges its results in parallel on a reasoning pool, half the cores by
   default with `serve --reason-threads`, that admits runs in arrival order. A run stops at
   50 million derived triples by default, and `sparkles infer --max-inferred`,

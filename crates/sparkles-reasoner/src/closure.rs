@@ -13,9 +13,10 @@
 //! The rules stay in the program, so explanations and maintenance still name them, and
 //! the closure is the fixpoint the rules reach: the operator only reaches it in fewer
 //! iterations. A program with a rule that is not monotonic (see
-//! [`crate::engine::incremental_blocker`]), or with a list test whose result changes as
-//! derived list facts arrive, runs without operators, because the order of derivation
-//! matters there.
+//! [`crate::engine::incremental_blocker`]), or one that reads lists and builds them,
+//! runs without operators, because the order of derivation matters there. A program
+//! that reads lists and derives list facts through a variable predicate starts again
+//! without operators when such a fact appears ([`Restart`]).
 //!
 //! The operator is semi-naive. It keeps, per predicate, the row up to which the relation
 //! is closed. The relation of the rows before that mark needs nothing more, so with few
@@ -29,10 +30,12 @@
 
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes};
 use crate::builtins::{BuiltinKind, same_value};
-use crate::engine::{Atom, CHead, CRule, Slot, incremental_blocker};
+use crate::engine::{Atom, CHead, CRule, Slot, incremental_blocker, reads_lists};
 use crate::facts::Memo;
 use crate::graph::{Graph, Triple};
 use crate::terms::{Kind, Terms};
+use oxrdf::Term;
+use oxrdf::vocab::rdf;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -97,6 +100,44 @@ fn emit(out: &mut Vec<Triple>, t: Triple, held: &mut Held, room: usize) -> anyho
     Ok(())
 }
 
+/// Insert `x` into `set`, charging a growth of its table to `held` before it is reserved.
+fn insert(set: &mut FxHashSet<u64>, x: u64, held: &mut Held) -> anyhow::Result<bool> {
+    if set.contains(&x) {
+        return Ok(false);
+    }
+    if set.len() == set.capacity() {
+        let before = set.capacity();
+        let want = (before * 2).max(16);
+        held.try_grow(
+            table_bytes(want, size_of::<u64>())
+                .saturating_sub(table_bytes(before, size_of::<u64>())),
+        )?;
+        set.reserve(want - set.len());
+        if set.capacity() > want {
+            held.try_grow(
+                table_bytes(set.capacity(), size_of::<u64>())
+                    .saturating_sub(table_bytes(want, size_of::<u64>())),
+            )?;
+        }
+    }
+    Ok(set.insert(x))
+}
+
+/// Push `x` onto `v`, charging a growth of its buffer to `held` before it is reserved.
+fn push(v: &mut Vec<u64>, x: u64, held: &mut Held) -> anyhow::Result<()> {
+    if v.len() == v.capacity() {
+        let before = v.capacity();
+        let want = (before * 2).max(16);
+        held.try_grow((want - before) * size_of::<u64>())?;
+        v.reserve_exact(want - v.len());
+        if v.capacity() > want {
+            held.try_grow((v.capacity() - want) * size_of::<u64>())?;
+        }
+    }
+    v.push(x);
+    Ok(())
+}
+
 /// The predicates an operator closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Over {
@@ -141,7 +182,25 @@ pub(crate) struct Stepped {
 pub(crate) struct Closures {
     ops: Vec<Op>,
     start: Option<u32>,
+    /// `rdf:first` and `rdf:rest` when a rule reads lists: a derived fact of either makes
+    /// what the list builtins read depend on when it appears
+    lists: Option<[u64; 2]>,
+    /// the charge of the operators' marks and of the counts they probe
+    held: Option<Held>,
 }
+
+/// A run with closure operators derived list structure that rules read, so it starts
+/// again without them, which gives the result of the rules' own order of derivation.
+#[derive(Debug)]
+pub(crate) struct Restart;
+
+impl std::fmt::Display for Restart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("derived list facts: the run starts again without closure operators")
+    }
+}
+
+impl std::error::Error for Restart {}
 
 #[inline]
 fn var(s: Slot) -> Option<usize> {
@@ -226,19 +285,29 @@ impl Closures {
     /// whose result depends on the order of derivation. `start` is the row before which
     /// the facts are closed under the rules, as for [`crate::engine::run`].
     pub(crate) fn detect(rules: &[CRule], terms: &Terms, start: Option<u32>) -> Option<Closures> {
-        // a list test whose result changes as derived list facts arrive, such as
-        // listNotContains, depends on when the closure's pairs appear
-        let order_dependent = |r: &CRule| {
-            r.builtins.iter().any(|b| {
-                matches!(
-                    b.kind,
-                    BuiltinKind::ListNotContains | BuiltinKind::ListLength | BuiltinKind::ListEntry
-                )
-            })
-        };
         if rules
             .iter()
-            .any(|r| incremental_blocker(r, terms).is_some() || order_dependent(r))
+            .any(|r| incremental_blocker(r, terms).is_some())
+        {
+            return None;
+        }
+        // what a list builtin reads depends on when derived list facts appear, and the
+        // operators derive their pairs earlier than joins do: a program that reads lists
+        // and builds them in a rule head runs without operators, and one whose rules
+        // derive list facts through a variable predicate starts again without them
+        // (see `Restart`)
+        let lists = rules.iter().any(reads_lists).then(|| {
+            [
+                terms.id_for(&Term::NamedNode(rdf::FIRST.into_owned())),
+                terms.id_for(&Term::NamedNode(rdf::REST.into_owned())),
+            ]
+        });
+        if let Some(ids) = lists
+            && rules.iter().any(|r| {
+                r.head
+                    .iter()
+                    .any(|h| matches!(h, CHead::Triple(_, Slot::Const(p), _) if ids.contains(p)))
+            })
         {
             return None;
         }
@@ -274,7 +343,12 @@ impl Closures {
             op.rules.retain(|&r| taken.insert(r));
         }
         ops.retain(|op| !op.rules.is_empty());
-        (!ops.is_empty()).then_some(Closures { ops, start })
+        (!ops.is_empty()).then_some(Closures {
+            ops,
+            start,
+            lists,
+            held: None,
+        })
     }
 
     /// Whether rule `ri` is evaluated by an operator now.
@@ -309,19 +383,30 @@ impl Closures {
             added: 0,
             refresh: Vec::new(),
         };
+        self.check_lists(g)?;
         let start = self.start;
+        let mut poll = Poll::new(cancel);
+        let held = self.held.get_or_insert_with(|| Held::new(budget));
         for op in &mut self.ops {
             if op.off {
                 continue;
             }
             let now = g.len();
-            let preds = op.predicates(g, now)?;
+            let preds = op.predicates(g, now, budget, &mut poll)?;
+            // the marks the operator keeps and the base's cached count of each predicate
+            held.try_set(
+                table_bytes(
+                    op.marks.capacity().max(preds.len()),
+                    size_of::<(u64, u32)>(),
+                ) + table_bytes(preds.len(), size_of::<(u64, u64)>()),
+            )?;
             let mut outs: Vec<Vec<Triple>> = Vec::new();
             let mut held = Held::new(budget);
             let mut done: Vec<u64> = Vec::new();
             let mut total = 0usize;
             let mut back = false;
             for q in preds {
+                poll.tick(1)?;
                 let mark = match op.marks.get(&q) {
                     Some(&m) => m,
                     None => op.initial(g, q, start),
@@ -398,32 +483,62 @@ impl Closures {
                 op.marks.insert(q, after);
             }
         }
+        self.check_lists(g)?;
         Ok(stepped)
+    }
+
+    /// [`Restart`] when the program reads lists and the run has derived list structure.
+    fn check_lists(&self, g: &Graph) -> anyhow::Result<()> {
+        if let Some([first, rest]) = self.lists {
+            let (lo, hi) = (g.offset(), g.len());
+            if g.count_p(first, lo, hi) > 0 || g.count_p(rest, lo, hi) > 0 {
+                return Err(Restart.into());
+            }
+        }
+        Ok(())
     }
 }
 
 impl Op {
     /// The predicates the operator closes now.
-    fn predicates(&self, g: &Graph, now: u32) -> anyhow::Result<Vec<u64>> {
+    fn predicates(
+        &self,
+        g: &Graph,
+        now: u32,
+        budget: &Arc<Budget>,
+        poll: &mut Poll,
+    ) -> anyhow::Result<Vec<u64>> {
         match self.over {
             Over::Fixed(c) => Ok(vec![c]),
             Over::Guarded(gp, go) => {
+                // charged as it grows; the caller keeps a charge for its length after
+                let mut held = Held::new(budget);
                 let mut out: Vec<u64> = Vec::new();
                 if let Some(b) = g.base()
                     && g.reads_base(0, now)
                 {
+                    let mut err: Option<anyhow::Error> = None;
                     b.for_each(None, Some(gp), Some(go), |t| {
-                        out.push(t[0]);
-                        true
+                        match push(&mut out, t[0], &mut held).and_then(|()| poll.tick(1)) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                err = Some(e);
+                                false
+                            }
+                        }
                     })?;
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
                 }
                 let c = g.cands(None, Some(gp), Some(go), g.offset(), now);
                 for i in 0..c.len() {
+                    poll.tick(1)?;
                     let r = c.get(i);
                     if g.alive(r) {
                         let t = g.triple(r);
                         if t[1] == gp && t[2] == go {
-                            out.push(t[0]);
+                            push(&mut out, t[0], &mut held)?;
                         }
                     }
                 }
@@ -466,15 +581,11 @@ struct Local {
     _held: Held,
 }
 
-/// Edges a scan or a search collects before it charges them.
-const CHARGE_EVERY: usize = 1 << 16;
-
 struct Builder {
     ids: Vec<u64>,
     at: FxHashMap<u64, u32>,
     pairs: Vec<(u32, u32)>,
     held: Held,
-    since: usize,
 }
 
 impl Builder {
@@ -484,7 +595,6 @@ impl Builder {
             at: FxHashMap::default(),
             pairs: Vec::new(),
             held: Held::new(budget),
-            since: 0,
         }
     }
 
@@ -499,27 +609,54 @@ impl Builder {
         self.held.try_set(b)
     }
 
-    #[inline]
-    fn node(&mut self, id: u64) -> (u32, bool) {
-        if let Some(&n) = self.at.get(&id) {
-            return (n, false);
+    /// Reserve room for `nodes` more nodes and one more pair, charging the growth of
+    /// each buffer before it is reserved.
+    fn room(&mut self, nodes: usize) -> Result<(), MemoryExceeded> {
+        let ids = self.ids.len() + nodes > self.ids.capacity();
+        let at = self.at.len() + nodes > self.at.capacity();
+        let pairs = self.pairs.len() == self.pairs.capacity();
+        if !(ids || at || pairs) {
+            return Ok(());
         }
+        let grow = |cap: usize, need: usize| {
+            if need > cap {
+                (cap * 2).max(need).max(16)
+            } else {
+                cap
+            }
+        };
+        let ids_cap = grow(self.ids.capacity(), self.ids.len() + nodes);
+        let at_cap = grow(self.at.capacity(), self.at.len() + nodes);
+        let pairs_cap = grow(self.pairs.capacity(), self.pairs.len() + 1);
+        self.held.try_set(
+            ids_cap * size_of::<u64>()
+                + table_bytes(at_cap, size_of::<(u64, u32)>())
+                + pairs_cap * size_of::<(u32, u32)>(),
+        )?;
+        self.ids.reserve_exact(ids_cap - self.ids.len());
+        self.at.reserve(at_cap - self.at.len());
+        self.pairs.reserve_exact(pairs_cap - self.pairs.len());
+        self.charge()
+    }
+
+    #[inline]
+    fn node(&mut self, id: u64) -> Result<(u32, bool), MemoryExceeded> {
+        if let Some(&n) = self.at.get(&id) {
+            return Ok((n, false));
+        }
+        self.room(1)?;
         let n = self.ids.len() as u32;
         self.ids.push(id);
         self.at.insert(id, n);
-        (n, true)
+        Ok((n, true))
     }
 
     #[inline]
     fn edge(&mut self, s: u64, o: u64) -> Result<(), MemoryExceeded> {
-        let (a, _) = self.node(s);
-        let (b, _) = self.node(o);
+        let (a, _) = self.node(s)?;
+        let (b, _) = self.node(o)?;
+        self.room(0)?;
         self.pairs.push((a, b));
-        self.since += 1;
-        if self.since >= CHARGE_EVERY {
-            self.since = 0;
-            self.charge()?;
-        }
         Ok(())
     }
 
@@ -641,12 +778,12 @@ impl Local {
     ) -> anyhow::Result<Option<Local>> {
         let mut memo = Memo::default();
         let mut b = Builder::new(budget);
-        let mut seeds: Vec<u64> = Vec::new();
-        // the search's own sets, charged as they grow
+        // the search's own sets and queues, each growth charged before it is reserved
         let mut search = Held::new(budget);
-        let set_bytes = |s: &FxHashSet<u64>| table_bytes(s.capacity(), size_of::<u64>());
         let c = g.cands(None, Some(q), None, mark.max(g.offset()), now);
-        search.try_grow(c.len() * 2 * size_of::<u64>())?;
+        let per = if shape == Shape::Equivalence { 2 } else { 1 };
+        search.try_grow(c.len() * per * size_of::<u64>())?;
+        let mut seeds: Vec<u64> = Vec::with_capacity(c.len() * per);
         for i in 0..c.len() {
             poll.tick(1)?;
             let r = c.get(i);
@@ -668,83 +805,62 @@ impl Local {
             let mut sources: FxHashSet<u64> = FxHashSet::default();
             let mut queue: Vec<u64> = Vec::new();
             for &s in &seeds {
-                if sources.insert(s) {
-                    queue.push(s);
+                if insert(&mut sources, s, &mut search)? {
+                    push(&mut queue, s, &mut search)?;
                 }
             }
             let mut steps = 0usize;
-            let mut charged_at = 0usize;
             while let Some(x) = queue.pop() {
-                let mut back = g.try_subjects(&mut memo, q, x, now)?;
+                let mut visit = |p: u64| -> anyhow::Result<bool> {
+                    steps += 1;
+                    if steps > limit {
+                        return Ok(false);
+                    }
+                    poll.tick(1)?;
+                    if insert(&mut sources, p, &mut search)? {
+                        push(&mut queue, p, &mut search)?;
+                    }
+                    Ok(true)
+                };
+                g.each_subject(&mut memo, q, x, now, &mut visit)?;
                 if shape == Shape::Equivalence {
-                    back.extend(g.try_objects(&mut memo, x, q, now)?);
+                    g.each_object(&mut memo, x, q, now, &mut visit)?;
                 }
-                steps += back.len();
                 if steps > limit {
                     return Ok(None);
                 }
-                poll.tick(back.len() + 1)?;
-                for p in back {
-                    if sources.insert(p) {
-                        queue.push(p);
-                    }
-                }
-                if steps >= charged_at + CHARGE_EVERY {
-                    charged_at = steps;
-                    search.try_set(
-                        seeds.capacity() * size_of::<u64>()
-                            + set_bytes(&sources)
-                            + queue.capacity() * size_of::<u64>(),
-                    )?;
-                }
             }
-            search.try_set(
-                seeds.capacity() * size_of::<u64>()
-                    + set_bytes(&sources)
-                    + queue.capacity() * size_of::<u64>(),
-            )?;
             // every node the sources reach, with its out-edges
             let mut seen: FxHashSet<u64> = FxHashSet::default();
-            search.try_grow(sources.len() * size_of::<u64>())?;
-            let mut order: Vec<u64> = sources.iter().copied().collect();
+            let mut order: Vec<u64> = Vec::new();
+            for &s in &sources {
+                push(&mut order, s, &mut search)?;
+            }
             order.sort_unstable();
             for &s in &order {
-                seen.insert(s);
-                b.node(s);
+                insert(&mut seen, s, &mut search)?;
+                b.node(s)?;
             }
             let mut queue = order;
             let mut edges = 0usize;
-            let mut charged_at = 0usize;
             while let Some(x) = queue.pop() {
-                let outs = g.try_objects(&mut memo, x, q, now)?;
-                poll.tick(outs.len() + 1)?;
-                for o in outs {
-                    b.edge(x, o)?;
+                g.each_object(&mut memo, x, q, now, |o| {
                     edges += 1;
-                    if seen.insert(o) {
-                        queue.push(o);
+                    if edges > limit {
+                        return Ok(false);
                     }
-                }
+                    poll.tick(1)?;
+                    b.edge(x, o)?;
+                    if insert(&mut seen, o, &mut search)? {
+                        push(&mut queue, o, &mut search)?;
+                    }
+                    Ok(true)
+                })?;
                 if edges > limit {
                     return Ok(None);
                 }
-                if edges >= charged_at + CHARGE_EVERY {
-                    charged_at = edges;
-                    search.try_set(
-                        seeds.capacity() * size_of::<u64>()
-                            + set_bytes(&sources)
-                            + set_bytes(&seen)
-                            + queue.capacity() * size_of::<u64>(),
-                    )?;
-                }
             }
-            search.try_set(
-                seeds.capacity() * size_of::<u64>()
-                    + set_bytes(&sources)
-                    + set_bytes(&seen)
-                    + queue.capacity() * size_of::<u64>()
-                    + b.ids.len(),
-            )?;
+            search.try_grow(b.ids.len())?;
             let emit: Vec<bool> = b.ids.iter().map(|id| sources.contains(id)).collect();
             Ok(Some(
                 std::mem::replace(&mut b, Builder::new(budget)).finish(emit)?,

@@ -369,3 +369,59 @@ fn wide_fan_out_is_linear() {
     let took = start.elapsed();
     assert!(took.as_secs() < 10, "the closure of a star took {took:?}");
 }
+
+/// A program that builds lists in rule heads and reads them keeps the ordinary
+/// evaluation: the list builtins read the first `rdf:first` of a list, which depends on
+/// when each is derived.
+#[test]
+fn lists_built_by_rules_keep_the_rules() {
+    for read in [
+        "listMember(ex:L, ?m) -> (ex:out ex:q ?m)",
+        "listContains(ex:L, ex:x) -> (ex:out ex:q ex:x)",
+    ] {
+        let rules = format!(
+            "
+@prefix ex: <http://ex.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+[t: (?a ex:r ?b), (?b ex:r ?c) -> (?a ex:r ?c)]
+[mk1: (ex:a ex:r ex:d) -> (ex:L rdf:first ex:x)]
+[mk2: (ex:a ex:r ex:c) -> (ex:L rdf:first ex:y)]
+[q: (ex:a ex:r ?z), {read}]
+"
+        );
+        let s = store("ex:a ex:r ex:b . ex:b ex:r ex:c . ex:c ex:r ex:d . ex:L rdf:rest rdf:nil .");
+        let p = Profile::Rules(rules);
+        let (with, without) = same(&s, &p, read);
+        assert_eq!(with, without, "{read}");
+    }
+}
+
+/// A program that reads lists and derives list facts through a variable predicate starts
+/// again without operators once such a fact appears, so it derives what the rules do.
+#[test]
+fn lists_derived_through_properties_start_again() {
+    let rules = "
+@prefix ex: <http://ex.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+[t: (?a ex:r ?b), (?b ex:r ?c) -> (?a ex:r ?c)]
+[sp: (?p ex:sub ?q), (?x ?p ?y) -> (?x ?q ?y)]
+[mk1: (ex:a ex:r ex:d) -> (ex:L ex:f ex:x)]
+[mk2: (ex:a ex:r ex:c) -> (ex:L ex:f ex:y)]
+[q: (ex:L rdf:rest rdf:nil), listMember(ex:L, ?m) -> (ex:out ex:q ?m)]
+";
+    let s = store(
+        "ex:a ex:r ex:b . ex:b ex:r ex:c . ex:c ex:r ex:d . ex:L rdf:rest rdf:nil .
+         ex:f ex:sub rdf:first .",
+    );
+    let p = Profile::Rules(rules.into());
+    let (with, without) = same(&s, &p, "derived rdf:first");
+    assert_eq!(with, without, "the run started again without operators");
+    // OWL 2 RL reads lists too, and its prp-spo1 derives rdf:first from a subproperty
+    let s = store(
+        "ex:f rdfs:subPropertyOf rdf:first . ex:L ex:f ex:x . ex:L rdf:rest rdf:nil .
+         ex:C owl:intersectionOf ex:L . ex:i a ex:x .
+         ex:t a owl:TransitiveProperty . ex:a ex:t ex:b . ex:b ex:t ex:c .",
+    );
+    let (with, without) = same(&s, &Profile::OwlRl, "rdf:first through rdfs:subPropertyOf");
+    assert_eq!(with, without, "the run started again without operators");
+}

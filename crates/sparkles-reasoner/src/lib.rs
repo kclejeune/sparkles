@@ -390,7 +390,7 @@ fn derive_here(
     if let Some(context) = &opts.analysis {
         context.check()?;
     }
-    let limits = engine::Limits {
+    let mut limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
         cancel: opts.cancel.clone(),
@@ -399,7 +399,24 @@ fn derive_here(
         closures: opts.closure_operators && opts.analysis.is_none(),
     };
     progress(opts, 0.1, "reasoning");
-    let out = engine::run(&mut g, &compiled, &terms, &limits, None)?;
+    let out = loop {
+        match engine::run(&mut g, &compiled, &terms, &limits, None) {
+            Err(e) if limits.closures && e.is::<closure::Restart>() => {
+                // the run derived list structure that its rules read: it starts again
+                // with the rules evaluated as joins, so that their order of derivation
+                // decides what the list builtins see
+                tracing::debug!("{e}");
+                limits.closures = false;
+                drop(g);
+                g = graph::Graph::with_base(base.clone());
+                g.set_budget(&budget)?;
+                if let Some(d) = &defaults {
+                    g.try_add_batch(d.0.iter().copied())?;
+                }
+            }
+            r => break r?,
+        }
+    };
     budget.check_peak()?;
     Ok(Derivation {
         graph: g,

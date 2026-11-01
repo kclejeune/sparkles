@@ -1432,29 +1432,34 @@ impl Graph {
         out
     }
 
-    /// The objects of `(s p ?)` among rows `< hi`, or the error of a base-tier read.
-    pub fn try_objects(
+    /// Call `f` with each object of `(s p ?)` among rows `< hi` until it returns
+    /// `Ok(false)`, or return the error of `f` or of a base-tier read.
+    pub fn each_object(
         &self,
         memo: &mut Memo,
         s: u64,
         p: u64,
         hi: u32,
-    ) -> anyhow::Result<Vec<u64>> {
-        self.try_ends(memo, Some(s), p, None, hi, 2)
+        f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.each_end(memo, Some(s), p, None, hi, 2, f)
     }
 
-    /// The subjects of `(? p o)` among rows `< hi`, or the error of a base-tier read.
-    pub fn try_subjects(
+    /// Call `f` with each subject of `(? p o)` among rows `< hi`, as
+    /// [`Graph::each_object`] does.
+    pub fn each_subject(
         &self,
         memo: &mut Memo,
         p: u64,
         o: u64,
         hi: u32,
-    ) -> anyhow::Result<Vec<u64>> {
-        self.try_ends(memo, None, p, Some(o), hi, 0)
+        f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.each_end(memo, None, p, Some(o), hi, 0, f)
     }
 
-    fn try_ends(
+    #[allow(clippy::too_many_arguments)]
+    fn each_end(
         &self,
         memo: &mut Memo,
         s: Option<u64>,
@@ -1462,26 +1467,40 @@ impl Graph {
         o: Option<u64>,
         hi: u32,
         at: usize,
-    ) -> anyhow::Result<Vec<u64>> {
-        let mut out = Vec::new();
+        mut f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
         if let Some(b) = &self.base
             && self.reads_base(0, hi)
         {
-            b.for_each_with(memo, s, Some(p), o, |t| {
-                out.push(t[at]);
-                true
+            let mut stop: Option<anyhow::Result<()>> = None;
+            b.for_each_with(memo, s, Some(p), o, |t| match f(t[at]) {
+                Ok(true) => true,
+                Ok(false) => {
+                    stop = Some(Ok(()));
+                    false
+                }
+                Err(e) => {
+                    stop = Some(Err(e));
+                    false
+                }
             })?;
+            if let Some(r) = stop {
+                return r;
+            }
         }
         let c = self.cands(s, Some(p), o, 0, hi);
-        out.extend(
-            (0..c.len())
-                .map(|i| c.get(i))
-                .filter(|&i| self.alive(i))
-                .map(|i| self.triple(i))
-                .filter(|t| s.is_none_or(|x| x == t[0]) && t[1] == p && o.is_none_or(|x| x == t[2]))
-                .map(|t| t[at]),
-        );
-        Ok(out)
+        for i in 0..c.len() {
+            let r = c.get(i);
+            if !self.alive(r) {
+                continue;
+            }
+            let t = self.triple(r);
+            if s.is_none_or(|x| x == t[0]) && t[1] == p && o.is_none_or(|x| x == t[2]) && !f(t[at])?
+            {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Members of an RDF list (`rdf:first` / `rdf:rest`), or `None` if `head` is not a
