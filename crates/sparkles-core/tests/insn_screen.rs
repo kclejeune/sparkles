@@ -13,8 +13,8 @@
 //! hybrid Intel CPU a counter is opened on each core type's PMU and the counts are summed,
 //! so the thread may move between cores. The counter covers the calling thread only,
 //! which is where these readers run. Each case also records the CPU time of the process's
-//! other threads during the case, and a check fails when it is more than two clock ticks,
-//! since work moved to another thread would otherwise look like a saving.
+//! other threads during the case, and a check fails when it is more than 20 ms, since
+//! work moved to another thread would otherwise look like a saving.
 //!
 //! `INSN_SCREEN_ITEMS` sets the size (20,000 items, about 160,000 triples, by default),
 //! `INSN_SCREEN_COMMITS` the commits that WAL replay reads (2,000 by default) and
@@ -262,15 +262,14 @@ impl Out {
         }));
     }
 
-    fn case(&mut self, key: &str, mut counts: Vec<u64>, other_ticks: u64, coverage: f64) {
+    fn case(&mut self, key: &str, mut counts: Vec<u64>, other_us: u64, coverage: f64) {
         counts.sort_unstable();
         let median = counts[counts.len() / 2];
-        let tick_ms = 1000 / clock_ticks();
+        let other_ms = other_us as f64 / 1000.0;
         println!(
-            "| {key} | {median} | {} | {} | {} |",
+            "| {key} | {median} | {} | {} | {other_ms:.1} |",
             counts[0],
             counts[counts.len() - 1],
-            other_ticks * tick_ms
         );
         self.line(serde_json::json!({
             "key": key, "value": median, "unit": "instructions", "better": "lower",
@@ -278,8 +277,8 @@ impl Out {
         }));
         self.check(
             &format!("{key}/single-thread"),
-            other_ticks <= 2,
-            format!("{} ms of CPU time on other threads", other_ticks * tick_ms),
+            other_us <= OTHER_THREADS_US,
+            format!("{other_ms:.1} ms of CPU time on other threads"),
         );
         self.check(
             &format!("{key}/counter-coverage"),
@@ -289,44 +288,46 @@ impl Out {
     }
 }
 
-fn clock_ticks() -> u64 {
-    // SAFETY: sysconf has no preconditions.
-    (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64
+/// The CPU time that the process's other threads may use during a case, in microseconds.
+const OTHER_THREADS_US: u64 = 20_000;
+
+/// A CPU-time clock in microseconds.
+fn cpu_us(clock: libc::clockid_t) -> i64 {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a pointer to a live timespec.
+    assert_eq!(unsafe { libc::clock_gettime(clock, &mut t) }, 0);
+    t.tv_sec * 1_000_000 + t.tv_nsec / 1000
 }
 
-/// User and system clock ticks of this process's threads other than the calling one,
-/// including threads that have exited: the process's total, which keeps the time of
-/// joined threads, less the calling thread's own.
-/// The two counters are read one after the other, so the difference can be a tick off
-/// either way, and it is signed; `ticks_since` clamps an interval at zero, which the
-/// guard's allowance of two ticks covers.
-fn other_thread_ticks() -> i64 {
-    fn ticks(path: &str) -> i64 {
-        let stat = std::fs::read_to_string(path).unwrap();
-        // the fields after the command, which is in parentheses
-        let rest = &stat[stat.rfind(')').unwrap() + 2..];
-        let f: Vec<&str> = rest.split(' ').collect();
-        f[11].parse::<i64>().unwrap() + f[12].parse::<i64>().unwrap()
-    }
-    ticks("/proc/self/stat") - ticks("/proc/thread-self/stat")
+/// The CPU time in microseconds of this process's threads other than the calling one,
+/// including threads that have exited: the process's CPU clock, which keeps the time of
+/// joined threads, less the calling thread's own. Both clocks count nanoseconds, so the
+/// difference is off only by the calling thread's time between the two reads, which is
+/// signed; `us_since` clamps an interval at zero.
+fn other_thread_us() -> i64 {
+    let process = cpu_us(libc::CLOCK_PROCESS_CPUTIME_ID);
+    process - cpu_us(libc::CLOCK_THREAD_CPUTIME_ID)
 }
 
-/// Wait until the process's other threads have used no CPU time for 50 ms, at most five
-/// seconds, so that a dropped store's threads winding down or a pool's workers spinning
-/// after a query are not counted as work of the next case.
+/// Wait until the process's other threads have used less than 0.1 ms of CPU time in 50 ms,
+/// at most five seconds, so that a dropped store's threads winding down or a pool's
+/// workers spinning after a query are not counted as work of the next case.
 fn quiesce() {
     for _ in 0..100 {
-        let t = other_thread_ticks();
+        let t = other_thread_us();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        if other_thread_ticks() == t {
+        if other_thread_us() - t < 100 {
             return;
         }
     }
 }
 
-/// Other-thread ticks since `before`, a value of `other_thread_ticks`.
-fn ticks_since(before: i64) -> u64 {
-    (other_thread_ticks() - before).max(0) as u64
+/// Other-thread microseconds since `before`, a value of `other_thread_us`.
+fn us_since(before: i64) -> u64 {
+    (other_thread_us() - before).max(0) as u64
 }
 
 /// Count `f` `reps` times and check that every run returned `expected`, which the caller
@@ -343,7 +344,7 @@ fn measure<R: PartialEq + std::fmt::Debug>(
     let mut coverage = 1f64;
     let mut wrong = None;
     quiesce();
-    let before = other_thread_ticks();
+    let before = other_thread_us();
     for _ in 0..reps {
         let (n, share, r) = c.count(&mut f);
         counts.push(n);
@@ -352,13 +353,13 @@ fn measure<R: PartialEq + std::fmt::Debug>(
             wrong = Some(r);
         }
     }
-    let ticks = ticks_since(before);
+    let other = us_since(before);
     let detail = match &wrong {
         None => format!("{expected:?}"),
         Some(r) => format!("{r:?}, expected {expected:?}"),
     };
     out.check(&format!("{key}/result"), wrong.is_none(), detail);
-    out.case(key, counts, ticks, coverage);
+    out.case(key, counts, other, coverage);
 }
 
 /// A deterministic sequence of ids below `n`.
@@ -617,7 +618,7 @@ fn content(s: &Store) -> Content {
 /// The counts of opening fresh copies of a store, and whether each recovered it.
 struct Opens {
     counts: Vec<u64>,
-    ticks: u64,
+    other_us: u64,
     coverage: f64,
     recovered: bool,
 }
@@ -625,7 +626,7 @@ struct Opens {
 fn opens(c: &counter::Instructions, src: &Path, reps: usize, want: &Content) -> Opens {
     let mut o = Opens {
         counts: Vec::new(),
-        ticks: 0,
+        other_us: 0,
         coverage: 1.0,
         recovered: true,
     };
@@ -634,9 +635,9 @@ fn opens(c: &counter::Instructions, src: &Path, reps: usize, want: &Content) -> 
         let dir: PathBuf = scratch.path().join("db");
         copy_dir(src, &dir);
         quiesce();
-        let before = other_thread_ticks();
+        let before = other_thread_us();
         let (n, share, s) = c.count(|| Store::open(&dir, StoreOptions::default()).unwrap());
-        o.ticks += ticks_since(before);
+        o.other_us += us_since(before);
         o.coverage = o.coverage.min(share);
         o.recovered &= content(&s) == *want;
         o.counts.push(n);
@@ -745,10 +746,10 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
     out.case(
         "wal/open-without-wal",
         empty.counts,
-        empty.ticks,
+        empty.other_us,
         empty.coverage,
     );
-    out.case(&key, replay.counts, replay.ticks, replay.coverage);
+    out.case(&key, replay.counts, replay.other_us, replay.coverage);
     // the open of the same store without the log, subtracted
     let coverage = empty.coverage.min(replay.coverage);
     out.case(&format!("wal/replay-{commits}-commits"), diff, 0, coverage);
@@ -757,31 +758,19 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
 /// The other-thread guard sees a worker that ran and was joined while a case ran.
 #[test]
 fn joined_threads_count_as_other_threads() {
-    let before = other_thread_ticks();
+    let before = other_thread_us();
     std::thread::spawn(|| {
         // 300 ms of this thread's own CPU time, however busy the machine is
-        let cpu = || {
-            let mut t = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: a valid clock id and a pointer to a live timespec.
-            assert_eq!(
-                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) },
-                0
-            );
-            t.tv_sec as f64 + t.tv_nsec as f64 * 1e-9
-        };
-        let start = cpu();
+        let start = cpu_us(libc::CLOCK_THREAD_CPUTIME_ID);
         let mut x = 0u64;
-        while cpu() - start < 0.3 {
+        while cpu_us(libc::CLOCK_THREAD_CPUTIME_ID) - start < 300_000 {
             x = std::hint::black_box(x.wrapping_add(1));
         }
     })
     .join()
     .unwrap();
-    let ticks = ticks_since(before);
-    assert!(ticks * 1000 / clock_ticks() >= 100, "{ticks} ticks");
+    let other = us_since(before);
+    assert!(other >= 100_000, "{other} us");
 }
 
 #[test]
