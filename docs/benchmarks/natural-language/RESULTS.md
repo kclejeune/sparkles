@@ -142,7 +142,7 @@ zero-or-more property path over redirects and disambiguations reached about 28 G
 and `skos:broader?/skos:broader?` from an unbound category reached a 12 GB cap. Ask's
 default query memory budget of 2048 MiB and 60-second timeout did not stop them. Ask
 needs an enforced default memory budget and timeout that cover property-path evaluation,
-which [ROADMAP](../../ROADMAP.md) item NEW-ITEM-1 tracks.
+which [ROADMAP](../../ROADMAP.md) item 505 tracks.
 
 [ROADMAP](../../ROADMAP.md) item 263 holds the accuracy work. The
 [paid record](../2026-11-01-ask-model-baseline-paid.json) gives per-run and per-case

@@ -1776,7 +1776,7 @@ a zero-or-more property path over redirects and once at a 12 GB cap on
 `skos:broader?/skos:broader?` from an unbound category. Ask's default query memory budget
 of 2048 MiB and 60-second query timeout did not stop them. Ask needs an enforced default
 memory budget and timeout that also cover property paths, which
-[ROADMAP](../../ROADMAP.md) item NEW-ITEM-1 tracks.
+[ROADMAP](../../ROADMAP.md) item 505 tracks.
 The campaign made 1,965 ledger-reserved requests for $39.22 under a cap of $45. That
 includes $5.34 for a Sonnet attempt and $3.40 for Opus attempts that host failures
 interrupted, and the 22 answers that the first Opus attempt completed are part of its
