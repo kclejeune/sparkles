@@ -70,7 +70,7 @@ enum Pos {
 enum R {
     Var(usize),
     Id(Id),
-    /// a constant the store does not hold: the pattern matches nothing
+    /// a position that matches nothing
     Never,
 }
 
@@ -108,10 +108,11 @@ pub struct RuleProgram {
     rules: Vec<CRule>,
     /// the rules' patterns resolved at the current pass
     resolved: Vec<Resolved>,
-    /// the head constants the store does not hold, as local ids
+    /// the rules' constants that the store does not hold, as local ids, which the
+    /// facts and their checkpoints share
     terms: Terms,
-    /// the ids the head constants resolved to at the last pass
-    heads: Vec<Id>,
+    /// the ids the rules' constants resolved to at the last pass
+    consts: Vec<Id>,
     by_p: FxHashMap<Id, FxHashSet<(Id, Id)>>,
     ps: FxHashMap<(Id, Id), FxHashSet<Id>>,
     po: FxHashMap<(Id, Id), FxHashSet<Id>>,
@@ -184,44 +185,69 @@ impl RuleProgram {
     }
 
     /// Resolve the rules' constants at the pass's new snapshot. Call it before each
-    /// build or advance. A head constant that the store does not hold derives triples
-    /// with a local id, and when the store comes to hold it the program's facts name
-    /// the wrong id: `begin` then returns `true`, and the caller builds the fixed point
-    /// again instead of advancing it.
+    /// build or advance. A constant that the store does not hold gets a local id, in
+    /// bodies and heads alike, so that a rule matches the triples that another rule
+    /// derives with it. When the store comes to hold such a constant, the program's
+    /// facts name the wrong id: `begin` then returns `true`, and the caller builds the
+    /// fixed point again instead of advancing it.
     pub fn begin(&mut self, cx: &RuleCx) -> bool {
-        let body = |p: &Pos| match p {
-            Pos::Var(v) => R::Var(*v),
-            Pos::Const(t) => cx.new.lookup_term(t).map_or(R::Never, R::Id),
-        };
-        let mut heads = Vec::new();
+        let mut consts = Vec::new();
         let mut resolved = Vec::with_capacity(self.rules.len());
         for c in &self.rules {
-            let b: Vec<[R; 3]> = c
-                .body
-                .iter()
-                .map(|[s, p, o]| [body(s), body(p), body(o)])
-                .collect();
-            let mut h = Vec::with_capacity(c.head.len());
-            for pat in &c.head {
-                let mut out = [R::Never; 3];
-                for (i, p) in pat.iter().enumerate() {
-                    out[i] = match p {
-                        Pos::Var(v) => R::Var(*v),
-                        Pos::Const(t) => {
-                            let id = self.terms.intern(&cx.new, t);
-                            heads.push(id);
-                            R::Id(id)
+            let mut side = |pats: &[[Pos; 3]]| -> Vec<[R; 3]> {
+                pats.iter()
+                    .map(|pat| {
+                        let mut out = [R::Never; 3];
+                        for (i, p) in pat.iter().enumerate() {
+                            out[i] = match p {
+                                Pos::Var(v) => R::Var(*v),
+                                Pos::Const(t) => {
+                                    let id = self.terms.intern(&cx.new, t);
+                                    consts.push(id);
+                                    R::Id(id)
+                                }
+                            };
                         }
-                    };
-                }
-                h.push(out);
-            }
+                        out
+                    })
+                    .collect()
+            };
+            let b = side(&c.body);
+            let h = side(&c.head);
             resolved.push((b, h));
         }
         self.resolved = resolved;
-        let moved = !self.heads.is_empty() && self.heads != heads;
-        self.heads = heads;
+        let moved = !self.consts.is_empty() && self.consts != consts;
+        self.consts = consts;
         moved
+    }
+
+    /// The bytes of the fixed point `fp` of a program, with the term table of its local
+    /// constants. A checkpoint must use it, or [`Self::decode`]'s counterpart, rather
+    /// than a writer over other terms, because the facts name the program's local ids.
+    pub fn encode(
+        fp: &fixpoint::FixedPoint<RuleProgram>,
+        snap: &Snapshot,
+    ) -> sparkles_core::Result<Vec<u8>> {
+        let mut w = Writer::new(snap, &fp.program.terms);
+        fp.save(&mut w)?;
+        Ok(w.finish())
+    }
+
+    /// Load into `fp` the state that [`Self::encode`] wrote, mapping its terms into the
+    /// id space of `snap` and the program's fresh local terms. Call [`Self::begin`]
+    /// before the next pass, as for any other.
+    pub fn decode(
+        fp: &mut fixpoint::FixedPoint<RuleProgram>,
+        data: &[u8],
+        snap: &Snapshot,
+    ) -> sparkles_core::Result<()> {
+        let mut terms = Terms::default();
+        let mut r = Reader::new(data, snap, &mut terms)?;
+        fp.program.terms = terms;
+        fp.program.consts.clear();
+        fp.program.resolved.clear();
+        fp.load(&mut r)
     }
 
     /// The term of an id of the program's facts at `snap`.

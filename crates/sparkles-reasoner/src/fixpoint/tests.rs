@@ -299,3 +299,140 @@ fn unsupported_rules_are_refused() {
         assert!(RuleProgram::new(&rules).is_err(), "{r}");
     }
 }
+
+fn program(
+    rules: &str,
+    s: &Store,
+    mode: Provenance,
+    max: Option<u64>,
+) -> sparkles_core::Result<FixedPoint<RuleProgram>> {
+    let rules = parse_rules(rules).expect("rules");
+    let mut fp = FixedPoint::new(RuleProgram::new(&rules).expect("program"));
+    fp.set_provenance(mode);
+    let control = Control::none();
+    let snap = s.snapshot();
+    let mut cx = RuleCx {
+        new: snap.clone(),
+        old: snap,
+        added: &[],
+        removed: &[],
+        control: &control,
+    };
+    fp.program.begin(&cx);
+    fp.build(&mut cx, max)?;
+    Ok(fp)
+}
+
+fn store(triples: &str) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    update(
+        &s,
+        &format!("INSERT DATA {{ {triples} }}"),
+        &QueryOptions::default(),
+    )
+    .expect("update");
+    s
+}
+
+/// A constant that only derived triples hold matches in the bodies of other rules.
+#[test]
+fn derived_constants_chain_through_rules() {
+    let s = store("<http://ex/a> <http://ex/p> <http://ex/b> .");
+    let fp = program(
+        "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+         [qr: (?x <http://ex/q> ?y) -> (?x <http://ex/r> ?y)]",
+        &s,
+        Provenance::None,
+        None,
+    )
+    .expect("build");
+    let got = shown(&s.snapshot(), &fp);
+    for p in ["p", "q", "r"] {
+        let t = format!("<http://ex/a> <http://ex/{p}> <http://ex/b>");
+        assert!(got.contains(&t), "{t} missing from {got:?}");
+    }
+}
+
+/// A body that names the same premise several times is annotated without reporting a
+/// cycle, whichever fact is annotated first.
+#[test]
+fn repeated_premises_are_not_a_cycle() {
+    let body = "(?x <http://ex/q> ?y) ".repeat(12);
+    let rules = format!(
+        "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+         [w: {body} -> (?x <http://ex/r> ?y)]"
+    );
+    for k in 0..8 {
+        let filler: String = (0..k)
+            .map(|j| format!("<http://ex/f{j}> <http://ex/z> <http://ex/g{j}> . "))
+            .collect();
+        let s = store(&format!(
+            "<http://ex/a> <http://ex/p> <http://ex/b> . {filler}"
+        ));
+        let fp = program(&rules, &s, Provenance::why(), None)
+            .unwrap_or_else(|e| panic!("{k} fillers: {e}"));
+        assert_eq!(fp.facts().count(), 3 + k);
+    }
+}
+
+/// Annotations count against the memory budget of a build.
+#[test]
+fn annotations_count_against_the_budget() {
+    let triples: String = (0..5000)
+        .map(|i| format!("<http://ex/i{i}> <http://ex/p> <http://ex/j{i}> . "))
+        .collect();
+    let s = store(&triples);
+    let rules = "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]";
+    let plain = program(rules, &s, Provenance::None, None).expect("build");
+    let why = program(rules, &s, Provenance::why(), None).expect("build");
+    assert!(
+        why.bytes() > plain.bytes() + 100_000,
+        "{} {}",
+        why.bytes(),
+        plain.bytes()
+    );
+    let limit = (plain.bytes() + why.bytes()) / 2;
+    assert!(program(rules, &s, Provenance::None, Some(limit)).is_ok());
+    let Err(e) = program(rules, &s, Provenance::why(), Some(limit)) else {
+        panic!("the annotated build fits the budget");
+    };
+    assert!(
+        matches!(e, sparkles_core::Error::BudgetExceeded(_)),
+        "{e:?}"
+    );
+}
+
+/// A fixed point whose rules derive a constant the store lacks survives a checkpoint.
+#[test]
+fn local_head_constants_survive_a_checkpoint() {
+    let s = store("<http://ex/a> <http://ex/p> <http://ex/b> .");
+    let rules = "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> <http://ex/new>)]";
+    let fp = program(rules, &s, Provenance::why(), None).expect("build");
+    let snap = s.snapshot();
+    let bytes = RuleProgram::encode(&fp, &snap).expect("encode");
+    let parsed = parse_rules(rules).expect("rules");
+    let mut back = FixedPoint::new(RuleProgram::new(&parsed).expect("program"));
+    back.set_provenance(Provenance::why());
+    RuleProgram::decode(&mut back, &bytes, &snap).expect("decode");
+    assert_eq!(shown(&snap, &back), shown(&snap, &fp));
+    // the restored program advances like the original
+    let after = s.snapshot().commit;
+    update(
+        &s,
+        "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
+        &QueryOptions::default(),
+    )
+    .expect("update");
+    assert!(
+        advance(&s, &mut back, after).is_some(),
+        "advanced, not built again"
+    );
+    let want: BTreeSet<String> = shown(&snap, &fp)
+        .into_iter()
+        .chain([
+            "<http://ex/c> <http://ex/p> <http://ex/d>".to_string(),
+            "<http://ex/c> <http://ex/q> <http://ex/new>".to_string(),
+        ])
+        .collect();
+    assert_eq!(shown(&s.snapshot(), &back), want);
+}
