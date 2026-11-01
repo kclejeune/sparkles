@@ -1315,7 +1315,17 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
                 continue
             if kind != "line":
                 # The reader queues every result line before the end, so the lines
-                # still in flight got none.
+                # still in flight got none. A child that the kernel or a memory cap
+                # killed fails them as a measured result, as single mode does. Any
+                # other end, or a result line past the cap, cannot be trusted and
+                # ends the run.
+                record = batch.close(wait=min(5, phase_left()))
+                if kind != "eof" or not killed(record, batch.directory):
+                    raise HarnessFault(
+                        "batch output too long"
+                        if kind != "eof"
+                        else f"batch child exited with status {record['returncode']}"
+                    )
                 fail_flight("killed")
                 continue
             c, rnd, sent = flight.popleft()
@@ -1531,30 +1541,28 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                 # The batch child holds a database directory's lock, so the cases
                 # are scored once it has ended.
                 results = []
-                try:
-                    run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results)
-                except (Invalid, OSError):
-                    # Keep the paid answers that finished, unscored, beside the report.
+
+                def drain():
+                    # Keep every paid answer that was not scored, unscored, beside
+                    # the report, whatever ended the run.
+                    scored = {r["case"] for r in report["cases"]}
+                    rest = [r for r in results if r[1] not in scored]
                     report["drainedCases"] = [
                         {"case": c, "pair": pair, "id": x["id"], "started": True}
-                        for x, c, _ in results
+                        for x, c, _ in rest
                     ]
-                    for x, c, a in results:
-                        with (out_dir / (c + ".json")).open("x") as f:
+                    for x, c, a in rest:
+                        path = out_dir / (c + ".json")
+                        with contextlib.suppress(OSError), path.open("x") as f:
                             json.dump({"id": x["id"], "answer": a, "score": None}, f, indent=2)
-                    raise
-                for n, (q, case_id, answer) in enumerate(results):
-                    try:
+
+                try:
+                    run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results)
+                    for q, case_id, answer in results:
                         finish_case(q, case_id, answer)
-                    except HarnessFault:
-                        report["drainedCases"] = [
-                            {"case": c, "pair": pair, "id": x["id"], "started": True}
-                            for x, c, _ in results[n + 1 :]
-                        ]
-                        for x, c, a in results[n + 1 :]:
-                            with (out_dir / (c + ".json")).open("x") as f:
-                                json.dump({"id": x["id"], "answer": a, "score": None}, f, indent=2)
-                        raise
+                except (Invalid, OSError):
+                    drain()
+                    raise
                 qs_left = []
             else:
                 qs_left = qs

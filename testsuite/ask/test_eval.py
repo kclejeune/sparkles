@@ -490,6 +490,45 @@ class Processes(unittest.TestCase):
         binary.write_text("#!" + PYTHON + "\n" + body)
         args.sparkles_sha256 = digest(binary)
 
+    BATCH_ASK = (
+        "import json,sys\n"
+        'if "--questions" not in sys.argv:\n'
+        '    print(json.dumps({"head":{"vars":[]},"results":{"bindings":[]}}))\n'
+        "    raise SystemExit(0)\n"
+        "for raw in sys.stdin:\n"
+        "    line = json.loads(raw)\n"
+        "{exit}"
+        '    print(json.dumps({"id": line["id"], "outcome": "clarify"}), flush=True)\n'
+    )
+
+    def test_a_batch_child_that_exits_with_lines_in_flight_ends_the_run(self):
+        args = self.questions_fixture(["clarify"] * 3)
+        args.batch = True
+        self.fake_ask(args, self.BATCH_ASK.replace("{exit}", "    raise SystemExit(1)\n"))
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertIn("status 1", report.get("errorDetail") or "")
+        self.assertEqual(report["scored"], 0)
+
+    def test_a_scoring_failure_keeps_every_unscored_batch_answer(self):
+        args = self.questions_fixture(["clarify"] * 3)
+        args.batch = True
+        self.fake_ask(args, self.BATCH_ASK.replace("{exit}", ""))
+        score = eval_ask.Runner.score
+
+        def failing(runner, q, answer):
+            if q["id"] == "q2":
+                raise eval_ask.HarnessFault("phase deadline expired")
+            return score(runner, q, answer)
+
+        with mock.patch.object(eval_ask.Runner, "score", failing):
+            out, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual([c["id"] for c in report["cases"]], ["q1"])
+        self.assertEqual(sorted(c["id"] for c in report["drainedCases"]), ["q2", "q3"])
+        saved = sorted(json.loads(f.read_text())["id"] for f in out.glob("*.json") if f.name != "report.json")
+        self.assertEqual(saved, ["q1", "q2", "q3"])
+
     def test_failed_ask_is_scored_and_does_not_end_the_run(self):
         args = self.questions_fixture(["clarify"] * 3)
         self.fake_ask(
@@ -1396,8 +1435,9 @@ for raw in sys.stdin:
         sys.exit(0)
     print(json.dumps(out), flush=True)
     if mode == "close-after-each":
+        # An end the runner trusts, as when a memory cap kills the child.
         sys.stdin.close()
-        sys.exit(0)
+        os.kill(os.getpid(), signal.SIGKILL)
 '''
 
 
