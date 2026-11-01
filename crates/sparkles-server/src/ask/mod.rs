@@ -304,6 +304,7 @@ pub fn ask(
         answered_by: None,
         reports: None,
         fallback: None,
+        held: Vec::new(),
     };
     let mut out = a.run();
     // an event stream learns of the endings without their own event here
@@ -377,6 +378,8 @@ struct Asking<'a, 'e> {
     reports: Option<Value>,
     /// the answer that a repair of its result's shape may replace
     fallback: Option<Answered>,
+    /// the terminal events of that repair, which wait while `fallback` stands
+    held: Vec<(String, Value)>,
 }
 
 /// What `run_query` returns: the compact result and, with `full_results`, the full one.
@@ -471,6 +474,12 @@ struct Draft {
 
 impl Asking<'_, '_> {
     fn emit(&mut self, event: &str, v: &Value) {
+        // while a repair of a result's shape may still give way to the first answer,
+        // its terminal events wait, so a stream never reports both
+        if self.fallback.is_some() && matches!(event, "error" | "result" | "clarify") {
+            self.held.push((event.to_string(), v.clone()));
+            return;
+        }
         (self.on)(event, v);
     }
 
@@ -1427,6 +1436,8 @@ impl Asking<'_, '_> {
         }
         match self.fallback.take() {
             Some(a) => {
+                // the repair's own terminal events give way to the first answer's
+                self.held.clear();
                 self.notes.push(
                     "the repair of the result's shape did not answer, so the first answer stands"
                         .into(),
@@ -1837,6 +1848,7 @@ impl Asking<'_, '_> {
             }
             self.attempts.push(record);
             self.fallback = None;
+            self.held.clear();
             return self.answer(
                 Answered {
                     result: r,

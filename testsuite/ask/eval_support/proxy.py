@@ -1244,10 +1244,13 @@ class Proxy:
                 self.api.path, payload, self.timeout
             )
         except UpstreamFailure as failure:
-            # A request that may have reached the server is charged at its bound.
+            # A request that may have reached the server is charged at its bound, and
+            # its prompt is recorded, since it was sent, with no reply.
             self.ledger.settle(
                 ident, limit if failure.sent else 0, "failure:" + failure.reason
             )
+            if failure.sent:
+                self.record(ident, case, model, payload, 502, b"", None)
             return 502, [], error_body("api_error", "the upstream did not answer")
         except Exception as error:  # noqa: BLE001 -- the reserve must never stay open
             # Any other fault may come after the body left, so it costs the bound.

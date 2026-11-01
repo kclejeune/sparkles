@@ -960,3 +960,36 @@ fn a_shape_repair_shows_rows_only_to_a_pair_that_may_receive_them() {
         assert_eq!(repair.contains("Its first rows"), rows, "{repair}");
     }
 }
+
+#[test]
+fn a_failed_shape_repair_streams_only_the_first_answer() {
+    let s = server(ORG);
+    let list = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let calls = Mutex::new(0);
+    // the first draft answers, and the repair's provider then fails
+    let mock = MockModel::start(move |_, _| {
+        let mut n = calls.lock();
+        *n += 1;
+        if *n == 1 {
+            (200, mock::openai(&list))
+        } else {
+            (500, json!({ "error": { "message": "down" } }))
+        }
+    });
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        shape_check: true,
+        ..opts("How many teams are there?")
+    };
+    let mut events = Vec::new();
+    let mut on = |e: &str, _: &Value| events.push(e.to_string());
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(!events.contains(&"error".to_string()), "{events:?}");
+    assert_eq!(
+        events.iter().filter(|e| *e == "result").count(),
+        1,
+        "{events:?}"
+    );
+}

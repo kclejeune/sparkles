@@ -512,6 +512,19 @@ class Errors(Base):
         self.assertEqual(settle["cost"], reserve["bound"])
         self.assertEqual(proxy.handle(raw())[0], 200)
 
+    def test_a_sent_request_whose_reply_was_lost_is_recorded(self):
+        path = self.root / "replies.jsonl"
+        proxy = self.proxy(Upstream(px.UpstreamFailure("timeout", True), px.UpstreamFailure("gaierror", False)),
+                           replies=path)
+        self.assertEqual(proxy.handle(raw())[0], 502)
+        self.assertEqual(proxy.handle(raw())[0], 502)
+        rows = [json.loads(x) for x in path.read_text().splitlines()]
+        # the sent prompt counts for recall, and the one that never left is not there
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], 502)
+        self.assertIn("messages", rows[0]["request"])
+        self.assertNotIn(KEY, path.read_text())
+
     def test_failure_before_the_body_left_costs_nothing(self):
         proxy = self.proxy(Upstream(px.UpstreamFailure("gaierror", False)))
         proxy.handle(raw())
