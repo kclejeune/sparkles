@@ -1110,16 +1110,21 @@ impl Asking<'_, '_> {
             "http://www.w3.org/2004/02/skos/core#prefLabel",
             "http://www.w3.org/2004/02/skos/core#altLabel",
         ];
+        let cfg = self.server.cfg();
+        let max_rows = cfg.max_rows.min(200);
         let run = |q: String| -> Option<Value> {
             let left = self.deadline.saturating_duration_since(Instant::now());
-            let secs = left.min(USAGE_QUERY_TIMEOUT).as_secs_f64();
+            let secs = left
+                .min(USAGE_QUERY_TIMEOUT)
+                .min(cfg.max_timeout)
+                .as_secs_f64();
             if secs < 0.5 {
                 return None;
             }
             self.ground_tool(
                 profile::Stage::PredicateUse,
                 "sparql_query",
-                json!({"query": q, "format": "json", "maxRows": 200, "timeoutSeconds": secs}),
+                json!({"query": q, "format": "json", "maxRows": max_rows, "timeoutSeconds": secs}),
                 false,
             )
             .ok()
@@ -1129,14 +1134,27 @@ impl Asking<'_, '_> {
             (!ranked.is_empty())
                 .then(|| format!("{subject}: {}\n", grounding::grouped(&ranked, prefixes)))
         };
+        // The default graph and every named graph the caller may read, as the linker
+        // searches them, without materialized inferences unless the ask reads them.
+        let inferred = (self.o.reasoning != Some(true))
+            .then(|| format!(" FILTER(?{{g}} != <{}>)", crate::http::INFERRED_GRAPH))
+            .unwrap_or_default();
+        let view = |pattern: &str, g: &str| -> String {
+            format!(
+                "{{ {{ {pattern} }} UNION {{ GRAPH ?{g} {{ {pattern} }}{} }} }}",
+                inferred.replace("{g}", g)
+            )
+        };
         let mut lines = String::new();
-        for e in entities {
+        for e in entities.iter().filter(|e| grounding::safe_iri(e)) {
             let name = grounding::compact(e, prefixes);
             let outgoing = format!(
-                "SELECT ?p (COUNT(*) AS ?n) WHERE {{ <{e}> ?p ?o }} GROUP BY ?p ORDER BY DESC(?n) LIMIT 200"
+                "SELECT ?p (COUNT(*) AS ?n) WHERE {{ {} }} GROUP BY ?p ORDER BY DESC(?n) LIMIT {max_rows}",
+                view(&format!("<{e}> ?p ?o"), "g")
             );
             let incoming = format!(
-                "SELECT ?p (COUNT(*) AS ?n) WHERE {{ {{ SELECT ?p WHERE {{ ?s ?p <{e}> }} LIMIT {USAGE_SAMPLE_TRIPLES} }} }} GROUP BY ?p ORDER BY DESC(?n) LIMIT 200"
+                "SELECT ?p (COUNT(*) AS ?n) WHERE {{ {{ SELECT ?p WHERE {{ {} }} LIMIT {USAGE_SAMPLE_TRIPLES} }} }} GROUP BY ?p ORDER BY DESC(?n) LIMIT {max_rows}",
+                view(&format!("?s ?p <{e}>"), "g")
             );
             if let Some(l) =
                 run(outgoing).and_then(|v| line(format!("{name} as subject"), &v, USAGE_OUT))
@@ -1149,10 +1167,12 @@ impl Asking<'_, '_> {
                 lines.push_str(&l);
             }
         }
-        for c in classes {
+        for c in classes.iter().filter(|c| grounding::safe_iri(c)) {
             let name = grounding::compact(c, prefixes);
             let q = format!(
-                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {{ SELECT ?s WHERE {{ ?s a <{c}> }} LIMIT {USAGE_SAMPLE_INSTANCES} }} ?s ?p ?o }} GROUP BY ?p ORDER BY DESC(?n) LIMIT 200"
+                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {{ SELECT DISTINCT ?s WHERE {{ {} }} LIMIT {USAGE_SAMPLE_INSTANCES} }} {} }} GROUP BY ?p ORDER BY DESC(?n) LIMIT {max_rows}",
+                view(&format!("?s a <{c}>"), "g1"),
+                view("?s ?p ?o", "g2")
             );
             if let Some(l) = run(q).and_then(|v| {
                 line(

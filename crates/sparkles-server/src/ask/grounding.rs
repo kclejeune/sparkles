@@ -405,6 +405,18 @@ pub(super) fn matched_classes(
         .collect()
 }
 
+/// Whether `iri` is absolute and can stand between angle brackets in a query.
+pub(super) fn safe_iri(iri: &str) -> bool {
+    iri.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    }) && !iri
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || "<>\"{}|^`\\".contains(c))
+}
+
 /// An absolute IRI that a clarification answer names, in angle brackets or under one
 /// of `prefixes`.
 pub(super) fn answered_iri(answer: &str, prefixes: &Value) -> Option<String> {
@@ -418,15 +430,7 @@ pub(super) fn answered_iri(answer: &str, prefixes: &Value) -> Option<String> {
         }
         e
     };
-    let scheme = iri.split_once(':').map(|(s, _)| s)?;
-    (!scheme.is_empty()
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
-        && !iri
-            .chars()
-            .any(|c| c.is_whitespace() || "<>\"{}|^`\\".contains(c)))
-    .then_some(iri)
+    safe_iri(&iri).then_some(iri)
 }
 
 #[cfg(test)]
@@ -715,6 +719,9 @@ mod tests {
         );
         assert_eq!(answered_iri("the planet", &prefixes), None);
         assert_eq!(answered_iri("<http://example.org/a b>", &prefixes), None);
+        assert!(safe_iri("http://example.org/A_(b)"));
+        assert!(!safe_iri("http://example.org/a> } DROP"));
+        assert!(!safe_iri("relative"));
     }
 
     #[test]
