@@ -617,3 +617,84 @@ fn tangled_lists_truncate_list_readers() {
     let got = cache.witnesses(&t("s", "t", "yes")).unwrap();
     assert!(got.annotation.truncated, "{got:?}");
 }
+
+/// Regression (fifteenth review of item 416): a tangled list makes the program not
+/// monotone also past its readers, through facts the closure lacks, so every fact is
+/// truncated.
+#[test]
+fn tangled_lists_truncate_through_absent_intermediates() {
+    let s = Store::in_memory(StoreOptions::default());
+    let first = format!("{RDF}first");
+    let rest = format!("{RDF}rest");
+    let nil = format!("{RDF}nil");
+    change(
+        &s,
+        None,
+        &[
+            t("l", &first, "bad"),
+            t("l", &rest, &nil),
+            t("s", "seed", "yes"),
+            t("s", "d", "yes"),
+        ],
+        &[],
+    );
+    let rules = Profile::Rules(format!(
+        "[g: (<{EX}s> <{EX}seed> <{EX}yes>) -> (<{EX}l> <{RDF}first> <{EX}good>)]
+         [c: (?l <{RDF}first> <{EX}good>), listContains(?l, <{EX}good>) -> (<{EX}s> <{EX}p> <{EX}yes>)]
+         [p: (?s <{EX}p> <{EX}yes>) -> (?s <{EX}t> <{EX}yes>)]
+         [d: (?s <{EX}d> <{EX}yes>) -> (?s <{EX}t> <{EX}yes>)]"
+    ));
+    let cache = Cache::default();
+    run_with(&s, &rules, None, &cache, &with(8)).unwrap_or_else(|e| panic!("{e:#}"));
+    assert!(cache.witnesses(&t("s", "p", "yes")).is_none());
+    let got = cache.witnesses(&t("s", "t", "yes")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+}
+
+/// Regression (fifteenth review of item 416): a feature with fewer geometries gains a
+/// default geometry, so with default geometries on the program is not monotone: every
+/// fact is truncated, and list readers keep no witnesses.
+#[test]
+fn default_geometries_make_programs_non_monotone() {
+    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+    let s = Store::in_memory(StoreOptions::default());
+    let has = format!("{GEO}hasGeometry");
+    let first = format!("{RDF}first");
+    let rest = format!("{RDF}rest");
+    let nil = format!("{RDF}nil");
+    change(
+        &s,
+        None,
+        &[
+            t("f", &has, "g1"),
+            t("f", &has, "g2"),
+            t("l", &first, "good"),
+            t("l", &rest, &nil),
+        ],
+        &[],
+    );
+    let rules = Profile::Rules(format!(
+        "[c: (<{EX}f> <{GEO}hasGeometry> <{EX}g1>), (?l <{RDF}first> <{EX}good>), listContains(?l, <{EX}good>) -> (<{EX}f> <{EX}t> <{EX}yes>)]"
+    ));
+    let cache = Cache::default();
+    let extras = Extras {
+        geo_default_geometry: true,
+        ..Extras::default()
+    };
+    materialize_incremental(
+        &s,
+        &rules,
+        &extras,
+        Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &with(8),
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    let got = cache.witnesses(&t("f", "t", "yes")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+    assert!(got.annotation.witnesses.is_empty(), "{got:?}");
+    let asserted = cache.witnesses(&t("f", &has, "g1")).unwrap();
+    assert!(asserted.annotation.truncated, "{asserted:?}");
+}

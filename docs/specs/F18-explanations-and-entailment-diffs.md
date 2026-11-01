@@ -626,18 +626,16 @@ fact is truncated when its own evaluation may have lost a support, or when a pre
 one of its instances is truncated. Its evaluation loses supports when they pass the bound,
 when a rule instance's product passes its working bound of four times the bound or 16,384
 unions per premise, and when a fact has more than 4,096 instances. A fact with the empty
-support is exact whatever its premises keep. A program with `noValue` or
-`listNotContains` is not monotone: a smaller set of facts can pass a test that fails now
-and derive facts the closure lacks, also through intermediate facts it does not hold.
-Every fact of such a program is therefore truncated, and its rules that read RDF lists
-keep no witnesses, because a smaller set of facts can derive a second list cell and
-break a list that a support reads. Under any program, while a node of the closure has
-more than one `rdf:first` or `rdf:rest`, the rules that read lists keep no witnesses and
-their facts are truncated, because a subset can make that list plain with other members. Facts derived
-through the GeoSPARQL default geometries, asserted default geometries when the closure
-derives them, and programs with head actions or `makeTemp` are truncated, since their
-instances do not show every support. Under such a program every asserted
-fact is truncated too, because a hidden derivation may give it another minimal support.
+support is exact whatever its premises keep. A program is not monotone when it uses `noValue` or `listNotContains`, when it
+synthesizes GeoSPARQL default geometries, or when a node of the closure has more than one
+`rdf:first` or `rdf:rest`. In each case a smaller set of facts can derive facts the
+closure lacks, also through intermediate facts it does not hold. A test that fails now can
+pass, a feature with fewer geometries gains a default one, and a tangled list can become
+plain with other members. Every fact of such a program is therefore truncated, and its
+rules that read RDF lists keep no witnesses. Programs with head actions or `makeTemp` are
+truncated too, since their instances do not show every support. Under such a program
+every asserted fact is truncated, because a hidden derivation may give it another minimal
+support.
 
 An incremental run keeps the witnesses that avoid the removed quads, which for a monotone
 program are exactly the minimal supports that remain. Before the deletion it finds the

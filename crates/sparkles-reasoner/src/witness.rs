@@ -126,10 +126,23 @@ enum Kind {
 
 /// Whether a node of the closure has more than one `rdf:first` or more than one
 /// `rdf:rest`, which makes a list through it ambiguous.
-fn tangled_lists(c: &Closure, first: u64, rest: u64) -> bool {
+/// The set of list cells is charged to the run as it grows, and the scan stops when the
+/// run is cancelled.
+fn tangled_lists(c: &Closure, first: u64, rest: u64, limits: &Limits) -> anyhow::Result<bool> {
+    let mut held = Held::new(&limits.budget);
     let mut seen: FxHashSet<(u64, u64)> = FxHashSet::default();
     let mut tangled = false;
+    let mut stop: Option<anyhow::Error> = None;
+    let cancel = limits.cancel.as_deref();
     let mut see = |t: Triple| {
+        if let Err(e) = grow_set(&mut seen, &mut held) {
+            stop = Some(e.into());
+            return false;
+        }
+        if seen.len().is_multiple_of(1 << 16) && cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            stop = Some(anyhow::anyhow!("reasoning cancelled"));
+            return false;
+        }
         if !seen.insert((t[0], t[1])) {
             tangled = true;
         }
@@ -137,9 +150,7 @@ fn tangled_lists(c: &Closure, first: u64, rest: u64) -> bool {
     };
     if let Some(base) = c.graph.base() {
         for p in [first, rest] {
-            if base.for_each(None, Some(p), None, &mut see).is_err() {
-                return true;
-            }
+            base.for_each(None, Some(p), None, &mut see)?;
         }
     }
     for (t, _) in c.live() {
@@ -147,7 +158,26 @@ fn tangled_lists(c: &Closure, first: u64, rest: u64) -> bool {
             break;
         }
     }
-    tangled
+    if let Some(e) = stop {
+        return Err(e);
+    }
+    Ok(tangled)
+}
+
+/// Make room in `s` for one more entry, charging a table's growth to `held` first.
+fn grow_set<K: Eq + std::hash::Hash>(
+    s: &mut FxHashSet<K>,
+    held: &mut Held,
+) -> Result<(), MemoryExceeded> {
+    let cap = s.capacity();
+    if s.len() < cap {
+        return Ok(());
+    }
+    let next = table_grown(cap, s.len(), 1);
+    let elem = size_of::<K>();
+    held.try_grow(table_bytes(next, elem).saturating_sub(table_bytes(cap, elem)))?;
+    s.reserve(next - s.len());
+    Ok(())
 }
 
 /// Whether the base fact `t` may have supports that no instance shows: under an opaque
@@ -476,7 +506,7 @@ impl<'a> Cx<'a> {
         plans: &'a Plans,
         abort: &'a AtomicBool,
         limits: &'a Limits,
-    ) -> Cx<'a> {
+    ) -> anyhow::Result<Cx<'a>> {
         let negated: Vec<bool> = rules
             .iter()
             .map(|r| {
@@ -487,11 +517,20 @@ impl<'a> Cx<'a> {
                     .any(|b| matches!(b.kind, BuiltinKind::NoValue | BuiltinKind::ListNotContains))
             })
             .collect();
-        // a negation makes the program non-monotone: a smaller set of facts can derive
-        // facts, also through intermediates the closure lacks, that the closure does not
-        // derive, so no support is shown to be complete
         let any_negated = negated.iter().any(|&n| n);
-        let opaque = any_negated
+        let t = &c.terms;
+        // the program is not monotone when a smaller set of facts can derive facts the
+        // closure lacks, also through intermediates it does not hold: under a negation,
+        // under the default geometries, which a feature gains when it has fewer
+        // geometries, and while a list of the closure is not plain, since a subset can
+        // make it plain with other members. No support is then shown to be complete,
+        // and the rules that read lists keep no witnesses, since a subset can also derive
+        // a second cell of a list that is plain now and break what a support reads.
+        let lists = rules.iter().any(engine::reads_lists);
+        let nonmonotone = any_negated
+            || c.defaults.is_some()
+            || (lists && tangled_lists(c, t.rdf_first, t.rdf_rest, limits)?);
+        let opaque = nonmonotone
             || rules.iter().enumerate().any(|(ri, r)| {
                 r.builtins.iter().any(|b| b.kind == BuiltinKind::MakeTemp)
                     || r.head.iter().enumerate().any(|(hi, h)| match h {
@@ -499,18 +538,11 @@ impl<'a> Cx<'a> {
                         CHead::Triple(..) => plans.back[ri][hi].is_none(),
                     })
             });
-        let t = &c.terms;
-        // a list that is not plain in the closure can be plain, with other members, in a
-        // subset of it, where a list builtin that fails now succeeds; and under a
-        // negation a subset can derive a second cell of a list that is plain now, so
-        // that a support of a list reader does not derive its fact
-        let lists = rules.iter().any(engine::reads_lists);
-        let tangled = lists && (any_negated || tangled_lists(c, t.rdf_first, t.rdf_rest));
         let unsure_lists = rules
             .iter()
-            .map(|r| tangled && engine::reads_lists(r))
+            .map(|r| nonmonotone && engine::reads_lists(r))
             .collect();
-        Cx {
+        Ok(Cx {
             c,
             rules,
             plans,
@@ -524,7 +556,7 @@ impl<'a> Cx<'a> {
             first: t.rdf_first,
             rest: t.rdf_rest,
             nil: t.rdf_nil,
-        }
+        })
     }
 
     /// Whether `t` may be the head of a rule instance.
@@ -973,7 +1005,7 @@ impl Witnesses {
         let _plans_held = Held::try_new(&limits.budget, plans.bytes)?;
         let c = &*c;
         let abort = AtomicBool::new(false);
-        let cx = Cx::new(c, rules, &plans, &abort, limits);
+        let cx = Cx::new(c, rules, &plans, &abort, limits)?;
         let mut w = Witnesses::empty(max, &limits.budget);
         w.opaque = cx.opaque;
         // the facts that may be heads: every derived fact, and the base facts whose
@@ -1201,7 +1233,7 @@ impl Witnesses {
         // the plans are charged while the pass reads them, as the update charges its own
         let _plans_held = Held::try_new(&limits.budget, plans.bytes)?;
         let abort = AtomicBool::new(false);
-        let cx = Cx::new(c, rules, &plans, &abort, limits);
+        let cx = Cx::new(c, rules, &plans, &abort, limits)?;
         let mut seen: FxHashSet<u32> = FxHashSet::default();
         // the removed facts that stay derived are evaluated again, as are the facts that
         // lost a kept support
@@ -1373,7 +1405,7 @@ impl Witnesses {
         let _plans_held = Held::try_new(&limits.budget, plans.bytes)?;
         let c = &*c;
         let abort = AtomicBool::new(false);
-        let cx = Cx::new(c, rules, &plans, &abort, limits);
+        let cx = Cx::new(c, rules, &plans, &abort, limits)?;
         self.opaque = cx.opaque;
         let mut pass = Pass::default();
         self.settle(&cx, seeds, &mut pass)?;
@@ -2431,7 +2463,7 @@ mod tests {
         let plans = Plans::new(&mut c.graph, &rules).unwrap();
         let abort = AtomicBool::new(false);
         let l = limits();
-        let cx = Cx::new(&c, &rules, &plans, &abort, &l);
+        let cx = Cx::new(&c, &rules, &plans, &abort, &l).unwrap();
         let mut net = 0isize;
         let mut gross = 0isize;
         let f = cx
@@ -2470,7 +2502,7 @@ mod tests {
         let plans = Plans::new(&mut c.graph, &rules).unwrap();
         let abort = AtomicBool::new(false);
         let l = limits();
-        let cx = Cx::new(&c, &rules, &plans, &abort, &l);
+        let cx = Cx::new(&c, &rules, &plans, &abort, &l).unwrap();
         let head = [i0, p1, i0];
         let mut all = 0isize;
         let f = cx

@@ -306,9 +306,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Provenance-based inferred visibility, which reads the reasoner's witnesses, remains
   roadmap item 18. Witness builds and updates take much longer than the closure, item
   NEW-ITEM-2, and their memory and their rebuild after the closure is read back from the
-  dataset are item NEW-ITEM-3. Every fact of a program with `noValue` or
-  `listNotContains`, the facts of list-reading rules while a list is not plain, and facts
-  derived through default geometries or head actions are always truncated, item
+  dataset are item NEW-ITEM-3. Every fact of a program with `noValue`,
+  `listNotContains`, default geometries, head actions or a list that is not plain is
+  always truncated, item
   NEW-ITEM-4. Query result cells do not offer a
   Why? action, item 285. `why_empty` adds hypotheses for a grounded failing intensional pattern.
   Abduction for patterns with unbound target variables remains item 286.
