@@ -321,8 +321,10 @@ Item 481 shipped. `sparkles::reasoning::ReasoningMode` is `Off`, `Materialized`,
 `ReasoningMode::parse` reads `false`, `true`, `materialized`, `demand` and `auto`, and
 `from_param` reads a request parameter, where an absent or unknown value keeps the
 materialized inferences as the endpoints always have. `Dataset::inference_view` turns a
-mode into an `InferenceView`. Its query options read the selected data, its `apply`
-changes a caller's options as the mode changes the dataset's defaults, its `inference` is
+mode into an `InferenceView`. Its query options read the selected data, and its `apply`
+changes a caller's options as the mode changes the dataset's defaults. Options that do not
+hold the dataset's defaults get them first, and a view replaces a query-time reasoner that
+the options had unless its mode is demand. Its `inference` is
 the input of incremental views and live queries, and `explain_source` names the source of
 an explanation. Demand builds the query-time reasoner and fails as `query_reasoner`
 does, and `Auto` is refused. `stored_inference_view` gives the infallible views of the
