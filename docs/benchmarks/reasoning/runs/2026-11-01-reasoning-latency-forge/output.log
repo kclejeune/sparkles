@@ -1,0 +1,44 @@
+LUBM-style data of 10 universities, 12 threads
+rdfs: 1856980 triples loaded in 1.1 s, 565906 inferred in 2.3 s
+owl-rl: 2524163 triples loaded in 1.0 s, 1233089 inferred in 1.9 s
+round 1 of 5 done; derived-table cache: 19 tables, 266243712 bytes, 435 hits, 169 misses
+round 2 of 5 done; derived-table cache: 21 tables, 266243840 bytes, 783 hits, 253 misses
+round 3 of 5 done; derived-table cache: 21 tables, 266243840 bytes, 1132 hits, 336 misses
+round 4 of 5 done; derived-table cache: 21 tables, 266243840 bytes, 1479 hits, 421 misses
+round 5 of 5 done; derived-table cache: 21 tables, 266243840 bytes, 1826 hits, 506 misses
+
+| rdfs | materialized ms | demand ms | demand-cached ms | on-read ms |
+|---|--:|--:|--:|--:|
+| q1 | 0.064 | 43.922 | 0.375 | 0.409 |
+| q2 | 0.661 | 50.131 | 3.424 | 14.445 |
+| q3 | 0.059 | 45.938 | 0.430 | 2.428 |
+| q4 | 0.161 | 48.047 | 1.204 | 0.648 |
+| q5 | 0.117 | 51.455 | 1.904 | 9.196 |
+| q6 | 0.935 | 112.311 | 51.763 | 1.432 |
+| q7 | 0.118 | 45.207 | 0.603 | 2.493 |
+| q8 | 2.801 | 129.181 | 78.134 | 12.365 |
+| q9 | 7.899 | 104.124 | 49.663 | 7.162 |
+| q10 | 0.064 | 44.423 | 0.355 | 1.668 |
+| q11 | 0.060 | 44.191 | 0.335 | 0.101 |
+| q12 | 0.059 | 46.498 | 0.787 | 0.146 |
+| q13 | 0.036 | 43.508 | 0.298 | 0.108 |
+| q14 | 0.957 | 43.681 | 0.342 | 1.160 |
+
+| owl-rl | materialized ms | demand ms | demand-cached ms |
+|---|--:|--:|--:|
+| q1 | 0.049 | 2038.621 | 1546.986 |
+| q2 | 3.021 | 2193.968 | 2975.181 |
+| q3 | 0.048 | 2076.202 | 1597.589 |
+| q4 | 0.165 | 2148.019 | 2576.134 |
+| q5 | 0.096 | 2114.078 | 1636.509 |
+| q6 | 1.098 | 2407.644 | 1280.011 |
+| q7 | 0.090 | 2068.923 | 2226.817 |
+| q8 | 2.836 | 2166.174 | 2602.886 |
+| q9 | 8.500 | 2632.351 | 2979.629 |
+| q10 | 0.045 | 2101.124 | 1657.427 |
+| q11 | 0.079 | 2083.903 | 1645.336 |
+| q12 | 0.186 | 2161.396 | 2246.208 |
+| q13 | 0.077 | 2026.646 | 1547.957 |
+| q14 | 0.814 | 2254.599 | 1244.335 |
+100 metrics and 100 checks into /home/kclejeune/lanes/ws1a-gates-469-473/runs/reasoning/record.json
+reasoning done 2026-11-01T04:47:15Z, load 2.37 2.13 2.52 1/583 18530

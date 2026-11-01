@@ -1814,6 +1814,18 @@ test` and cost about ten seconds more than the cursor pass at the same batch siz
 they replace. The [baseline](../benchmarks/engine/RESULTS.md#w3c-suites-under-streaming-execution)
 keeps the counts.
 
+Item 472 adds `mise run bench:reasoning-latency`, which times the 14 LUBM queries on 10
+LUBM-style universities over materialized rdfs and owl-rl inferences, derivation on
+demand with and without cached tables, and RDFS on read, after it checks every mode's
+answers against the materialized ones. On forge every answer matched. Derivation on
+demand with the rdfs profile took about 44 ms per query without cached tables, and RDFS
+on read stayed within a few milliseconds except on broad classes. Under owl-rl every
+query took about two seconds on demand, cached or not, which is far above F17's earlier
+measurement and which item NEW-ITEM-1 investigates. Item NEW-ITEM-2 adds item 190's
+equality-stage fixtures. The
+[baseline](../benchmarks/reasoning/RESULTS.md#query-time-reasoning-latency) keeps every
+sample and answer fingerprint.
+
 ### Scope changes
 
 **Further engines for comparison.** The second rule in §4 left commercial editions out of scope and did not run an engine whose terms forbid publishing results. Comparisons with Virtuoso Open Source and GraphDB Free, with Blazegraph at low priority, and with RDFox and Stardog after a check of their licenses for benchmark-publication clauses, are now planned under [ROADMAP](../ROADMAP.md) item 452 in this spec's Roadmap follow-ups. A measurement stays private when publication is forbidden.
