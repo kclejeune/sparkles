@@ -311,6 +311,19 @@ fn other_thread_ticks() -> i64 {
     ticks("/proc/self/stat") - ticks("/proc/thread-self/stat")
 }
 
+/// Wait until the process's other threads have used no CPU time for 50 ms, at most five
+/// seconds, so that a dropped store's threads winding down or a pool's workers spinning
+/// after a query are not counted as work of the next case.
+fn quiesce() {
+    for _ in 0..100 {
+        let t = other_thread_ticks();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if other_thread_ticks() == t {
+            return;
+        }
+    }
+}
+
 /// Other-thread ticks since `before`, a value of `other_thread_ticks`.
 fn ticks_since(before: i64) -> u64 {
     (other_thread_ticks() - before).max(0) as u64
@@ -329,6 +342,7 @@ fn measure<R: PartialEq + std::fmt::Debug>(
     let mut counts = Vec::with_capacity(reps);
     let mut coverage = 1f64;
     let mut wrong = None;
+    quiesce();
     let before = other_thread_ticks();
     for _ in 0..reps {
         let (n, share, r) = c.count(&mut f);
@@ -602,6 +616,7 @@ fn opens(c: &counter::Instructions, src: &Path, reps: usize, want: &Content) -> 
         let scratch = tempfile::tempdir().unwrap();
         let dir: PathBuf = scratch.path().join("db");
         copy_dir(src, &dir);
+        quiesce();
         let before = other_thread_ticks();
         let (n, share, s) = c.count(|| Store::open(&dir, StoreOptions::default()).unwrap());
         o.ticks += ticks_since(before);
