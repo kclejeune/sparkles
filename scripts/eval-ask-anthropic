@@ -196,11 +196,16 @@ def main():
         "--jobs",
         type=int,
         default=1,
-        help="cases asked at once; each holds its projected cost before it starts",
+        help="cases one batch child asks at once; each holds its projected cost first",
+    )
+    ap.add_argument(
+        "--no-batch",
+        action="store_true",
+        help="ask each case in its own child, as runs before the batch mode did",
     )
     ap.add_argument(
         "--child-memory-max",
-        help="each child's own memory limit under --jobs, 4G by default there",
+        help="the memory limit of each child's own systemd scope, 16G for a batch",
     )
     ap.add_argument("--billed-nanodollars", type=int)
     ap.add_argument("--evidence", help="where the billed amount comes from")
@@ -266,6 +271,7 @@ def main():
         "clarifications": run.get("clarifications", "answer"),
         "contextTokens": run.get("contextTokens"),
         "jobs": args.jobs,
+        "batch": not args.no_batch,
         "sets": {},
     }
     code = 2
@@ -316,7 +322,9 @@ def main():
                 argv += ["--loc", set_["loc"]]
             argv += ["--clarifications", run.get("clarifications", "answer")]
             argv += ["--jobs", str(args.jobs)]
-            memory = args.child_memory_max or ("4G" if args.jobs > 1 else None)
+            if not args.no_batch:
+                argv.append("--batch")
+            memory = args.child_memory_max or (None if args.no_batch else "16G")
             if memory:
                 argv += ["--child-memory-max", memory]
             for model in set_["models"]:

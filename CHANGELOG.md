@@ -638,12 +638,13 @@ QALD-9-plus training split, and `eval_support/grounding_recall.py` measures from
 prompts whether each gold term reached the prompt. The dry-run fake provider reads
 prompts that arrive as cached text blocks.
 
-`scripts/eval-ask` and `scripts/eval-ask-anthropic` take `--jobs N` to ask N cases at
-once. Each case has its own gate token, the ledger holds its projected cost before it
-starts, and no request spends what another case in flight holds. The report, the case
-files and `replies.jsonl` keep question order. `--child-memory-max` runs each child in
-its own systemd scope with a memory limit and no swap, 4G by default above one job. A
-database directory admits one process, so `--jobs` above 1 needs a set's data file.
+`sparkles ask --questions FILE` asks every question of a JSON-lines file with one store
+and one model configuration and prints each result in input order, and `--jobs N` runs
+up to N questions at once. Each question keeps its own deadline and budgets, and a
+failed line gets its own error result. `scripts/eval-ask-anthropic` asks each phase
+through one such child in a 16G systemd scope, holds each case's projected cost before
+its line is sent and keeps the outputs in question order. Caches stay warm across a
+phase's questions, which changes latency but not answers.
 
 The Ask evaluation scores under `rdf-term-set-projected-columns-v2`. An answer with more
 columns than the gold, such as a name beside each IRI, is projected onto the gold's

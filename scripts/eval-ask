@@ -15,11 +15,14 @@ import re
 import signal
 import statistics
 import sys
+import collections
+import contextlib
+import queue
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
@@ -118,9 +121,10 @@ def validate_args(args):
         finite_positive(args.phase_deadline)
     if type(args.jobs) is not int or not 1 <= args.jobs <= 64:
         raise Invalid("--jobs from 1 to 64 required")
-    if args.jobs > 1 and args.loc:
-        # A database directory admits one process at a time.
-        raise Invalid("--jobs above 1 needs the set's data file, not --loc")
+    if args.jobs > 1 and not args.batch:
+        # Separate processes cannot share a database directory's lock, so cases run
+        # at once only inside one batch child.
+        raise Invalid("--jobs above 1 needs --batch")
     memory_wrapper(getattr(args, "child_memory_max", None))
     binary = pathlib.Path(args.sparkles)
     if (
@@ -249,8 +253,6 @@ class Runner:
         )
         self.header = prefix_header(qset.get("prefixes", {}))
         self.gold_cache, self.serial = {}, 0
-        # Children of concurrent cases name their own directories, gate tokens and
-        # last records, so each thread keeps them apart.
         self._tl = threading.local()
         self.serial_lock = threading.Lock()
         self.last_got = None
@@ -290,36 +292,23 @@ class Runner:
         if time.monotonic() >= self.deadline:
             raise HarnessFault("phase deadline expired")
 
-    def enter_case(self, case, token):
-        """Run this thread's children as `case`, with its own gate token."""
-        self._tl.case, self._tl.n = case, 0
-        self._tl.env = (
-            leaf_environment({"SPARKLES_EVAL_GATE_TOKEN": token}) if token else None
-        )
-
     def refusals(self):
-        case = getattr(self._tl, "case", None)
-        if not self.proxy:
-            return 0
-        return self.proxy.refusals_for(case) if case else self.proxy.cap_refusals
+        return self.proxy.cap_refusals if self.proxy else 0
 
     def source_args(self, ask=False):
         if self.loc:
             return ["--loc", str(self.loc)]
         return ["--data", str(self.data)] + (["--text"] if ask else [])
 
-    def spawn(self, argv, label, child_limit=None):
+    def spawn(self, argv, label, child_limit=None, wrap=False):
+        """Run one child. `wrap` puts an Ask child in its own memory-limited scope;
+        the harness's own queries run without one."""
         self.check()
-        case = getattr(self._tl, "case", None)
-        if case:
-            self._tl.n += 1
-            directory = self.out / f"{case[:16]}-{self._tl.n:02d}-{label}"
-        else:
-            with self.serial_lock:
-                self.serial += 1
-                directory = self.out / f"{self.serial:05d}-{label}"
+        with self.serial_lock:
+            self.serial += 1
+            directory = self.out / f"{self.serial:05d}-{label}"
         record = capture_child(
-            self.wrap + argv,
+            (self.wrap if wrap else []) + argv,
             directory,
             min(
                 self.deadline,
@@ -327,7 +316,7 @@ class Runner:
                 + (child_limit or self.args.deadline)
                 + QUERY_GRACE_SECONDS,
             ),
-            getattr(self._tl, "env", None) or self.env,
+            self.env,
         )
         self.last_record = record
         if "pid" in record and not record["cleanup"]:
@@ -399,9 +388,14 @@ class Runner:
         out = validate_ask_record(
             strict_json(bounded_file(directory / "stdout", 4 * 1024 * 1024))
         )
-        if record["returncode"] == 2:
-            if out.get("outcome") != "error":
-                raise Invalid("child execution incomplete")
+        if record["returncode"] == 2 and out.get("outcome") != "error":
+            raise Invalid("child execution incomplete")
+        return self.classify_output(out)
+
+    @staticmethod
+    def classify_output(out):
+        """The Ask object and its failure status, from the object alone."""
+        if out.get("outcome") == "error":
             steps = (out.get("usage") or {}).get("steps") or []
             if (out.get("error") or {}).get("code") == "timeout":
                 return out, "timeout"
@@ -439,6 +433,27 @@ class Runner:
             *self.source_args(ask=True),
             self.qset.get("dataset", "data"),
             q["question"],
+        ] + self.ask_flags(pair, config)
+        if clarification is not None:
+            # One argument, so a value that starts with a dash is never an option.
+            cmd.append("--clarification=" + clarification)
+        return cmd
+
+    def batch_command(self, pair, jobs):
+        """One `sparkles ask --questions -` child that asks every case of a pair."""
+        return [
+            self.args.sparkles,
+            "ask",
+            *self.source_args(ask=True),
+            self.qset.get("dataset", "data"),
+            "--questions",
+            "-",
+            "--jobs",
+            str(jobs),
+        ] + self.ask_flags(pair)
+
+    def ask_flags(self, pair, config=None):
+        cmd = [
             "--json",
             "--deadline",
             str(self.args.deadline),
@@ -458,14 +473,11 @@ class Runner:
             cmd += ["--model-secret", secret]
         if self.args.allow_loopback:
             cmd += ["--outbound-allow", "127.0.0.1/32"]
-        if clarification is not None:
-            # One argument, so a value that starts with a dash is never an option.
-            cmd.append("--clarification=" + clarification)
         return cmd
 
     def ask(self, pair, q, config=None):
         refused = self.refusals()
-        record, directory = self.spawn(self.ask_command(pair, q, config), "ask")
+        record, directory = self.spawn(self.ask_command(pair, q, config), "ask", wrap=True)
         out, failure = self.classify(record, directory)
         wall = record["elapsedSeconds"]
         if (
@@ -504,7 +516,7 @@ class Runner:
             first["clarification"] = {"basis": "unusable"}
             return first, record, None, wall
         record2, directory = self.spawn(
-            self.ask_command(pair, q, config, choice["answer"]), "ask-clarified"
+            self.ask_command(pair, q, config, choice["answer"]), "ask-clarified", wrap=True
         )
         out, failure = self.classify(record2, directory)
         clarify = first.get("clarify") or {}
@@ -999,131 +1011,291 @@ def case_of(pair, q):
     ).hexdigest()
 
 
-def run_parallel(runner, proxy, pair, qs, jobs, admit, report, finish_case):
-    """Ask up to `jobs` cases at once and finish them in question order.
+# How long past its Ask deadline and the query grace the runner waits for the result
+# of the oldest line in flight before it ends the batch child.
+BATCH_SLACK_SECONDS = 30
 
-    Each case runs under its own gate token, so the proxy books every request to
-    the case that sent it. Before a case starts, the proxy's ledger holds its
-    projected cost beside what the cases in flight hold, and a case whose hold
-    does not fit waits for those to finish or, with none in flight, ends the run
-    as the cap would. Reply lines are held per case and appended in question
-    order, and the case files, report rows and scores follow question order, so
-    the outputs do not depend on which case finishes first.
+
+class Batch:
+    """One `sparkles ask --questions -` child: lines go to its standard input and its
+    results come back one line each, in the order the lines were sent."""
+
+    LINE_CAP = 4 * 1024 * 1024
+
+    def __init__(self, runner, argv, directory):
+        self.directory = pathlib.Path(directory)
+        self.directory.mkdir(mode=0o700)
+        self.started = time.monotonic()
+        self.stderr = (self.directory / "stderr").open("xb")
+        self.proc = subprocess.Popen(
+            runner.wrap + argv,
+            env=runner.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr,
+            start_new_session=True,
+        )
+        self.lines = queue.Queue()
+        self.reader = threading.Thread(target=self.read, daemon=True)
+        self.reader.start()
+        self.record = {"schema": 1, "argv": runner.wrap + argv, "pid": self.proc.pid}
+        self.closed = False
+
+    def read(self):
+        try:
+            while True:
+                line = self.proc.stdout.readline(self.LINE_CAP + 1)
+                if not line:
+                    break
+                if len(line) > self.LINE_CAP or not line.endswith(b"\n"):
+                    self.lines.put(("overlong", None))
+                    return
+                self.lines.put(("line", line))
+        except (OSError, ValueError):
+            pass
+        self.lines.put(("eof", None))
+
+    def send(self, obj):
+        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+    def close(self, kill=False):
+        """End the child and its group, and return its record."""
+        if self.closed:
+            return self.record
+        self.closed = True
+        with contextlib.suppress(OSError, ValueError):
+            self.proc.stdin.close()
+        if not kill:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.proc.wait(timeout=30)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.proc.pid, sig)
+        self.record["returncode"] = self.proc.wait()
+        self.reader.join(5)
+        self.proc.stdout.close()
+        self.stderr.close()
+        self.record["elapsedSeconds"] = time.monotonic() - self.started
+        self.record["stderrSha256"] = digest(self.directory / "stderr")
+        (self.directory / "status.json").write_text(json.dumps(self.record, indent=2) + "\n")
+        return self.record
+
+
+def merge_clarified(first, second, choice, wall_first, wall_second):
+    """The scored second Ask with the first one's clarification and usage beside it,
+    as Runner.answer_clarification builds it."""
+    clarify = first.get("clarify") or {}
+    second["clarification"] = {
+        "id": clarify.get("id"),
+        "question": clarify.get("question"),
+        "choices": clarify.get("choices"),
+        **choice,
+        "firstExecution": first.get("execution"),
+        "firstUsage": first.get("usage"),
+    }
+    usage, before = dict(second.get("usage") or {}), first.get("usage") or {}
+    for field in ("inputTokens", "outputTokens"):
+        if type(before.get(field)) is int:
+            usage[field] = usage.get(field, 0) + before[field]
+    if before.get("estimatedCost") is not None:
+        later = usage.get("estimatedCost")
+        usage["estimatedCost"] = (
+            later + before["estimatedCost"] if later is not None else None
+        )
+    if usage:
+        second["usage"] = usage
+    return second, wall_first + wall_second
+
+
+def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
+    """Ask a pair's cases through batch children and return [(q, case_id, answer)]
+    in question order.
+
+    The child opens the store and the model configuration once and asks up to `jobs`
+    lines at once. The runner keeps at most `jobs` lines in flight, so every line it
+    sends starts at once. Each case's line names its own gate token through a model
+    secret file, so the proxy books every request to the case that sent it, and the
+    ledger holds the case's projected cost before its line is sent. A case whose hold
+    does not fit waits for the lines in flight and, with none, ends the run as the cap
+    would. Reply lines are held per case and appended in question order. A clarified
+    case sends a second line with the chosen answer. When the child dies or a line
+    passes its deadline, the cases in flight fail as `killed` or `timeout` and a new
+    child asks the rest. `watch(q, answer)` sees each case in question order and
+    returns True to stop the run.
     """
-    ledger = proxy.ledger if proxy else None
     bound = getattr(admit, "case_bound", None)
+    ledger = proxy.ledger if proxy else None
     if proxy:
         proxy.ordered_replies = True
+    tokens = runner.out / f"tokens-{case_of(pair, {'id': ''})[:12]}"
+    tokens.mkdir(mode=0o700, exist_ok=True)
+    cases = []  # dicts in question order, for the cases that were sent
+    flight = collections.deque()  # (case dict, round, sent at) in the order sent
+    stopped, finished, batch, batches = False, 0, None, 0
+    limit = runner.args.deadline + QUERY_GRACE_SECONDS + BATCH_SLACK_SECONDS
+    i = 0
 
-    def work(q, case_id, token):
-        runner.enter_case(case_id, token)
-        runner.last_record = None
-        try:
-            answer = runner.ask(pair, q)
-            error = None
-        except (Invalid, OSError) as e:  # re-raised in order by the main thread
-            answer, error = None, e
-        record = runner.last_record
+    def start():
+        nonlocal batch, batches
+        batches += 1
+        with runner.serial_lock:
+            runner.serial += 1
+            directory = runner.out / f"{runner.serial:05d}-batch"
+        batch = Batch(runner, runner.batch_command(pair, jobs), directory)
+        report.setdefault("batches", []).append(batch.record)
+
+    def send(c, rnd, clarification=None):
+        line = {"id": f"{c['case']}#{rnd}", "question": c["q"]["question"]}
+        if clarification is not None:
+            line["clarification"] = clarification
+        if c["token"]:
+            line["modelSecrets"] = [f"evalgate=file:{c['tokenFile']}"]
+        batch.send(line)
+        flight.append((c, rnd, time.monotonic()))
+
+    def done(c, answer):
+        c["answer"] = answer
         if proxy:
-            proxy.wait_idle(case=case_id)  # A killed child can leave one in flight.
-            if answer is not None:
-                answer["ledgerNanodollars"] = proxy.case_cost(case_id)
-        return answer, error, record
+            proxy.wait_idle(case=c["case"])
+            answer["ledgerNanodollars"] = proxy.case_cost(c["case"])
+            proxy.close_case(c["token"])
+            ledger.release(c["case"])
+        with contextlib.suppress(OSError):
+            c["tokenFile"].unlink()
 
-    pending = []  # (q, case_id, token, future) in question order
-    stopped = False
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
+    def fail_flight(status):
+        record = batch.close(kill=True)
+        while flight:
+            c, rnd, _ = flight.popleft()
+            code = "killed" if status == "killed" else "timeout"
+            out = {"outcome": "error", "error": {"code": code}}
+            out["evalFailure"] = status
+            out["wallSeconds"] = None
+            out["execution"] = {"batch": record["pid"], "round": rnd}
+            done(c, out)
 
-        def settle_first():
-            nonlocal stopped
-            q, case_id, token, future = pending.pop(0)
-            answer, error, record = future.result()
+    def finalize():
+        nonlocal finished, stopped
+        while finished < len(cases) and "answer" in cases[finished]:
+            c = cases[finished]
             if proxy:
-                proxy.close_case(token)
-                ledger.release(case_id)
-                proxy.flush_replies(case_id)
-            if record and "pid" in record:
-                report["executed"] += 1
-            if error is not None:
-                report["failedCase"] = {
-                    "case": case_id,
-                    "id": q["id"],
-                    "execution": record,
-                }
-                raise error
-            # A case that finishes after the cap stopped the run still ran, so it
-            # is scored unless the cap refused it too.
-            if finish_case(q, case_id, answer):
+                proxy.flush_replies(c["case"])
+            if watch(c["q"], c["answer"]):
                 stopped = True
+            finished += 1
 
-        try:
-            for q in qs:
-                runner.check()
-                while len(pending) >= jobs:
-                    settle_first()
+    try:
+        start()
+        while True:
+            runner.check()
+            while not stopped and i < len(qs) and len(flight) < jobs:
+                q = qs[i]
                 case_id = case_of(pair, q)
-                held = not stopped
-                if held and proxy and bound:
+                held = True
+                if proxy and bound:
                     held = ledger.hold(case_id, bound(pair))
-                    while not held and pending and not stopped:
-                        settle_first()
-                        held = ledger.hold(case_id, bound(pair))
-                    if held and stopped:
-                        ledger.release(case_id)  # an earlier case stopped the run
-                        held = False
-                if stopped or not held:
+                if not held:
+                    if flight:
+                        break  # wait for a line in flight to end
                     stopped = True
-                    report["budgetStopped"] = True
-                    report["unattemptedIds"].setdefault(pair, []).append(q["id"])
-                    continue
+                    break
                 token = proxy.open_case(case_id) if proxy else None
+                path = tokens / case_id[:32]
+                if token:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w") as f:
+                        f.write(token)
+                c = {"q": q, "case": case_id, "token": token, "tokenFile": path}
+                cases.append(c)
                 report["attempted"] += 1
                 report["attemptedCases"].append(
                     {"case": case_id, "pair": pair, "id": q["id"]}
                 )
-                pending.append((q, case_id, token, pool.submit(work, q, case_id, token)))
-            while pending:
-                settle_first()
-        except BaseException:
-            # The run ends at the first error in question order. Peers already in
-            # flight still ran, so their children are counted and their answers are
-            # kept unscored beside the report.
-            for q, case_id, token, future in pending:
-                future.cancel()
-            drained = report.setdefault("drainedCases", [])
-            for q, case_id, token, future in pending:
-                entry = {"case": case_id, "pair": pair, "id": q["id"]}
-                if future.cancelled():
-                    entry["started"] = False
-                    report["attempted"] -= 1
-                    report["attemptedCases"] = [
-                        c for c in report["attemptedCases"] if c["case"] != case_id
-                    ]
+                send(c, 1)
+                i += 1
+            if not flight:
+                break
+            head_sent = flight[0][2]
+            try:
+                kind, raw = batch.lines.get(
+                    timeout=max(0.1, head_sent + limit - time.monotonic())
+                )
+            except queue.Empty:
+                fail_flight("timeout")
+                finalize()
+                if i < len(qs) and not stopped:
+                    start()
+                continue
+            if kind != "line":
+                fail_flight("killed")
+                finalize()
+                if i < len(qs) and not stopped:
+                    start()
+                continue
+            c, rnd, sent = flight.popleft()
+            try:
+                obj = strict_json(raw)
+                if not isinstance(obj, dict) or obj.get("id") != f"{c['case']}#{rnd}":
+                    raise Invalid("batch result out of order")
+                obj.pop("id")
+                out, failure = Runner.classify_output(validate_ask_record(obj))
+            except Invalid:
+                batch.close(kill=True)
+                raise HarnessFault("batch output invalid") from None
+            wall = ((out.get("usage") or {}).get("elapsedMs") or 0) / 1000
+            out["execution"] = {"batch": batch.record["pid"], "round": rnd}
+            refused = proxy and proxy.refusals_for(c["case"]) > 0
+            if (
+                rnd == 1
+                and not failure
+                and not refused
+                and runner.clarifications == "answer"
+                and c["q"]["kind"] == "answerable"
+                and out.get("outcome") == "clarify"
+            ):
+                choice = choose_clarification(
+                    out.get("clarify"), runner.header + c["q"]["gold"]
+                )
+                if choice is None:
+                    out["clarification"] = {"basis": "unusable"}
                 else:
-                    entry["started"] = True
-                    try:
-                        answer, error, record = future.result()
-                    except BaseException as e:  # noqa: BLE001 -- the first error wins
-                        answer, error, record = None, e, None
-                    if record and "pid" in record:
-                        report["executed"] += 1
-                    entry["error"] = type(error).__name__ if error else None
-                    if answer is not None:
-                        with (runner.out / (case_id + ".json")).open("x") as f:
-                            json.dump(
-                                {"id": q["id"], "answer": answer, "score": None},
-                                f,
-                                indent=2,
-                            )
-                drained.append(entry)
-                if proxy:
-                    proxy.close_case(token)
-                    ledger.release(case_id)
-                    proxy.flush_replies(case_id)
-            raise
-        finally:
-            if proxy:
-                proxy.ordered_replies = False
+                    c["first"], c["firstWall"], c["choice"] = out, wall, choice
+                    send(c, 2, choice["answer"])
+                    continue
+            if rnd == 2:
+                out, wall = merge_clarified(c["first"], out, c["choice"], c["firstWall"], wall)
+            if refused:
+                failure = "budget_refused"
+            if failure:
+                out["evalFailure"] = failure
+            out["wallSeconds"] = wall
+            out["cliEstimatedCostKnown"] = False
+            done(c, out)
+            finalize()
+        record = batch.close()
+        if record["returncode"] != 0 and not cases[finished:]:
+            # Every line was answered, so a failed exit after them is reported only.
+            report.setdefault("batchExitStatus", []).append(record["returncode"])
+        report["executed"] += sum(1 for c in cases if "answer" in c)
+        finalize()
+        if i < len(qs):
+            report["budgetStopped"] = report["budgetStopped"] or stopped
+            report["unattemptedIds"].setdefault(pair, []).extend(q["id"] for q in qs[i:])
+        return [(c["q"], c["case"], c["answer"]) for c in cases if "answer" in c]
+    except BaseException:
+        if batch:
+            batch.close(kill=True)
+        raise
+    finally:
+        if proxy:
+            proxy.ordered_replies = False
+            for c in cases:
+                proxy.close_case(c["token"])
+                ledger.release(c["case"])
+                proxy.flush_replies(c["case"])
+        shutil.rmtree(tokens, ignore_errors=True)
 
 
 def run_matrix(args, proxy=None, prepared=None, admit=None):
@@ -1254,10 +1426,35 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                     )
                 return False
 
-            if jobs > 1:
-                run_parallel(
-                    runner, proxy, pair, qs, jobs, admit, report, finish_case
-                )
+            if getattr(args, "batch", False):
+                watched = {"streak": 0}
+
+                def watch(q, answer):
+                    # The same stops as finish_case, while the batch still runs.
+                    if answer.get("evalFailure") == "budget_refused":
+                        return True
+                    failed = answer.get("evalFailure") == "provider_error"
+                    watched["streak"] = watched["streak"] + 1 if failed else 0
+                    return bool(
+                        args.max_consecutive_errors
+                        and watched["streak"] >= args.max_consecutive_errors
+                    )
+
+                # The batch child holds a database directory's lock, so the cases
+                # are scored once it has ended.
+                results = run_batch(runner, proxy, pair, qs, jobs, admit, report, watch)
+                for n, (q, case_id, answer) in enumerate(results):
+                    try:
+                        finish_case(q, case_id, answer)
+                    except HarnessFault:
+                        report["drainedCases"] = [
+                            {"case": c, "pair": pair, "id": x["id"], "started": True}
+                            for x, c, _ in results[n + 1 :]
+                        ]
+                        for x, c, a in results[n + 1 :]:
+                            with (out_dir / (c + ".json")).open("x") as f:
+                                json.dump({"id": x["id"], "answer": a, "score": None}, f, indent=2)
+                        raise
                 qs_left = []
             else:
                 qs_left = qs
@@ -1343,14 +1540,19 @@ def parse_args(argv=None):
     ap.add_argument("--sparkles-sha256")
     ap.add_argument("--loc", help="database directory instead of the set's data file")
     ap.add_argument(
+        "--batch",
+        action="store_true",
+        help="ask every case of a pair through one `sparkles ask --questions` child",
+    )
+    ap.add_argument(
         "--jobs",
         type=int,
         default=1,
-        help="cases asked at once, each scored in question order; needs the data file",
+        help="with --batch, the cases asked at once; each is scored in question order",
     )
     ap.add_argument(
         "--child-memory-max",
-        help="run each child in its own systemd scope with this memory limit, like 4G",
+        help="run each Ask child in its own systemd scope with this memory limit, like 16G",
     )
     ap.add_argument("--deadline", type=float, default=300, help="Ask seconds")
     ap.add_argument("--timeout", type=float, default=5, help="query seconds")

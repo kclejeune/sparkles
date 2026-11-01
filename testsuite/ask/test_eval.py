@@ -1352,37 +1352,135 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class ParallelCases(unittest.TestCase):
-    """run_parallel with stand-ins for the runner and the proxy."""
 
-    def setup(self, holds=None, fail=None, refuse=None):
+FAKE_BATCH = r'''
+import json, os, signal, sys, time
+mode = sys.argv[1]
+n = 0
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    n += 1
+    line = json.loads(raw)
+    if mode == f"die-at:{n}":
+        os.kill(os.getpid(), signal.SIGKILL)
+    if mode == f"hang-at:{n}":
+        time.sleep(600)
+    token = None
+    for s in line.get("modelSecrets", []):
+        name, src = s.split("=", 1)
+        token = open(src.split(":", 1)[1]).read()
+    out = {"id": line["id"], "usage": {"elapsedMs": 5, "inputTokens": 3, "outputTokens": 1}}
+    q = line["question"]
+    if q.startswith("clarify") and "clarification" not in line:
+        out.update(outcome="clarify", clarify={"id": "c", "question": "Which?",
+                   "choices": [{"label": "A", "value": "urn:a"}, {"label": "B", "value": "urn:b"}]})
+    else:
+        out.update(outcome="answered", result={"query": "ASK {}", "explanation": json.dumps(
+            [line.get("clarification"), token])})
+    print(json.dumps(out), flush=True)
+'''
+
+
+class BatchCases(unittest.TestCase):
+    """run_batch against a fake `sparkles ask --questions -` child."""
+
+    def runner(self, mode, deadline=5.0):
         import threading
 
-        lock = threading.Lock()
-        state = {"now": 0, "most": 0, "held": 0}
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="ask-batch-"))
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        fake = tmp / "fake.py"
+        fake.write_text(FAKE_BATCH)
 
-        state["live"] = set()
+        class Runner:
+            out = tmp / "out"
+            args = type("A", (), {"deadline": deadline})()
+            serial, serial_lock = 0, threading.Lock()
+            wrap, env = [], None
+            clarifications, header = "answer", ""
+
+            def check(self):
+                pass
+
+            def batch_command(self, pair, jobs):
+                return [sys.executable, str(fake), mode]
+
+        Runner.out.mkdir()
+        return Runner()
+
+    def report(self):
+        return {"executed": 0, "attempted": 0, "attemptedCases": [],
+                "budgetStopped": False, "unattemptedIds": {}}
+
+    def qs(self, n):
+        return [
+            {"id": f"q{i}", "kind": "answerable",
+             "question": ("clarify " if i % 3 == 1 else "") + f"question {i}",
+             "gold": "SELECT ?x WHERE { <urn:b> ?p ?x }"}
+            for i in range(n)
+        ]
+
+    def run_batch(self, runner, qs, jobs=3, proxy=None, admit=None, watch=None):
+        report = self.report()
+        out = eval_ask.run_batch(
+            runner, proxy, "p", qs, jobs, admit or (lambda pair, qs: True), report,
+            watch or (lambda q, a: False),
+        )
+        return out, report
+
+    def test_answers_come_back_in_question_order_with_clarifications_answered(self):
+        qs = self.qs(7)
+        out, report = self.run_batch(self.runner("normal"), qs)
+        self.assertEqual([q["id"] for q, _, _ in out], [q["id"] for q in qs])
+        clarified = out[1][2]
+        self.assertEqual(json.loads(clarified["result"]["explanation"])[0], "urn:b")
+        self.assertEqual(clarified["clarification"]["answer"], "urn:b")
+        self.assertEqual(clarified["usage"]["inputTokens"], 6)  # both Asks
+        self.assertEqual((report["attempted"], report["executed"]), (7, 7))
+        self.assertEqual(len(report["batches"]), 1)
+
+    def test_a_dead_child_fails_its_lines_in_flight_and_a_new_one_asks_the_rest(self):
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(6))]
+        out, report = self.run_batch(self.runner("die-at:3"), qs, jobs=2)
+        status = [a.get("evalFailure") for _, _, a in out]
+        self.assertEqual([q["id"] for q, _, _ in out], [q["id"] for q in qs])
+        self.assertIn("killed", status)
+        self.assertEqual(status.count(None) + status.count("killed"), 6)
+        self.assertGreaterEqual(len(report["batches"]), 2)
+
+    def test_a_hung_line_times_out(self):
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]
+        with mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0), mock.patch.object(
+            eval_ask, "BATCH_SLACK_SECONDS", 0.5
+        ):
+            out, _ = self.run_batch(self.runner("hang-at:2", deadline=0.5), qs, jobs=1)
+        self.assertEqual([a.get("evalFailure") for _, _, a in out], [None, "timeout", None])
+
+    def test_each_case_names_its_own_token_and_holds_its_cost(self):
+        import threading
 
         class Ledger:
+            holds, released = [], []
+
             def hold(self, case, amount):
-                with lock:
-                    if holds is not None and state["held"] >= holds:
-                        return False
-                    state["held"] += 1
-                    state["live"].add(case)
-                    return True
+                if len(self.holds) >= 4:
+                    return False
+                self.holds.append(case)
+                return True
 
             def release(self, case):
-                with lock:
-                    state["live"].discard(case)
+                self.released.append(case)
 
         class Proxy:
             ledger = Ledger()
             ordered_replies = False
-            flushed = []
+            lock = threading.Lock()
+            flushed, tokens = [], {}
 
             def open_case(self, case):
-                return "token-" + case
+                self.tokens[case] = "tok-" + case[:8]
+                return self.tokens[case]
 
             def close_case(self, token):
                 pass
@@ -1396,135 +1494,23 @@ class ParallelCases(unittest.TestCase):
             def case_cost(self, case):
                 return 1
 
-        class Runner:
-            tl = threading.local()
-            out = pathlib.Path(tempfile.mkdtemp(prefix="ask-parallel-"))
+            def refusals_for(self, case):
+                return 0
 
-            def check(self):
-                pass
-
-            def enter_case(self, case, token):
-                self.tl.case = case
-
-            @property
-            def last_record(self):
-                return getattr(self.tl, "record", None)
-
-            @last_record.setter
-            def last_record(self, value):
-                self.tl.record = value
-
-            def ask(self, pair, q):
-                with lock:
-                    state["now"] += 1
-                    state["most"] = max(state["most"], state["now"])
-                time.sleep(0.05 * (5 - int(q["id"][1:]) % 5))  # later cases end first
-                if q["id"] == refuse:
-                    return {"outcome": "error", "evalFailure": "budget_refused"}
-                with lock:
-                    state["now"] -= 1
-                self.last_record = {"pid": 1}
-                if q["id"] == fail:
-                    raise eval_ask.Invalid("child execution incomplete")
-                return {"outcome": "answered"}
-
-        report = {
-            "executed": 0,
-            "attempted": 0,
-            "attemptedCases": [],
-            "budgetStopped": False,
-            "unattemptedIds": {},
-        }
-        return Runner(), Proxy(), report, state
-
-    def test_cases_finish_in_question_order_with_jobs_at_once(self):
-        runner, proxy, report, state = self.setup()
-        qs = [{"id": f"q{i}"} for i in range(10)]
-        seen = []
-        bound = lambda pair: 5  # noqa: E731
-        admit = lambda pair, qs: True  # noqa: E731
-        admit.case_bound = bound
-        eval_ask.run_parallel(
-            runner, proxy, "p", qs, 3, admit, report,
-            lambda q, case, answer: seen.append(q["id"]) and False,
-        )
-        self.assertEqual(seen, [q["id"] for q in qs])
-        self.assertEqual(proxy.flushed, [eval_ask.case_of("p", q) for q in qs])
-        self.assertEqual(state["most"], 3)
-        self.assertEqual((report["attempted"], report["executed"]), (10, 10))
-
-    def test_a_hold_that_does_not_fit_stops_the_run(self):
-        runner, proxy, report, _ = self.setup(holds=4)
-        qs = [{"id": f"q{i}"} for i in range(10)]
         admit = lambda pair, qs: True  # noqa: E731
         admit.case_bound = lambda pair: 5
-        seen = []
-        eval_ask.run_parallel(
-            runner, proxy, "p", qs, 3, admit, report,
-            lambda q, case, answer: seen.append(q["id"]) and False,
-        )
-        self.assertEqual(seen, ["q0", "q1", "q2", "q3"])
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(6))]
+        proxy = Proxy()
+        out, report = self.run_batch(self.runner("normal"), qs, jobs=2, proxy=proxy, admit=admit)
+        self.assertEqual(len(out), 4)  # the fifth hold does not fit
+        for q, case, answer in out:
+            self.assertEqual(json.loads(answer["result"]["explanation"])[1], proxy.tokens[case])
+        self.assertEqual(proxy.flushed[:4], [c for _, c, _ in out])
         self.assertTrue(report["budgetStopped"])
-        self.assertEqual(report["unattemptedIds"]["p"], [f"q{i}" for i in range(4, 10)])
+        self.assertEqual(report["unattemptedIds"]["p"], ["q4", "q5"])
+        self.assertTrue(set(Ledger.holds) <= set(Ledger.released))
 
-    def test_a_failed_case_raises_in_order_after_its_peers_end(self):
-        runner, proxy, report, state = self.setup(fail="q2")
-        qs = [{"id": f"q{i}"} for i in range(6)]
-        admit = lambda pair, qs: True  # noqa: E731
-        admit.case_bound = lambda pair: 5
-        seen = []
-        with self.assertRaises(eval_ask.Invalid):
-            eval_ask.run_parallel(
-                runner, proxy, "p", qs, 3, admit, report,
-                lambda q, case, answer: seen.append(q["id"]) and False,
-            )
-        self.assertEqual(seen, ["q0", "q1"])
-        self.assertEqual(report["failedCase"]["id"], "q2")
-        self.assertEqual(state["now"], 0)  # no case is left running
-
-    def test_jobs_above_one_refuse_a_database_directory(self):
-        args = eval_ask.parse_args(["--sparkles", "/bin/true", "--jobs", "2", "--loc", "/x"])
+    def test_jobs_above_one_need_the_batch(self):
+        args = eval_ask.parse_args(["--sparkles", "/bin/true", "--jobs", "2"])
         with self.assertRaises(eval_ask.Invalid):
             eval_ask.validate_args(args)
-
-    def test_a_stop_takes_no_hold_for_unstarted_cases(self):
-        runner, proxy, report, state = self.setup(refuse="q0")
-        qs = [{"id": f"q{i}"} for i in range(8)]
-        admit = lambda pair, qs: True  # noqa: E731
-        admit.case_bound = lambda pair: 5
-        eval_ask.run_parallel(
-            runner, proxy, "p", qs, 2, admit, report,
-            lambda q, case, answer: answer.get("evalFailure") == "budget_refused",
-        )
-        self.assertEqual(state["live"], set())
-        self.assertEqual(state["held"], 2)  # q0 and q1, which was already in flight
-        self.assertEqual(report["unattemptedIds"]["p"], [f"q{i}" for i in range(2, 8)])
-
-    def test_peers_in_flight_at_an_error_are_counted_and_kept(self):
-        runner, proxy, report, state = self.setup(fail="q0")
-        qs = [{"id": "q0"}, {"id": "q1"}]
-        admit = lambda pair, qs: True  # noqa: E731
-        admit.case_bound = lambda pair: 5
-        with self.assertRaises(eval_ask.Invalid):
-            eval_ask.run_parallel(
-                runner, proxy, "p", qs, 2, admit, report, lambda q, c, a: False
-            )
-        self.assertEqual((report["attempted"], report["executed"]), (2, 2))
-        self.assertEqual(report["drainedCases"][0]["id"], "q1")
-        self.assertTrue(report["drainedCases"][0]["started"])
-        kept = json.loads((runner.out / (eval_ask.case_of("p", qs[1]) + ".json")).read_text())
-        self.assertIsNone(kept["score"])
-
-    @unittest.skipUnless(
-        __import__("shutil").which("systemd-run") and __import__("os").environ.get("XDG_RUNTIME_DIR"),
-        "needs a systemd user session",
-    )
-    def test_the_memory_wrapper_passes_arguments_unchanged(self):
-        import shutil
-        import subprocess
-
-        argv = eval_ask.memory_wrapper("256M") + [
-            shutil.which("python3"), "-c", "import sys; print(sys.argv[1:])", "${PATH}", "$$", "$HOME"
-        ]
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-        self.assertEqual(out.stdout.strip(), str(["${PATH}", "$$", "$HOME"]))

@@ -161,22 +161,39 @@ chunked and close-delimited replies, structured-output retries, a downgrade, a
 rate limit, an overload that clears and a cascade. `--dry-run` runs a whole run file
 against the fake, reads no key and reports request sizes. Neither contacts a provider.
 
-## Concurrent cases
+## Batch runs
 
-`--jobs N` on `scripts/eval-ask` and `scripts/eval-ask-anthropic` asks up to N cases at
-once, and the default of 1 runs them one at a time. Each case finishes in question order,
-so the report, the per-case files and `replies.jsonl` come out in the same order as a
-serial run. The proxy holds a case's reply lines until that case and every earlier one
-are done. Each concurrent case gets its own gate token, so the proxy books every request
-to the case that sent it. Before a case starts, the ledger holds its projected cost, the
-90th percentile of the model's case costs so far times the projection margin. A request
-may not spend what another case in flight still holds, so the cases in flight together
-stay within the cap. A case whose hold does not fit waits for the cases in flight, and
-with none in flight it ends the run as the cap would. `--child-memory-max 4G` runs each
-child in its own systemd user scope with that memory limit and no swap, so the kernel
-kills only that child, which scores as `killed`. The Anthropic runner sets 4G whenever
-`--jobs` is above 1. A database directory admits one process at a time, so `--jobs`
-above 1 needs a set's data file and refuses `--loc`.
+`sparkles ask --questions FILE` reads JSON lines of `{"id", "question",
+"clarification"?, "tryHarder"?, "modelSecrets"?}`, or standard input for `-`. It opens
+the store and the model configuration once and prints one JSON result with its `id` per
+line, in input order. `--jobs N` runs up to N questions at once on the shared state.
+Every other flag applies to each question, and each question keeps its own deadline,
+token budget and query memory budget. A line that is invalid, fails or panics gets its
+own error result while the rest go on. A line's `modelSecrets` replace the
+`--model-secret` of the same name for that question.
+
+`scripts/eval-ask-anthropic` asks each phase's cases through one such child, run in its
+own systemd user scope with 16G of memory and no swap. `--no-batch` asks each case in
+its own child as earlier runs did, and `scripts/eval-ask --batch` chooses the batch
+directly. Each case's line names its own gate token through a secret file, so the proxy
+books every request to the case that sent it. Before the runner sends a case's line,
+the ledger holds the case's projected cost, the 90th percentile of the model's case
+costs so far times the projection margin, and no request may spend what another case
+in flight still holds. A case whose hold does not fit waits for the cases in flight,
+and with none in flight it ends the run as the cap would. The runner keeps at most
+`--jobs` lines in flight, sends a second line with the chosen answer for a clarified
+case, and holds each case's reply lines until that case and every earlier one are done,
+so the report, the case files and `replies.jsonl` keep question order. A batch child
+holds a database directory's lock, so the cases are scored after it ends. When the
+child dies or a line passes its deadline, the cases in flight fail as `killed` or
+`timeout` and a new child asks the rest. A case's wall time is its result's
+`usage.elapsedMs`.
+
+The store's caches stay warm from one question to the next within a phase, as a running
+server's do. This lowers latency against one child per case but leaves the answers
+unchanged, and a dry run of the demo set gives the same results and the same replies in
+both modes. A query's memory budget applies to each query, but one runaway query that
+escapes it ends the whole batch child and fails the cases in flight with it.
 
 ## The cost cap
 

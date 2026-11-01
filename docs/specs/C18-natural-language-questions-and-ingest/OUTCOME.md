@@ -1870,9 +1870,10 @@ grounding reordered for prompt caching costs accuracy. NEW-ITEM-1 tracks linking
 through redirects and aliases. The campaign spent $26.74 of a $50 cap in 3,696
 requests, with nothing unresolved, and a provider outage stopped one Haiku fresh
 baseline after 42 questions before it was rerun. The eight final phases took about three hours,
-one case at a time. The evaluation runners now take `--jobs` to ask several cases at
-once, but only for sets with a data file, since a database directory admits one
-process. NEW-ITEM-3 tracks concurrent runs on a database directory. The
+one case at a time. `sparkles ask --questions` now asks a whole phase with one store
+and one model configuration, up to `--jobs` questions at once, and the Anthropic runner
+uses it with exact per-case cost holds. Caches then stay warm across a phase's
+questions, which lowers latency but leaves the answers unchanged. The
 [results](../../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)
 give the secondary scores and the
 [paid record](../../benchmarks/2026-11-01-ask-hillclimb-paid.json) gives the per-case
