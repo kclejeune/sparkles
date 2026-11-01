@@ -776,7 +776,9 @@ under one `Preparation` of 64 MiB with the request deadline and cancellation, an
 dataset and branch by UUID. The dataset is found among the catalog's registered datasets
 with `Catalog::try_get_by_id`, and the branch among the dataset's listed branches. The
 caller decides access on their current names before anything is read, so a renamed
-dataset or branch keeps resolving and a recreated name never does.
+dataset or branch keeps resolving and a recreated name never does. An anchor that the reference alone refuses is refused
+before the dataset is looked up, so its answer does not depend on whether the dataset
+exists.
 `Store::snapshot_of_branch_limited` then reads exactly the referenced commit within the
 remaining allowance, without opening a cold branch store, and never another branch or the
 head. A commit at or below a branch's starting point, including a held starting commit
@@ -786,7 +788,9 @@ its view is kept, and `GraphAccess::masked_controlled` prepares the caller's gra
 policy and triple mask under the same allowance. Each commit is prepared once per
 operation and shared by its references.
 
-A ground fact is found by controlled term lookups and one quad probe in the prepared view,
+A guard decided at the snapshot, such as the GraphRAG disclosure guard, is bound by
+that preparation before the graph is checked. A ground fact is found by controlled term
+lookups and one quad probe in the prepared view,
 and a named reifier must reify that triple in the same graph. A fact with blank nodes
 needs a reifier. The one triple term it reifies in the graph must match the expected
 triple up to a consistent renaming of blank nodes, and that stored triple must be
@@ -812,11 +816,15 @@ kind, another content digest, two digests or a second copy of the record is
 `immutable-record-conflict`. A passage's single selector start and end are Unicode code
 point offsets into its rendition's single `ev:normalizedText`. That rendition must itself
 resolve as an authenticated record, and the digest of the selected text must equal the
-passage's `ev:textDigest`, or the answer is `span-mismatch`.
+passage's `ev:textDigest`, or the answer is `span-mismatch`. The text is read as its
+stored bytes under the allowance rather than decoded as a term. The registry is read
+from the running state without a copy, and its settings decoding is charged before it
+allocates.
 
 `POST /{ds}/claims/resolve` exposes both reference forms. It needs `read` on `{ds}`
 through the query endpoint and builds each referenced dataset's view with the server's
-caller context. It answers every verified reference in order, or the first one that
+caller context, once per dataset and branch for the request, and a client that
+disconnects cancels it. It answers every verified reference in order, or the first one that
 does not verify with its code and key. The six outcomes have the stable codes above, with
 `422` for all but `immutable-record-conflict`, which is `409`. Malformed references are
 field-specific `400` errors.
@@ -824,11 +832,12 @@ field-specific `400` errors.
 Tests cover exact commits against later heads, the default and named graphs, literal
 datatypes and languages, triple terms, renamed, deleted and recreated branches and
 datasets, starting commits served by the upstream, a held starting commit after its
-history was trimmed, graph grants, triple protections, blank nodes with and without
-reifiers, the allowance and cancellation, view reuse, the record kinds, digests,
-receipts, detached and ordinary copies, passages with code point selectors, and the HTTP
-route with and without authentication. The unauthorized and missing answers are compared
-byte for byte.
+history was trimmed, graph grants, guards decided at the snapshot, triple protections,
+blank nodes with and without reifiers, the allowance and cancellation, branch lookups
+while the branch table is held, view reuse, the record kinds, digests, receipts, detached
+and ordinary copies, passages with code point selectors over a 4 MiB rendition, and the
+HTTP route with and without authentication. The unauthorized and missing answers are
+compared byte for byte, including for references refused from their anchor alone.
 
 #### Resolution decisions
 

@@ -4,6 +4,7 @@
 use super::*;
 use crate::access::{GraphRule, Graphs, Protection, Rule, TripleRules};
 use crate::branch::{BranchOptions, CommitRef, DeleteOptions};
+use crate::evidence::resolve::check_anchor;
 use crate::history::Retention;
 use crate::store::StoreOptions;
 use oxrdf::{BlankNode, Literal};
@@ -182,11 +183,9 @@ fn a_triple_protection_hides_the_fact() {
         code(r.stored_fact("r", &s, Some(&masked), &fact(&s, main, 1, Some(G), ab()))),
         "evidence-unavailable"
     );
-    // a second policy for a commit already prepared is refused, not mixed
-    assert!(
-        r.stored_fact("r", &s, Some(&all()), &fact(&s, main, 1, Some(G), ab()))
-            .is_err()
-    );
+    // a second policy for the same commit gets its own view
+    r.stored_fact("r", &s, Some(&all()), &fact(&s, main, 1, Some(G), ab()))
+        .unwrap();
     let mut r = resolver();
     r.stored_fact("r", &s, Some(&all()), &fact(&s, main, 1, Some(G), ab()))
         .unwrap();
@@ -459,4 +458,121 @@ fn limits_and_controls_refuse_without_a_verdict() {
     r.stored_fact("b", &s, Some(&all()), &fact(&s, main, 1, Some(G), ab()))
         .unwrap();
     assert_eq!(r.preparation().inner_used(), used);
+}
+
+/// A guard decided at the snapshot exempts its graph through the controlled provider
+/// contract, so a reference into an exempt guarded graph verifies.
+#[test]
+fn a_guarded_graph_is_decided_at_the_snapshot() {
+    use crate::access::{Decider, Exemptions, GuardDecision};
+    struct Exempt(&'static [&'static str]);
+    impl GuardDecision for Exempt {
+        fn exempt(&self, _: &Arc<Snapshot>) -> Vec<String> {
+            unreachable!("only the controlled contract is used")
+        }
+        fn exempt_controlled(
+            &self,
+            _: &Arc<Snapshot>,
+            preparation: &Preparation,
+        ) -> Result<Exemptions> {
+            let mut out = Exemptions::new(preparation)?;
+            for g in self.0 {
+                out.push(g)?;
+            }
+            Ok(out)
+        }
+    }
+    let (_dir, s) = setup();
+    let main = s.dataset_id();
+    let guarded = |exempt: &'static [&'static str]| {
+        Arc::new(GraphAccess::graphs(
+            Graphs::All.guarded_by("urn:*", Decider(Arc::new(Exempt(exempt)))),
+            Graphs::none(),
+        ))
+    };
+    let mut r = resolver();
+    r.stored_fact(
+        "r",
+        &s,
+        Some(&guarded(&[G])),
+        &fact(&s, main, 1, Some(G), ab()),
+    )
+    .unwrap();
+    let mut r = resolver();
+    assert_eq!(
+        code(r.stored_fact(
+            "r",
+            &s,
+            Some(&guarded(&[])),
+            &fact(&s, main, 1, Some(G), ab())
+        )),
+        "evidence-unavailable"
+    );
+}
+
+/// Branch identity lookups wait for the branch table under the request's controls.
+#[test]
+fn branch_lookups_observe_the_deadline_while_the_table_is_held() {
+    let (_dir, s) = setup();
+    let dev = s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let held = s.hold_branch_table_for_test();
+    let soon = || Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+    let started = std::time::Instant::now();
+    let options = crate::guard::WriteOptions {
+        deadline: soon(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        s.listed_branch_name(dev.id, &options),
+        Err(Error::Timeout)
+    ));
+    let control = Control {
+        deadline: soon(),
+        ..Control::none()
+    };
+    let mut r = Resolver::new(control.clone(), MEMORY_BYTES).unwrap();
+    assert!(matches!(
+        r.stored_fact("r", &s, Some(&all()), &fact(&s, dev.id, 1, Some(G), ab())),
+        Err(Error::Timeout)
+    ));
+    let preparation = Preparation::new(
+        Control {
+            deadline: soon(),
+            ..Control::none()
+        },
+        MEMORY_BYTES,
+    )
+    .unwrap();
+    assert!(matches!(
+        s.branch_known_prepared(dev.id, &preparation),
+        Err(Error::Timeout)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    drop(held);
+    assert_eq!(
+        s.listed_branch_name(dev.id, &Default::default()).unwrap(),
+        Some("dev".to_string())
+    );
+    assert!(
+        s.branch_known_prepared(dev.id, &Preparation::new(Control::none(), 4096).unwrap())
+            .unwrap()
+    );
+}
+
+/// An anchor is decided from the reference alone.
+#[test]
+fn anchors_are_checked_before_any_lookup() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut f = fact(
+        &s,
+        s.dataset_id(),
+        0,
+        None,
+        Triple::new(BlankNode::new("x").unwrap(), iri("urn:p"), iri("urn:o")),
+    );
+    assert_eq!(code(check_anchor("r", &f)), "unanchored-evidence");
+    f.anchor = Some(BlankAnchor::Reifier(iri("urn:r")));
+    assert!(check_anchor("r", &f).unwrap());
+    f.expected = ab();
+    assert!(!check_anchor("r", &f).unwrap());
 }

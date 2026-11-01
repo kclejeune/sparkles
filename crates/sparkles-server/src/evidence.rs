@@ -608,8 +608,10 @@ async fn resolve(
     } else {
         crate::http::main_dataset(&st, &name)?
     };
+    // A client that disconnects cancels the resolution; the guard stays in this future.
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
     blocking(move || {
-        use crate::auth::{Endpoint, Level, on_branch};
+        use crate::auth::{Endpoint, on_branch};
         let here = on_branch(&main.name, &branch);
         let opts = crate::http::caller::CallerContext::for_caller(&st, &logical, &p).options_on(
             &crate::http::Params::empty(),
@@ -618,28 +620,21 @@ async fn resolve(
         );
         let control = Control {
             deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
-            ..Control::none()
+            ..Control::with_cancel(cancel)
         };
         let mut resolution = Resolution::new(control)?;
-        // What the caller may read on a dataset and branch, by their current names.
-        let mut access =
-            |ds: &sparkles::Dataset, branch: &str| -> Option<Arc<sparkles::access::GraphAccess>> {
-                let name = ds.name()?;
-                let server = st.get(name)?;
-                if server.dataset.dataset_id() != ds.dataset_id() {
-                    return None;
-                }
-                let qualified = on_branch(name, branch);
-                if !p.can_at(&qualified, Endpoint::Query, Level::Read) {
-                    return None;
-                }
-                let opts = crate::http::caller::CallerContext::for_caller(&st, &server, &p)
-                    .options_on(&crate::http::Params::empty(), &qualified, Endpoint::Query);
-                Some(
-                    opts.graphs
-                        .unwrap_or_else(|| Arc::new(sparkles::access::GraphAccess::all())),
-                )
-            };
+        // What the caller may read on a dataset and branch, by their current names. One
+        // policy per dataset and branch serves the whole request, so that its references
+        // share prepared views.
+        type Policy = Option<Arc<sparkles::access::GraphAccess>>;
+        let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
+            std::collections::HashMap::new();
+        let mut access = |ds: &sparkles::Dataset, branch: &str| -> Policy {
+            policies
+                .entry((ds.dataset_id(), branch.to_string()))
+                .or_insert_with(|| policy(&st, &p, ds, branch))
+                .clone()
+        };
         let mut resolved = Vec::with_capacity(references.len());
         for (key, reference) in &references {
             let one = [(key.clone(), reference.clone())];
@@ -668,4 +663,33 @@ async fn resolve(
         Ok(Json(json!({ "resolved": resolved })).into_response())
     })
     .await
+}
+
+/// What `p` may read on branch `branch` of `ds` through the query endpoint, by their
+/// current names: `None` when it may read nothing there.
+fn policy(
+    st: &AppState,
+    p: &Principal,
+    ds: &sparkles::Dataset,
+    branch: &str,
+) -> Option<Arc<sparkles::access::GraphAccess>> {
+    use crate::auth::{Endpoint, Level, on_branch};
+    let name = ds.name()?;
+    let server = st.get(name)?;
+    if server.dataset.dataset_id() != ds.dataset_id() {
+        return None;
+    }
+    let qualified = on_branch(name, branch);
+    if !p.can_at(&qualified, Endpoint::Query, Level::Read) {
+        return None;
+    }
+    let opts = crate::http::caller::CallerContext::for_caller(st, &server, p).options_on(
+        &crate::http::Params::empty(),
+        &qualified,
+        Endpoint::Query,
+    );
+    Some(
+        opts.graphs
+            .unwrap_or_else(|| Arc::new(sparkles::access::GraphAccess::all())),
+    )
 }

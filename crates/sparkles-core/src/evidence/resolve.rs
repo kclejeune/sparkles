@@ -133,6 +133,24 @@ fn error(kind: ManagedErrorKind, message: String) -> Error {
     ManagedError::error(kind, message)
 }
 
+/// Check a stored-fact reference's anchor from the reference alone, before anything,
+/// even the dataset, is looked up, so that the answer is the same whether or not the
+/// referenced dataset exists. Returns whether the expected triple has blank nodes.
+pub fn check_anchor(key: &str, fact: &StoredFactRef) -> Result<bool> {
+    let blank = has_blank(&fact.expected);
+    match &fact.anchor {
+        Some(BlankAnchor::ImportMap(_)) => Err(unanchored(
+            key,
+            "names a source import mapping, which this build does not verify",
+        )),
+        None if blank => Err(unanchored(
+            key,
+            "has blank nodes and no stable reifier; a blank-node label is not a durable identity",
+        )),
+        _ => Ok(blank),
+    }
+}
+
 /// The one answer for a reference that is missing, unretained or hidden.
 pub fn unavailable(key: &str) -> Error {
     error(
@@ -224,7 +242,9 @@ struct Cached {
 /// the operation's allowance until the resolver is dropped.
 pub struct Resolver {
     preparation: Preparation,
-    views: BTreeMap<ViewKey, Cached>,
+    views: BTreeMap<ViewKey, Vec<Cached>>,
+    /// The record graphs of one dataset, charged while they are kept.
+    record_graphs: Option<(Uuid, Vec<NamedNode>, Reservation)>,
 }
 
 impl Resolver {
@@ -233,6 +253,7 @@ impl Resolver {
         Ok(Self {
             preparation: Preparation::new(control, memory_bytes)?,
             views: BTreeMap::new(),
+            record_graphs: None,
         })
     }
 
@@ -253,23 +274,7 @@ impl Resolver {
         fact: &StoredFactRef,
     ) -> Result<VerifiedFact> {
         self.preparation.check()?;
-        // Decided from the reference alone, before anything is read.
-        let blank = has_blank(&fact.expected);
-        match &fact.anchor {
-            Some(BlankAnchor::ImportMap(_)) => {
-                return Err(unanchored(
-                    key,
-                    "names a source import mapping, which this build does not verify",
-                ));
-            }
-            None if blank => {
-                return Err(unanchored(
-                    key,
-                    "has blank nodes and no stable reifier; a blank-node label is not a durable identity",
-                ));
-            }
-            _ => {}
-        }
+        let blank = check_anchor(key, fact)?;
         let Some(access) = access else {
             return Err(unavailable(key));
         };
@@ -280,7 +285,8 @@ impl Resolver {
             GraphIdentity::Default => None,
             GraphIdentity::Named(n) => Some(Term::NamedNode(n.clone())),
         };
-        if !access.readable(graph_term.as_ref()) {
+        // A guard that is decided at the snapshot is checked once the view is bound.
+        if !access.read.undecided() && !access.readable(graph_term.as_ref()) {
             return Err(unavailable(key));
         }
         let view_key = ViewKey {
@@ -288,7 +294,7 @@ impl Resolver {
             branch: fact.branch,
             commit: fact.commit,
         };
-        let served_by = self
+        let (served_by, index) = self
             .view(view_key, access, |preparation| {
                 let (snapshot, resolved, served_by) = main.snapshot_of_branch_limited(
                     fact.branch,
@@ -302,7 +308,7 @@ impl Resolver {
                 Ok((snapshot, served_by))
             })
             .map_err(|e| classify(key, e))?;
-        let cached = &self.views[&view_key];
+        let cached = &self.views[&view_key][index];
         let reifier = check_fact(
             &self.preparation,
             &cached.view,
@@ -351,12 +357,25 @@ impl Resolver {
         {
             return Err(unavailable(key));
         }
-        let graphs = record_graphs(main, &self.preparation).map_err(|e| classify(key, e))?;
-        let graphs: Vec<NamedNode> = graphs
-            .into_iter()
-            .filter(|g| access.readable(Some(&Term::NamedNode(g.clone()))))
-            .collect();
-        if graphs.is_empty() {
+        if self
+            .record_graphs
+            .as_ref()
+            .is_none_or(|(dataset, _, _)| *dataset != main.dataset_id())
+        {
+            self.record_graphs = None;
+            let (graphs, held) =
+                record_graphs(main, &self.preparation).map_err(|e| classify(key, e))?;
+            self.record_graphs = Some((main.dataset_id(), graphs, held));
+        }
+        let all_graphs = &self.record_graphs.as_ref().expect("prepared").1;
+        // A guard that is decided at the snapshot is checked once the view is bound.
+        let decided = !access.read.undecided();
+        if all_graphs.is_empty()
+            || decided
+                && !all_graphs
+                    .iter()
+                    .any(|g| access.readable(Some(&Term::NamedNode(g.clone()))))
+        {
             return Err(unavailable(key));
         }
         let live = logical.snapshot();
@@ -365,11 +384,26 @@ impl Resolver {
             branch: logical.branch_id(),
             commit: live.commit,
         };
-        self.view(view_key, access, |_| {
-            Ok((live.clone(), logical.branch_id()))
-        })
-        .map_err(|e| classify(key, e))?;
-        let cached = &self.views[&view_key];
+        let (_, index) = self
+            .view(view_key, access, |_| {
+                Ok((live.clone(), logical.branch_id()))
+            })
+            .map_err(|e| classify(key, e))?;
+        let cached = &self.views[&view_key][index];
+        let all_graphs = &self.record_graphs.as_ref().expect("prepared").1;
+        let mut graphs = Vec::new();
+        for g in all_graphs {
+            if cached
+                .view
+                .access()
+                .readable(Some(&Term::NamedNode(g.clone())))
+            {
+                graphs.push(g.clone());
+            }
+        }
+        if graphs.is_empty() {
+            return Err(unavailable(key));
+        }
         let mut lookups = Lookups::new(&self.preparation, &cached.view);
         let found = find_record(&mut lookups, &graphs, &request.iri, key)?;
         let Some((graph, kind)) = found else {
@@ -382,7 +416,11 @@ impl Resolver {
             ));
         }
         let receipt = receipt(&mut lookups, &graph, &request.iri, key)?;
-        if receipt.dataset != main.dataset_id() || !main.branch_known(receipt.branch) {
+        if receipt.dataset != main.dataset_id()
+            || !main
+                .branch_known_prepared(receipt.branch, lookups.preparation)
+                .map_err(|e| classify(key, e))?
+        {
             return Err(origin(key));
         }
         let content_digest =
@@ -417,22 +455,20 @@ impl Resolver {
         })
     }
 
-    /// Prepare, or reuse, the controlled view of `key` under `access`.
+    /// Prepare, or reuse, the controlled view of `key` under `access`, and return the
+    /// serving branch and the view's index among the views of `key`.
     fn view(
         &mut self,
         key: ViewKey,
         access: &Arc<GraphAccess>,
         read: impl FnOnce(&Preparation) -> Result<(Arc<Snapshot>, Uuid)>,
-    ) -> Result<Uuid> {
-        if let Some(cached) = self.views.get(&key) {
-            if *cached.access == **access {
-                return Ok(cached.served_by);
-            }
-            // One operation reads one view per commit; a second policy for the same
-            // commit is a caller error, not a reason to hold two masks.
-            return Err(Error::invalid(
-                "one resolution reads each commit under one access policy",
-            ));
+    ) -> Result<(Uuid, usize)> {
+        if let Some(views) = self.views.get(&key)
+            && let Some(index) = views
+                .iter()
+                .position(|c| Arc::ptr_eq(&c.access, access) || *c.access == **access)
+        {
+            return Ok((views[index].served_by, index));
         }
         let (snapshot, served_by) = read(&self.preparation)?;
         // The read was checked against the remaining allowance; the snapshot is
@@ -442,16 +478,14 @@ impl Resolver {
             .reserve(snapshot.retained_preparation_bytes())?;
         let view = access.masked_controlled(&snapshot, &self.preparation)?;
         drop(snapshot);
-        self.views.insert(
-            key,
-            Cached {
-                access: access.clone(),
-                view,
-                served_by,
-                _retained: retained,
-            },
-        );
-        Ok(served_by)
+        let views = self.views.entry(key).or_default();
+        views.push(Cached {
+            access: access.clone(),
+            view,
+            served_by,
+            _retained: retained,
+        });
+        Ok((served_by, views.len() - 1))
     }
 }
 
@@ -524,10 +558,8 @@ fn check_fact(
         .lookup_iri(snap, RDF_REIFIES)?
         .ok_or(Missing::Unavailable)?;
     let mut reified: Vec<Id> = Vec::new();
-    preparation.scan(snap, Perm::Spo, &[r_id.0, reifies.0], |q| {
-        if q[3] == g {
-            reified.push(q[2]);
-        }
+    preparation.scan(snap, Perm::Gspo, &[g.0, r_id.0, reifies.0], |q| {
+        reified.push(q[2]);
         Ok(reified.len() < 2)
     })?;
     let tt = match reified.as_slice() {
@@ -643,28 +675,47 @@ fn isomorphic(a: &Triple, b: &Triple) -> bool {
 /// The graphs that hold authenticated records: every graph the evidence settings give
 /// a record role, other than the accepted projections, that the evidence owner protects
 /// now. None when the profile is not configured or its registry cannot be enforced.
-fn record_graphs(main: &Store, preparation: &Preparation) -> Result<Vec<NamedNode>> {
-    let Some(snapshot) = main.managed_snapshot()? else {
-        return Ok(Vec::new());
+fn record_graphs(main: &Store, preparation: &Preparation) -> Result<(Vec<NamedNode>, Reservation)> {
+    use crate::managed::ManagedState;
+    let mut held = preparation.reserve(0)?;
+    // The registry is borrowed from the running state, never copied.
+    let Some(state) = main.managed_state_shared() else {
+        return Ok((Vec::new(), held));
     };
-    if snapshot.unavailable.is_some() {
-        return Ok(Vec::new());
-    }
-    let Some(bytes) = snapshot.settings.get(&OwnerKind::Evidence) else {
-        return Ok(Vec::new());
+    let ManagedState::Installed(installed) = &*state else {
+        return Ok((Vec::new(), held));
     };
-    let Ok(settings) = super::Settings::from_slice(bytes, preparation.control()) else {
-        return Ok(Vec::new());
+    let Some(bytes) = installed.settings.get(&OwnerKind::Evidence) else {
+        return Ok((Vec::new(), held));
+    };
+    // Decoding copies the settings' strings into its own maps and vectors.
+    let decoding = preparation.reserve(
+        (bytes.len() as u64)
+            .saturating_mul(4)
+            .saturating_add(64 << 10),
+    )?;
+    let settings = match super::Settings::from_slice(bytes, preparation.control()) {
+        Ok(settings) => settings,
+        Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+        // Settings this build cannot read authenticate no record.
+        Err(_) => return Ok((Vec::new(), held)),
     };
     if !settings.enabled {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), held));
     }
-    let protected: &[String] = snapshot
+    let protected: &[String] = installed
         .graphs
         .owners
         .get(&OwnerKind::Evidence)
         .map_or(&[], |e| &e.graphs);
-    let mut out = Vec::new();
+    let mut sorted: Vec<&str> = Vec::new();
+    held.grow_by((protected.len() as u64).saturating_mul(16))?;
+    sorted
+        .try_reserve_exact(protected.len())
+        .map_err(|_| preparation.exhausted())?;
+    sorted.extend(protected.iter().map(String::as_str));
+    crate::access::sort_by_prepared(&mut sorted, preparation, |a, b| preparation.compare(a, b))?;
+    let mut out: Vec<NamedNode> = Vec::new();
     for graph in settings
         .source_records
         .iter()
@@ -674,15 +725,27 @@ fn record_graphs(main: &Store, preparation: &Preparation) -> Result<Vec<NamedNod
         .chain(&settings.identity)
     {
         preparation.check()?;
-        if protected.contains(graph)
-            && let Ok(node) = NamedNode::new(graph.as_str())
-            && !out.contains(&node)
-        {
-            out.push(node);
+        let mut failure = None;
+        let found = sorted.binary_search_by(|p| match preparation.compare(p, graph) {
+            Ok(order) => order,
+            Err(e) => {
+                failure.get_or_insert(e);
+                std::cmp::Ordering::Equal
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        if found.is_ok() && !out.iter().any(|n| n.as_str() == graph) {
+            held.grow_by((graph.len() as u64).saturating_add(64))?;
+            if let Ok(node) = NamedNode::new(graph.as_str()) {
+                out.push(node);
+            }
         }
     }
     out.sort();
-    Ok(out)
+    drop(decoding);
+    Ok((out, held))
 }
 
 /// Controlled lookups in one prepared view, with the view's graph policy applied.
@@ -737,6 +800,45 @@ impl<'a> Lookups<'a> {
     }
 
     /// Up to two objects of `s p ?o` in `graph`, decoded.
+    /// Up to two object ids of `s p ?o` in graph `g`.
+    fn object_ids(&self, s: Id, p: Id, g: Id) -> Result<Vec<Id>> {
+        let mut ids = Vec::new();
+        self.preparation
+            .scan(self.snap(), Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                ids.push(q[2]);
+                Ok(ids.len() < 2)
+            })?;
+        Ok(ids)
+    }
+
+    /// The one object of `s p ?o` in `graph`, read as a stored simple literal's text
+    /// without decoding it as a term.
+    fn one_text<R>(
+        &mut self,
+        s: &str,
+        p: &str,
+        graph: &NamedNode,
+        each: impl FnOnce(&str) -> Result<R>,
+    ) -> Result<Text<R>> {
+        if !self.readable(graph) {
+            return Ok(Text::None);
+        }
+        let (Some(s), Some(p), Some(g)) = (self.iri(s)?, self.iri(p)?, self.iri(graph.as_str())?)
+        else {
+            return Ok(Text::None);
+        };
+        match self.object_ids(s, p, g)?.as_slice() {
+            [] => Ok(Text::None),
+            [id] => self
+                .preparation
+                .with_simple_literal(self.snap(), *id, |text| match text {
+                    Some(text) => Ok(Text::Some(each(text)?)),
+                    None => Ok(Text::None),
+                }),
+            _ => Ok(Text::Many),
+        }
+    }
+
     fn objects(&mut self, s: &str, p: &str, graph: &NamedNode) -> Result<Vec<Term>> {
         if !self.readable(graph) {
             return Ok(Vec::new());
@@ -745,14 +847,7 @@ impl<'a> Lookups<'a> {
         else {
             return Ok(Vec::new());
         };
-        let mut ids = Vec::new();
-        self.preparation
-            .scan(self.snap(), Perm::Spo, &[s.0, p.0], |q| {
-                if q[3] == g {
-                    ids.push(q[2]);
-                }
-                Ok(ids.len() < 2)
-            })?;
+        let ids = self.object_ids(s, p, g)?;
         let mut out = Vec::new();
         for id in ids {
             if let Some(term) = self
@@ -780,6 +875,12 @@ impl<'a> Lookups<'a> {
 enum One {
     None,
     Some(Term),
+    Many,
+}
+
+enum Text<R> {
+    None,
+    Some(R),
     Many,
 }
 
@@ -967,13 +1068,7 @@ fn verify_with_selector(
         ) else {
             return Ok(None);
         };
-        let mut ids = Vec::new();
-        preparation.scan(snap, Perm::Spo, &[s.0, p.0], |q| {
-            if q[3] == g {
-                ids.push(q[2]);
-            }
-            Ok(ids.len() < 2)
-        })?;
+        let ids = lookups.object_ids(s, p, g)?;
         let [id] = ids.as_slice() else {
             return Ok(None);
         };
@@ -1006,51 +1101,54 @@ fn verify_with_selector(
         return Err(conflict(key, "the passage's source is not a rendition"));
     }
     let receipt = receipt(lookups, &rendition_graph, rendition, key)?;
-    if receipt.dataset != main.dataset_id() || !main.branch_known(receipt.branch) {
+    if receipt.dataset != main.dataset_id()
+        || !main
+            .branch_known_prepared(receipt.branch, lookups.preparation)
+            .map_err(|e| classify(key, e))?
+    {
         return Err(origin(key));
     }
-    let text = match lookups
-        .one(
+    let control = lookups.preparation.control();
+    let checked = lookups
+        .one_text(
             rendition.as_str(),
             &format!("{EV}normalizedText"),
             &rendition_graph,
+            |text| {
+                let offsets: &[u64] = if start == end {
+                    &[start]
+                } else {
+                    &[start, end]
+                };
+                let positions = match locate_boundaries(text, offsets, control) {
+                    Ok(positions) => positions,
+                    Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+                    Err(_) => {
+                        return Ok(Err(
+                            "the passage selector exceeds the rendition's normalized text",
+                        ));
+                    }
+                };
+                let selected = &text[positions[0]..positions[positions.len() - 1]];
+                if Sha256Digest::of_bytes(selected.as_bytes(), control)? != text_digest {
+                    return Ok(Err(
+                        "the passage's text digest does not match the selected text",
+                    ));
+                }
+                Ok(Ok(()))
+            },
         )
-        .map_err(|e| classify(key, e))?
-    {
-        One::Some(Term::Literal(l)) => l,
-        One::Many => {
+        .map_err(|e| classify(key, e))?;
+    match checked {
+        Text::Some(Ok(())) => {}
+        Text::Some(Err(why)) => return Err(span(key, why)),
+        Text::Many => {
             return Err(conflict(
                 key,
                 "the rendition has more than one normalized text",
             ));
         }
-        _ => return Err(unavailable(key)),
-    };
-    // The decoded text is charged to the operation while it is checked.
-    let _held = lookups
-        .preparation
-        .reserve(text.value().len() as u64)
-        .map_err(|e| classify(key, e))?;
-    let control = lookups.preparation.control();
-    let offsets: &[u64] = if start == end {
-        &[start]
-    } else {
-        &[start, end]
-    };
-    let positions = locate_boundaries(text.value(), offsets, control).map_err(|e| match e {
-        Error::Cancelled | Error::Timeout => e,
-        _ => span(
-            key,
-            "the passage selector exceeds the rendition's normalized text",
-        ),
-    })?;
-    let selected = &text.value()[positions[0]..positions[positions.len() - 1]];
-    let actual = Sha256Digest::of_bytes(selected.as_bytes(), control)?;
-    if actual != text_digest {
-        return Err(span(
-            key,
-            "the passage's text digest does not match the selected text",
-        ));
+        Text::None => return Err(unavailable(key)),
     }
     Ok(VerifiedSpan {
         rendition: rendition.clone(),

@@ -13,7 +13,7 @@
 
 pub use sparkles_core::evidence::resolve::{
     MAX_REFERENCES, MEMORY_BYTES, Receipt, RecordRequest, VerifiedFact, VerifiedRecord,
-    VerifiedSpan, kind_iri, unavailable,
+    VerifiedSpan, check_anchor, kind_iri, unavailable,
 };
 pub use sparkles_core::evidence::{BlankAnchor, GraphIdentity, RecordKind, StoredFactRef};
 
@@ -94,6 +94,9 @@ impl Resolution {
         fact: &StoredFactRef,
         access: impl FnOnce(&Dataset, &str) -> Option<Arc<GraphAccess>>,
     ) -> Result<VerifiedFact> {
+        // The anchor is decided before the lookup, so its answer does not depend on
+        // whether the dataset exists.
+        check_anchor(key, fact)?;
         let Some(dataset) = catalog.try_get_by_id(fact.dataset, &self.options())? else {
             return Err(unavailable(key));
         };
@@ -110,11 +113,12 @@ impl Resolution {
         fact: &StoredFactRef,
         access: impl FnOnce(&Dataset, &str) -> Option<Arc<GraphAccess>>,
     ) -> Result<VerifiedFact> {
+        check_anchor(key, fact)?;
         let main = dataset.store();
         if main.is_branch() || dataset.dataset_id() != fact.dataset {
             return Err(unavailable(key));
         }
-        let granted = match main.listed_branch_name(fact.branch)? {
+        let granted = match main.listed_branch_name(fact.branch, &self.options())? {
             Some(branch) => access(dataset, &branch),
             None => None,
         };
@@ -157,7 +161,7 @@ impl Resolution {
         }
         let logical_branch = if logical.store().is_branch() {
             main.store()
-                .listed_branch_name(logical.store().branch_id())?
+                .listed_branch_name(logical.store().branch_id(), &self.options())?
         } else {
             Some(crate::branch::MAIN.to_string())
         };

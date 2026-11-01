@@ -388,3 +388,68 @@ fn passages_verify_their_selection_against_the_retained_rendition() {
     // a rendition is a record too; its text is not taken from an unprotected copy
     assert!(record(&ds, &request("urn:rendition", &[RecordKind::Rendition])).is_ok());
 }
+
+/// A long retained text is read as its stored bytes, so a passage of a 4 MiB rendition
+/// verifies within the 64 MiB allowance.
+#[test]
+fn a_long_rendition_is_checked_within_the_allowance() {
+    let ds = configured();
+    let text = "abcdefgh".repeat(512 * 1024);
+    let tail: String = text.chars().skip(text.len() - 3).collect();
+    typed(
+        &ds,
+        &format!(
+            "GRAPH <{SOURCES}> {{
+               <urn:long> a ev:Rendition ; ev:normalizedText \"{text}\" ;
+                 ev:availabilityReceipt <urn:l0> .
+               <urn:l0> {{receipt}} .
+               <urn:tail> a ev:Passage ; oa:hasSource <urn:long> ;
+                 oa:hasSelector [ oa:start {start} ; oa:end {end} ] ;
+                 ev:textDigest \"{digest}\" ; ev:availabilityReceipt <urn:l1> .
+               <urn:l1> {{receipt}} .
+             }}",
+            start = text.len() - 3,
+            end = text.len(),
+            digest = sha(&tail),
+        ),
+    );
+    let v = record(&ds, &request("urn:tail", &[RecordKind::Passage])).unwrap();
+    assert_eq!(v.span.unwrap().end, text.len() as u64);
+}
+
+/// A blank-node reference without an anchor answers the same for a dataset that
+/// exists and one that does not, and the registry read stays within the allowance.
+#[test]
+fn refusals_from_the_reference_alone_do_not_depend_on_the_dataset() {
+    let catalog = Catalog::memory(Default::default());
+    let ds = catalog
+        .attach("hidden", sparkles::catalog::Attach::Memory)
+        .unwrap();
+    let mut blank = fact(&ds, ds.dataset_id(), 0);
+    blank.expected = Triple::new(
+        oxrdf::BlankNode::new("x").unwrap(),
+        iri("urn:p"),
+        iri("urn:b"),
+    );
+    let mut missing = blank.clone();
+    missing.dataset = Uuid::new_v4();
+    let mut resolution = Resolution::new(Control::none()).unwrap();
+    let existing = message(resolution.stored_fact("r", &catalog, &blank, |_, _| None));
+    let absent = message(resolution.stored_fact("r", &catalog, &missing, |_, _| None));
+    assert_eq!(existing, absent);
+    assert!(existing.contains("blank nodes"));
+
+    // a record resolution that cannot read the registry within its allowance is
+    // incomplete, not unavailable
+    let configured = configured();
+    let tiny = Resolution::with_memory(Control::none(), 4096)
+        .unwrap()
+        .record("r", &configured, &configured, all(), &request("urn:x", &[]));
+    assert_eq!(code(tiny), "incomplete-evidence");
+    // cancellation keeps the request error contract
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut resolution = Resolution::new(Control::with_cancel(flag.clone())).unwrap();
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let cancelled = resolution.record("r", &configured, &configured, all(), &request("urn:x", &[]));
+    assert!(matches!(cancelled, Err(sparkles::Error::Cancelled)));
+}

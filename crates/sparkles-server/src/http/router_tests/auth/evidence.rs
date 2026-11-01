@@ -89,3 +89,89 @@ async fn unreadable_references_answer_as_missing_ones() {
         r.status
     );
 }
+
+#[tokio::test]
+async fn anchors_and_graph_grants_do_not_disclose_hidden_data() {
+    let s = build(Fixture {
+        extra: super::graphs::users(),
+        ..Default::default()
+    });
+    let ds = s.state.attach("graphs", DbType::Persistent, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            super::graphs::DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let commit = ds.store.head_commit().seq;
+    let id = ds.store.dataset_id();
+    let fact = |key: &str, graph: &str, triple: &str| {
+        serde_json::json!({ "key": key, "storedFact": {
+            "datasetId": id, "branchId": id, "commit": commit,
+            "graph": graph, "triple": triple,
+        }})
+    };
+    // gra reads http://ex/a/*: two references to one commit share its view
+    let r = resolve(
+        &s,
+        "graphs",
+        "gra",
+        serde_json::json!([
+            fact(
+                "a1",
+                "http://ex/a/1",
+                "<http://ex/a1> <http://ex/p> \"alpha fox\""
+            ),
+            fact(
+                "a2",
+                "http://ex/a/2",
+                "<http://ex/a2> <http://ex/p> \"alpha two\""
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // a fact in an unreadable graph answers as a missing one
+    let hidden = resolve(
+        &s,
+        "graphs",
+        "gra",
+        serde_json::json!([fact(
+            "r",
+            "http://ex/b/1",
+            "<http://ex/b1> <http://ex/p> \"secret fox\""
+        )]),
+    )
+    .await;
+    let missing = resolve(
+        &s,
+        "graphs",
+        "gra",
+        serde_json::json!([fact(
+            "r",
+            "http://ex/b/1",
+            "<http://ex/b1> <http://ex/p> \"no fox\""
+        )]),
+    )
+    .await;
+    assert_eq!(
+        hidden.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        hidden.text()
+    );
+    assert_eq!(hidden.body, missing.body);
+    // an unanchored blank node answers the same for an unreadable and a missing dataset
+    let secret = s.state.get("secret").unwrap().store.dataset_id();
+    let blank = |dataset: uuid::Uuid| {
+        serde_json::json!([{ "key": "b", "storedFact": {
+            "datasetId": dataset, "branchId": dataset, "commit": 1,
+            "triple": "_:x <http://ex.org/p> \"1\"",
+        }}])
+    };
+    let unreadable = resolve(&s, "wiki", "bob", blank(secret)).await;
+    let absent = resolve(&s, "wiki", "bob", blank(uuid::Uuid::new_v4())).await;
+    assert_eq!(unreadable.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(unreadable.body, absent.body);
+}

@@ -1549,28 +1549,73 @@ impl Store {
 
     /// The current name of the listed branch whose identity is `id`, `main` for the
     /// dataset id, through the dataset's main store. `None` for a deleted, retired or
-    /// unknown identity. Reads only the branch table, so no branch store is opened.
-    pub fn listed_branch_name(&self, id: uuid::Uuid) -> Result<Option<String>> {
+    /// unknown identity. Reads only the branch table, so no branch store is opened, and
+    /// waits for the table under the cancellation, deadline and no-wait choice of
+    /// `options`.
+    pub fn listed_branch_name(
+        &self,
+        id: uuid::Uuid,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<String>> {
+        options.check()?;
         if id == self.dataset_id && !self.is_branch() {
             return Ok(Some(MAIN.to_string()));
         }
-        match &self.branching.set {
-            SetRef::Owner(s) => Ok(s.table.lock().by_id(id).map(|e| e.name.clone())),
-            _ => Ok(None),
+        let SetRef::Owner(set) = &self.branching.set else {
+            return Ok(None);
+        };
+        let table = controlled_lock(&set.table, options)?;
+        for (n, entry) in table.branches.iter().enumerate() {
+            if n % 1024 == 0 {
+                options.check()?;
+            }
+            if entry.id == id {
+                return Ok(Some(entry.name.clone()));
+            }
         }
+        Ok(None)
     }
 
     /// Whether `id` names `main`, a listed branch, a retired branch or a deleted branch
-    /// whose starting point the table still records, of this store's dataset.
-    pub(crate) fn branch_known(&self, id: uuid::Uuid) -> bool {
+    /// whose starting point the table still records, of this store's dataset, waiting for
+    /// the branch table under `preparation`'s controls.
+    pub(crate) fn branch_known_prepared(
+        &self,
+        id: uuid::Uuid,
+        preparation: &crate::access::Preparation,
+    ) -> Result<bool> {
+        preparation.check()?;
         if id == self.owner_dataset_id() {
-            return true;
+            return Ok(true);
         }
         let Some(set) = self.branching.set() else {
-            return false;
+            return Ok(false);
         };
-        let table = set.table.lock();
-        table.any_by_id(id).is_some() || table.deleted.iter().any(|d| d.id == id)
+        let table = preparation.lock(&set.table)?;
+        for (n, entry) in table
+            .branches
+            .iter()
+            .chain(&table.retired)
+            .map(|e| e.id)
+            .chain(table.deleted.iter().map(|d| d.id))
+            .enumerate()
+        {
+            if n % 1024 == 0 {
+                preparation.check()?;
+            }
+            if entry == id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_branch_table_for_test(&self) -> parking_lot::MutexGuard<'_, impl Sized> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            panic!("a main store with branches");
+        };
+        set.table.lock()
     }
 
     /// Fail with `no-such-branch` unless `branch` is a listed branch of this main.
