@@ -287,3 +287,14 @@ The cold-read switches `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB` and
 remain until item 4 has measured them, and item NEW-ITEM-2 makes them test-only then.
 `SPARKLES_NO_IN_PLACE` remains as the method of the published memory benchmark, which
 compares the in-place runner with the blocking pool.
+
+### Measurements of stage 1
+
+A Namespace screen of the base against the five deletions ran the 30 synthetic queries
+at 1.05M triples with one thread in four A,B,B,A rounds. The geometric mean of server
+time was 0.982 of the base, and no query was 5% or more slower. `regex-iri` read 1.024
+and `class-predicates` 1.020 with every round above 1, which item NEW-ITEM-3 measures on
+an Intel host. EXPLAIN printed the same plans before and after for four generated groups
+of 17 to 22 triple patterns over the same data, a chain, a chain with a filter, a star
+and a snowflake, since a group of more than 16 inputs already kept the greedy plan of
+`joinorder.rs`.
