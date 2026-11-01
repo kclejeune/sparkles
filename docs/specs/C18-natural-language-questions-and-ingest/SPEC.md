@@ -1525,7 +1525,10 @@ from a pipe and writes its result to another, and the server reads at most a bou
 number of bytes of it. Before it reads the file, the child sets an address-space limit
 (`--convert-memory`, 2 GiB by default), a CPU-time limit, a file-size limit of zero
 unless OCR is configured, no core file and death with the server, and it refuses to run
-without them. Its environment is cleared except for the locale, the time zone, the
+without them. It then starts its threads under those limits, at most four in the rayon
+pool that the PDF parser uses and with glibc's malloc held to two arenas, because each
+thread would otherwise reserve a 64 MiB arena and a thread per core would not fit under
+the limit on a host with many cores. Its environment is cleared except for the locale, the time zone, the
 library paths that OCR needs and `PATH`, so it holds no provider key or token. This is
 resource containment and not a sandbox, because the child runs as the server's user with
 its privileges. The arguments and the reply carry a protocol version, and a child of
@@ -1533,8 +1536,9 @@ another version refuses to run. The server kills the child 250 ms after the task
 deadline, so the task reports `conversion-timeout` and the worker slot is free again
 whatever the converter does. A child that ends without a result, through a panic or its
 memory limit, gives `conversion-failed` with status 422, and one that could not set its
-limits gives `conversion-failed` with status 500, with its exit status and the start of
-its error output in the server's log. The server starts one child when it starts, to
+limits or start its threads gives `conversion-failed` with status 500. The refusal
+quotes the last 400 bytes of the child's error output, and the server's log holds its
+exit status and the first 2 KiB of that output. The server starts one child when it starts, to
 check that a child can set its limits. When it cannot, every PDF and Office conversion
 is refused with that reason, and `--convert-in-process` is the way to convert without
 the limits. The conversion runs on a blocking thread of its own under the same deadline,

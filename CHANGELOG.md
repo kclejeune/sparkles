@@ -612,6 +612,19 @@ line and uploads do not expose the mode.
 
 ### Fixed
 
+A PDF converted in a child process no longer fails with "the converter stopped on it"
+on a host with many cores. The PDF parser's first parallel loop started rayon's global
+pool with a thread per core, and each new thread made glibc reserve a malloc arena of
+64 MiB of address space, because Rust's standard library allocates with glibc's malloc
+when it installs a thread's stack-overflow handler. On a host with 20 cores the child
+reserved 1.6 GiB, so it ran out of a 1 GiB limit and panicked, and a server with the
+default limit of 2 GiB would fail the same way on about 32 cores. The child now caps
+glibc at two arenas and its rayon pool at four threads, which it starts under its limits
+before it reads the file, so the startup probe also finds a limit that the threads do not
+fit. The same PDF now reserves about 480 MiB in a debug build. A refusal for a child that
+ended without a result quotes the end of the child's error output, such as a panic's
+message.
+
 A delete or rename of a dataset waits up to two seconds for the requests and workers
 that still hold it, such as the first round of a new dataset's view worker, before it
 answers `409` with "still has live requests". Right after a create or clone, such a call

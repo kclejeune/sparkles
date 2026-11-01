@@ -4357,8 +4357,11 @@ OCR, a file-size limit of zero. The server kills it when the task's deadline pas
 a file that makes a converter loop or allocate without end fails with
 `conversion-timeout` or `conversion-failed` and frees its worker slot. The child gets a
 cleared environment without the server's keys and tokens, but it runs as the server's
-user, so this limits resources and is not a sandbox. Starting the child adds about 10 ms
-to each document. The server starts one child when it starts. If that child cannot set
+user, so this limits resources and is not a sandbox. The child parses with at most four
+threads and lets glibc's malloc keep at most two arenas, so the threads fit under the
+limit whatever the host's core count. When a child ends without a result, the error
+quotes the end of what it wrote to its standard error, such as a panic's message.
+Starting the child adds about 10 ms to each document. The server starts one child when it starts. If that child cannot set
 its limits, for example under a system call filter that forbids them, the server logs
 the reason and refuses PDF and Office files with status 500 until it is restarted with
 `--convert-in-process`. That flag converts on threads of the server instead, where a

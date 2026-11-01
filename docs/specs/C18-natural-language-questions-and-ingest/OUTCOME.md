@@ -1097,9 +1097,16 @@ audio and video remain, and so do the follow-ups listed at the end of this secti
   run without them, so the server starts it with `posix_spawn` and does not copy its own
   page tables, as a `fork` would. The child is given `MIMALLOC_ARENA_RESERVE=64MiB`,
   because mimalloc otherwise reserves 1 GiB of address space before the limit is set.
-  The flag takes at least 256 MiB, below which the binary cannot start its threads. A
-  build without mimalloc uses glibc's allocator, which reserves 64 MiB of address space
-  for each thread's arena, so a small limit leaves fewer threads room there. The
+  The flag takes at least 256 MiB, below which the binary cannot start its threads.
+  glibc reserves 64 MiB of address space for the malloc arena of each new thread, and
+  it does so with mimalloc too, because Rust's standard library calls
+  `pthread_getattr_np` with glibc's malloc when it installs a thread's stack-overflow
+  handler. The PDF parser started rayon's global pool with a thread per core, so on a
+  20-core host the child of a debug build reserved 1.6 GiB for a small PDF and panicked
+  under a 1 GiB limit. The child now holds glibc to two arenas and its rayon pool to four
+  threads, started under the limits before it reads the file, and the same conversion
+  reserves about 480 MiB. A refusal for a child that ended without a result quotes the
+  end of its error output. The
   tradeoff is latency and memory for containment. A child costs one process start per
   conversion, and the server may use up to `--pdf-workers` times `--convert-memory` of
   address space for conversions on top of its own. On a shared 16-core Linux laptop,
