@@ -282,16 +282,12 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
     let wait_until = o.deadline + GRACE;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut killed = false;
-    let mut err_text = Vec::new();
+    let mut err_text = (Vec::new(), Vec::new());
     let outcome = std::thread::scope(|s| {
-        // the first 2 KiB of the child's errors are kept for the log, and the rest is
-        // drained so that the child never blocks on a full pipe
-        let err_reader = s.spawn(move || {
-            let mut head = Vec::new();
-            let _ = (&mut stderr).take(2048).read_to_end(&mut head);
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-            head
-        });
+        // the first 2 KiB of the child's errors are kept for the log and its last bytes
+        // for the refusal, and the rest is drained so that the child never blocks on a
+        // full pipe
+        let err_reader = s.spawn(move || read_stderr(&mut stderr));
         // the input is written and the output read on threads of their own, so that a
         // child that writes before it has read everything cannot block the parent
         s.spawn(move || {
@@ -341,10 +337,10 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
     let failure = |what: &str, r: Refusal| {
         tracing::warn!(
             status = ?status,
-            stderr = %String::from_utf8_lossy(&err_text),
+            stderr = %String::from_utf8_lossy(&err_text.0),
             "a conversion child {what}"
         );
-        with_stderr(r, &err_text)
+        with_stderr(r, &err_text.1)
     };
     match got {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Some(timeout())),
@@ -404,6 +400,36 @@ pub fn probe(iso: &Isolation) -> Result<(), String> {
         Err(Some(r)) => Err(r.message),
         Err(None) => Err(format!("{} could not be started", iso.exe.display())),
     }
+}
+
+/// How many bytes of the start of the child's standard error the log keeps, and of its end
+/// the parent keeps for [`with_stderr`], which quotes less than that once it has left out
+/// Rust's backtrace hint.
+const STDERR_HEAD: usize = 2048;
+const STDERR_TAIL: usize = 1024;
+
+/// Read the child's standard error to its end, and return its first [`STDERR_HEAD`] and
+/// last [`STDERR_TAIL`] bytes.
+fn read_stderr(r: &mut impl Read) -> (Vec<u8>, Vec<u8>) {
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let chunk = &buf[..n];
+        let room = STDERR_HEAD.saturating_sub(head.len());
+        head.extend_from_slice(&chunk[..room.min(n)]);
+        tail.extend_from_slice(chunk);
+        if tail.len() > STDERR_TAIL {
+            tail.drain(..tail.len() - STDERR_TAIL);
+        }
+    }
+    (head, tail)
 }
 
 /// `r` with the end of the child's standard error `err` quoted, when it wrote any. Rust's
@@ -1133,11 +1159,18 @@ mod tests {
             "{}",
             e.message
         );
-        let long = format!("printf '%s' {} >&2; exit 101", "y".repeat(5000));
+        // a panic after more than the log's 2 KiB of other errors is still quoted, and a
+        // long message only by its end
+        let long = format!(
+            "printf '%s\\n' {} >&2; printf 'last words\\n' >&2; exit 101",
+            "y".repeat(5000)
+        );
         let e = run(&shell(&long), JOB, b"x", &o).unwrap_err().unwrap();
+        let quote = format!("{} last words", "y".repeat(STDERR_QUOTE - 11));
         assert!(
+            e.message.ends_with(&format!("reported: ...{quote}")),
+            "{}",
             e.message
-                .ends_with(&format!("reported: ...{}", "y".repeat(STDERR_QUOTE)))
         );
         let r = run(&shell("exit 5"), JOB, b"x", &o).unwrap_err().unwrap();
         assert!(r.message.contains("--convert-memory"), "{}", r.message);
