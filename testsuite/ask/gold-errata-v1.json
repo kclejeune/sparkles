@@ -5,7 +5,7 @@
     {
       "id": "qald9p-37",
       "goldSha256": "57a6992a92cbe467c31f3b06619442f3ad9b71b923b01dbd1600adfc03c2cf30",
-      "release": "DBpedia 2022.12.01",
+      "release": "2022.12.01",
       "reason": "the only foaf:nick value of res:San_Francisco on this release is the infobox text \"SeeList of nicknames for San Francisco\", which names no nickname"
     }
   ]

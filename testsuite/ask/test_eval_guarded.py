@@ -93,7 +93,10 @@ class GuardedScore(unittest.TestCase):
         g2, n = guarded.drop_empty(gold)
         self.assertEqual(n, 1)
         self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")]))[0])[0])
-        self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")], [lit("", lang="en")]))[0])[0])
+        self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")], [lit("", lang="en")]), gold=False)[0])[0])
+        # an empty label beside a wrong answer keeps that answer
+        got = rel(["y", "l"], [uri("ex:a"), lit("A")], [uri("ex:b"), lit("")])
+        self.assertFalse(guarded.compare(g2, guarded.drop_empty(got, gold=False)[0])[0])
 
     def test_extra_column_cap_and_flags(self):
         gold = rel(["x"], [uri("ex:a")])
@@ -125,12 +128,17 @@ class GuardedScore(unittest.TestCase):
         self.assertEqual(guarded.errata_exclusion(q, gold, {})["rule"], "select-star")
         q = {"id": "q1", "gold": 'SELECT ?x WHERE { ?x ?p "SELECT *" }'}
         self.assertIsNone(guarded.errata_exclusion(q, gold, {}))
+        q = {"id": "q1", "gold": "SELECT ?x WHERE { { SELECT * WHERE { ?x <urn:p> ?y } } }"}
+        self.assertIsNone(guarded.errata_exclusion(q, gold, {}))
         q = {"id": "q1", "gold": "SELECT ?x ?s WHERE { ?x ?p ?o }"}
         unbound = rel(["x", "s"], [uri("ex:a"), None])
         self.assertEqual(guarded.errata_exclusion(q, unbound, {})["rule"], "unbound-column")
         sha = hashlib.sha256(q["gold"].encode()).hexdigest()
-        named = {("q1", sha): {"reason": "r"}}
-        self.assertEqual(guarded.errata_exclusion(q, gold, named)["rule"], "named")
+        named = {("q1", sha): {"reason": "r", "release": "2022.12.01"}}
+        self.assertEqual(guarded.errata_exclusion(q, gold, named, "2022.12.01")["rule"], "named")
+        # the same gold recomputed on another release is not excluded
+        self.assertIsNone(guarded.errata_exclusion(q, gold, named, "2023.06.01"))
+        self.assertIsNone(guarded.errata_exclusion(q, gold, named))
         # an entry for another gold text with the same id does not apply
         self.assertIsNone(guarded.errata_exclusion(dict(q, gold=q["gold"] + " "), gold, named))
         self.assertTrue(guarded.load_errata())

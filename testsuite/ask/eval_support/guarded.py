@@ -51,6 +51,7 @@ NUMERIC = {
 }
 ERRATA_FILE = pathlib.Path(__file__).resolve().parent.parent / "gold-errata-v1.json"
 SELECT_STAR = re.compile(r"\bSELECT\s+(?:DISTINCT\s+|REDUCED\s+)?\*", re.I)
+FIRST_SELECT = re.compile(r"\bSELECT\b", re.I)
 
 
 def load_errata(path=ERRATA_FILE):
@@ -64,14 +65,19 @@ def strip_strings(text):
     return re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|<[^<>\s]*>|#[^\n]*', " ", text)
 
 
-def errata_exclusion(question, gold, errata):
+def errata_exclusion(question, gold, errata, release=None):
     """The reason this question leaves the v3 denominator, or None. A named entry
-    applies only to the exact gold text it was checked against."""
+    applies only to the exact gold text it was checked against, recomputed on the data
+    release it names, since its defect lies in that release's data."""
     sha = hashlib.sha256(question["gold"].encode()).hexdigest()
     named = errata.get((question["id"], sha))
-    if named is not None:
+    if named is not None and release is not None and named.get("release") == release:
         return {"rule": "named", "reason": named["reason"]}
-    if SELECT_STAR.search(strip_strings(question["gold"])):
+    text = strip_strings(question["gold"])
+    outer = FIRST_SELECT.search(text)
+    # Only the outer projection decides the answer's columns. A subquery's SELECT *
+    # inside it does not.
+    if outer and SELECT_STAR.match(text, outer.start()):
         return {
             "rule": "select-star",
             "reason": "the gold uses SELECT *, so the scorer demands every bound "
@@ -94,8 +100,15 @@ def empty_string(cell):
     )
 
 
-def drop_empty(rel):
-    rows = frozenset(r for r in rel.rows if not any(empty_string(c) for c in r))
+def drop_empty(rel, gold=True):
+    """`rel` without its rows that hold an empty string. A gold row goes when any cell
+    is empty. An answer row goes only when every bound cell is empty, so that an empty
+    label beside a wrong answer cannot hide that answer."""
+    if gold:
+        keep = lambda r: not any(empty_string(c) for c in r)  # noqa: E731
+    else:
+        keep = lambda r: not all(empty_string(c) or c == UNBOUND for c in r)  # noqa: E731
+    rows = frozenset(r for r in rel.rows if keep(r))
     return Relation(rel.variables, rows, rel.duplicates), len(rel.rows) - len(rows)
 
 

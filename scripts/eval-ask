@@ -558,7 +558,9 @@ class Runner:
         if q["kind"] != "answerable":
             return dict(out, correct=bool(strict_ok))
         gold = self.gold(q)
-        excluded = guarded.errata_exclusion(q, gold, self.errata)
+        excluded = guarded.errata_exclusion(
+            q, gold, self.errata, self.qset.get("dbpediaRelease")
+        )
         if excluded:
             return dict(out, correct=False, excluded=excluded)
         if type(gold) is bool:
@@ -576,7 +578,7 @@ class Runner:
         got = self.last_got
         if got is None or type(got) is bool:
             return dict(out, correct=False, status=strict_detail.get("status"))
-        got2, dropped_got = guarded.drop_empty(got)
+        got2, dropped_got = guarded.drop_empty(got, gold=False)
         detail = {"droppedEmptyGoldRows": dropped_gold, "droppedEmptyAnswerRows": dropped_got}
         ok, cmp = guarded.compare(gold2, got2, self.check)
         if not ok and cmp.get("status") is None:
