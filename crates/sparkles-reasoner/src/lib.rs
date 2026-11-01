@@ -21,6 +21,7 @@ pub mod analysis;
 mod budget;
 mod builtins;
 mod closure;
+mod costplan;
 mod demand;
 pub mod diagnostics;
 mod engine;
@@ -192,6 +193,11 @@ pub struct ReasonOptions {
     /// ordinary rules, for differential tests and measurements.
     #[doc(hidden)]
     pub closure_operators: bool,
+    /// Order rule bodies with the cost-based planner, which probes constant terms, reads
+    /// the characteristic sets and orders short bodies by dynamic programming. `true` by
+    /// default. `false` keeps the greedy planner, for differential tests and measurements.
+    #[doc(hidden)]
+    pub cost_planning: bool,
 }
 
 impl Default for ReasonOptions {
@@ -207,6 +213,7 @@ impl Default for ReasonOptions {
             threads: None,
             pool: None,
             closure_operators: true,
+            cost_planning: true,
         }
     }
 }
@@ -223,6 +230,7 @@ impl fmt::Debug for ReasonOptions {
             .field("threads", &self.threads)
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
             .field("closure_operators", &self.closure_operators)
+            .field("cost_planning", &self.cost_planning)
             .finish()
     }
 }
@@ -397,6 +405,7 @@ fn derive_here(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: opts.closure_operators && opts.analysis.is_none(),
+        cost_planning: opts.cost_planning && opts.analysis.is_none(),
     };
     progress(opts, 0.1, "reasoning");
     let out = engine::run(&mut g, &compiled, &terms, &limits, None)?;
@@ -1363,6 +1372,7 @@ fn update_closure(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: false,
+        cost_planning: false,
     };
     let ch = &ch;
     progress(opts, 0.1, "updating the closure");
@@ -1649,6 +1659,7 @@ pub fn dred_overdeletion(
         progress: None,
         budget: Budget::unlimited(),
         closures: false,
+        cost_planning: false,
     };
     let mut c = d.into_closure()?;
     Ok(incremental::dred_overdeletion(

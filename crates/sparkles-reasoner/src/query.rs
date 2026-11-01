@@ -466,6 +466,7 @@ impl Session {
             progress: None,
             budget: self.budget.clone(),
             closures: false,
+            cost_planning: false,
         };
         let terms = &self.terms;
         let ends = &mut self.compact_rounds;

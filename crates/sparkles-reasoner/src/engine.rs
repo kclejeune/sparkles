@@ -528,6 +528,11 @@ pub(crate) fn plan_with(
     bi_left.is_empty().then_some(steps)
 }
 
+/// The greedy planner's estimate of an atom's matches with the variables `bound` bound.
+pub(crate) fn estimate_atom(a: &Atom, bound: &[bool], range: (u32, u32), g: Option<&Graph>) -> f64 {
+    estimate(a, bound, range, g)
+}
+
 fn estimate(a: &Atom, bound: &[bool], (lo, hi): (u32, u32), g: Option<&Graph>) -> f64 {
     let (sb, pb, ob) = (
         slot_bound(a.s, bound),
@@ -1320,6 +1325,8 @@ pub(crate) struct Limits {
     /// evaluate transitive and equivalence rules with closure operators
     /// ([`crate::closure`]) when the program allows it
     pub closures: bool,
+    /// order rule bodies with the cost-based planner ([`crate::costplan`])
+    pub cost_planning: bool,
 }
 
 pub(crate) struct Outcome {
@@ -1674,8 +1681,15 @@ pub(crate) fn plan_iteration(
     ds: u32,
     de: u32,
     candidates: Option<&[usize]>,
+    mut planner: Option<&mut crate::costplan::Planner>,
 ) -> Vec<(usize, Vec<Step>)> {
     let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
+    // the cost-based planner when the run has one, or the greedy planner
+    let mut plan_of =
+        |ri: usize, key: usize, r: &CRule, ranges: &[(u32, u32)]| match planner.as_deref_mut() {
+            Some(p) => p.plan(g, ri, key, r, ranges),
+            None => plan(r, ranges, Some(g)),
+        };
     // a join with an atom whose constant predicate has no rows in its range is empty
     let empty = |r: &CRule, ranges: &[(u32, u32)], g: &Graph| {
         r.atoms.iter().zip(ranges).any(|(a, &(lo, hi))| match a.p {
@@ -1699,7 +1713,7 @@ pub(crate) fn plan_iteration(
             if empty(r, &ranges, g) {
                 continue;
             }
-            if let Some(p) = plan(r, &ranges, Some(g)) {
+            if let Some(p) = plan_of(ri, usize::MAX, r, &ranges) {
                 tasks.push((ri, p));
             }
             continue;
@@ -1711,7 +1725,7 @@ pub(crate) fn plan_iteration(
         if implicit_delta {
             let ranges = vec![(0, de); r.atoms.len()];
             if !empty(r, &ranges, g)
-                && let Some(p) = plan(r, &ranges, Some(g))
+                && let Some(p) = plan_of(ri, usize::MAX, r, &ranges)
             {
                 tasks.push((ri, p));
             }
@@ -1738,7 +1752,7 @@ pub(crate) fn plan_iteration(
             if empty(r, &ranges, g) {
                 continue;
             }
-            if let Some(p) = plan(r, &ranges, Some(g)) {
+            if let Some(p) = plan_of(ri, d, r, &ranges) {
                 tasks.push((ri, p));
             }
         }
@@ -1793,6 +1807,11 @@ pub(crate) fn run_observed(
     }
     // rules the ordinary evaluator takes back from an operator, with one full evaluation
     let mut refresh: Vec<usize> = Vec::new();
+    let mut planner = limits.cost_planning.then(|| {
+        crate::costplan::Planner::new(Some(
+            terms.id_for(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned())),
+        ))
+    });
     loop {
         terms.analysis_round(iteration);
         if cancelled() {
@@ -1835,6 +1854,7 @@ pub(crate) fn run_observed(
                 ds,
                 de,
                 candidates.as_ref().map(|(c, _)| c.as_slice()),
+                planner.as_mut(),
             ),
             _ => {
                 let keep = |ri: &usize| {
@@ -1844,11 +1864,19 @@ pub(crate) fn run_observed(
                     Some((c, _)) => c.iter().copied().filter(keep).collect(),
                     None => (0..rules.len()).filter(keep).collect(),
                 };
-                plan_iteration(g, rules, naive, ds, de, Some(&list))
+                plan_iteration(g, rules, naive, ds, de, Some(&list), planner.as_mut())
             }
         };
         if !refresh.is_empty() {
-            tasks.extend(plan_iteration(g, rules, true, ds, de, Some(&refresh)));
+            tasks.extend(plan_iteration(
+                g,
+                rules,
+                true,
+                ds,
+                de,
+                Some(&refresh),
+                planner.as_mut(),
+            ));
             refresh.clear();
         }
         for (ri, p) in &tasks {
@@ -2131,6 +2159,14 @@ pub(crate) fn run_observed(
         ds = de;
         de = g.len();
     }
+    if let Some(p) = &planner {
+        tracing::debug!(
+            made = p.made,
+            reused = p.reused,
+            changed = p.changed,
+            "cost-based plans"
+        );
+    }
     Ok(Outcome {
         iterations: iteration,
     })
@@ -2361,8 +2397,9 @@ mod index_tests {
                     ds,
                     de,
                     candidates.as_ref().map(|(c, _)| c.as_slice()),
+                    None,
                 );
-                let every = plan_iteration(&g, &rules, naive, ds, de, None);
+                let every = plan_iteration(&g, &rules, naive, ds, de, None, None);
                 planned += every.len();
                 skipped += candidates
                     .as_ref()

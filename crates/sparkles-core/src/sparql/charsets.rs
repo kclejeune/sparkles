@@ -314,6 +314,52 @@ pub(super) fn register(ctx: &Ctx, stars: &[(VarId, u64, Option<u64>)]) {
     }
 }
 
+/// The rows and distinct subjects of the star of `items` on one subject variable, one
+/// pattern `?s p ?o` per `(p, None)` and `?s rdf:type <class>` per `(rdf:type, Some(class))`,
+/// from the characteristic sets. `None` when an item is not a star item, occurs twice, or
+/// is one whose triples the kept sets do not nearly all hold. For planners outside the
+/// SPARQL engine, such as the reasoner's rule bodies.
+pub fn star_estimate(generation: &Generation, items: &[(u64, Option<u64>)]) -> Option<(f64, f64)> {
+    let stats = &generation.stats;
+    if stats.charsets.is_empty() || items.is_empty() || items.len() > MAX_PREDS {
+        return None;
+    }
+    let idx = generation
+        .charsets
+        .get_or_init(|| CharIndex::new(generation));
+    let mut preds: Vec<u64> = Vec::with_capacity(items.len());
+    for &(p, o) in items {
+        let it = item(p, o, idx.rdf_type)?;
+        if preds.contains(&it) {
+            return None;
+        }
+        preds.push(it);
+    }
+    idx.find(stats, &preds);
+    for &p in &preds {
+        let count = match crate::builder::item_class(p) {
+            Some(c) => stats.classes.iter().find(|x| x.0 == c).map_or(0, |x| x.1),
+            None => stats.predicate(p).map_or(0, |s| s.count),
+        };
+        let covered: f64 = idx.postings(stats, p).iter().map(|x| x.1).sum();
+        if count == 0 || covered < COVERAGE * count as f64 {
+            return None;
+        }
+    }
+    let usable = if preds.len() == 64 {
+        u64::MAX
+    } else {
+        (1u64 << preds.len()) - 1
+    };
+    let mut star = StarVar {
+        groups: Some(idx.groups(stats, &preds, usable)),
+        preds,
+        usable,
+        memo: FxHashMap::default(),
+    };
+    Some(star.star(usable))
+}
+
 /// Combine the star masks of two sets of patterns on one variable: a predicate in both
 /// makes the result unusable.
 #[inline]
