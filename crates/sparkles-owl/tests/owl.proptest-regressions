@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 77fe49e74437f931d03fee030dbc4278d07c9569e2be1f5b674e3a8f4f72151b # shrinks to axioms = [Axiom { kind: DataPropertyRange(DataProperty(NamedNode { iri: "http://example.org/d1" }), Datatype(Datatype(NamedNode { iri: "http://www.w3.org/2001/XMLSchema#integer" }))), annotations: {Annotation { property: AnnotationProperty(NamedNode { iri: "http://www.w3.org/2000/01/rdf-schema#comment" }), value: Literal(Literal(Literal(String("a")))), annotations: {} }} }, Axiom { kind: DataPropertyRange(DataProperty(NamedNode { iri: "http://example.org/d1" }), Datatype(Datatype(NamedNode { iri: "http://www.w3.org/2001/XMLSchema#integer" }))), annotations: {Annotation { property: AnnotationProperty(NamedNode { iri: "http://www.w3.org/2000/01/rdf-schema#comment" }), value: Literal(Literal(Literal(String("b")))), annotations: {} }} }]

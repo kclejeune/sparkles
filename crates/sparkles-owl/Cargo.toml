@@ -1,0 +1,15 @@
+[package]
+name = "sparkles-owl"
+description = "The OWL 2 axiom model for Sparkles: the structural specification, the mapping to and from RDF graphs, and the OWL 2 EL, QL, RL and DL profile checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxrdf.workspace = true
+serde_json.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+oxrdfio.workspace = true
+proptest.workspace = true

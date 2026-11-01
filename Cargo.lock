@@ -5934,6 +5934,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles-owl"
+version = "0.1.0"
+dependencies = [
+ "oxrdf",
+ "oxrdfio",
+ "proptest",
+ "rustc-hash 2.1.3",
+ "serde_json",
+]
+
+[[package]]
 name = "sparkles-reasoner"
 version = "0.1.0"
 dependencies = [

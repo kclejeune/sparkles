@@ -1,0 +1,34 @@
+# Known differences from the W3C OWL 2 test cases: "<identifier>:<check> <reason>".
+# The test cases date from 2009 and many were converted from the OWL 1 suite. Where a
+# case disagrees with the 2012 recommendations, the checks follow the recommendations.
+New-Feature-Rational-002:dl The enumeration ends with rdf:rest rdf: (the RDF namespace IRI) instead of rdf:nil, so it is not a well-formed list and the restriction maps to no class expression.
+New-Feature-Rational-003:dl The enumeration ends with rdf:rest rdf: instead of rdf:nil, as in Rational-002.
+New-Feature-ReflexiveProperty-001:rl OWL 2 Profiles §4.2 excludes ReflexiveObjectProperty from OWL 2 RL.
+WebOnt-I4.6-004:el The case excludes EL, but EquivalentClasses and SameIndividual over punned IRIs are both in the EL grammar.
+WebOnt-I5.26-001:dl The conclusion's ObjectIntersectionOf node is a free-standing class expression that no axiom uses, which the reverse mapping leaves unmapped.
+WebOnt-I5.26-001:el OWL 2 Profiles §2.2 excludes anonymous individuals from OWL 2 EL.
+WebOnt-I5.26-001:ql OWL 2 Profiles §3.2 excludes anonymous individuals from OWL 2 QL.
+WebOnt-I5.26-001:rl The free-standing class expression of the DL difference.
+WebOnt-I5.26-002:el OWL 2 Profiles §2.2 excludes anonymous individuals from OWL 2 EL.
+WebOnt-I5.26-002:ql OWL 2 Profiles §3.2 excludes anonymous individuals from OWL 2 QL.
+WebOnt-I5.26-010:dl The conclusion is a free-standing restriction that no axiom uses, which the reverse mapping leaves unmapped.
+WebOnt-I5.26-010:el The free-standing restriction of the DL difference.
+WebOnt-I5.26-010:ql The free-standing restriction of the DL difference.
+WebOnt-I5.26-010:rl The free-standing restriction of the DL difference.
+WebOnt-I5.5-005:dl The premise has no ontology header, which the Mapping to RDF Graphs §3.1.2 requires, and the conclusion is a free-standing union.
+WebOnt-I5.5-005:el The missing header and free-standing union of the DL difference.
+WebOnt-I5.5-005:ql The missing header and free-standing union of the DL difference.
+WebOnt-I5.5-005:rl The missing header and free-standing union of the DL difference.
+WebOnt-InverseFunctionalProperty-001:dl The case excludes DL because OWL 1 DL needed owl:ObjectProperty beside owl:InverseFunctionalProperty; Table 6 of the 2012 mapping implies that declaration, and the ontology meets every DL restriction.
+WebOnt-Nothing-001:el OWL 2 Profiles §2.2 excludes anonymous individuals from OWL 2 EL.
+WebOnt-Nothing-001:ql OWL 2 Profiles §3.2 excludes anonymous individuals from OWL 2 QL.
+WebOnt-SymmetricProperty-003:dl The case excludes DL for the OWL 1 typing of owl:SymmetricProperty, which Table 6 of the 2012 mapping resolves as in InverseFunctionalProperty-001.
+WebOnt-SymmetricProperty-003:ql The ontology is in the QL grammar once the property is typed as in the DL difference.
+WebOnt-description-logic-104:ql OWL 2 Profiles §3.2 excludes anonymous individuals from OWL 2 QL.
+WebOnt-someValuesFrom-003:el OWL 2 Profiles §2.2 excludes anonymous individuals from OWL 2 EL.
+bnode2somevaluesfrom:el OWL 2 Profiles §2.2 excludes anonymous individuals from OWL 2 EL.
+owl2-rl-anonymous-individual:dl A blank node typed owl:NamedIndividual maps to no axiom, because Table 7 declares named individuals by IRI only.
+owl2-rl-anonymous-individual:rl The owl:NamedIndividual typing of a blank node, as in the DL difference.
+owl2-rl-valid-oneof:dl The ObjectOneOf node has no rdf:type owl:Class triple, which Table 13 requires; the lenient mode reads it.
+owl2-rl-valid-oneof:rl The missing owl:Class typing of the DL difference.
+somevaluesfrom2bnode:el OWL 2 Profiles §2.2 excludes anonymous individuals from OWL 2 EL.
