@@ -1103,7 +1103,12 @@ impl Witnesses {
     ) -> anyhow::Result<Prepared> {
         let mut p = Prepared::default();
         let mut start: Vec<Triple> = Vec::new();
+        // each starting fact is charged before it is collected, with its dead key, its
+        // place in the search and a rekeyed entry
+        let mut reached = Held::new(&limits.budget);
+        let one = REACHED_BYTES + VISITED_BYTES + size_of::<FactKey>() + 8 + 4;
         for t in removed {
+            reached.try_grow(one)?;
             if let Some(i) = self.node(t)
                 && let Some(k) = self.nodes[i as usize].key.take()
             {
@@ -1117,6 +1122,7 @@ impl Witnesses {
             {
                 let now = fact_key(c, t);
                 if now != k {
+                    reached.try_grow(one)?;
                     p.dead.insert(k);
                     self.nodes[i as usize].key = Some(now);
                     p.rekeyed.push(i);
@@ -1127,8 +1133,6 @@ impl Witnesses {
         if p.dead.is_empty() && start.is_empty() {
             return Ok(p);
         }
-        let mut reached = Held::new(&limits.budget);
-        reached.try_grow(start.len() * (REACHED_BYTES + VISITED_BYTES) + p.dead.len() * 24)?;
         let lost = self.lost(&p.dead, &mut reached)?;
         let plans = Plans::new(&mut c.graph, rules)?;
         let abort = AtomicBool::new(false);
@@ -1151,7 +1155,7 @@ impl Witnesses {
             }
         }
         let mut memo = Memo::default();
-        reached.try_grow(queue.len() * VISITED_BYTES)?;
+        reached.try_grow(lost.len() * VISITED_BYTES)?;
         let mut visited: FxHashSet<Triple> = queue.iter().copied().collect();
         while let Some(x) = queue.pop_front() {
             if cancelled(&cx) {
@@ -2488,5 +2492,39 @@ mod tests {
             budget.peak()
         );
         assert_eq!(w.held.bytes(), w.heap_bytes());
+    }
+
+    /// Regression (eighth review of item 416): the search before a deletion collected
+    /// every moved or removed fact before its first charge. Each is charged as it is
+    /// collected, so a large batch under a small budget is refused at once.
+    #[test]
+    fn a_large_deletion_is_refused_as_it_is_collected() {
+        let v = Vocab::new();
+        let sub = v.id(RDFS, "subClassOf");
+        let ty = v.id(RDF, "type");
+        let mut base: FxHashSet<Triple> = FxHashSet::default();
+        for k in 0..8 {
+            for c in 0..6 {
+                base.insert([ex(&v, &format!("i{k}")), ty, ex(&v, &format!("C{c}"))]);
+            }
+        }
+        base.insert([ex(&v, "C0"), sub, ex(&v, "C1")]);
+        let text = crate::RDFS_RULES;
+        let mut c = full(&v, text, &base);
+        let rules = compiled(text, &c.terms);
+        let mut w = Witnesses::build(&mut c, &rules, 8, &limits()).unwrap();
+        let removed: Vec<Triple> = base.iter().copied().collect();
+        let one = REACHED_BYTES + VISITED_BYTES + size_of::<FactKey>() + 8 + 4;
+        let budget = Budget::new(Some(4 * one));
+        let l = Limits {
+            budget: budget.clone(),
+            ..limits()
+        };
+        let Err(e) = w.prepare(&mut c, &rules, &l, &removed, &[]) else {
+            panic!("the batch passed the limit");
+        };
+        assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
+        assert!(budget.peak() <= 4 * one, "{}", budget.peak());
+        assert_eq!(budget.used(), 0);
     }
 }
