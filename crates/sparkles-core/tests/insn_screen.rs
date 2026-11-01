@@ -298,6 +298,8 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
         )])
         .unwrap();
         let gen_dir = s.snapshot().generation.dir.clone().unwrap();
+        // the store's background threads would run beside the counted cases
+        drop(s);
         let fsst = codec == Some(VocabCodec::Fsst);
         let v = Vocab::open_codec(&gen_dir, fsst).unwrap();
         assert_eq!(
@@ -364,7 +366,6 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
                 })
                 .sum::<u64>()
         });
-        drop(s);
     }
 }
 

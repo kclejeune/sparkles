@@ -38,6 +38,10 @@ use std::time::Instant;
 #[path = "common/lubm.rs"]
 mod lubm;
 
+/// The derived facts a query may make, far above the server's default of a million, which
+/// LUBM's broad queries pass under OWL RL from about ten universities on.
+const MAX_DERIVED: usize = 1 << 32;
+
 const QUERIES: &str = include_str!("../../../scripts/bench-lubm/queries.txt");
 
 /// The `## name` blocks of the LUBM query file.
@@ -150,6 +154,7 @@ fn main() {
     let demand = |p: Profile| {
         QueryReasoner::new(p, &Extras::default(), Inputs::default())
             .unwrap()
+            .with_max_derived(MAX_DERIVED)
             .provider()
     };
     let rdfs = Arc::new(RdfsOnRead::fixed(
@@ -227,16 +232,32 @@ fn main() {
     let qs = queries();
     assert_eq!(qs.len(), 14, "the LUBM query file has 14 queries");
 
-    // the answers, and one untimed run of each mode and query
+    // the answers, and one untimed run of each mode and query; a query that fails is a
+    // failed check and is not timed
     let mut reference = std::collections::HashMap::new();
-    for m in &modes {
-        for (q, text) in &qs {
-            let r = query(stores[m.store].snapshot(), text, &m.options).unwrap();
+    let mut failed = std::collections::HashSet::new();
+    for (mi, m) in modes.iter().enumerate() {
+        for (qi, (q, text)) in qs.iter().enumerate() {
+            let r = match query(stores[m.store].snapshot(), text, &m.options) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{}/{}/{q}: {e}", m.profile, m.name);
+                    line(serde_json::json!({
+                        "check": format!("{}/{}/{q}/answer", m.profile, m.name), "ok": false,
+                        "detail": e.to_string(),
+                    }));
+                    failed.insert((mi, qi));
+                    continue;
+                }
+            };
             let a = answer(&r);
             if m.name == "materialized" {
                 reference.insert((m.profile, q.as_str()), a);
             }
-            let want = reference[&(m.profile, q.as_str())];
+            let Some(&want) = reference.get(&(m.profile, q.as_str())) else {
+                failed.insert((mi, qi));
+                continue;
+            };
             let ok = a == want;
             if !ok {
                 eprintln!(
@@ -257,6 +278,9 @@ fn main() {
             for k in 0..modes.len() {
                 let mi = (k + round + qi) % modes.len();
                 let m = &modes[mi];
+                if failed.contains(&(mi, qi)) {
+                    continue;
+                }
                 for _ in 0..reps {
                     let t = Instant::now();
                     let r = query(stores[m.store].snapshot(), text, &m.options).unwrap();
@@ -293,11 +317,17 @@ fn main() {
         for (qi, (q, _)) in qs.iter().enumerate() {
             let cells: Vec<String> = ms
                 .iter()
-                .map(|&i| format!("{:.3}", median(&samples[i][qi])))
+                .map(|&i| match samples[i][qi].is_empty() {
+                    true => "failed".to_string(),
+                    false => format!("{:.3}", median(&samples[i][qi])),
+                })
                 .collect();
             println!("| {q} | {} |", cells.join(" | "));
             for &i in &ms {
                 let s = &samples[i][qi];
+                if s.is_empty() {
+                    continue;
+                }
                 line(serde_json::json!({
                     "key": format!("{profile}/{}/{q}", modes[i].name),
                     "value": median(s), "unit": "ms", "better": "lower",
