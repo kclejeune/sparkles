@@ -38,8 +38,10 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   compiler targets. CI writes `.artifacts/ci`, reviews write `.artifacts/audits`,
   and benchmark tasks default to `.artifacts/bench…` or `.artifacts/nsc…`.
   Their outputs must survive collection after a command's target lease ends.
-- Prefer targeted runs (`mbx test -p <crate> --test <name>`) while iterating, and run the
-  full gate before reporting work as done.
+- Prefer targeted runs (`mbx test -p <crate> --test <name>`) while iterating. A lane
+  reports once its targeted tests, the crates it touched and `scripts/ci.sh --fast` pass.
+  The full gate runs once on each merged batch before a push, as described under
+  Merging and pushing, so lanes do not queue full gates of their own.
 - When the local machine is busy, build and test on another host (atlas or forge), or on an
   ephemeral Namespace instance created with `nsc create --bare --duration …` and always
   destroyed afterwards. Before a benchmark runs on forge or atlas, move builds off that host
