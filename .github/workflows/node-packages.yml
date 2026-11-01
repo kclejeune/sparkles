@@ -17,6 +17,7 @@ on:
       - 'crates/sparkles-backup/**'
       - 'crates/sparkles-client/**'
       - 'crates/sparkles-core/**'
+      - 'crates/sparkles-embed/**'
       - 'crates/sparkles-fmt/**'
       - 'crates/sparkles-graphql/**'
       - 'crates/sparkles-memory-import/**'
@@ -27,6 +28,7 @@ on:
       # the remote client's tests build the default-feature server
       - 'crates/sparkles-server/**'
       - 'crates/sparkles-shacl/**'
+      - 'crates/sparkles-shaclc/**'
       - 'crates/sparkles-shex/**'
       - '!crates/sparkles*/tests/**'
       - '!crates/sparkles*/benches/**'
@@ -38,7 +40,6 @@ on:
       - 'rust-toolchain.toml'
       - 'scripts/node-native.sh'
       - 'scripts/install-mbx-container.sh'
-      - 'scripts/node-native.sh'
       - 'scripts/ci-node-musl.sh'
       - 'mise.toml'
       - '.github/workflows/node-packages.yml'

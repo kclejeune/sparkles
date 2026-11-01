@@ -21,6 +21,7 @@ on:
       - "crates/sparkles-graphql/**"
       - "crates/sparkles-reasoner/**"
       - "crates/sparkles-shacl/**"
+      - "crates/sparkles-shaclc/**"
       - "crates/sparkles-shex/**"
       - "!crates/sparkles*/tests/**"
       - "!crates/sparkles*/benches/**"
