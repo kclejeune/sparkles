@@ -146,6 +146,13 @@ python3 -I -S -B scripts/eval-ask --self-test --sparkles /ABSOLUTE/sparkles
 scripts/eval-ask-anthropic --run RUN.json --dry-run
 ```
 
+`eval_support/grounding_recall.py SET RUN_DIR` measures grounding recall from a run's
+saved prompts. For each answerable question it takes the last first-draft prompt, after
+any clarification, and checks whether every schema term and every resource of the gold
+query occurs in it, by full IRI or by a prefixed name under the prompt's own prefixes.
+A dry run gives the same prompts as a paid run, so the metric costs no provider call.
+It reports the questions whose prompt holds every gold term and the prompt size.
+
 The self-test drives the real CLI through the proxy against a local fake API. It covers
 chunked and close-delimited replies, structured-output retries, a downgrade, a
 rate limit, an overload that clears and a cascade. `--dry-run` runs a whole run file
