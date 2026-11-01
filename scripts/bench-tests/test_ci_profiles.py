@@ -14,6 +14,7 @@ FULL_TASKS = {
     "test:bench-scripts", "api:check", "client:types:check", "lint", "ui:check",
     "fmt:wasm", "py:lint", "jvm:lint", "node:lint", "test", "ui:test", "py:test",
     "jvm:rust-test", "jvm:test", "node:test", "node:client:check", "licenses:check",
+    "test:quickstart",
 }
 FAST_TASKS = {
     "fmt:check", "lint:shell", "lint:doc-paths", "api:check", "client:types:check",
