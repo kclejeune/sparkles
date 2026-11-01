@@ -637,7 +637,9 @@ otherwise changes nothing. A configuration interrupted between `evidence.json` a
 `managed.json` refuses every write until the next configuration, which is checked
 against the protection `managed.json` records and repairs the registry. After an
 interrupted first configuration there is no `managed.json`, and the next configuration
-starts from no protection at revision 0, on the live dataset or after a reopen.
+starts from no protection at revision 0, on the live dataset or after a reopen. An
+in-memory clone of such a dataset has no recorded registry to repair from, so it keeps
+refusing every write rather than starting from no protection.
 All three routes need `admin`. A `format` or `profile` other than 1 answers
 `409 unsupported-profile`.
 

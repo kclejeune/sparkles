@@ -611,6 +611,34 @@ fn an_interrupted_change_is_repaired_on_the_live_store() {
         assert!(r.is_err());
         s.set_failpoint("managed-settings-written", None);
         assert_eq!(managed_code(upd(&s, &insert_t)), "managed-unavailable");
+        if !first.is_empty() {
+            // an in-memory clone inherits the unavailable registry without its files,
+            // so it cannot be repaired from nothing
+            let (clone, _) = s
+                .clone_to_memory(&Default::default(), StoreOptions::default())
+                .unwrap();
+            assert_eq!(
+                managed_code(clone.managed_snapshot()),
+                "managed-unavailable"
+            );
+            for expected in [0, 1] {
+                assert_eq!(
+                    managed_code(clone.enable_managed_at(
+                        OwnerKind::Evidence,
+                        entry(&[T], NEW),
+                        NEW,
+                        expected
+                    )),
+                    "managed-unavailable"
+                );
+            }
+            assert_eq!(
+                managed_code(clone.enable_managed(OwnerKind::Evidence, entry(&[T], NEW), NEW)),
+                "managed-unavailable"
+            );
+            let insert_m = format!("INSERT DATA {{ GRAPH <{M}> {{ <urn:x> <urn:p> 9 }} }}");
+            assert_eq!(managed_code(upd(&clone, &insert_m)), "managed-unavailable");
+        }
         let snap = s.managed_snapshot().unwrap().unwrap();
         assert!(snap.unavailable.is_some());
         let expected = if first.is_empty() { 0 } else { 1 };

@@ -253,7 +253,9 @@ impl Store {
     /// that enabling an owner again repairs, such as one whose owner settings file does
     /// not match its digest or one whose change did not complete, is returned as
     /// `managed.json` records it, or empty at revision 0 when there is no such file,
-    /// with the settings files on disk and [`ManagedSnapshot::unavailable`] set. Any other registry that cannot
+    /// with the settings files on disk and [`ManagedSnapshot::unavailable`] set. Such a
+    /// registry of a store without a directory, as an in-memory clone can inherit,
+    /// fails with `managed-unavailable`. Any other registry that cannot
     /// be enforced fails with `managed-unavailable`.
     pub fn managed_snapshot(&self) -> Result<Option<ManagedSnapshot>> {
         let Some(state) = self.managed_state() else {
@@ -272,15 +274,18 @@ impl Store {
                 // What `managed.json` records, or no registry at all when a first
                 // enablement stopped before writing it: the same state that enabling
                 // the owner again starts from.
-                let recorded = match self.managed_root() {
-                    Some(root) => recorded_entries(&root).map_err(|e| {
-                        ManagedError::error(
-                            ManagedErrorKind::Unavailable,
-                            format!("{reason}; {}: {e}", crate::managed::FILE),
-                        )
-                    })?,
-                    None => None,
+                // A store without a directory, such as an in-memory clone of a
+                // dataset whose change did not complete, has no recorded registry to
+                // repair from, so it is not repaired from nothing.
+                let Some(root) = self.managed_root() else {
+                    return Err(rootless_repair(reason));
                 };
+                let recorded = recorded_entries(&root).map_err(|e| {
+                    ManagedError::error(
+                        ManagedErrorKind::Unavailable,
+                        format!("{reason}; {}: {e}", crate::managed::FILE),
+                    )
+                })?;
                 let (graphs, settings) = match recorded {
                     Some(i) => (i.graphs, i.settings),
                     None => (
@@ -377,6 +382,10 @@ impl Store {
             (None, Some(ManagedState::Unavailable { .. }), Some(root)) => {
                 repaired = recorded_entries(root)?;
                 repaired.as_ref()
+            }
+            // Repairing without the recorded files could drop protected graphs.
+            (None, Some(ManagedState::Unavailable { reason, .. }), None) => {
+                return Err(rootless_repair(reason));
             }
             (i, _, _) => i,
         };
@@ -668,6 +677,13 @@ fn recorded_entries(root: &Path) -> Result<Option<Installed>> {
         settings,
     )
     .map(Some)
+}
+
+fn rootless_repair(reason: &str) -> Error {
+    ManagedError::error(
+        ManagedErrorKind::Unavailable,
+        format!("{reason}; a store without a directory has no recorded registry to repair it from"),
+    )
 }
 
 fn not_enabled(owner: OwnerKind) -> Error {

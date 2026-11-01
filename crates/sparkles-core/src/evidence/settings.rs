@@ -322,6 +322,15 @@ impl Settings {
                 )));
             }
         }
+        if let Some(graph) = self
+            .projections
+            .iter()
+            .find(|g| !outputs.contains_key(g.as_str()))
+        {
+            return Err(Error::invalid(format!(
+                "projections: <{graph}> is not the output of any policy"
+            )));
+        }
         control.check()
     }
 
@@ -826,6 +835,7 @@ mod tests {
         let mut settings = reviewed();
         let template = settings.policies["advisories"].clone();
         settings.policies.clear();
+        settings.projections.clear();
         for index in 0..=MAX_POLICIES {
             let output = format!("urn:out:{index}");
             settings.projections.push(output.clone());
@@ -838,7 +848,16 @@ mod tests {
             );
         }
         assert!(settings.validate(&Control::none()).is_err());
-        settings.policies.pop_last();
+        let (_, last) = settings.policies.pop_last().unwrap();
+        settings.projections.retain(|g| *g != last.output);
+        assert!(settings.validate(&Control::none()).is_ok());
+        // every projection graph needs its policy
+        settings.projections.push("urn:out:unowned".into());
+        assert!(settings.validate(&Control::none()).is_err());
+        let mut settings = reviewed();
+        settings.policies.clear();
+        assert!(settings.validate(&Control::none()).is_err());
+        settings.projections.clear();
         assert!(settings.validate(&Control::none()).is_ok());
     }
 
