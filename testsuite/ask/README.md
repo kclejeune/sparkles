@@ -244,8 +244,8 @@ are refused the same way, and need a new ledger directory or an edit by hand.
 
 A charge that stands at an upper bound can be reconciled with the amount the provider
 billed. Such charges are the carryover, a reserve that a crash left without a settle
-line, and a request settled at its bound because its reply was lost or its usage could
-not be read. `--held` lists them with each request's model, case, time and request ID.
+line, a request settled at its bound because its reply was lost or its usage could
+not be read, and a reply of another model, whose charge is an estimate. `--held` lists them with each request's model, case, time and request ID.
 `--reconcile TARGET --billed-nanodollars N --evidence TEXT` appends a reconcile line
 that replaces one of them, where TARGET is `carryover` or a request ID. The evidence is
 10 to 1000 printable characters that name the source of the amount, such as the

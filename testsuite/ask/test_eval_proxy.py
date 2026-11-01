@@ -1282,6 +1282,22 @@ class OpenAI(Base):
         settle = [x for x in self.lines("b.jsonl") if x.get("op") == "settle"][-1]
         self.assertGreaterEqual(settle["cost"], px.openai_cost(SOL, usage) * px.UNKNOWN_PREMIUM)
 
+    def test_a_mismatch_charge_is_held_and_reconcilable_after_reopening(self):
+        ledger = self.ledger()
+        proxy = self.proxy(Upstream(self.reply(model="gpt-7", usage={"prompt_tokens": 1, "completion_tokens": 1})),
+                           ledger=ledger)
+        proxy.handle(chat())
+        settle = [x for x in self.lines() if x.get("op") == "settle"][-1]
+        ledger.close()
+        again = px.Ledger(self.root / "ledger.jsonl", 10**10, provider="openai")
+        self.addCleanup(again.close)
+        held = {h["target"]: h for h in again.report()["heldAtBound"]}
+        self.assertEqual(held[settle["id"]]["status"], "served-model-mismatch")
+        self.assertEqual(held[settle["id"]]["cost"], settle["cost"])
+        before = again.spent()
+        again.reconcile(settle["id"], 30, "usage export row req_1")
+        self.assertEqual(again.spent(), before - settle["cost"] + 30)
+
     def test_inconsistent_cache_counts_keep_the_bound(self):
         for details in [{"cached_tokens": 2000}, {"cached_tokens": 600, "cache_write_tokens": 600}]:
             u = {"prompt_tokens": 1000, "completion_tokens": 0, "prompt_tokens_details": details}

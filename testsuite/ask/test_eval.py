@@ -1472,8 +1472,7 @@ class BatchCases(unittest.TestCase):
             clarifications, header = "answer", ""
             proxy, cli_priced_pairs = None, set()
 
-            def check(self):
-                pass
+            check = eval_ask.Runner.check
 
             def batch_command(self, pair, jobs):
                 return [sys.executable, str(fake), mode]
@@ -1718,6 +1717,43 @@ class BatchCases(unittest.TestCase):
                 lambda q, a: False, results,
             )
         self.assertEqual([q["id"] for q, _, _ in results], ["q0"])
+
+    def test_answers_queued_while_a_proxy_wait_reaches_the_phase_deadline_are_kept(self):
+        runner = self.runner("normal", deadline=300)
+        runner.deadline = time.monotonic() + 1
+
+        class Proxy:
+            ledger = type("L", (), {"hold": lambda *a: True, "release": lambda *a: None})()
+            ordered_replies = False
+
+            def open_case(self, case):
+                return None
+
+            def close_case(self, token):
+                pass
+
+            def flush_replies(self, case):
+                pass
+
+            def wait_idle(self, timeout=None, case=None):
+                # The first case's last request settles just as the phase ends.
+                time.sleep(max(0, runner.deadline - time.monotonic()) + 0.05)
+                return True
+
+            def case_cost(self, case):
+                return 0
+
+            def refusals_for(self, case):
+                return 0
+
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]
+        results = []
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, Proxy(), "p", qs, 2, lambda pair, qs: True, self.report(),
+                lambda q, a: False, results,
+            )
+        self.assertEqual([q["id"] for q, _, _ in results], ["q0", "q1"])
 
     def test_an_eof_from_a_child_the_runner_had_to_kill_ends_the_run(self):
         qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(2))]

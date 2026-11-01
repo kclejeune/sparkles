@@ -1353,7 +1353,8 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
     try:
         start()
         while True:
-            runner.check()
+            if phase_left() <= 0:
+                phase_expired()
             if batch.broken and not flight and (pending or (i < len(qs) and not stopped)):
                 restart()
                 continue

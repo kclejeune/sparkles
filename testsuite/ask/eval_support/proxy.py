@@ -612,9 +612,10 @@ class Ledger:
     def held_at_bound(self):
         """The charges that stand at an upper bound rather than a billed amount.
 
-        These are the carryover, every reserve without a settle line, and every
-        request that was settled at its bound because the reply was lost or its usage
-        could not be read. A reconcile line takes one off this list.
+        These are the carryover, every reserve without a settle line, every request
+        that was settled at its bound because the reply was lost or its usage could
+        not be read, and every reply of another model than the one asked for, which
+        is charged an estimate. A reconcile line takes one off this list.
         """
         out = []
         if self.carryover_name is not None and "carryover" not in self.reconciled:
@@ -638,9 +639,12 @@ class Ledger:
                 }
             )
         for ident, c in sorted(self.charges.items()):
-            bounded = c["status"] == "usage-unknown" or c["status"].startswith(
-                "failure:"
-            )
+            # A reply of another model is charged an estimate, which billing
+            # evidence may replace like a bound.
+            bounded = c["status"] in (
+                "usage-unknown",
+                "served-model-mismatch",
+            ) or c["status"].startswith("failure:")
             if bounded and c["cost"] and ident not in self.reconciled:
                 out.append(
                     {

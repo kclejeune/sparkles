@@ -53,16 +53,17 @@ SYSTEM_ROLES = ("system", "developer")
 
 
 def prompt_text(request):
-    parts = []
+    """The text of a draft request's first user message, which holds its grounding. A
+    retry after an answer that did not match the schema adds that answer and a
+    correction, and neither counts."""
     for m in request.get("messages") or []:
         if not isinstance(m, dict) or (m.get("role") in SYSTEM_ROLES and "system" not in request):
             continue
         c = m.get("content")
         if isinstance(c, str):
-            parts.append(c)
-        else:
-            parts.extend(b.get("text", "") for b in c or [] if isinstance(b, dict))
-    return "".join(parts)
+            return c
+        return "".join(b.get("text", "") for b in c or [] if isinstance(b, dict))
+    return ""
 
 
 def system_text(request):

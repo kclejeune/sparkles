@@ -218,6 +218,29 @@ class GroundingRecall(unittest.TestCase):
             self.assertTrue(row["prompt"] and row["complete"])
             self.assertEqual(row["promptTokens"], 900)
 
+    def test_a_schema_retry_counts_only_the_grounding_prompt(self):
+        import json
+        import grounding_recall
+
+        qset = {"questions": [{"id": "a", "kind": "answerable", "question": "Q?",
+                               "gold": "SELECT ?x WHERE { ?x <http://ex.org/p> ?y . ?y <http://ex.org/q> ?x }"}]}
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            # A retry after an answer that did not match the schema carries that answer
+            # and a correction, and neither is grounding.
+            request = {"system": "You translate", "messages": [
+                {"role": "user", "content": "<http://ex.org/p> Question: Q?"},
+                {"role": "assistant", "content": "{\"query\": \"SELECT * { ?x <http://ex.org/q> ?y }\""},
+                {"role": "user", "content": "That answer did not match the schema: <http://ex.org/q>"}]}
+            (p / "replies.jsonl").write_text(json.dumps(
+                {"case": "c1", "status": 200, "request": request, "reply": {}}) + "\n")
+            (p / "s").mkdir()
+            (p / "s" / "report.json").write_text(json.dumps(
+                {"pairs": ["m"], "cases": [{"id": "a", "case": "c1", "pair": "m"}]}))
+            row = grounding_recall.recall(qset, p)["a"]
+            self.assertTrue(row["prompt"])
+            self.assertFalse(row["complete"])
+
     def test_one_report_of_one_pair_per_set(self):
         import json
         import grounding_recall
