@@ -1,7 +1,6 @@
-//! Differential tests of the closure operators and the cost-based planner (spec F23,
-//! roadmap items 485 and 487): every run with both derives exactly the facts,
-//! generalized ones included, that the same run derives with transitive and equivalence
-//! rules evaluated as ordinary rules and with the greedy planner.
+//! Differential tests of the closure operators (spec F23, roadmap item 485): every run
+//! with the operators derives exactly the facts, generalized ones included, that the
+//! same run derives with transitive and equivalence rules evaluated as ordinary rules.
 
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::store::{Store, StoreOptions};
@@ -29,8 +28,6 @@ fn store(ttl: &str) -> Store {
 fn options(closures: bool) -> ReasonOptions {
     ReasonOptions {
         closure_operators: closures,
-        // the reference run is the engine before items 485 and 487
-        cost_planning: closures,
         ..ReasonOptions::default()
     }
 }

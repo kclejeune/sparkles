@@ -32,11 +32,6 @@ request or on every write, and the schema report counts what the data holds.
   program, so explanations and incremental maintenance still name them, and a run
   derives the same facts as one that evaluates them as joins. A program with a rule that
   is not monotonic evaluates every rule as a join.
-* Rule bodies are ordered by cost. Atoms with a constant subject or object are counted in
-  the indexes, joins on one subject over the stored graph are estimated from the
-  characteristic sets the SPARQL planner uses, and bodies of up to six atoms are ordered
-  by dynamic programming. A plan is kept between iterations until an atom's row count
-  changes by more than a factor of two.
 * Each iteration merges its results in parallel on a reasoning pool, half the cores by
   default with `serve --reason-threads`, that admits runs in arrival order. A run stops at
   50 million derived triples by default, and `sparkles infer --max-inferred`,

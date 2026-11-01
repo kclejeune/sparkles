@@ -12,8 +12,7 @@
 //! ```
 //!
 //! `RAYON_NUM_THREADS` sets the number of threads, and `SPARKLES_GENERIC_CLOSURES=1` makes
-//! `infer` evaluate transitive and equivalence rules as ordinary rules, and
-//! `SPARKLES_GREEDY_PLANS=1` makes it keep the greedy rule-body planner. The peak heap counts every allocation
+//! `infer` evaluate transitive and equivalence rules as ordinary rules. The peak heap counts every allocation
 //! of the process from the start of the run, so it includes the data the run returns.
 //!
 //! `keep` measures the closure kept for incremental runs, as a server keeps it: a full
@@ -160,12 +159,10 @@ fn change_sets(k: usize) -> (Vec<Triple>, Vec<Triple>) {
 }
 
 /// The options of `infer`: `SPARKLES_GENERIC_CLOSURES=1` evaluates transitive and
-/// equivalence rules as ordinary rules, for a comparison with the closure operators, and
-/// `SPARKLES_GREEDY_PLANS=1` keeps the greedy rule-body planner.
+/// equivalence rules as ordinary rules, for a comparison with the closure operators.
 fn run_options() -> ReasonOptions {
     ReasonOptions {
         closure_operators: std::env::var("SPARKLES_GENERIC_CLOSURES").as_deref() != Ok("1"),
-        cost_planning: std::env::var("SPARKLES_GREEDY_PLANS").as_deref() != Ok("1"),
         ..ReasonOptions::default()
     }
 }
