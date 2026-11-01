@@ -173,7 +173,9 @@ NEW-ITEM-1 covers them in the n-ary core. The compact query session now admits 1
 distinct terms, because the new axioms' constants passed the previous 64. Query-time
 reasoning under OWL 2 RL is no slower for the larger demand programs. Four OWL2Bench
 queries over 1 university, each in its own process, took 77 to 87 s against 230 to 240 s
-before, and returned the same number of result lines. A work split
+before, and returned the same number of result lines. Entailment analysis evaluates the
+whole rule set in each oracle run, so a justification with about 3,000 checks became
+about 28% slower, a tradeoff that roadmap item NEW-ITEM-7 follows up. A work split
 tries up to four atom steps for one that gives enough items, which keeps `prp-key`'s
 first step from running on one thread.
 
