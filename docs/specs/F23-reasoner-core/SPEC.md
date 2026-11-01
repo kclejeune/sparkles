@@ -152,7 +152,7 @@ are small. With `sparkles infer`, OWL2Bench with 5 universities now completes in
 of RSS, where the joins ran out of 14 GiB after 13 minutes, and with 2 universities it
 takes 5.0 to 5.3 s against 53 s. OWL2Bench with 10 universities exceeded the 14 GiB run limit with or without the
 operators, and with them a 28 GiB limit on a development host. Where that memory goes
-has not been profiled, and roadmap item NEW-ITEM-6 covers it.
+has not been profiled, and roadmap item 522 covers it.
 [The reasoning results](../../benchmarks/reasoning/RESULTS.md#owl2bench) give every run.
 
 ### OWL 2 RL rules
@@ -163,19 +163,19 @@ annotation-property axioms of `prp-ap` and the `dt-type1` axioms for the RL data
 `tests/owl_rl_rules.rs` lists every rule of OWL 2 Profiles Tables 4 to 9 and checks each
 one through an entailment, or, for a rule whose conclusion is `false`, through the
 inconsistency check that reports it. The test cases follow the Profiles tables, because
-the OWL 2 test-case repository was not reachable, and roadmap item NEW-ITEM-4 vendors
+the OWL 2 test-case repository was not reachable, and roadmap item 520 vendors
 the official cases. `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff` stay out of the
 materialization, since each would derive a fact for every term or every pair of
-literals, and roadmap item NEW-ITEM-2 covers them with a value operator. Chains of more
+literals, and roadmap item 518 covers them with a value operator. Chains of more
 than 3 properties and keys of more than 2 would add thousands of rules to the demand
 programs of query-time reasoning, which have a cap of 50,000 rules, and roadmap item
-NEW-ITEM-1 covers them in the n-ary core. The compact query session now admits 128
+517 covers them in the n-ary core. The compact query session now admits 128
 distinct terms, because the new axioms' constants passed the previous 64. Query-time
 reasoning under OWL 2 RL is no slower for the larger demand programs. Four OWL2Bench
 queries over 1 university, each in its own process, took 77 to 87 s against 230 to 240 s
 before, and returned the same number of result lines. Entailment analysis evaluates the
 whole rule set in each oracle run, so a justification with about 3,000 checks became
-about 28% slower, a tradeoff that roadmap item NEW-ITEM-7 follows up. A work split
+about 28% slower, a tradeoff that roadmap item 523 follows up. A work split
 tries up to four atom steps for one that gives enough items, which keeps `prp-key`'s
 first step from running on one thread.
 

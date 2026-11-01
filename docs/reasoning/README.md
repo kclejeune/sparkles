@@ -220,11 +220,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 ### Reasoning and validation
 
 * The `owl-rl` profile has property chains of 2 and 3 properties and keys of 1 and 2,
-  roadmap item NEW-ITEM-1, and leaves out `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff`,
-  roadmap item NEW-ITEM-2. Its rule tests follow the Profiles tables rather than the
-  OWL 2 test cases, roadmap item NEW-ITEM-4.
+  roadmap item 517, and leaves out `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff`,
+  roadmap item 518. Its rule tests follow the Profiles tables rather than the
+  OWL 2 test cases, roadmap item 520.
 * Closure operators serve full materialization only. Incremental updates and query-time
-  reasoning evaluate transitive and equivalence rules as joins, roadmap item NEW-ITEM-5.
+  reasoning evaluate transitive and equivalence rules as joins, roadmap item 521.
 * Inference is forward materialization, RDFS on read and derivation on demand.
   Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
   rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid
