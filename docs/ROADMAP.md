@@ -18,9 +18,11 @@ and does not do today. Every known gap names the roadmap item that addresses it.
 workloads where Sparkles loses. The tiers list remaining work, followed by a record of
 completed items.
 
-The current priorities are to complete engine correctness and performance work, advance
-recovery and release contracts, and then complete the shared evidence and agent-memory
-capabilities. The [delivery priorities](#delivery-priorities) explain their dependencies.
+The current priorities are engine correctness, performance and standard features in
+Waves A and A2, followed by embedded agent memory and the ontology platform, including its
+editor, in Waves B and C, which run alongside them. Shared entity representation follows
+memory. Packaging, recovery and the API compatibility contract advance alongside capability
+completion. The [delivery priorities](#delivery-priorities) explain their dependencies.
 The numbered tiers are the detailed backlog, and [Completed](#completed) records finished
 items.
 
@@ -79,9 +81,10 @@ ordered by their tier alone.
 
 ## Delivery priorities
 
-The first priority is correctness, conformance, performance, robustness and the
-standard features expected of a graph database.
-Embedded agent memory in C17 and C18 comes second, and shared entity representation in
+The goal comes first. Sparkles should be the best graph database by objective measures,
+which are correctness, conformance, performance, robustness and the standard features.
+Embedded agent memory in C17 and C18 and the ontology platform of items 457 to 461, with
+its editor, come second and run alongside each other. Shared entity representation in
 A01 and C25 comes third. Applications built on top of Sparkles, such as the cyber and
 public-health supply-chain pilot, come after these. The engine supplies generic
 primitives, and domain adapters and matching logic stay application work rather than
