@@ -626,11 +626,14 @@ fact is truncated when its own evaluation may have lost a support, or when a pre
 one of its instances is truncated. Its evaluation loses supports when they pass the bound,
 when a rule instance's product passes its working bound of four times the bound or 16,384
 unions per premise, and when a fact has more than 4,096 instances. A fact with the empty
-support is exact whatever its premises keep. A fact that a rule with `noValue` or
-`listNotContains` can derive is truncated, also when the rule's test fails now, since a
-smaller set of facts may pass it. In a program with such a rule, a rule that reads RDF
-lists keeps no witnesses for its instances and its facts are truncated, because a
-smaller set of facts can derive a second list cell and break the list. Facts derived
+support is exact whatever its premises keep. A program with `noValue` or
+`listNotContains` is not monotone: a smaller set of facts can pass a test that fails now
+and derive facts the closure lacks, also through intermediate facts it does not hold.
+Every fact of such a program is therefore truncated, and its rules that read RDF lists
+keep no witnesses, because a smaller set of facts can derive a second list cell and
+break a list that a support reads. Under any program, while a node of the closure has
+more than one `rdf:first` or `rdf:rest`, the rules that read lists keep no witnesses and
+their facts are truncated, because a subset can make that list plain with other members. Facts derived
 through the GeoSPARQL default geometries, asserted default geometries when the closure
 derives them, and programs with head actions or `makeTemp` are truncated, since their
 instances do not show every support. Under such a program every asserted

@@ -567,3 +567,53 @@ fn asserted_default_geometries_are_truncated() {
     let got = cache.witnesses(&t("f", &default, "g")).unwrap();
     assert!(got.annotation.truncated, "{got:?}");
 }
+
+/// Regression (fourteenth review of item 416): a negation can let a smaller set of facts
+/// derive a fact through an intermediate the closure lacks, so a program with one keeps
+/// every fact truncated.
+#[test]
+fn negation_truncates_through_absent_intermediates() {
+    let s = Store::in_memory(StoreOptions::default());
+    let facts = [t("x", "a", "yes"), t("x", "b", "yes"), t("x", "d", "yes")];
+    change(&s, None, &facts, &[]);
+    let rules = Profile::Rules(format!(
+        "[n: (?x <{EX}a> <{EX}yes>), noValue(?x <{EX}b> <{EX}yes>) -> (?x <{EX}p> <{EX}yes>)]
+         [p: (?x <{EX}p> <{EX}yes>) -> (?x <{EX}t> <{EX}yes>)]
+         [d: (?x <{EX}d> <{EX}yes>) -> (?x <{EX}t> <{EX}yes>)]"
+    ));
+    let cache = Cache::default();
+    run_with(&s, &rules, None, &cache, &with(8)).unwrap_or_else(|e| panic!("{e:#}"));
+    let got = cache.witnesses(&t("x", "t", "yes")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+}
+
+/// Regression (fourteenth review of item 416): a list that is not plain in the closure
+/// can be plain in a subset of it, where a list builtin that fails now succeeds, so the
+/// facts of list-reading rules are truncated while any list is tangled.
+#[test]
+fn tangled_lists_truncate_list_readers() {
+    let s = Store::in_memory(StoreOptions::default());
+    let first = format!("{RDF}first");
+    let rest = format!("{RDF}rest");
+    let nil = format!("{RDF}nil");
+    change(
+        &s,
+        None,
+        &[
+            t("l", &first, "bad"),
+            t("l", &rest, &nil),
+            t("s", "seed", "yes"),
+            t("s", "d", "yes"),
+        ],
+        &[],
+    );
+    let rules = Profile::Rules(format!(
+        "[g: (<{EX}s> <{EX}seed> <{EX}yes>) -> (<{EX}l> <{RDF}first> <{EX}good>)]
+         [c: (?l <{RDF}first> <{EX}good>), listContains(?l, <{EX}good>) -> (<{EX}s> <{EX}t> <{EX}yes>)]
+         [d: (?s <{EX}d> <{EX}yes>) -> (?s <{EX}t> <{EX}yes>)]"
+    ));
+    let cache = Cache::default();
+    run_with(&s, &rules, None, &cache, &with(8)).unwrap_or_else(|e| panic!("{e:#}"));
+    let got = cache.witnesses(&t("s", "t", "yes")).unwrap();
+    assert!(got.annotation.truncated, "{got:?}");
+}

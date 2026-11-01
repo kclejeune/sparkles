@@ -124,6 +124,32 @@ enum Kind {
     Flagged,
 }
 
+/// Whether a node of the closure has more than one `rdf:first` or more than one
+/// `rdf:rest`, which makes a list through it ambiguous.
+fn tangled_lists(c: &Closure, first: u64, rest: u64) -> bool {
+    let mut seen: FxHashSet<(u64, u64)> = FxHashSet::default();
+    let mut tangled = false;
+    let mut see = |t: Triple| {
+        if !seen.insert((t[0], t[1])) {
+            tangled = true;
+        }
+        !tangled
+    };
+    if let Some(base) = c.graph.base() {
+        for p in [first, rest] {
+            if base.for_each(None, Some(p), None, &mut see).is_err() {
+                return true;
+            }
+        }
+    }
+    for (t, _) in c.live() {
+        if (t[1] == first || t[1] == rest) && !see(t) {
+            break;
+        }
+    }
+    tangled
+}
+
 /// Whether the base fact `t` may have supports that no instance shows: under an opaque
 /// program, or a GeoSPARQL default geometry, which the closure can also derive from the
 /// feature's geometries.
@@ -461,18 +487,28 @@ impl<'a> Cx<'a> {
                     .any(|b| matches!(b.kind, BuiltinKind::NoValue | BuiltinKind::ListNotContains))
             })
             .collect();
-        let opaque = rules.iter().enumerate().any(|(ri, r)| {
-            r.builtins.iter().any(|b| b.kind == BuiltinKind::MakeTemp)
-                || r.head.iter().enumerate().any(|(hi, h)| match h {
-                    CHead::Action(..) => true,
-                    CHead::Triple(..) => plans.back[ri][hi].is_none(),
-                })
-        });
-        let t = &c.terms;
+        // a negation makes the program non-monotone: a smaller set of facts can derive
+        // facts, also through intermediates the closure lacks, that the closure does not
+        // derive, so no support is shown to be complete
         let any_negated = negated.iter().any(|&n| n);
+        let opaque = any_negated
+            || rules.iter().enumerate().any(|(ri, r)| {
+                r.builtins.iter().any(|b| b.kind == BuiltinKind::MakeTemp)
+                    || r.head.iter().enumerate().any(|(hi, h)| match h {
+                        CHead::Action(..) => true,
+                        CHead::Triple(..) => plans.back[ri][hi].is_none(),
+                    })
+            });
+        let t = &c.terms;
+        // a list that is not plain in the closure can be plain, with other members, in a
+        // subset of it, where a list builtin that fails now succeeds; and under a
+        // negation a subset can derive a second cell of a list that is plain now, so
+        // that a support of a list reader does not derive its fact
+        let lists = rules.iter().any(engine::reads_lists);
+        let tangled = lists && (any_negated || tangled_lists(c, t.rdf_first, t.rdf_rest));
         let unsure_lists = rules
             .iter()
-            .map(|r| any_negated && engine::reads_lists(r))
+            .map(|r| tangled && engine::reads_lists(r))
             .collect();
         Cx {
             c,
@@ -483,7 +519,7 @@ impl<'a> Cx<'a> {
             budget: &limits.budget,
             negated,
             opaque,
-            lists: rules.iter().any(engine::reads_lists),
+            lists,
             unsure_lists,
             first: t.rdf_first,
             rest: t.rdf_rest,
