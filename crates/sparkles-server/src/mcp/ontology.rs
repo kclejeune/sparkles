@@ -479,14 +479,30 @@ impl Tools<'_> {
             .into_iter()
             .map(|(p, n)| (p.to_string(), json!(n)))
             .collect();
-        let mut used = 512 + serde_json::to_vec(&prefixes).map_or(0, |v| v.len());
+        let response = |axioms: Vec<Value>, next: Value| {
+            json!({
+                "dataset": ds.name,
+                "commit": o.snapshot.commit,
+                "graphs": o.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+                "axioms": axioms,
+                "total": page.total,
+                "offset": page.offset,
+                "next": next,
+                "prefixes": prefixes,
+            })
+        };
+        // the response without its axioms, with the longest `next`
+        let mut used =
+            serde_json::to_vec(&response(Vec::new(), json!(u64::MAX))).map_or(0, |v| v.len());
         let mut axioms: Vec<Value> = Vec::with_capacity(page.items.len());
         for (ax, g) in &page.items {
             let mut j = json!({ "type": ax.axiom_type().name(), "ofn": renderer.axiom(ax) });
             if let Some(g) = g {
                 j["graph"] = json!(o.graph_name(*g));
             }
-            let size = serde_json::to_vec(&j).map_or(0, |v| v.len()) + 1;
+            // the axiom and the comma before it
+            let size =
+                serde_json::to_vec(&j).map_or(0, |v| v.len()) + usize::from(!axioms.is_empty());
             if used + size > budget {
                 if axioms.is_empty() {
                     return Err(ctx.engine(sparkles::Error::BudgetExceeded(
@@ -503,16 +519,12 @@ impl Tools<'_> {
             axioms.push(j);
         }
         let next = page.offset + axioms.len();
-        Ok(Outcome::Structured(json!({
-            "dataset": ds.name,
-            "commit": o.snapshot.commit,
-            "graphs": o.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
-            "axioms": axioms,
-            "total": page.total,
-            "offset": page.offset,
-            "next": if next < page.total { json!(next) } else { Value::Null },
-            "prefixes": prefixes,
-        })))
+        let next = if next < page.total {
+            json!(next)
+        } else {
+            Value::Null
+        };
+        Ok(Outcome::Structured(response(axioms, next)))
     }
 }
 

@@ -275,3 +275,17 @@ fn edits_are_admitted_as_writes() {
     assert!(!call_writes("ontology_axioms", None));
     assert!(call_writes("sparql_update", None));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_listing_fits_the_least_budget() {
+    let cfg = McpConfig {
+        max_bytes: 1024,
+        ..McpConfig::default()
+    };
+    let mut c = Client::start(server_with(&[("t", &[ONTO])], cfg));
+    let out = c
+        .structured("ontology_axioms", json!({"type": "SubClassOf"}))
+        .await;
+    assert_eq!(out["axioms"].as_array().unwrap().len(), 1, "{out}");
+    assert!(serde_json::to_vec(&out).unwrap().len() <= 1024);
+}
