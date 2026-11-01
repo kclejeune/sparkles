@@ -202,6 +202,30 @@ async fn check_terms() {
     assert!(s.get("terms").is_none());
 }
 
+/// A check over its memory budget is unknown, like one past its time, so that a
+/// pattern with two unbound ends does not fail the whole diagnosis.
+#[tokio::test(flavor = "multi_thread")]
+async fn why_empty_over_budget_is_unknown() {
+    let cfg = McpConfig {
+        query_memory_bytes: Some(1),
+        ..McpConfig::default()
+    };
+    let mut c = Client::start(org(cfg));
+    let q = format!(
+        "{PREFIXES}SELECT ?p {{ ?p ex:memberOf res:payments . ?p (ex:memberOf|foaf:knows)* ?t . ?p foaf:name \"Nobody\" }}"
+    );
+    let s = c.structured("why_empty", json!({"query": q})).await;
+    assert_eq!(s["complete"], false, "{s}");
+    assert!(
+        s["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["solutions"].is_null()),
+        "{s}"
+    );
+}
+
 /// A4: the first pattern without solutions, with the language-tag warning.
 #[tokio::test(flavor = "multi_thread")]
 async fn why_empty() {
