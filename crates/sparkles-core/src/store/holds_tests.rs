@@ -278,6 +278,63 @@ fn branch_commits_are_held_where_they_were_made_and_hold_the_branch() {
     );
 }
 
+/// A hold on a branch's starting commit keeps the upstream's state, and a read of the
+/// commit on the branch finds it there once the branch no longer keeps its own copy.
+#[test]
+fn a_held_branch_starting_commit_stays_readable_on_the_branch() {
+    let check = |s: &Store| {
+        let o = Default::default();
+        let (snap, r) = s.branch_snapshot_at("dev", &At::Commit(3), &o).unwrap();
+        assert_eq!(r.commit.seq, 3);
+        let (main, _) = s.snapshot_at(&At::Commit(3), &o).unwrap();
+        assert_eq!(snap.len(), main.len());
+    };
+    let (_dir, root, s) = setup();
+    let dev = s.create_branch("dev", &BranchOptions::default()).unwrap();
+    s.acquire_hold(
+        EV,
+        id(1),
+        &[CommitRef {
+            branch_id: dev.id,
+            seq: 3,
+        }],
+    )
+    .unwrap();
+    for _ in 0..3 {
+        let b = s.branch("dev").unwrap();
+        bump(&b, 1);
+        b.compact().unwrap();
+        bump(&s, 1);
+        s.compact().unwrap();
+    }
+    check(&s);
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    check(&s);
+    // the same in memory, where the branch's window passes its starting commit
+    let s = Store::in_memory(StoreOptions::default());
+    s.set_retention(Retention {
+        keep_commits: Some(1),
+        keep_age_ms: None,
+        max_bytes: None,
+    })
+    .unwrap();
+    bump(&s, 3);
+    let dev = s.create_branch("dev", &BranchOptions::default()).unwrap();
+    s.acquire_hold(
+        EV,
+        id(1),
+        &[CommitRef {
+            branch_id: dev.id,
+            seq: 3,
+        }],
+    )
+    .unwrap();
+    bump(&s.branch("dev").unwrap(), 3);
+    bump(&s, 3);
+    check(&s);
+}
+
 #[test]
 fn in_memory_holds_keep_their_states() {
     let s = Store::in_memory(StoreOptions::default());

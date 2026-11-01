@@ -695,7 +695,9 @@ Durable source holds are the third Phase 2 step. `sparkles_core::holds` records 
 `main` and every branch. A hold has an owner-chosen UUID, its owner, its creation time
 and a sorted set of commits, each named by the branch identity the caller gave and the
 branch store whose history serves it. A commit at or below a branch's starting point is
-served by its upstream. Together the holds of a dataset name at most 65,536 commits. The
+served by its upstream. A read of the starting commit on the branch falls back to the
+upstream once the branch no longer keeps its own copy, so the hold keeps it readable
+under both names. Together the holds of a dataset name at most 65,536 commits. The
 file is refused above 32 MiB, and the format check at open reads no more of it than
 that. `Store::acquire_hold`, `Store::release_holds`,
 `Store::source_holds` and `Store::reconcile_holds` change and list them through the main

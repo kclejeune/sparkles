@@ -2647,6 +2647,16 @@ impl Store {
         })
     }
 
+    /// Whether this is a branch store that started at commit `seq`. Its state there is
+    /// its upstream's, which serves a read of it once this store no longer keeps it, as
+    /// when a source hold keeps only the upstream's copy.
+    fn starts_at(&self, seq: u64) -> bool {
+        self.branching
+            .ident
+            .as_ref()
+            .is_some_and(|i| i.from.seq == seq)
+    }
+
     /// The error for a commit a branch store shares with its upstream: reads of it are
     /// served by the upstream (see [`Store::branch_snapshot_at`]).
     fn inherited(&self, at: &crate::history::At, seq: u64) -> Error {
@@ -2767,7 +2777,9 @@ impl Store {
                         crate::history::At::Snapshot(n) => Some(n.clone()),
                         _ => None,
                     };
-                    if memory.is_some() {
+                    if self.starts_at(seq) {
+                        Err(self.inherited(at, seq))
+                    } else if memory.is_some() {
                         Err(self.mem_gone_limited(seq, r.head, name, Some(r.commit), &limit)?)
                     } else {
                         Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
@@ -2797,7 +2809,9 @@ impl Store {
             h.owner(seq, current, r.head)
         };
         let Some(owner) = owner else {
-            return if memory.is_some() {
+            return if self.starts_at(seq) {
+                Err(self.inherited(at, seq))
+            } else if memory.is_some() {
                 Err(self.history_gone_limited(
                     &h,
                     seq,
