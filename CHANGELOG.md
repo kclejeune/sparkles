@@ -621,7 +621,7 @@ reserved 1.6 GiB, so it ran out of a 1 GiB limit and panicked, and a server with
 default limit of 2 GiB would fail the same way on about 32 cores. The child now caps
 glibc at two arenas and its rayon pool at four threads, which it starts under its limits
 before it reads the file, so the startup probe also finds a limit that the threads do not
-fit. The same PDF now reserves about 480 MiB in a debug build. A refusal for a child that
+fit. The same PDF now reserves about 400 MiB in a debug build. A refusal for a child that
 ended without a result quotes the end of the child's error output, such as a panic's
 message.
 

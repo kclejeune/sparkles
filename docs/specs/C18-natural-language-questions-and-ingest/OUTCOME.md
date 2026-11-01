@@ -1105,7 +1105,7 @@ audio and video remain, and so do the follow-ups listed at the end of this secti
   20-core host the child of a debug build reserved 1.6 GiB for a small PDF and panicked
   under a 1 GiB limit. The child now holds glibc to two arenas and its rayon pool to four
   threads, started under the limits before it reads the file, and the same conversion
-  reserves about 480 MiB. A refusal for a child that ended without a result quotes the
+  reserves about 400 MiB. A refusal for a child that ended without a result quotes the
   end of its error output. The
   tradeoff is latency and memory for containment. A child costs one process start per
   conversion, and the server may use up to `--pdf-workers` times `--convert-memory` of
