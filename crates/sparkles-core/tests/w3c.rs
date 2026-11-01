@@ -955,6 +955,12 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
             "{name}: {} queries needed eager fallback",
             FALLBACKS.with(|n| n.get())
         );
+        // for the gate record, which fails on unexpected failures only
+        eprintln!(
+            "{name}: {} known failures, {} unexpected failures",
+            fail - new_failures.len(),
+            new_failures.len()
+        );
     }
     if !fixed.is_empty() {
         eprintln!("now passing (remove from known failures): {fixed:?}");

@@ -35,14 +35,15 @@ direction is flagged.
 
 `compare` prints a Markdown table with each metric of the baseline, the candidate and
 their ratio, oriented so that a ratio above 1 is a slowdown or a loss. It exits with
-status 1 when a ratio above 1 reaches 1 + threshold, when the candidate lacks a metric of
+status 1 when a ratio above 1 reaches 1 + threshold, when the candidate lacks a metric or a check of
 the baseline, when a check of the candidate fails or when a fingerprint differs from the
 baseline's. The threshold comes from the baseline's settings unless --threshold is
 given. When both records hold a metric's range over several processes, a slowdown
 counts only if the ranges do not overlap. A baseline's `short_below` and `short_threshold` settings give timings below
 that many milliseconds their own threshold. It refuses two records whose suite, scale,
-workload settings, host or metric units differ, unless --allow-different is given; a
-record whose settings say `host_independent` may come from another host. --floor V ignores metrics whose
+workload settings, host, compiler (the manifest's rustc, cc, rustflags and profile) or
+metric units differ, unless --allow-different is given; a record whose settings say
+`host_independent` may come from another host and compiler. --floor V ignores metrics whose
 baseline value is below V, for timings too short for the gate's host. A comparison
 across runs on different days carries the host's run-to-run noise, so a flagged metric
 is confirmed by an interleaved A/B of the two builds before it counts as a regression,
@@ -89,11 +90,12 @@ def host_info():
 
 
 def read_record(path):
-    record = json.loads(Path(path).read_text())
+    record = json.loads(Path(path).read_text(), parse_constant=lambda c: fail(f"{path}: {c} is not a number"))
     if record.get("gate_record") != VERSION:
         fail(f"{path}: unknown gate record version {record.get('gate_record')!r}")
     if record.get("gate") not in GATES:
         fail(f"{path}: unknown gate {record.get('gate')!r}")
+    validate(record, path)
     return record
 
 
@@ -102,19 +104,39 @@ def write_record(record, out):
     Path(out).write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
 
 
-def validate(record):
+def finite(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def validate(record, where="record"):
+    for k in ("host", "manifest", "settings", "metrics", "checks"):
+        if k not in record:
+            fail(f"{where}: no {k}")
     keys = set()
     for m in record["metrics"]:
+        for k in ("key", "value", "unit", "better"):
+            if k not in m:
+                fail(f"{where}: a metric has no {k}")
         if m["key"] in keys:
-            fail(f"duplicate metric {m['key']}")
+            fail(f"{where}: duplicate metric {m['key']}")
         keys.add(m["key"])
         if m["better"] not in ("lower", "higher"):
-            fail(f"{m['key']}: better must be lower or higher")
-        if not isinstance(m["value"], (int, float)) or not math.isfinite(m["value"]):
-            fail(f"{m['key']}: value must be a finite number")
+            fail(f"{where}: {m['key']}: better must be lower or higher")
+        if not finite(m["value"]):
+            fail(f"{where}: {m['key']}: value must be a finite number")
+        if "range" in m:
+            r = m["range"]
+            if not (isinstance(r, list) and len(r) == 2 and all(map(finite, r)) and r[0] <= m["value"] <= r[1]):
+                fail(f"{where}: {m['key']}: range must be two finite numbers around the value")
+        if not all(map(finite, m.get("samples", []))):
+            fail(f"{where}: {m['key']}: samples must be finite numbers")
+    names = set()
     for c in record["checks"]:
+        if c.get("name") in names:
+            fail(f"{where}: duplicate check {c.get('name')}")
+        names.add(c.get("name"))
         if not isinstance(c.get("ok"), bool):
-            fail(f"check {c.get('name')}: ok must be true or false")
+            fail(f"{where}: check {c.get('name')}: ok must be true or false")
 
 
 def parse_kv(pairs):
@@ -188,7 +210,10 @@ def executors(args):
             answers[q][v] = (n, h)
         table = []
         for q in order:
-            agree = len(set(answers[q].values())) == 1 and "error" not in str(answers[q])
+            # LIMIT without ORDER BY may return other rows in each mode, so only the
+            # counts must agree
+            got = {v: (a[0] if q in unordered else a) for v, a in answers[q].items()}
+            agree = set(got) == {"A", "B"} and len(set(got.values())) == 1 and "error" not in str(answers[q])
             eager = answers[q].get("A", ("error", "error"))
             # LIMIT without ORDER BY may return other rows, so only the count is kept
             fingerprint = eager[0] if q in unordered else f"{eager[0]} rows, {eager[1]}"
@@ -220,6 +245,7 @@ def executors(args):
         "suite": "synthetic", "scale": "1.05m and 10.5m",
         "host": host_info() | {"name": run_env.get("host", host_info()["name"])},
         "manifest": {"binary": manifest.get("binary"), "binary_sha256": manifest.get("binary sha256"),
+                     "rustc": manifest.get("rustc"),
                      "binary_commit": manifest.get("binary commit"), "version": manifest.get("version"),
                      "scripts_commit": manifest.get("scripts commit"),
                      "scripts_dirty_files": manifest.get("scripts dirty"),
@@ -290,15 +316,27 @@ def merge_processes(runs):
     processes' values and `range` their smallest and largest; a check holds when it held
     in every process with one fingerprint."""
     ms, checks = {}, {}
-    for run_ms, run_checks in runs:
+    for i, (run_ms, run_checks) in enumerate(runs, 1):
+        seen = set()
         for m in run_ms:
+            if m["key"] in seen:
+                fail(f"metric {m['key']} occurs twice in run {i}")
+            seen.add(m["key"])
             ms.setdefault(m["key"], []).append(m)
+        seen = set()
         for c in run_checks:
+            if c["name"] in seen:
+                fail(f"check {c['name']} occurs twice in run {i}")
+            seen.add(c["name"])
             checks.setdefault(c["name"], []).append(c)
     out_ms = []
     for key, rows in ms.items():
         if len(rows) != len(runs):
             fail(f"metric {key} is in {len(rows)} of {len(runs)} runs")
+        if len({(r["unit"], r["better"]) for r in rows}) != 1:
+            fail(f"metric {key} has different units or directions in different runs")
+        if not all(finite(r["value"]) for r in rows):
+            fail(f"metric {key} has a value that is not a finite number")
         values = [r["value"] for r in rows]
         m = dict(rows[0])
         m["value"] = statistics.median(values)
@@ -336,11 +374,18 @@ def metrics(args):
 def w3c(args):
     text = Path(args.log).read_text()
     ms, checks = [], []
+    # a suite's failures that are on its known-failure list fail in eager execution too,
+    # so only the unexpected ones fail the check
+    unexpected = {name: (int(k), int(u)) for name, k, u in re.findall(
+        r"^(.+): (\d+) known failures, (\d+) unexpected failures", text, re.M)}
     for name, passed, failed, skipped in re.findall(
             r"^(.+): (\d+) passed, (\d+) failed, (\d+) skipped", text, re.M):
         ms.append({"key": f"{name}/passed", "value": int(passed), "unit": "tests", "better": "higher"})
-        checks.append({"name": f"{name}/failed", "ok": failed == "0",
-                       "detail": f"{passed} passed, {failed} failed, {skipped} skipped"})
+        known, new = unexpected.get(name, (0, int(failed)))
+        detail = f"{passed} passed, {failed} failed, {skipped} skipped"
+        if known:
+            detail += f", {known} of the failures on the suite's known-failure list"
+        checks.append({"name": f"{name}/failed", "ok": new == 0, "detail": detail})
     for name, n in re.findall(r"^(.+): (\d+) queries needed eager fallback", text, re.M):
         ms.append({"key": f"{name}/fallbacks", "value": int(n), "unit": "queries", "better": "lower"})
     if not ms:
@@ -361,6 +406,9 @@ def w3c(args):
 
 # Settings that describe a run's circumstances rather than its workload.
 VOLATILE_SETTINGS = {"threshold", "short_below", "short_threshold", "load", "host_independent"}
+# Manifest fields of the build that must match, since another compiler or code generation
+# setting can hide or make a regression. The source revision may differ.
+TOOLCHAIN = ("rustc", "cc", "rustflags", "profile")
 
 
 def incompatibilities(base, cand):
@@ -374,8 +422,13 @@ def incompatibilities(base, cand):
     for k in sorted(set(bs) | set(cs)):
         if bs.get(k) != cs.get(k):
             out.append(f"setting {k}: {bs.get(k)!r} against {cs.get(k)!r}")
-    if not base["settings"].get("host_independent") and base["host"].get("name") != cand["host"].get("name"):
-        out.append(f"host: {base['host'].get('name')!r} against {cand['host'].get('name')!r}")
+    if not base["settings"].get("host_independent"):
+        if base["host"].get("name") != cand["host"].get("name"):
+            out.append(f"host: {base['host'].get('name')!r} against {cand['host'].get('name')!r}")
+        bm, cmf = base.get("manifest", {}), cand.get("manifest", {})
+        for k in TOOLCHAIN:
+            if bm.get(k) != cmf.get(k):
+                out.append(f"manifest {k}: {bm.get(k)!r} against {cmf.get(k)!r}")
     cm = {m["key"]: m for m in cand["metrics"]}
     for m in base["metrics"]:
         c = cm.get(m["key"])
@@ -435,18 +488,18 @@ def compare(args):
             bad.append(key)
         rows.append((key, m["value"], c["value"], ratio, flag))
     failed = [c for c in cand["checks"] if not c["ok"]]
-    # answers and other fingerprints must match the baseline's, whatever the candidate's
-    # own checks say
+    # every check of the baseline must be in the candidate, and fingerprints such as
+    # answers must match the baseline's, whatever the candidate's own checks say
     cc = {c["name"]: c for c in cand["checks"]}
-    changed = []
+    changed, missing = [], []
     for c in base["checks"]:
-        if "fingerprint" not in c:
-            continue
         if pattern and not pattern.search(c["name"]):
             continue
         other = cc.get(c["name"])
-        if other is None or other.get("fingerprint") != c["fingerprint"]:
-            changed.append((c["name"], c["fingerprint"], None if other is None else other.get("fingerprint")))
+        if other is None:
+            missing.append(c["name"])
+        elif "fingerprint" in c and other.get("fingerprint") != c["fingerprint"]:
+            changed.append((c["name"], c["fingerprint"], other.get("fingerprint")))
     print(f"# {base['gate']} gate: candidate against baseline")
     print()
     for label, r in (("baseline", base), ("candidate", cand)):
@@ -466,11 +519,13 @@ def compare(args):
     print()
     if failed:
         print("Failed candidate checks: " + ", ".join(c["name"] for c in failed) + ".")
+    if missing:
+        print("Checks of the baseline that the candidate lacks: " + ", ".join(missing) + ".")
     for name, b, c in changed:
         print(f"Changed from the baseline: {name}, {b} against {c}.")
     print(f"{len(rows)} metrics compared, {len(bad)} flagged, {len(failed)} failed checks, "
-          f"{len(changed)} changed fingerprints.")
-    sys.exit(1 if bad or failed or changed else 0)
+          f"{len(missing)} missing checks, {len(changed)} changed fingerprints.")
+    sys.exit(1 if bad or failed or changed or missing else 0)
 
 
 # ------------------------------------------------------------------------------ catalog

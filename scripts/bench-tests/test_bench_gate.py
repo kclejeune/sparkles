@@ -225,6 +225,88 @@ class GateTests(unittest.TestCase):
             self.assertIn("| count-all | 2.100 | 1.100 | 0.524 |", r.stdout)
             self.assertIn("minus (answers differ)", r.stdout)
 
+    def test_unordered_limit_answers_agree_on_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "run"
+            res = root / "people-100000-threads-1" / "results"
+            res.mkdir(parents=True)
+            (root / "queries").mkdir()
+            (root / "queries" / "export.rq").write_text("SELECT * WHERE { ?s ?p ?o } LIMIT 5\n")
+            (root / "manifest.txt").write_text("host: forge\n")
+            res.joinpath("samples.tsv").write_text(
+                "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
+                "1\t1\tA\texport\t0\t1\t2\n1\t1\tB\texport\t0\t1\t2\n")
+            res.joinpath("answers.tsv").write_text("A\texport\t5\tx\nB\texport\t5\ty\n")
+            out = Path(d) / "record.json"
+            self.assertEqual(run("executors", root, "--out", out).returncode, 0)
+            rec = json.loads(out.read_text())
+            self.assertEqual([(c["ok"], c["fingerprint"]) for c in rec["checks"]], [(True, "5")])
+            self.assertEqual(run("compare", out, out).returncode, 0)
+
+    def test_baseline_checks_must_be_in_the_candidate(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = {"key": "a", "value": 1, "unit": "ms", "better": "lower"}
+            base = metrics_record(d, "base", [m, {"check": "a/result", "ok": True, "detail": "7"}])
+            bare = metrics_record(d, "bare", [m])
+            r = run("compare", base, bare)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("lacks: a/result", r.stdout)
+
+    def test_another_compiler_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = [{"key": "a", "value": 1, "unit": "ms", "better": "lower"}]
+            base = metrics_record(d, "base", m)
+            rec = json.loads(base.read_text())
+            rec["manifest"]["rustc"] = "rustc 1.2.3"
+            other = Path(d) / "other.json"
+            other.write_text(json.dumps(rec))
+            r = run("compare", base, other)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("manifest rustc", r.stderr)
+
+    def test_records_are_validated_when_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = [{"key": "a", "value": 1, "unit": "ms", "better": "lower"}]
+            base = metrics_record(d, "base", m)
+            bad = Path(d) / "bad.json"
+            bad.write_text(base.read_text().replace('"value": 1', '"value": NaN'))
+            self.assertEqual(run("compare", base, bad).returncode, 2)
+            rec = json.loads(base.read_text())
+            rec["metrics"].append(dict(rec["metrics"][0]))
+            bad.write_text(json.dumps(rec))
+            r = run("compare", base, bad)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("duplicate metric", r.stderr)
+
+    def test_processes_must_agree_on_units_and_report_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b = Path(d) / "a.jsonl", Path(d) / "b.jsonl"
+            a.write_text(json.dumps({"key": "x", "value": 100, "unit": "ms", "better": "lower"}) + "\n")
+            b.write_text(json.dumps({"key": "x", "value": 100, "unit": "s", "better": "lower"}) + "\n")
+            r = run("metrics", a, b, "--gate", "incr", "--out", Path(d) / "r.json")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("units", r.stderr)
+            b.write_text(a.read_text() * 2)
+            r = run("metrics", a, b, "--gate", "incr", "--out", Path(d) / "r.json")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("twice", r.stderr)
+
+    def test_w3c_known_failures_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "out.log"
+            log.write_text(
+                "Geo (streaming): 37 passed, 7 failed, 0 skipped (44 tests)\n"
+                "Geo (streaming): 0 queries needed eager fallback\n"
+                "Geo (streaming): 7 known failures, 0 unexpected failures\n"
+                "test result: ok. 1 passed\n")
+            out = Path(d) / "r.json"
+            self.assertEqual(run("w3c", log, "--out", out).returncode, 0)
+            self.assertEqual(run("compare", out, out).returncode, 0)
+            log.write_text(log.read_text().replace("7 known failures, 0 unexpected", "6 known failures, 1 unexpected"))
+            bad = Path(d) / "bad.json"
+            run("w3c", log, "--out", bad)
+            self.assertEqual(run("compare", out, bad).returncode, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

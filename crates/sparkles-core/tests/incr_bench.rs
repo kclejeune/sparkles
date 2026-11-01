@@ -87,6 +87,86 @@ fn metric(key: &str, value: f64, unit: &str, better: &str) {
     writeln!(f, "{line}").unwrap();
 }
 
+/// Append one check to `INCR_BENCH_JSON`: a condition the timings depend on, such as a
+/// maintained view equal to evaluating its query again.
+fn check(name: &str, ok: bool, detail: String) {
+    use std::io::Write as _;
+    if !ok {
+        eprintln!("check failed: {name}: {detail}");
+    }
+    let Some(path) = std::env::var_os("INCR_BENCH_JSON") else {
+        assert!(ok, "{name}: {detail}");
+        return;
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    let line = serde_json::json!({ "check": name, "ok": ok, "detail": detail });
+    writeln!(f, "{line}").unwrap();
+}
+
+/// Rows as sorted strings, each repeated by its multiplicity.
+fn rows_of(rows: &[(Vec<Option<oxrdf::Term>>, i64)]) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .iter()
+        .flat_map(|(r, w)| {
+            let s = r
+                .iter()
+                .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            std::iter::repeat_n(s, (*w).max(0) as usize)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Check that the view `name` is at the store's head commit and holds the rows of
+/// evaluating `text` again with `opts`, outside every timed interval.
+fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: QueryOptions) {
+    let snap = s.snapshot();
+    let read = rt.read(&sparkles_core::sparql::viewsvc::ViewRead {
+        name,
+        at: snap.commit,
+        snap: Some(&snap),
+        allow_stale: false,
+        caller: None,
+        deadline: None,
+    });
+    let fresh = sparql::query(
+        s.snapshot(),
+        text,
+        &QueryOptions {
+            no_cache: true,
+            ..opts
+        },
+    )
+    .unwrap();
+    let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
+    let (ok, detail) = match read {
+        Ok(r) if r.commit != snap.commit => (
+            false,
+            format!("the view is at commit {} of {}", r.commit, snap.commit),
+        ),
+        Ok(r) => {
+            let got = rows_of(&r.rows);
+            (
+                got == want,
+                format!(
+                    "{} maintained rows, {} evaluated rows",
+                    got.len(),
+                    want.len()
+                ),
+            )
+        }
+        Err(e) => (false, e.to_string()),
+    };
+    check(&format!("{key}/answer"), ok, detail);
+}
+
 fn pct(v: &mut [f64], p: f64) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[((v.len() as f64 - 1.0) * p).round() as usize]
@@ -165,6 +245,14 @@ fn pass_against_recompute() {
             rt.round(&s);
             passes.push(t.elapsed().as_secs_f64() * 1e3);
         }
+        check_view(
+            &rt,
+            &s,
+            &format!("pass/{name}"),
+            name,
+            &text,
+            QueryOptions::default(),
+        );
         let info = rt.get(&s, name).unwrap();
         let qm = pct(&mut query, 0.5);
         let pm = pct(&mut passes, 0.5);
@@ -236,15 +324,33 @@ fn commit_latency_with_views() {
         }
         let (med, p99, rate) = commits(&s, 2000);
         let t = Instant::now();
-        let head = s.snapshot().commit;
+        let mut caught_up = true;
         while rt.stats(&s).views.iter().any(|v| v.lag_commits > 0) {
             std::thread::sleep(Duration::from_millis(1));
             if t.elapsed() > Duration::from_secs(600) {
+                caught_up = false;
                 break;
             }
         }
-        let _ = head;
         let catch_up = t.elapsed().as_secs_f64() * 1e3;
+        check(
+            &format!("commits/{views}-views/caught-up"),
+            caught_up,
+            format!("the views caught up in {catch_up:.0} ms"),
+        );
+        // a few views against their queries evaluated again
+        for v in (0..views).step_by(7) {
+            let (_, q) = VIEWS[v % VIEWS.len()];
+            let q = q.replace("WHERE {", &format!("WHERE {{ VALUES ?vx {{ {v} }}"));
+            check_view(
+                &rt,
+                &s,
+                &format!("commits/{views}-views/v{v}"),
+                &format!("v{v}"),
+                &format!("{PREFIX}{q}"),
+                QueryOptions::default(),
+            );
+        }
         println!("| {views} | {med:.3} | {p99:.3} | {rate:.0} | {catch_up:.0} |");
         metric(&format!("commits/{views}-views/median"), med, "ms", "lower");
         metric(&format!("commits/{views}-views/p99"), p99, "ms", "lower");
@@ -299,6 +405,7 @@ fn commit_path_without_views() {
             "higher",
         );
     };
+    let start = s.snapshot().commit;
     let mut all = Vec::new();
     for round in 0..3 {
         let (med, p99, rate) = commits(&s, 3000);
@@ -327,6 +434,12 @@ fn commit_path_without_views() {
         all.push((med, p99, rate));
     }
     rounds("live-query", &mut all);
+    let head = s.snapshot().commit;
+    check(
+        "commit-path/commits",
+        head == start + 18_000,
+        format!("{} commits from {start}", head - start),
+    );
     drop(live);
 }
 
@@ -369,6 +482,15 @@ fn pass_breakdown() {
             c.advance(&d, &Control::none()).unwrap();
             adv.push(t.elapsed().as_secs_f64() * 1e6);
         }
+        check(
+            &format!("breakdown/{name}/applied"),
+            c.applied == s.snapshot().commit,
+            format!(
+                "the circuit applied commit {} of {}",
+                c.applied,
+                s.snapshot().commit
+            ),
+        );
         let (r, o, a) = (pct(&mut read, 0.5), pct(&mut old, 0.5), pct(&mut adv, 0.5));
         println!("| {name} | {r:.1} | {o:.1} | {a:.1} |");
         metric(&format!("breakdown/{name}/read"), r, "µs", "lower");
@@ -499,6 +621,19 @@ fn inferred_pass_against_query() {
             rt.round(&s);
             skips.push(t.elapsed().as_secs_f64() * 1e3);
         }
+        let key = name.replace(' ', "-");
+        check_view(
+            &rt,
+            &s,
+            &format!("inferred/{key}"),
+            "v",
+            &text,
+            QueryOptions {
+                rdfs: inf.rdfs.clone(),
+                default_graph_extra: inf.default_graph_extra.clone(),
+                ..Default::default()
+            },
+        );
         let info = rt.get(&s, "v").unwrap();
         let qm = pct(&mut query, 0.5);
         let pm = pct(&mut passes, 0.5);
@@ -510,7 +645,6 @@ fn inferred_pass_against_query() {
             info.passes,
             info.skipped
         );
-        let key = name.replace(' ', "-");
         metric(&format!("inferred/{key}/query"), qm, "ms", "lower");
         metric(&format!("inferred/{key}/round-median"), pm, "ms", "lower");
         metric(&format!("inferred/{key}/round-p95"), p95, "ms", "lower");

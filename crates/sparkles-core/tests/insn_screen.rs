@@ -125,30 +125,50 @@ mod counter {
             }
         }
 
+        /// Time that a counted interval may miss without counting as multiplexed.
+        const SLACK_NS: u64 = 20_000;
+
+        /// Each counter's value, time enabled and time running. A reset clears the value
+        /// but not the times, so a measurement takes the difference of two reads.
+        fn read(&self) -> Vec<[u64; 3]> {
+            self.fds
+                .iter()
+                .map(|fd| {
+                    use std::io::Read as _;
+                    let mut buf = [0u8; 24];
+                    let mut file = std::fs::File::from(fd.try_clone().unwrap());
+                    file.read_exact(&mut buf).unwrap();
+                    std::array::from_fn(|i| {
+                        u64::from_ne_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap())
+                    })
+                })
+                .collect()
+        }
+
         /// The instructions `f` executed on this thread, and the share of the time the
-        /// counters were enabled that one of them was counting. A thread runs on one
-        /// core type at a time, so the share is 1 unless the kernel multiplexed the
-        /// counters with other events and missed part of the work.
+        /// counters were enabled in this interval that one of them was counting. A thread
+        /// runs on one core type at a time, so the share is 1 unless the kernel
+        /// multiplexed the counters with other events and missed part of the work. The
+        /// kernel's accounting at enable, disable and a move between core types leaves
+        /// gaps of a few microseconds, which `SLACK_NS` forgives. Multiplexing rotates
+        /// events at the scheduler tick, so it misses at least a millisecond.
         pub fn count<R>(&self, f: impl FnOnce() -> R) -> (u64, f64, R) {
             self.ioctl(IOC_RESET);
+            let before = self.read();
             self.ioctl(IOC_ENABLE);
             let r = std::hint::black_box(f());
             self.ioctl(IOC_DISABLE);
+            let after = self.read();
             let (mut total, mut enabled, mut running) = (0, 0, 0);
-            for fd in &self.fds {
-                use std::io::Read as _;
-                let mut buf = [0u8; 24];
-                let mut file = std::fs::File::from(fd.try_clone().unwrap());
-                file.read_exact(&mut buf).unwrap();
-                let word = |i: usize| u64::from_ne_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
-                total += word(0);
-                enabled = enabled.max(word(1));
-                running += word(2);
+            for (b, a) in before.iter().zip(&after) {
+                total += a[0] - b[0];
+                enabled = enabled.max(a[1] - b[1]);
+                running += a[2] - b[2];
             }
             let coverage = if enabled == 0 {
                 1.0
             } else {
-                running as f64 / enabled as f64
+                ((running + Self::SLACK_NS) as f64 / enabled as f64).min(1.0)
             };
             (total, coverage, r)
         }
@@ -377,6 +397,25 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
             .collect();
         let sorted: Vec<u64> = (0..n).step_by(7).collect();
         let random = ids(n, 50_000);
+        // the ids and keys of the sorted and random reads, compared in full before they
+        // are counted
+        let mut got = Vec::with_capacity(sorted.len());
+        v.get_sorted(&sorted, |i, k| got.push((i, k.to_vec())));
+        let want: Vec<(u64, Vec<u8>)> = sorted
+            .iter()
+            .map(|&i| (i, all[i as usize].clone()))
+            .collect();
+        assert!(got == want, "{name}: get_sorted returned other ids or keys");
+        for &i in &random {
+            assert_eq!(
+                v.get(i).as_deref(),
+                Some(all[i as usize].as_slice()),
+                "{name}: key {i}"
+            );
+        }
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(v.find(k), Ok(13 * i as u64), "{name}: find");
+        }
         // the expected results, from the scanned keys
         let id_sum: u64 = (0..n).step_by(13).sum();
         let prefix_total: u64 = prefixes
@@ -482,21 +521,40 @@ fn wal_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// A store's commit, its quads and a digest of the `ex:size`, `ex:link` and `ex:label`
-/// facts, which the screen's commits insert and delete.
-type Content = (u64, u64, String);
+/// A store's commit, its quads and an FNV-1a digest of every quad in sorted order, made
+/// outside the counted interval.
+type Content = (u64, u64, u64);
 
 fn content(s: &Store) -> Content {
     let r = sparkles_core::sparql::query(
         s.snapshot(),
-        "SELECT (COUNT(?v) AS ?n) (SUM(?v) AS ?t) (COUNT(?l) AS ?k) (COUNT(DISTINCT ?x) AS ?d) \
-         WHERE { { ?s <http://example.org/size> ?v } UNION { ?s <http://example.org/link> ?l } \
-         UNION { ?s <http://example.org/label> ?x } }",
-        &QueryOptions::default(),
+        "SELECT ?g ?s ?p ?o WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }",
+        &QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        },
     )
     .unwrap();
+    let mut rows: Vec<String> = r
+        .rows()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|t| t.map_or("-".into(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    rows.sort_unstable();
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for row in &rows {
+        for b in row.bytes().chain(*b"\n") {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
     let snap = s.snapshot();
-    (snap.commit, snap.len(), format!("{:?}", r.rows()))
+    assert_eq!(rows.len() as u64, snap.len(), "the digest missed quads");
+    (snap.commit, snap.len(), h)
 }
 
 /// The counts of opening fresh copies of a store, and whether each recovered it.

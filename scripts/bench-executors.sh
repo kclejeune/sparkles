@@ -133,6 +133,8 @@ NQ=$(find "$OUT/queries" -name '*.rq' | wc -l)
   echo "binary sha256: $(sha256sum "$BIN" | cut -d' ' -f1)"
   echo "binary commit: ${COMMIT:-unknown}"
   echo "version: $("$BIN" --version 2> /dev/null || echo unknown)"
+  # the compiler, from the binary's .comment section, for compare's toolchain check
+  echo "rustc: $(python3 -c 'import re,sys; m=re.search(rb"rustc version [^\x00]*", open(sys.argv[1],"rb").read()); print(m.group().decode() if m else "unknown")' "$BIN")"
   echo "scripts commit: $(git -C "$ROOT" rev-parse HEAD 2> /dev/null || echo unknown)"
   echo "scripts dirty: $(git -C "$ROOT" status --porcelain 2> /dev/null | grep -c . || true)"
   echo "host: $(hostname)"
