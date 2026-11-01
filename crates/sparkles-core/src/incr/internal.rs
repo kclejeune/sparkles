@@ -203,6 +203,9 @@ pub(crate) struct Tally {
     /// the most memory the counts took right after a commit was counted
     #[cfg(test)]
     pub(crate) peak: u64,
+    /// the drops that the budget made
+    #[cfg(test)]
+    pub(crate) drops: u64,
 }
 
 /// The approximate memory of one entry and of one unknown range.
@@ -235,7 +238,7 @@ impl Tally {
     pub(crate) fn bytes(&self) -> u64 {
         self.entries.capacity() as u64 * ENTRY_BYTES
             + self.key_bytes
-            + self.unknown.len() as u64 * RANGE_BYTES
+            + self.unknown.capacity() as u64 * RANGE_BYTES
     }
 
     fn intern(&mut self, key: Vec<Option<Term>>) -> u32 {
@@ -304,6 +307,9 @@ impl Tally {
         if self.entries.capacity() > self.entries.len() + self.entries.len() / 4 + 64 {
             self.entries.shrink_to_fit();
         }
+        if self.unknown.capacity() > self.unknown.len() + self.unknown.len() / 4 + 16 {
+            self.unknown.shrink_to_fit();
+        }
         self.compact_keys();
     }
 
@@ -315,17 +321,26 @@ impl Tally {
         }
         // spare capacity alone may pass the budget
         self.entries.shrink_to_fit();
+        self.unknown.shrink_to_fit();
         if self.bytes() <= bytes {
             return false;
         }
+        // a drop goes a quarter below the budget, so that counts at the budget are
+        // dropped in batches and not one commit after each commit
+        let target = bytes - bytes / 4;
+        #[cfg(test)]
+        {
+            self.drops += 1;
+        }
         loop {
-            let through = self.through_for(bytes);
+            let through = self.through_for(target);
             if through <= self.since {
                 return true;
             }
             self.discard_through(through);
             self.entries.shrink_to_fit();
-            if self.bytes() <= bytes {
+            self.unknown.shrink_to_fit();
+            if self.bytes() <= target {
                 return true;
             }
         }
@@ -618,8 +633,20 @@ mod tests {
         let budget = t.bytes() - ENTRY_BYTES;
         assert!(t.shrink_to(budget));
         assert!(t.bytes() <= budget, "{} over {budget}", t.bytes());
-        assert_eq!(t.since, 1);
-        assert_eq!(t.counts(1, 4).get(&[iri("a")]), 3);
+        assert!(t.since >= 1);
+        assert!(t.counts(t.since, 4).complete());
+    }
+
+    #[test]
+    fn discarded_ranges_release_their_storage() {
+        let mut t = Tally::new(vec![0], 0);
+        for c in 0..100_000u64 {
+            t.lose(2 * c + 1, 2 * c + 1);
+        }
+        assert!(t.bytes() >= 100_000 * RANGE_BYTES);
+        t.discard_through(u64::MAX - 1);
+        assert!(t.unknown.capacity() < 32, "{}", t.unknown.capacity());
+        assert!(t.bytes() < 1 << 10, "{}", t.bytes());
     }
 
     #[test]
@@ -699,9 +726,9 @@ mod tests {
         let mut t = tally();
         let all = t.bytes();
         assert!(t.shrink_to(all - 1));
-        assert_eq!(t.since, 4);
+        assert!(t.since >= 4, "{}", t.since);
         assert!(!t.counts(3, 7).complete());
-        assert!(t.counts(4, 7).complete());
+        assert!(t.counts(t.since, 7).complete());
         assert!(!t.shrink_to(all));
     }
 }

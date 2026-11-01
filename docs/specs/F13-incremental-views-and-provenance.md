@@ -1134,8 +1134,10 @@ the circuits.
   evaluates the query once. An internal circuit's state over its budget fails the
   circuit with `over-budget`. An accumulator's counts that pass the rest of the budget
   drop the oldest commits' counts first, with the keys and unknown ranges only they
-  hold, which moves the commit the counts start after. The counts' storage is charged
-  at its capacity and shrinks after such a drop. A recovered checkpoint is held to the
+  hold, which moves the commit the counts start after. The budget holds after each commit
+  of a run, and a drop goes a quarter below it, so counts at the budget are dropped in
+  batches. The counts' storage, unknown ranges included, is charged at its capacity and
+  shrinks after a drop. A recovered checkpoint is held to the
   budget of the attach that loads it.
 - Checkpoints are `circuits/{id}/main/state-{commit}.bin`
   (`formats::INTERNAL_CIRCUIT_STATE`, version 1), with the view checkpoint's header under

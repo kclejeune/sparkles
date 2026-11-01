@@ -172,10 +172,16 @@ impl InternalCircuit {
         st.circuit.bytes() + st.tally.as_ref().map_or(0, Tally::bytes)
     }
 
-    /// The most memory the counts took right after a commit was counted.
+    /// The most memory the counts took right after a commit was counted, and the drops
+    /// that the budget made.
     #[cfg(test)]
-    pub(crate) fn tally_peak(&self) -> u64 {
-        self.cell.state.lock().tally.as_ref().map_or(0, |t| t.peak)
+    pub(crate) fn tally_peak(&self) -> (u64, u64) {
+        self.cell
+            .state
+            .lock()
+            .tally
+            .as_ref()
+            .map_or((0, 0), |t| (t.peak, t.drops))
     }
 
     /// Evaluate the circuit again from scratch on the next round, lifting a failure.

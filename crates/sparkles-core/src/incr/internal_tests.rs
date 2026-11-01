@@ -782,11 +782,13 @@ fn a_long_run_keeps_to_the_budget_at_each_commit() {
     rt.round(&s);
     assert_eq!(c.commit(), s.snapshot().commit);
     assert!(c.bytes() <= budget, "{}", c.bytes());
-    let peak = c.tally_peak();
+    let (peak, drops) = c.tally_peak();
     assert!(
         peak <= budget + (4 << 10),
         "the counts reached {peak} bytes"
     );
+    // counts at the budget are dropped in batches, not after every commit
+    assert!((1..200).contains(&drops), "{drops} drops for 2,000 commits");
     let n = c.counts(0).unwrap();
     assert!(n.unknown.is_some(), "the oldest counts were dropped");
 }
