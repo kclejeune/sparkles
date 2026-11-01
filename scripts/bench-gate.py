@@ -250,7 +250,8 @@ def executors(args):
         # the timed format's answer after each server process's timed requests
         warm = defaultdict(set)
         for row in read_tsv(d / "results" / "warm-answers.tsv"):
-            _, v, q, digest = row[:4]
+            # epoch, variant, query, [timed repetition,] digest
+            v, q, digest = row[1], row[2], row[-1]
             # unordered LIMIT answers may hold other rows, but not another count, schema or
             # number of distinct rows
             warm[q].add(",".join(digest.split(",")[:3]) if q in unordered else digest)

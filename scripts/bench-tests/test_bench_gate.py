@@ -487,7 +487,9 @@ class GateTests(unittest.TestCase):
             self.assertEqual(run("executors", root, "--out", out).returncode, 0)
             checks = {c["name"]: c for c in json.loads(out.read_text())["checks"]}
             self.assertTrue(checks["1.05m-1t/sorted/timed-answers"]["ok"])
-            res.joinpath("warm-answers.tsv").write_text(f"1\tA\tsorted\t{good}\n2\tB\tsorted\t0 rows, e\n")
+            # a wrong answer in an earlier timed repetition fails, though the last is right
+            res.joinpath("warm-answers.tsv").write_text(
+                f"1\tA\tsorted\t1\t0 rows, e\n1\tA\tsorted\t2\t{good}\n2\tB\tsorted\t1\t{good}\n")
             self.assertEqual(run("executors", root, "--out", out).returncode, 0)
             checks = {c["name"]: c for c in json.loads(out.read_text())["checks"]}
             self.assertFalse(checks["1.05m-1t/sorted/timed-answers"]["ok"])
