@@ -770,7 +770,9 @@ its rows, once without provenance and once with each annotation, and times 200 r
 | `teams` | lineage | 94.5 | 0.007 | 0.016 | 8.0 |
 | `teams` | why | 96.4 | 0.007 | 0.016 | 0.8 |
 
-An annotated pass costs at most 0.025 ms more than a plain one in these medians.
+In these medians of three runs, an annotated pass was at most 0.025 ms slower than a
+plain one. Single runs vary more, and one run of `team-sizes` with `lineage` measured
+0.054 ms.
 `count` keeps an integer beside each row of each state, which doubles the state of
 `labelled` with its 200,000 output rows. `lineage` keeps every atom that some derivation
 of a row uses, so a group row lists all of its members' quads, and its state is 4 to 80
@@ -793,5 +795,8 @@ medians of `team-ages`, `labelled` and `teams` were within 0.001 ms. Those of
 0.124 ms on the candidate. `team-sizes` measured 0.008 ms in two of the baseline's runs
 and 0.010 ms in two of the candidate's. That is a difference of 2 µs in a path whose
 plain operators did not change, and NEW-ITEM-2 tracks checking it on forge. A query screen
-of the two servers on Namespace with 8 rounds gave a geometric mean of 0.987, with no
-query slower by 10% or more.
+on Namespace with 8 rounds compared the server of the baseline with that of `5368bd97`,
+which precedes the two measured fixes, and the commits after it change only incremental
+circuits. It gave a geometric mean of 0.987, with no query slower by 10% or more.
+`types-grouped` measured 6.4% slower at 0.017 ms and `order-by-full` 2.0% slower, and
+NEW-ITEM-2 covers both.

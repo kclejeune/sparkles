@@ -20,7 +20,8 @@ the default size. `pass_against_recompute` keeps each view as a table view and t
 rounds after commits of one or two quads. `annotation_cost` attaches each view's query
 as an internal circuit that keeps its rows, once without provenance and once with each
 of `count`, `lineage` and `why` with 8 witnesses, and times 200 rounds after the same mix
-of commits. Each test asserts that the circuit reached the store's latest commit.
+of commits. `annotation_cost` asserts that each circuit reached the store's latest
+commit, and `pass_against_recompute` checks no result.
 
 ## Query screen
 

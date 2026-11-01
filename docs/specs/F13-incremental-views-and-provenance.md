@@ -1323,18 +1323,20 @@ reads the pattern with the fewest estimated quads next, and it estimates each sc
 once per pass. Tests check the size against a recomputed sum, the build's scans on a
 large team and the number of estimates.
 
-**Measurements.** On an 8-vCPU Namespace instance at 200,000 people, an annotated pass of
-the five views of the incremental benchmark costs at most 0.025 ms more than a plain one.
+**Measurements.** On an 8-vCPU Namespace instance at 200,000 people, the median annotated
+pass of three runs was at most 0.025 ms above the plain one for each of the five views of
+the incremental benchmark.
 `lineage` makes a state 4 to 80 times larger and `why` 4 to 8 times, and `count` doubles
 the state of a view with 200,000 output rows. This memory buys exact deletions without
 evaluating the query again. An annotated build matches its patterns with index probes and
 takes 1.3 to 10 times as long as a plain build, and 240 times as long, 2.2 seconds, for a
 three-pattern join that the plain build evaluates with the engine's joins. Views without
 annotations kept their pass costs, apart from 2 µs on one view whose plain operators did
-not change, and a query screen gave a geometric mean of 0.987. The
+not change. A query screen of the build before the measured fixes, whose later commits
+change only incremental circuits, gave a geometric mean of 0.987. The
 [writes benchmark](../benchmarks/writes/RESULTS.md#provenance-annotations) has the tables,
-and NEW-ITEM-2, NEW-ITEM-3 and NEW-ITEM-4 track the forge check, the plain pattern order
-and faster annotated builds.
+and NEW-ITEM-2, NEW-ITEM-3 and NEW-ITEM-4 track the forge checks, the plain pattern
+order and faster annotated builds.
 
 ### Maintained assessments and conservative dependencies
 

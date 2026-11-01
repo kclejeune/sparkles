@@ -33,10 +33,11 @@ terms' vocabulary keys, which `resolve` maps back to quads, and a row that `MINU
 `NOT EXISTS` or an unmatched `OPTIONAL` keeps names the condition that has no match.
 Deletions are exact. A row whose witnesses did not fit in the bound is reported as
 truncated, its reported witnesses are always real, and it is exact again once the extra
-derivations are removed. Circuits without a provenance setting are unchanged. At
-200,000 people, an annotated pass costs at most 0.025 ms more than a plain one, while
-`lineage` makes a state up to 80 times larger and `why` up to 8 times, and an annotated
-build of a three-pattern join takes 2.2 seconds against 9 ms.
+derivations are removed. Circuits without a provenance setting are unchanged. On an
+8-vCPU Namespace instance at 200,000 people, the median annotated pass of three runs was
+at most 0.025 ms above the plain one for each benchmark view. `lineage` made a state up
+to 80 times larger and `why` up to 8 times, and an annotated build of a three-pattern
+join took 2.2 seconds against 9 ms.
 
 Server code can attach internal circuits to a dataset's incremental views runtime
 (spec F13 §3.6) with `Runtime::attach_internal`, or `Dataset::attach_internal` in the
