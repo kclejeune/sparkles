@@ -1109,7 +1109,7 @@ def merge_clarified(first, second, choice, wall_first, wall_second):
     return second, wall_first + wall_second
 
 
-def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
+def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None):
     """Ask a pair's cases through batch children and return [(q, case_id, answer)]
     in question order.
 
@@ -1123,8 +1123,10 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
     case sends a second line with the chosen answer. When the child dies or a line
     passes its deadline, the cases in flight fail as `killed` or `timeout` and a new
     child asks the rest. `watch(q, answer)` sees each case in question order and
-    returns True to stop the run.
+    returns True to stop the run. The finished cases also go to `results` as they
+    finish, so a caller keeps them when the run ends with an error.
     """
+    results = [] if results is None else results
     bound = getattr(admit, "case_bound", None)
     ledger = proxy.ledger if proxy else None
     if proxy:
@@ -1152,7 +1154,18 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
             line["clarification"] = clarification
         if c["token"]:
             line["modelSecrets"] = [f"evalgate=file:{c['tokenFile']}"]
-        batch.send(line)
+        for attempt in (1, 2):
+            try:
+                batch.send(line)
+                break
+            except OSError:
+                # The child ended before this line reached it: the lines in flight
+                # fail as a dead child's do, and a new child gets this one.
+                fail_flight("killed")
+                finalize()
+                if attempt == 2:
+                    raise HarnessFault("batch child ended twice in a row") from None
+                start()
         flight.append((c, rnd, time.monotonic()))
 
     def done(c, answer):
@@ -1171,15 +1184,21 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
             c, rnd, _ = flight.popleft()
             code = "killed" if status == "killed" else "timeout"
             out = {"outcome": "error", "error": {"code": code}}
-            out["evalFailure"] = status
-            out["wallSeconds"] = None
             out["execution"] = {"batch": record["pid"], "round": rnd}
+            wall = None
+            if rnd == 2:
+                # Keep the first Ask's clarification and usage, as single mode does.
+                out, wall = merge_clarified(c["first"], out, c["choice"], c["firstWall"], 0)
+            refused = proxy and proxy.refusals_for(c["case"]) > 0
+            out["evalFailure"] = "budget_refused" if refused else status
+            out["wallSeconds"] = wall
             done(c, out)
 
     def finalize():
         nonlocal finished, stopped
         while finished < len(cases) and "answer" in cases[finished]:
             c = cases[finished]
+            results.append((c["q"], c["case"], c["answer"]))
             if proxy:
                 proxy.flush_replies(c["case"])
             if watch(c["q"], c["answer"]):
@@ -1218,11 +1237,13 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
             if not flight:
                 break
             head_sent = flight[0][2]
+            until = min(head_sent + limit, runner.deadline)
             try:
-                kind, raw = batch.lines.get(
-                    timeout=max(0.1, head_sent + limit - time.monotonic())
-                )
+                kind, raw = batch.lines.get(timeout=max(0.1, until - time.monotonic()))
             except queue.Empty:
+                if time.monotonic() >= runner.deadline:
+                    batch.close(kill=True)
+                    raise HarnessFault("phase deadline expired") from None
                 fail_flight("timeout")
                 finalize()
                 if i < len(qs) and not stopped:
@@ -1271,7 +1292,9 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
             if failure:
                 out["evalFailure"] = failure
             out["wallSeconds"] = wall
-            out["cliEstimatedCostKnown"] = False
+            out["cliEstimatedCostKnown"] = (
+                runner.proxy is None and pair in runner.cli_priced_pairs
+            )
             done(c, out)
             finalize()
         record = batch.close()
@@ -1283,7 +1306,7 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch):
         if i < len(qs):
             report["budgetStopped"] = report["budgetStopped"] or stopped
             report["unattemptedIds"].setdefault(pair, []).extend(q["id"] for q in qs[i:])
-        return [(c["q"], c["case"], c["answer"]) for c in cases if "answer" in c]
+        return results
     except BaseException:
         if batch:
             batch.close(kill=True)
@@ -1442,7 +1465,19 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
 
                 # The batch child holds a database directory's lock, so the cases
                 # are scored once it has ended.
-                results = run_batch(runner, proxy, pair, qs, jobs, admit, report, watch)
+                results = []
+                try:
+                    run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results)
+                except (Invalid, OSError):
+                    # Keep the paid answers that finished, unscored, beside the report.
+                    report["drainedCases"] = [
+                        {"case": c, "pair": pair, "id": x["id"], "started": True}
+                        for x, c, _ in results
+                    ]
+                    for x, c, a in results:
+                        with (out_dir / (c + ".json")).open("x") as f:
+                            json.dump({"id": x["id"], "answer": a, "score": None}, f, indent=2)
+                    raise
                 for n, (q, case_id, answer) in enumerate(results):
                     try:
                         finish_case(q, case_id, answer)

@@ -1378,7 +1378,14 @@ for raw in sys.stdin:
     else:
         out.update(outcome="answered", result={"query": "ASK {}", "explanation": json.dumps(
             [line.get("clarification"), token])})
+    if mode == "close-before-answer":
+        os.close(0)  # the runner's next write then fails with a broken pipe
+        print(json.dumps(out), flush=True)
+        sys.exit(0)
     print(json.dumps(out), flush=True)
+    if mode == "close-after-each":
+        sys.stdin.close()
+        sys.exit(0)
 '''
 
 
@@ -1399,6 +1406,7 @@ class BatchCases(unittest.TestCase):
             serial, serial_lock = 0, threading.Lock()
             wrap, env = [], None
             clarifications, header = "answer", ""
+            proxy, cli_priced_pairs = None, set()
 
             def check(self):
                 pass
@@ -1407,7 +1415,9 @@ class BatchCases(unittest.TestCase):
                 return [sys.executable, str(fake), mode]
 
         Runner.out.mkdir()
-        return Runner()
+        runner = Runner()
+        runner.deadline = float("inf")
+        return runner
 
     def report(self):
         return {"executed": 0, "attempted": 0, "attemptedCases": [],
@@ -1514,3 +1524,77 @@ class BatchCases(unittest.TestCase):
         args = eval_ask.parse_args(["--sparkles", "/bin/true", "--jobs", "2"])
         with self.assertRaises(eval_ask.Invalid):
             eval_ask.validate_args(args)
+
+    def test_a_child_that_ends_between_lines_is_replaced_and_keeps_its_answers(self):
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(4))]
+        out, report = self.run_batch(self.runner("close-after-each"), qs, jobs=1)
+        # A line the pipe took before the child ended fails as killed, and a line
+        # the child never got goes to the next child, so the phase goes on.
+        status = [a.get("evalFailure") for _, _, a in out]
+        self.assertEqual([q["id"] for q, _, _ in out], [q["id"] for q in qs])
+        self.assertTrue(set(status) <= {None, "killed"}, status)
+        self.assertGreaterEqual(status.count(None), 2)
+        self.assertGreaterEqual(len(report["batches"]), 2)
+
+    def test_a_failed_second_round_keeps_the_first_rounds_usage(self):
+        qs = self.qs(2)  # q1 asks for a clarification, so its second line is line 3
+        with mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0), mock.patch.object(
+            eval_ask, "BATCH_SLACK_SECONDS", 0.5
+        ):
+            out, _ = self.run_batch(self.runner("hang-at:3", deadline=0.5), qs, jobs=1)
+        failed = out[1][2]
+        self.assertEqual(failed["evalFailure"], "timeout")
+        self.assertEqual(failed["clarification"]["answer"], "urn:b")
+        self.assertEqual(failed["usage"]["inputTokens"], 3)
+
+    def test_a_refused_case_stays_refused_when_its_batch_times_out(self):
+        class Proxy:
+            ledger = type("L", (), {"hold": lambda *a: True, "release": lambda *a: None})()
+            ordered_replies = False
+
+            def open_case(self, case):
+                return None
+
+            def close_case(self, token):
+                pass
+
+            def flush_replies(self, case):
+                pass
+
+            def wait_idle(self, timeout=None, case=None):
+                return True
+
+            def case_cost(self, case):
+                return 0
+
+            def refusals_for(self, case):
+                return 1 if case == eval_ask.case_of("p", {"id": "q1"}) else 0
+
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]
+        with mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0), mock.patch.object(
+            eval_ask, "BATCH_SLACK_SECONDS", 0.5
+        ):
+            out, _ = self.run_batch(
+                self.runner("hang-at:1", deadline=0.5), qs, jobs=2, proxy=Proxy(),
+                watch=lambda q, a: a.get("evalFailure") == "budget_refused",
+            )
+        self.assertEqual([a.get("evalFailure") for _, _, a in out][:2], ["timeout", "budget_refused"])
+
+    def test_the_phase_deadline_ends_a_silent_batch_and_keeps_finished_cases(self):
+        runner = self.runner("hang-at:2", deadline=300)
+        runner.deadline = time.monotonic() + 1.5
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]
+        results, started = [], time.monotonic()
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, None, "p", qs, 1, lambda pair, qs: True, self.report(),
+                lambda q, a: False, results,
+            )
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertEqual([q["id"] for q, _, _ in results], ["q0"])
+
+    def test_a_broken_pipe_sends_the_line_to_a_new_child(self):
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(3))]
+        out, report = self.run_batch(self.runner("close-before-answer"), qs, jobs=1)
+        self.assertEqual([a.get("evalFailure") for _, _, a in out], [None] * 3)
+        self.assertEqual(len(report["batches"]), 3)

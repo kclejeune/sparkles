@@ -189,7 +189,10 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
     }
     let mut o = base(&models, args.question.clone().unwrap_or_default());
     o.clarification = args.clarification.clone();
-    o.draft_start = args.try_harder.map(|i| i + 1);
+    o.draft_start = match args.try_harder {
+        Some(i) => Some(i.checked_add(1).context("--try-harder is too large")?),
+        None => None,
+    };
     let events = args.events;
     let mut on = |event: &str, v: &Value| {
         if events {
@@ -399,17 +402,18 @@ fn batch(
                 Err(e) => return line_error(id, "invalid-request", format!("{e:#}")),
             }
         };
+        let draft_start = match line.try_harder.map(|i| i.checked_add(1)) {
+            Some(None) => {
+                return line_error(id, "invalid-request", "tryHarder is too large".into());
+            }
+            Some(start) => start,
+            None => None,
+        };
         let mut o = base(models, line.question);
         o.clarification = line.clarification;
-        o.draft_start = line.try_harder.map(|i| i + 1);
+        o.draft_start = draft_start;
         let mut on = |_: &str, _: &Value| {};
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ask(server, models, &Principal::local(), &o, &mut on)
-        }));
-        let mut result = match result {
-            Ok(v) => v,
-            Err(_) => return line_error(id, "internal", "the question's pipeline panicked".into()),
-        };
+        let mut result = ask(server, models, &Principal::local(), &o, &mut on);
         let mut m = serde_json::Map::new();
         m.insert("id".into(), id);
         if let Some(obj) = result.as_object_mut() {
@@ -450,7 +454,21 @@ fn batch(
                             }
                         }
                     };
-                    let text = run_line(raw).to_string();
+                    // a panic anywhere in a line's work fails that line alone
+                    let id = serde_json::from_str::<Value>(&raw)
+                        .ok()
+                        .and_then(|v| v.get("id").cloned())
+                        .unwrap_or(Value::Null);
+                    let text =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_line(raw)))
+                            .unwrap_or_else(|_| {
+                                line_error(
+                                    id,
+                                    "internal",
+                                    "the question's pipeline panicked".into(),
+                                )
+                            })
+                            .to_string();
                     let mut g = out.lock();
                     let (w, next, pending) = &mut *g;
                     pending.insert(index, text);
@@ -656,16 +674,19 @@ mod tests {
             .to_string(),
             "{\"id\": \"b\", \"question\": 3}".to_string(),
             "not json".to_string(),
+            json!({"id": "e", "question": "Which teams?", "tryHarder": u64::MAX}).to_string(),
             json!({"id": "d", "question": "Which teams are there?"}).to_string(),
         ]
         .join("\n");
         let out = run(&input, 2, &mock, &key);
-        assert_eq!(out.len(), 4);
+        assert_eq!(out.len(), 5);
         assert_eq!(out[0]["outcome"], "answered");
         assert_eq!(out[1]["id"], "b");
         assert_eq!(out[1]["error"]["code"], "invalid-request");
         assert_eq!(out[2]["id"], Value::Null);
-        assert_eq!(out[3]["outcome"], "answered");
+        assert_eq!(out[3]["id"], "e");
+        assert_eq!(out[3]["error"]["code"], "invalid-request");
+        assert_eq!(out[4]["outcome"], "answered");
         let keys: Vec<String> = mock
             .requests()
             .iter()
