@@ -200,6 +200,14 @@ No lane lands without review, and each step picks its model from the table above
 4. **Re-review.** An independent reviewer checks the fix commits and the validating
    agent validates the findings again. The lane merges once this comes back clean.
 
+A finding blocks the merge and gets a re-review of its fix when it is non-trivial: a
+correctness, durability, concurrency, security or data-loss defect, a broken API, format
+or spec contract, or a fix that changes behaviour beyond a few lines. Other findings, such
+as more precise accounting, documentation wording or a cleanup, are either fixed in the
+same round without a further review or recorded as roadmap follow-ups, and the plan says
+which. A re-review covers only the fix commits since the previous review, and its
+reviewer may keep the earlier round's context instead of reading the branch again.
+
 The user decides only scope changes and disagreements with a spec that the validating
 agent raises.
 
