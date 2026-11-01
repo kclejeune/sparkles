@@ -24,6 +24,17 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+Incremental circuits can annotate each row with provenance (spec F13 §5). An internal
+circuit that keeps rows takes `count`, `lineage` or `why` through
+`InternalSpec::with_provenance`, and `annotated_rows()` returns each row with the number
+of its derivations, the atoms its derivations use, or its minimal witnesses, at most
+`maxWitnesses` (8 by default). Input quads are named by a 128-bit `FactKey` over their
+terms' vocabulary keys, which `resolve` maps back to quads, and a row that `MINUS`,
+`NOT EXISTS` or an unmatched `OPTIONAL` keeps names the condition that has no match.
+Deletions are exact. A row whose witnesses did not fit in the bound is reported as
+truncated, its reported witnesses are always real, and it is exact again once the extra
+derivations are removed. Circuits without a provenance setting are unchanged.
+
 Server code can attach internal circuits to a dataset's incremental views runtime
 (spec F13 §3.6) with `Runtime::attach_internal`, or `Dataset::attach_internal` in the
 library. Such a circuit keeps a query's rows, or counts the changed facts per key in each
@@ -790,6 +801,11 @@ derived kind `internal-circuit-state` version 1 with the magic `SPKCIRC\0`. A fi
 another version is left in place and the circuit is built from the data, and an
 accumulator built so counts from its build. Releases without internal circuits ignore
 the directory.
+
+`internal-circuit-state` version 2 holds an internal circuit's provenance annotations
+after its state. A circuit with a provenance setting writes version 2 and one without
+writes version 1, and each reads only its own. A checkpoint of a version this release
+does not read is left in place while the circuit is built from the data.
 
 The dataset reader capability 6 marks protected managed graphs. Enabling a profile
 owner raises `minimumReader` to 6 durably, writes the owner's settings file such as
