@@ -87,7 +87,7 @@ impl Store {
     /// The hold is durable in `holds.json` when this returns, and from then on no
     /// trimming, compaction or generation retirement removes the commits' states, and no
     /// branch the hold names is deleted unless the deletion releases its holds. The first
-    /// hold raises the dataset reader to 6 durably. Acquiring the same `id` for the same
+    /// hold raises the dataset reader to 7 durably. Acquiring the same `id` for the same
     /// owner and commits again returns the existing hold. A different owner or set of
     /// commits is a `hold-conflict`, and more than [`holds::MAX_COMMITS`] held commits
     /// in all is `holds-limit`. A commit that is no longer readable is `410
@@ -144,6 +144,7 @@ impl Store {
             if existing.hold.owner == owner && existing.hold.commits == commits {
                 // a reconciliation that looked before this no longer releases it
                 existing.touch = touch;
+                existing.acquired_ms = existing.acquired_ms.max(self.now_ms());
                 let hold = existing.hold.clone();
                 // the hold is durable before it is acknowledged again
                 if self.family.holds.uncertain.load(Ordering::Relaxed) {
@@ -163,10 +164,11 @@ impl Store {
             return Err(holds::limit(held, commits.len()));
         }
         let mut next = records.clone();
+        let now = self.now_ms();
         let hold = SourceHold {
             id,
             owner,
-            created_ms: self.now_ms(),
+            created_ms: now,
             commits: commits.clone(),
         };
         next.insert(
@@ -175,6 +177,7 @@ impl Store {
                 hold: hold.clone(),
                 stores: stores.clone(),
                 touch,
+                acquired_ms: now,
             },
         );
         // 4. the protection first: a collection that decides from here keeps them
@@ -237,7 +240,7 @@ impl Store {
         self.release_where(|r| r.hold.owner == owner && ids.contains(&r.hold.id))
     }
 
-    /// Release the holds of `owner` acquired at least `grace_ms` milliseconds ago that
+    /// Release the holds of `owner` last acquired at least `grace_ms` milliseconds ago that
     /// `keep` does not keep, as after an operation that acquired them never published
     /// the commit that refers to them. `keep` is asked outside every lock, and a hold
     /// acquired again in the meantime, even with the same commits, is not released.
@@ -253,7 +256,7 @@ impl Store {
         let candidates: Vec<(SourceHold, u64)> = match &*self.family.holds.state.lock() {
             HoldsState::Ready(r) => r
                 .values()
-                .filter(|r| r.hold.owner == owner && r.hold.created_ms <= cutoff)
+                .filter(|r| r.hold.owner == owner && r.acquired_ms <= cutoff)
                 .map(|r| (r.hold.clone(), r.touch))
                 .collect(),
             HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),

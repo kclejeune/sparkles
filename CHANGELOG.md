@@ -820,7 +820,7 @@ files.
 `holds.json` format 1 at a dataset root records the durable source holds of the dataset
 and its branches, each with its `id`, `owner`, `created` time and `commits` of
 `branchId`, `seq` and, when it differs, the serving `storeId`. The first hold raises
-`minimumReader` to 6, so releases that read only up to reader 5 refuse the dataset. A
+`minimumReader` to 7, so releases that read only up to reader 6 refuse the dataset. A
 file of a newer format refuses the open. A file that cannot be read or belongs to
 another dataset keeps every past state and refuses hold changes. Backups and clones do
 not carry it.

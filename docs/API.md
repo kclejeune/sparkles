@@ -11904,7 +11904,7 @@ commit}`, where `branch` is `null` once the branch is deleted. A request names e
 commit's branch by `branch`, by `branchId` as an evidence reference does, or by neither
 for `main`. A commit at or below a branch's starting point is held in its upstream's
 history. A hold without an `id` gets a random one. The hold is durable when the answer
-arrives, and the first hold raises the dataset reader to 6. The same `id` with the same
+arrives, and the first hold raises the dataset reader to 7. The same `id` with the same
 commits answers `200` with the existing hold. Other commits under that `id` are a `409`
 with code `hold-conflict`, and more than 65,536 held commits in the dataset are a `409`
 with code `holds-limit`. A commit that is no longer readable is `410 history-gone`, and

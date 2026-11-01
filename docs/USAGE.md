@@ -7085,7 +7085,8 @@ because the generations it writes from then on start their logs with a header. F
 then on, releases that read only up to reader 4 refuse it. To go back to such a
 release, dump the database with `sparkles dump` and load the dump with the older
 release. A dataset whose graphs a profile manages through `managed.json` needs
-reader 6, so a release that cannot enforce that protection refuses it.
+reader 6, so a release that cannot enforce that protection refuses it. A dataset with
+durable source holds in `holds.json` needs reader 7 for the same reason.
 [Upgrading databases](#upgrading-databases) describes the version window and
 `sparkles migrate`.
 

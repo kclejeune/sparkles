@@ -313,7 +313,7 @@ pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
 /// by a deletion that releases its holds. Acquiring the same hold again returns it
 /// unchanged. A hold of that id with other commits is `hold-conflict`, more than
 /// [`MAX_COMMITS`] held commits in the dataset is `holds-limit`, and a commit that is
-/// no longer readable is `history-gone`. The first hold raises the dataset reader to 6.
+/// no longer readable is `history-gone`. The first hold raises the dataset reader to 7.
 pub fn acquire_hold(dataset: &Dataset, id: uuid::Uuid, commits: &[CommitRef]) -> Result<Acquired> {
     dataset
         .store()

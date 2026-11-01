@@ -81,7 +81,15 @@ fn a_hold_keeps_its_generation_across_compaction_and_reopens() {
     let a = s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
     assert!(a.created);
     assert_eq!(a.hold.commits, [at(&s, 1)]);
-    assert!(minimum_reader(&root) >= 6);
+    assert_eq!(minimum_reader(&root), 7);
+    // a release that honors managed graphs (reader 6) but not holds refuses the dataset
+    let ds: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
+    assert!(matches!(
+        crate::commit::check_dataset_value_as(&ds, 6),
+        Err(Error::Unsupported(_))
+    ));
+    crate::commit::check_dataset_value_as(&ds, 7).unwrap();
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join(crate::holds::FILE)).unwrap()).unwrap();
     assert_eq!(v["format"], 1);
@@ -306,6 +314,35 @@ fn in_memory_holds_keep_their_states() {
         code(s.delete_branch_with("dev", &DeleteOptions::default())),
         "branch-held"
     );
+}
+
+#[test]
+fn acquiring_a_hold_again_starts_its_grace_period_again() {
+    let (_dir, _root, s) = setup();
+    let now = Arc::new(AtomicI64::new(1_000_000));
+    let n = now.clone();
+    s.set_clock(Arc::new(move || n.load(Ordering::SeqCst)));
+    let c = at(&s, 1);
+    s.acquire_hold(EV, id(1), std::slice::from_ref(&c)).unwrap();
+    // the owner acquires the same hold again just before reconciliation
+    now.store(1_000_000 + 10_000, Ordering::SeqCst);
+    let again = s.acquire_hold(EV, id(1), std::slice::from_ref(&c)).unwrap();
+    assert!(!again.created);
+    assert_eq!(again.hold.created_ms, 1_000_000, "creation time is kept");
+    now.store(1_000_000 + 10_001, Ordering::SeqCst);
+    let mut asked = Vec::new();
+    let released = s
+        .reconcile_holds(EV, 5_000, &mut |h| {
+            asked.push(h.id);
+            Ok(false)
+        })
+        .unwrap();
+    assert!(asked.is_empty(), "a renewed hold is not yet asked about");
+    assert!(released.is_empty());
+    // once the renewed grace period has passed it is an orphan again
+    now.store(1_000_000 + 15_000, Ordering::SeqCst);
+    let released = s.reconcile_holds(EV, 5_000, &mut |_| Ok(false)).unwrap();
+    assert_eq!(released, [id(1)]);
 }
 
 #[test]

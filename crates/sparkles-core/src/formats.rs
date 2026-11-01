@@ -173,7 +173,7 @@ pub const DATASET: FileKind = FileKind {
     marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5, 6],
+    reads: &[1, 2, 3, 4, 5, 6, 7],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.

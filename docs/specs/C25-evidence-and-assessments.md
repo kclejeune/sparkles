@@ -700,8 +700,8 @@ the file is refused above 32 MiB. `Store::acquire_hold`, `Store::release_holds`,
 `Store::source_holds` and `Store::reconcile_holds` change and list them through the main
 store, and `sparkles::evidence` and `/$/evidence/{ds}/holds` expose the evidence owner's
 holds to administrators. Acquiring the same hold again returns it, and other commits
-under its id are a `hold-conflict`. The first hold raises the dataset reader to 6, which
-already marks managed graphs, so a release that does not honor holds refuses the dataset
+under its id are a `hold-conflict`. The first hold raises the dataset reader to 7, a capability
+of its own, so a release that honors managed graphs but not holds refuses the dataset
 instead of trimming held history.
 
 Every collector keeps a held commit. Each store's history state reads the family's held
@@ -740,8 +740,10 @@ lock, and collectors never take the holds' lock.
 
 An owner acquires its holds before the commit that refers to them. When that commit
 never publishes, the hold is an orphan. `Store::reconcile_holds` asks the owner about
-each of its holds older than a grace period, one hour by default, outside every lock and
-releases those it does not keep, unless the hold was acquired again meanwhile. The
+each of its holds last acquired more than a grace period ago, one hour by default, outside
+every lock and releases those it does not keep, unless the hold was acquired again
+meanwhile. Each acquisition of an existing hold starts its grace period again, and a
+reopened store counts it from the hold's creation. The
 typed evidence operations supply that check when they record references. A
 `holds.json` that cannot be read or names another dataset keeps every past state and
 refuses hold changes and branch deletions with `holds-unavailable`, while reads and

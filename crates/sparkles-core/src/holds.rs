@@ -18,8 +18,8 @@
 //! `branchId` is the branch the caller named. `storeId`, present when it differs, is the
 //! branch that made the commit: a commit at or below a branch's starting point belongs
 //! to its upstream, whose history the hold keeps. Together the holds name at most
-//! [`MAX_COMMITS`] commits. A dataset with `holds.json` needs dataset reader 6
-//! ([`READER`]), so a release that ignores the file refuses to open the dataset instead of
+//! [`MAX_COMMITS`] commits. A dataset with `holds.json` needs dataset reader 7
+//! ([`READER`]), so a build that ignores the file refuses to open the dataset instead of
 //! trimming held history.
 //!
 //! A `holds.json` of a newer format refuses the open. One that cannot be read or does not
@@ -46,7 +46,7 @@ pub const FILE: &str = "holds.json";
 pub const FORMAT: u32 = 1;
 
 /// The dataset reader capability that honors holds (`minimumReader` of `dataset.json`).
-pub const READER: u32 = 6;
+pub const READER: u32 = 7;
 
 /// The most commits all the holds of a dataset may name together.
 pub const MAX_COMMITS: usize = 65_536;
@@ -80,6 +80,10 @@ pub(crate) struct Record {
     /// reconciliation releases only a hold nobody acquired since it looked. In memory
     /// only.
     pub touch: u64,
+    /// When the hold was last acquired, its creation or a repeated acquisition, which
+    /// starts its grace period again. In memory only: a reopened hold starts from its
+    /// creation.
+    pub acquired_ms: i64,
 }
 
 /// The holds of a dataset family, or why they cannot be read.
@@ -365,6 +369,7 @@ pub(crate) fn decode(bytes: &[u8], dataset_id: uuid::Uuid) -> Result<BTreeMap<uu
             },
             stores,
             touch: 0,
+            acquired_ms: created_ms,
         };
         if out.insert(h.id, record).is_some() {
             return Err(corrupt(format!("hold {} is listed twice", h.id)));
@@ -437,6 +442,7 @@ mod tests {
                 .map(|(_, _, s)| uuid::Uuid::from_u128(*s))
                 .collect(),
             touch: 0,
+            acquired_ms: 1_700_000_000_000,
         }
     }
 
