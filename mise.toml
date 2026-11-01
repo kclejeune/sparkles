@@ -1311,3 +1311,29 @@ python3 scripts/bench-gate.py metrics "$out/metrics.jsonl" --gate incr --suite i
   --manifest rustc="$(rustc -V)" --setting people="$usage_people" \
   --setting harness="crates/sparkles-core/tests/incr_bench.rs" --setting load="$(cut -d' ' -f1-3 /proc/loadavg)"
 '''
+
+[tasks."bench:insn"]
+description = "The instruction-count screen (item 473): user-space instructions of vocabulary scans and WAL replay (crates/sparkles-core/tests/insn_screen.rs, Linux) into a gate record"
+usage = '''
+flag "--items <n>" default="20000" help="generated items (about 8 triples each)"
+flag "--commits <n>" default="2000" help="commits that WAL replay reads"
+flag "--reps <n>" default="5" help="counted runs of each case"
+flag "--out <dir>" help="results directory (default .artifacts/bench-insn/<UTC time>)"
+'''
+run = '''
+set -e
+out=$(realpath -m "${usage_out:-.artifacts/bench-insn/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+[ ! -e "$out/metrics.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
+started=$(date -u +%FT%TZ)
+INSN_SCREEN_ITEMS="$usage_items" INSN_SCREEN_COMMITS="$usage_commits" INSN_SCREEN_REPS="$usage_reps" \
+  INSN_SCREEN_JSON="$out/metrics.jsonl" \
+  mbx test --release -p sparkles-core --test insn_screen -- --ignored --nocapture --test-threads 1 \
+  | tee "$out/output.md"
+python3 scripts/bench-gate.py metrics "$out/metrics.jsonl" --gate insn-screen --suite insn-screen \
+  --scale "$usage_items items, $usage_commits commits" --threshold 0.01 --out "$out/record.json" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" \
+  --manifest rustc="$(rustc -V)" --setting items="$usage_items" --setting commits="$usage_commits" \
+  --setting reps="$usage_reps" --setting harness="crates/sparkles-core/tests/insn_screen.rs"
+'''
