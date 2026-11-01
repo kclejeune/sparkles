@@ -262,6 +262,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // `assert_facts` and the memory brief over HTTP (C18 Phase 3m-a)
     ("/{ds}/facts", &["POST"]),
     ("/{ds}/memory/brief", &["POST"]),
+    // retained-reference resolution of the evidence profile (C25 §3 and §8)
+    ("/{ds}/claims/resolve", &["POST"]),
     // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
     ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
@@ -462,6 +464,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/explain"
         | "/{ds}/check"
         | "/{ds}/recall"
+        | "/{ds}/claims/resolve"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
@@ -596,6 +599,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/explain"
         | "/{ds}/check"
         | "/{ds}/recall"
+        | "/{ds}/claims/resolve"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"

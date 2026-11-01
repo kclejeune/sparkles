@@ -24,6 +24,20 @@ use crate::{Catalog, Dataset, Result};
 use sparkles_core::evidence::resolve::Resolver;
 use std::sync::Arc;
 
+/// Whether `code` is one of the resolution outcomes, whose answers name the reference
+/// that did not verify.
+pub fn is_outcome(code: &str) -> bool {
+    matches!(
+        code,
+        "evidence-unavailable"
+            | "incomplete-evidence"
+            | "unanchored-evidence"
+            | "span-mismatch"
+            | "origin-not-reproduced"
+            | "immutable-record-conflict"
+    )
+}
+
 /// One reference of a resolution request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reference {

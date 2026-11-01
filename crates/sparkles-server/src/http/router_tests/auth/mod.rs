@@ -13,6 +13,7 @@ mod algo_view;
 mod audit;
 mod branches;
 mod cli_grants;
+mod evidence;
 #[cfg(feature = "reasoning")]
 mod explain;
 #[cfg(feature = "shacl")]

@@ -2872,6 +2872,14 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 422]),
     );
     p.add(
+        op(POST, "/{ds}/claims/resolve", "resolveEvidence", "SPARQL", "Verify evidence references")
+            .doc("Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.")
+            .see("evidence-resolution")
+            .json_body(true, "EvidenceResolveRequest")
+            .json("200", "Every reference, verified.", "EvidenceResolveResult")
+            .errors(&[400, 403, 404, 408, 409, 413, 422]),
+    );
+    p.add(
         op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")
             .doc("The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.")
             .see("importing-agent-memory")

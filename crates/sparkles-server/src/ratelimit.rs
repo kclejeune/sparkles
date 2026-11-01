@@ -163,6 +163,7 @@ pub fn classify(
         | "/{ds}/explain"
         | "/{ds}/check"
         | "/{ds}/recall"
+        | "/{ds}/claims/resolve"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"

@@ -7388,6 +7388,328 @@
         ],
         "type": "object"
       },
+      "EvidenceResolveRequest": {
+        "additionalProperties": false,
+        "description": "Evidence references to verify at their exact retained views.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-resolution"
+        },
+        "properties": {
+          "references": {
+            "description": "The references, verified in order. Each names exactly one of `storedFact` and `record`.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "description": "The caller's unique name of the reference, which an answer names.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "record": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "contentDigest": {
+                      "description": "The content digest the record must carry.",
+                      "pattern": "^sha256:[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "iri": {
+                      "description": "The record's IRI.",
+                      "type": "string"
+                    },
+                    "kinds": {
+                      "description": "The kinds the record may have. Any profile kind when absent.",
+                      "items": {
+                        "enum": [
+                          "SourceRevision",
+                          "Rendition",
+                          "Passage",
+                          "EvidenceRef",
+                          "Claim",
+                          "EvidenceLink",
+                          "Assessment",
+                          "Note",
+                          "Decision",
+                          "Task",
+                          "ReviewDecision",
+                          "IdentityProposal"
+                        ],
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "iri"
+                  ],
+                  "type": "object"
+                },
+                "storedFact": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "branchId": {
+                      "description": "The branch by identity: the dataset's id for `main`.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "commit": {
+                      "description": "The exact commit of the branch that the fact is read at.",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "datasetId": {
+                      "description": "The dataset by identity, never by name.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "graph": {
+                      "description": "The named graph's IRI. Absent or `null` for the default graph.",
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "importMap": {
+                      "description": "A source import's blank-node mapping. Refused as `unanchored-evidence` by this release.",
+                      "type": "string"
+                    },
+                    "reifier": {
+                      "description": "A stable reifier IRI that reifies the triple in the graph at the commit. Required when the triple has blank nodes.",
+                      "type": "string"
+                    },
+                    "triple": {
+                      "description": "The expected triple as one N-Triples 1.2 statement without its final `.`.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "datasetId",
+                    "branchId",
+                    "commit",
+                    "triple"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key"
+              ],
+              "type": "object"
+            },
+            "maxItems": 10000,
+            "type": "array"
+          }
+        },
+        "required": [
+          "references"
+        ],
+        "type": "object"
+      },
+      "EvidenceResolveResult": {
+        "additionalProperties": false,
+        "description": "The verified evidence references.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-resolution"
+        },
+        "properties": {
+          "resolved": {
+            "description": "Every reference, verified, in request order.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "record": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "contentDigest": {
+                      "oneOf": [
+                        {
+                          "description": "The record's content digest.",
+                          "pattern": "^sha256:[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "graph": {
+                      "description": "The protected evidence graph that holds the record.",
+                      "type": "string"
+                    },
+                    "iri": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "SourceRevision",
+                        "Rendition",
+                        "Passage",
+                        "EvidenceRef",
+                        "Claim",
+                        "EvidenceLink",
+                        "Assessment",
+                        "Note",
+                        "Decision",
+                        "Task",
+                        "ReviewDecision",
+                        "IdentityProposal"
+                      ],
+                      "type": "string"
+                    },
+                    "receipt": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "branchId": {
+                          "description": "The branch it was published on.",
+                          "format": "uuid",
+                          "type": "string"
+                        },
+                        "commit": {
+                          "description": "The commit that published it.",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "datasetId": {
+                          "description": "The dataset the record was published in.",
+                          "format": "uuid",
+                          "type": "string"
+                        },
+                        "iri": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "iri",
+                        "datasetId",
+                        "branchId",
+                        "commit"
+                      ],
+                      "type": "object"
+                    },
+                    "span": {
+                      "oneOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "end": {
+                              "description": "The code point after the selection.",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "rendition": {
+                              "type": "string"
+                            },
+                            "start": {
+                              "description": "The first selected code point.",
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "textDigest": {
+                              "description": "The digest of the selected text.",
+                              "pattern": "^sha256:[0-9a-f]{64}$",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "rendition",
+                            "start",
+                            "end",
+                            "textDigest"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "iri",
+                    "kind",
+                    "graph",
+                    "receipt",
+                    "contentDigest",
+                    "span"
+                  ],
+                  "type": "object"
+                },
+                "storedFact": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "branchId": {
+                      "description": "The branch the reference names.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "commit": {
+                      "description": "The commit the fact was verified at.",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "datasetId": {
+                      "description": "The dataset's identity.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "graph": {
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "reifier": {
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "servedBy": {
+                      "description": "The branch whose history served the commit: the named branch, or the upstream that serves a commit at or below its starting point.",
+                      "format": "uuid",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "datasetId",
+                    "branchId",
+                    "commit",
+                    "servedBy",
+                    "graph",
+                    "reifier"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "key"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "resolved"
+        ],
+        "type": "object"
+      },
       "EvidenceSettings": {
         "additionalProperties": false,
         "description": "The evidence settings of a dataset, as `evidence.json` format 1 holds them.",
@@ -41512,6 +41834,93 @@
           }
         ],
         "summary": "Check a query against the schema",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/claims/resolve": {
+      "post": {
+        "description": "Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-resolution"
+        },
+        "operationId": "resolveEvidence",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceResolveRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceResolveResult"
+                }
+              }
+            },
+            "description": "Every reference, verified."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Verify evidence references",
         "tags": [
           "SPARQL"
         ],

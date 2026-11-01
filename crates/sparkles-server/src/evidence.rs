@@ -3,10 +3,15 @@
 //! settings, `POST /$/evidence/{ds}/detach` stops protecting one graph of their roles,
 //! and `GET` and `POST /$/evidence/{ds}/holds` and `DELETE
 //! /$/evidence/{ds}/holds/{id}` list, acquire and release durable source holds.
+//! `POST /{ds}/claims/resolve` verifies evidence references at their exact retained
+//! views and records by their publication origin.
 //!
-//! Authorization (the route table in `auth/routes.rs`): every route needs `admin` on
-//! `{ds}`. The settings name the dataset's protected graphs and policies, and holds
-//! name commits of any branch and decide what history is retained.
+//! Authorization (the route table in `auth/routes.rs`): every `/$/evidence` route needs
+//! `admin` on `{ds}`. The settings name the dataset's protected graphs and policies,
+//! and holds name commits of any branch and decide what history is retained. The
+//! resolution route needs `read` on `{ds}` through the query endpoint, and each stored
+//! fact needs it on the dataset and branch the reference names, under their current
+//! names. A reference the caller cannot read answers as a missing one does.
 
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err};
@@ -34,6 +39,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/evidence/{ds}/detach", post(detach))
         .route("/$/evidence/{ds}/holds", get(list_holds).post(acquire_hold))
         .route("/$/evidence/{ds}/holds/{id}", delete(release_hold))
+        .route("/{ds}/claims/resolve", post(resolve))
 }
 
 /// The response body: the canonical settings, their digest, the registry revision and
@@ -322,6 +328,344 @@ async fn release_hold(
         } else {
             Err(err(StatusCode::NOT_FOUND, format!("no evidence hold {id}")))
         }
+    })
+    .await
+}
+
+// ------------------------------------------------------------- resolution ------
+
+use sparkles::evidence::resolve::{
+    BlankAnchor, GraphIdentity, RecordKind, RecordRequest, Reference, Resolution, StoredFactRef,
+    Verified,
+};
+
+/// The most bytes a resolution request body holds (spec C25 §8).
+const MAX_RESOLVE_BYTES: usize = 16 << 20;
+/// The most bytes of a reference key.
+const MAX_KEY_BYTES: usize = 256;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveRequest {
+    references: Vec<ReferenceJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReferenceJson {
+    key: String,
+    stored_fact: Option<StoredFactJson>,
+    record: Option<RecordJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredFactJson {
+    dataset_id: uuid::Uuid,
+    branch_id: uuid::Uuid,
+    commit: u64,
+    /// the named graph's IRI; absent or `null` for the default graph
+    graph: Option<String>,
+    /// one N-Triples 1.2 triple without its final `.`
+    triple: String,
+    reifier: Option<String>,
+    import_map: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordJson {
+    iri: String,
+    #[serde(default)]
+    kinds: Vec<String>,
+    content_digest: Option<String>,
+}
+
+fn bad(field: String, why: impl std::fmt::Display) -> crate::http::ApiError {
+    crate::http::err_code(
+        StatusCode::BAD_REQUEST,
+        "invalid-reference",
+        format!("{field}: {why}"),
+    )
+}
+
+fn named(field: &str, value: &str) -> ApiResult<oxrdf::NamedNode> {
+    oxrdf::NamedNode::new(value).map_err(|e| bad(field.to_string(), e))
+}
+
+/// The record kind named `name` (`SourceRevision`, `Claim`, …).
+fn record_kind(name: &str) -> Option<RecordKind> {
+    use RecordKind::*;
+    [
+        SourceRevision,
+        Rendition,
+        Passage,
+        EvidenceRef,
+        Claim,
+        EvidenceLink,
+        Assessment,
+        Note,
+        Decision,
+        Task,
+        ReviewDecision,
+        IdentityProposal,
+    ]
+    .into_iter()
+    .find(|k| {
+        sparkles::evidence::resolve::kind_iri(*k).strip_prefix("urn:x-sparkles:evidence:")
+            == Some(name)
+    })
+}
+
+fn kind_name(kind: RecordKind) -> &'static str {
+    let iri = sparkles::evidence::resolve::kind_iri(kind);
+    iri.strip_prefix("urn:x-sparkles:evidence:").unwrap_or(iri)
+}
+
+/// One N-Triples 1.2 triple, `<s> <p> <o>`, without its final dot.
+fn parse_triple(field: &str, text: &str) -> ApiResult<oxrdf::Triple> {
+    let line = format!("{text} .\n");
+    let mut quads =
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_slice(line.as_bytes());
+    let quad = match quads.next() {
+        Some(Ok(q)) => q,
+        Some(Err(e)) => return Err(bad(field.to_string(), e)),
+        None => return Err(bad(field.to_string(), "expected one triple")),
+    };
+    if quads.next().is_some() {
+        return Err(bad(field.to_string(), "expected one triple"));
+    }
+    Ok(oxrdf::Triple::new(
+        quad.subject,
+        quad.predicate,
+        quad.object,
+    ))
+}
+
+fn parse_references(request: ResolveRequest) -> ApiResult<Vec<(String, Reference)>> {
+    use sparkles::evidence::resolve::MAX_REFERENCES;
+    if request.references.len() > MAX_REFERENCES {
+        return Err(bad(
+            "references".into(),
+            format!("at most {MAX_REFERENCES} references"),
+        ));
+    }
+    let mut keys = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(request.references.len());
+    for (i, r) in request.references.into_iter().enumerate() {
+        let at = format!("references[{i}]");
+        if r.key.is_empty() || r.key.len() > MAX_KEY_BYTES {
+            return Err(bad(
+                format!("{at}.key"),
+                format!("a key has 1 to {MAX_KEY_BYTES} bytes"),
+            ));
+        }
+        if !keys.insert(r.key.clone()) {
+            return Err(bad(format!("{at}.key"), "keys are unique"));
+        }
+        let reference = match (r.stored_fact, r.record) {
+            (Some(f), None) => {
+                let at = format!("{at}.storedFact");
+                let graph = match &f.graph {
+                    None => GraphIdentity::Default,
+                    Some(g) => GraphIdentity::Named(named(&format!("{at}.graph"), g)?),
+                };
+                let anchor = match (&f.reifier, &f.import_map) {
+                    (Some(_), Some(_)) => {
+                        return Err(bad(at, "name a reifier or an import mapping, not both"));
+                    }
+                    (Some(r), None) => {
+                        Some(BlankAnchor::Reifier(named(&format!("{at}.reifier"), r)?))
+                    }
+                    (None, Some(m)) => Some(BlankAnchor::ImportMap(named(
+                        &format!("{at}.importMap"),
+                        m,
+                    )?)),
+                    (None, None) => None,
+                };
+                Reference::StoredFact(StoredFactRef {
+                    dataset: f.dataset_id,
+                    branch: f.branch_id,
+                    commit: f.commit,
+                    graph,
+                    expected: parse_triple(&format!("{at}.triple"), &f.triple)?,
+                    anchor,
+                })
+            }
+            (None, Some(rec)) => {
+                let at = format!("{at}.record");
+                let mut kinds = Vec::new();
+                for (j, k) in rec.kinds.iter().enumerate() {
+                    let kind = record_kind(k).ok_or_else(|| {
+                        bad(
+                            format!("{at}.kinds[{j}]"),
+                            format!("unknown record kind {k}"),
+                        )
+                    })?;
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                let content_digest = match &rec.content_digest {
+                    None => None,
+                    Some(d) => Some(
+                        d.parse()
+                            .map_err(|e| bad(format!("{at}.contentDigest"), e))?,
+                    ),
+                };
+                Reference::Record(RecordRequest {
+                    iri: named(&format!("{at}.iri"), &rec.iri)?,
+                    kinds,
+                    content_digest,
+                })
+            }
+            _ => {
+                return Err(bad(
+                    at,
+                    "a reference has exactly one of storedFact and record",
+                ));
+            }
+        };
+        out.push((r.key, reference));
+    }
+    Ok(out)
+}
+
+fn graph_json(graph: &GraphIdentity) -> J {
+    match graph {
+        GraphIdentity::Default => J::Null,
+        GraphIdentity::Named(n) => J::String(n.as_str().to_string()),
+    }
+}
+
+fn verified_json(key: &str, v: &Verified) -> J {
+    match v {
+        Verified::Fact(f) => json!({
+            "key": key,
+            "storedFact": {
+                "datasetId": f.dataset,
+                "branchId": f.branch,
+                "commit": f.commit,
+                "servedBy": f.served_by,
+                "graph": graph_json(&f.graph),
+                "reifier": f.reifier.as_ref().map(|r| r.as_str()),
+            },
+        }),
+        Verified::Record(r) => json!({
+            "key": key,
+            "record": {
+                "iri": r.iri.as_str(),
+                "kind": kind_name(r.kind),
+                "graph": r.graph.as_str(),
+                "receipt": {
+                    "iri": r.receipt.iri.as_str(),
+                    "datasetId": r.receipt.dataset,
+                    "branchId": r.receipt.branch,
+                    "commit": r.receipt.commit,
+                },
+                "contentDigest": r.content_digest.map(|d| d.to_string()),
+                "span": r.span.as_ref().map(|s| json!({
+                    "rendition": s.rendition.as_str(),
+                    "start": s.start,
+                    "end": s.end,
+                    "textDigest": s.text_digest.to_string(),
+                })),
+            },
+        }),
+    }
+}
+
+/// `POST /{ds}/claims/resolve` with `{"references": [{"key", "storedFact" | "record"}]}`:
+/// verify each reference in order. `200` with every verified reference, or the first
+/// reference that does not verify with its code: `422` for `evidence-unavailable`,
+/// `incomplete-evidence`, `unanchored-evidence`, `span-mismatch` and
+/// `origin-not-reproduced`, and `409` for `immutable-record-conflict`. Records resolve
+/// at the current state of the request's branch.
+async fn resolve(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    AdminBody(bytes): AdminBody,
+) -> ApiResult {
+    if bytes.len() > MAX_RESOLVE_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a resolution request holds at most {MAX_RESOLVE_BYTES} bytes"),
+        ));
+    }
+    let request: ResolveRequest = serde_json::from_slice(&bytes).map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid resolution request: {e}"),
+        )
+    })?;
+    let references = parse_references(request)?;
+    let branch =
+        crate::http::branches::current().unwrap_or_else(|| sparkles::branch::MAIN.to_string());
+    let logical = dataset(&st, &name)?;
+    let main = if branch == sparkles::branch::MAIN {
+        logical.clone()
+    } else {
+        crate::http::main_dataset(&st, &name)?
+    };
+    blocking(move || {
+        use crate::auth::{Endpoint, Level, on_branch};
+        let here = on_branch(&main.name, &branch);
+        let opts = crate::http::caller::CallerContext::for_caller(&st, &logical, &p).options_on(
+            &crate::http::Params::empty(),
+            &here,
+            Endpoint::Query,
+        );
+        let control = Control {
+            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
+            ..Control::none()
+        };
+        let mut resolution = Resolution::new(control)?;
+        // What the caller may read on a dataset and branch, by their current names.
+        let mut access =
+            |ds: &sparkles::Dataset, branch: &str| -> Option<Arc<sparkles::access::GraphAccess>> {
+                let name = ds.name()?;
+                let server = st.get(name)?;
+                if server.dataset.dataset_id() != ds.dataset_id() {
+                    return None;
+                }
+                let qualified = on_branch(name, branch);
+                if !p.can_at(&qualified, Endpoint::Query, Level::Read) {
+                    return None;
+                }
+                let opts = crate::http::caller::CallerContext::for_caller(&st, &server, &p)
+                    .options_on(&crate::http::Params::empty(), &qualified, Endpoint::Query);
+                Some(
+                    opts.graphs
+                        .unwrap_or_else(|| Arc::new(sparkles::access::GraphAccess::all())),
+                )
+            };
+        let mut resolved = Vec::with_capacity(references.len());
+        for (key, reference) in &references {
+            let one = [(key.clone(), reference.clone())];
+            match resolution.all(
+                Some(&st.catalog),
+                &main.dataset,
+                &logical.dataset,
+                &one,
+                &mut access,
+            ) {
+                Ok(mut v) => resolved.push(verified_json(key, &v.remove(0))),
+                Err(sparkles::Error::Managed(m))
+                    if sparkles::evidence::resolve::is_outcome(m.code) =>
+                {
+                    let status = StatusCode::from_u16(m.status())
+                        .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                    return Ok((
+                        status,
+                        Json(json!({ "error": m.message, "code": m.code, "reference": key })),
+                    )
+                        .into_response());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Json(json!({ "resolved": resolved })).into_response())
     })
     .await
 }

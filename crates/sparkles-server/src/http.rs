@@ -922,6 +922,18 @@ impl From<anyhow::Error> for ApiError {
 
 pub(crate) type ApiResult<T = Response> = Result<T, ApiError>;
 
+/// The dataset `name` itself, `main`, whatever branch the request chose.
+pub(crate) fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
+    match st.lookup(name) {
+        crate::state::Lookup::Open(ds) => Ok(ds),
+        crate::state::Lookup::Unavailable(u) => Err(unavailable_error(name, &u)),
+        crate::state::Lookup::Missing => Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no such dataset: /{name}"),
+        )),
+    }
+}
+
 pub(crate) fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
     let ds = match st.lookup(name) {
         crate::state::Lookup::Open(ds) => ds,
@@ -995,6 +1007,11 @@ pub(crate) async fn blocking<T: Send + 'static>(
 pub(crate) struct Params(Vec<(String, String)>);
 
 impl Params {
+    /// No parameters, for a route whose options come from the server alone.
+    pub(crate) fn empty() -> Params {
+        Params(Vec::new())
+    }
+
     pub(crate) fn from_query(uri: &Uri) -> Params {
         Params(
             uri.query()

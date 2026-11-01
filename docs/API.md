@@ -11927,6 +11927,80 @@ repaired, and acquisitions, releases and branch deletions answer `503
 holds-unavailable` meanwhile. A `holds.json` of a newer format refuses the dataset's
 open.
 
+### Evidence resolution
+
+`POST /{ds}/claims/resolve` verifies evidence references of the
+[evidence profile](ai/README.md#evidence-profile) without writing anything. It needs
+`read` on the dataset through the query endpoint and counts as a query. The design is in
+[C25 §3 and §8](specs/C25-evidence-and-assessments.md#3-references-and-source-spans).
+
+```json
+{
+  "references": [
+    {"key": "inventory", "storedFact": {
+      "datasetId": "6f1c…", "branchId": "6f1c…", "commit": 42,
+      "graph": "https://example.org/inventory",
+      "triple": "<https://example.org/host> <https://example.org/runs> <https://example.org/release>"}},
+    {"key": "bulletin", "record": {
+      "iri": "https://example.org/bulletin-r1", "kinds": ["SourceRevision"],
+      "contentDigest": "sha256:…"}}
+  ]
+}
+```
+
+A request names at most 10,000 references in at most 16 MiB, and each key is unique and
+at most 256 bytes. A `storedFact` names its dataset and branch by identity, and the
+dataset's own id names `main`. It is read at exactly that commit of that branch, never
+at the head or on another branch. A commit at or below a branch's starting point is read
+from the upstream that serves it, as [evidence holds](#evidence-holds) describe, and
+`servedBy` names that branch. The `graph` is the named graph's IRI, absent or `null` for
+the default graph. The `triple` is one N-Triples 1.2 statement without its final dot,
+so literals keep their datatype, language and direction and triple terms are allowed.
+A triple with blank nodes needs a `reifier`, a stable IRI that reifies one triple in the
+graph at that commit. The stored triple then matches the expected one up to a renaming
+of blank nodes. An `importMap` anchor is refused as `unanchored-evidence` in this
+release.
+
+The caller's access is decided before anything is read, on the dataset's and branch's
+current names, through the query endpoint. A renamed dataset or branch keeps resolving,
+and a new dataset or branch with an old name never satisfies an old reference. A
+dataset, branch, commit, graph or fact that does not exist, is no longer retained, or
+is hidden from the caller by its grants or triple protections all answer the same
+`422 evidence-unavailable` body, so a caller cannot tell them apart.
+
+A `record` names an authenticated profile record of the dataset that the route names, at
+the current state of the request's branch. The record is found by its `rdf:type` in the
+graphs that the [evidence settings](#evidence-settings) give a role other than
+`projections` and that the profile protects now. A copy in an ordinary or detached graph
+is not a profile record. A record has exactly one `ev:availabilityReceipt`, whose
+`ev:datasetId` and `ev:branchId` name this dataset and one of its branches and whose
+`ev:commit` names the publishing commit. `kinds` limits the record's kind, and
+`contentDigest` is compared with the record's `ev:contentDigest`. A passage's
+`oa:hasSelector` start and end are checked as Unicode code point offsets against its
+rendition's `ev:normalizedText`, and the digest of the selected text against its
+`ev:textDigest`.
+
+The answer `200` is `{"resolved": [...]}` with each reference in order, its `key` and
+its verified `storedFact` or `record`. The first reference that does not verify stops
+the request, and the answer is `{error, code, reference}`.
+
+| Status and code | Meaning |
+|---|---|
+| `422 evidence-unavailable` | The reference is missing, not retained, or unreadable by the caller. |
+| `422 incomplete-evidence` | Verification stopped within the 64 MiB resolution limit, or the caller's access policy cannot be prepared within it. This is not a finding that the fact is absent. |
+| `422 unanchored-evidence` | A triple with blank nodes has no stable reifier, or its reifier reifies more than one triple. |
+| `422 span-mismatch` | A passage selector or text digest does not match its rendition's retained text. |
+| `422 origin-not-reproduced` | A record's receipt is missing or names another dataset or an unknown branch. |
+| `409 immutable-record-conflict` | A record has another kind or digest than the reference expects, or is stored more than once. |
+
+A malformed reference is a `400` with code `invalid-reference` whose message starts with
+the field, such as `references[2].storedFact.triple`. The request deadline and
+cancellation keep their usual answers. One resolution reads each commit once and
+prepares the caller's view of it once, within a 64 MiB allowance shared by all its
+references. That allowance charges up to 2 KiB for each quad in a state's unindexed
+delta, so a state with tens of thousands of recent writes that compaction has not yet
+folded in may answer `incomplete-evidence`.
+
 ### Suggested examples
 
 A reader who finds a good question and query can suggest it as an example, and a
