@@ -7251,18 +7251,20 @@ impl Graph<'_> {
     /// pass over the predicate's index rows between the first and last frontier node,
     /// merged with the frontier.
     fn expand(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
+        // one charge for the buffer's growth over the whole expansion
+        let mut grown = Growth::new(self.ctx, out)?;
         if let Some((p, rev)) = self.spec.simple {
-            return self.expand_pred(p, rev, frontier, forward, out);
+            return self.expand_pred(p, rev, frontier, forward, out, &mut grown);
         }
         if let Some(preds) = &self.spec.preds {
             // each predicate of an alternative as a simple path would expand it, so a
             // wide frontier takes one sweep per predicate rather than a lookup per node
             for &(p, rev) in preds {
-                self.expand_pred(p, rev, frontier, forward, out)?;
+                self.expand_pred(p, rev, frontier, forward, out, &mut grown)?;
             }
             return Ok(());
         }
-        self.expand_each(frontier, forward, out)
+        self.expand_each(frontier, forward, out, &mut grown)
     }
 
     /// [`Graph::expand`] over predicate `p` (`rev`: its inverse) alone.
@@ -7273,6 +7275,7 @@ impl Graph<'_> {
         frontier: &[u64],
         forward: bool,
         out: &mut Vec<u64>,
+        grown: &mut Growth<'_>,
     ) -> Result<()> {
         let perm = if forward != rev { Perm::Pso } else { Perm::Pos };
         let rows = self.ctx.snap.estimate(perm, &[p]);
@@ -7280,9 +7283,8 @@ impl Graph<'_> {
             || frontier.len() < 64
             || (frontier.len() as u64).saturating_mul(SWEEP_RATIO) < rows
         {
-            let mut grown = Growth::new(self.ctx, out)?;
             for (i, &x) in frontier.iter().enumerate() {
-                self.seek(p, rev, x, forward, out, &mut grown)?;
+                self.seek(p, rev, x, forward, out, grown)?;
                 if i % 1024 == 1023 {
                     self.ctx.check()?;
                 }
@@ -7293,7 +7295,6 @@ impl Graph<'_> {
         let gc = perm.col_of(crate::index::G);
         let (first, last) = (frontier[0], frontier[frontier.len() - 1]);
         let mut j = 0;
-        let mut grown = Growth::new(self.ctx, out)?;
         self.ctx.snap.scan_between_cols(
             perm,
             [p, first, 0, 0],
@@ -7348,10 +7349,15 @@ impl Graph<'_> {
     /// [`Graph::expand`] by one lookup per frontier node, checking the deadline and
     /// the neighbour buffer's memory between lookups, since one level of a wide
     /// closure may hold millions of nodes.
-    fn expand_each(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
-        let mut grown = Growth::new(self.ctx, out)?;
+    fn expand_each(
+        &self,
+        frontier: &[u64],
+        forward: bool,
+        out: &mut Vec<u64>,
+        grown: &mut Growth<'_>,
+    ) -> Result<()> {
         for (i, &x) in frontier.iter().enumerate() {
-            self.neighbours_into(x, forward, out, &mut grown)?;
+            self.neighbours_into(x, forward, out, grown)?;
             if i % 1024 == 1023 {
                 self.ctx.check()?;
             }

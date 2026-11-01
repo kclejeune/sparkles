@@ -464,3 +464,33 @@ fn a_sweep_charges_only_the_capacity_it_adds() {
         assert!(rows[0][0].starts_with("\"514\""), "{mode:?}: {rows:?}");
     }
 }
+
+#[test]
+fn growth_stays_charged_from_one_predicate_to_the_next() {
+    // Each predicate's 20,000 neighbours fit the budget, and the buffer that holds
+    // both does not. The query fails while it expands, not after the closure has
+    // built its visited set and frontier for both.
+    let mut data = String::new();
+    for p in ["p", "q"] {
+        for i in 0..20_000 {
+            data.push_str(&format!("<urn:hub> <urn:{p}> <urn:n:{p}:{i}> .\n"));
+        }
+    }
+    let store = store(&data);
+    let limit = 300u64 << 10;
+    let opts = QueryOptions {
+        max_memory_bytes: Some(limit),
+        no_cache: true,
+        ..Default::default()
+    };
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { <urn:hub> (<urn:p>|<urn:q>)+ ?t }";
+    for mode in MODES {
+        match run(&store, q, &opts, mode) {
+            Err(Error::BudgetExceeded(b)) => {
+                assert_eq!(b.kind, BudgetKind::Memory, "{mode:?}");
+                assert!(b.requested < 4 * limit, "{mode:?}: {b:?}");
+            }
+            r => panic!("{mode:?}: {r:?}"),
+        }
+    }
+}
