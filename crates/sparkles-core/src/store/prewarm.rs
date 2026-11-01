@@ -352,11 +352,14 @@ fn page_size() -> usize {
 const HINT_AHEAD: u64 = 64 << 20;
 
 /// Read `ranges` of `path` into the page cache: hint the ranges up to [`HINT_AHEAD`]
-/// bytes ahead, so that their reads overlap, and read them through to wait for them.
+/// bytes ahead of the reads, refilling the hints when half of that is left, so that their
+/// reads overlap, and read them through to wait for them.
 /// Returns the bytes read, or `None` when `stop` said to stop. Ranges past the end of the
 /// file are cut off, since a list may be older than a file the store rewrote.
 fn read_ranges(path: &Path, ranges: &[[u64; 2]], stop: &dyn Fn() -> bool) -> Result<Option<u64>> {
-    read_ranges_with(path, ranges, stop, &mut will_need)
+    read_ranges_with(path, ranges, stop, HINT_AHEAD, &mut |f, off, n, _| {
+        will_need(f, off, n)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -377,11 +380,14 @@ fn will_need(f: &std::fs::File, off: u64, n: u64) {
 #[cfg(not(target_os = "linux"))]
 fn will_need(_: &std::fs::File, _: u64, _: u64) {}
 
+/// [`read_ranges`] with the hint made by `hint(file, offset, length, read)`, where `read`
+/// is the length of the ranges read through so far, and with `ahead` for [`HINT_AHEAD`].
 fn read_ranges_with(
     path: &Path,
     ranges: &[[u64; 2]],
     stop: &dyn Fn() -> bool,
-    hint: &mut dyn FnMut(&std::fs::File, u64, u64),
+    ahead: u64,
+    hint: &mut dyn FnMut(&std::fs::File, u64, u64, u64),
 ) -> Result<Option<u64>> {
     let f = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -389,9 +395,10 @@ fn read_ranges_with(
         Err(e) => return Err(e.into()),
     };
     let len = f.metadata()?.len();
+    // an empty range is dropped: a hint of length 0 would mean the rest of the file
     let clipped: Vec<(u64, u64)> = ranges
         .iter()
-        .filter_map(|&[off, n]| (off < len).then(|| (off, n.min(len - off))))
+        .filter_map(|&[off, n]| (off < len && n > 0).then(|| (off, n.min(len - off))))
         .collect();
     // the next hint starts at range `hi`, offset `hat` into it. `hinted` counts the bytes
     // hinted so far, and `done` the length of the ranges read through, which a file that
@@ -402,18 +409,21 @@ fn read_ranges_with(
     for &(off, n) in &clipped {
         let mut at = off;
         while at < off + n {
-            while hi < clipped.len() && hinted < done + (at - off) + HINT_AHEAD {
-                if stop() {
-                    return Ok(None);
-                }
-                let (ho, hn) = clipped[hi];
-                let step = (hn - hat).min(HINT_AHEAD);
-                hint(&f, ho + hat, step);
-                hinted += step;
-                hat += step;
-                if hat == hn {
-                    hi += 1;
-                    hat = 0;
+            let read = done + (at - off);
+            if hinted < read + ahead / 2 {
+                while hi < clipped.len() && hinted < read + ahead {
+                    if stop() {
+                        return Ok(None);
+                    }
+                    let (ho, hn) = clipped[hi];
+                    let step = (hn - hat).min(read + ahead - hinted);
+                    hint(&f, ho + hat, step, read);
+                    hinted += step;
+                    hat += step;
+                    if hat == hn {
+                        hi += 1;
+                        hat = 0;
+                    }
                 }
             }
             if stop() {
@@ -592,13 +602,41 @@ mod tests {
             [200_000, 10],
         ];
         let mut hints = Vec::new();
-        let got = read_ranges_with(&path, &ranges, &|| true, &mut |_, o, n| hints.push((o, n)));
+        let mut log = |_: &std::fs::File, o, n, _| hints.push((o, n));
+        let got = read_ranges_with(&path, &ranges, &|| true, HINT_AHEAD, &mut log);
         assert_eq!(got.unwrap(), None);
         assert!(hints.is_empty(), "{hints:?}");
 
-        let got = read_ranges_with(&path, &ranges, &|| false, &mut |_, o, n| hints.push((o, n)));
+        let mut log = |_: &std::fs::File, o, n, _| hints.push((o, n));
+        let got = read_ranges_with(&path, &ranges, &|| false, HINT_AHEAD, &mut log);
         assert_eq!(got.unwrap(), Some(4096 + 10_000 + 1_000));
-        let hinted: Vec<_> = hints.into_iter().filter(|h| h.1 > 0).collect();
-        assert_eq!(hinted, [(0, 4096), (50_000, 10_000), (99_000, 1_000)]);
+        assert_eq!(hints, [(0, 4096), (50_000, 10_000), (99_000, 1_000)]);
+    }
+
+    #[test]
+    fn the_hints_stay_within_the_window_ahead_of_the_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        let size = 20 * READ_CHUNK as u64 + 123;
+        std::fs::write(&path, vec![1u8; size as usize]).unwrap();
+        let ahead = 4 * READ_CHUNK as u64;
+        let ranges = [
+            [0, 9 * READ_CHUNK as u64 + 5],
+            [9 * READ_CHUNK as u64 + 100, size],
+        ];
+        let (mut hinted, mut next, mut calls) = (0u64, 0u64, 0);
+        let mut check = |_: &std::fs::File, o: u64, n: u64, read: u64| {
+            assert!(n > 0);
+            assert!(o >= next, "hints in order and once");
+            next = o + n;
+            hinted += n;
+            calls += 1;
+            assert!(hinted <= read + ahead, "{hinted} hinted at {read} read");
+        };
+        let got = read_ranges_with(&path, &ranges, &|| false, ahead, &mut check);
+        let want = 9 * READ_CHUNK as u64 + 5 + (size - 9 * READ_CHUNK as u64 - 100);
+        assert_eq!(got.unwrap(), Some(want));
+        assert_eq!(hinted, want);
+        assert!(calls > 2, "the window refills as the reads go");
     }
 }
