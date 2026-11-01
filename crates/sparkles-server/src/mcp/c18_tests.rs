@@ -226,6 +226,33 @@ async fn why_empty_over_budget_is_unknown() {
     );
 }
 
+/// A check that exhausts the server's query memory pool is unknown too.
+#[test]
+fn why_empty_past_the_pool_is_unknown() {
+    let server = org(McpConfig::default());
+    let pool = sparkles::sparql::pool::QueryPool::new(1);
+    let call = Call {
+        arrived: Instant::now(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        request_id: "why-empty-pool".into(),
+        principal: Principal::local(),
+        headers: None,
+        held: None,
+        grant: Some(Arc::new(pool.empty_grant())),
+    };
+    let q = format!(
+        "{PREFIXES}SELECT ?p {{ ?p ex:memberOf res:payments . ?p (ex:memberOf|foaf:knows)* ?t . ?p foaf:name \"Nobody\" }}"
+    );
+    let args = json!({"dataset": "org", "query": q});
+    let Outcome::Structured(s) = server
+        .run_now("why_empty", args.as_object().unwrap().clone(), &call)
+        .unwrap()
+    else {
+        panic!("expected a structured diagnosis")
+    };
+    assert_eq!(s["complete"], false, "{s}");
+}
+
 /// A4: the first pattern without solutions, with the language-tag warning.
 #[tokio::test(flavor = "multi_thread")]
 async fn why_empty() {

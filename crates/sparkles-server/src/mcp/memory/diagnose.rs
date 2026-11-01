@@ -315,8 +315,8 @@ struct Asker<'a> {
 
 impl Asker<'_> {
     /// `Some(found)`, or `None` when the check ran out of its time or exceeded the
-    /// query's memory or row budget, as a pattern alone can when it has two unbound
-    /// ends. The other checks still run.
+    /// query's memory or row budget or the server's query memory pool, as a pattern
+    /// alone can when it has two unbound ends. The other checks still run.
     fn ask(&self, pattern: GraphPattern) -> Result<Option<bool>, Error> {
         let (dataset, base_iri) = match self.query {
             Query::Select {
@@ -347,6 +347,7 @@ impl Asker<'_> {
                 if matches!(
                     b.kind,
                     sparkles::BudgetKind::Memory
+                        | sparkles::BudgetKind::ServerMemory
                         | sparkles::BudgetKind::Rows
                         | sparkles::BudgetKind::RowsProduced
                 ) =>
