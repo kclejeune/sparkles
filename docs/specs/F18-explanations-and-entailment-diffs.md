@@ -645,7 +645,9 @@ with their truncation reset. When a fact stops being truncated, the truncated fa
 downstream are reset and evaluated again, so a cycle of truncated facts cannot keep its
 flag after its cause goes. A fact whose minimal supports fit the bound after an update is
 therefore exact, as a fresh build of the same closure keeps it. A changed RDF list cell
-under rules that read lists builds the witnesses again.
+under rules that read lists builds the witnesses again. With default geometries every
+update builds them again, because a deleted default geometry can return as a synthetic
+one and leave no removal for the update to follow.
 
 The closure operators of item 485 keep no provenance. Their rules stay in the program, so
 the witnesses of the facts they derive come from the rules' instances, found as joins over

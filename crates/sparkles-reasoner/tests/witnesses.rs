@@ -698,3 +698,54 @@ fn default_geometries_make_programs_non_monotone() {
     let asserted = cache.witnesses(&t("f", &has, "g1")).unwrap();
     assert!(asserted.annotation.truncated, "{asserted:?}");
 }
+
+/// Regression (sixteenth review of item 416): a deleted default geometry that comes back
+/// as a synthetic one leaves no removal in the change set, so the incremental update would
+/// keep witnesses that name the deleted quad through a cycle. Witnesses are built again.
+#[test]
+fn deleted_default_geometries_leave_no_witnesses() {
+    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+    let s = Store::in_memory(StoreOptions::default());
+    let has = format!("{GEO}hasGeometry");
+    let default = format!("{GEO}hasDefaultGeometry");
+    let d = t("f", &default, "g");
+    change(&s, None, &[t("f", &has, "g"), d.clone()], &[]);
+    let rules = Profile::Rules(format!(
+        "[d: (?f <{GEO}hasDefaultGeometry> ?g) -> (?f <{EX}p> ?g)]
+         [p: (?f <{EX}p> ?g) -> (?f <{EX}q> ?g)]
+         [q: (?f <{EX}q> ?g) -> (?f <{EX}p> ?g)]"
+    ));
+    let extras = Extras {
+        geo_default_geometry: true,
+        ..Extras::default()
+    };
+    let cache = Cache::default();
+    let run = |since: Option<u64>| {
+        materialize_incremental(
+            &s,
+            &rules,
+            &extras,
+            Incremental {
+                since,
+                cache: Some(&cache),
+            },
+            &with(8),
+        )
+        .unwrap_or_else(|e| panic!("{e:#}"))
+    };
+    let r = run(None);
+    let since = r.receipt.unwrap().commit.seq;
+    change(&s, None, &[], std::slice::from_ref(&d));
+    run(Some(since));
+    let dead = key(&d, None);
+    for f in [t("f", "p", "g"), t("f", "q", "g")] {
+        let got = cache.witnesses(&f).unwrap();
+        assert!(
+            got.annotation
+                .witnesses
+                .iter()
+                .all(|w| !w.atoms().contains(&Atom::Fact(dead.clone()))),
+            "{got:?}"
+        );
+    }
+}

@@ -1459,9 +1459,11 @@ fn update_closure(
     };
     let ch = &ch;
     // the witnesses of the previous closure, when the run keeps witnesses with the same
-    // bound; otherwise they are built again after the update
+    // bound; otherwise they are built again after the update. With default geometries the
+    // change set no longer shows which input quads went away, since a removed default can
+    // come back as a synthetic one, so the witnesses are built again
     let mut prior = match (wanted, prev.witnesses) {
-        (Some(max), Some(w)) if w.max() == max => Some(w),
+        (Some(max), Some(w)) if w.max() == max && !extras.geo_default_geometry => Some(w),
         _ => None,
     };
     let wl = witness_limits(&budget, opts);
