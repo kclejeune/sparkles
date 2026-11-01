@@ -100,9 +100,9 @@ Wave A holds the work that most improves the engine against objective measures.
   competitive coverage finds becomes its own Wave A item.
 * Streaming execution follows through item 7.
 * The first three stages of the unified executor, item 453, follow. The deletions of
-  items 474 to 478 are complete, item 479 sets the first-release format cutoff, and
-  items 480 to 484 consolidate the execution policy, the reasoning mode, request
-  building, rank fusion and the commit publish tail.
+  items 474 to 478 are complete, item 479 sets the first-release format cutoff, items
+  480 to 483 have consolidated the execution policy, the reasoning mode, request
+  building and rank fusion, and item 484 consolidates the commit publish tail.
 * The reasoning quick fixes of item 456 are items 485 to 487. They add closure operators,
   the missing OWL 2 RL rules and cost-based rule-body planning.
 * The remaining Stage A parts of item 17 are items 415 to 417. They deliver the
@@ -486,7 +486,6 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 | 512 | **Test-only reference evaluator.** The differential tests use `Optimizations::NONE` as their oracle, so a generic operator that a deleted off path would leave is still part of the engine. A test-only evaluator that follows the SPARQL algebra literally replaces that oracle, after which the remaining replacement-style off paths that only the tests reach can go. | [X14](specs/X14-unified-executor/SPEC.md#superseded-replacement-toggles) | M | 453 |
 | 513 | **Cold-read switches made test-only.** Once item 4 has measured them, make `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB`, `SPARKLES_READ_WINDOW_KB` and the prefetch and decoding switches of `Optimizations` test-only or remove them. It depends on item 4. | [X14](specs/X14-unified-executor/SPEC.md#test-only-implementation-switches) | S | 453 |
 | 479 | **First-release format cutoff.** Fix the cutoff, refuse older formats with the dump-and-reload message or migrate each one, and drop the pre-release readers and the legacy WAL machinery. It lands after item 343 and before the release artifacts of items 58 and 59. | [X16](specs/X16-storage-consolidation/SPEC.md#candidate-phases) | M | 455 |
-| 482 | **Query request builder and caller context.** A library request builder with budgets and reasoning and a server caller context replace about 16 copies of the per-caller options recipe. The GraphRAG builder then applies the server's timeouts and limits. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
 | 484 | **Shared commit publish tail, short-term half.** Extract the WAL transaction encoder, a snapshot builder and the shared publish tail from the three publish paths and the compaction writer. The long-term half, in which the group leader writes through the direct handles, waits for item 446. | [X16](specs/X16-storage-consolidation/SPEC.md#candidate-phases) | M | 455 |
 | 485 | **Closure operators.** Evaluate transitive, symmetric and equivalence relations, `subClassOf`, `subPropertyOf` and `sameAs` through SCC condensation with a linear closure and union-find, so that OWL2Bench under OWL RL completes at 5 universities and above. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | M | 456 |
 | 486 | **The missing OWL 2 RL rules.** Add `prp-key`, `cls-maxqc4`, the cardinality-zero rules, the datatype rules and property chains of any length. | [F23](specs/F23-reasoner-core/SPEC.md#quick-fixes) | S | 456 |
@@ -748,6 +747,7 @@ These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver
 linked spec Outcome records how they landed.
 
 - **483.** One library rank fusion, `sparkles::rank::fuse_rrf`, and one `text:query` call and hit reader, which `spk:hybridSearch`, MCP search and the memory layer share. [X14](specs/X14-unified-executor/SPEC.md#shared-rank-fusion-and-text-hits)
+- **482.** A library query request builder, `QueryRequest` with `Budgets`, and the server's `CallerContext`, which build the options of the query endpoints, MCP and the bindings and put GraphRAG under the server's budgets. [X14](specs/X14-unified-executor/SPEC.md#query-request-builder-and-caller-context)
 - **481.** A typed reasoning mode, `ReasoningMode`, and one inference view on `Dataset` for the query options, incremental views and explanations, which the HTTP, CLI and MCP reasoning choices use. [X14](specs/X14-unified-executor/SPEC.md#typed-reasoning-mode-and-one-inference-view)
 - **480.** One execution-policy function, `choose_execution`, which HTTP, the CLI, the Node addon and the FFI call with the needs of their consumers. [X14](specs/X14-unified-executor/SPEC.md#one-execution-policy)
 - **478.** Test-only implementation switches for the numeric column, steady writeback, direct log writes and the idle group bypass. The X07 cold-read switches remain under item 513. [X14](specs/X14-unified-executor/SPEC.md#test-only-implementation-switches)

@@ -5231,7 +5231,10 @@ sparkles settings set org assistant.send=rows
 ```
 
 The build sends facts to the model provider, so the provider must be allowed to receive
-rows, through `assistant.send` or `assistant.sendByProvider`.
+rows, through `assistant.send` or `assistant.sendByProvider`. The build's queries run
+under `--max-rows`, the query memory and rows-produced budgets, the spill budget and
+`--update-timeout`, which sets no limit by default. The `/$/graphrag/{ds}` read routes run
+under `--timeout` and the same budgets.
 
 ```sh
 sparkles graphrag --dataset org build            # shows the estimate and asks

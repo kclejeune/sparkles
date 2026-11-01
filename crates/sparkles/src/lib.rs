@@ -27,6 +27,7 @@ pub mod managed_source;
 pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;
+pub mod request;
 pub mod shared_entity;
 pub mod stats;
 pub mod syntax;
@@ -36,5 +37,6 @@ pub mod write_guard;
 
 pub use catalog::{Catalog, CatalogOptions};
 pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};
+pub use request::{Budgets, QueryRequest};
 pub use sparkles_core::{Budget, BudgetKind, Error, Result};
 pub use syntax::RdfSyntax;

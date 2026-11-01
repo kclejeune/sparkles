@@ -118,14 +118,18 @@ pub fn query_options(args: &QueryArgs<'_>) -> PyResult<(QueryOptions, Option<At>
             .unwrap_or_default()
             .into_iter()
             .collect(),
-        timeout: args.timeout.map(Duration::from_secs_f64),
-        max_rows: args.max_rows,
-        max_memory_bytes: args.max_memory_bytes,
-        max_rows_produced: args.max_rows_produced,
         cancel: Some(interrupt::flag(args.cancel.as_ref())?),
         cancellation: interrupt::additional(args.cancel.as_ref())?,
         ..Default::default()
     };
+    sparkles::Budgets {
+        timeout: args.timeout.map(Duration::from_secs_f64),
+        max_rows: args.max_rows,
+        max_memory_bytes: args.max_memory_bytes,
+        max_rows_produced: args.max_rows_produced,
+        max_spill_bytes: None,
+    }
+    .apply(&mut opts);
     if let Some(b) = &args.bindings {
         let items = b.call_method0("items")?;
         for item in items.try_iter()? {

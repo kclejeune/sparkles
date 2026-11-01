@@ -168,19 +168,9 @@ pub fn authorized_principal(st: &AppState, ds: &Dataset, name: &str) -> Result<P
     Ok(principal)
 }
 
-/// The query options of the principal on `ds`.
-fn options_of(ds: &Dataset, p: &Principal, cancel: Arc<AtomicBool>) -> QueryOptions {
-    let mut opts = QueryOptions {
-        cancel: Some(cancel),
-        ..ds.dataset.query_options()
-    };
-    #[cfg(feature = "auth")]
-    crate::auth::restrict(&mut opts, p, &ds.name, Endpoint::Query);
-    #[cfg(not(feature = "auth"))]
-    {
-        opts.graphs = p.view(&ds.name, Endpoint::Query);
-    }
-    opts
+/// The query options of the principal on `ds`, under the server's budgets for a task.
+fn options_of(st: &AppState, ds: &Dataset, p: &Principal, cancel: Arc<AtomicBool>) -> QueryOptions {
+    crate::http::caller::CallerContext::for_caller(st, ds, p).task_options(cancel)
 }
 
 /// The rows of a query.
@@ -428,7 +418,7 @@ impl Run<'_> {
     /// Read the projection, the hierarchy, the identities and the inputs.
     fn prepare(&self, p: &Principal, previous: &BuildState) -> Result<Prepared, RunError> {
         let snap = self.ds.store.snapshot();
-        let opts = options_of(&self.ds, p, self.cancel.clone());
+        let opts = options_of(self.st, &self.ds, p, self.cancel.clone());
         let ctl = sparkles::algo::Control::new(self.cancel.clone(), None, u64::MAX);
         self.progress(0.01, "reading the projection");
         let proj: Projection =

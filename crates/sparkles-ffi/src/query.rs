@@ -51,15 +51,19 @@ impl QueryOpts {
         let mut o = QueryOptions {
             base_iri: self.base_iri.clone(),
             union_default_graph: self.union_default_graph,
-            timeout: self.timeout_ms.map(Duration::from_millis),
-            max_rows: self.max_rows.map(|m| m as usize),
-            max_memory_bytes: self.max_memory_bytes,
-            max_rows_produced: self.max_rows_produced,
             allow_service: self.allow_service,
             cancel: Some(cancel),
             no_cache: self.no_cache,
             ..Default::default()
         };
+        sparkles::Budgets {
+            timeout: self.timeout_ms.map(Duration::from_millis),
+            max_rows: self.max_rows.map(|m| m as usize),
+            max_memory_bytes: self.max_memory_bytes,
+            max_rows_produced: self.max_rows_produced,
+            max_spill_bytes: None,
+        }
+        .apply(&mut o);
         o.outbound.allow_private = self.allow_private_network;
         if self.include_inferred {
             o.default_graph_extra = vec![INFERRED_GRAPH.to_string()];

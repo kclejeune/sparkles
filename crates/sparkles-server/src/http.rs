@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use caller::CallerContext;
 use oxrdfio::{RdfFormat, RdfSerializer};
 use serde_json::{Value as J, json};
 use sparkles::BudgetKind;
@@ -25,6 +26,7 @@ use std::time::Duration;
 mod algo;
 pub(crate) mod branches;
 mod budgets;
+pub(crate) mod caller;
 mod changes;
 mod commit_graph;
 mod conditional;
@@ -1308,32 +1310,9 @@ pub(crate) fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiErr
     e
 }
 
-/// The options of a query request: the dataset's query defaults (RDFS on read, the
-/// inferred overlay and DESCRIBE, see [`sparkles::Dataset::query_options`]) with the
-/// server's limits and the request's parameters. `reasoning=false` leaves the inferred
-/// overlay and RDFS on read out, so the request reads the asserted data alone.
+/// The options of a query request (see [`caller::request_options`]).
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
-    let mut defaults = ds.dataset.query_options();
-    ds.dataset
-        .stored_inference_view(reasoning_mode(params).reads_inferences())
-        .apply(&mut defaults);
-    QueryOptions {
-        timeout: Some(timeout_param(st, params)),
-        max_rows: Some(st.limits.max_rows),
-        max_memory_bytes: st.limits.query_memory_bytes,
-        // the grant the request was admitted with, if the server has a memory pool
-        grant: crate::server_memory::current_grant(),
-        max_rows_produced: st.limits.max_rows_produced,
-        // cursor sorts write sorted runs here when they outgrow the memory budget
-        spill: st.spill.clone(),
-        max_spill_bytes: st.limits.query_spill_bytes,
-        no_cache: params.get("nocache").is_some_and(truthy),
-        default_graph_uris: params.all("default-graph-uri"),
-        named_graph_uris: params.all("named-graph-uri"),
-        allow_service: st.allow_service,
-        outbound: st.outbound.clone(),
-        ..defaults
-    }
+    caller::request_options(st, ds, params)
 }
 
 /// The reasoning mode a request's `reasoning` parameter names. An absent or unknown value
@@ -1584,13 +1563,13 @@ pub(crate) async fn run_query(
             )
         })?),
     };
-    let mut opts = query_options(&st, &ds, &params);
+    let mut opts =
+        CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     query_reasoning(&st, &ds, &params, &mut opts)?;
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
     opts.describe = describe::request_options(&ds, &params)?;
-    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     // a SERVICE call to this server runs in process, as this caller
     self_service::install(&st, &mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
@@ -2174,8 +2153,8 @@ async fn text_search(
         return Err(bad(format!("lang: {l:?} is not a language tag")));
     }
     let graph = params.get("graph").map(|g| iri("graph", g)).transpose()?;
-    let mut options = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut options, &p, &ds.name, crate::auth::Endpoint::Query);
+    let options =
+        CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     let search = sparkles::handles::TextSearch {
         query: q,
         predicates,
@@ -2734,9 +2713,9 @@ async fn explain(
         }
         params.get("query").unwrap_or_default().to_string()
     };
-    let mut opts = query_options(&st, &ds, &params);
+    let mut opts =
+        CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     query_reasoning(&st, &ds, &params, &mut opts)?;
-    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let at = history::at_param(&params)?;
     blocking(move || {
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;

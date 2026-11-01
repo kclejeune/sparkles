@@ -120,8 +120,7 @@ pub(super) async fn model(
     let s = settings(&st, &main, params.get("shapes"))?;
     let at = history::at_param(&params)?;
     let branch = ds.branch_name();
-    let mut opts = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Query);
+    let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     let timeout = opts.timeout.unwrap_or(st.default_timeout);
     opts.deadline = Some(std::time::Instant::now() + timeout);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -369,9 +368,8 @@ async fn prepare(
         st.branch_dataset(&main, &branch)?
     };
     let params = Params::from_query(uri);
-    let mut opts = query_options(st, &ds, &params);
     let q = on_branch(name, &branch);
-    crate::auth::restrict(&mut opts, p, &q, Endpoint::Update);
+    let mut opts = CallerContext::for_caller(st, &ds, p).options_on(&params, &q, Endpoint::Update);
     let timeout = update_timeout(st, &params);
     opts.timeout = timeout;
     let mut w = validation::write_options(st, &params, headers, timeout)?;

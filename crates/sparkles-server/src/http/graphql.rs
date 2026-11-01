@@ -6,7 +6,7 @@
 
 use super::{
     AdminBody, ApiError, ApiResult, Params, QueryBody, St, blocking, budgets, cancel_on_drop,
-    content_type, dataset, err, history, query_options, with_commit,
+    content_type, dataset, err, history, with_commit,
 };
 use crate::auth::{Endpoint, Level, Principal};
 use crate::obs::{GraphqlReport, Op, Outcome, RequestReport};
@@ -202,7 +202,8 @@ pub(super) async fn run(
         Err((status, e)) => return Ok(gql_error(status, ct, e)),
     };
     crate::obs::log_query_text(&req.query);
-    let mut qopts = query_options(&st, &ds, &params);
+    let mut qopts =
+        super::CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Graphql);
     let asked = match budgets::Overrides::parse(&params) {
         Ok(a) => a,
         Err(e) => {
@@ -214,7 +215,6 @@ pub(super) async fn run(
         }
     };
     asked.apply(&mut qopts);
-    crate::auth::restrict(&mut qopts, &p, &ds.name, Endpoint::Graphql);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     qopts.cancel = Some(cancel);
     let at = match history::at_param(&params) {

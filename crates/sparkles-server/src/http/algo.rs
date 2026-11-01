@@ -245,12 +245,12 @@ pub(super) async fn run(
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     super::task_start_check(&st, Some(TASK), &ds.name)?;
-    let mut opts = super::query_options(&st, &ds, &params);
+    let mut opts =
+        super::CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Update);
     // A write-back run is an update, so it has the update deadline: none unless the
     // request or `--update-timeout` gives one, and never above `--max-timeout`. The
     // server's query timeout does not apply.
     opts.timeout = super::update_timeout(&st, &params);
-    crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Update);
     // The run takes its initial grant of the memory pool when its task starts, waiting
     // in arrival order up to `--query-admission-wait` as a request does, so that a run
     // queued behind others holds no memory while it waits.

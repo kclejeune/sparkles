@@ -254,3 +254,70 @@ fn a_demand_view_installs_the_query_time_reasoner() {
     assert!(opts.reasoning.is_some());
     assert!(ds.query_with(ASK, &opts).unwrap().boolean);
 }
+
+/// A query request starts from the dataset's defaults, takes budgets that replace its
+/// limits and budgets that only lower them, reads the inferred data of a view and
+/// carries a cancellation flag. Its row budget stops a query as the options' does.
+#[test]
+fn query_requests_apply_budgets_reasoning_and_cancellation() {
+    use sparkles::reasoning::ReasoningMode;
+    use sparkles::{Budgets, QueryRequest};
+    use std::time::Duration;
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<urn:s> a <urn:child> . <urn:t> a <urn:child> . <urn:u> a <urn:child> .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds.load_str_into(
+        "<urn:s> a <urn:parent> .",
+        RdfFormat::Turtle,
+        INFERRED_GRAPH,
+    )
+    .unwrap();
+    ds.state()
+        .set_reasoning(Some(ReasoningRecord {
+            profile: "rdfs".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let server = Budgets {
+        timeout: Some(Duration::from_secs(5)),
+        max_rows: Some(100),
+        max_memory_bytes: Some(1 << 30),
+        max_rows_produced: None,
+        max_spill_bytes: Some(1 << 20),
+    };
+    let asked = Budgets {
+        timeout: Some(Duration::from_secs(1)),
+        max_rows: Some(2),
+        max_memory_bytes: Some(1 << 40),
+        max_rows_produced: Some(50),
+        max_spill_bytes: None,
+    };
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opts = QueryRequest::new(&ds)
+        .budgets(&server)
+        .lower_budgets(&asked)
+        .cancel(flag.clone())
+        .build();
+    // lowering keeps the timeout and the smaller of each limit, where none is no limit
+    assert_eq!(opts.timeout, Some(Duration::from_secs(5)));
+    assert_eq!(opts.max_rows, Some(2));
+    assert_eq!(opts.max_memory_bytes, Some(1 << 30));
+    assert_eq!(opts.max_rows_produced, Some(50));
+    assert_eq!(opts.max_spill_bytes, Some(1 << 20));
+    assert_eq!(opts.default_graph_extra, [INFERRED_GRAPH]);
+    assert!(ds.query_with(ASK, &opts).unwrap().boolean);
+    let all = "SELECT ?s { ?s a <urn:child> }";
+    assert!(
+        ds.query_with(all, &opts).is_err(),
+        "three rows pass the row budget"
+    );
+    let off = QueryRequest::new(&ds)
+        .with_reasoning(&ds.inference_view(ReasoningMode::Off).unwrap())
+        .build();
+    assert!(!ds.query_with(ASK, &off).unwrap().boolean);
+    assert_eq!(ds.query_with(all, &off).unwrap().len(), 3);
+    assert!(std::sync::Arc::ptr_eq(opts.cancel.as_ref().unwrap(), &flag));
+}

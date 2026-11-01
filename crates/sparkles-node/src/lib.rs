@@ -193,15 +193,19 @@ fn query_options(v: &Value, flag: Arc<AtomicBool>) -> sparkles::Result<QueryOpti
     let mut o = QueryOptions {
         cancel: Some(flag.clone()),
         write: write_options(v, flag)?,
-        timeout: v["timeout"].as_u64().map(Duration::from_millis),
         union_default_graph: v["unionDefaultGraph"].as_bool(),
         no_cache: v["noCache"].as_bool().unwrap_or(false),
         base_iri: v["baseIri"].as_str().map(str::to_string),
+        ..Default::default()
+    };
+    sparkles::Budgets {
+        timeout: v["timeout"].as_u64().map(Duration::from_millis),
         max_rows: v["maxRows"].as_u64().map(|n| n as usize),
         max_memory_bytes: v["maxMemoryBytes"].as_u64(),
         max_rows_produced: v["maxRowsProduced"].as_u64(),
-        ..Default::default()
-    };
+        max_spill_bytes: None,
+    }
+    .apply(&mut o);
     if !v["describe"].is_null() {
         o.describe = serde_json::from_value(v["describe"].clone())
             .map_err(|e| EngineError::invalid(e.to_string()))?;

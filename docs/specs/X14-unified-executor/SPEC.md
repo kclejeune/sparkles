@@ -339,6 +339,36 @@ names only `materialized` or `demand`. Behaviour is unchanged. The new CLI test 
 `--reasoning false`, `true`, `materialized` and `demand` with and without a profile and
 with an unlimited limit, and the library tests cover each view.
 
+### Query request builder and caller context
+
+Item 482 shipped. `sparkles::QueryRequest` builds the options of one query from a
+dataset's defaults. `budgets` sets a `sparkles::Budgets` of timeout, rows, memory, rows
+produced and spill bytes, `lower_budgets` only lowers them as a request lowers a server's,
+`with_reasoning` reads the data of an `InferenceView`, and `cancel` sets the cancellation
+flag. The server's `CallerContext::for_caller` holds the state, the dataset and the caller.
+Its `options` gives the request options of the dataset's defaults, the server's budgets and
+settings and the request's parameters, restricted to the caller's grants on an endpoint.
+`task_options` gives a background task the same budgets with the update timeout and no
+pool grant, and `read_options` gives a route without parameters of its own the query
+timeout and the budgets.
+
+The query, text search and explanation endpoints, the graph and facet routes, the SPARQL
+diff, the forms model and check, the view reads, GraphQL, ShEx selectors, in-process
+SERVICE calls and algorithm write-back now take their options from the caller context
+instead of repeating the recipe. The request budgets lower the options through `Budgets`,
+the MCP tools build theirs with `QueryRequest` and their own memory budget, and the Node,
+Python and FFI bindings apply their callers' limits as `Budgets`. The update endpoint keeps
+its own options, which have no spill budget and no dataset defaults besides the pool.
+
+The GraphRAG build and its read routes used to run with the dataset's defaults and the
+caller's grants alone, so no server timeout or budget applied to them. A build now runs
+under the server's row, memory, rows-produced and spill budgets and its update timeout, as
+an algorithm write-back does, and the read routes run under the query timeout and the same
+budgets. This is the one intended change in behaviour. A unit test of the caller context
+checks the budgets, settings, parameters and inferred data of a request, a task and a
+read, and the library tests check the builder's budgets, reasoning and cancellation. The
+server's budget, limit and quota tests cover the endpoints.
+
 ### Shared rank fusion and text hits
 
 Item 483 shipped. `sparkles::rank` holds the reciprocal rank fusion. `fuse_rrf` sums

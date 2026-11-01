@@ -350,12 +350,12 @@ pub(super) async fn sparql_diff(
             _ => return Err(bad(format!("limit must be from 1 to {MAX_LIMIT}"))),
         },
     };
-    let mut opts = query_options(&st, &ds, &params);
+    let mut opts =
+        CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
     let max_bytes = asked.result_limit(st.limits.max_result_bytes);
-    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel.clone());
     let restricted = p.restricted(&ds.name);

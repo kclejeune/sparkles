@@ -24,6 +24,16 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+The library builds the options of a query with `sparkles::QueryRequest`, which applies a
+`sparkles::Budgets` of timeout, rows, memory, rows produced and spill bytes, a caller's
+lower budgets, an inference view and a cancellation flag. The server builds every query
+endpoint's options through one caller context, and the MCP tools and the bindings apply
+their limits through `Budgets`. A GraphRAG build now runs under the server's `--max-rows`,
+query memory, rows-produced and spill budgets and `--update-timeout`, and the
+`/$/graphrag/{ds}` read routes under `--timeout` and the same budgets. Before, neither had
+a server timeout or budget, so a large build or report read could outrun the limits that
+every other query meets.
+
 `spk:hybridSearch` and the MCP memory tools fuse ranked lists with one library function,
 `sparkles::rank::fuse_rrf`, and read full-text hits through one `text:query` call,
 `sparkles::handles::text_call`, and one reader, `TextIndex::hits`, which reads a given
