@@ -24,6 +24,11 @@ Sparkles runs the W3C and community test suites in its own harness. `mise run te
 | GeoSPARQL 1.1 | 37 of Oxigraph's 44 tests pass, and the other 7 are listed with reasons. Tests derived from Jena's also pass. |
 | Apache Jena | Jena's contract tests pass on the `sparkles-jena` dataset, and Jena's HTTP clients are tested against the server. |
 
+The query evaluation tests of these SPARQL, CDT, property function and GeoSPARQL suites
+also pass with `execution=streaming`, through the cursors that a streamed query uses.
+`mise run test:w3c:streaming` runs that pass alone and reports, for each suite, the
+queries that fall back to eager execution for an operator the cursors do not stream.
+
 The SPARQL parser is a vendored, patched `spargebra`
 ([`vendor/spargebra/PATCHED.md`](../../vendor/spargebra/PATCHED.md)).
 

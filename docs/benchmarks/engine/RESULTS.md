@@ -301,3 +301,32 @@ slower with FSST, DBpedia's `abstract-contains` and `label-regex` 12% slower, an
 `entity-summary-1` on DBpedia takes 1.17 times as long. [Roadmap](../../ROADMAP.md) item 160
 follows up `star-join` and `entity-summary-1`, and item 241 follows up three warm DBpedia
 queries that run 1.4% to 4.2% slower with front coding since item 108.
+
+## Rewrite gate baselines
+
+These baselines belong to the rewrite gates of [BENCHMARKING.md](../../BENCHMARKING.md#rewrite-gates).
+A lane compares its own gate record with them using `scripts/bench-gate.py compare`.
+
+### W3C suites under streaming execution
+
+`mise run test:w3c:streaming` ran the query evaluation suites with `execution=streaming`
+at commit fcff390a, whose engine code is that of 04d49b57. The suites came from the
+Apache Jena checkout that the tests read by default. Every suite passed with no new
+failures, and the debug test binary took 23 seconds on a busy development laptop.
+
+| Suite | Passed | Failed | Skipped | Queries with eager fallback |
+|---|--:|--:|--:|--:|
+| SPARQL 1.0 and 1.1 query | 508 | 0 | 103 | 0 |
+| SPARQL 1.2 | 63 | 0 | 206 | 0 |
+| Jena's CDT, FOLD and UNFOLD tests | 655 | 0 | 0 | 30 |
+| ARQ property functions | 48 | 0 | 0 | 24 |
+
+The skipped tests are syntax and update tests, which do not depend on the execution mode
+and run in the default pass. The fallback counts are the queries whose plans hold an
+operator that the cursors do not stream, which then runs eagerly on first demand. These
+counts are the measure that the executor merge drives to zero. The
+[run record](runs/2026-11-01-w3c-streaming-stanley/record.json) and its
+[log](runs/2026-11-01-w3c-streaming-stanley/output.log) hold the counts. `mise run test`
+runs the same tests in CI with Oxigraph's GeoSPARQL tests added. The streaming tests
+replace the cursor pass at 4,096 rows that `sparql_query_cursors` used to run, so CI
+runs about 10 seconds more of these tests than before.

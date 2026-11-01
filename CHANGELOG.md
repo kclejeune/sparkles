@@ -22,6 +22,14 @@ fails set `--ready-ignore-failed` and use `/$/ready/{ds}` for the datasets they 
 monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move to
 `/$/ready`. The Helm chart's startup probe now asks for `/$/ping`.
 
+### Performance gates
+
+The W3C SPARQL 1.0, 1.1 and 1.2 query evaluation suites, Jena's CDT and property
+function tests and Oxigraph's GeoSPARQL tests run with `execution=streaming` in
+`mise run test` and alone in `mise run test:w3c:streaming`, which reports the queries
+that fall back to eager execution. `scripts/bench-gate.py` writes versioned gate records
+and compares a candidate's record with a recorded baseline.
+
 ### Changed
 
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a

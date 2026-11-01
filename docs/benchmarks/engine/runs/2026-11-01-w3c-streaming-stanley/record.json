@@ -1,0 +1,104 @@
+{
+ "checks": [
+  {
+   "detail": "48 passed, 0 failed, 0 skipped",
+   "name": "ARQ property functions (Jena, streaming)/failed",
+   "ok": true
+  },
+  {
+   "detail": "508 passed, 0 failed, 103 skipped",
+   "name": "SPARQL 1.0 and 1.1 query (streaming)/failed",
+   "ok": true
+  },
+  {
+   "detail": "63 passed, 0 failed, 206 skipped",
+   "name": "SPARQL 1.2 (streaming)/failed",
+   "ok": true
+  },
+  {
+   "detail": "655 passed, 0 failed, 0 skipped",
+   "name": "SPARQL CDTs (Jena, streaming)/failed",
+   "ok": true
+  },
+  {
+   "detail": "the test binary reported ok",
+   "name": "test result",
+   "ok": true
+  }
+ ],
+ "gate": "w3c-streaming",
+ "gate_record": 1,
+ "host": {
+  "cpu": "Intel(R) Core(TM) Ultra X7 358H",
+  "cpus": 16,
+  "kernel": "7.2.9",
+  "name": "stanley"
+ },
+ "kind": "gate-record",
+ "manifest": {
+  "build": "debug test profile, mbx test -p sparkles-core --test w3c",
+  "commit": "fcff390a7ab9a27f9a78a749c8d85db4d1204a62",
+  "ended": "2026-11-01T03:49:47Z",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "suites": "Apache Jena checkout b1dcba53b5",
+  "test_binary_sha256": "de47f08d37a38d086a0c02bef00ca9a36dd0fa6419a19dc7522521d83f9d07d8"
+ },
+ "metrics": [
+  {
+   "better": "higher",
+   "key": "ARQ property functions (Jena, streaming)/passed",
+   "unit": "tests",
+   "value": 48
+  },
+  {
+   "better": "higher",
+   "key": "SPARQL 1.0 and 1.1 query (streaming)/passed",
+   "unit": "tests",
+   "value": 508
+  },
+  {
+   "better": "higher",
+   "key": "SPARQL 1.2 (streaming)/passed",
+   "unit": "tests",
+   "value": 63
+  },
+  {
+   "better": "higher",
+   "key": "SPARQL CDTs (Jena, streaming)/passed",
+   "unit": "tests",
+   "value": 655
+  },
+  {
+   "better": "lower",
+   "key": "ARQ property functions (Jena, streaming)/fallbacks",
+   "unit": "queries",
+   "value": 24
+  },
+  {
+   "better": "lower",
+   "key": "SPARQL 1.0 and 1.1 query (streaming)/fallbacks",
+   "unit": "queries",
+   "value": 0
+  },
+  {
+   "better": "lower",
+   "key": "SPARQL 1.2 (streaming)/fallbacks",
+   "unit": "queries",
+   "value": 0
+  },
+  {
+   "better": "lower",
+   "key": "SPARQL CDTs (Jena, streaming)/fallbacks",
+   "unit": "queries",
+   "value": 30
+  }
+ ],
+ "scale": null,
+ "settings": {
+  "batch_rows": 4096,
+  "execution": "streaming",
+  "harness": "crates/sparkles-core/tests/w3c.rs, the streaming_ tests",
+  "threshold": 0.0
+ },
+ "suite": "w3c-sparql"
+}

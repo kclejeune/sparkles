@@ -1797,6 +1797,23 @@ comparison with that change measured `optional-count` at +1.9%, about 10 µs, an
 `subquery-agg` at −7.9%, and every other query within 2.2%. A follow-up item records
 the remaining `optional-count` cost.
 
+### Rewrite gates
+
+Roadmap items 469 to 473 add the performance gates that the engine rewrites of items 453
+and 455 must pass, as the first phase of item 452's workstream.
+[BENCHMARKING.md](../BENCHMARKING.md#rewrite-gates) describes each gate's task, host and
+threshold, and `scripts/bench-gate.py compare` checks a candidate's gate record against
+the recorded baseline.
+
+Item 470 runs the W3C query evaluation suites with `execution=streaming`. All SPARQL
+1.0, 1.1 and 1.2 query evaluation tests, Jena's CDT tests and ARQ's property function
+tests pass in that mode with the default run's known-failure lists. The SPARQL suites
+need no eager fallback, while 30 CDT queries and 24 property function queries hold an
+operator that runs eagerly on first demand. The tests run in CI as part of `mise run
+test` and cost about ten seconds more than the cursor pass at the same batch size that
+they replace. The [baseline](../benchmarks/engine/RESULTS.md#w3c-suites-under-streaming-execution)
+keeps the counts.
+
 ### Scope changes
 
 **Further engines for comparison.** The second rule in §4 left commercial editions out of scope and did not run an engine whose terms forbid publishing results. Comparisons with Virtuoso Open Source and GraphDB Free, with Blazegraph at low priority, and with RDFox and Stardog after a check of their licenses for benchmark-publication clauses, are now planned under [ROADMAP](../ROADMAP.md) item 452 in this spec's Roadmap follow-ups. A measurement stays private when publication is forbidden.
