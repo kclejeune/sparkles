@@ -755,15 +755,16 @@ impl CatchUp {
         Ok(())
     }
 
-    /// Make the carried commits and their new terms durable.
-    fn sync(&mut self) -> Result<()> {
+    /// Make the carried commits and their new terms durable, the terms on the store
+    /// writer's vocabulary-sync `worker` while the log syncs.
+    fn sync(&mut self, worker: &mut crate::vocab::LazySync) -> Result<()> {
         match self.wal.as_mut() {
             Some(w) => {
                 w.flush()?;
                 if self.gen_.dvocab.needs_sync() {
                     self.gen_.dvocab.flush()?;
                 }
-                sync_commit(w.get_ref(), &self.gen_.dvocab)
+                sync_commit_reused(w.get_ref(), &self.gen_.dvocab, worker, u64::MAX)
             }
             None => Ok(()),
         }
@@ -1335,7 +1336,7 @@ impl Store {
         if cancelled() {
             return Err(Error::Cancelled);
         }
-        cu.sync()?;
+        cu.sync(&mut w.vocab_sync)?;
         w.next_bnode = w.next_bnode.max(cu.next_bnode);
         let new_no = commit::generation_number(&name);
         if let Some(root) = &self.root {
@@ -1358,38 +1359,29 @@ impl Store {
                     return Err(Error::Cancelled);
                 }
             }
-            if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
-                // a CURRENT that cannot be read may name the new generation
-                let maybe_switched = std::fs::read_to_string(root.join("CURRENT"))
-                    .map_or(true, |c| c.trim() == name);
-                if maybe_switched {
-                    // the next open may use the new generation, which lacks the commits
-                    // this process would make to the old one: take no more writes
+            if let Err(f) = self.switch_generation(&mut w, root, &name) {
+                if f.maybe_switched {
                     w.tap = None;
-                    w.poisoned = true;
                     run.published = true;
                 }
-                return Err(e);
+                return Err(f.error);
             }
             run.published = true;
             if relink.is_some() {
                 self.failpoint("relink-current");
             }
-            let wal = cu.wal.take().expect("a persistent store has a log");
-            w.trim_wal();
-            // the old generation's vocabulary takes no more writes either
-            self.snapshot().generation.dvocab.trim();
-            self.quota
-                .set_vocab_preallocated(cu.gen_.dvocab.preallocated());
-            w.wal = Some(wal);
-            w.tail = wal::Tail::new(cu.wal_len, cu.wal_len);
-            w.wal_len = cu.wal_len;
-            self.wal_end.store(cu.wal_len, Ordering::Relaxed);
-            self.quota.set_preallocated(0);
-            *gen_.wal_index.lock() = Some(std::mem::replace(
-                &mut cu.index,
-                wal::WalIndex::new(base.seq, false),
-            ));
+            let index = std::mem::replace(&mut cu.index, wal::WalIndex::new(base.seq, false));
+            self.adopt_generation_log(
+                &mut w,
+                &gen_,
+                NextLog {
+                    wal: cu.wal.take().expect("a persistent store has a log"),
+                    tail: wal::Tail::new(cu.wal_len, cu.wal_len),
+                    len: cu.wal_len,
+                    index,
+                    vocab_preallocated: cu.gen_.dvocab.preallocated(),
+                },
+            );
         }
         w.tap = None;
         run.published = true;

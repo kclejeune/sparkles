@@ -5,11 +5,15 @@
 //! a referencing object map per foreign key.
 
 use super::Connection;
+use super::rdf::turtle_string;
 use crate::error::{Error, Result};
 use rusqlite::OpenFlags;
 
-fn turtle_string(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+/// A column name inside an R2RML template, with its backslashes and braces escaped.
+fn template_column(n: &str) -> String {
+    n.replace('\\', "\\\\")
+        .replace('{', "\\{")
+        .replace('}', "\\}")
 }
 
 fn iri_part(s: &str) -> String {
@@ -126,23 +130,19 @@ pub fn r2rml(conn: &Connection, tables: &[String], base: &str) -> Result<String>
         pk.sort();
         let tp = iri_part(t);
         let subject = if pk.is_empty() {
-            "    rr:subjectMap [ rr:termType rr:BlankNode ; rr:template \"".to_string()
-                + &cols
-                    .iter()
-                    .map(|(n, _)| format!("{{{n}}}"))
-                    .collect::<Vec<_>>()
-                    .join(";")
-                + &format!("\" ; rr:class <{tp}> ] ;\n")
+            let template = cols
+                .iter()
+                .map(|(n, _)| format!("{{{}}}", template_column(n)))
+                .collect::<Vec<_>>()
+                .join(";");
+            format!(
+                "    rr:subjectMap [ rr:termType rr:BlankNode ; rr:template {} ; rr:class <{tp}> ] ;\n",
+                turtle_string(&template)
+            )
         } else {
             let key = pk
                 .iter()
-                .map(|(_, n)| {
-                    format!(
-                        "{}={{{}}}",
-                        iri_part(n),
-                        n.replace('{', "\\{").replace('}', "\\}")
-                    )
-                })
+                .map(|(_, n)| format!("{}={{{}}}", iri_part(n), template_column(n)))
                 .collect::<Vec<_>>()
                 .join(";");
             format!(
@@ -194,6 +194,47 @@ pub fn r2rml(conn: &Connection, tables: &[String], base: &str) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names with quotes, backslashes, braces and line breaks, in a table without a
+    /// primary key and in one with a key, give a draft that parses and runs.
+    #[test]
+    fn drafts_escape_names_as_turtle_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db.sqlite");
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch(
+            "CREATE TABLE \"odd\nname\" (\"a\"\"b\\c\" TEXT, \"line\nbreak{x}\" TEXT);
+             CREATE TABLE keyed (\"k\ney\" INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO \"odd\nname\" VALUES ('one', 'two');
+             INSERT INTO keyed VALUES (3, 'three');",
+        )
+        .unwrap();
+        drop(c);
+        let conn = Connection::Sqlite { path: p };
+        let ttl = r2rml(&conn, &[], "http://ex.org/db/").unwrap();
+        let m = super::super::parse(&ttl, super::super::MappingKind::Rml, None)
+            .unwrap_or_else(|e| panic!("{e}\n{ttl}"));
+        let inputs = super::super::Inputs {
+            connections: vec![super::super::NamedConnection {
+                name: "db".into(),
+                connection: conn,
+                jdbc_dsn: None,
+            }],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        super::super::write(
+            &m,
+            &inputs,
+            &Default::default(),
+            &mut out,
+            oxrdfio::RdfFormat::NQuads,
+        )
+        .unwrap_or_else(|e| panic!("{e}\n{ttl}"));
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\"one\""), "{out}\n{ttl}");
+        assert!(out.contains("\"three\""), "{out}\n{ttl}");
+    }
 
     #[test]
     fn drafts_a_mapping_that_runs() {

@@ -188,20 +188,6 @@ pub fn raise_open_file_limit() -> Option<u64> {
     None
 }
 
-/// Whether files written through [`WritebackFile`] send their data to the device as
-/// they grow (on by default, `off` in `SPARKLES_WRITEBACK` turns it off for a process).
-pub fn steady_writeback() -> bool {
-    STEADY_WRITEBACK.get()
-}
-
-/// Turn [`steady_writeback`] on or off for writes from now on.
-pub fn set_steady_writeback(on: bool) {
-    STEADY_WRITEBACK.set(on);
-}
-
-static STEADY_WRITEBACK: crate::index::EnvSwitch =
-    crate::index::EnvSwitch::new("SPARKLES_WRITEBACK");
-
 /// A [`WritebackFile`] starts writeback of its data every this many bytes.
 #[cfg(target_os = "linux")]
 const WRITEBACK_EVERY: u64 = 8 << 20;
@@ -244,7 +230,7 @@ impl WritebackFile {
     #[cfg(target_os = "linux")]
     fn writeback(&mut self) {
         use std::os::fd::AsRawFd;
-        if self.written - self.started < WRITEBACK_EVERY || !steady_writeback() {
+        if self.written - self.started < WRITEBACK_EVERY {
             return;
         }
         let fd = self.f.as_raw_fd();

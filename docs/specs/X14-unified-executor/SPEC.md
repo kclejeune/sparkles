@@ -1,6 +1,6 @@
 # X14: Unified executor
 
-> **Status:** planned.
+> **Status:** in progress.
 >
 > **Roadmap:** [item 453](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -178,4 +178,123 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 453](../../ROADMAP.md) tracks the work.
+Stage 1 is under way, and [item 453](../../ROADMAP.md) tracks the rest of the work.
+
+### Dead compaction arm and one generation switch
+
+Item 474 shipped. `rebuild_locked` takes a plain `BulkCommit` and its write options,
+since every caller passes a bulk commit, and the branches that served a compaction
+through it are gone. The build of a bulk commit's generation is its own function,
+`build_generation`. A bulk commit and a compaction switch `CURRENT` through one
+function, `switch_generation`, which poisons the writer when the switch may have
+happened, and move the writer onto the new generation's log through one function,
+`adopt_generation_log`. The compaction's last catch-up sync runs the delta-vocabulary
+sync on the store writer's lazily started worker instead of a thread spawned per call,
+and the thread-per-call `sync_commit` is deleted. A bulk commit now reads the size of
+its new log before the switch rather than after it, so a failed read can no longer
+leave the writer on the old log after `CURRENT` moved. Behaviour is otherwise unchanged,
+and the existing compaction, bulk-load, relink and crash-boundary tests cover the paths.
+
+### One join-order planner
+
+Item 475 shipped. The planner orders every connected group with the program on cost
+summaries in `joinorder.rs`, and the `pruned_join_order` toggle is gone with the
+exhaustive program over plan trees and the planner's own greedy ordering that it chose
+between. A group that the program cannot track, with more than 16 inputs or more than
+128 variables shared between inputs, keeps the greedy plan of `joinorder.rs`, which
+tracks variables in sets of any size. Before, a group of up to 12 inputs that shared
+more than 128 variables fell back to the exhaustive program. The filter placement that
+both programs shared moved into `joinorder.rs`. The deleted ordering survives only as
+the oracle of `joinorder_tests.rs`, behind a test-only switch, so the tests still
+compare the program's costs and answers with the exhaustive program's. With every
+optimization off, a group is now planned on cost summaries as well, where it used to
+take the exhaustive program. Default plans change only for groups that share more than
+128 variables, since every other group already took the program on cost summaries or
+its greedy plan.
+
+### Superseded replacement toggles
+
+Item 476 shipped for the switches whose off path served no purpose but the old
+implementation. Five switches are gone with their off paths. Hash joins always build the
+flat table, so the per-key lists and their cost constant are deleted (`flat_hash_join`).
+Scans always decode only the key columns they read (`selective_columns`). Index
+statistics are always corrected for the delta and for unread graphs (`delta_statistics`).
+A filter with a fixed string start always reads only its key ranges and fails the base
+ids outside its id ranges (`filter_key_ranges` and `filter_id_ranges`). Every result was
+already the same with each switch on, which the tests checked, and the tests now compare
+these paths with a nested-loop join, with the statistics switched off and with the
+generic operators.
+
+The other switches stay. The algorithm switches that the merge keeps choose between
+different algorithms for diagnosis. `expr_cache`, `sampled_filters`,
+`decorrelate_exists`, `count_filter_runs`, `filter_scan_runs` and `topk_first_key` are
+switched off at run time for queries that call extensions, so their off paths are live.
+The cost-model switches `sampled_filters`, `characteristic_sets`, `probed_keys` and
+`fused_star_costs` are what the cost calibration harness compares. `grow_input` and
+`decode_ahead` are the memory and latency tradeoffs that the cursor tests measure against
+their off paths, and the sequential writer stays as the path of a single Rayon worker.
+The prefetch and decoding switches of X07 wait for item 4 under item 478. The switches
+that shipped with their measurements in the current release, `probed_optional` and
+`bound_order_keys`, keep their off paths as the baseline of the forge checks.
+`gallop_index_join` chooses between the galloping reader and the clustered reader, which
+are different read paths.
+
+The generic operators of `Optimizations::NONE` remain the oracle of the differential
+tests. The test-only evaluator that follows the SPARQL algebra literally, after which
+the remaining off paths that only tests reach can go, is item 512.
+
+### Shared format registry and small helpers
+
+Item 477 shipped. `sparkles_core::syntaxes` is the registry of the names, file
+extensions and media types of the W3C RDF syntaxes. File names, media types, result
+format names, Jena-style syntax names, SHACL shapes syntax names, the `convert` tool,
+the ShEx schema hint and Fuseki configuration files look a syntax up there, so an alias
+that one of them accepted is accepted by all of them. The callers keep their
+exclusions. Results are not written in N3, and the generic JSON and XML media types
+still name result formats. A shapes file is not read as N3, and a `.json` ShEx schema
+is ShExJ. Jena reads the N3 media types as Turtle, and so do media-type lookups.
+`sparkles_core::INFERRED_GRAPH` is the one inferred-graph constant, which the other
+crates re-export, and `sparkles_core::duration::parse_duration` is the one parser of
+written durations, behind the backup policy, the server's retention and age flags,
+the auth configuration and the transcript import. `sparkles_core::fsutil::write_atomic`
+and `write_atomic_via` are the durable atomic write, which the store, the change-log
+index, the catalog and the server's state files use. The change-log index now also
+syncs its directory after the rename. The R2RML draft writer escapes its strings with
+the main mapping writer's Turtle escaping, so a table or column name with a line break
+or a quote no longer produces invalid Turtle.
+
+The helpers whose differences are deliberate keep their own code. The reasoner's
+unsynced write, the backup cache and the server's writers that set file permissions or
+keep a file's mode are not durable replacements in this sense. The day-based `assist`
+ages accept fractions and years, the rate limiter parses rates, and Fuseki's timeouts
+are milliseconds. The client and the formatter do not depend on `sparkles-core` and keep
+their extension tables.
+
+### Test-only implementation switches
+
+Item 478 shipped for the switches that X07 does not measure. `SPARKLES_NUMERIC_COLUMN`
+and `SPARKLES_WRITEBACK` are deleted with their switches. Vocabularies always read their
+numeric column when they have one, and a vocabulary without the file, which the numeric
+column tests open, takes the path the switch used to select. Index builds always send
+their files to the device as they write them. The hidden server flags `--no-wal-direct-writes` and `--no-group-commit-idle-direct`
+are gone, and the store options they set, `wal_direct_writes` and
+`group_commit_idle_direct`, are hidden fields that the tests of the buffered log path
+and of the group set. The buffered path still serves a file system that refuses direct
+I/O. The undocumented `SPARKLES_DEBUG_CACHE` printout of result-cache keys is deleted.
+
+The cold-read switches `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB` and
+`SPARKLES_READ_WINDOW_KB`, and the prefetch and decoding switches of `Optimizations`,
+remain until item 4 has measured them, and item 513 makes them test-only then.
+`SPARKLES_NO_IN_PLACE` remains as the method of the published memory benchmark, which
+compares the in-place runner with the blocking pool.
+
+### Measurements of stage 1
+
+A Namespace screen of the base against the five deletions ran the 30 synthetic queries
+at 1.05M triples with one thread in four A,B,B,A rounds. The geometric mean of server
+time was 0.982 of the base, and no query was 5% or more slower. `regex-iri` read 1.024
+and `class-predicates` 1.020 with every round above 1, which item 514 measures on
+an Intel host. EXPLAIN printed the same plans before and after for four generated groups
+of 17 to 22 triple patterns over the same data, a chain, a chain with a filter, a star
+and a snowflake, since a group of more than 16 inputs already kept the greedy plan of
+`joinorder.rs`.

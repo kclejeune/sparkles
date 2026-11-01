@@ -284,23 +284,21 @@ impl CountCache {
 }
 
 /// The exact answer to `key` on `snap`, or `None` when the statistics do not hold it or
-/// correcting them would cost more than `budget` rows of a scan. With `correct` off, only
-/// a snapshot without a delta whose base has no quads in unread graphs is answered.
-/// `rdf_type` is the snapshot's id of `rdf:type` (class counts); `check` is called now
+/// correcting them for the snapshot's delta and the quads in unread graphs would cost more
+/// than `budget` rows of a scan. `rdf_type` is the snapshot's id of `rdf:type` (class counts); `check` is called now
 /// and then for cancellation and deadlines.
 pub fn exact_counts(
     snap: &Snapshot,
     key: &CountKey,
     rdf_type: Option<u64>,
     budget: u64,
-    correct: bool,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Option<Arc<Counts>>> {
-    if key.perm == Perm::Gspo || !correct && !snap.delta.is_empty() {
+    if key.perm == Perm::Gspo {
         return Ok(None);
     }
     if let Some(c) = snap.counts.get(key) {
-        return Ok((correct || c.unread == 0).then_some(c));
+        return Ok(Some(c));
     }
     let generation = &snap.generation;
     let stats = &generation.stats;
@@ -313,9 +311,6 @@ pub fn exact_counts(
         .filter(|(g, _)| !key.graphs.accepts(*g))
         .map(|(_, n)| n)
         .sum();
-    if !correct && (unread > 0 || !snap.delta.is_empty()) {
-        return Ok(None);
-    }
     #[cfg(test)]
     let budget = if UNLIMITED.get() { u64::MAX } else { budget };
     let per_quad = match key.measure {

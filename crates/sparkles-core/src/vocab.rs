@@ -568,9 +568,7 @@ impl Vocab {
         v.first_triple = match v.find(b"(") {
             Ok(i) | Err(i) => i,
         };
-        if crate::index::numeric_column() {
-            v.num = numeric::NumColumn::open(dir, v.len, v.first_triple);
-        }
+        v.num = numeric::NumColumn::open(dir, v.len, v.first_triple);
         Ok(v)
     }
 
@@ -667,20 +665,18 @@ impl Vocab {
         // Type boundaries need one byte, not a reconstructed giant literal.
         vocab.first_iri = vocab.boundary_controlled(b'<', budget)?;
         vocab.first_triple = vocab.boundary_controlled(b'(', budget)?;
-        if crate::index::numeric_column() {
-            let before = budget.used();
-            vocab.num =
-                match numeric::NumColumn::open_controlled(dir, len, vocab.first_triple, budget) {
-                    Ok(loaded) => loaded.map(|loaded| loaded.value),
-                    Err(crate::Error::BudgetExceeded(_)) => {
-                        // Numeric values can be decoded from keys when this optional
-                        // column cannot fit. Do not invoke the old uncontrolled opener.
-                        budget.release(budget.used() - before);
-                        None
-                    }
-                    Err(error) => return Err(error),
-                };
-        }
+        let before = budget.used();
+        vocab.num = match numeric::NumColumn::open_controlled(dir, len, vocab.first_triple, budget)
+        {
+            Ok(loaded) => loaded.map(|loaded| loaded.value),
+            Err(crate::Error::BudgetExceeded(_)) => {
+                // Numeric values can be decoded from keys when this optional
+                // column cannot fit. Do not invoke the old uncontrolled opener.
+                budget.release(budget.used() - before);
+                None
+            }
+            Err(error) => return Err(error),
+        };
         budget.check()?;
         Ok(crate::store::cold::Loaded {
             value: vocab,

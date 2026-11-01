@@ -154,7 +154,7 @@ pub(super) fn observed(
             measure,
             graphs: graphs.clone(),
         };
-        exact_counts(snap, &key, rdf_type, work, true, &check)
+        exact_counts(snap, &key, rdf_type, work, &check)
     };
     let Some(rows) = count(Perm::Pso, Vec::new(), Measure::Rows)? else {
         return Ok(None);

@@ -518,18 +518,7 @@ pub fn format_for_path(path: &Path) -> Option<(RdfFormat, Option<Codec>)> {
     let name = path.file_name()?.to_str()?.to_ascii_lowercase();
     let name = Codec::strip_extension(&name);
     let ext = name.rsplit('.').next()?;
-    let f = match ext {
-        "ttl" | "turtle" => RdfFormat::Turtle,
-        "nt" | "ntriples" => RdfFormat::NTriples,
-        "nq" | "nquads" => RdfFormat::NQuads,
-        "trig" => RdfFormat::TriG,
-        "rdf" | "owl" | "xml" | "rdfxml" => RdfFormat::RdfXml,
-        "jsonld" | "json" => RdfFormat::JsonLd {
-            profile: oxrdfio::JsonLdProfileSet::empty(),
-        },
-        "n3" => RdfFormat::N3,
-        _ => RdfFormat::from_extension(ext)?,
-    };
+    let f = crate::syntaxes::by_extension(ext).or_else(|| RdfFormat::from_extension(ext))?;
     Some((f, codec))
 }
 
@@ -537,16 +526,12 @@ pub fn format_for_path(path: &Path) -> Option<(RdfFormat, Option<Codec>)> {
 /// including `http://www.w3.org/ns/json-ld#streaming`.
 pub fn format_for_media_type(mt: &str) -> Option<RdfFormat> {
     let base = mt.split(';').next()?.trim().to_ascii_lowercase();
-    match base.as_str() {
-        // Jena reads N3 as Turtle (`text/rdf+n3` is its N3 media type)
-        "text/turtle" | "application/x-turtle" | "text/rdf+n3" | "text/n3" | "application/n3" => {
-            Some(RdfFormat::Turtle)
-        }
-        "application/n-triples" | "text/plain" => Some(RdfFormat::NTriples),
-        "application/n-quads" | "text/x-nquads" => Some(RdfFormat::NQuads),
-        "application/trig" => Some(RdfFormat::TriG),
-        "application/rdf+xml" | "application/xml" | "text/xml" => Some(RdfFormat::RdfXml),
-        "application/ld+json" | "application/json" => {
+    // Jena reads N3 as Turtle (`text/rdf+n3` is its N3 media type)
+    if matches!(base.as_str(), "text/rdf+n3" | "text/n3" | "application/n3") {
+        return Some(RdfFormat::Turtle);
+    }
+    match crate::syntaxes::by_media_type(&base) {
+        Some(RdfFormat::JsonLd { .. }) => {
             let mut profile = oxrdfio::JsonLdProfileSet::empty();
             for param in mt.split(';').skip(1) {
                 if let Some((key, value)) = param.split_once('=')
@@ -561,7 +546,8 @@ pub fn format_for_media_type(mt: &str) -> Option<RdfFormat> {
             }
             Some(RdfFormat::JsonLd { profile })
         }
-        _ => RdfFormat::from_media_type(&base),
+        Some(f) => Some(f),
+        None => RdfFormat::from_media_type(&base),
     }
 }
 
@@ -1351,24 +1337,14 @@ impl DataSyntax {
     /// `N-Quads`, `NQ`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON` or `TriX`.
     pub fn from_name(name: &str) -> Option<DataSyntax> {
         use crate::jena_formats::JenaFormat;
-        let n = name.to_ascii_lowercase();
-        Some(DataSyntax::Rdf(match n.as_str() {
-            "turtle" | "ttl" => RdfFormat::Turtle,
-            "n-triples" | "ntriples" | "n-triple" | "nt" => RdfFormat::NTriples,
-            "n-quads" | "nquads" | "nq" => RdfFormat::NQuads,
-            "trig" => RdfFormat::TriG,
-            "rdf/xml" | "rdfxml" | "rdf" => RdfFormat::RdfXml,
-            "json-ld" | "jsonld" => RdfFormat::JsonLd {
-                profile: oxrdfio::JsonLdProfileSet::empty(),
-            },
-            "jsonld-streaming" | "json-ld-streaming" => RdfFormat::JsonLd {
-                profile: oxrdfio::JsonLdProfile::Streaming.into(),
-            },
-            "n3" => RdfFormat::N3,
-            "rdf/json" | "rdfjson" | "rj" => return Some(DataSyntax::Jena(JenaFormat::RdfJson)),
-            "trix" => return Some(DataSyntax::Jena(JenaFormat::TriX)),
-            _ => return None,
-        }))
+        if let Some(f) = crate::syntaxes::by_name(name) {
+            return Some(DataSyntax::Rdf(f));
+        }
+        match name.to_ascii_lowercase().as_str() {
+            "rdf/json" | "rdfjson" | "rj" => Some(DataSyntax::Jena(JenaFormat::RdfJson)),
+            "trix" => Some(DataSyntax::Jena(JenaFormat::TriX)),
+            _ => None,
+        }
     }
 }
 

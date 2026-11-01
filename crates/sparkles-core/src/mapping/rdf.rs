@@ -988,7 +988,8 @@ fn sql_decl(connection: &str, query: SqlQuery) -> SourceDecl {
 
 // ------------------------------------------------------------------- printing ----
 
-fn turtle_string(s: &str) -> String {
+/// `s` as a Turtle string literal, with its quotes, backslashes and line breaks escaped.
+pub(super) fn turtle_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

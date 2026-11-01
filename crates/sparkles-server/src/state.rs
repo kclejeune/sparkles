@@ -5,8 +5,6 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use sparkles::store::StoreOptions;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "backup")]
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -536,29 +534,18 @@ impl Default for FormatConf {
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    sync_dir(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )
+    Ok(sparkles::fsutil::write_atomic_via(
+        path,
+        &PathBuf::from(tmp),
+        bytes,
+    )?)
 }
 
 /// Flush a directory's entries to stable storage (a no-op where directories cannot be
 /// opened for syncing).
 #[cfg(any(feature = "backup", feature = "auth"))]
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
+    Ok(sparkles::fsutil::sync_dir(dir)?)
 }
 
 pub fn now() -> String {

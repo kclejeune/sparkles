@@ -1703,14 +1703,11 @@ fn sorted(mut v: Vec<(QuadKey, bool)>) -> Vec<(bool, QuadKey)> {
 
 /// Write a file through a temporary one, durably.
 fn write_synced_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("idx.tmp");
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(crate::fsutil::write_atomic_via(
+        path,
+        &path.with_extension("idx.tmp"),
+        bytes,
+    )?)
 }
 
 #[cfg(unix)]

@@ -671,6 +671,42 @@ CSVW's processing rules, which warn about a problem and use the default and keep
 that fails its datatype as a plain string. The default stays strict, and the command
 line and uploads do not expose the mode.
 
+A bulk commit and a compaction switch to a new generation through one shared function,
+and the compaction's last catch-up sync uses the store writer's vocabulary-sync worker
+instead of starting a thread for each sync. A bulk commit reads the size of its new
+log before it switches `CURRENT`, so a failed read no longer leaves the writer on the
+old log after the switch (X14, item 474).
+
+The `pruned_join_order` optimization switch is gone, because the planner now orders
+joins with the program on cost summaries only. `SPARKLES_DISABLE_OPTIMIZATIONS` warns
+about the name as it does about any unknown one. A group of up to 12 inputs that share
+more than 128 variables now keeps the greedy plan instead of the exhaustive program's
+(X14, item 475).
+
+The optimization switches `flat_hash_join`, `selective_columns`, `delta_statistics`,
+`filter_key_ranges` and `filter_id_ranges` are gone, and their optimizations always
+apply. `SPARKLES_DISABLE_OPTIMIZATIONS` warns about these names, and
+`Optimizations::NONE` now uses the flat hash table, selective column decoding, the
+corrected statistics and the key ranges of a fixed string start (X14, item 476).
+
+Every reader of RDF syntax names, file extensions and media types uses one registry,
+so the aliases that one place accepted work everywhere. `--format`, `format=` and
+syntax names accept `n-triples`, `n-quads`, `rdf/xml`, `rdf-xml` and `xml` wherever
+they name a syntax, `.owl` and `.xml` files read as RDF/XML in ShEx schemas and Fuseki
+configuration files, and `.json` configuration files read as JSON-LD. Durations accept
+`ms` and compound terms such as `1d 12h` everywhere the server or the backup policy reads
+one, and the auth configuration accepts weeks. The change-log index syncs its directory
+after it replaces its file. `sparkles map draft` escapes line breaks and quotes in table
+and column names, including in the template of a table without a primary key, which
+could produce invalid Turtle, and escapes backslashes in template column names (X14,
+item 477).
+
+The environment variables `SPARKLES_NUMERIC_COLUMN` and `SPARKLES_WRITEBACK` and the
+hidden server flags `--no-wal-direct-writes` and `--no-group-commit-idle-direct` are
+gone. They selected an implementation for comparisons, and the numeric column, steady
+writeback, direct log writes and the idle group bypass now always apply outside tests
+(X14, item 478).
+
 ### Fixed
 
 Zero-or-more, one-or-more and zero-or-one property paths stay within the query memory

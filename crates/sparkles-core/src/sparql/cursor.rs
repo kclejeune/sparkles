@@ -3742,7 +3742,7 @@ impl Scan {
             return Ok(SharedAttempt::Unsupported);
         };
         let index = ctx.snap.perm(self.spec.perm);
-        let mask = exec::scan_mask(ctx, &self.spec);
+        let mask = exec::scan_mask(&self.spec);
         while self.at < self.ranges.len() {
             ctx.check()?;
             let (lo, hi, _) = self.ranges[self.at];
@@ -3889,7 +3889,7 @@ impl Scan {
             .map(|v| self.spec.cols.iter().find(|(_, x)| x == v).unwrap().0)
             .collect::<Vec<_>>();
         let mut out = Buffer::new(ctx, vars, cap)?;
-        let mask = exec::scan_mask(ctx, &self.spec);
+        let mask = exec::scan_mask(&self.spec);
         let mut step = ScanStep::default();
         while out.table.len < cap {
             ctx.check()?;

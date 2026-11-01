@@ -160,10 +160,6 @@ fn check(s: &Store, q: &str) -> bool {
     assert_eq!(a, solutions(&run(s, q, Optimizations::NONE)), "{q}");
     let counts = Optimizations::ALL.disable("filter_scan_runs").unwrap();
     assert_eq!(a, solutions(&run(s, q, counts)), "{q}");
-    let whole = Optimizations::ALL.disable("filter_key_ranges").unwrap();
-    assert_eq!(a, solutions(&run(s, q, whole)), "{q}");
-    let every_key = Optimizations::ALL.disable("filter_id_ranges").unwrap();
-    assert_eq!(a, solutions(&run(s, q, every_key)), "{q}");
     has_op(&fast.plan, "CountFilterFromRuns") || has_desc(&fast.plan, "[runs of ?")
 }
 
@@ -264,13 +260,11 @@ fn id_ranges_match_reading_every_key() {
     let generic = Optimizations::ALL
         .disable("count_filter_runs,filter_scan_runs")
         .unwrap();
-    let every_key = generic.disable("filter_id_ranges").unwrap();
     let check = |s: &Store| {
         for f in filters {
             let q = shape.replace("{E}", &f.replace("{X}", "?v"));
             let a = solutions(&run(s, &q, generic));
             assert!(!a.is_empty() || f.contains("zzz"), "{q}");
-            assert_eq!(a, solutions(&run(s, &q, every_key)), "{q}");
             assert_eq!(a, solutions(&run(s, &q, Optimizations::NONE)), "{q}");
         }
     };
@@ -322,13 +316,6 @@ fn prefix_filters_are_costed_by_their_key_ranges() {
         // 120 rows in the range of "The B", read in 3 key ranges
         let cost = filter_cost(&fast.plan).unwrap();
         assert!(cost < 200.0, "{q}: {cost}");
-        let off = run(
-            &s,
-            &q,
-            Optimizations::ALL.disable("filter_id_ranges").unwrap(),
-        );
-        assert!(filter_cost(&off.plan).unwrap() >= 6000.0, "{q}");
-        assert_eq!(a, solutions(&off), "{q}");
         assert_eq!(a, solutions(&run(&s, &q, Optimizations::NONE)), "{q}");
     }
 }

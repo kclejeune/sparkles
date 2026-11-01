@@ -1,7 +1,7 @@
 //! Hash joins over a flat table, merge left joins and galloping index joins: random
 //! tables (duplicates, unbound values, one to three shared variables in any column
 //! order) and random queries over stores of one or many blocks give the same rows with
-//! each switch on and off. The flat hash join also gives them in the same order.
+//! each switch on and off. The flat hash join gives the rows of a nested-loop join.
 
 use super::exec::{join_tables, left_join};
 use super::indexjoin_tests::random_trig;
@@ -75,17 +75,42 @@ fn shapes(ctx: &Ctx) -> Vec<(Vec<VarId>, Vec<VarId>)> {
     ]
 }
 
+/// The rows of the join of `l` and `r` over `vars`, by comparing every pair of rows, with
+/// the unmatched rows of `l` when `left` is set (an OPTIONAL without a condition).
+fn nested_loop(l: &Table, r: &Table, vars: &[VarId], left: bool) -> Vec<Vec<Id>> {
+    let value = |t: &Table, i: usize, v: VarId| t.col_of(v).map_or(Id::UNDEF, |c| t.cols[c][i]);
+    let mut rows = Vec::new();
+    for i in 0..l.len() {
+        let mut matched = false;
+        for j in 0..r.len() {
+            let fits = l.vars.iter().filter(|v| r.vars.contains(v)).all(|&v| {
+                let (a, b) = (value(l, i, v), value(r, j, v));
+                a == Id::UNDEF || b == Id::UNDEF || a == b
+            });
+            if fits {
+                matched = true;
+                rows.push(
+                    vars.iter()
+                        .map(|&v| match value(l, i, v) {
+                            Id::UNDEF => value(r, j, v),
+                            x => x,
+                        })
+                        .collect(),
+                );
+            }
+        }
+        if left && !matched {
+            rows.push(vars.iter().map(|&v| value(l, i, v)).collect());
+        }
+    }
+    rows.sort();
+    rows
+}
+
 #[test]
-fn flat_hash_joins_give_the_rows_of_per_key_lists_in_the_same_order() {
+fn flat_hash_joins_give_the_rows_of_a_nested_loop_join() {
     let s = Store::in_memory(StoreOptions::default());
     let on = ctx_with(&s, Optimizations::ALL);
-    let off = ctx_with(
-        &s,
-        Optimizations {
-            flat_hash_join: false,
-            ..Optimizations::ALL
-        },
-    );
     let mut next = xorshift(0x2545_f491_4f6c_dd1d);
     for round in 0..400 {
         for (lv, rv) in shapes(&on) {
@@ -103,16 +128,19 @@ fn flat_hash_joins_give_the_rows_of_per_key_lists_in_the_same_order() {
             if round % 4 == 2 {
                 r.sort_by_vars(&rv[..1]);
             }
+            let mut vars = lv.clone();
+            vars.extend(rv.iter().filter(|v| !lv.contains(v)));
+            let want = nested_loop(&l, &r, &vars, false);
             for merge in [false, true] {
                 let a = join_tables(&on, &l, &r, &[], merge).unwrap();
-                let b = join_tables(&off, &l, &r, &[], merge).unwrap();
-                assert_eq!(a.vars, b.vars, "round {round}");
-                assert_eq!(a.cols, b.cols, "round {round}: {lv:?} {rv:?}");
-                assert_eq!(a.sorted, b.sorted, "round {round}");
+                assert_eq!(bag(&a, &vars), want, "round {round}: {lv:?} {rv:?}");
             }
             let a = left_join(&on, &l, &r, None, &mut None).unwrap();
-            let b = left_join(&off, &l, &r, None, &mut None).unwrap();
-            assert_eq!(a.cols, b.cols, "round {round}: left join {lv:?} {rv:?}");
+            assert_eq!(
+                bag(&a, &vars),
+                nested_loop(&l, &r, &vars, true),
+                "round {round}: left join {lv:?} {rv:?}"
+            );
         }
     }
 }
@@ -125,7 +153,6 @@ fn merge_left_joins_keep_the_left_order_and_the_rows_of_hash_left_joins() {
         &s,
         Optimizations {
             merge_left_join: false,
-            flat_hash_join: false,
             ..Optimizations::ALL
         },
     );
@@ -303,13 +330,6 @@ fn optional_and_join_queries_give_the_same_rows_with_each_switch() {
                         "no merge left join",
                         Optimizations {
                             merge_left_join: false,
-                            ..Optimizations::ALL
-                        },
-                    ),
-                    (
-                        "no flat hash",
-                        Optimizations {
-                            flat_hash_join: false,
                             ..Optimizations::ALL
                         },
                     ),

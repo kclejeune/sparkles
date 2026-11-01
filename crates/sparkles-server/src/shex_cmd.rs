@@ -245,15 +245,10 @@ mod enabled {
     fn hint(path: &Path, given: Option<&str>) -> Option<SchemaFormat> {
         use sparkles::io::RdfFormat;
         let ext = path.extension().and_then(|e| e.to_str());
-        let rdf = match ext.map(str::to_ascii_lowercase).as_deref() {
-            Some("ttl" | "turtle") => Some(RdfFormat::Turtle),
-            Some("nt" | "ntriples") => Some(RdfFormat::NTriples),
-            Some("nq" | "nquads") => Some(RdfFormat::NQuads),
-            Some("trig") => Some(RdfFormat::TriG),
-            Some("rdf" | "owl" | "rdfxml") => Some(RdfFormat::RdfXml),
-            Some("n3") => Some(RdfFormat::N3),
-            _ => None,
-        };
+        // `.json` is ShExJ, not JSON-LD
+        let rdf = ext
+            .and_then(sparkles::syntaxes::by_extension)
+            .filter(|f| !matches!(f, RdfFormat::JsonLd { .. }));
         match given.and_then(SchemaFormat::from_name) {
             Some(SchemaFormat::ShExR(turtle)) => Some(SchemaFormat::ShExR(rdf.unwrap_or(turtle))),
             Some(f) => Some(f),

@@ -206,19 +206,11 @@ struct Cli {
     /// journal commit, which on ext4 and XFS takes a fraction of the time
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_WAL_PREALLOC_BYTES >> 10)]
     wal_prealloc_kb: u64,
-    /// Write commits to the write-ahead log with buffered writes and fdatasync instead of
-    /// direct writes with O_DSYNC (Linux), for comparing the two
-    #[arg(long, global = true, hide = true)]
-    no_wal_direct_writes: bool,
     /// Commit each write with its own synchronization instead of letting concurrent
     /// commits share one (group commit, on by default). SPARKLES_GROUP_COMMIT=off does the
     /// same
     #[arg(long, global = true)]
     no_group_commit: bool,
-    /// With group commit on, send every commit through the group, including one that is
-    /// the only writer (which otherwise commits with write-through writes), for comparing
-    #[arg(long, global = true, hide = true)]
-    no_group_commit_idle_direct: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -355,22 +347,16 @@ enum SnapshotCmd {
     },
 }
 
-/// `90s`, `30m`, `12h`, `7d`, `2w`, or plain seconds, to milliseconds.
+/// `90s`, `30m`, `12h`, `7d`, `2w` (see [`sparkles::duration::parse_duration`]), or
+/// plain seconds, to milliseconds.
 pub(crate) fn parse_duration_ms(s: &str) -> Result<u64> {
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (num, unit) = s.split_at(split);
-    let n: u64 = num
-        .parse()
-        .with_context(|| format!("invalid duration {s:?}"))?;
-    let secs = match unit {
-        "" | "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 604_800,
-        _ => bail!("invalid duration {s:?}: use s, m, h, d or w"),
+    let d = match s.trim().parse::<u64>() {
+        Ok(secs) => secs.checked_mul(1000),
+        Err(_) => {
+            sparkles::duration::parse_duration(s).and_then(|d| u64::try_from(d.as_millis()).ok())
+        }
     };
-    Ok(n * secs * 1000)
+    d.with_context(|| format!("invalid duration {s:?}: use ms, s, m, h, d or w"))
 }
 
 fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
@@ -2225,7 +2211,6 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
-        wal_direct_writes: !cli.no_wal_direct_writes,
         group_commit: {
             let (on, warning) = group_commit_setting(
                 cli.no_group_commit,
@@ -2236,7 +2221,6 @@ fn store_opts(cli: &Cli) -> StoreOptions {
             }
             on
         },
-        group_commit_idle_direct: !cli.no_group_commit_idle_direct,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
         build: sparkles::builder::BuildOptions {

@@ -40,8 +40,7 @@ pub const STATUS_FILE: &str = "validation-status.json";
 /// reads it). Like [`STATUS_FILE`] it is not one of [`FILES`], so a copy of the
 /// database, a branch or a backup starts without it.
 pub const TYPING_FILE: &str = "validation-typing.bin";
-/// The reasoner's graph of materialized inferences.
-pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+pub use crate::INFERRED_GRAPH;
 
 /// The language of `<root>/validation.json`: `None` without a file, SHACL when the file
 /// has no `language` (format 1). A file that is not JSON, or names another language, is

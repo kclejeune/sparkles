@@ -73,23 +73,20 @@ impl SolutionsFormat {
     }
 }
 
+/// The RDF syntax a result is written in, by a name or a media type of the syntax
+/// registry ([`crate::syntaxes`]). The generic JSON and XML media types, which also name
+/// result formats, and N3, which no writer writes, are not among them. JSON-LD's media
+/// type keeps its profile.
 pub fn rdf_format_from_name(s: &str) -> Option<RdfFormat> {
     let base = s.split(';').next()?.trim().to_ascii_lowercase();
-    Some(match base.as_str() {
-        "text/turtle" | "turtle" | "ttl" => RdfFormat::Turtle,
-        "application/n-triples" | "ntriples" | "nt" | "text/plain" => RdfFormat::NTriples,
-        "application/n-quads" | "nquads" | "nq" => RdfFormat::NQuads,
-        "application/trig" | "trig" => RdfFormat::TriG,
-        "application/rdf+xml" | "rdfxml" | "xml" => RdfFormat::RdfXml,
+    match base.as_str() {
         "application/ld+json" => return crate::io::format_for_media_type(s),
-        "jsonld" | "json-ld" => RdfFormat::JsonLd {
-            profile: oxrdfio::JsonLdProfileSet::empty(),
-        },
-        "jsonld-streaming" | "json-ld-streaming" => RdfFormat::JsonLd {
-            profile: oxrdfio::JsonLdProfile::Streaming.into(),
-        },
-        _ => return None,
-    })
+        "application/json" | "application/xml" | "text/xml" => return None,
+        _ => {}
+    }
+    crate::syntaxes::by_name(&base)
+        .or_else(|| crate::syntaxes::by_media_type(&base))
+        .filter(|f| *f != RdfFormat::N3)
 }
 
 pub fn rdf_media_type(f: RdfFormat) -> &'static str {

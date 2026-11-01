@@ -24,8 +24,8 @@
 //! about a millisecond is planned in rounds. Each round plans the subsets up to the
 //! largest size that fits, and the cheapest plan of that size joins its inputs into one
 //! for the next round. The result of the rounds can cost more than the exhaustive
-//! program's, but never more than the greedy plan. A group of more than 16 inputs keeps
-//! the greedy plan.
+//! program's, but never more than the greedy plan. A group of more than 16 inputs, or
+//! one whose inputs share more than 128 variables, keeps the greedy plan.
 
 use super::ctx::Ctx;
 use super::expr::Expr;
@@ -565,19 +565,16 @@ fn bits_of(mut m: u32) -> impl Iterator<Item = usize> + Clone {
 }
 
 /// The plan for a connected group of inputs (each with its access paths), placing the
-/// filters it can and removing them from `filters`. The inputs come back unplanned when
-/// they are 12 or fewer and the program on summaries cannot track them (more than 128
-/// variables shared between inputs), for the exhaustive program to plan.
+/// filters it can and removing them from `filters`. A group that the program cannot
+/// track, with more than 16 inputs or more than 128 variables shared between inputs,
+/// keeps the greedy plan.
 pub(super) fn order(
     pl: &Planner,
     mut items: Vec<Vec<Node>>,
     filters: &mut Vec<Expr>,
-) -> Result<std::result::Result<Node, Vec<Vec<Node>>>> {
+) -> Result<Node> {
     let g = Group::new(&items, filters, pl.ctx)?;
     let dp = Dp::prepare(&g, &items);
-    if dp.is_none() && items.len() <= 12 {
-        return Ok(Err(items));
-    }
     let greedy = Greedy::run(&g, &items, filters, pl.ctx)?;
     if let Some(mut dp) = dp {
         let bound = greedy.cost();
@@ -587,17 +584,46 @@ pub(super) fn order(
                 node.cost <= bound.unwrap_or(f64::INFINITY),
                 "plan dearer than the bound"
             );
-            // the program places only the first 64 filters (see `Planner::dp`)
+            // the program places only the first 64 filters (see `place_masked`)
             let mut i = 0;
             filters.retain(|_| {
                 let keep = i >= 64 || applied & (1u64 << i) == 0;
                 i += 1;
                 keep
             });
-            return Ok(Ok(node));
+            return Ok(node);
         }
     }
-    Ok(Ok(greedy.build(items, filters, pl)?))
+    greedy.build(items, filters, pl)
+}
+
+/// Place on `n` the filters among the first 64 of `filters` that `applied` does not
+/// mark and whose variables `n` binds, and return `n` with `applied` and those filters
+/// marked. `fvars` holds each filter's variables, with an impossible variable for one
+/// that holds an EXISTS, which is never placed here.
+pub(super) fn place_masked(
+    pl: &Planner,
+    n: Node,
+    applied: u64,
+    filters: &[Expr],
+    fvars: &[Vec<VarId>],
+) -> (Node, u64) {
+    let mut now = Vec::new();
+    let mut mask = applied;
+    for (i, f) in filters.iter().enumerate().take(64) {
+        if mask & (1 << i) == 0
+            && !fvars[i].is_empty()
+            && fvars[i].iter().all(|v| n.vars.contains(v))
+        {
+            now.push(f.clone());
+            mask |= 1 << i;
+        }
+    }
+    if now.is_empty() {
+        (n, mask)
+    } else {
+        (plan::filter(n, now, pl.ctx), mask)
+    }
 }
 
 // ------------------------------------------------------------------------------
@@ -1369,7 +1395,7 @@ impl Dp {
                     .take(64)
                     .any(|fv| !fv.is_empty() && fv.iter().all(|v| o.vars.contains(v)))
                 {
-                    filtered = pl.apply_dp_filters(o.clone(), 0, filters, &fvars).0;
+                    filtered = place_masked(pl, o.clone(), 0, filters, &fvars).0;
                     &filtered
                 } else {
                     o
@@ -1815,11 +1841,11 @@ impl Dp {
             let e = self.ents[x as usize];
             let (n, f) = if e.mask.is_power_of_two() {
                 let leaf = std::mem::replace(&mut items[e.a as usize][e.b as usize], Node::unit());
-                pl.apply_dp_filters(leaf, 0, filters, &fvars)
+                place_masked(pl, leaf, 0, filters, &fvars)
             } else {
                 let (na, fa) = built.remove(&e.a).unwrap();
                 let (nb, fb) = built.remove(&e.b).unwrap();
-                pl.apply_dp_filters(build_join(na, nb, e.how, ctx), fa | fb, filters, &fvars)
+                place_masked(pl, build_join(na, nb, e.how, ctx), fa | fb, filters, &fvars)
             };
             debug_assert!(
                 n.cost.to_bits() == e.sum.cost.to_bits() && n.est.to_bits() == e.sum.est.to_bits(),

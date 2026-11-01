@@ -1005,7 +1005,7 @@ pub(super) fn key_filter_mask(
     // the vocabulary ids whose keys are read: with a fixed start, only those of the keys
     // with that start (the vocabulary is sorted by key), the others fail unread
     let spans: Vec<(usize, usize)> = match kf.key_prefixes() {
-        Some(prefixes) if ctx.opt.filter_id_ranges => {
+        Some(prefixes) => {
             let mut spans: Vec<(usize, usize)> = prefixes
                 .iter()
                 .map(|p| {

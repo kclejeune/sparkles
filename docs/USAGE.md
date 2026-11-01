@@ -538,7 +538,7 @@ happens to materialized inferences, and the limits.
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
 | `--embedding-secret NAME=SOURCE` | | A secret that vector indexes may name as their embedding API key: `NAME=env:VARIABLE` or `NAME=file:PATH`, read when a request is made. Repeatable. See [Embeddings computed on write](#embeddings-computed-on-write). |
 | `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
-| `--wal-prealloc-kb N` | `4096` | The most a write-ahead log grows ahead of its commits at once, as zero bytes written and synced in advance; `0` means each commit appends to the file. A commit that overwrites preallocated bytes syncs them without a file-system journal commit, which on ext4 and XFS is faster and no longer waits behind other files' writeback. On Linux, a commit of up to 64 KiB that lands inside preallocated space is written with `O_DIRECT` and `O_DSYNC`, which the device can complete as a forced-unit-access write instead of a full cache flush. The update vocabulary `delta.vocab` grows the same way, by up to 1 MiB at a time, and a commit that adds terms writes them as one checksummed chunk with `O_DIRECT` and `O_DSYNC` at the same time as its log records, so it no longer waits for a journal commit either. A file system that refuses direct I/O falls back to buffered writes and `fdatasync`, and the hidden `--no-wal-direct-writes` flag forces that path for both files. The log ends at its last commit and the vocabulary at its last chunk for readers, backups and the quota, and a close trims the zeros. A global flag. |
+| `--wal-prealloc-kb N` | `4096` | The most a write-ahead log grows ahead of its commits at once, as zero bytes written and synced in advance; `0` means each commit appends to the file. A commit that overwrites preallocated bytes syncs them without a file-system journal commit, which on ext4 and XFS is faster and no longer waits behind other files' writeback. On Linux, a commit of up to 64 KiB that lands inside preallocated space is written with `O_DIRECT` and `O_DSYNC`, which the device can complete as a forced-unit-access write instead of a full cache flush. The update vocabulary `delta.vocab` grows the same way, by up to 1 MiB at a time, and a commit that adds terms writes them as one checksummed chunk with `O_DIRECT` and `O_DSYNC` at the same time as its log records, so it no longer waits for a journal commit either. A file system that refuses direct I/O falls back to buffered writes and `fdatasync`. The log ends at its last commit and the vocabulary at its last chunk for readers, backups and the quota, and a close trims the zeros. A global flag. |
 | `--no-group-commit` | | Give every commit its own synchronization. By default concurrent commits of a persistent dataset share one, and each is acknowledged only once it is durable. Datasets with a full-text, spatial or embedding index group their commits too, except while a full-text index recovers or rebuilds, or while a spatial index builds or after its build failed. Grouping holds up to 64 commits or 4 MiB of log records per dataset in memory, plus the speculative snapshots of the commits in flight. `SPARKLES_GROUP_COMMIT=off`, `false`, `no` or `0` does the same, and an unrecognised value logs a warning and is ignored. Node takes `groupCommit: false` and Python `group_commit=False`. The JVM library has no option and always groups a persistent dataset. A global flag. |
 | `--no-patterns` | | Build no predicate patterns (`patterns.bin`) when a bulk load or a compaction writes a generation. Predicate listings and `spk:hasPredicate` then read the permutations. A global flag. |
 | `--pattern-memory-mb N` | `1024` | Memory for the distinct predicate patterns while a bulk load or a compaction builds them. A generation that needs more is built without patterns, the reason is logged and kept in its `meta.json`, and queries read the permutations. A global flag. |
@@ -929,8 +929,7 @@ The other commands are:
   stores because their lexical form is not canonical, such as `"48.85"^^xsd:float` or
   any `xsd:int`. Range filters, sorts and aggregates over those literals read 8 bytes
   per value from the column instead of decoding each key. A database without the file
-  answers the same queries by decoding the keys, and `SPARKLES_NUMERIC_COLUMN=off`
-  turns the column off.
+  answers the same queries by decoding the keys.
 
 `sparkles help COMMAND` describes each one.
 
@@ -958,7 +957,7 @@ pages, so `man sparkles-serve` works after `nix profile install`.
 `--format yaml` prints it as YAML. A running server serves the same document at
 `/$/openapi.json` ([API.md](API.md#openapi-description)).
 
-Four environment variables change I/O paths for comparisons.
+Three environment variables change cold-read paths for comparisons.
 `SPARKLES_IO_HINTS=off` maps the index and vocabulary files without access hints, so
 that a page fault reads the device's whole read-ahead window and blocks are not read
 ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
@@ -967,10 +966,8 @@ ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
 that budget. Whole-block progress can extend it through one next block and its bridged
 gap, which is at most 64 KiB. It bounds requested coverage rather than physical I/O in
 flight. Zero restores per-block hints. Cached columns that are evicted before consumption
-receive fallback advice at the block they need.
-`SPARKLES_WRITEBACK=off` leaves the permutation and vocabulary files of an index build
-to the kernel's own writeback. By default the build sends them to the device as it
-writes them.
+receive fallback advice at the block they need. An index build sends its permutation and
+vocabulary files to the device as it writes them.
 
 `SPARKLES_UI_DIR=DIR` makes the server read the web UI from a UI build directory, such as
 `ui/build`, instead of the copy embedded in the binary. The Nix package sets it to its UI

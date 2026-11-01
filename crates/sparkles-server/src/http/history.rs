@@ -306,17 +306,7 @@ pub(crate) fn parse_age(v: &J) -> Option<u64> {
     match v {
         J::Number(n) => n.as_u64().map(|s| s * 1000),
         J::String(s) => {
-            let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
-            let n: u64 = num.parse().ok()?;
-            let secs = match unit {
-                "s" => 1,
-                "m" => 60,
-                "h" => 3600,
-                "d" => 86_400,
-                "w" => 604_800,
-                _ => return None,
-            };
-            Some(n * secs * 1000)
+            sparkles::duration::parse_duration(s).and_then(|d| u64::try_from(d.as_millis()).ok())
         }
         _ => None,
     }

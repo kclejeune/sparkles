@@ -1770,11 +1770,7 @@ impl<'a> Engine<'a> {
         let (kc, nc, pc) = lane.cols();
         let gc = lane.perm.col_of(crate::index::G);
         let prefix: Vec<u64> = lane.p.into_iter().collect();
-        let mask = if self.ctx.opt.selective_columns {
-            (1 << kc) | (1 << nc) | (1 << gc) | pc.map_or(0, |c| 1 << c)
-        } else {
-            crate::index::ALL_COLS
-        };
+        let mask = (1 << kc) | (1 << nc) | (1 << gc) | pc.map_or(0, |c| 1 << c);
         let graph = &self.spec.graph;
         let dedup = self.dedup;
         let fixed_p = lane.p.unwrap_or(0);

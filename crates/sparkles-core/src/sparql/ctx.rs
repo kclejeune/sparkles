@@ -111,8 +111,6 @@ pub struct Optimizations {
     /// ORDER BY a scan's variable with LIMIT reads the scan in value order and stops once
     /// the first rows are proven
     pub ordered_topk: bool,
-    /// scans decode (and cache) only the key columns they read
-    pub selective_columns: bool,
     /// spatial FILTERs on an indexed predicate's object search the spatial index
     pub spatial_pushdown: bool,
     /// `FILTER (NOT) EXISTS` over a join group probes a key set built once from the
@@ -137,26 +135,12 @@ pub struct Optimizations {
     /// ORDER BY several keys with LIMIT evaluates the later keys only on the rows that
     /// the first key does not rule out
     pub topk_first_key: bool,
-    /// counts from the index statistics are corrected for the snapshot's delta and for
-    /// quads in graphs the query does not read, instead of being used only when neither
-    /// exists
-    pub delta_statistics: bool,
-    /// join ordering runs the dynamic program on cost summaries, over subsets connected
-    /// by shared variables, and drops partial plans dearer than a greedy plan; off: the
-    /// program builds every candidate plan tree for every split
-    pub pruned_join_order: bool,
     /// COUNT(*) over a FILTER on one variable of a single scan tests the filter once per
     /// run of the variable in a permutation sorted on it and sums the run lengths
     pub count_filter_runs: bool,
     /// a FILTER over a scan sorted on a variable it tests reads the runs of that
     /// variable, tests each value once and copies only the rows of the values that pass
     pub filter_scan_runs: bool,
-    /// those two read only the key ranges of the values whose string starts as a
-    /// `STRSTARTS` or a `REGEX` anchored on a literal start requires
-    pub filter_key_ranges: bool,
-    /// hash joins group the build side's rows by key in one flat array instead of a list
-    /// per key
-    pub flat_hash_join: bool,
     /// index joins find each key's rows by galloping from the previous key's position
     /// and keep the current block, instead of a binary search and a scan per cluster
     pub gallop_index_join: bool,
@@ -192,10 +176,6 @@ pub struct Optimizations {
     /// an index join with few keys asks the kernel to read every block it will visit
     /// before it decodes the first, so a cold server reads them in parallel
     pub prefetch_blocks: bool,
-    /// a FILTER tested on vocabulary keys whose `STRSTARTS` or start-anchored `REGEX`
-    /// fixes the start of the string rejects the base-vocabulary ids outside the id
-    /// ranges of the keys with that start, without reading their keys
-    pub filter_id_ranges: bool,
     /// a hash join whose right side is a `text:query` call without a limit searches only
     /// the subjects of a small left side
     pub text_subject_pushdown: bool,
@@ -231,7 +211,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 46] = [
+    pub const NAMES: [&str; 40] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -239,7 +219,6 @@ impl Optimizations {
         "batched_paths",
         "topk_prefilter",
         "ordered_topk",
-        "selective_columns",
         "spatial_pushdown",
         "decorrelate_exists",
         "batched_join",
@@ -249,12 +228,8 @@ impl Optimizations {
         "expr_cache",
         "anti_join",
         "topk_first_key",
-        "delta_statistics",
-        "pruned_join_order",
         "count_filter_runs",
         "filter_scan_runs",
-        "filter_key_ranges",
-        "flat_hash_join",
         "gallop_index_join",
         "merge_left_join",
         "probed_optional",
@@ -266,7 +241,6 @@ impl Optimizations {
         "probed_keys",
         "fused_star_costs",
         "prefetch_blocks",
-        "filter_id_ranges",
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
@@ -289,7 +263,6 @@ impl Optimizations {
         batched_paths: true,
         topk_prefilter: true,
         ordered_topk: true,
-        selective_columns: true,
         spatial_pushdown: true,
         decorrelate_exists: true,
         batched_join: true,
@@ -299,12 +272,8 @@ impl Optimizations {
         expr_cache: true,
         anti_join: true,
         topk_first_key: true,
-        delta_statistics: true,
-        pruned_join_order: true,
         count_filter_runs: true,
         filter_scan_runs: true,
-        filter_key_ranges: true,
-        flat_hash_join: true,
         gallop_index_join: true,
         merge_left_join: true,
         probed_optional: true,
@@ -316,7 +285,6 @@ impl Optimizations {
         probed_keys: true,
         fused_star_costs: true,
         prefetch_blocks: true,
-        filter_id_ranges: true,
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
@@ -339,7 +307,6 @@ impl Optimizations {
         batched_paths: false,
         topk_prefilter: false,
         ordered_topk: false,
-        selective_columns: false,
         spatial_pushdown: false,
         decorrelate_exists: false,
         batched_join: false,
@@ -349,12 +316,8 @@ impl Optimizations {
         expr_cache: false,
         anti_join: false,
         topk_first_key: false,
-        delta_statistics: false,
-        pruned_join_order: false,
         count_filter_runs: false,
         filter_scan_runs: false,
-        filter_key_ranges: false,
-        flat_hash_join: false,
         gallop_index_join: false,
         merge_left_join: false,
         probed_optional: false,
@@ -366,7 +329,6 @@ impl Optimizations {
         probed_keys: false,
         fused_star_costs: false,
         prefetch_blocks: false,
-        filter_id_ranges: false,
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
@@ -389,7 +351,6 @@ impl Optimizations {
             "batched_paths" => &mut self.batched_paths,
             "topk_prefilter" => &mut self.topk_prefilter,
             "ordered_topk" => &mut self.ordered_topk,
-            "selective_columns" => &mut self.selective_columns,
             "spatial_pushdown" => &mut self.spatial_pushdown,
             "decorrelate_exists" => &mut self.decorrelate_exists,
             "batched_join" => &mut self.batched_join,
@@ -399,12 +360,8 @@ impl Optimizations {
             "expr_cache" => &mut self.expr_cache,
             "anti_join" => &mut self.anti_join,
             "topk_first_key" => &mut self.topk_first_key,
-            "delta_statistics" => &mut self.delta_statistics,
-            "pruned_join_order" => &mut self.pruned_join_order,
             "count_filter_runs" => &mut self.count_filter_runs,
             "filter_scan_runs" => &mut self.filter_scan_runs,
-            "filter_key_ranges" => &mut self.filter_key_ranges,
-            "flat_hash_join" => &mut self.flat_hash_join,
             "gallop_index_join" => &mut self.gallop_index_join,
             "merge_left_join" => &mut self.merge_left_join,
             "probed_optional" => &mut self.probed_optional,
@@ -416,7 +373,6 @@ impl Optimizations {
             "probed_keys" => &mut self.probed_keys,
             "fused_star_costs" => &mut self.fused_star_costs,
             "prefetch_blocks" => &mut self.prefetch_blocks,
-            "filter_id_ranges" => &mut self.filter_id_ranges,
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,

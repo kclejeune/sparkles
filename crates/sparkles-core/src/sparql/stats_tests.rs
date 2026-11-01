@@ -10,10 +10,10 @@ use crate::io::RdfFormat;
 use crate::store::{Snapshot, Store, StoreOptions};
 use std::sync::Arc;
 
-/// Every optimization but the correction of the statistics.
-fn without_delta_statistics() -> Optimizations {
+/// Every optimization but the counts from the index statistics.
+fn without_metadata_counts() -> Optimizations {
     Optimizations {
-        delta_statistics: false,
+        metadata_counts: false,
         ..Optimizations::ALL
     }
 }
@@ -47,7 +47,7 @@ fn class_counts_from_statistics() {
     let after = same_answer(&s, q, "desc:corrected for 3 delta quads");
     assert_ne!(before, after);
     // switched off, the index runs are counted
-    let r = run(&s, q, without_delta_statistics());
+    let r = run(&s, q, without_metadata_counts());
     assert!(!has_op(&r.plan, "GroupCountFromMetadata"));
     assert!(has_op(&r.plan, "GroupCountFromIndex"));
     assert_eq!(solutions(&r), after);
@@ -167,7 +167,7 @@ fn distinct_counts_from_statistics() {
     let mut after = Vec::new();
     for q in queries {
         after.push(same_answer(&s, q, "desc:delta quads]"));
-        let r = run(&s, q, without_delta_statistics());
+        let r = run(&s, q, without_metadata_counts());
         assert!(has_op(&r.plan, "CountDistinctFromIndex"), "{q}");
     }
     assert_ne!(before, after);
@@ -275,19 +275,19 @@ fn statistics_answers(snap: &Arc<Snapshot>, opt: Optimizations) -> (Vec<Vec<Stri
 }
 
 /// Checks that the answers on `snap` equal the generic operators': with the correction
-/// within its usual work limit, without a limit, and switched off. Returns the generic
+/// within its usual work limit, without a limit, and with the statistics switched off. Returns the generic
 /// answers and, for each query, whether its plan without a limit corrected the
 /// statistics.
 fn check_statistics(snap: &Arc<Snapshot>, what: &str) -> (Vec<Vec<String>>, Vec<bool>) {
     let (slow, _) = statistics_answers(snap, Optimizations::NONE);
     let (fast, _) = statistics_answers(snap, Optimizations::ALL);
-    let (plain, _) = statistics_answers(snap, without_delta_statistics());
+    let (plain, _) = statistics_answers(snap, without_metadata_counts());
     super::stats::UNLIMITED.set(true);
     let (unlimited, corrected) = statistics_answers(snap, Optimizations::ALL);
     super::stats::UNLIMITED.set(false);
     for (i, (q, a)) in statistics_queries().iter().zip(&slow).enumerate() {
         assert_eq!(&fast[i], a, "{what}: {q}");
-        assert_eq!(&plain[i], a, "{what}, without the correction: {q}");
+        assert_eq!(&plain[i], a, "{what}, without the statistics: {q}");
         assert_eq!(&unlimited[i], a, "{what}, without a work limit: {q}");
     }
     (slow, corrected)
