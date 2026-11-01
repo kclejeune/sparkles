@@ -267,6 +267,20 @@ impl<'a> Pass<'a> {
         self.new.lookup_term(t)
     }
 
+    /// The index's estimate of the quads [`scan`](Self::scan) visits, without decoding
+    /// a block.
+    pub fn estimate(
+        &self,
+        w: Which,
+        s: Option<Id>,
+        p: Option<Id>,
+        o: Option<Id>,
+        g: GraphSel,
+    ) -> u64 {
+        let (perm, prefix) = scan_prefix(s, p, o, g);
+        self.snap(w).estimate(perm, &prefix)
+    }
+
     /// Visit the visible quads of snapshot `w` with the given positions bound, in graph
     /// `g`. The callback returns `false` to stop.
     pub fn scan(
@@ -279,18 +293,7 @@ impl<'a> Pass<'a> {
         f: &mut dyn FnMut([Id; 4]) -> Result<bool>,
     ) -> Result<()> {
         let snap = self.snap(w);
-        let (perm, prefix): (Perm, Vec<u64>) = match (s, p, o, g) {
-            (Some(s), Some(p), Some(o), _) => (Perm::Spo, vec![s.0, p.0, o.0]),
-            (Some(s), Some(p), None, _) => (Perm::Spo, vec![s.0, p.0]),
-            (Some(s), None, Some(o), _) => (Perm::Sop, vec![s.0, o.0]),
-            (None, Some(p), Some(o), _) => (Perm::Pos, vec![p.0, o.0]),
-            (Some(s), None, None, _) => (Perm::Spo, vec![s.0]),
-            (None, Some(p), None, _) => (Perm::Pso, vec![p.0]),
-            (None, None, Some(o), _) => (Perm::Osp, vec![o.0]),
-            (None, None, None, GraphSel::Exact(g)) => (Perm::Gspo, vec![g.0]),
-            (None, None, None, GraphSel::Default) => (Perm::Gspo, vec![Id::DEFAULT_GRAPH.0]),
-            (None, None, None, GraphSel::Named) => (Perm::Spo, vec![]),
-        };
+        let (perm, prefix) = scan_prefix(s, p, o, g);
         let mut stop = false;
         let mut each = |q: [Id; 4]| -> Result<bool> {
             #[cfg(test)]
@@ -600,5 +603,21 @@ impl<'a> Pass<'a> {
             ));
         }
         Ok(z.into_changes())
+    }
+}
+
+/// The permutation and key prefix that a scan with these positions bound reads.
+fn scan_prefix(s: Option<Id>, p: Option<Id>, o: Option<Id>, g: GraphSel) -> (Perm, Vec<u64>) {
+    match (s, p, o, g) {
+        (Some(s), Some(p), Some(o), _) => (Perm::Spo, vec![s.0, p.0, o.0]),
+        (Some(s), Some(p), None, _) => (Perm::Spo, vec![s.0, p.0]),
+        (Some(s), None, Some(o), _) => (Perm::Sop, vec![s.0, o.0]),
+        (None, Some(p), Some(o), _) => (Perm::Pos, vec![p.0, o.0]),
+        (Some(s), None, None, _) => (Perm::Spo, vec![s.0]),
+        (None, Some(p), None, _) => (Perm::Pso, vec![p.0]),
+        (None, None, Some(o), _) => (Perm::Osp, vec![o.0]),
+        (None, None, None, GraphSel::Exact(g)) => (Perm::Gspo, vec![g.0]),
+        (None, None, None, GraphSel::Default) => (Perm::Gspo, vec![Id::DEFAULT_GRAPH.0]),
+        (None, None, None, GraphSel::Named) => (Perm::Spo, vec![]),
     }
 }

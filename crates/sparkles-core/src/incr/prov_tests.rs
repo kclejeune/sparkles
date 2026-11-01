@@ -1019,6 +1019,35 @@ fn resolving_keys_stops_and_cancels() {
     assert!(cancelled <= 1024, "{cancelled} quads after cancellation");
 }
 
+/// An annotated build matches the patterns itself, and it reads the pattern with the
+/// fewest estimated quads next. With one large team, extending `?q memberOf ?t` by
+/// `?p memberOf ?t` would visit every pair of members, while `?p knows ?q` first visits
+/// a few quads per member.
+#[test]
+fn an_annotated_build_orders_patterns_by_estimate() {
+    let s = Store::in_memory(StoreOptions::default());
+    let n = 400;
+    let mut u = String::from("INSERT DATA {");
+    for i in 0..n {
+        u.push_str(&format!(
+            " <{NS}m{i}> <{NS}memberOf> <{NS}team> . <{NS}m{i}> <{NS}knows> <{NS}m{}> .",
+            (i + 1) % n
+        ));
+    }
+    u.push_str(" }");
+    sparql_update(&s, &u);
+    let q = format!(
+        "SELECT ?p ?q WHERE {{ ?p <{NS}knows> ?q . ?p <{NS}memberOf> ?t . ?q <{NS}memberOf> ?t }}"
+    );
+    let c = built(&s, &q, Provenance::Count);
+    assert_eq!(c.result.len(), n);
+    assert!(
+        c.build_scanned < 20 * n as u64,
+        "the build visited {} quads",
+        c.build_scanned
+    );
+}
+
 /// An OPTIONAL's filter reads left variables beyond the shared ones, so two rows
 /// without a match that differ only there have different conditions.
 #[test]

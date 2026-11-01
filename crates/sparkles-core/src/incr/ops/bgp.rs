@@ -211,6 +211,26 @@ impl Bgp {
         }
     }
 
+    /// The index's estimate of the quads that [`scan`](Self::scan) visits for pattern
+    /// `rp` under binding `b`.
+    fn estimate(p: &Pass, w: Which, rp: &RPat, b: &[Id]) -> u64 {
+        if rp.never() {
+            return 0;
+        }
+        let val = |r: R| match r {
+            R::Id(c) => Some(c),
+            R::Var(s) if !b[s].is_undef() => Some(b[s]),
+            _ => None,
+        };
+        let sel = match rp.g {
+            RG::Default => GraphSel::Default,
+            RG::Id(x) => GraphSel::Exact(x),
+            RG::Var(v) if !b[v].is_undef() => GraphSel::Exact(b[v]),
+            _ => GraphSel::Named,
+        };
+        p.estimate(w, val(rp.s), val(rp.p), val(rp.o), sel)
+    }
+
     /// Extend binding `b` by the patterns in `rest`, each read at `which(j)`.
     #[allow(clippy::too_many_arguments)]
     fn extend(
@@ -328,10 +348,18 @@ impl Bgp {
             out.push((row, w, a));
             return Ok(());
         }
+        // the build matches every pattern here rather than through the query engine, so
+        // it reads the pattern with the fewest estimated quads next
         let (k, _) = rest
             .iter()
             .enumerate()
-            .max_by_key(|(_, j)| rps[**j].bound(b))
+            .min_by_key(|(_, j)| {
+                let rp = &rps[**j];
+                (
+                    Self::estimate(p, which(**j), rp, b),
+                    std::cmp::Reverse(rp.bound(b)),
+                )
+            })
             .expect("rest is not empty");
         let j = rest.swap_remove(k);
         let mut found: Vec<(Vec<Id>, [Id; 4])> = Vec::new();

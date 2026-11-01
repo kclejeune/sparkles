@@ -293,6 +293,9 @@ pub struct Circuit {
     /// the annotations of the result's rows
     ann: AnnMap,
     facts: FactCache,
+    /// the quads the latest build's pattern matching visited, which tests read
+    #[cfg(test)]
+    pub(crate) build_scanned: u64,
 }
 
 /// Annotated changes split into the weights' changes, consolidated, and the changes
@@ -330,6 +333,8 @@ impl Circuit {
             prov: Provenance::None,
             ann: AnnMap::default(),
             facts: FactCache::default(),
+            #[cfg(test)]
+            build_scanned: 0,
         }
     }
 
@@ -597,7 +602,13 @@ impl Circuit {
             (w, Some(a))
         };
         let stats = p.stats;
+        #[cfg(test)]
+        let scanned = p.scanned.get();
         drop(p);
+        #[cfg(test)]
+        {
+            self.build_scanned = scanned;
+        }
         self.result = if self.keep_result {
             out.into_iter().collect()
         } else {

@@ -406,8 +406,63 @@ pub enum Ann {
     Why(Box<Why>),
 }
 
-/// The annotations of rows, beside a state's weights.
-pub type AnnMap = FxHashMap<Row, Ann>;
+/// The annotations of rows, beside a state's weights. It keeps the total size of its
+/// annotations, so that a state's memory is known without visiting every row.
+#[derive(Clone, Debug, Default)]
+pub struct AnnMap {
+    map: FxHashMap<Row, Ann>,
+    /// the sum of [`Ann::bytes`] over the annotations
+    bytes: u64,
+}
+
+impl std::ops::Deref for AnnMap {
+    type Target = FxHashMap<Row, Ann>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl AnnMap {
+    pub fn insert(&mut self, row: Row, a: Ann) -> Option<Ann> {
+        self.bytes += a.bytes();
+        let old = self.map.insert(row, a);
+        if let Some(o) = &old {
+            self.bytes -= o.bytes();
+        }
+        old
+    }
+
+    pub fn remove<Q>(&mut self, row: &Q) -> Option<Ann>
+    where
+        Row: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let old = self.map.remove(row);
+        if let Some(o) = &old {
+            self.bytes -= o.bytes();
+        }
+        old
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+
+    /// Keep only the rows for which `f` holds.
+    pub fn retain(&mut self, mut f: impl FnMut(&Row, &Ann) -> bool) {
+        let mut bytes = 0;
+        self.map.retain(|r, a| {
+            let keep = f(r, a);
+            if keep {
+                bytes += a.bytes();
+            }
+            keep
+        });
+        self.bytes = bytes;
+    }
+}
 
 /// Annotated changes: each row's weight change and the change of its annotation. A row
 /// may occur more than once, and an entry may change the annotation alone.
@@ -826,7 +881,7 @@ impl Ann {
 /// Write the annotations of a state.
 pub fn save_map(w: &mut Writer, m: &AnnMap) -> Result<()> {
     w.u64(m.len() as u64);
-    for (r, a) in m {
+    for (r, a) in m.iter() {
         w.row(r)?;
         a.save(w);
     }
@@ -846,20 +901,22 @@ pub fn load_map(r: &mut Reader, mode: Provenance) -> Result<AnnMap> {
 
 /// The approximate memory of a state's annotations.
 pub fn map_bytes(m: &AnnMap, width: usize) -> u64 {
-    m.values()
-        .map(|a| a.bytes() + super::zset::row_bytes(width))
-        .sum()
+    m.bytes + m.len() as u64 * super::zset::row_bytes(width)
 }
 
 /// Add change `d` to row `row`'s annotation in `m`, dropping it when it becomes zero,
 /// and return the effective change.
 pub fn absorb_row(m: &mut AnnMap, row: &Row, d: Ann, mode: Provenance) -> Ann {
     let max = mode.max_witnesses();
-    match m.get_mut(row) {
+    match m.map.get_mut(row) {
         Some(a) => {
+            let before = a.bytes();
             let e = a.absorb(d, max);
             if a.is_zero() {
-                m.remove(row);
+                m.map.remove(row);
+                m.bytes -= before;
+            } else {
+                m.bytes = m.bytes - before + a.bytes();
             }
             e
         }
@@ -962,6 +1019,60 @@ mod tests {
 
     fn fact(n: u128) -> Atom {
         Atom::Fact(FactKey(Key128::from_u128(n)))
+    }
+
+    /// An annotation map's byte total stays the sum over its rows through absorbs,
+    /// inserts, removals and retains, so a state's memory needs no visit of its rows.
+    #[test]
+    fn annotation_maps_keep_their_size() {
+        use crate::id::Id;
+        let mut rng = StdRng::seed_from_u64(11);
+        let id = |k: i64| Id::from_i64(k).expect("inline");
+        for mode in [
+            Provenance::Count,
+            Provenance::Lineage,
+            Provenance::Why { max_witnesses: 2 },
+        ] {
+            let mut m = AnnMap::default();
+            // the derivations each row holds, so that a removal removes one of them
+            let mut held: FxHashMap<i64, Vec<Ann>> = FxHashMap::default();
+            for _ in 0..2000 {
+                let k = rng.random_range(0..20);
+                let row: Row = vec![id(k)].into();
+                match rng.random_range(0..10) {
+                    0 => {
+                        m.remove(&row);
+                        held.remove(&k);
+                    }
+                    1 => {
+                        let a = Ann::derivation(mode, vec![fact(rng.random_range(0..5u128))]);
+                        m.insert(row, a.clone());
+                        held.insert(k, vec![a]);
+                    }
+                    2 => {
+                        m.retain(|r, _| r[0] != id(k));
+                        held.remove(&k);
+                    }
+                    _ => {
+                        let h = held.entry(k).or_default();
+                        if !h.is_empty() && rng.random_bool(0.4) {
+                            let d = h.swap_remove(rng.random_range(0..h.len()));
+                            absorb_row(&mut m, &row, d.scaled(-1), mode);
+                        } else {
+                            let atoms = (0..rng.random_range(1..3))
+                                .map(|_| fact(rng.random_range(0..5u128)))
+                                .collect();
+                            let d = Ann::derivation(mode, atoms);
+                            h.push(d.clone());
+                            absorb_row(&mut m, &row, d, mode);
+                        }
+                    }
+                }
+                let sum: u64 = m.values().map(Ann::bytes).sum();
+                let rows = m.len() as u64 * super::super::zset::row_bytes(1);
+                assert_eq!(map_bytes(&m, 1), sum + rows);
+            }
+        }
     }
 
     fn wit(v: &[u128]) -> Witness {
