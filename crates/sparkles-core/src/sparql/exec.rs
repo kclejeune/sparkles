@@ -7635,7 +7635,7 @@ impl Graph<'_> {
 
     /// Call `f` with every start node of a path with two unbound ends, in order: the
     /// sources of the edge relation of a path over a sequence or alternative without a
-    /// zero-length match, otherwise the nodes that [`start_chunk`] reads chunk by chunk,
+    /// zero-length match, otherwise the nodes that [`StartNodes`] reads chunk by chunk,
     /// so that the start nodes are never all held at once.
     fn each_start(&self, f: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
         if self.spec.min > 0 && self.spec.simple.is_none() {
@@ -7651,17 +7651,13 @@ impl Graph<'_> {
             }
             return Ok(());
         }
-        let mut after = None;
-        loop {
-            let (chunk, last) = start_chunk(self.ctx, self.spec, &self.graph, after)?;
-            for &x in &chunk {
+        let mut starts = StartNodes::new(self.spec);
+        while let Some(chunk) = starts.next(self.ctx, &self.graph)? {
+            for x in chunk {
                 f(x)?;
             }
-            if last {
-                return Ok(());
-            }
-            after = chunk.last().copied();
         }
+        Ok(())
     }
 }
 
@@ -7951,9 +7947,9 @@ pub(super) struct PathWalk {
     graph: usize,
     starts: Option<Vec<u64>>,
     start: usize,
-    /// The last start node read so far in the graph being walked, and whether no
-    /// start node follows the ones held.
-    after: Option<u64>,
+    /// Where the start nodes of the graph being walked continue, and whether no start
+    /// node follows the ones held.
+    cursor: Option<StartNodes>,
     last_chunk: bool,
     sweeps: std::cell::Cell<usize>,
     /// The edge relation of a path over a sequence or alternative.
@@ -7971,7 +7967,7 @@ impl PathWalk {
             graph: 0,
             starts: None,
             start: 0,
-            after: None,
+            cursor: None,
             last_chunk: false,
             sweeps: std::cell::Cell::new(0),
         })
@@ -7994,6 +7990,7 @@ impl PathWalk {
     /// The start nodes kept for the graph being walked.
     pub(super) fn retained(&self) -> usize {
         self.starts.as_ref().map_or(0, Vec::capacity)
+            + self.cursor.as_ref().map_or(0, StartNodes::retained)
     }
 
     /// The solutions of the next start node with any, or None when every graph has
@@ -8080,16 +8077,25 @@ impl PathWalk {
                         // As [`Graph::each_start`] finds them: the sources of the edge
                         // relation when the path has no zero-length match, otherwise
                         // the nodes of the next chunk.
-                        let (starts, last) = match g.fwd {
+                        let starts = match g.fwd {
                             Some(f) if spec.min > 0 => {
                                 let mut starts: Vec<u64> = f.keys().copied().collect();
                                 starts.sort_unstable();
-                                (starts, true)
+                                self.last_chunk = true;
+                                starts
                             }
-                            _ => start_chunk(ctx, spec, &g.graph, self.after)?,
+                            _ => {
+                                let cursor =
+                                    self.cursor.get_or_insert_with(|| StartNodes::new(spec));
+                                match cursor.next(ctx, &g.graph)? {
+                                    Some(chunk) => chunk,
+                                    None => {
+                                        self.last_chunk = true;
+                                        Vec::new()
+                                    }
+                                }
+                            }
                         };
-                        self.after = starts.last().copied();
-                        self.last_chunk = last;
                         self.starts = Some(starts);
                         self.start = 0;
                     }
@@ -8097,7 +8103,8 @@ impl PathWalk {
                     let Some(&x) = starts.get(self.start) else {
                         self.starts = None;
                         if self.last_chunk {
-                            self.after = None;
+                            self.cursor = None;
+                            self.last_chunk = false;
                             self.graph += 1;
                         }
                         continue;
@@ -8115,79 +8122,125 @@ impl PathWalk {
     }
 }
 
-/// The start nodes of a path with two variable ends that [`start_chunk`] reads at a
-/// time from each index it reads.
+/// The distinct start nodes that [`StartNodes`] reads at a time from each index.
 const START_CHUNK: usize = 4096;
 
-/// The next start nodes of a path with two variable ends after `after`, in order, and
-/// whether they are the last: the subjects of a simple path's predicate when the path
-/// has no zero-length match, otherwise every subject and object of the active graph.
-/// Each call reads at most about [`START_CHUNK`] distinct nodes from each index, so a
-/// walk over every node of a large graph holds a few thousand of them at a time
-/// rather than a set of all of them.
-fn start_chunk(
-    ctx: &Ctx,
-    spec: &PathSpec,
-    graph: &GraphFilter,
-    after: Option<u64>,
-) -> Result<(Vec<u64>, bool)> {
-    let from = match after {
-        None => 0,
-        Some(u64::MAX) => return Ok((Vec::new(), true)),
-        Some(a) => a + 1,
-    };
-    if spec.min > 0 {
-        let Some((p, rev)) = spec.simple else {
-            return Ok((Vec::new(), true));
-        };
-        let perm = if rev { Perm::Pos } else { Perm::Pso };
-        return distinct_from(ctx, perm, Some(p), from, graph);
-    }
-    let (subjects, s_last) = distinct_from(ctx, Perm::Spo, None, from, graph)?;
-    let (objects, o_last) = distinct_from(ctx, Perm::Osp, None, from, graph)?;
-    // Up to the smaller end of a list cut short, both lists hold every node.
-    let bound = match (s_last, o_last) {
-        (true, true) => u64::MAX,
-        (true, false) => *objects.last().expect("a list cut short is not empty"),
-        (false, true) => *subjects.last().expect("a list cut short is not empty"),
-        (false, false) => {
-            (*subjects.last().expect("cut short")).min(*objects.last().expect("cut short"))
+#[cfg(test)]
+thread_local! {
+    /// Index rows that start-node reads have visited on this thread.
+    static START_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The start nodes of a path with two variable ends, in order, a chunk at a time: the
+/// subjects of a simple path's predicate when the path has no zero-length match,
+/// otherwise every subject and object of the active graph. Each index is read on from
+/// where its last chunk stopped, so every index row is read once, and at most about
+/// [`START_CHUNK`] nodes of each index are held at a time rather than a set of all of
+/// them.
+pub(super) struct StartNodes {
+    sides: Vec<StartSide>,
+}
+
+/// The distinct nodes of one index column, read a chunk at a time.
+struct StartSide {
+    perm: Perm,
+    prefix: Option<u64>,
+    held: Vec<u64>,
+    at: usize,
+    from: u64,
+    done: bool,
+}
+
+impl StartSide {
+    fn new(perm: Perm, prefix: Option<u64>) -> Self {
+        Self {
+            perm,
+            prefix,
+            held: Vec::new(),
+            at: 0,
+            from: 0,
+            done: false,
         }
-    };
-    let mut out = Vec::with_capacity(subjects.len() + objects.len());
-    let (mut i, mut j) = (0, 0);
-    loop {
-        let x = match (subjects.get(i), objects.get(j)) {
-            (Some(&a), Some(&b)) if a == b => {
-                i += 1;
-                j += 1;
-                a
-            }
-            (Some(&a), Some(&b)) if a < b => {
-                i += 1;
-                a
-            }
-            (_, Some(&b)) => {
-                j += 1;
-                b
-            }
-            (Some(&a), None) => {
-                i += 1;
-                a
-            }
-            (None, None) => break,
-        };
-        if x > bound {
-            break;
-        }
-        out.push(x);
     }
-    Ok((out, s_last && o_last))
+
+    fn pending(&self) -> &[u64] {
+        &self.held[self.at..]
+    }
+
+    /// Read the next chunk once the held nodes are used up.
+    fn fill(&mut self, ctx: &Ctx, graph: &GraphFilter) -> Result<()> {
+        if self.at < self.held.len() || self.done {
+            return Ok(());
+        }
+        let (held, next) = distinct_from(ctx, self.perm, self.prefix, self.from, graph)?;
+        self.held = held;
+        self.at = 0;
+        match next {
+            Some(n) => self.from = n,
+            None => self.done = true,
+        }
+        Ok(())
+    }
+}
+
+impl StartNodes {
+    pub(super) fn new(spec: &PathSpec) -> Self {
+        let sides = if spec.min > 0 {
+            match spec.simple {
+                Some((p, rev)) => {
+                    vec![StartSide::new(
+                        if rev { Perm::Pos } else { Perm::Pso },
+                        Some(p),
+                    )]
+                }
+                None => Vec::new(),
+            }
+        } else {
+            vec![
+                StartSide::new(Perm::Spo, None),
+                StartSide::new(Perm::Osp, None),
+            ]
+        };
+        Self { sides }
+    }
+
+    /// The nodes held from each index.
+    fn retained(&self) -> usize {
+        self.sides.iter().map(|s| s.held.capacity()).sum()
+    }
+
+    /// The next start nodes in order, or `None` after the last.
+    pub(super) fn next(&mut self, ctx: &Ctx, graph: &GraphFilter) -> Result<Option<Vec<u64>>> {
+        for side in &mut self.sides {
+            side.fill(ctx, graph)?;
+        }
+        // Up to the smallest last node of a side with more to read, every side holds
+        // every node it has.
+        let bound = self
+            .sides
+            .iter()
+            .filter(|s| !s.done)
+            .filter_map(|s| s.pending().last().copied())
+            .min()
+            .unwrap_or(u64::MAX);
+        let mut out: Vec<u64> = Vec::new();
+        for side in &mut self.sides {
+            let take = side.pending().partition_point(|&x| x <= bound);
+            out.extend_from_slice(&side.pending()[..take]);
+            side.at += take;
+        }
+        if out.is_empty() {
+            return Ok(None);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(Some(out))
+    }
 }
 
 /// The distinct values from `from` on of the key column after `prefix` in `perm`,
-/// in order, of the quads in `graph`: at most [`START_CHUNK`] of them, and whether
-/// the scan reached the end of the range. The rows of a value already taken are
+/// in order, of the quads in `graph`: at most [`START_CHUNK`] of them, and the value
+/// the next read starts from, `None` when the scan reached the end of the range. The rows of a value already taken are
 /// skipped by a new seek past them once they run long, so a value with millions of
 /// quads, such as a common class, costs a seek rather than a read of its rows. The
 /// deadline is checked as rows are read.
@@ -8197,7 +8250,7 @@ fn distinct_from(
     prefix: Option<u64>,
     mut from: u64,
     graph: &GraphFilter,
-) -> Result<(Vec<u64>, bool)> {
+) -> Result<(Vec<u64>, Option<u64>)> {
     /// Rows of a value already taken that are read before seeking past it.
     const RUN: usize = 512;
     let col = usize::from(prefix.is_some());
@@ -8214,12 +8267,14 @@ fn distinct_from(
             Some(p) => ([p, from, 0, 0], [p, u64::MAX, u64::MAX, u64::MAX]),
             None => ([from, 0, 0, 0], [u64::MAX; 4]),
         };
-        // `Some(v)`: seek to v, past a long run; `None` with `cut`: the chunk is full
+        // `Some(v)`: seek to v, past a long run; `cut`: the chunk is full at value v
         let mut resume: Option<u64> = None;
-        let mut cut = false;
+        let mut cut: Option<u64> = None;
         let mut run = 0usize;
         let mut take = |v: u64, g: u64, out: &mut Vec<u64>| -> Result<bool> {
             rows += 1;
+            #[cfg(test)]
+            START_ROWS.with(|n| n.set(n.get() + 1));
             if rows.is_multiple_of(65_536) {
                 ctx.check()?;
             }
@@ -8234,7 +8289,7 @@ fn distinct_from(
             run = 0;
             if graph.accepts(g) {
                 if out.len() == START_CHUNK {
-                    cut = true;
+                    cut = Some(v);
                     return Ok(false);
                 }
                 out.push(v);
@@ -8259,9 +8314,10 @@ fn distinct_from(
             Ok(true)
         })?;
         ctx.check()?;
-        match resume {
-            Some(next) if !cut => from = next,
-            _ => return Ok((out, !cut)),
+        match (cut, resume) {
+            (Some(v), _) => return Ok((out, Some(v))),
+            (None, Some(next)) => from = next,
+            (None, None) => return Ok((out, None)),
         }
     }
 }
@@ -9600,6 +9656,58 @@ mod path_lookup_tests {
     use super::*;
     use crate::io::{RdfFormat, Source};
     use crate::store::{Store, StoreOptions};
+
+    /// Start nodes are read on from where each index stopped, so that rows of another
+    /// graph that one index has already passed are not read again for each chunk.
+    #[test]
+    fn start_nodes_read_each_index_row_once() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..20_000 {
+            data.push_str(&format!("_:b{i} <urn:p> <urn:one> <urn:g1> .\n"));
+        }
+        for i in 0..50_000 {
+            data.push_str(&format!("<urn:s:{i}> <urn:q> <urn:o:{i}> <urn:g2> .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let ctx = Ctx::new(store.snapshot());
+        let g1 = ctx
+            .intern_term(&oxrdf::Term::NamedNode(
+                oxrdf::NamedNode::new("urn:g1").unwrap(),
+            ))
+            .0;
+        let v = ctx.var("s");
+        let spec = PathSpec {
+            subj: PathEnd::Var(v),
+            obj: PathEnd::Var(ctx.var("o")),
+            min: 0,
+            max_one: false,
+            simple: None,
+            preds: None,
+            graph: GraphFilter::One(g1),
+            graph_var: None,
+            edge_vars: None,
+            count: None,
+            src: None,
+        };
+        let before = START_ROWS.with(|n| n.get());
+        let mut starts = StartNodes::new(&spec);
+        let mut nodes = Vec::new();
+        while let Some(chunk) = starts.next(&ctx, &GraphFilter::One(g1)).unwrap() {
+            assert!(nodes.last().is_none_or(|l| chunk[0] > *l));
+            nodes.extend(chunk);
+        }
+        let read = START_ROWS.with(|n| n.get()) - before;
+        assert_eq!(nodes.len(), 20_001);
+        // each of the 70,000 quads once in SPO and once in OSP, and a row per chunk
+        assert!(read <= 2 * 70_000 + 64, "{read} rows read");
+    }
 
     /// A lookup that reads many index rows checks the deadline even when the active
     /// graph rejects every row, so that no neighbour is added to its buffer.
