@@ -2,6 +2,7 @@
 //! applies to the change rows as it applies to the rows, and keeps no state.
 
 use super::super::pass::Pass;
+use super::super::prov::{AChanges, Ann};
 use super::super::zset::{Changes, Row};
 use super::Node;
 use crate::error::Result;
@@ -38,6 +39,29 @@ impl Filter {
         let c = self.inner.delta(p)?;
         self.apply(p, c)
     }
+
+    fn apply_a(&self, p: &mut Pass, c: AChanges) -> Result<AChanges> {
+        if c.is_empty() {
+            return Ok(c);
+        }
+        let rows: Vec<&[Id]> = c.iter().map(|(r, _, _)| &r[..]).collect();
+        let keep = p.eval(&self.inner.schema, &rows, &self.expr, true)?;
+        Ok(c.into_iter()
+            .zip(keep)
+            .filter(|(_, k)| *k == Some(Id::from_bool(true)))
+            .map(|(c, _)| c)
+            .collect())
+    }
+
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.init_a(p)?;
+        self.apply_a(p, c)
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.delta_a(p)?;
+        self.apply_a(p, c)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +97,32 @@ impl Extend {
         let c = self.inner.delta(p)?;
         self.apply(p, c)
     }
+
+    fn apply_a(&self, p: &mut Pass, c: AChanges) -> Result<AChanges> {
+        if c.is_empty() {
+            return Ok(c);
+        }
+        let rows: Vec<&[Id]> = c.iter().map(|(r, _, _)| &r[..]).collect();
+        let vals = p.eval(&self.inner.schema, &rows, &self.expr, false)?;
+        Ok(c.into_iter()
+            .zip(vals)
+            .map(|((r, w, a), v)| {
+                let mut row = r.into_vec();
+                row.push(v.unwrap_or(Id::UNDEF));
+                (row.into_boxed_slice(), w, a)
+            })
+            .collect())
+    }
+
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.init_a(p)?;
+        self.apply_a(p, c)
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.delta_a(p)?;
+        self.apply_a(p, c)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +155,29 @@ impl Project {
         let c = self.inner.delta(p)?;
         Ok(self.apply(c))
     }
+
+    fn apply_a(&self, c: AChanges) -> AChanges {
+        c.into_iter()
+            .map(|(r, w, a)| {
+                let row: Row = self
+                    .cols
+                    .iter()
+                    .map(|c| c.map_or(Id::UNDEF, |i| r[i]))
+                    .collect();
+                (row, w, a)
+            })
+            .collect()
+    }
+
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.init_a(p)?;
+        Ok(self.apply_a(c))
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.delta_a(p)?;
+        Ok(self.apply_a(c))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -123,7 +196,26 @@ fn pad(c: Changes, map: &[Option<usize>]) -> impl Iterator<Item = (Row, i64)> + 
     })
 }
 
+fn pad_a(c: AChanges, map: &[Option<usize>]) -> impl Iterator<Item = (Row, i64, Ann)> + '_ {
+    c.into_iter().map(move |(r, w, a)| {
+        let row: Row = map.iter().map(|c| c.map_or(Id::UNDEF, |i| r[i])).collect();
+        (row, w, a)
+    })
+}
+
 impl Union {
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let l = self.left.init_a(p)?;
+        let r = self.right.init_a(p)?;
+        Ok(pad_a(l, &self.lmap).chain(pad_a(r, &self.rmap)).collect())
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let l = self.left.delta_a(p)?;
+        let r = self.right.delta_a(p)?;
+        Ok(pad_a(l, &self.lmap).chain(pad_a(r, &self.rmap)).collect())
+    }
+
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         let l = self.left.init(p)?;
         let r = self.right.init(p)?;
@@ -154,5 +246,15 @@ impl Values {
             out.push((row, 1));
         }
         Ok(out)
+    }
+
+    /// The rows, each one derivation that uses no atom.
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let one = Ann::one(p.prov);
+        Ok(self
+            .init(p)?
+            .into_iter()
+            .map(|(r, w)| (r, w, one.clone()))
+            .collect())
     }
 }

@@ -18,8 +18,10 @@
 
 use super::*;
 use crate::incr::internal::{
-    self as internal, Counts, Dec, Enc, InternalAccess, InternalRows, InternalSpec, Sink, Tally,
+    self as internal, AnnotatedRows, Counts, Dec, Enc, InternalAccess, InternalRows, InternalSpec,
+    Sink, Tally,
 };
+use crate::incr::prov::{Annotation, FactKey};
 use spargebra::algebra::GraphPattern;
 
 /// An internal circuit with its state.
@@ -166,6 +168,67 @@ impl InternalCircuit {
         })
     }
 
+    /// The circuit's rows at its commit, each with its annotation (spec F13 §5). The
+    /// spec must keep a provenance setting.
+    pub fn annotated_rows(&self) -> Result<AnnotatedRows> {
+        let st = self.cell.state.lock();
+        if let Some(e) = status_error(&st.status) {
+            return Err(e);
+        }
+        if st.circuit.provenance().is_none() {
+            return Err(crate::incr::error(
+                "invalid-view",
+                "the internal circuit keeps no provenance",
+            ));
+        }
+        Ok(AnnotatedRows {
+            commit: st.circuit.applied,
+            columns: st.circuit.columns(),
+            rows: st
+                .circuit
+                .annotated_rows()
+                .into_iter()
+                .map(|(r, w, a)| (r, w.unsigned_abs(), a.unwrap_or_default()))
+                .collect(),
+        })
+    }
+
+    /// The quads that fact keys of the circuit's annotations name, at the circuit's
+    /// commit: each key with its subject, predicate, object and graph (`None`: the
+    /// default graph), or `None` when no quad of the circuit's patterns has the key.
+    #[allow(clippy::type_complexity)]
+    pub fn resolve(
+        &self,
+        keys: &[FactKey],
+    ) -> Result<Vec<(FactKey, Option<([Term; 3], Option<Term>)>)>> {
+        let st = self.cell.state.lock();
+        if let Some(e) = status_error(&st.status) {
+            return Err(e);
+        }
+        let control = self
+            .rt
+            .upgrade()
+            .map_or_else(Control::none, |rt| rt.control());
+        st.circuit.resolve_facts(keys, &control)
+    }
+
+    /// The negative conditions that the circuit's witnesses name: each number with its
+    /// operator and the pattern that must have no match.
+    pub fn conditions(&self) -> Vec<(u32, String)> {
+        self.cell.state.lock().circuit.conditions()
+    }
+
+    /// The annotation of one row of the circuit's result (`None` without provenance or
+    /// without the row).
+    pub fn annotation(&self, row: &[Option<Term>]) -> Option<Annotation> {
+        let st = self.cell.state.lock();
+        st.circuit
+            .annotated_rows()
+            .into_iter()
+            .find(|(r, _, _)| r.as_slice() == row)
+            .and_then(|(_, _, a)| a)
+    }
+
     /// The circuit's state's approximate memory, its counts' included.
     pub fn bytes(&self) -> u64 {
         let st = self.cell.state.lock();
@@ -222,6 +285,16 @@ fn groups(gp: &GraphPattern) -> bool {
     }
 }
 
+/// The kind of checkpoint a circuit writes and reads: format 2 when it keeps
+/// annotations, and format 1 otherwise.
+fn checkpoint_kind(c: &Circuit) -> persist::Kind {
+    if c.provenance().is_none() {
+        persist::INTERNAL
+    } else {
+        persist::INTERNAL_ANNOTATED
+    }
+}
+
 /// The directory of internal circuit `id`'s checkpoints.
 fn dir(root: &std::path::Path, id: &str) -> PathBuf {
     root.join(internal::DIR).join(id).join(BRANCH)
@@ -264,11 +337,18 @@ impl Runtime {
             }
             (Sink::Rows, _) => {}
         }
+        spec.provenance.check()?;
+        if !spec.provenance.is_none() && !matches!(spec.sink, Sink::Rows) {
+            return Err(invalid(
+                "provenance annotates rows, which an accumulator does not keep".into(),
+            ));
+        }
         let graphs = access.graphs;
         let whole = whole_reason(graphs.as_ref()).map(str::to_string);
         let compiled = compile(&q, whole.as_deref())?;
         let mut circuit = Circuit::new(compiled, graphs.clone());
         circuit.max_memory_bytes = Some(spec.max_memory_bytes);
+        circuit.set_provenance(spec.provenance)?;
         // an accumulator counts the changes and keeps no rows
         circuit.keep_result = matches!(spec.sink, Sink::Rows);
         let columns = circuit.columns();
@@ -307,6 +387,12 @@ impl Runtime {
             // the query reads, so a state of the other setting is not loaded
             h.update([u8::from(store.snapshot().union_default_graph)]);
             h.update([0]);
+            if !spec.provenance.is_none() {
+                h.update(b"provenance\0");
+                h.update(spec.provenance.name().as_bytes());
+                h.update((spec.provenance.max_witnesses() as u64).to_le_bytes());
+                h.update([0]);
+            }
             match &spec.sink {
                 Sink::Rows => h.update(b"rows"),
                 Sink::Accumulator { .. } => {
@@ -585,7 +671,7 @@ impl Runtime {
                     }
                 }
                 persist::write_as(
-                    persist::INTERNAL,
+                    checkpoint_kind(&st.circuit),
                     &dir(&root, &cell.spec.id),
                     &persist::Header {
                         dataset: self.dataset,
@@ -625,7 +711,7 @@ impl Runtime {
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let (h, body) = match persist::decode_as(persist::INTERNAL, &bytes) {
+            let (h, body) = match persist::decode_as(checkpoint_kind(&st.circuit), &bytes) {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(

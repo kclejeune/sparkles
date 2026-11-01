@@ -3155,6 +3155,16 @@ result has the key columns and the changed fact's own columns. Internal circuits
 not listed under `/$/views/{ds}`, `SERVICE view:read` does not read them, and they
 are checkpointed under `circuits/{id}/main/`.
 
+A rows circuit can keep a provenance annotation for each row (spec F13 §5), set with
+`InternalSpec::with_provenance` to `Provenance::Count`, `Provenance::Lineage` or
+`Provenance::Why { max_witnesses }` (`Provenance::why()` bounds it at 8).
+`annotated_rows()` returns each row with an `Annotation`, which holds the number of
+derivations, the lineage's atoms, the minimal witnesses and whether some derivation's
+atoms are unknown. An atom is either `Atom::Fact` with the `FactKey` of an input quad or
+`Atom::Absent` with a negative condition. `resolve(keys)` returns the quads that fact
+keys name at the circuit's commit, and `conditions()` describes each condition's
+operator and pattern. An accumulator does not take a provenance setting.
+
 ## Live queries
 
 `GET /{ds}/live?query=…` runs a SELECT, ASK or CONSTRUCT query that a view could be and

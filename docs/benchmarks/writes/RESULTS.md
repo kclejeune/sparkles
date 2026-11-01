@@ -734,3 +734,69 @@ builds switched between faster and slower writes within a process. Tracing chang
 timings, so these figures diagnose where the variation occurs rather than measure the
 inference change's cost. Item 265 requires a comparison with matched durable-write
 latency before attributing a difference to the engine.
+
+#### Provenance annotations
+
+The provenance annotations of
+[F13 §5](../../specs/F13-incremental-views-and-provenance.md#provenance-annotations) were
+measured with the same views and commit mix at 200,000 people, on an ephemeral Namespace
+instance with 8 AMD EPYC vCPUs and nothing else running. The
+[run record](runs/2026-11-01-provenance-annotations-nsc/README.md) holds the raw output,
+the builds' checksums and the script. Each figure is the median of three runs.
+
+The test `annotation_cost` attaches each view's query as an internal circuit that keeps
+its rows, once without provenance and once with each annotation, and times 200 rounds.
+
+| View | Provenance | Build ms | Pass median ms | Pass p95 ms | State MiB |
+|---|---|---:|---:|---:|---:|
+| `team-sizes` | none | 40.4 | 0.006 | 0.016 | 0.2 |
+| `team-sizes` | count | 54.5 | 0.013 | 0.020 | 0.3 |
+| `team-sizes` | lineage | 197.8 | 0.024 | 0.085 | 15.8 |
+| `team-sizes` | why | 205.4 | 0.027 | 0.039 | 1.4 |
+| `team-ages` | none | 36.7 | 0.013 | 0.027 | 0.4 |
+| `team-ages` | count | 138.9 | 0.021 | 0.038 | 0.5 |
+| `team-ages` | lineage | 377.2 | 0.038 | 0.061 | 31.5 |
+| `team-ages` | why | 355.8 | 0.036 | 0.057 | 2.3 |
+| `colleagues-known` | none | 9.2 | 0.126 | 0.244 | 0.0 |
+| `colleagues-known` | count | 2,212.3 | 0.014 | 0.029 | 0.0 |
+| `colleagues-known` | lineage | 2,195.8 | 0.014 | 0.025 | 0.0 |
+| `colleagues-known` | why | 2,208.7 | 0.014 | 0.026 | 0.0 |
+| `labelled` | none | 55.7 | 0.007 | 0.019 | 22.9 |
+| `labelled` | count | 89.6 | 0.009 | 0.020 | 47.3 |
+| `labelled` | lineage | 276.5 | 0.010 | 0.022 | 85.7 |
+| `labelled` | why | 266.5 | 0.011 | 0.028 | 87.3 |
+| `teams` | none | 17.6 | 0.006 | 0.014 | 0.1 |
+| `teams` | count | 22.6 | 0.006 | 0.015 | 0.1 |
+| `teams` | lineage | 94.5 | 0.007 | 0.016 | 8.0 |
+| `teams` | why | 96.4 | 0.007 | 0.016 | 0.8 |
+
+In these medians of three runs, an annotated pass was at most 0.025 ms slower than a
+plain one. Single runs vary more, and one run of `team-sizes` with `lineage` measured
+0.054 ms.
+`count` keeps an integer beside each row of each state, which doubles the state of
+`labelled` with its 200,000 output rows. `lineage` keeps every atom that some derivation
+of a row uses, so a group row lists all of its members' quads, and its state is 4 to 80
+times the plain state. `why` keeps at most 8 supports per row, and its state is 4 to 8
+times the plain state. This memory buys exact deletions without evaluating the query
+again.
+
+An annotated build matches its patterns with index probes, since the query engine does
+not report the quads behind a row. It takes 1.3 to 10 times as long as a plain build, and
+240 times as long for the three-pattern join of `colleagues-known`, where the plain build
+uses the engine's joins. 531 tracks faster annotated builds. The annotated passes
+of `colleagues-known` are 9 times faster than its plain passes, because the annotated
+path reads the pattern with the fewest estimated quads next while the plain path reads the
+one with most bound positions. 530 tracks the same order for plain passes.
+
+Views without annotations kept their cost within the noise of this host, except
+possibly for one view. In three alternating runs of `pass_against_recompute`, the pass
+medians of `team-ages`, `labelled` and `teams` were within 0.001 ms. Those of
+`colleagues-known` ranged from 0.109 to 0.124 ms on the baseline and from 0.119 to
+0.124 ms on the candidate. `team-sizes` measured 0.008 ms in two of the baseline's runs
+and 0.010 ms in two of the candidate's. That is a difference of 2 µs in a path whose
+plain operators did not change, and 529 tracks checking it on forge. A query screen
+on Namespace with 8 rounds compared the server of the baseline with that of `5368bd97`,
+which precedes the two measured fixes, and the commits after it change only incremental
+circuits. It gave a geometric mean of 0.987, with no query slower by 10% or more.
+`types-grouped` measured 6.4% slower at 0.017 ms and `order-by-full` 2.0% slower, and
+529 covers both.

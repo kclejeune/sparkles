@@ -11,11 +11,16 @@
 //! counts its ways of matching.
 
 use super::super::pass::{GraphSel, Pass, Which};
+use super::super::prov::AChanges;
 use super::super::zset::{Changes, Row};
 use crate::error::Result;
 use crate::id::Id;
 use oxrdf::Term;
 use spargebra::algebra::GraphPattern;
+
+/// A seed of an annotated delta: the quad to bind, the stored quad its annotation
+/// names, the weight and the annotation's sign.
+type Seed = ([Id; 4], [Id; 4], i64, i64);
 
 /// A position of a pattern.
 #[derive(Clone, Debug)]
@@ -206,6 +211,26 @@ impl Bgp {
         }
     }
 
+    /// The index's estimate of the quads that [`scan`](Self::scan) visits for pattern
+    /// `rp` under binding `b`.
+    fn estimate(p: &Pass, w: Which, rp: &RPat, b: &[Id]) -> u64 {
+        if rp.never() {
+            return 0;
+        }
+        let val = |r: R| match r {
+            R::Id(c) => Some(c),
+            R::Var(s) if !b[s].is_undef() => Some(b[s]),
+            _ => None,
+        };
+        let sel = match rp.g {
+            RG::Default => GraphSel::Default,
+            RG::Id(x) => GraphSel::Exact(x),
+            RG::Var(v) if !b[v].is_undef() => GraphSel::Exact(b[v]),
+            _ => GraphSel::Named,
+        };
+        p.estimate(w, val(rp.s), val(rp.p), val(rp.o), sel)
+    }
+
     /// Extend binding `b` by the patterns in `rest`, each read at `which(j)`.
     #[allow(clippy::too_many_arguments)]
     fn extend(
@@ -244,6 +269,268 @@ impl Bgp {
         rest.push(j);
         let last = rest.len() - 1;
         rest.swap(k, last);
+        Ok(())
+    }
+
+    /// The quad that represents triple `t` of the union default graph at snapshot `w`:
+    /// of the visible named-graph quads that hold it, the one with the smallest fact key
+    /// (spec F13 §5.1). One quad keeps a triple's annotation as small as a quad's, while
+    /// its witnesses name a stored quad.
+    fn representative(p: &Pass, w: Which, t: [Id; 3]) -> Result<Option<[Id; 4]>> {
+        let mut best: Option<(super::super::prov::FactKey, [Id; 4])> = None;
+        p.scan(
+            w,
+            Some(t[0]),
+            Some(t[1]),
+            Some(t[2]),
+            GraphSel::Named,
+            &mut |q| {
+                let k = p.fact_key_of(&q);
+                if best.is_none_or(|(b, _)| k < b) {
+                    best = Some((k, q));
+                }
+                Ok(true)
+            },
+        )?;
+        Ok(best.map(|(_, q)| q))
+    }
+
+    /// Visit the matches of `rp` under `b` at snapshot `w`, each with the stored quad
+    /// behind it: the quad itself, or for the union default graph its triple's
+    /// representative.
+    fn scan_sources(
+        p: &Pass,
+        w: Which,
+        rp: &RPat,
+        b: &[Id],
+        f: &mut dyn FnMut([Id; 4], [Id; 4]),
+    ) -> Result<()> {
+        if !matches!(rp.g, RG::Union) {
+            return Self::scan(p, w, rp, b, &mut |q| {
+                f(q, q);
+                Ok(())
+            });
+        }
+        let mut found: Vec<[Id; 4]> = Vec::new();
+        Self::scan(p, w, rp, b, &mut |q| {
+            found.push(q);
+            Ok(())
+        })?;
+        for q in found {
+            if let Some(src) = Self::representative(p, w, [q[0], q[1], q[2]])? {
+                f(q, src);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`extend`](Self::extend) that keeps the stored quads each derivation matched, for
+    /// its annotation (spec F13 §5). `w` is the derivation's weight and `sign` the sign
+    /// of its annotation, which differ when the representative of a triple of the union
+    /// default graph changes while the triple stays.
+    #[allow(clippy::too_many_arguments)]
+    fn extend_a(
+        &self,
+        p: &mut Pass,
+        rps: &[RPat],
+        which: &dyn Fn(usize) -> Which,
+        rest: &mut Vec<usize>,
+        b: &[Id],
+        w: i64,
+        sign: i64,
+        trail: &mut Vec<[Id; 4]>,
+        out: &mut AChanges,
+    ) -> Result<()> {
+        p.tick()?;
+        if rest.is_empty() {
+            let row: Row = self.out.iter().map(|&s| b[s]).collect();
+            let a = p.fact_ann(trail).scaled(sign);
+            out.push((row, w, a));
+            return Ok(());
+        }
+        // the build matches every pattern here rather than through the query engine, so
+        // it reads the pattern with the fewest estimated quads next
+        let (k, _) = rest
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, j)| {
+                let rp = &rps[**j];
+                (
+                    Self::estimate(p, which(**j), rp, b),
+                    std::cmp::Reverse(rp.bound(b)),
+                )
+            })
+            .expect("rest is not empty");
+        let j = rest.swap_remove(k);
+        let mut found: Vec<(Vec<Id>, [Id; 4])> = Vec::new();
+        Self::scan_sources(p, which(j), &rps[j], b, &mut |q, src| {
+            let mut nb = b.to_vec();
+            if rps[j].bind(&q, &mut nb) {
+                found.push((nb, src));
+            }
+        })?;
+        for (nb, src) in found {
+            trail.push(src);
+            self.extend_a(p, rps, which, rest, &nb, w, sign, trail, out)?;
+            trail.pop();
+        }
+        rest.push(j);
+        let last = rest.len() - 1;
+        rest.swap(k, last);
+        Ok(())
+    }
+
+    /// [`init`](Self::init) with annotations. The query engine does not report the
+    /// quads behind a row, so the patterns are matched here, at the new snapshot.
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let rps = self.resolve(p);
+        let mut out = AChanges::new();
+        let mut rest: Vec<usize> = (0..rps.len()).collect();
+        let b = vec![Id::UNDEF; self.slots];
+        self.extend_a(
+            p,
+            &rps,
+            &|_| Which::New,
+            &mut rest,
+            &b,
+            1,
+            1,
+            &mut Vec::new(),
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// The changes of the union default graph's representatives: for each triple whose
+    /// named-graph quads changed, the triple with the representative it loses or gains,
+    /// the weight of its change of presence and the sign of the annotation's change.
+    fn union_seeds(p: &Pass) -> Result<Vec<Seed>> {
+        let mut seen: rustc_hash::FxHashSet<[Id; 3]> = Default::default();
+        let mut out = Vec::new();
+        for q in p.added.iter().chain(p.removed.iter()) {
+            if q[3] == Id::DEFAULT_GRAPH {
+                continue;
+            }
+            let t = [q[0], q[1], q[2]];
+            if !seen.insert(t) {
+                continue;
+            }
+            let at = [t[0], t[1], t[2], Id::DEFAULT_GRAPH];
+            let old = Self::representative(p, Which::Old, t)?;
+            let new = Self::representative(p, Which::New, t)?;
+            match (old, new) {
+                (None, Some(r)) => out.push((at, r, 1, 1)),
+                (Some(r), None) => out.push((at, r, -1, -1)),
+                (Some(a), Some(b)) if a != b => {
+                    out.push((at, a, 0, -1));
+                    out.push((at, b, 0, 1));
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`delta`](Self::delta) with annotations: each derivation's annotation names the
+    /// changed quad and the quads it joined. A pattern over the union default graph is
+    /// seeded by the changes of its triples' representatives.
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let mut out = AChanges::new();
+        if p.added.is_empty() && p.removed.is_empty() {
+            return Ok(out);
+        }
+        let rps = self.resolve(p);
+        let n = rps.len();
+        let union_seeds = if rps.iter().any(|r| matches!(r.g, RG::Union)) {
+            Self::union_seeds(p)?
+        } else {
+            Vec::new()
+        };
+        let mut trail = Vec::with_capacity(n);
+        for i in 0..n {
+            if rps[i].never() {
+                continue;
+            }
+            let seeds: Vec<Seed> = if matches!(rps[i].g, RG::Union) {
+                union_seeds.clone()
+            } else {
+                p.added
+                    .iter()
+                    .map(|q| (*q, *q, 1, 1))
+                    .chain(p.removed.iter().map(|q| (*q, *q, -1, -1)))
+                    .collect()
+            };
+            let mut rest: Vec<usize> = (0..n).filter(|&j| j != i).collect();
+            let which = |j: usize| if j < i { Which::New } else { Which::Old };
+            for (q, src, w, s) in seeds {
+                let mut b = vec![Id::UNDEF; self.slots];
+                if rps[i].bind(&q, &mut b) {
+                    trail.clear();
+                    trail.push(src);
+                    self.extend_a(p, &rps, &which, &mut rest, &b, w, s, &mut trail, &mut out)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`probe`](Self::probe) with annotations.
+    pub fn probe_a(&self, p: &mut Pass, w: Which, seed: &[(usize, Id)]) -> Result<AChanges> {
+        let rps = self.resolve(p);
+        let mut b = vec![Id::UNDEF; self.slots];
+        for &(pos, v) in seed {
+            b[self.out[pos]] = v;
+        }
+        let mut out = AChanges::new();
+        let mut rest: Vec<usize> = (0..rps.len()).collect();
+        self.extend_a(
+            p,
+            &rps,
+            &|_| w,
+            &mut rest,
+            &b,
+            1,
+            1,
+            &mut Vec::new(),
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// The stored quads of snapshot `w` that some pattern matches with its constants,
+    /// each visited once per pattern; for resolving fact keys. A pattern over the union
+    /// default graph visits the named-graph quads that hold its triples. `f` returns
+    /// `false` to stop the visit, which ends at the first error too.
+    pub fn visit(
+        &self,
+        p: &Pass,
+        w: Which,
+        f: &mut dyn FnMut([Id; 4]) -> Result<bool>,
+    ) -> Result<()> {
+        let rps = self.resolve(p);
+        for rp in &rps {
+            if rp.never() {
+                continue;
+            }
+            let c = |r: R| match r {
+                R::Id(c) => Some(c),
+                _ => None,
+            };
+            let sel = match rp.g {
+                RG::Never => continue,
+                RG::Default => GraphSel::Default,
+                RG::Union | RG::Var(_) => GraphSel::Named,
+                RG::Id(g) => GraphSel::Exact(g),
+            };
+            let mut go = true;
+            p.scan(w, c(rp.s), c(rp.p), c(rp.o), sel, &mut |q| {
+                go = f(q)?;
+                Ok(go)
+            })?;
+            if !go {
+                break;
+            }
+        }
         Ok(())
     }
 

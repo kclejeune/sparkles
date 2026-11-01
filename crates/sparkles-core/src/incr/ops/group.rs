@@ -12,6 +12,7 @@
 
 use super::super::pass::Pass;
 use super::super::persist::{Reader, Writer};
+use super::super::prov::{self, AChanges, Ann, AnnMap, Provenance};
 use super::super::zset::{Changes, Row, consolidate, row_bytes};
 use super::Node;
 use crate::error::Result;
@@ -188,6 +189,12 @@ pub struct Group {
     /// no `GROUP BY`: one group, present even without rows
     pub implicit: bool,
     groups: FxHashMap<Row, GState>,
+    /// each group's annotation, the sum of its members', when the circuit keeps them
+    /// (spec F13 §5.2)
+    gann: Option<AnnMap>,
+    /// the number of the condition of an implicit group without rows
+    pub cond: u32,
+    prov: Provenance,
 }
 
 impl Group {
@@ -198,7 +205,126 @@ impl Group {
             aggs,
             implicit,
             groups: FxHashMap::default(),
+            gann: None,
+            cond: u32::MAX,
+            prov: Provenance::None,
         }
+    }
+
+    pub fn enable_prov(&mut self, mode: Provenance, cond: u32) {
+        self.prov = mode;
+        self.cond = cond;
+        self.gann = (!mode.is_none()).then(AnnMap::default);
+    }
+
+    fn key_of(&self, r: &[Id]) -> Row {
+        self.keys
+            .iter()
+            .map(|k| k.map_or(Id::UNDEF, |k| r[k]))
+            .collect()
+    }
+
+    /// The annotation of group `key`'s row: its members' sum, or, for an implicit
+    /// group without rows, the condition that the pattern has no match.
+    fn row_ann(&self, p: &mut Pass, key: &Row) -> Ann {
+        let mode = p.prov;
+        match self.groups.get(key) {
+            Some(g) if g.rows == 0 && self.implicit => p.absent_ann(self.cond, &[]),
+            Some(_) => self
+                .gann
+                .as_ref()
+                .map_or_else(|| Ann::zero(mode), |m| prov::get(m, key, mode)),
+            None => Ann::zero(mode),
+        }
+    }
+
+    /// [`apply`](Self::apply) with annotations. The weights move the groups as
+    /// without them, and the annotations of the rows that the groups retract, emit or
+    /// keep follow the groups' annotations before and after.
+    fn apply_a(&mut self, p: &mut Pass, c: AChanges) -> Result<AChanges> {
+        let mode = p.prov;
+        let mut before: FxHashMap<Row, Ann> = FxHashMap::default();
+        for (r, _, _) in &c {
+            let k = self.key_of(r);
+            if let std::collections::hash_map::Entry::Vacant(e) = before.entry(k) {
+                let a = self.row_ann(p, e.key());
+                e.insert(a);
+            }
+        }
+        let plain = consolidate(c.iter().map(|(r, w, _)| (r.clone(), *w)).collect());
+        let mut gann = self.gann.take().unwrap_or_default();
+        for (r, _, a) in c {
+            let k = self.key_of(&r);
+            prov::absorb_row(&mut gann, &k, a, mode);
+        }
+        self.gann = Some(gann);
+        let moved = if plain.is_empty() {
+            Changes::new()
+        } else {
+            self.apply(p, plain)?
+        };
+        let n = self.keys.len();
+        let mut out = AChanges::new();
+        let mut emitted: rustc_hash::FxHashSet<Row> = Default::default();
+        for (row, w) in moved {
+            let k: Row = row[..n].into();
+            let a = if w < 0 {
+                before
+                    .get(&k)
+                    .cloned()
+                    .unwrap_or_else(|| Ann::zero(mode))
+                    .scaled(w)
+            } else {
+                self.row_ann(p, &k).scaled(w)
+            };
+            emitted.insert(k);
+            out.push((row, w, a));
+        }
+        for (k, old) in before {
+            if emitted.contains(&k) {
+                continue;
+            }
+            let Some(row) = self.groups.get(&k).and_then(|g| g.out.clone()) else {
+                continue;
+            };
+            let d = self.row_ann(p, &k).sub(&old);
+            if !d.is_zero() {
+                out.push((row, 0, d));
+            }
+        }
+        if let Some(m) = self.gann.as_mut() {
+            m.retain(|k, _| self.groups.contains_key(k));
+        }
+        Ok(out)
+    }
+
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        self.groups.clear();
+        if let Some(m) = self.gann.as_mut() {
+            m.clear();
+        }
+        let c = prov::consolidate(self.inner.init_a(p)?);
+        let mut out = self.apply_a(p, c)?;
+        if self.implicit && self.groups.is_empty() {
+            let g = self.fresh();
+            let mut row = Vec::new();
+            row.extend(self.finish(p, &g));
+            let row: Row = row.into();
+            let mut g = g;
+            g.out = Some(row.clone());
+            self.groups.insert(Row::default(), g);
+            let a = self.row_ann(p, &Row::default());
+            out.push((row, 1, a));
+        }
+        Ok(out)
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = prov::consolidate(self.inner.delta_a(p)?);
+        if c.is_empty() {
+            return Ok(c);
+        }
+        self.apply_a(p, c)
     }
 
     fn fresh(&self) -> GState {
@@ -438,7 +564,11 @@ impl Group {
                         })
                         .sum::<u64>()
             })
-            .sum()
+            .sum::<u64>()
+            + self
+                .gann
+                .as_ref()
+                .map_or(0, |m| prov::map_bytes(m, self.keys.len()))
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {
@@ -496,6 +626,9 @@ impl Group {
                 }
             }
         }
+        if let Some(m) = &self.gann {
+            prov::save_map(w, m)?;
+        }
         Ok(())
     }
 
@@ -552,6 +685,10 @@ impl Group {
                 }
             }
             self.groups.insert(k, g);
+        }
+        let mode = self.prov;
+        if let Some(m) = self.gann.as_mut() {
+            *m = prov::load_map(r, mode)?;
         }
         Ok(())
     }

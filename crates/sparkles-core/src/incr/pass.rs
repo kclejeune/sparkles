@@ -32,6 +32,9 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// An estimate's snapshot (`true`: the new one), permutation and key prefix.
+type EstimateKey = (bool, Perm, Vec<u64>);
+
 /// Which snapshot a probe reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Which {
@@ -140,6 +143,19 @@ pub struct Pass<'a> {
     pub base: Option<oxiri::Iri<String>>,
     /// the dataset's inference, which evaluations read with
     pub inference: Option<Arc<super::inference::Inference>>,
+    /// the annotation the circuit keeps (spec F13 §5)
+    pub prov: super::prov::Provenance,
+    /// the keys of quads met so far, when the circuit keeps an annotation
+    pub facts: Option<&'a mut super::prov::FactCache>,
+    /// the quads scans visited, for tests
+    #[cfg(test)]
+    pub scanned: std::cell::Cell<u64>,
+    /// the estimates read so far, by snapshot (`true`: the new one), permutation and
+    /// prefix, since an estimate walks the metadata of every block in its range
+    estimates: RefCell<FxHashMap<EstimateKey, u64>>,
+    /// the estimates computed rather than found, for tests
+    #[cfg(test)]
+    pub estimated: std::cell::Cell<u64>,
     ctx: Option<Ctx>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
@@ -174,6 +190,13 @@ impl<'a> Pass<'a> {
             max_memory_bytes: None,
             base: None,
             inference: None,
+            prov: super::prov::Provenance::None,
+            facts: None,
+            #[cfg(test)]
+            scanned: std::cell::Cell::new(0),
+            estimates: RefCell::default(),
+            #[cfg(test)]
+            estimated: std::cell::Cell::new(0),
             ctx: None,
             union_changes: None,
             work: 0,
@@ -196,9 +219,87 @@ impl<'a> Pass<'a> {
         }
     }
 
+    /// The key of quad `q` of this pass's id space (spec F13 §5.1).
+    pub fn fact_key(&mut self, q: &[Id; 4]) -> super::prov::FactKey {
+        if let Some(k) = self.facts.as_ref().and_then(|f| f.get(q)) {
+            return k;
+        }
+        let k = self.fact_key_of(q);
+        if let Some(f) = self.facts.as_mut() {
+            f.insert(*q, k);
+        }
+        k
+    }
+
+    /// [`fact_key`](Self::fact_key) without the cache.
+    pub fn fact_key_of(&self, q: &[Id; 4]) -> super::prov::FactKey {
+        let key = |i: Id| self.terms.key(&self.new, i).unwrap_or_default();
+        let g = (q[3] != Id::DEFAULT_GRAPH).then(|| key(q[3]));
+        super::prov::FactKey::of_keys(&key(q[0]), &key(q[1]), &key(q[2]), g.as_deref())
+    }
+
+    /// The annotation of one derivation that matched `quads`.
+    pub fn fact_ann(&mut self, quads: &[[Id; 4]]) -> super::prov::Ann {
+        let atoms = match self.prov {
+            super::prov::Provenance::Count => Vec::new(),
+            _ => quads
+                .iter()
+                .map(|q| super::prov::Atom::Fact(self.fact_key(q)))
+                .collect(),
+        };
+        super::prov::Ann::derivation(self.prov, atoms)
+    }
+
+    /// The annotation of one derivation that holds because operator `node` has no
+    /// match for the values `vals` of circuit variables (spec F13 §5.2).
+    pub fn absent_ann(&mut self, node: u32, vals: &[(u32, Id)]) -> super::prov::Ann {
+        let atoms = match self.prov {
+            super::prov::Provenance::Count => Vec::new(),
+            _ => {
+                let keys: Vec<(&str, Option<Vec<u8>>)> = vals
+                    .iter()
+                    .map(|&(v, i)| {
+                        let k = (!i.is_undef())
+                            .then(|| self.terms.key(&self.new, i).unwrap_or_default());
+                        (self.vars[v as usize].as_str(), k)
+                    })
+                    .collect();
+                let refs: Vec<(&str, Option<&[u8]>)> =
+                    keys.iter().map(|(n, k)| (*n, k.as_deref())).collect();
+                vec![super::prov::Atom::Absent(super::prov::Absence::of_keys(
+                    node, &refs,
+                ))]
+            }
+        };
+        super::prov::Ann::derivation(self.prov, atoms)
+    }
+
     /// The id of a constant at this pass (`None`: no quad holds it).
     pub fn constant(&self, t: &Term) -> Option<Id> {
         self.new.lookup_term(t)
+    }
+
+    /// The index's estimate of the quads [`scan`](Self::scan) visits, without decoding
+    /// a block. A pass keeps each estimate, so a prefix that many bindings share is
+    /// estimated once.
+    pub fn estimate(
+        &self,
+        w: Which,
+        s: Option<Id>,
+        p: Option<Id>,
+        o: Option<Id>,
+        g: GraphSel,
+    ) -> u64 {
+        let (perm, prefix) = scan_prefix(s, p, o, g);
+        let key = (matches!(w, Which::New), perm, prefix);
+        if let Some(&n) = self.estimates.borrow().get(&key) {
+            return n;
+        }
+        #[cfg(test)]
+        self.estimated.set(self.estimated.get() + 1);
+        let n = self.snap(w).estimate(perm, &key.2);
+        self.estimates.borrow_mut().insert(key, n);
+        n
     }
 
     /// Visit the visible quads of snapshot `w` with the given positions bound, in graph
@@ -213,20 +314,11 @@ impl<'a> Pass<'a> {
         f: &mut dyn FnMut([Id; 4]) -> Result<bool>,
     ) -> Result<()> {
         let snap = self.snap(w);
-        let (perm, prefix): (Perm, Vec<u64>) = match (s, p, o, g) {
-            (Some(s), Some(p), Some(o), _) => (Perm::Spo, vec![s.0, p.0, o.0]),
-            (Some(s), Some(p), None, _) => (Perm::Spo, vec![s.0, p.0]),
-            (Some(s), None, Some(o), _) => (Perm::Sop, vec![s.0, o.0]),
-            (None, Some(p), Some(o), _) => (Perm::Pos, vec![p.0, o.0]),
-            (Some(s), None, None, _) => (Perm::Spo, vec![s.0]),
-            (None, Some(p), None, _) => (Perm::Pso, vec![p.0]),
-            (None, None, Some(o), _) => (Perm::Osp, vec![o.0]),
-            (None, None, None, GraphSel::Exact(g)) => (Perm::Gspo, vec![g.0]),
-            (None, None, None, GraphSel::Default) => (Perm::Gspo, vec![Id::DEFAULT_GRAPH.0]),
-            (None, None, None, GraphSel::Named) => (Perm::Spo, vec![]),
-        };
+        let (perm, prefix) = scan_prefix(s, p, o, g);
         let mut stop = false;
         let mut each = |q: [Id; 4]| -> Result<bool> {
+            #[cfg(test)]
+            self.scanned.set(self.scanned.get() + 1);
             if s.is_some_and(|x| x != q[0])
                 || p.is_some_and(|x| x != q[1])
                 || o.is_some_and(|x| x != q[2])
@@ -532,5 +624,21 @@ impl<'a> Pass<'a> {
             ));
         }
         Ok(z.into_changes())
+    }
+}
+
+/// The permutation and key prefix that a scan with these positions bound reads.
+fn scan_prefix(s: Option<Id>, p: Option<Id>, o: Option<Id>, g: GraphSel) -> (Perm, Vec<u64>) {
+    match (s, p, o, g) {
+        (Some(s), Some(p), Some(o), _) => (Perm::Spo, vec![s.0, p.0, o.0]),
+        (Some(s), Some(p), None, _) => (Perm::Spo, vec![s.0, p.0]),
+        (Some(s), None, Some(o), _) => (Perm::Sop, vec![s.0, o.0]),
+        (None, Some(p), Some(o), _) => (Perm::Pos, vec![p.0, o.0]),
+        (Some(s), None, None, _) => (Perm::Spo, vec![s.0]),
+        (None, Some(p), None, _) => (Perm::Pso, vec![p.0]),
+        (None, None, Some(o), _) => (Perm::Osp, vec![o.0]),
+        (None, None, None, GraphSel::Exact(g)) => (Perm::Gspo, vec![g.0]),
+        (None, None, None, GraphSel::Default) => (Perm::Gspo, vec![Id::DEFAULT_GRAPH.0]),
+        (None, None, None, GraphSel::Named) => (Perm::Spo, vec![]),
     }
 }

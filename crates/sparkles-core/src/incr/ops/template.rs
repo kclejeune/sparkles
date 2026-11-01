@@ -10,6 +10,7 @@
 
 use super::super::pass::Pass;
 use super::super::persist::{Reader, Writer};
+use super::super::prov::{AChanges, Ann};
 use super::super::zset::{Changes, Row, ZSet};
 use super::Node;
 use crate::error::Result;
@@ -145,6 +146,62 @@ impl Template {
                 }
             }
         }
+    }
+
+    /// [`apply`](Self::apply) with annotations. A template without blank nodes gives
+    /// each triple its solution's annotation. A template with blank nodes mints a node
+    /// per occurrence of a solution, and no derivation belongs to one occurrence, so
+    /// such triples have unknown atoms.
+    fn apply_a(&mut self, p: &mut Pass, c: AChanges) -> Result<AChanges> {
+        let mode = p.prov;
+        let blanks = self
+            .triples
+            .iter()
+            .any(|t| t.iter().any(|s| matches!(s, TSlot::Blank(_))));
+        let mut out = AChanges::new();
+        for (row, w, a) in c {
+            p.tick()?;
+            if blanks {
+                // each occurrence's triples count one derivation, and the first
+                // occurrence's carry the solution's other derivations, so the triples of
+                // a solution count `count − weight + 1` there and 1 elsewhere
+                let extra = a.count() - w;
+                if extra != 0 {
+                    let keys: Vec<Vec<u8>> = row
+                        .iter()
+                        .map(|&i| p.terms.key(&p.new, i).unwrap_or_default())
+                        .collect();
+                    let mut first = Changes::new();
+                    self.emit(p, &row, &keys, None, 0, &mut first);
+                    for (t, _) in first {
+                        out.push((t, 0, Ann::unknown(mode, extra)));
+                    }
+                }
+                if w != 0 {
+                    for (t, tw) in self.apply(p, vec![(row, w)])? {
+                        out.push((t, tw, Ann::unknown(mode, tw)));
+                    }
+                }
+                continue;
+            }
+            let mut tmp = Changes::new();
+            self.emit(p, &row, &[], None, w, &mut tmp);
+            for (t, tw) in tmp {
+                out.push((t, tw, a.clone()));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        self.counts = ZSet::new();
+        let c = self.inner.init_a(p)?;
+        self.apply_a(p, c)
+    }
+
+    pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
+        let c = self.inner.delta_a(p)?;
+        self.apply_a(p, c)
     }
 
     pub fn bytes(&self) -> u64 {

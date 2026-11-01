@@ -870,8 +870,10 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 **Phase 1 delivered on 2026-10-24.** Item 413, the load-time checks and the split of the
 runtime into modules, was delivered on 2026-10-31, and so were the internal circuits of
-item 414, which [Internal circuits](#internal-circuits) records. The rest of Phases 2 and
-3 is not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 415 to 429.
+item 414, which [Internal circuits](#internal-circuits) records. The provenance algebra of
+item 415 was delivered on 2026-11-01, and [Provenance annotations](#provenance-annotations)
+records it. The rest of Phases 2 and 3 is not built, and [ROADMAP](../ROADMAP.md) item 17
+tracks it as items 416 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
@@ -1225,6 +1227,116 @@ transactions per second with a p99 of 1.013, and `writers` at 0.992 with a p99 o
 With four table views over the written predicate, four rounds gave 0.997 for
 `serial-literal` and 0.978 for `writers`, with ranges that overlap. The raw runs are kept
 under `.artifacts/nsc-bench` and `.artifacts/nsc-writes` of the lane's worktree.
+
+### Provenance annotations
+
+Item 415 delivers the algebra of §5.1 and §5.2 in `incr/prov.rs`, carried through every
+operator of the circuit. Internal circuits that keep rows take it through
+`InternalSpec::with_provenance`, and views do not take it until item 429 adds
+`view:witness` and `view:why`.
+
+- **Semantics.** Each row's provenance polynomial over the input quads is kept as its
+  image under one of three homomorphisms, with signed integer coefficients so that a
+  deletion subtracts what an insertion added. `count` is the number of derivations.
+  `lineage` keeps the number of derivations that use each atom, together with the
+  number of derivations, and a join combines them by inclusion and exclusion, which is
+  bilinear and therefore exact under the delta rule. `why` counts the derivations per
+  support, the set of atoms a derivation uses. Joins multiply annotations, and unions,
+  projections, `DISTINCT` and groups add them. `EXISTS` multiplies a left row's
+  annotation by the sum of its matches'. `count` therefore differs from the Z-set weight
+  above `DISTINCT`, `EXISTS` and groups, and it is the weight elsewhere.
+- **Atoms.** A quad is named by its `FactKey`, the first 128 bits of SHA-256 over the
+  vocabulary keys of its four terms, each framed by its length, with the default graph as
+  no key. A triple of the union default graph is represented by the visible named-graph
+  quad with the smallest key among those that hold it, so its witnesses name a stored quad
+  and many graphs do not multiply a row's supports. When that quad goes while the triple
+  stays, the annotation moves to the next representative without a change of weight. The
+  lineage of such a triple therefore names one graph and not every graph that holds it.
+  Keys do not
+  change at a generation switch, so the remap of a compaction leaves the annotations as
+  they are. A key resolves back to its quad through the circuit's snapshot by matching
+  the circuit's patterns (`resolve_facts`). A row that `MINUS`, `NOT EXISTS` or an
+  unmatched `OPTIONAL` keeps is multiplied by an `Absence` atom. It holds the operator's
+  number in the circuit's preorder and a 128-bit hash of the shared variables' names and
+  values, ordered by name. An `OPTIONAL` with a filter binds every left variable, since
+  the filter can read them all. An implicit group without rows has the absence of its pattern
+  as its witness. `conditions()` describes each number's operator and pattern.
+- **Bounded witnesses.** A `why` annotation in an operator's state keeps at most
+  `maxWitnesses` supports, 8 by default and 256 at most, and counts the other
+  derivations as unknown. Every state passes on its effective change, the change of what
+  it keeps, so a support that does not fit, or that a smaller one displaces, reaches
+  later operators as a move to the unknown count. A removal of a support the state does
+  not keep is taken from the unknown count. Two derivations with the same row and support
+  are indistinguishable downstream, so two rules hold at every operator. A kept count is
+  never more than the row's derivations with that support, and an unknown count of zero
+  means the supports are exact. A reported witness is therefore always real, `truncated`
+  is set exactly when the unknown count is not zero, and a row is exact again once its
+  unknown derivations are removed. A build is exact for a row whose supports fit the
+  bound and whose atoms are known, and otherwise keeps the smallest supports. A build keeps the
+  smallest supports first. A report lists the minimal kept supports, smallest first. This
+  is the convergence rule that item 416 adopts for the reasoner.
+- **Where atoms are unknown.** The rows of a `recompute` node, including a whole query
+  evaluated again for inference or protections that depend on the data, and the triples
+  of a CONSTRUCT template with blank nodes have unknown atoms. They report `count` and
+  `truncated` with no witnesses or lineage. A template mints nodes per occurrence of a
+  solution, so its first occurrence's triples carry the derivations beyond one per
+  occurrence, and the triples of all occurrences together count the solution's
+  derivations. 528 tracks witnesses through them.
+- **State.** Each stateful operator keeps the annotations beside its weights, in a map
+  from row to annotation that exists only when the circuit has a provenance setting. A
+  pattern's matches are probed from the store with the quads they matched. A circuit
+  without provenance runs the operators' code of Phase 1 unchanged, and its passes do
+  not touch the annotation code. Annotations count against the circuit's memory budget.
+- **API for items 416 and 417.** `Ann` holds a value of a semiring with `zero`, `one`,
+  `derivation`, `unknown`, `add_assign`, `mul`, `scale`, `absorb` and `report`.
+  `Witness`, `Atom`, `FactKey` and `Absence` are public, so the reasoner records rule
+  firings as products of its premises' annotations and absorbs them with the same bound.
+  The fixed-point operator of item 417 cannot weight recursion by counts (§4.3), and it is
+  expected to keep `Witness` sets by rederivation and use `report` for minimality.
+- **Checkpoints.** `INTERNAL_CIRCUIT_STATE` gains format 2, whose circuit state ends with
+  the annotations of every operator and of the result. A circuit writes format 1 without
+  provenance and format 2 with it, and reads only its own. A file of the other format is
+  left for the next checkpoint to remove, and a file of an unknown format is left in place
+  while the circuit is built from the data. The fingerprint covers the setting and its
+  bound. `VIEW_STATE` keeps format 1.
+
+**Tests.** `incr/prov_tests.rs` draws random queries from joins, unions, `OPTIONAL`,
+`MINUS`, `FILTER EXISTS` and `NOT EXISTS`, `DISTINCT`, projections and grouped and implicit
+`COUNT`, renders each as SPARQL and evaluates it by brute force with its exact `why`
+polynomial. It applies random histories with insertions, deletions, a quad added and
+removed in one commit, replacements, passes over several commits and compactions, and a
+third of the cases read two named graphs as the union default graph. After
+every pass it compares weights, `count`, the exact `lineage` and the `why` supports with
+bounds of 8, 2 and 1, checking the two rules and, without truncation, the exact supports
+and the minimal report. The default run has 120 cases, and runs of 2,600 cases over the
+default graph and 600 cases with the union default graph pass.
+`SPARKLES_PROV_CASES` and `SPARKLES_PROV_SEED` select longer runs. Unit tests in
+`prov.rs` check the products, the bounded state against an exact one on random changes,
+and the keys. Other tests check truncation and convergence on one row, negative
+conditions, the state encoding of every mode, fact resolution, and a format 2 checkpoint
+across a restart. Regressions from the review cover witnesses over the union default
+graph, many graphs holding one triple, `OPTIONAL` filters, template blank nodes, a
+circuit whose provenance is turned off, and cancelled fact resolution.
+Measurements found and fixed two costs. A state's annotation map keeps the total size of
+its annotations, so the memory a round reads does not visit every row. An annotated build
+reads the pattern with the fewest estimated quads next, and it estimates each scan prefix
+once per pass. Tests check the size against a recomputed sum, the build's scans on a
+large team and the number of estimates.
+
+**Measurements.** On an 8-vCPU Namespace instance at 200,000 people, the median annotated
+pass of three runs was at most 0.025 ms above the plain one for each of the five views of
+the incremental benchmark.
+`lineage` makes a state 4 to 80 times larger and `why` 4 to 8 times, and `count` doubles
+the state of a view with 200,000 output rows. This memory buys exact deletions without
+evaluating the query again. An annotated build matches its patterns with index probes and
+takes 1.3 to 10 times as long as a plain build, and 240 times as long, 2.2 seconds, for a
+three-pattern join that the plain build evaluates with the engine's joins. Views without
+annotations kept their pass costs, apart from 2 µs on one view whose plain operators did
+not change. A query screen of the build before the measured fixes, whose later commits
+change only incremental circuits, gave a geometric mean of 0.987. The
+[writes benchmark](../benchmarks/writes/RESULTS.md#provenance-annotations) has the tables,
+and 529, 530 and 531 track the forge checks, the plain pattern
+order and faster annotated builds.
 
 ### Maintained assessments and conservative dependencies
 

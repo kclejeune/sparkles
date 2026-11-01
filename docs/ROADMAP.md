@@ -103,8 +103,8 @@ Wave A holds the work that most improves the engine against objective measures.
   items 474 to 478 are complete, item 479 sets the first-release format cutoff, items
   480 to 483 have consolidated the execution policy, the reasoning mode, request
   building and rank fusion, and item 484 consolidates the commit publish tail.
-* The remaining Stage A parts of item 17 are items 415 to 417. They deliver the
-  provenance algebra, reasoner witnesses and the fixed-point operator.
+* The remaining Stage A parts of item 17 are items 416 and 417. They deliver the
+  reasoner witnesses and the fixed-point operator.
 * Small items that finish a capability run in free capacity, such as item 77.
 
 ### Wave A2: engine rewrites
@@ -120,7 +120,7 @@ query under 0.3 ms may be slower on an Intel host.
 
 Wave B starts with item 81 Phase 3, then items 341, 396 and 435 and the remaining C18
 work. Item 12 can move its refresh onto an internal circuit now, and item 18 Phase 3
-follows once items 415 and 416 have landed. The cheap agent
+follows once item 416 has landed. The cheap agent
 tools of item 462 also belong to Wave B. They are the `ask` MCP tool in item 488, MCP tool
 profiles in item 489 and a hybrid search tool that embeds query text in item 490.
 
@@ -232,7 +232,7 @@ not to every extension in a spec or to phases that have already shipped.
 |---|---|---|
 | **Performance** | 1 refreshes the evidence while 7 and 4 address their remaining gates. 501 removes the last device flush of an annotated fence, and 502 measures write-through fences in the drive's fast state. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
 | **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh can use the internal circuits of F13. | F14, C22, F13 |
-| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. Item 456 rebuilds the reasoner core on the closure operators and OWL 2 RL rule set of items 485 and 486. | F16, F17, F13, F18, F23 |
+| **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 416, and item 19 Phase 3 waits for 417, while existing explanations remain available. Item 456 completes OWL 2 RL and rebuilds the reasoner core, starting with items 485 to 487. | F16, F17, F13, F18, F23 |
 | **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, starting with items 474 to 484. Item 454 follows the executor merge, and 455 follows 4 and 14. | X14, X15, X16, X17, X05 |
 | **Ontology and data platform** | 71 is the root of the ontology workbench 457. Items 458 to 461 add the resource catalog, checks and protected merges, git sync and linked-data publishing once the policy plumbing of 480 to 483 has landed. | F21, F24, U12, C30, X18, C31, F25, C32 |
 | **Agent platform** | 462 adds tool profiles, review queues, handoff and framework adapters, starting with 488 to 490. Its data-change triggers wait for 339. | C33, C11, C17, C18 |
@@ -283,13 +283,9 @@ incremental execution exists.
 flowchart LR
     E["81 · Shared evidence"] --> A["340 · Maintained analyses"]
     J["339 · Durable jobs and delivery"] --> A
-    L2["415 · Provenance algebra"] --> L3["416 · Reasoner witnesses"]
-    L2 --> L4["417 · Fixed-point operator"]
-    L2 --> V["18 · F18 Phase 3 supported visibility"]
-    L3 --> V
+    L3["416 · Reasoner witnesses"] --> V["18 · F18 Phase 3 supported visibility"]
     E --> V
-    L2 --> T["19 · F17 Phase 3 maintained tables"]
-    L4 --> T
+    L4["417 · Fixed-point operator"] --> T["19 · F17 Phase 3 maintained tables"]
     W["write-path competitive work"] --> L8["421 · Commit-time table views"]
     P222["222 · View access by grant containment"] --> L11["424 · MCP"]
     P222 --> L13["426 · UI"]
@@ -348,7 +344,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F09](specs/F09-branches-and-merges.md#outcome) | 45 | Finish relink from the remote CLI and remote/archive cloning. Compare relink identities and clone contents with offline operations, including chosen commits, lineage, cancellation and corrupt-transfer refusal. |
 | [F10](specs/F10-replication.md#outcome) | 74, 280, 66 | Settle the replication contract before implementing replicas, bootstrap, archives, promotion, synchronous acknowledgement and fenced failover. Test exact primary identities, stream gaps, restart and declared data-loss guarantees, and separately complete multi-transaction patch and blank-node semantics. |
 | [F11](specs/F11-encryption-at-rest.md#outcome) | 61, 65, 58, 59 | Finish key workflows and recovery, Phase 2 chunking and write-only age-recipient repositories, then live-file and derived-index encryption. Pass the remaining phase acceptance for provider outages, read-authority separation, rotation, locked states and format compatibility. Standard builds include repository encryption with protected keys on Linux and macOS; later phases remain open. |
-| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 415–430, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
+| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 416–430, 528, 530, 531, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
 | [F14](specs/F14-graph-algorithms.md#outcome) | 8 | Finish Graphalytics acceptance, completion, background progress and the remaining algorithm surfaces. The C23 writer is item 36 and openCypher procedures are item 20, and each belongs to its own capability. Items 79 and 80 extend weighted betweenness as optional work, and the exact refusal boundaries stand until a broader domain is defined and independently validated. |
 | [F16](specs/F16-materialization-at-scale.md#outcome) | 9, 113 | Deliver the separate derived layer, canonical equality representatives and the remaining barrier-free and incremental-equality execution. Re-run the scale, differential, datatype and kept-closure memory gates, and settle the named small-change costs with matched measurements. |
 | [F17](specs/F17-query-time-reasoning.md#outcome) | 19, 190, 192, 193 | Finish automatic cost selection, hybrid rules, OWL 2 QL, settings and client surfaces, then F13-maintained tables and provenance. Close Phase 1's cache accounting, DESCRIBE and per-query costs with demand/materialization equivalence tests. |
@@ -423,7 +419,7 @@ continues within its caller-visible evidence and measured-latency scope.
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
 | 17 | **Incremental computation core.** This umbrella item is split into items 413 to 429, so that each part has its own size and dependencies. Item 17 is complete when all of its parts are. Item 413 is complete, and the [table of its parts](#parts-of-item-17) lists the others. GraphQL subscriptions are deferred under item 37 until a workload asks for them. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | XL | Very high |
-| 18 | **Explanations.** Provenance-aware protections with `reviewedOnly` over derived facts. Demand derivation trees, bounded why-not searches, entailment diffs and minimal justifications are available. Phase 3 needs the provenance algebra and reasoner witnesses of items 415 and 416. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
+| 18 | **Explanations.** Provenance-aware protections with `reviewedOnly` over derived facts. Demand derivation trees, bounded why-not searches, entailment diffs and minimal justifications are available. Phase 3 needs the reasoner witnesses of item 416, which use F13's provenance algebra. | [F18](specs/F18-explanations-and-entailment-diffs.md) | M–L | High |
 | 23 | **Full-text parity.** Online enabling and reconfiguring, search after uncommitted writes, and historical search remain. The analyzers that follow Lucene's and the dictionary analyzers are built. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
 | 24 | **GeoSPARQL completion.** Add per-row nearest-neighbour joins that run at least 50 times faster than the generic plan, QLever's `spatialSearch:` syntax, metric-property rewrites and polygon approximations in a versioned index format. Add exact Helmert datum shifts and geographic CRSs on datums other than WGS 84, opt-in grid-based shifts from operator-supplied grid files that still refuse when a needed grid is missing, and curved GML segments read by densifying arcs into line segments within a stated tolerance. Exact arithmetic on curves, GML solids, 3D constructions and splitting lines at crossings are not adopted. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | L | Medium |
 | 21 | **Editing forms generated from SHACL shapes.** Complete atomic nested changes and browser editing from the Rust library's pooled read models, plus list and `sh:or`/`sh:xone` editors. Complete blank-named graph contexts and admission for model sources, complex nested paths, remaining target and query producers and controlled reader integration through item 395. | [U02](specs/U02-shape-driven-forms/SPEC.md#outcome) | M–L | Medium–high |
@@ -447,7 +443,7 @@ continues within its caller-visible evidence and measured-latency scope.
 
 Stage A makes the incremental core safe and supplies what items 12, 18 and 19 need.
 Items 12, 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 18
-Phase 3 needs items 415 and 416, and item 19 Phase 3 needs items 415 and 417. Item 12
+Phase 3 needs item 416, and item 19 Phase 3 needs item 417. Item 12
 uses the internal circuits that are already available. Stage B delivers the rest of Phase 2. Stage C delivers view
 provenance. The F13 spec records the design decisions that the parts follow. Items that
 affect the write path measure with the `--views none|async:N|commit:Q|graph:N` option of
@@ -455,9 +451,8 @@ affect the write path measure with the `--views none|async:N|commit:Q|graph:N` o
 
 | # | Item | Spec | Size | Depends on |
 |---|---|---|---|---|
-| 415 | **Provenance algebra.** Add the `count`, `lineage` and `why` annotations with a 128-bit `FactKey` over vocabulary keys and bounded witness sets. | [F13](specs/F13-incremental-views-and-provenance.md#5-provenance) | S–M | None |
-| 416 | **Reasoner witnesses.** Record witnesses in the reasoner with F13's algebra, off unless a protection needs supported visibility, and define how witness sets converge under truncation. | [F18](specs/F18-explanations-and-entailment-diffs.md#71-protections) | M | 415 |
-| 417 | **Fixed-point operator.** Host one fixed-point interface in F13 with a reasoner plug-in, maintain property paths with `+` and `*` through backward and forward rederivation, and add `VIEW_STATE` format 2 for its state. | [F13](specs/F13-incremental-views-and-provenance.md#43-added-in-phase-3), [F17](specs/F17-query-time-reasoning.md#63-kept-current-phase-3) | M | 415 |
+| 416 | **Reasoner witnesses.** Record witnesses in the reasoner with F13's algebra, off unless a protection needs supported visibility, and define how witness sets converge under truncation. | [F18](specs/F18-explanations-and-entailment-diffs.md#71-protections) | M | None |
+| 417 | **Fixed-point operator.** Host one fixed-point interface in F13 with a reasoner plug-in, maintain property paths with `+` and `*` through backward and forward rederivation, and add `VIEW_STATE` format 2 for its state. | [F13](specs/F13-incremental-views-and-provenance.md#43-added-in-phase-3), [F17](specs/F17-query-time-reasoning.md#63-kept-current-phase-3) | M | None |
 | 418 | **Aggregates and correlated EXISTS.** Maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`, `HAVING` and correlated `EXISTS` instead of recomputing them. | [F13](specs/F13-incremental-views-and-provenance.md#42-added-in-phase-2) | M | None |
 | 419 | **Ordered windows.** Keep `ORDER BY` with `LIMIT` and `OFFSET` as a window with a reserve, and report row positions in live diffs. | [F13](specs/F13-incremental-views-and-provenance.md#44-ordered-windows) | S–M | None |
 | 420 | **Asynchronous graph views.** Add `graph` views with `view.json` format 3, the `View` commit kind, reserved graphs and skolem IRIs over distinct solutions. On a dataset that restricts reads, a graph view always needs `declassify: true` with an audit record naming the view, its query, the output graph and the declassifying principal. A view without it marks its output graph when it first writes it. The mark stays with the graph and its history after the view is deleted, with or without `dropGraph`, and under a read-restricting policy only administrators read a marked graph until one declassifies the graph with an audit record. Installing such a policy first suspends every undeclassified graph view, including one that has not written its graph, and applies the restriction before the policy is visible. The mark lives in a versioned dataset file that older releases refuse, and this item defines the format. Tests read a populated output graph across the policy transition, cover a C12b protection that hides an input triple, cover a view with no output yet, and delete the view with and without `dropGraph` before checking that current and historical reads are refused to non-administrators. This is the graph-view counterpart of the `view:{name}` grant of item 222. | [F13](specs/F13-incremental-views-and-provenance.md#22-reading-a-view) | M | None |
@@ -469,7 +464,7 @@ affect the write path measure with the `--views none|async:N|commit:Q|graph:N` o
 | 426 | **Views in the UI.** Add view management and live results to the web UI. | [F13](specs/F13-incremental-views-and-provenance.md#24-cli-library-bindings-and-mcp) | M | 222 |
 | 427 | **Per-branch views and `keepCommits`.** Keep state per branch with defined fork semantics, and keep recent diffs in memory only for reads at past commits. | [F13](specs/F13-incremental-views-and-provenance.md#7-branches-and-history) | M | 223 |
 | 428 | **Data-dependent protections as views.** Compile protections that depend on data into views, so a live reader no longer recomputes its whole query. | [F13](specs/F13-incremental-views-and-provenance.md#62-live-queries) | L | 417 |
-| 429 | **View provenance.** Add `view:witness` and `view:why`, and provenance on one-off queries, together with item 221's views over inferred data. | [F13](specs/F13-incremental-views-and-provenance.md#53-uses) | M | 415, 417 |
+| 429 | **View provenance.** Add `view:witness` and `view:why`, and provenance on one-off queries, together with item 221's views over inferred data. | [F13](specs/F13-incremental-views-and-provenance.md#53-uses) | M | 417 |
 
 ### Numbered phases of items 453, 455 and 456
 
@@ -506,7 +501,7 @@ and shared capability work above. Each phase keeps its declared prerequisites an
 
 | # | Item | Spec | Size | Value |
 |---|---|---|---|---|
-| 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 after items 415 and 417, and adds `why` provenance on tables for F18. Items 190, 192 and 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
+| 19 | **Query-time reasoning.** Phase 2 adds `auto` with its cost model, the dataset setting, hybrid Jena rules, OWL 2 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08 mapping. Phase 3 keeps tables current through F13 after item 417, and adds `why` provenance on tables for F18. Items 190, 192 and 193 cover what Phase 1 left. | [F17](specs/F17-query-time-reasoning.md#outcome) | L | High |
 | 25 | **Query extension completion.** Dynamic dispatch, foreign callbacks, batching, additional aggregate arities and measurements remain, including native Java dispatch beside ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 27 | **Live query profiling and verified rewrites.** The static plan overlay is available. The running-query registry, live operator progress and hotspot views remain planned, followed by C18 Phase 6's result-equivalent rewrite suggestions and their integration in the live plan. | [U04](specs/U04-live-query-profiling.md), [C18](specs/C18-natural-language-questions-and-ingest/README.md) Phase 6 | M | Medium |
 | 71 | **An OWL 2 ontology object API,** as Jena's `jena-ontapi` provides. Its Phase 1 axiom model, mappings, profile checks and `/$/ontology/{ds}` are the root of the ontology workbench, item 457. | [F21](specs/F21-ontology-api.md) | L | High |
@@ -625,6 +620,10 @@ spec sections.
 | 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a two-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. An internal circuit keeps the ring filled on every commit, so item 226 comes before item 12 attaches one to every dataset with automatic refresh. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
 | 506 | **Small screen differences after the internal circuits.** In Namespace screens, the internal circuits build ran `two-hop-count` 4.8% slower over 12 interleaved rounds than the build before them. The `writers` scenario ran 0.8% fewer transactions per second without views and 2.2% fewer with four table views, though the change touches neither the query path nor the commit path. Pin both on forge and bisect what holds. | [F13](specs/F13-incremental-views-and-provenance.md#internal-circuits) | S |
 | 507 | **View checkpoints across the union default graph setting.** A view checkpoint's fingerprint does not cover `union_default_graph`, so a dataset reopened with the other setting can load a view state that reads other quads. Internal circuits cover it. Adding it to the view fingerprint builds such views again once. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
+| 528 | **Witnesses through recompute nodes and template blank nodes.** Rows of a `recompute` node and triples of a CONSTRUCT template with blank nodes carry provenance with unknown atoms, so they report `truncated` with no witnesses. Evaluating such a subtree with annotations, or splitting a solution's derivations across its occurrences, would give them witnesses. | [F13](specs/F13-incremental-views-and-provenance.md#provenance-annotations) | M |
+| 529 | **Small differences after the provenance annotations.** On Namespace, the plain pass of the `team-sizes` view measured 0.010 ms with the annotations against 0.008 ms before them, though its operators did not change. The query screen measured `types-grouped` 6.4% slower at 0.017 ms and `order-by-full` 2.0% slower, though the query path did not change. Pin them on forge and remove the cost, or show that it comes from code placement. | [Writes benchmark](benchmarks/writes/RESULTS.md#provenance-annotations) | S |
+| 530 | **Estimate-ordered probes in plain passes.** A plain pass extends a changed quad by the pattern with most bound positions, so a new member of a large team in `colleagues-known` can scan the whole team. The annotated path reads the pattern with the fewest estimated quads and passes 9 times faster on that view. Use the same order for plain passes, and measure it on forge. | [Writes benchmark](benchmarks/writes/RESULTS.md#provenance-annotations) | S |
+| 531 | **Faster annotated builds.** An annotated build matches its patterns with nested index probes, because the query engine does not report the quads behind a row. A three-pattern join over 200,000 people takes 2.2 seconds against 9 ms without annotations. Join the patterns with hash or merge joins that keep each row's quads. | [F13](specs/F13-incremental-views-and-provenance.md#provenance-annotations) | M |
 | 240 | **Buffered output of streamed answers.** The cursor writers of streamed SELECT and graph answers still write a few bytes at a time through the response writer and are compiled with the server. Give them the engine-side buffer that eager answers use, with the same count of the rows the client received. | [Benchmarking](BENCHMARKING.md#release-build-settings) | S |
 | 241 | **Front coding on three warm DBpedia queries.** Since item 108, `pat-film-predicates` and `pat-film-predicate-list` take about 4% longer with front coding and `top-linked` 1.4% longer, in all 16 pinned rounds on forge. Count their instructions on both builds and remove the cost, or show that it comes from code placement. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
 | 243 | **Cheaper row accounting in the result buffer.** The buffer checks the row count at every write so that an answer cut partway reports the rows the client received. Serializers write one character at a time, so the check costs 7% of the instructions of `optional-chain` and 14% of its client time on forge, 150.8 ms against 132.0 ms. A row log that the serializers fill themselves measured no cheaper. Find a way to record row ends that costs nothing per write. | [Benchmarks](benchmarks/engine/RESULTS.md#the-cost-of-result-serialization) | S |
@@ -750,6 +749,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **415.** The `count`, `lineage` and `why` provenance annotations with 128-bit fact keys and bounded witness sets, on internal circuits that keep rows. [F13](specs/F13-incremental-views-and-provenance.md#provenance-annotations)
 - **483.** One library rank fusion, `sparkles::rank::fuse_rrf`, and one `text:query` call and hit reader, which `spk:hybridSearch`, MCP search and the memory layer share. [X14](specs/X14-unified-executor/SPEC.md#shared-rank-fusion-and-text-hits)
 - **482.** A library query request builder, `QueryRequest` with `Budgets`, and the server's `CallerContext`, which build the options of the query endpoints, MCP and the bindings and put GraphRAG under the server's budgets. [X14](specs/X14-unified-executor/SPEC.md#query-request-builder-and-caller-context)
 - **481.** A typed reasoning mode, `ReasoningMode`, and one inference view on `Dataset` for the query options, incremental views and explanations, which the HTTP, CLI and MCP reasoning choices use. [X14](specs/X14-unified-executor/SPEC.md#typed-reasoning-mode-and-one-inference-view)

@@ -8,7 +8,10 @@
 //!
 //! `INCR_BENCH_PEOPLE` sets the size (200,000 people, about 1.2M quads, by default).
 
-use sparkles_core::incr::{LiveOptions, OpenHost, Runtime, RuntimeOptions, ViewDef};
+use sparkles_core::incr::{
+    InternalAccess, InternalSpec, LiveOptions, OpenHost, Provenance, Runtime, RuntimeOptions,
+    ViewDef,
+};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::{self, QueryOptions};
 use sparkles_core::store::{Store, StoreOptions};
@@ -158,6 +161,91 @@ fn pass_against_recompute() {
         );
         rt.delete(name).unwrap();
         rt.round(&s);
+    }
+}
+
+/// One commit of the pass benchmarks' mix: new members, new knows edges both ways,
+/// an edge to a new person, and a member who leaves.
+fn mix(s: &Store, i: usize, n: usize) {
+    let f = fresh();
+    let who = (f * 7919) % n;
+    let u = match i % 4 {
+        0 => format!(
+            "INSERT DATA {{ :new{f} :memberOf :t{} . :new{f} :age 33 }}",
+            who % 50
+        ),
+        1 => format!("INSERT DATA {{ :new{f} :knows :p{who} . :p{who} :knows :new{f} }}"),
+        2 => format!("INSERT DATA {{ :p{who} :knows :x{f} }}"),
+        _ => format!("DELETE WHERE {{ :p{who} :memberOf ?t }}"),
+    };
+    upd(s, &u);
+}
+
+/// §5: the cost of each provenance annotation. Each view's query runs as an internal
+/// circuit that keeps its rows, once per setting, through the same 200 commits as
+/// `pass_against_recompute`. `INCR_BENCH_MODES` names the settings to run, by default
+/// `none,count,lineage,why`, and `INCR_BENCH_VIEWS` the views.
+#[test]
+#[ignore]
+fn annotation_cost() {
+    let n = people();
+    let t0 = Instant::now();
+    let s = store(n, None);
+    eprintln!("loaded {n} people in {:.1?}", t0.elapsed());
+    let modes: Vec<String> = std::env::var("INCR_BENCH_MODES")
+        .unwrap_or_else(|_| "none,count,lineage,why".into())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let only: Option<Vec<String>> = std::env::var("INCR_BENCH_VIEWS")
+        .ok()
+        .map(|v| v.split(',').map(str::to_string).collect());
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    println!("| view | provenance | build ms | pass median ms | pass p95 ms | state MiB |");
+    println!("|---|---|---|---|---|---|");
+    for (name, q) in VIEWS {
+        if only.as_ref().is_some_and(|o| !o.iter().any(|x| x == name)) {
+            continue;
+        }
+        let text = format!("{PREFIX}{q}");
+        for mode in &modes {
+            let p = match mode.as_str() {
+                "none" => Provenance::None,
+                "count" => Provenance::Count,
+                "lineage" => Provenance::Lineage,
+                "why" => Provenance::why(),
+                m => panic!("unknown provenance {m}"),
+            };
+            let t = Instant::now();
+            let c = rt
+                .attach_internal(
+                    &s,
+                    InternalSpec::rows(format!("{name}-{mode}"), text.clone())
+                        .with_provenance(p)
+                        .with_memory(16 << 30),
+                    InternalAccess::everything(),
+                )
+                .unwrap();
+            let build = t.elapsed().as_secs_f64() * 1e3;
+            let mut passes = Vec::new();
+            for i in 0..200 {
+                mix(&s, i, n);
+                let t = Instant::now();
+                rt.round(&s);
+                passes.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            assert_eq!(c.commit(), s.snapshot().commit);
+            let bytes = c.bytes();
+            println!(
+                "| {name} | {mode} | {build:.1} | {:.3} | {:.3} | {:.1} |",
+                pct(&mut passes, 0.5),
+                pct(&mut passes, 0.95),
+                bytes as f64 / (1 << 20) as f64
+            );
+            drop(c);
+            rt.round(&s);
+        }
     }
 }
 
