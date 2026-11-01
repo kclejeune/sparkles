@@ -1268,3 +1268,23 @@ scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$
   ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
 SPARKLES_TASK
 '''
+
+# ----------------------------------------------------------------- engine rewrite gates ----
+# The gates of ROADMAP items 469 to 473. Each writes a gate record that
+# `scripts/bench-gate.py compare BASELINE CANDIDATE` checks against the recorded baseline;
+# docs/BENCHMARKING.md#rewrite-gates says how a lane uses them.
+
+[tasks."test:w3c:streaming"]
+description = "The W3C SPARQL 1.0, 1.1 and 1.2 query evaluation tests and Jena's CDT and property function tests with execution=streaming, with per-suite summaries and eager fallback counts (item 470). `mise run test` also runs them, with Oxigraph's GeoSPARQL tests"
+usage = '''
+flag "--out <dir>" help="results directory (default .artifacts/w3c-streaming/<UTC time>)"
+'''
+run = '''
+set -o pipefail
+out=$(realpath -m "${usage_out:-.artifacts/w3c-streaming/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+mbx test -p sparkles-core --test w3c -- --nocapture --test-threads=1 streaming_ 2>&1 | tee "$out/output.log"
+python3 scripts/bench-gate.py w3c "$out/output.log" --out "$out/record.json" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)"
+'''
