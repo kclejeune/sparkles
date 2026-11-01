@@ -288,6 +288,13 @@ fn a_held_branch_starting_commit_stays_readable_on_the_branch() {
         assert_eq!(r.commit.seq, 3);
         let (main, _) = s.snapshot_at(&At::Commit(3), &o).unwrap();
         assert_eq!(snap.len(), main.len());
+        // a bounded read follows the same way
+        let dev = s.branch("dev").unwrap();
+        let (snap, r, _) = s
+            .snapshot_at_with_branch_limited(&dev, &At::Commit(3), &o, 1 << 30)
+            .unwrap();
+        assert_eq!(r.commit.seq, 3);
+        assert_eq!(snap.len(), main.len());
     };
     let (_dir, root, s) = setup();
     let dev = s.create_branch("dev", &BranchOptions::default()).unwrap();
@@ -307,6 +314,15 @@ fn a_held_branch_starting_commit_stays_readable_on_the_branch() {
         bump(&s, 1);
         s.compact().unwrap();
     }
+    check(&s);
+    // the branch's catalog no longer has the starting commit's metadata either
+    s.branch("dev")
+        .unwrap()
+        .set_catalog_horizon(crate::history::CatalogHorizon {
+            keep_commits: Some(1),
+            keep_age_ms: None,
+        })
+        .unwrap();
     check(&s);
     drop(s);
     let s = Store::open(&root, StoreOptions::default()).unwrap();

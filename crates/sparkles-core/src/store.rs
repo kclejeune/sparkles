@@ -2630,6 +2630,9 @@ impl Store {
                 .and_then(|m| m.lock().kept_commit(seq))
         });
         let Some(commit) = meta else {
+            if self.starts_at(seq) {
+                return Err(self.inherited(at, seq));
+            }
             let snapshot = match at {
                 At::Snapshot(n) => Some(n.clone()),
                 _ => None,
@@ -2650,7 +2653,7 @@ impl Store {
     /// Whether this is a branch store that started at commit `seq`. Its state there is
     /// its upstream's, which serves a read of it once this store no longer keeps it, as
     /// when a source hold keeps only the upstream's copy.
-    fn starts_at(&self, seq: u64) -> bool {
+    pub(super) fn starts_at(&self, seq: u64) -> bool {
         self.branching
             .ident
             .as_ref()

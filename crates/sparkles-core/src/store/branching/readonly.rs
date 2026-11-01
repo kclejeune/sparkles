@@ -469,9 +469,18 @@ impl Store {
             &mut selection,
             &mut budget,
         )?;
+        // the state at the starting commit is the upstream's, which serves it once
+        // this branch no longer keeps its own copy or metadata
+        let start = CommitRef {
+            branch_id: entry.from.branch_id,
+            seq: entry.from.seq,
+        };
         let Some(mut metadata) = selection.selected else {
             if matches!(at, At::Time(_)) {
                 return Ok(OriginRead::Inherited(entry.from.into()));
+            }
+            if wanted == Some(entry.from.seq) {
+                return Ok(OriginRead::Inherited(start));
             }
             return Err(gone_controlled(
                 &root,
@@ -500,6 +509,9 @@ impl Store {
             &mut budget,
         )?;
         let Some(selected) = selected else {
+            if metadata.seq == entry.from.seq && wanted.is_some() {
+                return Ok(OriginRead::Inherited(start));
+            }
             return Err(gone_controlled(
                 &root,
                 id,

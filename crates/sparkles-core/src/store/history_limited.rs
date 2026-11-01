@@ -179,6 +179,9 @@ impl Store {
             (metadata, _) => metadata,
         };
         let Some(commit) = metadata else {
+            if self.starts_at(seq) {
+                return Err(self.inherited_limited(at, seq, limit)?);
+            }
             let name = match at {
                 At::Snapshot(name) => Some(name.clone()),
                 _ => None,
