@@ -37,7 +37,9 @@ enum Class {
     Test,
 }
 
-/// How the constants of the comparisons classify an id.
+/// How the constants of the comparisons classify an id. One rule is built per
+/// comparison and read for every id, so the numeric segments stay inline rather than boxed.
+#[allow(clippy::large_enum_variant)]
 enum Rule<'a> {
     /// numeric constants: the id range of the numeric range scan within each segment
     /// of [`numeric_segments`], searched for when an id of the segment first occurs,
@@ -337,14 +339,14 @@ mod tests {
     use std::cmp::Ordering;
 
     fn holds(op: RangeOp, o: Option<Ordering>) -> bool {
-        match (op, o) {
-            (RangeOp::Lt, Some(Ordering::Less)) => true,
-            (RangeOp::Le, Some(Ordering::Less | Ordering::Equal)) => true,
-            (RangeOp::Gt, Some(Ordering::Greater)) => true,
-            (RangeOp::Ge, Some(Ordering::Greater | Ordering::Equal)) => true,
-            (RangeOp::Eq, Some(Ordering::Equal)) => true,
-            _ => false,
-        }
+        matches!(
+            (op, o),
+            (RangeOp::Lt, Some(Ordering::Less))
+                | (RangeOp::Le, Some(Ordering::Less | Ordering::Equal))
+                | (RangeOp::Gt, Some(Ordering::Greater))
+                | (RangeOp::Ge, Some(Ordering::Greater | Ordering::Equal))
+                | (RangeOp::Eq, Some(Ordering::Equal))
+        )
     }
 
     fn lex(y: i64, m: u64, d: u64, h: u64, mi: u64, tz: Option<i64>, date: bool) -> String {

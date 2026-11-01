@@ -187,6 +187,7 @@ impl Coordinator {
     /// so the queued commits fail. A prefix whose fence is already running keeps that
     /// fence's outcome: when the sync succeeds, its commits are durable and are
     /// acknowledged.
+    #[cfg(any(feature = "text", test))]
     pub fn fail(&self) {
         let mut s = self.state.lock();
         s.failed = true;
