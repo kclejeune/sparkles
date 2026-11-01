@@ -196,8 +196,10 @@ pub(super) fn shape_hint(question: &str, query: &str, doc: &Value) -> Option<Str
         }
         _ => {}
     }
+    // shortened terms can make distinct rows look the same
+    let shortened = doc["termsShortened"].as_u64().unwrap_or(0) > 0;
     let mut seen = std::collections::BTreeSet::new();
-    if !rows.iter().all(|r| seen.insert(r.clone())) {
+    if !shortened && !rows.iter().all(|r| seen.insert(r.clone())) {
         return Some("The result repeats rows. Add DISTINCT.".into());
     }
     None
@@ -283,6 +285,8 @@ mod tests {
             shape_hint("What is it?", "SELECT ?x", &repeated).as_deref(),
             Some("The result repeats rows. Add DISTINCT.")
         );
+        let cut = json!({ "vars": ["x"], "rows": [["\"ab…\""], ["\"ab…\""]], "termsShortened": 2 });
+        assert_eq!(shape_hint("What is it?", "SELECT DISTINCT ?x", &cut), None);
     }
 
     #[test]

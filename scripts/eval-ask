@@ -1251,19 +1251,24 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
         flight.append((c, rnd, now))
 
     def done(c, answer):
-        settled = True
+        settled, phase_bound = True, False
         if proxy:
             # A request the line left running settles before the case's cost is read,
-            # within the time the phase has left. When the phase ends first, the
-            # answer is kept with its cost unknown.
-            settled = proxy.wait_idle(timeout=max(0, phase_left()), case=c["case"])
+            # within the time the phase has left. When the phase ends first, or the
+            # request outlasts its own timeout, the answer is kept with its cost unknown.
+            # With no phase deadline, the proxy's own request timeout bounds the wait.
+            left = phase_left()
+            phase_bound = not math.isinf(left)
+            settled = proxy.wait_idle(
+                timeout=None if math.isinf(left) else max(0, left), case=c["case"]
+            )
             answer["ledgerNanodollars"] = proxy.case_cost(c["case"]) if settled else None
             proxy.close_case(c["token"])
             ledger.release(c["case"])
         c["answer"] = answer
         with contextlib.suppress(OSError):
             c["tokenFile"].unlink()
-        if not settled and not expiring:
+        if not settled and not expiring and phase_bound:
             finalize()
             phase_expired()
 

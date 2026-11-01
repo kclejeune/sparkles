@@ -1848,6 +1848,36 @@ class BatchCases(unittest.TestCase):
         # the answer stays, with its cost unknown
         self.assertEqual([(q["id"], a["ledgerNanodollars"]) for q, _, a in results], [("q0", None)])
 
+    def test_without_a_phase_deadline_the_proxy_bounds_its_own_wait(self):
+        class Proxy:
+            ledger = type("L", (), {"hold": lambda *a: True, "release": lambda *a: None})()
+            ordered_replies = False
+            waits = []
+
+            def open_case(self, case):
+                return None
+
+            def close_case(self, token):
+                pass
+
+            def flush_replies(self, case):
+                pass
+
+            def wait_idle(self, timeout=None, case=None):
+                self.waits.append(timeout)
+                # a timeout of infinity overflows a real condition wait
+                return timeout is None or timeout < 1e9
+
+            def case_cost(self, case):
+                return 5
+
+            def refusals_for(self, case):
+                return 0
+
+        out, _ = self.run_batch(self.runner("normal"), self.qs(3), proxy=Proxy())
+        self.assertEqual(Proxy.waits, [None, None, None])
+        self.assertEqual([a["ledgerNanodollars"] for _, _, a in out], [5, 5, 5])
+
     def test_an_answer_whose_request_is_unsettled_at_the_phase_deadline_is_kept(self):
         runner = self.runner("normal", deadline=300)
         runner.deadline = time.monotonic() + 1
