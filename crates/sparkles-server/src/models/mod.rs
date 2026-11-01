@@ -808,6 +808,7 @@ impl Models {
                     level,
                     max_output_tokens: pair.max_output_tokens.unwrap_or(m.max_output_tokens),
                     temperature: m.temperature,
+                    reasoning_effort: m.reasoning_effort,
                     num_ctx: m.num_ctx,
                     timeout: Duration::from_secs_f64(timeout).min(left),
                 };

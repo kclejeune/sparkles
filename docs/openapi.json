@@ -11814,7 +11814,7 @@
                 "x-sparkles-unset": "2 times the input price"
               },
               "cacheWritePerMTok": {
-                "description": "The price of one million input tokens written to the prompt cache with the 5-minute TTL.",
+                "description": "The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.",
                 "minimum": 0.0,
                 "title": "Cache write price",
                 "type": "number",
@@ -11852,6 +11852,24 @@
             "type": "string",
             "x-sparkles-kinds": [
               "local"
+            ]
+          },
+          "reasoningEffort": {
+            "description": "How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.",
+            "enum": [
+              "none",
+              "minimal",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "title": "Reasoning effort",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "openai",
+              "anthropic"
             ]
           },
           "repo": {
@@ -11930,6 +11948,7 @@
           "temperature",
           "structuredOutput",
           "requestTimeoutSecs",
+          "reasoningEffort",
           "numCtx",
           "pricing",
           "repo",
@@ -12198,7 +12217,7 @@
                 "x-sparkles-unset": "2 times the input price"
               },
               "cacheWritePerMTok": {
-                "description": "The price of one million input tokens written to the prompt cache with the 5-minute TTL.",
+                "description": "The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.",
                 "minimum": 0.0,
                 "title": "Cache write price",
                 "type": "number",
@@ -12268,6 +12287,25 @@
             "type": "string",
             "x-sparkles-kinds": [
               "local"
+            ],
+            "x-sparkles-section": "Model defaults"
+          },
+          "reasoningEffort": {
+            "description": "How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.",
+            "enum": [
+              "none",
+              "minimal",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "title": "Reasoning effort",
+            "type": "string",
+            "x-sparkles-kinds": [
+              "openai",
+              "anthropic"
             ],
             "x-sparkles-section": "Model defaults"
           },
@@ -12432,6 +12470,7 @@
           "temperature",
           "structuredOutput",
           "requestTimeoutSecs",
+          "reasoningEffort",
           "numCtx",
           "pricing",
           "repo",

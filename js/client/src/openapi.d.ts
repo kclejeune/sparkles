@@ -7228,7 +7228,7 @@ export interface components {
                 cacheWrite1hPerMTok?: number;
                 /**
                  * Cache write price
-                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 * @description The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.
                  */
                 cacheWritePerMTok?: number;
                 /**
@@ -7249,6 +7249,12 @@ export interface components {
              * @description Text added before each query, replacing the snapshot's query prompt.
              */
             queryPrefix?: string;
+            /**
+             * Reasoning effort
+             * @description How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.
+             * @enum {string}
+             */
+            reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
             /**
              * Repository
              * @description The Hugging Face repository that holds the model snapshot.
@@ -7420,7 +7426,7 @@ export interface components {
                 cacheWrite1hPerMTok?: number;
                 /**
                  * Cache write price
-                 * @description The price of one million input tokens written to the prompt cache with the 5-minute TTL.
+                 * @description The price of one million input tokens written to the prompt cache with the shorter TTL, five minutes for the anthropic kind and 30 minutes for OpenAI.
                  */
                 cacheWritePerMTok?: number;
                 /**
@@ -7460,6 +7466,12 @@ export interface components {
              * @description Text added before each query, replacing the snapshot's query prompt.
              */
             queryPrefix?: string;
+            /**
+             * Reasoning effort
+             * @description How much a reasoning model thinks before it answers, sent as the openai kind's reasoning_effort and the anthropic kind's output_config.effort. The provider decides which values a model accepts. An openai model with an effort limits its output with max_completion_tokens and sends a temperature only when one is set.
+             * @enum {string}
+             */
+            reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
             /**
              * Repository
              * @description The Hugging Face repository that holds the model snapshot.

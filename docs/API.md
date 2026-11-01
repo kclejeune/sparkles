@@ -11857,9 +11857,16 @@ except `repair`, which uses the `draft` list.
 A provider may also set `concurrency` (4 by default), `requestsPerMinute`,
 `allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind,
 `version` and `promptCaching` for the `anthropic` kind, and the defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
-`temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs` and, for Ollama,
-`numCtx` per model. Headers that carry credentials are refused, and so are endpoints
-with credentials, a query or a fragment. Requests go through the server's outbound
+`temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs`, `reasoningEffort`
+and, for Ollama, `numCtx` per model. `reasoningEffort` is one of `none`, `minimal`,
+`low`, `medium`, `high`, `xhigh` and `max`, and the provider decides which a model
+accepts. The `openai` kind sends it as `reasoning_effort`, and the `anthropic` kind as
+`output_config.effort`. An `openai` model with an effort is treated as a reasoning
+model, so its requests limit the output with `max_completion_tokens`, which counts its
+reasoning tokens, and send a temperature only when one is set. An OpenAI answer counts
+its cache reads and writes inside `prompt_tokens`, and Sparkles takes them out of the
+uncached input and prices the writes at `cacheWritePerMTok`. Headers that carry
+credentials are refused, and so are endpoints with credentials, a query or a fragment. Requests go through the server's outbound
 policy, so a provider on a private address needs `--outbound-allow-private`.
 
 **TLS.** A provider with an `https` endpoint may set `tls`. `tls.caCert` names a PEM CA
