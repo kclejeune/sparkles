@@ -11,6 +11,7 @@ use serde_json::{Map, Value as J, json};
 
 mod admin;
 mod assist;
+mod catalog;
 mod changes;
 mod features;
 mod kit;
@@ -1389,5 +1390,6 @@ pub(super) fn schemas() -> Map<String, J> {
     policies::put_all(&mut put);
     assist::put_all(&mut put);
     model_settings::put_all(&mut put);
+    catalog::put_all(&mut put);
     s
 }

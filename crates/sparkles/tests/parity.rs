@@ -930,6 +930,21 @@ fn entries() -> Vec<(&'static str, Entry)> {
         // C21: outbound notifications are a server-wide settings kind with its own worker
         server_only!("getNotifications", Process),
         server_only!("testNotification", Process),
+        // C30: the resource catalog is a file of the server's data directory, and its
+        // header read and install act on the server's datasets through their HTTP state
+        server_only!("listResources", Process),
+        server_only!("createResource", Process),
+        server_only!("getResource", Process),
+        server_only!("replaceResource", Process),
+        server_only!("deleteResource", Process),
+        server_only!("addResourceVersion", Process),
+        server_only!("deleteResourceVersion", Process),
+        server_only!("acceptResourceTerms", Process),
+        server_only!("withdrawResourceTerms", Process),
+        server_only!("getResourceLicense", Process),
+        server_only!("getResourceNotice", Process),
+        server_only!("getVocabularyHeader", Process),
+        server_only!("installVocabularyPrefixes", Process),
         server_only!("listAsks", Process),
         server_only!("deleteAsks", Process),
         server_only!("askFeedback", Process),

@@ -333,6 +333,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::models::http::routes());
     let app = app.merge(crate::assist::routes());
     let app = app.merge(crate::settings::http::routes());
+    let app = app.merge(crate::resources::http::routes());
     // outbound notifications: status and test sends (C21)
     let app = app.merge(crate::notify::http::routes());
     // assistant settings, ask history and usage (C18 §3.5, §5.5, §6.4)
@@ -500,6 +501,11 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    /// The response's status.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.0
+    }
+
     pub(crate) fn audit_code(&self) -> &str {
         self.1
             .get("code")
@@ -1032,7 +1038,7 @@ fn content_type(h: &HeaderMap) -> String {
 }
 
 /// Pick the best offer for an Accept header (q-values, wildcards).
-fn negotiate(accept: &str, offers: &[&str]) -> Option<usize> {
+pub(crate) fn negotiate(accept: &str, offers: &[&str]) -> Option<usize> {
     let mut best: Option<(f32, usize, usize)> = None; // (q, specificity, offer)
     for part in accept.split(',') {
         let mut it = part.split(';');

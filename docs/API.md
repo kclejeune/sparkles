@@ -41,6 +41,7 @@ A machine-readable description of this API is served at `/$/openapi.json`. See
 * [Commits](#commits)
 * [Branches and merges](#branches-and-merges)
 * [Point-in-time reads and snapshots](#point-in-time-reads-and-snapshots)
+* [Resource catalog](#resource-catalog)
 * [Backup repositories](#backup-repositories)
 
 **Search and graph analytics**
@@ -4911,6 +4912,140 @@ These commands open the database, so stop a server that holds it or use the HTTP
 `sparkles log` reads without the lock and marks with `*` the commits a point-in-time read
 can see. The Rust API has `Store::snapshot_at`, `diff`, `create_snapshot_with`,
 `set_retention`, `set_schedules`, `history_tick` and `history`.
+
+## Resource catalog
+
+The design is in [C30 Resource catalog](specs/C30-resource-catalog/README.md).
+
+The resource catalog records the sources, vocabularies and datasets a server works with,
+their versions and their licences. It describes data and never holds any. The catalog
+is the file `resources.json` of the data directory, and a server without a data
+directory keeps it in memory. Every route needs server `admin`, except the install
+route, which needs `admin` on its dataset. Writes answer `403 server-read-only` on a
+read-only server.
+
+| Route | What it does |
+|---|---|
+| `GET /$/resources` | Lists every resource as JSON, or describes the catalog in RDF. |
+| `POST /$/resources` | Adds a resource with any initial versions. |
+| `GET /$/resources/{id}` | Reads one resource with its `ETag`, or its RDF description. |
+| `PUT /$/resources/{id}` | Replaces the descriptive members and honours `If-Match`. |
+| `DELETE /$/resources/{id}` | Removes a resource that nothing references and honours `If-Match`. |
+| `POST /$/resources/{id}/versions` | Adds a version. |
+| `DELETE /$/resources/{id}/versions/{version}` | Removes a version that nothing references. |
+| `POST /$/resources/{id}/acceptance` | Records the caller's acceptance of restricted terms. |
+| `DELETE /$/resources/{id}/acceptance` | Withdraws the acceptance. |
+| `GET /$/resources/{id}/license` | Reports a version's licence obligations and the gate's verdict. |
+| `GET /$/resources/{id}/notice` | Writes a version's NOTICE as plain text. |
+| `GET /$/resources/{id}/header` | Reads a vocabulary's header from its graphs. |
+| `POST /$/resources/{id}/install/{ds}` | Binds a vocabulary's namespaces as prefixes of a dataset. |
+
+A resource has an `id` of 1 to 64 letters, digits, `.`, `_` and `-` that starts with a
+letter or digit, a `kind` of `source`, `vocabulary` or `dataset`, and a `title`. It may
+carry a `description`, a `homepage`, a `license`, a `licenseClass`, a `licenseUrl` and an
+`attribution`. The `ownership` is `owned`. A `mirrored` resource waits for the immutable
+mirrors that build on item 81, and a `synced` resource waits for the update monitoring
+that depends on item 339, so both are refused with `400 bad-resource`.
+
+```json
+{
+  "id": "osm",
+  "kind": "source",
+  "title": "OpenStreetMap",
+  "license": "ODbL-1.0",
+  "attribution": "© OpenStreetMap contributors",
+  "versions": [
+    {
+      "version": "2025-01",
+      "issued": "2025-01-06",
+      "distributions": [
+        {"url": "https://example.org/osm.nt.gz", "mediaType": "application/n-triples",
+         "byteSize": 1048576, "sha256": "…"}
+      ]
+    }
+  ]
+}
+```
+
+A version has a `version` of 1 to 64 letters, digits, `.`, `_`, `+` and `-`, and it may
+carry `issued`, `notes`, a `license` that overrides the resource's, `distributions` and
+`imports`. A version of a dataset resource lists its `graphs`, each with the `sources` it
+was built from. An import or a source is a pin, `{"resource": …, "version": …}`, of a
+version that exists. A version never changes once it is added, so a correction is a new
+version, and the version added last is the current one. Removing a version or a
+resource that another version references is `409 resource-in-use`. The catalog sets
+`created`, `modified`, `added` and `acceptance` itself, and a body that names them is
+`400 bad-resource`. `PUT` keeps the resource's kind and refuses `versions`.
+
+`GET` answers JSON by default. `Accept: text/turtle` or another RDF media type, or
+`format=turtle`, `ntriples`, `nquads`, `trig`, `rdfxml` or `jsonld`, describes the catalog
+in DCAT 3. The catalog is `urn:x-sparkles:resources`, a `dcat:Catalog`, and a resource is
+`urn:x-sparkles:resource:{id}`, a `dcat:Dataset` whose `dct:type` names its kind. A
+version is `urn:x-sparkles:resource:{id}/{version}`, linked by `dcat:hasVersion`,
+`dcat:hasCurrentVersion` and `dcat:previousVersion`. Distributions carry
+`dcat:downloadURL`, `dcat:mediaType`, `dcat:byteSize` and an `spdx:checksum`. Imports and
+graph sources are `prov:wasDerivedFrom`. Each graph of a dataset version is a
+`void:Dataset` of that version that names its graph with `dct:identifier`. Namespaces are
+`vann:preferredNamespacePrefix` and `vann:preferredNamespaceUri`.
+
+A catalog file of a format this build does not read, or one that does not parse, is left
+as it is. Every route then answers `503 catalog-unreadable`, and the datasets keep
+serving.
+
+### Resource licences
+
+A licence is an SPDX licence expression, such as `CC-BY-4.0`, `ODbL-1.0 AND CC-BY-4.0`
+or `LicenseRef-imdb`. A built-in table sorts the common data and software licences into
+four classes, which are `open`, `attribution`, `share-alike` and `restricted`. An
+identifier outside the table and every `LicenseRef-` need `licenseClass`. A
+`licenseClass` given for an expression the table classifies, including `NOASSERTION` and
+`NONE`, must restate the table's class. `WITH` follows a single licence. `AND` takes
+the more restrictive class and `OR` the less restrictive one. A missing licence,
+`NOASSERTION` and `NONE` have the class `unknown`. Data whose class is `restricted` or
+`unknown` may not be redistributed.
+
+`GET /$/resources/{id}/license?version=…` reports the obligations of a version, which
+is the current one by default. They are its own licence and, transitively, the licences
+of its imports and of its graphs' sources. Each graph of a dataset version has its own
+class, which is the most restrictive of its obligations. The report gives
+`redistributable`, the `policy` and the `verdict` of the licence gate. The verdict is
+`warn` for data that may not be redistributed under `serve --license-policy warn`, the
+default, and `refuse` only under `--license-policy enforce`. The export and publication
+routes do not consult the verdict in this release. `GET /$/resources/{id}/notice`
+writes the NOTICE with each licence, its attribution, its page and the graphs it covers.
+
+A resource with restricted terms needs an administrator's acceptance, which
+`POST /$/resources/{id}/acceptance` records with the caller and the time. The
+acceptance names the licences it accepted, so a later version under other terms leaves
+it stale, and the report lists the resource in `unaccepted`. A change of the resource's
+licences through `PUT` withdraws it. A resource without restricted terms answers
+`409 not-restricted`.
+
+### Vocabulary resources
+
+A vocabulary resource lists the `namespaces` it owns, each a `prefix` and an `iri`, and
+the dataset `graphs` that hold it, each a `dataset` and a `graph`. A prefix and a
+namespace IRI belong to one vocabulary of the server, and a second claim is
+`409 namespace-owned`.
+
+`GET /$/resources/{id}/header` reads the `owl:Ontology` or `skos:ConceptScheme` of each
+of those graphs, with its `owl:versionIRI`, `owl:versionInfo`, `dct:license`,
+`dct:title`, `vann:preferredNamespacePrefix` and `vann:preferredNamespaceUri`. The read
+runs with the caller's grants and the server's query timeout and budgets, and rate
+limits and memory admission count it as a query. Each graph lists its `disagreements`
+with the current version's record, and nothing changes. `owl:versionInfo` must equal the
+current version, and without it one segment of the version IRI's path, or its
+fragment, must. SPDX licence pages
+compare by identifier, and other licence IRIs compare exactly.
+
+`POST /$/resources/{id}/install/{ds}` binds the namespaces of the vocabulary, and of the
+vocabularies its current version imports, as prefixes of the dataset in one write of the
+`prefixes` settings kind. The write honours the operator's locks and `--max-prefixes`.
+A prefix that the dataset binds to another IRI is `409 prefix-conflict` with the
+`conflicts`, unless the request sets `replace=true`. The answer lists the prefixes it
+`installed`, those it `replaced` and those that were `unchanged`. A prefix write that
+lands between the install's read and its write makes the install read again, so it
+never overwrites a binding it did not check.
 
 ## Backup repositories
 

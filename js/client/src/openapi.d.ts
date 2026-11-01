@@ -2584,6 +2584,202 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the resource catalog
+         * @description Every source, vocabulary and dataset resource of the server with its versions, as JSON, or the catalog in DCAT 3 with PROV-O, SPDX, VANN and VoID on `Accept` or `format=`. Needs server `admin`.
+         */
+        get: operations["listResources"];
+        put?: never;
+        /**
+         * Add a resource
+         * @description Adds a resource with any initial versions, which may reference earlier ones in the list. A `mirrored` or `synced` ownership policy is refused, since this build keeps owned resources. Needs server `admin`.
+         */
+        post: operations["createResource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a resource
+         * @description The resource with its `ETag`, or its description in DCAT on `Accept` or `format=`. Needs server `admin`.
+         */
+        get: operations["getResource"];
+        /**
+         * Replace a resource's description
+         * @description Replaces the descriptive members. The kind stays, and `versions` is refused, since versions are added and removed on their own routes. A change of the licences withdraws the acceptance of restricted terms. Needs server `admin`.
+         */
+        put: operations["replaceResource"];
+        post?: never;
+        /**
+         * Remove a resource
+         * @description Removes a resource that no version of another resource references (`409 resource-in-use` otherwise). Needs server `admin`.
+         */
+        delete: operations["deleteResource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/acceptance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept restricted terms
+         * @description Records the caller's acceptance of the resource's restricted terms, with the licences it accepts. A resource without restricted terms is `409 not-restricted`. Needs server `admin`.
+         */
+        post: operations["acceptResourceTerms"];
+        /**
+         * Withdraw an acceptance
+         * @description Withdraws the acceptance of the resource's terms. Needs server `admin`.
+         */
+        delete: operations["withdrawResourceTerms"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/header": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a vocabulary's header
+         * @description Reads the `owl:Ontology` or `skos:ConceptScheme` header of each graph that holds the vocabulary, under the caller's grants and the server's query timeout and budgets, and lists where it disagrees with the current version's record. Changes nothing. Needs server `admin`.
+         */
+        get: operations["getVocabularyHeader"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/install/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Install a vocabulary's prefixes
+         * @description Binds the namespaces of the vocabulary and of the vocabularies its current version imports as prefixes of the dataset in one settings write, which honours the operator's locks and the prefix limit. A prefix the dataset binds to another IRI is `409 prefix-conflict` unless `replace=true`. Needs `admin` on the dataset.
+         */
+        post: operations["installVocabularyPrefixes"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/license": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a version's licence obligations
+         * @description The licences that apply to a version, propagated through its imports and its graphs' sources, the class of each graph, whether the data may be redistributed and the verdict of the licence gate under `serve --license-policy`. Needs server `admin`.
+         */
+        get: operations["getResourceLicense"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/notice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a version's NOTICE
+         * @description The NOTICE of a version as plain text, with each licence, its attribution, its page and the graphs it covers. Needs server `admin`.
+         */
+        get: operations["getResourceNotice"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add a version
+         * @description Adds a version, which never changes afterwards. Its imports and graph sources pin versions that exist. Needs server `admin`.
+         */
+        post: operations["addResourceVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/versions/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a version
+         * @description Removes a version that nothing references (`409 resource-in-use` otherwise). Needs server `admin`.
+         */
+        delete: operations["deleteResourceVersion"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/revert/{ds}": {
         parameters: {
             query?: never;
@@ -6954,6 +7150,48 @@ export interface components {
         } & (unknown | unknown | unknown);
         /** @enum {string} */
         Level: "read" | "write" | "admin";
+        /** @description The licence obligations of a version and the gate's verdict. */
+        LicenseReport: {
+            /**
+             * @description The most restrictive class of the obligations.
+             * @enum {string}
+             */
+            class: "open" | "attribution" | "share-alike" | "restricted" | "unknown";
+            graphs?: {
+                /** @enum {string} */
+                class: "open" | "attribution" | "share-alike" | "restricted" | "unknown";
+                graph: string;
+                /** @description `resource version` keys of the obligations. */
+                obligations: string[];
+                redistributable: boolean;
+            }[];
+            obligations: {
+                /** @description For restricted terms, whether an administrator accepted them. */
+                accepted?: boolean;
+                attribution?: string;
+                /** @enum {string} */
+                class: "open" | "attribution" | "share-alike" | "restricted" | "unknown";
+                license?: string;
+                resource: string;
+                title: string;
+                url?: string;
+                /** @description Empty for a resource without versions. */
+                version: string;
+            }[];
+            /** @enum {string} */
+            policy: "warn" | "enforce";
+            redistributable: boolean;
+            resource: string;
+            /** @description Resources with restricted terms that no administrator accepted. */
+            unaccepted?: string[];
+            /**
+             * @description `refuse` only under `--license-policy enforce`.
+             * @enum {string}
+             */
+            verdict: "allow" | "warn" | "refuse";
+            version?: string | null;
+            warnings: string[];
+        };
         /** @description The server's per-request budgets. 0 means unlimited. */
         Limits: {
             maxAdminBodyBytes?: number;
@@ -8419,6 +8657,25 @@ export interface components {
             prefix: string;
             uri: string;
         };
+        /** @description The prefixes an install bound. */
+        PrefixInstall: {
+            dataset: string;
+            installed: {
+                iri: string;
+                prefix: string;
+            }[];
+            replaced: {
+                /** @description The IRI the dataset bound before. */
+                bound: string;
+                iri: string;
+                prefix: string;
+                resource: string;
+            }[];
+            unchanged: {
+                iri: string;
+                prefix: string;
+            }[];
+        };
         /** @description A prefix whose name is well-known but whose IRI differs (spec C20). */
         PrefixWarning: {
             /** @description The IRI the dataset binds it to. */
@@ -8973,6 +9230,218 @@ export interface components {
                 readonly: boolean;
                 type: string;
             })[];
+        };
+        /** @description A resource of the catalog. */
+        Resource: {
+            /** @description An administrator's acceptance of restricted terms. */
+            acceptance?: {
+                at: string;
+                by: string;
+                /** @description The licences of the resource and its versions that were accepted. */
+                licenses: string[];
+            };
+            /** @description The attribution text that the NOTICE carries. */
+            attribution?: string;
+            created: {
+                /** @description An RFC 3339 time. */
+                at: string;
+                by: string;
+            };
+            /** @description The server dataset a dataset resource describes. */
+            dataset?: string;
+            description?: string;
+            /** @description The dataset graphs that hold a vocabulary. */
+            graphs?: {
+                dataset: string;
+                graph: string;
+            }[];
+            /** @description An absolute IRI. */
+            homepage?: string;
+            id: string;
+            /** @enum {string} */
+            kind: "source" | "vocabulary" | "dataset";
+            /** @description An SPDX licence expression. Absent means no licence is known, which forbids redistribution. */
+            license?: string;
+            /**
+             * @description The licence's class, needed for identifiers outside the built-in table and for `LicenseRef-`.
+             * @enum {string}
+             */
+            licenseClass?: "open" | "attribution" | "share-alike" | "restricted";
+            /** @description The licence's page, for a licence outside the SPDX list. */
+            licenseUrl?: string;
+            modified: {
+                /** @description An RFC 3339 time. */
+                at: string;
+                by: string;
+            };
+            /** @description The namespaces a vocabulary owns. A prefix and a namespace belong to one vocabulary of the server. */
+            namespaces?: {
+                iri: string;
+                prefix: string;
+            }[];
+            /**
+             * @description `owned`; this build refuses `mirrored` and `synced`.
+             * @enum {string}
+             */
+            ownership: "owned" | "mirrored" | "synced";
+            title: string;
+            versions: components["schemas"]["ResourceVersion"][];
+        };
+        /** @description A resource to add, with any initial versions. */
+        ResourceCreate: {
+            /** @description The attribution text that the NOTICE carries. */
+            attribution?: string;
+            /** @description The server dataset a dataset resource describes. */
+            dataset?: string;
+            description?: string;
+            /** @description The dataset graphs that hold a vocabulary. */
+            graphs?: {
+                dataset: string;
+                graph: string;
+            }[];
+            /** @description An absolute IRI. */
+            homepage?: string;
+            /** @description 1 to 64 letters, digits, `.`, `_` and `-`, starting with a letter or digit. */
+            id: string;
+            /** @enum {string} */
+            kind: "source" | "vocabulary" | "dataset";
+            /** @description An SPDX licence expression. Absent means no licence is known, which forbids redistribution. */
+            license?: string;
+            /**
+             * @description The licence's class, needed for identifiers outside the built-in table and for `LicenseRef-`.
+             * @enum {string}
+             */
+            licenseClass?: "open" | "attribution" | "share-alike" | "restricted";
+            /** @description The licence's page, for a licence outside the SPDX list. */
+            licenseUrl?: string;
+            /** @description The namespaces a vocabulary owns. A prefix and a namespace belong to one vocabulary of the server. */
+            namespaces?: {
+                iri: string;
+                prefix: string;
+            }[];
+            /**
+             * @description `owned`; this build refuses `mirrored` and `synced`.
+             * @enum {string}
+             */
+            ownership?: "owned" | "mirrored" | "synced";
+            title: string;
+            versions?: components["schemas"]["ResourceVersionInput"][];
+        };
+        /** @description The resources of the catalog. */
+        ResourceList: {
+            resources: components["schemas"]["Resource"][];
+        };
+        /** @description The descriptive members of a resource. */
+        ResourceUpdate: {
+            /** @description The attribution text that the NOTICE carries. */
+            attribution?: string;
+            /** @description The server dataset a dataset resource describes. */
+            dataset?: string;
+            description?: string;
+            /** @description The dataset graphs that hold a vocabulary. */
+            graphs?: {
+                dataset: string;
+                graph: string;
+            }[];
+            /** @description An absolute IRI. */
+            homepage?: string;
+            /** @description The route's id, when given. */
+            id?: string;
+            /** @enum {string} */
+            kind: "source" | "vocabulary" | "dataset";
+            /** @description An SPDX licence expression. Absent means no licence is known, which forbids redistribution. */
+            license?: string;
+            /**
+             * @description The licence's class, needed for identifiers outside the built-in table and for `LicenseRef-`.
+             * @enum {string}
+             */
+            licenseClass?: "open" | "attribution" | "share-alike" | "restricted";
+            /** @description The licence's page, for a licence outside the SPDX list. */
+            licenseUrl?: string;
+            /** @description The namespaces a vocabulary owns. A prefix and a namespace belong to one vocabulary of the server. */
+            namespaces?: {
+                iri: string;
+                prefix: string;
+            }[];
+            /**
+             * @description `owned`; this build refuses `mirrored` and `synced`.
+             * @enum {string}
+             */
+            ownership?: "owned" | "mirrored" | "synced";
+            title: string;
+        };
+        /** @description A version, with who added it and when. */
+        ResourceVersion: {
+            added: {
+                /** @description An RFC 3339 time. */
+                at: string;
+                by: string;
+            };
+            distributions?: {
+                byteSize?: number;
+                mediaType?: string;
+                /** @description The SHA-256 digest in hexadecimal. */
+                sha256?: string;
+                url: string;
+            }[];
+            /** @description A dataset version's graphs. */
+            graphs?: {
+                graph: string;
+                /** @description The pinned source versions the graph was built from. */
+                sources?: {
+                    resource: string;
+                    version: string;
+                }[];
+            }[];
+            /** @description Pinned versions this version imports. */
+            imports?: {
+                resource: string;
+                version: string;
+            }[];
+            /** @description A date (`YYYY-MM-DD`) or an RFC 3339 time. */
+            issued?: string;
+            /** @description The version's SPDX licence expression, which overrides the resource's. */
+            license?: string;
+            /** @enum {string} */
+            licenseClass?: "open" | "attribution" | "share-alike" | "restricted";
+            licenseUrl?: string;
+            notes?: string;
+            /** @description 1 to 64 letters, digits, `.`, `_`, `+` and `-`. */
+            version: string;
+        };
+        /** @description A version to add. It never changes once it is added. */
+        ResourceVersionInput: {
+            distributions?: {
+                byteSize?: number;
+                mediaType?: string;
+                /** @description The SHA-256 digest in hexadecimal. */
+                sha256?: string;
+                url: string;
+            }[];
+            /** @description A dataset version's graphs. */
+            graphs?: {
+                graph: string;
+                /** @description The pinned source versions the graph was built from. */
+                sources?: {
+                    resource: string;
+                    version: string;
+                }[];
+            }[];
+            /** @description Pinned versions this version imports. */
+            imports?: {
+                resource: string;
+                version: string;
+            }[];
+            /** @description A date (`YYYY-MM-DD`) or an RFC 3339 time. */
+            issued?: string;
+            /** @description The version's SPDX licence expression, which overrides the resource's. */
+            license?: string;
+            /** @enum {string} */
+            licenseClass?: "open" | "attribution" | "share-alike" | "restricted";
+            licenseUrl?: string;
+            notes?: string;
+            /** @description 1 to 64 letters, digits, `.`, `_`, `+` and `-`. */
+            version: string;
         };
         /** @description Where and how to restore a backup. */
         RestoreRequest: {
@@ -10452,6 +10921,25 @@ export interface components {
             name: string;
             task: string;
         };
+        /** @description The header of each graph that holds a vocabulary. */
+        VocabularyHeader: {
+            graphs: {
+                dataset: string;
+                disagreements?: string[];
+                error?: string;
+                found?: boolean;
+                graph: string;
+                header?: string;
+                license?: string;
+                namespace?: string;
+                prefix?: string;
+                title?: string;
+                versionIRI?: string;
+                versionInfo?: string;
+            }[];
+            resource: string;
+            version: string | null;
+        };
         Whoami: {
             authEnabled: boolean;
             canMintTokens?: boolean;
@@ -10796,7 +11284,7 @@ export interface components {
         gspDefault: boolean;
         /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
         gspGraph: string;
-        /** @description The id of the task, token or lock. */
+        /** @description The id of the task, token, lock or catalog resource. */
         id: string;
         /** @description Entity tags. A write needs a tag that names the current head. */
         ifMatch: string;
@@ -10850,6 +11338,8 @@ export interface components {
         user_code: string;
         /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
         validate: boolean;
+        /** @description A version of the resource. */
+        version: string;
     };
     requestBodies: {
         /** @description RDF data in the syntax its `Content-Type` names. Jena's N3 media types are read as Turtle. A `text/csv` or `text/tab-separated-values` body is a table that `mapping` or `base` maps into the graph. */
@@ -11150,7 +11640,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The id of the task, token or lock. */
+                /** @description The id of the task, token, lock or catalog resource. */
                 id: components["parameters"]["id"];
             };
             cookie?: never;
@@ -11667,7 +12157,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The id of the task, token or lock. */
+                /** @description The id of the task, token, lock or catalog resource. */
                 id: components["parameters"]["id"];
             };
             cookie?: never;
@@ -16836,7 +17326,7 @@ export interface operations {
             path: {
                 /** @description The backup repository. */
                 repo: components["parameters"]["repo"];
-                /** @description The id of the task, token or lock. */
+                /** @description The id of the task, token, lock or catalog resource. */
                 id: components["parameters"]["id"];
             };
             cookie?: never;
@@ -16903,6 +17393,444 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listResources: {
+        parameters: {
+            query?: {
+                /** @description `json`, or the RDF syntax of the description. `Accept` decides when it is left out. */
+                format?: "json" | "turtle" | "ntriples" | "nquads" | "trig" | "rdfxml" | "jsonld";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The catalog. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceList"];
+                    "application/ld+json": string;
+                    "application/n-quads": string;
+                    "application/n-triples": string;
+                    "application/rdf+json": string;
+                    "application/rdf+protobuf": string;
+                    "application/rdf+thrift": string;
+                    "application/rdf+xml": string;
+                    "application/trig": string;
+                    "text/turtle": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createResource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResourceCreate"];
+            };
+        };
+        responses: {
+            /** @description The resource, with `Location`. */
+            201: {
+                headers: {
+                    /** @description The resource's entity tag. */
+                    ETag?: string;
+                    /** @description The resource's route. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getResource: {
+        parameters: {
+            query?: {
+                /** @description `json`, or the RDF syntax of the description. */
+                format?: "json" | "turtle" | "ntriples" | "nquads" | "trig" | "rdfxml" | "jsonld";
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The resource. */
+            200: {
+                headers: {
+                    /** @description The resource's entity tag. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                    "application/ld+json": string;
+                    "application/n-quads": string;
+                    "application/n-triples": string;
+                    "application/rdf+json": string;
+                    "application/rdf+protobuf": string;
+                    "application/rdf+thrift": string;
+                    "application/rdf+xml": string;
+                    "application/trig": string;
+                    "text/turtle": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    replaceResource: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResourceUpdate"];
+            };
+        };
+        responses: {
+            /** @description The resource. */
+            200: {
+                headers: {
+                    /** @description The resource's entity tag. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteResource: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    acceptResourceTerms: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The resource. */
+            200: {
+                headers: {
+                    /** @description The resource's entity tag. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    withdrawResourceTerms: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The resource. */
+            200: {
+                headers: {
+                    /** @description The resource's entity tag. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getVocabularyHeader: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The headers. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VocabularyHeader"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    installVocabularyPrefixes: {
+        parameters: {
+            query?: {
+                /** @description Rebind prefixes that the dataset binds to other IRIs. */
+                replace?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the write bound. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrefixInstall"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getResourceLicense: {
+        parameters: {
+            query?: {
+                /** @description The version; the current version by default. */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The report. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseReport"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getResourceNotice: {
+        parameters: {
+            query?: {
+                /** @description The version; the current version by default. */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The NOTICE. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    addResourceVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResourceVersionInput"];
+            };
+        };
+        responses: {
+            /** @description The resource with the new version. */
+            201: {
+                headers: {
+                    /** @description The resource's entity tag. */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteResourceVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description A version of the resource. */
+                version: components["parameters"]["version"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -18070,7 +18998,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The id of the task, token or lock. */
+                /** @description The id of the task, token, lock or catalog resource. */
                 id: components["parameters"]["id"];
             };
             cookie?: never;
@@ -18096,7 +19024,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The id of the task, token or lock. */
+                /** @description The id of the task, token, lock or catalog resource. */
                 id: components["parameters"]["id"];
             };
             cookie?: never;

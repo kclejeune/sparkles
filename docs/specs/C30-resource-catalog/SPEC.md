@@ -1,6 +1,6 @@
 # C30: Resource catalog
 
-> **Status:** planned.
+> **Status:** partially implemented (Phase 1).
 >
 > **Roadmap:** [item 458](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -67,6 +67,152 @@ Vocabularies are per server.
 
 **Canonical content hashing of sources.** Hash sorted canonical quads after parsing, with RDFC-1.0 for small blank-node graphs, to detect the same data across formats and mirrors. LOD Laundromat shows the value. The formatter already canonicalizes.
 
+## Phase 1: catalog model, licences and vocabularies
+
+Phase 1 builds the parts of the unified resource catalog, the licence records, the
+vocabulary resource and the prefix bundles that need neither durable jobs nor storage
+backends. Nothing in it fetches a file, so the outbound policy, the source store and
+update monitoring stay with their phases.
+
+### Model
+
+The catalog is one file of the data directory, `resources.json`. A resource has an id,
+a kind, a title and an ownership policy, and it may carry a description, a homepage, a
+licence and an attribution text. An id has 1 to 64 letters, digits, `.`, `_` and `-` and
+starts with a letter or digit. The kind is `source`, `vocabulary` or `dataset`.
+
+* The ownership policy is `owned`. A `mirrored` resource needs the immutable mirrors
+  that build on item 81, and a `synced` resource needs the update monitoring of item
+  339. The catalog refuses both and names the dependency, rather than recording a
+  policy that nothing enforces.
+* A vocabulary resource owns namespaces, each a prefix and a namespace IRI, and lists
+  the dataset graphs that hold it. A namespace IRI and a prefix belong to at most one
+  vocabulary resource on the server. Other kinds refuse namespaces and graph locations.
+* A dataset resource may name the server dataset it describes.
+* A version has a version string of 1 to 64 letters, digits, `.`, `_`, `+` and `-`,
+  unique in its resource. It may carry an issue date, notes, a licence that overrides
+  the resource's licence, distributions and pinned imports. A distribution has a
+  download URL, a media type, a byte size and a SHA-256 digest, and only the URL is
+  required. An import names an existing resource and one of its existing versions.
+* A version of a dataset resource lists its graphs, each with the source versions it
+  was built from. These references are pinned in the same way as imports.
+* A version cannot change once it is added, so a pin always names the same record. A
+  correction is a new version. Removing a version or a resource that another version
+  references is refused with `409 resource-in-use`. A version can reference only
+  versions that already exist, so references never form a cycle.
+
+The catalog records who created and last changed each resource and when, and who
+added each version and when.
+
+### Licences
+
+A licence is an SPDX licence expression of identifiers, `LicenseRef-` references,
+`AND`, `OR`, `WITH`, `+` and parentheses. A built-in table sorts the common data and
+software licences into the four classes of open, attribution, share-alike and
+restricted. An expression that names an identifier outside the table, or a
+`LicenseRef-`, needs an explicit class. A class given for an expression that the table
+classifies, or for `NOASSERTION` and `NONE`, must restate the table's class, so a record
+cannot loosen it. `WITH` follows a single licence. `A AND B` takes the more restrictive class and
+`A OR B` the less restrictive one, and `WITH` keeps the class of its licence. A missing
+licence, `NOASSERTION` and `NONE` have the class unknown. Unknown and restricted data is
+not redistributable.
+
+A restricted resource needs administrator acceptance, which
+`POST /$/resources/{id}/acceptance` records with the principal and the time. A change
+of the resource's licence withdraws the acceptance, and so does `DELETE` on the same
+route.
+
+Obligations propagate through references. The obligations of a version are its own
+licence and, transitively, the licences of the versions it imports. Each graph of a
+dataset version adds the obligations of its source versions. The class of a graph is the
+most restrictive class among its obligations, in the order open, attribution,
+share-alike, restricted and unknown. `GET /$/resources/{id}/license` reports the
+obligations of a version for each graph, whether the data is redistributable and the
+verdict of the licence gate. `GET /$/resources/{id}/notice` writes the NOTICE as plain
+text, with each licence, its attribution, its URL and the graphs it covers.
+
+The gate is `serve --license-policy`, which is `warn` by default. Under `warn`, a version
+that is not redistributable gets the verdict `warn`. Only `enforce`, which the operator
+sets explicitly, gives the verdict `refuse`. A restricted resource without acceptance is
+always reported. The export and publication surfaces apply this verdict in 525,
+since the dump, Graph Store downloads, shared backups, git export in item 460 and
+linked-data publication in item 461 each need their own refusal.
+
+### Description in DCAT 3, PROV-O, SPDX, VANN and VoID
+
+`GET /$/resources` and `GET /$/resources/{id}` answer JSON by default and RDF on
+`Accept` or `format=`. The catalog is `urn:x-sparkles:resources`, a `dcat:Catalog`, and
+each resource is `urn:x-sparkles:resource:{id}`, a `dcat:Dataset` with `dct:type` naming
+its kind. Each version is `urn:x-sparkles:resource:{id}/{version}`, linked with
+`dcat:hasVersion`, `dcat:hasCurrentVersion` and `dcat:previousVersion` and carrying
+`dcat:version`. A distribution is a `dcat:Distribution` with `dcat:downloadURL`,
+`dcat:mediaType`, `dcat:byteSize` and an `spdx:checksum`. A licence is `dct:license`,
+which is the SPDX licence page for a single listed identifier and a
+`dct:LicenseDocument` labelled with the expression otherwise. Imports and graph sources
+are `prov:wasDerivedFrom`. Each graph of a dataset version is a `void:Dataset` of that
+version, linked with `dct:hasPart` and naming its graph with `dct:identifier`, so two
+versions that reuse a graph IRI keep their own sources. A
+namespace is `vann:preferredNamespacePrefix` and `vann:preferredNamespaceUri`, and a
+vocabulary's graph location is a `void:Dataset` with `void:inDataset`. The Croissant
+export for ML consumers is 526.
+
+### Vocabulary header and prefix bundles
+
+`GET /$/resources/{id}/header` reads the header of each graph that holds a vocabulary,
+which is the `owl:Ontology` or `skos:ConceptScheme` with its `owl:versionIRI`,
+`owl:versionInfo`, `dct:license`, `dct:title`, `vann:preferredNamespacePrefix` and
+`vann:preferredNamespaceUri`. It runs the read through the caller context of the
+graph's dataset, so it reads only what the caller may query, under the server's query
+timeout and budgets, and the rate limits and memory admission count it as a query.
+`owl:versionInfo` must equal the current version, and without it one segment of the
+version IRI's path, or its fragment, must. SPDX licence pages compare by identifier, and any other licence IRI
+compares exactly. It reports where the header disagrees with the current version
+record, and it changes nothing.
+
+`POST /$/resources/{id}/install/{ds}` installs the namespaces of a vocabulary, and of
+the vocabularies its current version imports transitively, as prefixes of the dataset in
+one write. The write goes through the prefixes settings kind, so it honours the
+operator's locks and the prefix limit. A prefix that the dataset already binds to a
+different IRI is a `409 prefix-conflict` unless the request sets `replace=true`. The
+write carries the entity tag of the prefixes the install read, so a concurrent prefix
+write makes the install plan again instead of overwriting a binding it did not see.
+Loading the vocabulary graphs themselves and the C20 prefix sets of prefix.cc and
+Bioregistry needs the fetch of the source store and stays with the bundle phase.
+
+### Routes and access
+
+Every `/$/resources` route needs server `admin`, except the install route, which needs
+`admin` on its dataset. Writes answer `403 server-read-only` on a read-only server. A
+resource's JSON carries an `ETag`, and `PUT` and `DELETE` honour `If-Match`. `PUT`
+replaces the descriptive members and refuses `versions`, which change only through
+`POST /$/resources/{id}/versions` and `DELETE /$/resources/{id}/versions/{version}`.
+
+### Format
+
+`resources.json` carries `format` 1 and is registered in `sparkles::formats`. A file
+with an unknown format, or one that does not parse, is never rewritten. Every catalog
+route then answers `503 catalog-unreadable` with the reason, and the server keeps
+serving its datasets. A missing file is an empty catalog, and a server without a data
+directory keeps its catalog in memory. The file is written atomically. Each write checks
+the whole catalog. A version names each import and each graph source once. The catalog refuses more than 4,096 resources, 1,000 versions of a
+resource, 256 namespaces, distributions, imports or graphs on one record and a file
+larger than 16 MiB, which it reads no further than the limit.
+
+### Tests and gates
+
+Unit tests cover the licence table and expressions, the class order, the model's checks,
+the propagation of obligations, the NOTICE and the RDF description. Router tests cover
+the routes, `ETag` and `If-Match`, the read-only refusal, references that block removal,
+namespace ownership, acceptance withdrawal, both licence policies, the header read and
+its disagreements, and installation with and without conflicts. A
+format test writes a file of format 2 and checks that every route refuses it and that
+the file is unchanged. The OpenAPI description, the generated client types and
+`api-compat.py --check-manifest` cover the new routes.
+
+The phase meets the third acceptance gate for the verdict. Licence verdicts warn by
+default and refuse only under `--license-policy enforce`, and the surfaces that act on
+the verdict are 525. The first two gates need the source store and stay open.
+
 ## Dependencies
 
 * The policy and plumbing stage of [item 453](../../ROADMAP.md), items 480 to 483, lands first, so that
@@ -104,6 +250,42 @@ for redistributable data, and restricted sources are shared as recipes only.
 
 This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: DVC, DBpedia Databus, Hugging Face Hub, qlever-control, Databus, CKAN, OBO Foundry, LOV, GraphDB server files, Kaggle, Virtuoso load list, Qleverfile MULTI_INPUT_JSON, ODK import refresh, QLever Qleverfiles, TopBraid EDG, VocBench, OBO idranges, EDG, WebProtégé forms, OLS, OntoPortal, MLCommons Croissant, Databus linksets, SSSOM, prefix.cc, Bioregistry, OBO conventions, SPDX, TopBraid EDG includes and LOD Laundromat. No code from another project is copied.
 
+Phase 1 was written from the W3C Recommendations DCAT 3 (Data Catalog Vocabulary,
+Version 3), PROV-O and the VoID Vocabulary, the VANN vocabulary for annotating
+vocabulary descriptions, and the SPDX specification's License Expression syntax, License
+List identifiers and checksum terms. The licence table classifies SPDX License List
+identifiers by the terms of their licence texts. No Fluree source or documentation was
+used, and no code from another project is copied.
+
 ## Outcome
 
-Nothing is built. [Item 458](../../ROADMAP.md) tracks the work.
+Phase 1 has shipped. [Item 458](../../ROADMAP.md) keeps the remaining phases.
+
+The server keeps the catalog in `resources.json`, format 1, which `sparkles::formats`
+registers as a server settings file. The code is `crates/sparkles-server/src/resources`.
+The model, the licences, the propagation of obligations, the NOTICE, the DCAT
+description, the vocabulary header read and the prefix install follow the plan above.
+The header read runs through `CallerContext::read_options`, so it meets the server's
+query timeout and budgets. The install writes through the prefixes settings kind. The
+catalog reads its file on each request under one lock, which keeps it current after an
+operator edits the file and costs one parse of at most 16 MiB per request. That is
+small for an administrative catalog of at most 4,096 resources.
+
+A version of a dataset resource records its graphs and their sources by hand in this
+phase. Recording them when data is loaded, and reloading from sources, belong to the load
+manifest phase, which needs the source store for reload. The licence gate reports its
+verdict, and the export and publication routes apply it under 525. The Croissant
+export is 526. Only server administrators read the catalog, and a filtered read
+for dataset administrators belongs to the dataset manager phase.
+
+The catalog is per server, as the non-goals require. A vocabulary resource names the
+dataset graphs that hold the vocabulary, and each dataset keeps its own term dictionary.
+A dictionary shared across datasets is not adopted, because it would couple the
+lifecycles of the datasets, force renumbering when one changes, reveal through shared
+ids which terms another dataset holds and widen the reach of every change to its format.
+
+Unit tests cover the licence expressions and table, the class order, the model's checks,
+references, propagation, the NOTICE, the DCAT description and the file format. Router
+tests cover every route, the entity tags, the read-only refusal, an unreadable file on
+every route, both licence policies, acceptance, the header read and the install with and
+without conflicts.

@@ -77,6 +77,29 @@ an OpenAPI description. The MCP server for agents is described under
   stored query as a tool.
 
 
+### Resource catalog
+
+* The server keeps a catalog of the sources, vocabularies and datasets it works with in
+  `resources.json` of its data directory ([API.md](../API.md#resource-catalog),
+  [C30](../specs/C30-resource-catalog/README.md)). The catalog describes data and holds
+  none, and server administrators manage it under `/$/resources`.
+* Each resource has versions that never change once they are added. A version's imports
+  and a dataset version's graph sources pin versions that exist, and a referenced version
+  or resource cannot be removed.
+* The catalog is described in DCAT 3, with PROV-O derivations, SPDX checksums and
+  licences, VANN namespaces and VoID graph locations, as JSON or in any RDF syntax.
+* Licences are SPDX expressions sorted into the classes open, attribution, share-alike
+  and restricted, and a missing licence forbids redistribution. Obligations propagate
+  through imports and graph sources to each graph of a dataset version, and the catalog
+  writes a NOTICE. Restricted terms need an administrator's recorded acceptance.
+* The licence gate warns by default and refuses only under
+  `serve --license-policy enforce`. It reports its verdict, and the export and
+  publication routes do not consult it yet.
+* A vocabulary owns its namespaces and prefixes, which belong to one vocabulary of the
+  server. Its header can be read from its graphs and compared with the catalog, and one
+  request installs its prefixes and those of its imports into a dataset.
+
+
 ## Access control and security
 
 Authentication is off by default. Once it is on, access is denied unless a grant allows it.
@@ -179,6 +202,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 37.
 * Stored queries have no stored updates, no parameters bound to several values at once,
   and no private queries per user. Roadmap item 39.
+* The resource catalog fetches nothing. The content-addressed source store, recipes and
+  harvesters, load manifests with reload from sources, mirrors, update monitoring, IRI
+  minting and vocabulary graph bundles remain under roadmap item 458. The export and
+  publication routes do not apply the licence gate's verdict, item 525, and the
+  catalog has no Croissant export, item 526. Only server administrators read the
+  catalog.
 * Sparkles runs as a single node on local disk. There is no clustering and there are no
   replicas, roadmap item 66. Live RDF data on local disk is not encrypted at rest, item 65.
 * Backups cover individual datasets, with no whole-server backup, roadmap item 61.
@@ -200,6 +229,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 * Read [OpenAPI description](../API.md#openapi-description).
 * Read [GraphQL](../API.md#graphql).
 * Read [Stored queries](../API.md#stored-queries).
+* Read [Resource catalog](../API.md#resource-catalog).
 * Read [Authentication and access control](../API.md#authentication-and-access-control).
 * Read [OAuth for the MCP endpoint](../API.md#oauth-for-the-mcp-endpoint).
 * Read [Graph-level access control](../API.md#graph-level-access-control).
@@ -207,7 +237,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 37](../ROADMAP.md), [item 39](../ROADMAP.md), [item 69](../ROADMAP.md), [item 61](../ROADMAP.md), [item 65](../ROADMAP.md), [item 66](../ROADMAP.md), [item 71](../ROADMAP.md), [item 75](../ROADMAP.md), [item 76](../ROADMAP.md), [item 342](../ROADMAP.md).
+The remaining work described above refers to [item 37](../ROADMAP.md), [item 39](../ROADMAP.md), [item 69](../ROADMAP.md), [item 61](../ROADMAP.md), [item 65](../ROADMAP.md), [item 66](../ROADMAP.md), [item 71](../ROADMAP.md), [item 75](../ROADMAP.md), [item 76](../ROADMAP.md), [item 342](../ROADMAP.md), [item 458](../ROADMAP.md), [item 525](../ROADMAP.md), [item 526](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
