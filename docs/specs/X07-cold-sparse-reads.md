@@ -1066,26 +1066,30 @@ per block, checks the request every `PREFETCH_CHECK_STEPS` ranges, and also runs
 range that starts in a held segment continues into cold ones.
 
 The gates were measured on forge on 2026-11-01 under the heavy lock, in interleaved rounds
-of A, B, B and A with `bench-regressions.py`, comparing main at `04d49b57` with the lane at
-`38deb1e8`. The [run record](../benchmarks/synthetic/runs/2026-11-01-cold-lookups-forge/validation.json)
+of A, B, B and A with `bench-regressions.py`, comparing main at `04d49b57` with the lane.
+The final code is `cd46d9c3`, and the prewarm, 1.05M and Oxigraph rows come from
+`38deb1e8`, which differs from it only in the inlining of the lookahead. The
+[run record](../benchmarks/synthetic/runs/2026-11-01-cold-lookups-forge/validation.json)
 holds every sample.
 
 | Gate | Result |
 |---|---|
-| Cold `star-join` at 10.5M | 83.8 to 78.3 ms. The unsegmented build at `72d85c7f` takes 77.8 ms on its own store, and the lane takes 1.010 of that in the same rounds. |
-| Other cold queries at 10.5M | 25 of the other 27 are no more than 5% slower than main, after a rerun of `path-plus` and `values-star` in three pairs of 11 samples. `group-avg` and `expr-agg-arg` are 8% and 11% slower and are discussed below. |
+| Cold `star-join` at 10.5M | 85.7 to 76.9 ms in the final code, and 83.8 to 78.3 ms in `38deb1e8`. The unsegmented build at `72d85c7f` takes 77.8 ms on its own store, and `38deb1e8` takes 1.010 of that in the same rounds. |
+| Other cold queries at 10.5M | No other query of the suite is more than 2% slower than main in the final code. |
 | Cold at 1.05M | A rerun of the queries that one pair flagged, in three pairs of 11 samples, put every one within 0.955 to 1.027 of main. |
-| Warm at 10.5M | Queries above 1 ms are no more than 5% slower except `group-avg` and `expr-agg-arg`. `star-lookup` runs 1.9% more instructions per request and `employee-docs` 2.8% more. |
+| Warm at 10.5M | No query above 1 ms is more than 5% slower than main after a rerun of the flagged ones in four pairs. `star-lookup` runs 1.6% more instructions per request and `employee-docs` 2.5% more. |
 | Prewarm | With the list of a warm pass, cold `star-lookup` goes from 11.4 to 3.3 ms at 10.5M, `employee-docs` from 10.5 to 3.2 ms, `values-star` from 7.3 to 3.7 ms and `star-join` from 77.9 to 33.4 ms. The background read takes 3 to 71 ms, and the time to ready stays at 52 ms. |
 
-`group-avg` and `expr-agg-arg` at 10.5M are 7.6% and 10.6% slower cold in three pairs of 11
-samples, and 14% and 21% slower warm. They run a merge join of two scans and a grouping,
-read through no index join, and run 1.4% and 2.1% fewer instructions per request than
-main. A build with the first version of the lookahead ran them within 1% of main with the
-lookahead on and off. The difference therefore lies in code placement, and roadmap item
-515 follows it up. The cold check before each fresh block's read accounts for the
-extra instructions of the warm point lookups, and item 516 moves it to the cache
-miss.
+In `38deb1e8` the lookahead was inlined into the join's read loop, and `group-avg` and
+`expr-agg-arg` at 10.5M ran 7.6% and 10.6% slower cold and 14% and 21% slower warm.
+Neither reads through an index join. They ran 1.4% and 2.1% fewer instructions and about
+12% more cycles per request, with front-end counters that did not account for the
+difference, so the change had moved how the compiler built code that these queries share
+with the join. The final code keeps the first look at a block and the walk out of line,
+marked `#[cold]` and `#[inline(never)]`. It runs both queries with the instructions and
+cycles of main, at 1.001 and 1.004 of main warm and 0.995 and 0.969 cold, and keeps the
+`star-join` gain. The cold check before each fresh block's read accounts for the extra
+instructions of the warm point lookups, and roadmap item 516 moves it to the cache miss.
 
 The cold rows of `bench.sh` against Oxigraph, in two rounds of five restarts per engine on
 forge, give these medians and the §9 targets at 1.1 times Oxigraph's times of the same

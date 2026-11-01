@@ -32,11 +32,9 @@ a warm pass, cold `star-lookup` took 3.3 ms instead of 11.4 ms after a backgroun
 
 An index join over index format 3 reads a block whole at its first cold segment when its
 ranges in that block span more than a quarter of the block's segments. Cold `star-join` at
-10.5M on forge went from 83.8 to 78.3 ms, which matches unsegmented blocks. The same build
-runs `group-avg` and `expr-agg-arg` at 10.5M 8% and 11% slower cold and 14% and 21% slower
-warm with fewer instructions per request, a code placement cost that roadmap item
-515 follows up. Warm point lookups run 2% to 3% more instructions, which item
-516 covers.
+10.5M on forge went from 85.7 to 76.9 ms, in line with unsegmented blocks. The lookahead
+runs out of line from the join's read loop, because inlining it slowed unrelated queries.
+Warm point lookups run 1.6% to 2.5% more instructions, which roadmap item 516 covers.
 
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
 node in both shortest modes, run Dijkstra's algorithm from both ends. Weighted path

@@ -5,7 +5,7 @@ L=~/lanes/cold-lookups-4
 tag=$1 rounds=$2; shift 2
 exec 9> "$HOME/lanes/.heavy.lock"; flock 9
 out=$L/out/$tag; mkdir -p $out
-PERF=/nix/store/qyym38g8svwhx58fhdv7d8qrxxv41lrc-perf-linux-7.3/bin/perf
+PERF=$HOME/lanes/cold-lookups-4/perf-root/bin/perf
 Q=~/.cache/sparkles-bench/10m/queries
 N=20
 for round in $(seq 1 $rounds); do

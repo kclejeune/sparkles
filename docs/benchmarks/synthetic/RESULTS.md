@@ -272,14 +272,15 @@ either way.
 
 | Cold, forge, 10.5M, median ms | Unsegmented | Format 3 before the lookahead | Format 3 with it |
 |---|---:|---:|---:|
-| `star-join` | 77.8 | 83.8 | 78.3 to 78.5 |
-| `star-lookup` | 20.9 | 11.1 | 10.9 to 11.1 |
-| `employee-docs` | 15.0 | 10.3 | 10.1 to 10.4 |
-| `knows-reach` | 215.2 | 201.2 | 199.5 to 199.7 |
+| `star-join` | 77.8 | 83.8 to 85.7 | 76.9 to 78.5 |
+| `star-lookup` | 20.9 | 11.1 to 11.8 | 10.9 to 11.6 |
+| `employee-docs` | 15.0 | 10.3 to 11.0 | 10.1 to 10.6 |
+| `knows-reach` | 215.2 | 201.2 to 202.0 | 199.5 to 201.4 |
 
 *Measured on forge on 2026-11-01 with `bench-regressions.py --cold`, 7 or 11 samples in
 interleaved rounds of A, B, B and A. The unsegmented column comes from the build at
-72d85c7f on its own store, and the format 3 columns from 04d49b57 and 38deb1e8.*
+72d85c7f on its own store, and the format 3 columns from 04d49b57 and from 38deb1e8 and
+cd46d9c3, which differ only in the inlining of the lookahead.*
 
 The same build ran the cold rows of `bench.sh` against Oxigraph on forge, in two rounds of
 five restarts per engine and query. Sparkles leads on the three point lookups and still
@@ -309,14 +310,13 @@ The time to ready stays at 52 ms with and without the prewarm.
 | `path-plus` | 3.7 | 3.5 | 2.7 | 3.4 | 3.3 | 2.8 |
 | `star-join` | 21.5 | **11.4** | 18.5 | 77.9 | **33.4** | 71.1 |
 
-`group-avg` and `expr-agg-arg` at 10.5M run 8% and 11% slower cold and 14% and 21% slower
-warm in this build than in the one before, although they run 1.4% and 2.1% fewer
-instructions per request. Neither reads through an index join, and a build with the first
-version of the lookahead ran them as fast as the base with it on and off. The cost
-therefore comes from where the compiler placed their code, and
-[roadmap item 515](../../ROADMAP.md#performance-follow-ups) follows it up. At 1.05M
-both are within 3%. Warm point lookups run 2% to 3% more instructions for the check of
-cold segments, which [item 516](../../ROADMAP.md#performance-follow-ups) covers.
+With the lookahead inlined into the join's read loop, `group-avg` and `expr-agg-arg` at
+10.5M ran 8% and 11% slower cold and 14% and 21% slower warm, with fewer instructions and
+about 12% more cycles per request, although neither reads through an index join. Keeping
+the lookahead out of line restores their instructions and cycles, and the final build
+runs them within 0.5% of main warm and no slower cold. Warm point lookups run 1.6% to 2.5%
+more instructions for the check of cold segments, which
+[item 516](../../ROADMAP.md#performance-follow-ups) covers.
 The [immutable run record](runs/2026-11-01-cold-lookups-forge/validation.json) holds the
 revisions, binary hashes, scripts, compressed samples and answer hashes of every step.
 

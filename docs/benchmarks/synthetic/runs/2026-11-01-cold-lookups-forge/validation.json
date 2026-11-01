@@ -22,22 +22,28 @@
     "exp": {
       "commit": "04d49b57",
       "role": "base with an uncommitted first version of the join lookahead and an XNOLOOK environment switch that turns it off, used only for look-agg"
+    },
+    "att1": {
+      "commit": "cd46d9c3",
+      "role": "the final code: 38deb1e8 with the lookahead's first look and walk kept out of line and cold"
     }
   },
   "binary_sha256": {
     "base": "8a93ee7563cba3146ff8e6bac471791eed7c4b02bcad8dcc29178778c1a85678",
     "fin": "6d5a229d006267d8dd0d7ef645c1bb2a67249722417dd3c140f905628b31291c",
     "pre3": "dff16e58146988684469c3be07e1681473aeb9bff6859445987cc1a1fc1b4323",
-    "exp": "c9f17d0a28c2fb261f931fa2c396955312102eb3ffeeb0ccd6ceb7c48fe5d498"
+    "exp": "c9f17d0a28c2fb261f931fa2c396955312102eb3ffeeb0ccd6ceb7c48fe5d498",
+    "att1": "0813b9f69f4874596efff7c4fc74e598deb114f608ba34eb8b513ff1b387d61c"
   },
-  "compiler_provenance": "GCC 15.3.0, clang 23.1.0git, LLD 23.1.1, rustc 1.99.1 (58cf8f9c3 2026-10-13); the .comment sections of the four binaries are identical. Built on forge with mbx build --release -p sparkles-server --bin sparkles in nix develop.",
+  "compiler_provenance": "GCC 15.3.0, clang 23.1.0git, LLD 23.1.1, rustc 1.99.1 (58cf8f9c3 2026-10-13); the .comment sections of the five binaries are identical. Built on forge with mbx build --release -p sparkles-server --bin sparkles in nix develop.",
   "stores": "db10m and db1m are format 3 stores loaded by base from the synthetic generator at 10.5M and 1.05M triples; db10m-u and db1m-u are unsegmented stores loaded by pre3.",
   "locks": "Every step held ~/lanes/.heavy.lock on forge; no other build or benchmark ran during a step.",
   "methods": {
     "ab": "scripts/ab.sh: interleaved rounds of A, B, B and A, each a bench-regressions.py run with --cold N (a fresh server per sample after evicting the store with posix_fadvise DONTNEED) or --warmup 3 and N warm samples, server pinned to CPUs 0-11, port 43800.",
     "prewarm": "bench-regressions.py --prewarm: a seed pass per query records prewarm.json from a warm server, the list is restored before each sample, and each cold sample starts a server with --prewarm and waits for its 'prewarm finished' log line before the query; ready_ms and prewarm_ms are kept per sample.",
-    "insn": "scripts/insn.sh: a warm server per binary and round, three warm-up requests per query, then perf stat -e instructions:u on the server process over 20 requests.",
-    "engines": "scripts/plan3.sh: scripts/bench.sh MODE=cold COLD_RUNS=5 SKIP_LOAD=1 for Oxigraph from the repository's pinned packages, fin and base, in two rounds per scale with the engines in turn."
+    "insn": "scripts/insn.sh: a warm server per binary and round, three warm-up requests per query, then perf stat -e instructions:u on the server process over 20 requests. scripts/insn.sh in this record points perf at a GC root; the first insn step used the same perf build from the store directly.",
+    "engines": "scripts/plan3.sh: scripts/bench.sh MODE=cold COLD_RUNS=5 SKIP_LOAD=1 for Oxigraph from the repository's pinned packages, fin and base, in two rounds per scale with the engines in turn.",
+    "fe": "scripts/fe.sh: a warm server per binary and round, three warm-up requests, then perf stat over 20 requests with user-mode cycles, instructions, frontend_retired.any_dsb_miss, frontend_retired.l1i_miss, frontend_retired.itlb_miss, dsb2mite_switches.penalty_cycles, br_misp_retired.all_branches, topdown-fe-bound and slots on the P-cores."
   },
   "steps": {
     "suite10": "base against fin, 28 queries, 10.5M, 7 cold samples, 2 pairs",
@@ -51,7 +57,14 @@
     "look-agg": "exp with XNOLOOK=1 against exp, 10.5M, 7 cold samples, 2 pairs",
     "prof-base-agg, prof-fin-agg": "profile=io of group-avg, expr-agg-arg, values-star and path-plus, 3 cold samples",
     "insn": "base and fin, 2 rounds",
-    "bench-<scale>-<engine>-<round>": "bench.sh cold rows of five queries"
+    "bench-<scale>-<engine>-<round>": "bench.sh cold rows of five queries",
+    "fe1": "front-end counters of base, fin and att1, 2 rounds",
+    "att1-warm": "base against att1, 5 queries, 10.5M, 21 warm samples, 2 pairs",
+    "att1-cold": "base against att1, 5 queries, 10.5M, 11 cold samples, 2 pairs",
+    "att1-suite10": "base against att1, 28 queries, 10.5M, 7 cold samples, 2 pairs",
+    "att1-warm10": "base against att1, 27 queries, 10.5M, 21 warm samples, 2 pairs",
+    "att1-warmflag": "base against att1, the queries att1-warm10 flagged and the two placement queries, 10.5M, 21 warm samples, 4 pairs",
+    "insn-att1": "instructions per request of base, fin and att1, 2 rounds"
   },
   "correctness": "Every A/B step's summary lists one answer hash per query across both sides (column 'hashes'). bench.sh checks row agreement across the engines before timing.",
   "results": {
@@ -146,6 +159,64 @@
       "order": [
         "base",
         "fin"
+      ]
+    },
+    "placement": {
+      "warm_ms_base_fin_att1": {
+        "group-avg": [
+          40.12,
+          45.72,
+          40.12
+        ],
+        "expr-agg-arg": [
+          23.61,
+          28.48,
+          23.93
+        ]
+      },
+      "cycles_per_request_base_fin_att1": {
+        "group-avg": [
+          155000000.0,
+          174000000.0,
+          156000000.0
+        ],
+        "expr-agg-arg": [
+          90000000.0,
+          108000000.0,
+          90900000.0
+        ]
+      },
+      "instructions_ratio_to_base_fin_att1": {
+        "group-avg": [
+          0.9852,
+          1.0
+        ],
+        "expr-agg-arg": [
+          0.9782,
+          1.0
+        ],
+        "star-lookup": [
+          1.0153,
+          1.0155
+        ],
+        "employee-docs": [
+          1.0281,
+          1.0249
+        ],
+        "star-join": [
+          1.001,
+          0.9986
+        ]
+      }
+    },
+    "cold_10m_star_join_ms_att1": {
+      "base": [
+        85.74,
+        85.84
+      ],
+      "att1": [
+        76.93,
+        79.62
       ]
     }
   }

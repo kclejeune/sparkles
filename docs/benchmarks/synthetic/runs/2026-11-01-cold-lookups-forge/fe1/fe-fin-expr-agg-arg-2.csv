@@ -1,0 +1,11 @@
+# started on Sun Nov  1 04:02:22 2026
+
+2162719922,,cpu_core/cycles/u,353715199,61.00,,
+5687515674,,cpu_core/instructions/u,427413273,74.00,,
+20198393,,cpu_core/frontend_retired.any_dsb_miss/u,429764010,74.00,,
+1405904,,cpu_core/frontend_retired.l1i_miss/u,74529601,12.00,,
+2037,,cpu_core/frontend_retired.itlb_miss/u,69993334,12.00,,
+11460491,,cpu_core/dsb2mite_switches.penalty_cycles/u,139978435,24.00,,
+1416767,,cpu_core/br_misp_retired.all_branches/u,209976822,36.00,,
+12879136019,,cpu_core/slots/u,279498998,48.00,,
+505064157,,cpu_core/topdown-fe-bound/u,279498998,48.00,,
