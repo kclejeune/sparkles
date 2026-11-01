@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "eval_support"))
@@ -524,6 +525,34 @@ class Errors(Base):
         self.assertEqual(rows[0]["status"], 502)
         self.assertIn("messages", rows[0]["request"])
         self.assertNotIn(KEY, path.read_text())
+
+    def test_a_reply_naming_a_model_that_is_not_a_string_is_charged_as_unknown(self):
+        for served in ([], {}, 7):
+            with self.subTest(served=served):
+                name = f"m{type(served).__name__}.jsonl"
+                reply = dict(REPLY, model=served)
+                path = self.root / f"r-{name}"
+                proxy = self.proxy(Upstream((200, [], json.dumps(reply).encode())),
+                                   ledger=self.ledger(name=name), replies=path)
+                self.assertEqual(proxy.handle(raw())[0], 502)
+                reserve, settle = [x for x in self.lines(name) if x.get("op") in ("reserve", "settle")]
+                # charged as a reply of a model the table does not know
+                self.assertEqual(settle["status"], "served-model-mismatch")
+                self.assertGreater(settle["cost"], reserve["bound"])
+                self.assertEqual(len(path.read_text().splitlines()), 1)
+
+    def test_a_reply_that_breaks_the_pricing_is_held_at_its_bound(self):
+        path = self.root / "r.jsonl"
+        proxy = self.proxy(Upstream(), replies=path)
+
+        def broken(*a):
+            raise TypeError("unpriceable")
+
+        with mock.patch.object(proxy.api, "cost", broken):
+            self.assertEqual(proxy.handle(raw())[0], 502)
+        reserve, settle = [x for x in self.lines() if x.get("op") in ("reserve", "settle")]
+        self.assertEqual((settle["cost"], settle["status"]), (reserve["bound"], "failure:internal-TypeError"))
+        self.assertEqual(len(path.read_text().splitlines()), 1)
 
     def test_failure_before_the_body_left_costs_nothing(self):
         proxy = self.proxy(Upstream(px.UpstreamFailure("gaierror", False)))

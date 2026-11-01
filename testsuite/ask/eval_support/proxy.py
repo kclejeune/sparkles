@@ -878,7 +878,7 @@ class AnthropicAPI:
     def served_model(self, reply):
         """The table's model that served a reply, or None for one it does not know."""
         served = reply.get("model")
-        return served if served in RATES else None
+        return served if isinstance(served, str) and served in RATES else None
 
     def any_cost(self, model, reply, limit):
         return self.cost(model, reply, limit)[0]
@@ -1274,16 +1274,23 @@ class Proxy:
             reply = strict_json(data)
         except Invalid:
             reply = None
-        amount, usage = self.api.cost(model, reply, limit)
-        # A reply from another model than the one asked for is charged at least its
-        # bound and never reaches the child as an answer.
-        mismatch = isinstance(reply, dict) and not self.api.served(model, reply)
-        if mismatch:
-            charged, status_text = self.mismatch_charge(reply, usage, limit, amount, payload), "served-model-mismatch"
-        elif amount is None:
-            charged, status_text = limit, "usage-unknown"
-        else:
-            charged, status_text = amount, "ok"
+        try:
+            amount, usage = self.api.cost(model, reply, limit)
+            # A reply from another model than the one asked for is charged at least
+            # its bound and never reaches the child as an answer.
+            mismatch = isinstance(reply, dict) and not self.api.served(model, reply)
+            if mismatch:
+                charged, status_text = self.mismatch_charge(reply, usage, limit, amount, payload), "served-model-mismatch"
+            elif amount is None:
+                charged, status_text = limit, "usage-unknown"
+            else:
+                charged, status_text = amount, "ok"
+        except Exception as error:  # noqa: BLE001 -- a reply the tables cannot price
+            # A reply that breaks the pricing is charged its bound like a lost one,
+            # recorded, and kept from the child.
+            self.ledger.settle(ident, limit, "failure:internal-" + type(error).__name__, request_id=request_id)
+            self.record(ident, case, model, payload, status, self.clean_bytes(data), request_id)
+            return 502, [], error_body("api_error", "the proxy could not price the reply")
         self.ledger.settle(
             ident,
             charged,
