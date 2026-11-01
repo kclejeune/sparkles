@@ -164,8 +164,12 @@ def recall(qset, run_dir, namespaces=None):
     report = matching[0]
     # A case key is the pair and the question ID, so the replies of another set of the
     # run with the same IDs could not be told apart from this set's.
+    def paid(r):
+        # every case a set sent, scored or not, since each one's prompts are replies
+        return {c["case"] for k in ("cases", "attemptedCases", "drainedCases") for c in r.get(k) or []}
+
     keys = {c["case"] for c in report["cases"]}
-    if any(keys & {c["case"] for c in r["cases"]} for r in reports if r is not report):
+    if any(keys & paid(r) for r in reports if r is not report):
         raise ValueError(f"{run_dir}: another set of the run shares question IDs; give a run of one set")
     if len(report.get("pairs") or []) != 1:
         raise ValueError(f"{run_dir}: the run has several pairs; recall is per pair")

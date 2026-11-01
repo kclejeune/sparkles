@@ -200,7 +200,8 @@ pub struct AskOptions {
     /// use only reviewed community reports (`reviewedOnly`, C22 A7)
     pub reviewed_only: bool,
     /// the draft and repair pairs may receive rows, so their grounding may hold the
-    /// communities of the linked entities (C22 §7.3)
+    /// communities of the linked entities (C22 §7.3), an exploration may show sample
+    /// values and a repair of a result's shape may show its first rows
     pub report_context: bool,
     /// explore the data once when a draft gives no query or its query returns no rows,
     /// and draft again with what the exploration found, on by default
@@ -1325,7 +1326,15 @@ impl Asking<'_, '_> {
                 if let Some(l) = self
                     .usage_query(profile::Stage::PredicateUse, q)
                     .and_then(|v| {
-                        repair::usage_line(&format!("{name} as {side}"), &v, &ground.prefixes, max)
+                        // a sample value is data, which only a pair that may receive
+                        // rows sees
+                        repair::usage_line(
+                            &format!("{name} as {side}"),
+                            &v,
+                            &ground.prefixes,
+                            max,
+                            self.o.report_context,
+                        )
                     })
                 {
                     out.push_str(&l);
@@ -1490,10 +1499,12 @@ impl Asking<'_, '_> {
                 signatures.push(None);
                 continue;
             }
-            let (q, _) = self.with_limit(&d.query, parsed.as_ref());
+            let (q, limited) = self.with_limit(&d.query, parsed.as_ref());
             match self.run_query(&q) {
                 Ok(r) => {
-                    signatures.push(repair::signature(&r.0));
+                    // a result that reaches the limit Ask added may have more rows
+                    let capped = limited && r.0["returned"].as_u64().unwrap_or(0) >= ADDED_LIMIT;
+                    signatures.push((!capped).then(|| repair::signature(&r.0)).flatten());
                     x.3 = Some((q, r));
                 }
                 Err(_) => signatures.push(None),
@@ -1808,8 +1819,9 @@ impl Asking<'_, '_> {
                     );
                     record["diagnosis"] = hint.clone().into();
                     self.attempts.push(record);
-                    let (rows_seen, _) = rows_text(&doc, 10);
-                    repair = Some(repair::shape_text(&run_query, &hint, &rows_seen));
+                    // the rows go to the repair pair only when it may receive rows
+                    let rows_seen = self.o.report_context.then(|| rows_text(&doc, 10).0);
+                    repair = Some(repair::shape_text(&run_query, &hint, rows_seen.as_deref()));
                     self.fallback = Some(Answered {
                         result: r,
                         query: run_query,

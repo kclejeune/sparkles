@@ -936,3 +936,27 @@ fn the_exploration_and_the_shape_check_are_on_by_default() {
     assert!(!o.type_hints);
     assert_eq!(o.drafts, 1);
 }
+
+#[test]
+fn a_shape_repair_shows_rows_only_to_a_pair_that_may_receive_them() {
+    let s = server(ORG);
+    for rows in [false, true] {
+        let list = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+        let count = draft(&format!(
+            "{PREFIXES}SELECT (COUNT(?t) AS ?n) WHERE {{ ?t a ex:Team }}"
+        ));
+        let mock = scripted(vec![list, count], json!({}));
+        let m = models(&mock.url(), json!({}));
+        let o = AskOptions {
+            summary: false,
+            shape_check: true,
+            report_context: rows,
+            ..opts("How many teams are there?")
+        };
+        let (out, _) = run(&s, &m, &o);
+        assert_eq!(out["outcome"], "answered", "{out:#}");
+        let repair = mock::prompt_of(&mock.requests()[1]);
+        assert!(repair.contains("does not fit the question"), "{repair}");
+        assert_eq!(repair.contains("Its first rows"), rows, "{repair}");
+    }
+}

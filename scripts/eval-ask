@@ -1272,14 +1272,17 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
         # Results the child printed before it ended still count.
         drain()
         while flight:
-            c, rnd, _ = flight.popleft()
+            c, rnd, sent = flight.popleft()
             code = "killed" if status == "killed" else "timeout"
             out = {"outcome": "error", "error": {"code": code}}
             out["execution"] = {"batch": record["pid"], "round": rnd}
             wall = None
             if rnd == 2:
-                # Keep the first Ask's clarification and usage, as single mode does.
-                out, wall = merge_clarified(c["first"], out, c["choice"], c["firstWall"], 0)
+                # Keep the first Ask's clarification and usage, as single mode does, and
+                # the time the failed second round took until it ended.
+                out, wall = merge_clarified(
+                    c["first"], out, c["choice"], c["firstWall"], time.monotonic() - sent
+                )
             refused = proxy and proxy.refusals_for(c["case"]) > 0
             out["evalFailure"] = "budget_refused" if refused else status
             out["wallSeconds"] = wall

@@ -4595,10 +4595,12 @@ request spacing and daily token limits that every other line shares.
 Two repair turns look at the data and the result after a draft. When a draft gives no
 query, or its query still returns no rows after the usual repairs, Ask explores the data
 once. It shows the model further link candidates for the question's mentions and the
-predicates those entities use in either direction, with counts and sample values, and
-drafts again. When a result does not fit the form of the question, such as several rows
-for "How many", a SELECT for a yes or no question or a count for "Which", Ask repairs
-once and keeps the first answer if the repair does not answer. `--no-explore` and
+predicates those entities use in either direction, with counts, and drafts again. When a
+result does not fit the form of the question, such as several rows for "How many", a
+SELECT for a yes or no question or a count for "Which", Ask repairs once and keeps the
+first answer if the repair does not answer. The exploration's sample values and the
+result's first rows reach the model only when the dataset's `send` policy lets the draft
+and repair providers receive rows. `--no-explore` and
 `--no-shape-check` turn these off. Two more options are off by default because they
 did not raise accuracy in the [evaluation](benchmarks/natural-language/RESULTS.md).
 `--drafts N` asks N first drafts and keeps the one whose checked, complete result most

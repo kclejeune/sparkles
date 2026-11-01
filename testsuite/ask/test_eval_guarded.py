@@ -266,6 +266,12 @@ class GroundingRecall(unittest.TestCase):
                 {"pairs": ["m"], "cases": [{"id": "a", "case": "c1", "pair": "m"}, {"id": "z", "case": "c9", "pair": "m"}]}))
             with self.assertRaises(ValueError):
                 grounding_recall.recall(qset, p)
+            # and so does one that paid for that case without scoring it
+            (p / "t" / "report.json").write_text(json.dumps(
+                {"pairs": ["m"], "cases": [{"id": "z", "case": "c9", "pair": "m"}],
+                 "attemptedCases": [{"id": "a", "case": "c1", "pair": "m"}]}))
+            with self.assertRaises(ValueError):
+                grounding_recall.recall(qset, p)
             (p / "t" / "report.json").unlink()
             (p / "s" / "report.json").write_text(json.dumps(dict(report, pairs=["m", "n"])))
             with self.assertRaises(ValueError):

@@ -27,21 +27,26 @@ pub(super) fn explore_text(query: Option<&str>, found: &str) -> String {
 }
 
 /// The repair section of a draft prompt when a result's shape does not fit the
-/// question: the query, the hint and the first rows it returned.
-pub(super) fn shape_text(query: &str, hint: &str, rows: &str) -> String {
+/// question: the query, the hint and, when the repair pair may receive rows, the first
+/// rows it returned.
+pub(super) fn shape_text(query: &str, hint: &str, rows: Option<&str>) -> String {
+    let rows = rows
+        .map(|r| format!(" Its first rows:\n{}\n", super::prompts::data_block(r)))
+        .unwrap_or_else(|| "\n".into());
     format!(
-        "Your previous query was:\n```sparql\n{}\n```\nIts result does not fit the question. {hint} Its first rows:\n{}\nWrite a corrected query.",
+        "Your previous query was:\n```sparql\n{}\n```\nIts result does not fit the question. {hint}{rows}Write a corrected query.",
         query.trim(),
-        super::prompts::data_block(rows)
     )
 }
 
-/// One line of an exploration: a predicate with its count and a sample value.
+/// One line of an exploration: a predicate with its count and, with `samples`, a
+/// sample value.
 pub(super) fn usage_line(
     subject: &str,
     rows: &Value,
     prefixes: &serde_json::Map<String, Value>,
     max: usize,
+    samples: bool,
 ) -> Option<String> {
     let result_prefixes = &rows["prefixes"];
     let items: Vec<String> = rows["rows"]
@@ -53,6 +58,7 @@ pub(super) fn usage_line(
             let n = super::grounding::result_count(row.get(1)?)?;
             let sample = row
                 .get(2)
+                .filter(|_| samples)
                 .and_then(Value::as_str)
                 .map(|s| format!(", such as {}", super::prompts::cut(s, 80)))
                 .unwrap_or_default();
@@ -301,6 +307,25 @@ mod tests {
         assert!(
             signature(&json!({ "rows": [["ex:a"]], "truncated": null, "termsShortened": 0 }))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn samples_and_rows_only_when_rows_may_leave() {
+        let rows = json!({ "rows": [["<http://ex.org/p>", "3", "Secret value"]], "prefixes": {} });
+        let p = serde_json::Map::new();
+        let with = usage_line("e", &rows, &p, 5, true).unwrap();
+        let without = usage_line("e", &rows, &p, 5, false).unwrap();
+        assert!(with.contains("Secret value"), "{with}");
+        assert!(
+            !without.contains("Secret value") && without.contains("(3)"),
+            "{without}"
+        );
+        assert!(shape_text("SELECT ?x {}", "Hint.", Some("Secret row")).contains("Secret row"));
+        let hidden = shape_text("SELECT ?x {}", "Hint.", None);
+        assert!(
+            hidden.contains("Hint.") && !hidden.contains("first rows"),
+            "{hidden}"
         );
     }
 

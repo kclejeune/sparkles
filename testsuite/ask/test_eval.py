@@ -1530,6 +1530,16 @@ class BatchCases(unittest.TestCase):
             out, _ = self.run_batch(self.runner("hang-at:2", deadline=0.5), qs, jobs=1)
         self.assertEqual([a.get("evalFailure") for _, _, a in out], [None, "timeout", None])
 
+    def test_a_failed_second_round_keeps_its_time(self):
+        qs = self.qs(2)  # q1 clarifies, so its second line is line 3 and hangs
+        with mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0), mock.patch.object(
+            eval_ask, "BATCH_SLACK_SECONDS", 0.5
+        ):
+            out, _ = self.run_batch(self.runner("hang-at:3", deadline=0.5), qs, jobs=1)
+        failed = out[1][2]
+        self.assertEqual(failed["evalFailure"], "timeout")
+        self.assertGreaterEqual(failed["wallSeconds"], 0.9)
+
     def test_each_case_names_its_own_token_and_holds_its_cost(self):
         import threading
 
