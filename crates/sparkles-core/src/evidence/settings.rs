@@ -708,7 +708,8 @@ mod tests {
         let set = |s: &mut Settings, p: Policy| {
             s.policies.insert("advisories".into(), p);
         };
-        let refusals: Vec<(&str, Box<dyn Fn(&mut Settings)>)> = vec![
+        type Change = Box<dyn Fn(&mut Settings)>;
+        let refusals: Vec<(&str, Change)> = vec![
             (
                 "projection reused",
                 Box::new(|s| s.proposals.push("urn:out".into())),
