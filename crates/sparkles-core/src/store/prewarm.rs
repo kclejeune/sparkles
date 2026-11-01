@@ -39,6 +39,9 @@ const WHOLE_BLOCK: u64 = crate::index::BLOCK_ROWS as u64 * 8 * 4;
 /// Bytes read by one call when a prewarm waits for recorded pages.
 const READ_CHUNK: usize = 1 << 20;
 
+/// Held while a list is written, by any store of the process.
+static RECORDING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[derive(Serialize, Deserialize)]
 struct List {
     format: String,
@@ -130,6 +133,9 @@ impl Store {
             }
         }
         let bytes = serde_json::to_vec(&list).map_err(|e| Error::Invalid(e.to_string()))?;
+        // a periodic recording and the one at shutdown may overlap: one writer at a time
+        // keeps the temporary file and the rename of one from mixing with the other's
+        let _one = RECORDING.lock();
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, &path)?;
@@ -307,7 +313,7 @@ fn resident_ranges(path: &Path, budget: &mut u64) -> Result<Vec<[u64; 2]>> {
     let pages = len.div_ceil(ps);
     let mut vec = vec![0u8; pages];
     // SAFETY: `map` is a live mapping of `len` bytes, and `vec` has one byte per page
-    let rc = unsafe { libc::mincore(map.as_ptr().cast_mut().cast(), len, vec.as_mut_ptr()) };
+    let rc = unsafe { libc::mincore(map.as_ptr().cast_mut().cast(), len, vec.as_mut_ptr().cast()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
