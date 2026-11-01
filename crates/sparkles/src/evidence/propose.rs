@@ -718,9 +718,39 @@ pub fn operation_recorded(main: &Dataset, id: Uuid, control: &Control) -> Result
 /// operation never published, as after a failure or crash between a hold and its
 /// commit. The grace period must exceed the longest request deadline, so that an
 /// operation still on its way to its commit keeps its hold. Returns the released ids.
+///
+/// The store asks again, under the lock that every release takes, which holds to
+/// keep. That second answer reads the current snapshots of the stores found first and
+/// takes no writer, since a commit waiting for that lock may hold one. A branch listed
+/// since the first look keeps every hold, as its operations were not looked at.
 pub fn reconcile_operation_holds(main: &Dataset, grace_ms: i64) -> Result<Vec<Uuid>> {
     let control = Control::none();
+    // the listed branches, found without their heads, so without their writers
+    let mut stores = vec![main.clone()];
+    for id in main.store().listed_branch_ids() {
+        if let Some(name) = main.store().listed_branch_name(id, &Default::default())? {
+            stores.push(main.branch(&name)?);
+        }
+    }
+    let known: std::collections::BTreeSet<Uuid> =
+        stores.iter().map(|d| d.store().branch_id()).collect();
     super::reconcile_holds(main, grace_ms, &mut |hold| {
-        operation_recorded(main, hold.id, &control)
+        if main
+            .store()
+            .listed_branch_ids()
+            .iter()
+            .any(|id| !known.contains(id))
+        {
+            return Ok(true);
+        }
+        let op = operation_iri(hold.id);
+        let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
+        for ds in &stores {
+            let head = ds.store().snapshot();
+            if Reads::new(&preparation, &head).described_anywhere(&op)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     })
 }

@@ -898,6 +898,29 @@ mod crashes {
     }
 
     #[test]
+    fn a_reconciliation_takes_no_writer_while_it_holds_off_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = crash_at(dir.path(), "evidence-held", &options());
+        ds.create_branch("dev", &Default::default()).unwrap();
+        assert_eq!(evidence::holds(&ds).unwrap().len(), 1);
+        // a commit that holds the writer, as one on its way to its hold check does
+        let t = ds.store().write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(evidence::reconcile_operation_holds(&ds, 0).map(|r| r.len()))
+                    .unwrap();
+            });
+            let released = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the reconciliation finished while the writer was held")
+                .unwrap();
+            assert_eq!(released, 1);
+            drop(t);
+        });
+    }
+
+    #[test]
     fn a_retry_after_a_crash_reuses_the_hold() {
         let dir = tempfile::tempdir().unwrap();
         let mut o = options();

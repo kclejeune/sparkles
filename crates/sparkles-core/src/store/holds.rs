@@ -321,14 +321,14 @@ impl Store {
         // No commit is publishing a reference to a hold from here on, so asking again
         // sees every publication that passed its check before this point, and a later
         // one finds its hold gone and is refused.
-        let _publishing = self.family.holds.publishing.write();
+        let publishing = self.family.holds.publishing.write();
         let mut confirmed: Vec<(uuid::Uuid, u64)> = Vec::new();
         for (h, touch) in &orphans {
             if !keep(h)? {
                 confirmed.push((h.id, *touch));
             }
         }
-        self.release_locked(|r| {
+        self.release_locked(publishing, |r| {
             confirmed
                 .iter()
                 .any(|(id, touch)| r.hold.id == *id && r.touch == *touch)
@@ -337,12 +337,17 @@ impl Store {
 
     /// Release the holds `which` selects.
     fn release_where(&self, which: impl Fn(&Record) -> bool) -> Result<Vec<uuid::Uuid>> {
-        let _publishing = self.family.holds.publishing.write();
-        self.release_locked(which)
+        let publishing = self.family.holds.publishing.write();
+        self.release_locked(publishing, which)
     }
 
-    /// [`Store::release_where`] under the exclusive publication lock.
-    fn release_locked(&self, which: impl Fn(&Record) -> bool) -> Result<Vec<uuid::Uuid>> {
+    /// [`Store::release_where`] under the exclusive publication lock `publishing`,
+    /// which is released once the holds are installed, before any collection.
+    fn release_locked(
+        &self,
+        publishing: parking_lot::RwLockWriteGuard<'_, ()>,
+        which: impl Fn(&Record) -> bool,
+    ) -> Result<Vec<uuid::Uuid>> {
         let mut state = self.family.holds.state.lock();
         let records = match &*state {
             HoldsState::Ready(r) => r,
@@ -362,6 +367,7 @@ impl Store {
         self.failpoint("holds-release-published");
         self.install_holds(&mut state, next, &touched);
         drop(state);
+        drop(publishing);
         self.collect_members(&touched);
         Ok(ids)
     }
