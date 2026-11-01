@@ -1481,12 +1481,15 @@ fn read_ranges_gallop(
                 (Some((cb, cp, held)), _)
                     if *cb == x && *cp != 0 && lead_cmp(held, held.len() - 1, &lo, d).is_ge() =>
                 {
-                    // a range that runs on into the next segment, which may be cold, has
-                    // the walk of `segment_part` before it reads any row
+                    // a range that runs on into later segments, which may be cold, has the
+                    // walk of `segment_part` over all of them before it reads any row
                     let s = *cp - 1;
-                    if !idx.last_segment(x, s) && idx.segment_first(x, s + 1) <= hi {
-                        let span = Some((s, s + 2));
-                        segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)
+                    let mut end = s + 1;
+                    while !idx.last_segment(x, end - 1) && idx.segment_first(x, end) <= hi {
+                        end += 1;
+                    }
+                    if end > s + 1 {
+                        segment_part(ctx, idx, ranges, (r, x), mask, Some((s, end)), &mut looked)
                     } else {
                         *cp
                     }
@@ -2398,11 +2401,16 @@ mod dense_ahead_tests {
 
     /// [`store`] with `rows` values per subject, so that subjects cross segment bounds.
     fn store_of(rows: usize) -> (tempfile::TempDir, Store) {
+        store_with(|_| rows)
+    }
+
+    /// [`store`] with `rows(i)` values for subject `i`.
+    fn store_with(rows: impl Fn(u64) -> usize) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
         let mut nt = String::new();
         for i in 0..80_000u64 {
-            for v in 0..rows {
+            for v in 0..rows(i) {
                 nt.push_str(&format!("<http://e/s{i:06}> <http://e/p> \"v{i}-{v}\" .\n"));
             }
         }
@@ -2574,5 +2582,57 @@ mod dense_ahead_tests {
         assert!(snap.cache.has_cols(idx, b, mask));
         // segment 1 was not decoded on its own before the block was read whole
         assert_eq!(single_segments(&snap, b), 1);
+    }
+
+    #[test]
+    fn a_range_over_several_warm_segments_into_a_cold_one_has_the_walk() {
+        // subject 1 has 5,000 rows, from segment 0 of block 0 into segment 2
+        let (_dir, s) = store_with(|i| if i == 1 { 5000 } else { 1 });
+        let snap = s.snapshot();
+        let idx = snap.perm(Perm::Pso);
+        let b = 0;
+        let n = idx.segment_count(b).unwrap();
+        assert!(n >= 8);
+        let blk = idx.decode_block(b).unwrap();
+        let p = blk.key(0)[0];
+        let big = blk.key(1)[1];
+        let (r2, _) = idx.segment_rows(b, 2);
+        assert_eq!(blk.key(r2)[1], big, "subject 1 reaches segment 2");
+        let mut keys = vec![blk.key(0)[1], big];
+        for t in 3..n {
+            let (r0, _) = idx.segment_rows(b, t);
+            keys.push(blk.key(r0 + 1)[1]);
+        }
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &keys,
+        };
+        let mask = 0b111;
+        for seg in 0..2 {
+            snap.cache.get_segment(idx, b, seg, mask, false).unwrap();
+        }
+        let ctx = Ctx::new(snap.clone());
+        let rule = RowRule {
+            graph: &GraphFilter::All,
+            graph_col: Perm::Pso.col_of(G),
+            eqs: &[],
+            dedup: false,
+        };
+        let mut out = vec![Table::new(vec![0])];
+        let mut stats = Stats::default();
+        read_ranges_gallop(
+            &ctx,
+            Perm::Pso,
+            &ranges,
+            &[vec![2]],
+            &rule,
+            &mut out,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out[0].len(), keys.len() - 1 + 5000);
+        assert!(snap.cache.has_cols(idx, b, mask));
+        // segment 2 was not decoded on its own before the block was read whole
+        assert_eq!(single_segments(&snap, b), 2);
     }
 }
