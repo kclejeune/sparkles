@@ -403,3 +403,16 @@ an Intel host. EXPLAIN printed the same plans before and after for four generate
 of 17 to 22 triple patterns over the same data, a chain, a chain with a filter, a star
 and a snowflake, since a group of more than 16 inputs already kept the greedy plan of
 `joinorder.rs`.
+
+### Measurements of stage 3
+
+A Namespace screen of the base against items 480 to 483 ran the 30 synthetic queries at
+1.05M triples with one thread in four A,B,B,A rounds, with both binaries built on one host
+by the same compilers. Both returned the same answers to every query. The geometric mean
+of server time was 0.984 of the base, and no query of 0.3 ms or more was 5% or more slower.
+`distinct-obj`, which runs in about 0.008 ms, read 1.130, and a rerun of it with
+`count-all` and `path-plus` in 12 rounds read 1.155, 1.059 and 1.037. Server time covers
+the execution of the plan, which none of the items changes for these queries, so item
+NEW-ITEM-1 measures `distinct-obj` on an Intel host. Building the options of a request
+through the caller context and the query request builder adds a few moves of the options
+and one reference count, outside the measured time.
