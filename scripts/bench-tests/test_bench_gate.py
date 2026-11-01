@@ -384,6 +384,51 @@ class GateTests(unittest.TestCase):
         self.assertIn('"release"', a)
         self.assertNotEqual(a, b)
 
+    def test_build_config_reads_cargo_home_and_incremental(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "cargo"
+            home.mkdir()
+            (home / "config").write_text("[profile.release]\nopt-level = 0\n")
+            env = dict(os.environ, CARGO_HOME=str(home))
+            def config(**extra):
+                return subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent)],
+                                      capture_output=True, text=True, env=dict(env, **extra)).stdout
+            a = config()
+            self.assertIn('"opt-level":0', a)
+            (home / "config").write_text("[profile.release]\nopt-level = 3\n")
+            self.assertNotEqual(a, config())
+            self.assertNotEqual(config(), config(CARGO_INCREMENTAL="1"))
+
+    @unittest.skipUnless(__import__("shutil").which("mbx"), "needs mbx")
+    def test_build_config_holds_the_boxington_policy(self):
+        def config(**extra):
+            return subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent)],
+                                  capture_output=True, text=True, env=dict(os.environ, **extra)).stdout
+        self.assertNotEqual(config(MBX_INCREMENTAL="off"), config(MBX_INCREMENTAL="on"))
+
+    def test_matrix_queries_must_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            def record(name, text):
+                root = Path(d) / name
+                res = root / "people-100000-threads-1" / "results"
+                res.mkdir(parents=True)
+                (root / "queries").mkdir()
+                (root / "queries" / "count-all.rq").write_text(text)
+                (root / "manifest.txt").write_text("host: forge\ncompilers: rustc version 1\nbuild config: {}\n")
+                res.joinpath("samples.tsv").write_text(
+                    "round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
+                    "1\t1\tA\tcount-all\t0\t1\t2\n1\t1\tB\tcount-all\t0\t1\t2\n")
+                res.joinpath("answers.tsv").write_text("A\tcount-all\t1\tx\nB\tcount-all\t1\tx\n")
+                out = Path(d) / f"{name}.json"
+                self.assertEqual(run("executors", root, "--out", out).returncode, 0)
+                return out
+            a = record("a", "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
+            b = record("b", "SELECT (COUNT(?s) AS ?n) WHERE { ?s ?p ?o }")
+            self.assertEqual(run("compare", a, a).returncode, 0)
+            r = run("compare", a, b)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("queries_sha256", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

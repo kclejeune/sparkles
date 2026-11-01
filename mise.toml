@@ -1326,6 +1326,7 @@ description = "Incremental view maintenance (item 471): every test of crates/spa
 usage = '''
 flag "--people <n>" default="200000" help="people in the generated data (about 6 quads each)"
 flag "--processes <n>" default="5" help="processes, whose values give each measurement's range"
+flag "--threads <n>" default="12" help="RAYON_NUM_THREADS of every process"
 flag "--out <dir>" help="results directory (default .artifacts/bench-incr/<UTC time>)"
 '''
 run = '''
@@ -1343,7 +1344,7 @@ bin=$(mbx test --release -p sparkles-core --test incr_bench --no-run 2>&1 | tee 
 [ -x "$bin" ] || { echo "no incr_bench binary" >&2; exit 1; }
 files=()
 for i in $(seq "$usage_processes"); do
-  INCR_BENCH_PEOPLE="$usage_people" INCR_BENCH_JSON="$OUT/metrics-$i.jsonl" \
+  RAYON_NUM_THREADS="$usage_threads" INCR_BENCH_PEOPLE="$usage_people" INCR_BENCH_JSON="$OUT/metrics-$i.jsonl" \
     "$bin" --ignored --nocapture --test-threads 1 | tee "$OUT/output-$i.md"
   files+=("$OUT/metrics-$i.jsonl")
 done
@@ -1352,7 +1353,7 @@ python3 scripts/bench-gate.py metrics "${files[@]}" --gate incr --suite incremen
   --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
   --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" --manifest rustc="$(rustc -V)" \
   --manifest build_config="$(python3 scripts/bench-gate.py build-config)" \
-  --setting people="$usage_people" --setting harness="crates/sparkles-core/tests/incr_bench.rs" \
+  --setting people="$usage_people" --setting threads="$usage_threads" --setting harness="crates/sparkles-core/tests/incr_bench.rs" \
   --setting load="$(cut -d' ' -f1-3 /proc/loadavg)"
 SPARKLES_TASK
 '''

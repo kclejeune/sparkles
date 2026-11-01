@@ -269,6 +269,11 @@ def executors(args):
         tables.append((cell, threads, table))
         env[cell] = (d / "results" / "env.txt").read_text().splitlines() if (d / "results" / "env.txt").exists() else []
     run_env = manifest_txt(root / "manifest.txt")
+    # the dataset each cell served, by its file's digest
+    data_digests = {}
+    for d in cells:
+        m = manifest_txt(d / "manifest.txt")
+        data_digests[d.name.split("-threads-")[0]] = m.get("data sha256")
     comp = manifest.get("compilers") or compilers(manifest.get("binary") or "")
     record = {
         "gate_record": VERSION, "gate": "executors", "kind": "gate-record",
@@ -284,6 +289,9 @@ def executors(args):
                      "load_before": manifest.get("load before"), "load_after": manifest.get("load after"),
                      "cells": env},
         "settings": {"threshold": 0.05, "short_below": 0.3, "short_threshold": 0.0,
+                     "queries_sha256": corpus_digest(root / "queries"),
+                     "generator_sha256": manifest.get("generator sha256"),
+                     "data_sha256": data_digests,
                      "metric": "medians per request of the server's execMs (/exec) and of curl's time_total (/wall)",
                      "variants": manifest.get("variants"), "run": manifest.get("settings"),
                      "harness": "scripts/bench-executors.sh with scripts/nsc-bench-remote.sh"},
@@ -318,6 +326,17 @@ def executors(args):
     print()
     print("Times are medians over every timed request of the client's wall time (curl time_total) and of the "
           "server's execMs. The ratio is of the wall times.")
+
+
+def corpus_digest(qdir):
+    """A digest of every query file's name and text, in name order."""
+    h = hashlib.sha256()
+    files = sorted(Path(qdir).glob("*.rq"))
+    if not files:
+        return None
+    for f in files:
+        h.update(f.name.encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
 
 
 # ----------------------------------------------------------------------- metrics (JSONL)
@@ -612,12 +631,13 @@ def order_digest(args):
 # environment variables that change the code Cargo and rustc generate; wrappers such as
 # RUSTC_WRAPPER and cache paths do not
 # and the compilers themselves are in the binary's .comment section
-BUILD_ENV = re.compile(r"^(CARGO_PROFILE_.*|.*RUSTFLAGS|CARGO_BUILD_TARGET|CFLAGS.*|CXXFLAGS.*)$")
+BUILD_ENV = re.compile(r"^(CARGO_PROFILE_.*|.*RUSTFLAGS|CARGO_BUILD_TARGET|CARGO_INCREMENTAL|CFLAGS.*|CXXFLAGS.*)$")
 
 
 def build_config_cmd(args):
     """The build configuration that decides the generated code, as one line of JSON for
-    the manifest's `build_config`: the workspace's Cargo profile, the profile and build
+    the manifest's `build_config`: the workspace's Cargo profile, a digest of Boxington's
+    effective build policy (scripts/mbx-policy-key.py), the profile and build
     settings of every Cargo config file that applies (the workspace's .cargo directories
     up to the root and $CARGO_HOME), and the environment variables that override them.
     Run it in the environment of the build."""
@@ -632,12 +652,21 @@ def build_config_cmd(args):
         name = (profiles[name] or {}).get("inherits")
     out["Cargo.toml"] = profiles
     configs = [d / ".cargo" / n for d in [root, *root.parents] for n in ("config.toml", "config")]
-    configs.append(Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")) / "config.toml")
+    home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+    configs += [home / "config.toml", home / "config"]
     for f in configs:
         if f.is_file():
             c = tomllib.loads(f.read_text())
             out[str(f)] = {k: c[k] for k in ("profile", "build", "target") if k in c}
     out["env"] = {k: v for k, v in sorted(os.environ.items()) if BUILD_ENV.match(k)}
+    # Boxington's effective incremental, linker and cache policy, which its own resolver
+    # reads from the environment and the global configuration, as mise's validation keys do
+    import shutil
+    if shutil.which("mbx"):
+        spec = importlib.util.spec_from_file_location("mbx_policy", Path(__file__).resolve().parent / "mbx-policy-key.py")
+        mp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mp)
+        out["mbx_policy"] = mp.policy_key()
     print(json.dumps(out, sort_keys=True, separators=(",", ":")))
 
 

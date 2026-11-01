@@ -148,6 +148,7 @@ NQ=$(find "$OUT/queries" -name '*.rq' | wc -l)
   echo "started: $(date -u +%FT%TZ)"
   echo "settings: $NQ queries, scales $SCALES people, threads $THREADS, $ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $REPS timed requests per query and server"
   echo "variants: A execution=eager, B execution=streaming, one binary and one shared store"
+  echo "generator sha256: $(sha256sum "$ROOT/scripts/gen-data.py" | cut -d' ' -f1)"
   echo "load before: $(cat /proc/loadavg)"
 } > "$OUT/manifest.txt"
 log "matrix of $NQ queries into $OUT"
@@ -159,6 +160,8 @@ for people in $SCALES; do
     python3 "$ROOT/scripts/gen-data.py" "$people" | zstd -q -T0 -10 -o "$data.tmp"
     mv "$data.tmp" "$data"
   fi
+  # the digest of the uncompressed data, which compare requires to match
+  data_sha=$(zstd -dc "$data" | sha256sum | cut -d' ' -f1)
   for t in $THREADS; do
     cell=people-$people-threads-$t
     d=$OUT/$cell
@@ -194,6 +197,7 @@ ENV
       echo "settings: $NQ queries, $ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $REPS timed requests per query and server process, RAYON_NUM_THREADS=$t, server CPU $server_cpu, client CPU $client_cpu, spinners $([ "$spin" = 1 ] && echo on || echo off), execution eager,streaming"
       echo "A: $BIN"
       echo "B: $BIN"
+      echo "data sha256: $data_sha"
     } > "$d/manifest.txt"
     log "$cell: start, load $(cut -d' ' -f1-3 /proc/loadavg)"
     bash "$d/nsc-bench-remote.sh" > "$d/remote.log" 2>&1 || die "$cell failed, see $d/results/progress.log"
