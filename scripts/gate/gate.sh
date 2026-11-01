@@ -41,6 +41,11 @@
 # whole gate on an idle host that has the free disk for it. With no idle host it puts ci on
 # the host with the fewest gate units and splits only onto a helper whose queue is no
 # longer.
+#
+# Before it starts, the driver checks each chosen host's free disk: GATE_NEED_CI_GB
+# (default 30) for a ci half or a whole gate and GATE_NEED_CONF_GB (default 15) for a
+# conformance half. A host that is short runs `mbx gc` first, and the driver refuses to
+# start when it is still short.
 set -euo pipefail
 
 self=$(readlink -f "${BASH_SOURCE[0]}")
@@ -420,6 +425,41 @@ fi
 if [ $dry = 1 ]; then
   echo "dry run: gate-$name primary $primary helper $helper jobs $jobs results $dest"
   exit 0
+fi
+
+# Free GiB under the host's home directory, or nothing when ssh fails.
+free_gib() {
+  # shellcheck disable=SC2016
+  ssh "${ssh_opts[@]}" "$1" 'df -BG --output=avail "$HOME" | tail -n1 | tr -dc 0-9' 2> /dev/null
+}
+
+# ensure_disk HOST NEED_GIB WHAT: refuse to start WHAT on HOST unless the host has NEED_GIB
+# free. A host that is short first runs `mbx gc`, which collects idle managed targets and
+# evicts cache objects down to their budgets and to gc.min_free_size. A build holds its
+# target lease for the whole run, so space freed after the start comes too late.
+ensure_disk() {
+  local h=$1 need=$2 what=$3 d
+  d=$(free_gib "$h")
+  [ -n "$d" ] || return 0
+  [ "$d" -ge "$need" ] && return 0
+  echo "gate.sh: $h has $d GiB free and the $what needs $need GiB, so mbx gc runs there first" >&2
+  ssh "${ssh_opts[@]}" "$h" 'mbx gc' >&2 || echo "gate.sh: mbx gc on $h failed" >&2
+  d=$(free_gib "$h")
+  if [ -z "$d" ] || [ "$d" -lt "$need" ]; then
+    die "$h has ${d:-an unknown number of} GiB free after mbx gc and the $what needs $need GiB. Free space there, choose another host with --host or --helper, or lower GATE_NEED_CI_GB or GATE_NEED_CONF_GB."
+  fi
+  echo "gate.sh: $h has $d GiB free after mbx gc" >&2
+}
+
+need_ci=${GATE_NEED_CI_GB:-30}
+need_conf=${GATE_NEED_CONF_GB:-15}
+case $need_ci in '' | *[!0-9]*) die "bad GATE_NEED_CI_GB $need_ci" ;; esac
+case $need_conf in '' | *[!0-9]*) die "bad GATE_NEED_CONF_GB $need_conf" ;; esac
+# A whole gate runs the suites in the ci half's worktree after it, so it needs what the ci
+# half needs. An unreachable helper is left to the fallback below.
+ensure_disk "$primary" "$need_ci" "ci half"
+if [ "$helper" != none ] && ssh "${ssh_opts[@]}" "$helper" true 2> /dev/null; then
+  ensure_disk "$helper" "$need_conf" "conformance half"
 fi
 note=
 if [ "$helper" != none ] && ! ssh "${ssh_opts[@]}" "$helper" true 2> /dev/null; then

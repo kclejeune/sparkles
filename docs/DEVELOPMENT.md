@@ -744,6 +744,15 @@ never rewrites a script that a queued or running gate is reading. The host also 
 wally through the laptop and checks linger, mbx and free disk. A ci half needs about
 30 GiB of free disk for its target and a conformance half about 15 GiB.
 
+The driver checks the free disk under the home directory of each chosen host before it
+starts anything there. A whole gate needs what a ci half needs. When a host has less, the
+driver runs `mbx gc` on it, which collects idle managed targets and evicts cache objects to
+the cache's budgets, and checks again. A host that is still short makes the driver stop
+with a message that names the host, the free space and the space needed. The check runs
+before the start because a running build holds its target's lease, so the cache cannot
+give back that space until the gate ends. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change
+the two amounts, in the environment or in `~/.config/sparkles/gate.env`.
+
 ## Continuous integration
 
 The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free
