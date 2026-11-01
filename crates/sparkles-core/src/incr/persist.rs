@@ -397,6 +397,18 @@ pub fn write_as(
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name(h.commit));
     let tmp = path.with_extension("tmp");
+    // a file of the same commit that another release wrote is left in place
+    if let Ok(existing) = std::fs::read(&path)
+        && !(existing.len() >= 12
+            && &existing[..8] == kind.magic
+            && existing[8..12] == kind.format.to_le_bytes())
+    {
+        return Err(Error::Unsupported(format!(
+            "{} holds a {} this release does not write over",
+            path.display(),
+            kind.what
+        )));
+    }
     crate::store::write_synced(&tmp, &encode_as(kind, h, body))?;
     before_rename();
     std::fs::rename(&tmp, &path)?;

@@ -1129,9 +1129,13 @@ the circuits.
   of the same name reaches only that view. `RuntimeStats` counts them separately as
   `internal_circuits`. They read the stored quads as the change feed lists them, and
   the dataset's inference does not apply to them.
-- An internal circuit's state over its budget fails the circuit with `over-budget`. An
-  accumulator's counts that pass the rest of the budget drop the oldest commits' counts
-  first, which moves the commit the counts start after.
+- An accumulator's circuit keeps no result rows, only the state its operators need, so
+  an accumulator over a pattern holds its counts and little else. Its first build still
+  evaluates the query once. An internal circuit's state over its budget fails the
+  circuit with `over-budget`. An accumulator's counts that pass the rest of the budget
+  drop the oldest commits' counts first, with the keys and unknown ranges only they
+  hold, which moves the commit the counts start after. A recovered checkpoint is held to
+  the budget of the attach that loads it.
 - Checkpoints are `circuits/{id}/main/state-{commit}.bin`
   (`formats::INTERNAL_CIRCUIT_STATE`, version 1), with the view checkpoint's header under
   the magic `SPKCIRC\0`. The body holds the circuit's state as a view checkpoint does,
@@ -1139,21 +1143,30 @@ the circuits.
   counts. They are written with the views' checkpoints and when a circuit is collected.
   The fingerprint covers the compiler version, the id, the normalized query, the access
   and the sink, so a changed spec builds the circuit again. A file of another format is
-  left in place and the circuit is built from the data, which a test checks.
+  left in place and the circuit is built from the data, which a test checks. A
+  checkpoint is never written over a file of another format at the same commit, for
+  views as well.
+- A circuit whose last handle is dropped stays registered while its final checkpoint is
+  written, so an attach of the same id meanwhile joins it and keeps its counts.
 
-**Ordering against commits.** Internal circuits never run inside a commit, so they add
-nothing to a commit's latency and do not stop group commit. The argument that an
-accumulator counts every commit exactly once has six steps.
+**Ordering against commits.** Internal circuits are maintained after a commit is
+published and never inside it, so they keep group commit. While one is attached, each
+commit copies its changes into the change ring, as it does for a view or live query, and
+item 226 measures that copy. A dataset without views, live queries or internal circuits
+does neither. The argument that an accumulator counts every commit exactly once has six
+steps.
 
 1. A commit puts its changes in the ring of recent changes before it publishes its
    snapshot, so a worker that the publication wakes lists them. The ring is filled while
    any circuit is attached, internal ones included.
 2. The worker advances an accumulator's circuit from its commit `c` to the head `h` one
    commit at a time. `DeltaSet::steps` lists commits `c+1` to `h` in order with each
-   commit's own net changes, and builds each commit's snapshot from the head's by
-   reversing the later commits' changes with `Snapshot::before_changes`. Commit `k` is
-   applied against the snapshots of `k−1` and `k`, and its counts are added before
-   commit `k+1` is read, so a later change cannot cancel them. Changes within one
+   commit's own net changes. It reverses the run's net changes once with
+   `Snapshot::before_changes` to get the snapshot at `c`, then builds each commit's
+   snapshot forward from the previous one, so at most two derived snapshots are alive
+   and the last commit uses the head's own snapshot. Commit `k` is applied against the
+   snapshots of `k−1` and `k`, and its counts are added before commit `k+1` is read, so
+   a later change cannot cancel them. Changes within one
    commit are net, as the feed lists them, and an addition with a removal of the same
    fact in one commit counts nothing in either counter.
 3. The circuit's commit and its counts change together under the circuit's state lock,

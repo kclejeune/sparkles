@@ -257,6 +257,8 @@ impl Runtime {
         let compiled = compile(&q, whole.as_deref())?;
         let mut circuit = Circuit::new(compiled, graphs.clone());
         circuit.max_memory_bytes = Some(spec.max_memory_bytes);
+        // an accumulator counts the changes and keeps no rows
+        circuit.keep_result = matches!(spec.sink, Sink::Rows);
         let columns = circuit.columns();
         let key_cols = match &spec.sink {
             Sink::Rows => Vec::new(),
@@ -346,6 +348,12 @@ impl Runtime {
         drop(reg);
         if let Some(root) = &self.root {
             self.recover_internal(store, &cell, &mut st, &dir(root, &cell.spec.id));
+            // the checkpoint was written under the budget of an earlier attach
+            if st.status == Status::Ready
+                && let Some(e) = self.internal_budget(&mut st)
+            {
+                self.fail_internal(&cell, &mut st, &e);
+            }
         }
         if st.status == Status::Building {
             self.build_internal(store, &cell, &mut st);
@@ -490,15 +498,16 @@ impl Runtime {
     ) -> Result<()> {
         let InternalSlot { circuit, tally, .. } = st;
         let tally = tally.as_mut().expect("an accumulator");
-        let Some(steps) = DeltaSet::steps(store, from, &Control::none()) else {
+        let Some(mut steps) = DeltaSet::steps(store, from, control) else {
             let snap = store.snapshot();
             circuit.reset(&DeltaSet::at(snap.clone()), control)?;
             tally.lose(from + 1, snap.commit);
             return Ok(());
         };
-        for d in &steps.sets {
+        while let Some(d) = steps.next() {
+            let d = d?;
             let at = d.snapshot.commit;
-            match circuit.advance(d, control)? {
+            match circuit.advance(&d, control)? {
                 Advance::Skipped => {}
                 Advance::Changed(c) => {
                     let snap = d.snapshot.clone();
@@ -649,21 +658,32 @@ impl Runtime {
     }
 
     /// Drop the internal circuits whose handles are all gone, after checkpointing them.
+    /// A circuit stays registered while its final checkpoint is written, so an attach
+    /// of the same id meanwhile joins it rather than building a new circuit that would
+    /// miss the checkpoint, and such a circuit is then kept.
     pub(super) fn collect_internal(&self, store: &Store) {
-        let gone: Vec<Arc<InternalCell>> = {
-            let mut reg = self.reg.lock();
-            let ids: Vec<String> = reg
-                .internal
-                .iter()
-                .filter(|(_, c)| c.handles.load(Ordering::Acquire) == 0)
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.iter()
-                .filter_map(|id| reg.internal.remove(id))
-                .collect()
-        };
-        if !gone.is_empty() {
-            self.checkpoint_internal(store, &gone);
+        let idle: Vec<Arc<InternalCell>> = self
+            .reg
+            .lock()
+            .internal
+            .values()
+            .filter(|c| c.handles.load(Ordering::Acquire) == 0)
+            .cloned()
+            .collect();
+        if idle.is_empty() {
+            return;
+        }
+        self.checkpoint_internal(store, &idle);
+        let mut reg = self.reg.lock();
+        for c in idle {
+            if c.handles.load(Ordering::Acquire) == 0
+                && reg
+                    .internal
+                    .get(&c.spec.id)
+                    .is_some_and(|r| Arc::ptr_eq(r, &c))
+            {
+                reg.internal.remove(&c.spec.id);
+            }
         }
     }
 }

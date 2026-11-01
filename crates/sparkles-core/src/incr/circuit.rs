@@ -102,18 +102,18 @@ impl DeltaSet {
     }
 
     /// The changes after commit `after` up to the store's head one commit at a time,
-    /// each set leading to the snapshot of its own commit (spec F13 §3.6). The
-    /// snapshots before the head are built from it by reversing the later commits'
-    /// changes ([`Snapshot::before_changes`]), so no history is read. `None` when some
-    /// commit's changes are not known, when the commits list more than
+    /// each set leading to the snapshot of its own commit (spec F13 §3.6). The run's net
+    /// changes are reversed once to give the snapshot at `after`
+    /// ([`Snapshot::before_changes`]), and each commit's snapshot is built forward from
+    /// the previous one as [`Steps::next`] yields it, so no history is read and at most
+    /// two derived snapshots are alive. The last set leads to the head's own snapshot.
+    /// `None` when some commit's changes are not known, when the commits list more than
     /// [`MAX_PASS_CHANGES`] changes together, or when a generation switch interrupts
     /// the listing: a reader then evaluates again at the head.
     pub fn steps(store: &Store, after: u64, control: &Control) -> Option<Steps> {
         let snap = store.snapshot();
-        let mut commits = Vec::new();
-        if after >= snap.commit {
-            return Some(Steps { sets: Vec::new() });
-        }
+        let mut commits = std::collections::VecDeque::new();
+        let mut net: FxHashMap<[Id; 4], i64> = FxHashMap::default();
         let o = ChangesOptions {
             max_commits: 1000,
             cancel: Some(control.cancel.flag()),
@@ -135,33 +135,38 @@ impl DeltaSet {
                     return None;
                 }
                 listed += c.added.len() + c.removed.len();
+                for q in &c.removed {
+                    *net.entry(*q).or_insert(0) -= 1;
+                }
+                for q in &c.added {
+                    *net.entry(*q).or_insert(0) += 1;
+                }
                 at = c.seq;
-                commits.push(c);
+                commits.push_back(c);
             }
             if listed > MAX_PASS_CHANGES {
                 return None;
             }
         }
-        let mut sets = Vec::with_capacity(commits.len());
-        let mut top = snap;
-        for i in (0..commits.len()).rev() {
-            let before = if i == 0 { after } else { commits[i - 1].seq };
-            let c = &mut commits[i];
-            let d = DeltaSet {
-                after: before,
-                snapshot: top.clone(),
-                added: std::mem::take(&mut c.added),
-                removed: std::mem::take(&mut c.removed),
-                complete: true,
-                old: OnceLock::new(),
-            };
-            if i > 0 {
-                top = d.old().ok()?;
+        let (mut added, mut removed) = (Vec::new(), Vec::new());
+        for (q, n) in net {
+            match n.cmp(&0) {
+                std::cmp::Ordering::Greater => added.push(q),
+                std::cmp::Ordering::Less => removed.push(q),
+                std::cmp::Ordering::Equal => {}
             }
-            sets.push(d);
         }
-        sets.reverse();
-        Some(Steps { sets })
+        let start = if commits.is_empty() {
+            snap.clone()
+        } else {
+            Arc::new(snap.before_changes(&added, &removed, after).ok()?)
+        };
+        Some(Steps {
+            head: snap,
+            commits,
+            prev: start,
+            prev_seq: after,
+        })
     }
 
     /// A set without changes that leads to `snap` (a build).
@@ -193,7 +198,51 @@ impl DeltaSet {
 /// The changes of a run of commits one commit at a time ([`DeltaSet::steps`]), in
 /// commit order. Each set's `after` is the previous set's commit.
 pub struct Steps {
-    pub sets: Vec<DeltaSet>,
+    head: Arc<Snapshot>,
+    commits: std::collections::VecDeque<crate::store::CommitDelta>,
+    /// the snapshot of the latest set yielded, or at the run's start
+    prev: Arc<Snapshot>,
+    prev_seq: u64,
+}
+
+impl Steps {
+    /// The commits left to yield.
+    pub fn len(&self) -> usize {
+        self.commits.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commits.is_empty()
+    }
+
+    /// The next commit's changes, leading from the previous set's snapshot to its own.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Result<DeltaSet>> {
+        let c = self.commits.pop_front()?;
+        // a commit's additions and removals applied forward: the snapshot that the
+        // reversal of the opposite changes would give
+        let snapshot = if self.commits.is_empty() {
+            self.head.clone()
+        } else {
+            match self.prev.before_changes(&c.removed, &c.added, c.seq) {
+                Ok(s) => Arc::new(s),
+                Err(e) => return Some(Err(e)),
+            }
+        };
+        let old = OnceLock::new();
+        let _ = old.set(Ok(self.prev.clone()));
+        let d = DeltaSet {
+            after: self.prev_seq,
+            snapshot: snapshot.clone(),
+            added: c.added,
+            removed: c.removed,
+            complete: true,
+            old,
+        };
+        self.prev = snapshot;
+        self.prev_seq = c.seq;
+        Some(Ok(d))
+    }
 }
 
 /// What a pass did to a circuit.
@@ -234,6 +283,10 @@ pub struct Circuit {
     pub pattern: spargebra::algebra::GraphPattern,
     pub dataset: Option<spargebra::algebra::QueryDataset>,
     inferred: InferredFootprint,
+    /// Whether the circuit keeps its result. A sink that consumes only the changes,
+    /// such as an internal circuit's accumulator, sets it to `false`: the result then
+    /// stays empty, and the operators keep only the state they need.
+    pub keep_result: bool,
 }
 
 impl Circuit {
@@ -260,6 +313,7 @@ impl Circuit {
             pattern: c.pattern,
             dataset: c.dataset,
             inferred: InferredFootprint::default(),
+            keep_result: true,
         }
     }
 
@@ -317,7 +371,11 @@ impl Circuit {
         let out = root.init(&mut p)?;
         let stats = p.stats;
         drop(p);
-        self.result = out.into_iter().collect();
+        self.result = if self.keep_result {
+            out.into_iter().collect()
+        } else {
+            ZSet::new()
+        };
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
@@ -358,6 +416,11 @@ impl Circuit {
     /// Evaluate again at `d.snapshot` and return the change of the result.
     pub fn reset(&mut self, d: &DeltaSet, control: &Control) -> Result<Changes> {
         let snap = d.snapshot.clone();
+        if !self.keep_result {
+            // no result to compare with: the change is not known
+            self.build(snap, control)?;
+            return Ok(Vec::new());
+        }
         // the old result in the new id space, to compare with
         if let Some(prev) = self.snap.clone()
             && (prev.generation.uid != snap.generation.uid || !self.terms.is_empty())
@@ -436,7 +499,9 @@ impl Circuit {
             let stats = p.stats;
             drop(p);
             let out = consolidate(out);
-            self.result.apply(&out);
+            if self.keep_result {
+                self.result.apply(&out);
+            }
             self.applied = snap.commit;
             self.snap = Some(snap);
             self.last = stats;
@@ -477,7 +542,9 @@ impl Circuit {
         let stats = p.stats;
         drop(p);
         let out = consolidate(out);
-        self.result.apply(&out);
+        if self.keep_result {
+            self.result.apply(&out);
+        }
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;

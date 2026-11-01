@@ -44,7 +44,7 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 /// The directory of internal circuits' checkpoints under a dataset's root.
@@ -198,11 +198,27 @@ pub(crate) struct Tally {
     index: FxHashMap<Vec<Option<Term>>, u32>,
     /// `(commit, key, count)` in commit order
     entries: VecDeque<(u64, u32, u64)>,
+    /// the memory of `keys` and `index` together ([`key_bytes`])
+    key_bytes: u64,
 }
 
-/// The approximate memory of one entry and of one key's term.
+/// The approximate memory of one entry and of one unknown range.
 const ENTRY_BYTES: u64 = 24;
-const TERM_BYTES: u64 = 64;
+const RANGE_BYTES: u64 = 16;
+
+/// The approximate memory of one key, held once in the list of keys and once in the
+/// index: each term's vocabulary key and the term's own size, and the map's slot.
+fn key_bytes(key: &[Option<Term>]) -> u64 {
+    let terms: u64 = key
+        .iter()
+        .map(|t| {
+            t.as_ref()
+                .map_or(0, |t| crate::id::term_key(t).len() as u64)
+                + 32
+        })
+        .sum();
+    2 * (terms + 24) + 16
+}
 
 impl Tally {
     pub(crate) fn new(key_cols: Vec<usize>, since: u64) -> Tally {
@@ -215,7 +231,8 @@ impl Tally {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.entries.len() as u64 * ENTRY_BYTES
-            + self.keys.len() as u64 * (self.key_cols.len() as u64 * TERM_BYTES + 48)
+            + self.key_bytes
+            + self.unknown.len() as u64 * RANGE_BYTES
     }
 
     fn intern(&mut self, key: Vec<Option<Term>>) -> u32 {
@@ -223,6 +240,7 @@ impl Tally {
             return n;
         }
         let n = self.keys.len() as u32;
+        self.key_bytes += key_bytes(&key);
         self.keys.push(key.clone());
         self.index.insert(key, n);
         n
@@ -253,8 +271,16 @@ impl Tally {
 
     /// Record that the commits `first..=last` were not counted per key.
     pub(crate) fn lose(&mut self, first: u64, last: u64) {
-        if first <= last {
-            self.unknown.push((first, last));
+        if first > last {
+            return;
+        }
+        // losses come in commit order: one that meets or overlaps the latest joins it
+        match self.unknown.last_mut() {
+            Some(r) if first <= r.1.saturating_add(1) && last.saturating_add(1) >= r.0 => {
+                r.0 = r.0.min(first);
+                r.1 = r.1.max(last);
+            }
+            _ => self.unknown.push((first, last)),
         }
     }
 
@@ -271,25 +297,39 @@ impl Tally {
         self.compact_keys();
     }
 
-    /// Drop the oldest commits' counts until the counts take at most `bytes`.
+    /// Drop the oldest commits' counts until the counts take at most `bytes`, keys and
+    /// unknown ranges they alone hold included. Whether any were dropped.
     pub(crate) fn shrink_to(&mut self, bytes: u64) -> bool {
-        if self.bytes() <= bytes {
+        let total = self.bytes();
+        if total <= bytes {
             return false;
         }
-        while self.bytes() > bytes {
-            let Some(&(c, _, _)) = self.entries.front() else {
+        // the commit of each key's latest count: dropping the counts through that
+        // commit frees the key
+        let mut last = vec![0u64; self.keys.len()];
+        for &(c, k, _) in &self.entries {
+            last[k as usize] = c;
+        }
+        let mut freed_by: BTreeMap<u64, u64> = BTreeMap::new();
+        for (k, &c) in last.iter().enumerate() {
+            *freed_by.entry(c).or_insert(0) += key_bytes(&self.keys[k]);
+        }
+        for &(c, _, _) in &self.entries {
+            *freed_by.entry(c).or_insert(0) += ENTRY_BYTES;
+        }
+        for &(_, end) in &self.unknown {
+            *freed_by.entry(end).or_insert(0) += RANGE_BYTES;
+        }
+        let mut freed = 0;
+        let mut through = self.since;
+        for (c, b) in freed_by {
+            freed += b;
+            through = through.max(c);
+            if total - freed <= bytes {
                 break;
-            };
-            while self.entries.front().is_some_and(|e| e.0 == c) {
-                self.entries.pop_front();
-            }
-            self.since = self.since.max(c);
-            self.unknown.retain(|r| r.1 > c);
-            if self.keys.len() > 2 * self.entries.len() + 16 {
-                self.compact_keys();
             }
         }
-        self.compact_keys();
+        self.discard_through(through);
         true
     }
 
@@ -310,6 +350,7 @@ impl Tally {
             .enumerate()
             .map(|(i, k)| (k.clone(), i as u32))
             .collect();
+        self.key_bytes = keys.iter().map(|k| key_bytes(k)).sum();
         self.keys = keys;
     }
 
@@ -404,6 +445,7 @@ impl Tally {
                 });
             }
             let n = t.keys.len() as u32;
+            t.key_bytes += key_bytes(&key);
             t.index.insert(key.clone(), n);
             t.keys.push(key);
         }
@@ -513,7 +555,30 @@ mod tests {
             .map(|(i, k)| (k.clone(), i as u32))
             .collect();
         t.entries = [(4, 0, 2), (5, 1, 1), (7, 0, 1)].into_iter().collect();
+        t.key_bytes = t.keys.iter().map(|k| key_bytes(k)).sum();
         t
+    }
+
+    #[test]
+    fn large_keys_and_unknown_ranges_are_charged() {
+        let mut t = Tally::new(vec![0], 0);
+        let big = Some(Term::Literal(oxrdf::Literal::new_simple_literal(
+            "x".repeat(1 << 20),
+        )));
+        let n = t.intern(vec![big]);
+        t.entries.push_back((1, n, 1));
+        assert!(t.bytes() >= 2 << 20, "{}", t.bytes());
+        // dropping the only count that names the key frees it
+        assert!(t.shrink_to(1 << 10));
+        assert!(t.bytes() < 1 << 10, "{}", t.bytes());
+        // adjacent and overlapping losses join one range
+        for c in 2..1000 {
+            t.lose(c, c);
+        }
+        t.lose(500, 1200);
+        assert_eq!(t.unknown, vec![(2, 1200)]);
+        t.lose(1300, 1300);
+        assert_eq!(t.unknown.len(), 2);
     }
 
     #[test]

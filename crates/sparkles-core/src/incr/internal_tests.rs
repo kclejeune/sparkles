@@ -503,6 +503,13 @@ fn unknown_checkpoint_formats_are_refused() {
     let c = attach(&rt, &s, "facts", FACTS, "s");
     assert_eq!(rt.stats(&s).loaded, 0);
     let start = c.commit();
+    // a checkpoint at the same commit does not write over the file
+    rt.checkpoint(&s);
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        bytes,
+        "left in place at its commit"
+    );
     upd(&s, WORKLOAD[3]);
     rt.round(&s);
     assert_eq!(counts(&c, start), feed_counts(&s, start));
@@ -612,4 +619,112 @@ fn accumulators_recover_from_crashes() {
         assert_eq!(names.len(), 1, "{name}: {names:?}");
         rt.close(&s);
     }
+}
+
+/// An attach of the same id while the last handle's circuit writes its final checkpoint
+/// joins that circuit and keeps its counts, rather than building a new circuit at the
+/// head that never loads them.
+#[test]
+fn an_attach_during_collection_keeps_the_counts() {
+    use parking_lot::Mutex;
+    let dir = tempfile::tempdir().unwrap();
+    let s = persistent(dir.path(), true);
+    load(&s);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    let c = attach(&rt, &s, "facts", FACTS, "s");
+    let start = c.commit();
+    for u in &WORKLOAD[..3] {
+        upd(&s, u);
+        rt.round(&s);
+    }
+    drop(c);
+    // the final checkpoint is written and not yet renamed when the attach comes
+    let joined: Arc<Mutex<Option<InternalCircuit>>> = Arc::default();
+    let (rt2, slot) = (rt.clone(), joined.clone());
+    s.set_failpoint(
+        "internal-checkpoint-written",
+        Some(Arc::new(move |s: &Store| {
+            let mut slot = slot.lock();
+            if slot.is_none() {
+                *slot = Some(attach(&rt2, s, "facts", FACTS, "s"));
+            }
+        })),
+    );
+    rt.round(&s);
+    s.set_failpoint("internal-checkpoint-written", None);
+    let c = joined
+        .lock()
+        .take()
+        .expect("attached during the collection");
+    assert_eq!(rt.internal_count(), 1);
+    upd(&s, WORKLOAD[3]);
+    rt.round(&s);
+    assert_eq!(counts(&c, start), feed_counts(&s, start));
+}
+
+/// An accumulator keeps the counts and not the rows its query matches.
+#[test]
+fn an_accumulator_keeps_no_rows() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    for i in 0..2000 {
+        upd(&s, &format!("INSERT DATA {{ :p{i} :age {i} }}"));
+    }
+    let rt = runtime(&s, None);
+    let rows = rt
+        .attach_internal(
+            &s,
+            InternalSpec::rows("rows", FACTS),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    let acc = attach(&rt, &s, "acc", FACTS, "s");
+    let start = acc.commit();
+    assert!(
+        acc.bytes() * 20 < rows.bytes(),
+        "{} against {}",
+        acc.bytes(),
+        rows.bytes()
+    );
+    for u in WORKLOAD {
+        upd(&s, u);
+    }
+    rt.round(&s);
+    assert_eq!(counts(&acc, start), feed_counts(&s, start));
+}
+
+/// A checkpoint written under a larger budget is held to the budget of the attach that
+/// loads it: the oldest counts are dropped, and the later ones stay exact.
+#[test]
+fn a_recovered_accumulator_keeps_its_new_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = persistent(dir.path(), true);
+    load(&s);
+    let start;
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        let c = attach(&rt, &s, "facts", FACTS, "s");
+        start = c.commit();
+        for i in 0..200 {
+            upd(&s, &format!("INSERT DATA {{ :q{i} :age {i} }}"));
+            rt.round(&s);
+        }
+        rt.close(&s);
+    }
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    let c = rt
+        .attach_internal(
+            &s,
+            InternalSpec::accumulator("facts", FACTS, ["s"]).with_memory(8 << 10),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    assert_eq!(rt.stats(&s).loaded, 1);
+    assert!(c.bytes() <= 8 << 10, "{}", c.bytes());
+    let n = c.counts(start).unwrap();
+    assert!(n.unknown.is_some(), "the oldest counts are gone: {n:?}");
+    let head = s.snapshot().commit;
+    upd(&s, WORKLOAD[2]);
+    rt.round(&s);
+    assert_eq!(counts(&c, head), feed_counts(&s, head));
 }
