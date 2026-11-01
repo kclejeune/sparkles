@@ -398,7 +398,8 @@ fn read_ranges_with(
     // an empty range is dropped: a hint of length 0 would mean the rest of the file
     let clipped: Vec<(u64, u64)> = ranges
         .iter()
-        .filter_map(|&[off, n]| (off < len && n > 0).then(|| (off, n.min(len - off))))
+        .filter(|&&[off, n]| off < len && n > 0)
+        .map(|&[off, n]| (off, n.min(len - off)))
         .collect();
     // the next hint starts at range `hi`, offset `hat` into it. `hinted` counts the bytes
     // hinted so far, and `done` the length of the ranges read through, which a file that
