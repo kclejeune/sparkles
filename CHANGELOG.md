@@ -22,6 +22,10 @@ fails set `--ready-ignore-failed` and use `/$/ready/{ds}` for the datasets they 
 monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move to
 `/$/ready`. The Helm chart's startup probe now asks for `/$/ping`.
 
+`sparkles ask` takes its question argument as optional, since `--questions FILE` reads
+questions from a batch file instead. A command line that passes a question parses and
+behaves as before, and one that gives neither a question nor `--questions` is refused.
+
 ### Changed
 
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
