@@ -15,8 +15,14 @@
 # Checks whose inputs are unchanged since they last passed are skipped through mise's task
 # cache (see the task caching section of mise.toml).
 #
-# Usage: scripts/ci.sh [--fast] [--exhaustive-features] [--fail-fast] [--force] [--jobs N] [task...]
+# Usage: scripts/ci.sh [--fast] [--changed BASE] [--exhaustive-features] [--fail-fast] [--force] [--jobs N] [task...]
 #   --fast       formatting, shell checks, doc paths, workspace Clippy and Rust tests
+#   --changed BASE
+#                run `lint` and `test` only for the workspace packages that the change since
+#                the merge base of BASE and HEAD can affect and the packages that depend on
+#                them (scripts/changed-crates.py). A change to a shared root, such as
+#                Cargo.lock or sparkles-core, keeps the whole workspace. The batch gate
+#                never uses it.
 #   --exhaustive-features
 #                also run optional-feature Clippy and the six stripped-server test sets
 #   --fail-fast  stop the remaining tasks after the first failure
@@ -43,6 +49,7 @@ main() {
   fast=(fmt:check lint:shell lint:doc-paths api:check client:types:check lint test)
 
   jobs=2
+  changed_base=
   fail_fast=
   force=()
   exhaustive_features=
@@ -50,6 +57,10 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --fast) tasks=("${fast[@]}") ;;
+      --changed)
+        changed_base=${2:?--changed needs a base revision}
+        shift
+        ;;
       --exhaustive-features) exhaustive_features=1 ;;
       --fail-fast) fail_fast=1 ;;
       --force) force=(--force) ;;
@@ -66,6 +77,15 @@ main() {
     shift
   done
   [ ${#tasks[@]} -gt 0 ] || tasks=("${full[@]}")
+  if [ -n "$changed_base" ]; then
+    # The packages go to the lint and test tasks, whose cache keys include the variable.
+    changed=$(python3 scripts/changed-crates.py "$changed_base") || exit 1
+    case $changed in
+      all) unset SPARKLES_CHANGED_PACKAGES ;;
+      *) export SPARKLES_CHANGED_PACKAGES="${changed//$'\n'/ }" ;;
+    esac
+    echo "changed packages since $changed_base: ${SPARKLES_CHANGED_PACKAGES:-the whole workspace}"
+  fi
   if [ -n "$exhaustive_features" ]; then
     for feature_task in lint:features test:features; do
       if [[ " ${tasks[*]} " != *" $feature_task "* ]]; then

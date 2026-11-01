@@ -216,15 +216,21 @@ agent raises.
 A lane reports once its review is clean and its targeted tests and `scripts/ci.sh --fast`
 pass, together with the mise test task of each binding, UI or JavaScript package it
 touched, such as `py:test`, `jvm:test`, `node:test`, `node:client:check` or `ui:test`,
-since `--fast` runs none of them. Lanes do not run full gates of their own.
+since `--fast` runs none of them. The lane may run `scripts/ci.sh --fast --changed <base>`
+instead, which runs Clippy and the tests only for the workspace packages its change can
+affect and falls back to the whole workspace when a shared root changes. Lanes do not run
+full gates of their own, and the batch gate always runs the whole workspace.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
 batch. One full gate runs on the batch: `scripts/ci.sh`, the conformance suites and a
 Namespace screen (`mise run bench:nsc origin/main HEAD`). `scripts/gate/gate.sh <rev>` runs
 the tests on the configured gate hosts, as the
 [batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Push when the tests pass and the
-screen shows no query 10% or more slower after a rerun of the flagged queries with more
-rounds.
+screen shows no query 10% or more slower after the rerun of the flagged queries with more
+rounds, which `bench:nsc` runs on the same instance and reports beside the first pass.
+`scripts/premerge.sh` checks the generated clients, the binding lock files, the Python
+parity list, the doc paths and the script tests in minutes, and runs on the merged batch
+before the gate starts.
 
 Benchmark-host measurements do not hold up a feature lane or a push. A lane whose goal
 is performance measures on the benchmark host before it reports, and every other lane

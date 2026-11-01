@@ -55,6 +55,7 @@ global_env = [
   "MBX_INCREMENTAL", "MBX_LEARNED_INCREMENTAL", "MBX_EAGER_INCREMENTAL", "MBX_LINKER",
   "MBX_SEED_INCREMENTAL", "MBX_VERIFY", "MBX_VERIFY_SAMPLE_RATE",
   "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS",
+  "SPARKLES_CHANGED_PACKAGES",
 ]
 
 [task_config.input_groups]
@@ -325,12 +326,19 @@ run = [
 ]
 
 [tasks.lint]
-sources = ["@group:rust", "@group:ui"]
+sources = ["@group:rust", "@group:ui", "scripts/changed-crates.py"]
 outputs = []
 description = "Clippy (warnings are errors) + svelte-check"
 # ui:build first: the server embeds ui/build, which a concurrent UI build rewrites
 depends = ["ui:check", "ui:build"]
-run = "mbx clippy --workspace --all-targets -- -D warnings"
+# SPARKLES_CHANGED_PACKAGES, which `scripts/ci.sh --changed BASE` sets, narrows it to the
+# packages a lane's change can affect (scripts/changed-crates.py).
+run = '''
+set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args)
+if [ "$pkgs" = none ]; then echo "no workspace package reads a changed file"; exit 0; fi
+mbx clippy $pkgs --all-targets -- -D warnings
+'''
 
 [tasks."lint:features"]
 sources = ["@group:rust", "@group:ui", "scripts/lint-features.sh"]
@@ -370,7 +378,7 @@ depends = ["ui:check", "ui:build"]
 run = "mbx check --workspace --all-targets"
 
 [tasks.test]
-sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**"]
+sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**", "scripts/changed-crates.py", "scripts/nextest-slow.py"]
 outputs = []
 # The W3C, SHACL, ShEx and JSON-LD suites read checkouts of Apache Jena and Oxigraph
 # next to this repository when they exist, so their commits are part of the key.
@@ -388,23 +396,36 @@ depends = ["ui:build"]
 # 9 GB of rustc memory, and nextest would build them at the same time. Building them one
 # after the other halves the peak at the cost of a few minutes. nextest does not run
 # doctests, so `mbx test --doc` runs them afterwards.
+# SPARKLES_CHANGED_PACKAGES, which `scripts/ci.sh --changed BASE` sets, narrows the run to
+# the packages a lane's change can affect (scripts/changed-crates.py). nextest still builds
+# the whole workspace, so its binaries match a full run's and come from the shared cache,
+# and runs only those packages' tests. The doctests build only those packages.
 run = [
-  "mbx test --workspace --no-run --bin sparkles",
   '''
 set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args)
+if [ "$pkgs" = none ]; then echo "no workspace package reads a changed file"; exit 0; fi
+mbx test --workspace --no-run --bin sparkles
+''',
+  '''
+set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args --nextest)
+[ "$pkgs" != none ] || exit 0
 if [ "$(uname -s)" = Darwin ]; then
   mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
   ulimit -c 0
 fi
 rc=0
-mbx nextest run --workspace --no-fail-fast || rc=$?
+mbx nextest run $pkgs --no-fail-fast || rc=$?
 python3 scripts/nextest-slow.py target/nextest/default/junit.xml .artifacts/ci/slow-tests.txt
 exit $rc
 ''',
   '''
 set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args --doc)
+[ "$pkgs" != none ] || exit 0
 if [ "$(uname -s)" = Darwin ]; then ulimit -c 0; fi
-mbx test --workspace --doc
+mbx test $pkgs --doc
 ''',
 ]
 
