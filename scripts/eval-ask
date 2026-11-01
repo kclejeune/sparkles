@@ -19,6 +19,8 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
 from evaluator import (
+    ANSWER_MAX_COLUMNS,
+    GOLD_MAX_COLUMNS,
     QUERY_GRACE_SECONDS,
     GoldFault,
     HarnessFault,
@@ -26,6 +28,7 @@ from evaluator import (
     POLICIES,
     POLICY,
     OfflinePolicy,
+    Unsupported,
     answer_set,
     bounded_file,
     capture_child,
@@ -245,7 +248,7 @@ class Runner:
             raise Invalid("final result object required")
         return result, record
 
-    def query(self, text, label="query"):
+    def query(self, text, label="query", max_columns=GOLD_MAX_COLUMNS):
         offline_query(self.header + text)
         result, record = self.execute(
             [
@@ -264,7 +267,7 @@ class Runner:
             label,
             self.args.timeout,
         )
-        return answer_set(result), record
+        return answer_set(result, max_columns), record
 
     def gold(self, q):
         if q["id"] not in self.gold_cache:
@@ -441,7 +444,7 @@ class Runner:
             return {"status": "unknown", "reason": "no_runnable_first_query"}
         query_sha = hashlib.sha256((self.header + query).encode()).hexdigest()
         try:
-            first_result, record = self.query(query, "first-query")
+            first_result, record = self.query(query, "first-query", ANSWER_MAX_COLUMNS)
             correct, _, _ = score_sets(
                 self.gold(q), first_result, self.check, self.policy
             )
@@ -509,12 +512,19 @@ class Runner:
         if not isinstance(query, str) or not query:
             return failure("missing_query")
         try:
-            got, _ = self.query(query)
+            got, _ = self.query(query, max_columns=ANSWER_MAX_COLUMNS)
         except HarnessFault:
             raise
         except Invalid:
             return failure("candidate_query_failure")
-        ok, scores, detail = score_sets(gold, got, self.check, self.policy)
+        try:
+            ok, scores, detail = score_sets(gold, got, self.check, self.policy)
+        except Unsupported:
+            # The answer ran, but the column search passed its cell cap. It counts as
+            # wrong under its own status rather than ending the run.
+            ok, scores, detail = failure("scoring_unsupported")
+            detail["gotRows"] = len(got.rows)
+            return ok, scores, detail
         detail["firstDraft"] = first
         return ok, scores, detail
 

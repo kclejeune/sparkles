@@ -1327,6 +1327,69 @@ class FirstDraft(unittest.TestCase):
         self.assertEqual(list(out.iterdir()), [])
 
 
+class WideAnswers(unittest.TestCase):
+    setUp = Processes.setUp
+    child = Processes.child
+    fixture = Processes.fixture
+
+    def runner_with(self, gold, answer_result):
+        args = self.fixture()
+        qs, out = eval_ask.validate_args(args)
+        q = dict(qs["questions"][0], kind="answerable", gold="GOLD")
+        runner = eval_ask.Runner(args, qs, out)
+        runner.gold_cache[q["id"]] = gold
+        runner.execute = lambda argv, label, *unused: (answer_result, {})
+        answer = {"outcome": "answered", "result": {"query": "SELECT * WHERE {}"}}
+        return runner, q, answer
+
+    def test_answer_wider_than_eight_columns_is_projected(self):
+        gold = answer_set(result([{"p": iri("urn:a")}, {"p": iri("urn:b")}], ("p",)))
+        names = ["p"] + [f"extra{i}" for i in range(9)]
+        rows = [
+            {"p": iri(p), **{n: literal(p + n) for n in names[1:]}}
+            for p in ("urn:a", "urn:b")
+        ]
+        runner, q, answer = self.runner_with(gold, result(rows, names))
+        ok, scores, detail = runner.score(q, answer)
+        self.assertTrue(ok, detail)
+        self.assertEqual(scores, (1, 1, 1))
+        self.assertEqual((detail["mapping"], detail["extraColumns"]), ([0], 9))
+        # Gold keeps the eight-column limit, which bounds the equal-width search.
+        with self.assertRaises(Unsupported):
+            answer_set(result([], tuple(str(i) for i in range(9))))
+
+    def test_answer_beyond_the_answer_column_limit_fails(self):
+        gold = answer_set(result([{"p": iri("urn:a")}], ("p",)))
+        names = [f"c{i}" for i in range(eval_ask.ANSWER_MAX_COLUMNS + 1)]
+        rows = [{n: iri("urn:a") for n in names}]
+        runner, q, answer = self.runner_with(gold, result(rows, names))
+        ok, _, detail = runner.score(q, answer)
+        self.assertFalse(ok)
+        self.assertEqual(detail["status"], "candidate_query_failure")
+
+    def test_projection_past_the_cell_cap_is_a_scoring_status(self):
+        # Every answer column shares terms with every gold column and no injective
+        # choice matches, so the search runs into its cell cap.
+        size, width = 1000, 12
+        gold = answer_set(
+            result(
+                [{c: literal(str(i)) for c in "abcd"} for i in range(size)],
+                tuple("abcd"),
+            )
+        )
+        names = [f"c{k}" for k in range(width)]
+        rows = [
+            {n: literal(str((j + k) % size)) for k, n in enumerate(names)}
+            for j in range(size)
+        ]
+        runner, q, answer = self.runner_with(gold, result(rows, names))
+        ok, scores, detail = runner.score(q, answer)
+        self.assertFalse(ok)
+        self.assertEqual(scores, (0.0, 0.0, 0.0))
+        self.assertEqual(detail["status"], "scoring_unsupported")
+        self.assertEqual(detail["gotRows"], size)
+
+
 class RecordShapes(unittest.TestCase):
     def test_invalid_optional_record_fields_are_not_scored(self):
         from evaluator import validate_ask_record

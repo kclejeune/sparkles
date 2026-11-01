@@ -51,8 +51,11 @@ answer with the gold's width is compared whole. An answer with more columns, suc
 name beside each person, is projected onto one distinct answer column for each gold
 column, and the projected set of rows is compared with the gold, so a stray or missing
 row still costs precision or recall. An answer with fewer columns than the gold is
-wrong. Blank nodes, more than eight columns and more than 1000 rows are unsupported.
-Gold that needs them fails before any model is called. The scorer refuses SERVICE before
+wrong. Blank nodes and more than 1000 rows are unsupported. Gold may have at most eight
+columns and an answer at most 32, since the answer's extra columns are projected away.
+Gold that exceeds a limit fails before any model is called, and an answer that exceeds
+one is scored wrong as `candidate_query_failure`. An answer whose projection search
+passes its cell cap is scored wrong as `scoring_unsupported` and the run continues. The scorer refuses SERVICE before
 it starts a query. This is the policy `rdf-term-set-projected-columns-v2`, a strict
 RDF-term policy and not an official QALD score. The first policy,
 `rdf-term-set-global-columns-v1`, compared whole rows only, and it scored most answers of

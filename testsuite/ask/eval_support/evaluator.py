@@ -17,6 +17,11 @@ POLICY = "rdf-term-set-projected-columns-v2"
 # The policy of the first paid run, kept so its reports can be reproduced.
 POLICY_V1 = "rdf-term-set-global-columns-v1"
 POLICIES = (POLICY, POLICY_V1)
+# Gold columns bound the equal-width search over column permutations. An answer may be
+# wider, such as labels beside each IRI, because projection picks one answer column per
+# gold column and its search has its own cell cap.
+GOLD_MAX_COLUMNS = 8
+ANSWER_MAX_COLUMNS = 32
 XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
 UNBOUND = ("unbound",)
 STDOUT_CAP = 4 * 1024 * 1024
@@ -242,7 +247,7 @@ class Relation:
         return align(self, other)[0] == len(self.rows)
 
 
-def answer_set(result):
+def answer_set(result, max_columns=GOLD_MAX_COLUMNS):
     if not isinstance(result, dict) or result.keys() - {"head", "boolean", "results"}:
         raise Invalid("SPARQL JSON result required")
     head = result.get("head")
@@ -268,8 +273,8 @@ def answer_set(result):
         or len(set(variables)) != len(variables)
     ):
         raise Invalid("invalid SELECT variables")
-    if len(variables) > 8:
-        raise Unsupported("scoring supports at most eight columns")
+    if len(variables) > max_columns:
+        raise Unsupported(f"scoring supports at most {max_columns} columns")
     results = result.get("results")
     if (
         not isinstance(results, dict)
