@@ -94,9 +94,10 @@ impl MatchOp {
     pub fn enable_prov(&mut self, mode: Provenance, cond: u32) {
         self.prov = mode;
         self.cond = cond;
-        self.lann = Some(AnnMap::default());
-        self.sann = (self.mode == MatchMode::Exists).then(AnnMap::default);
-        self.rann = self.rarr.is_some().then(AnnMap::default);
+        let on = !mode.is_none();
+        self.lann = on.then(AnnMap::default);
+        self.sann = (on && self.mode == MatchMode::Exists).then(AnnMap::default);
+        self.rann = (on && self.rarr.is_some()).then(AnnMap::default);
     }
 
     /// [`matching`](Self::matching) with the annotations of the right rows.
@@ -132,12 +133,22 @@ impl MatchOp {
         match self.mode {
             MatchMode::Exists => la.mul(sa),
             _ => {
-                let vals: Vec<(u32, Id)> = self
-                    .m
-                    .shared
-                    .iter()
-                    .map(|&(i, _)| (self.left.schema[i], a[i]))
-                    .collect();
+                // an OPTIONAL's filter can read any left variable, so its condition
+                // binds them all
+                let vals: Vec<(u32, Id)> = if self.expr.is_some() {
+                    self.left
+                        .schema
+                        .iter()
+                        .copied()
+                        .zip(a.iter().copied())
+                        .collect()
+                } else {
+                    self.m
+                        .shared
+                        .iter()
+                        .map(|&(i, _)| (self.left.schema[i], a[i]))
+                        .collect()
+                };
                 la.mul(&p.absent_ann(self.cond, &vals))
             }
         }

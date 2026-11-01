@@ -52,8 +52,9 @@ impl Join {
 
     pub fn enable_prov(&mut self, mode: Provenance) {
         self.prov = mode;
-        self.lann = self.larr.is_some().then(AnnMap::default);
-        self.rann = self.rarr.is_some().then(AnnMap::default);
+        let on = !mode.is_none();
+        self.lann = (on && self.larr.is_some()).then(AnnMap::default);
+        self.rann = (on && self.rarr.is_some()).then(AnnMap::default);
     }
 
     /// [`init`](Self::init) with annotations: a merged row's annotation is the product

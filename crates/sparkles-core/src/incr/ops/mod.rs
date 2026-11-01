@@ -163,6 +163,8 @@ impl Node {
     pub fn enable_prov(&mut self, mode: Provenance, next: &mut u32) {
         match &mut self.op {
             Op::Join(o) => o.enable_prov(mode),
+            Op::Match(o) if mode.is_none() => o.enable_prov(mode, u32::MAX),
+            Op::Group(o) if mode.is_none() => o.enable_prov(mode, u32::MAX),
             Op::Match(o) => {
                 o.enable_prov(mode, *next);
                 *next += 1;
@@ -184,15 +186,23 @@ impl Node {
     pub fn conditions(&self, vars: &[String], out: &mut Vec<(u32, String)>) {
         match &self.op {
             Op::Match(o) if o.cond != u32::MAX => {
-                let names: Vec<String> =
-                    o.m.shared
-                        .iter()
-                        .map(|&(i, _)| format!("?{}", vars[o.left.schema[i] as usize]))
-                        .collect();
+                let cols: Vec<u32> = if o.expr.is_some() {
+                    o.left.schema.clone()
+                } else {
+                    o.m.shared.iter().map(|&(i, _)| o.left.schema[i]).collect()
+                };
+                let names: Vec<String> = cols
+                    .iter()
+                    .map(|&v| format!("?{}", vars[v as usize]))
+                    .collect();
+                let filter = o
+                    .expr
+                    .as_ref()
+                    .map_or(String::new(), |e| format!(" FILTER {e}"));
                 out.push((
                     o.cond,
                     format!(
-                        "{} on [{}]: {}",
+                        "{} on [{}]: {}{filter}",
                         o.mode.name(),
                         names.join(" "),
                         describe(&o.right, vars)

@@ -214,7 +214,7 @@ impl Group {
     pub fn enable_prov(&mut self, mode: Provenance, cond: u32) {
         self.prov = mode;
         self.cond = cond;
-        self.gann = Some(AnnMap::default());
+        self.gann = (!mode.is_none()).then(AnnMap::default);
     }
 
     fn key_of(&self, r: &[Id]) -> Row {

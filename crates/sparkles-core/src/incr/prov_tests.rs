@@ -863,3 +863,161 @@ fn annotations_round_trip_through_the_state_encoding() {
         assert!(plain.decode(&body, &snap).is_err(), "{mode:?}");
     }
 }
+
+fn built(s: &Store, text: &str, mode: Provenance) -> Circuit {
+    let parsed = sparql::parse_query(text, None, &[]).unwrap();
+    let mut c = Circuit::new(compile(&parsed, None).unwrap(), None);
+    c.set_provenance(mode).unwrap();
+    c.build(s.snapshot(), &Control::none()).unwrap();
+    c
+}
+
+fn pass(s: &Store, c: &mut Circuit) {
+    let d = DeltaSet::read(s, c.applied, &Control::none());
+    c.advance(&d, &Control::none()).unwrap();
+}
+
+fn sparql_update(s: &Store, u: &str) {
+    sparql::update::update(s, u, &QueryOptions::default()).unwrap();
+}
+
+/// Over the union default graph, a triple's witnesses are the named-graph quads that
+/// hold it, they move when the triple moves between graphs, and they resolve to the
+/// stored quads.
+#[test]
+fn union_default_graph_witnesses_name_stored_quads() {
+    let s = Store::in_memory(StoreOptions {
+        union_default_graph: true,
+        ..Default::default()
+    });
+    let g = |i: u8| iri(format!("g{i}"));
+    sparql_update(
+        &s,
+        &format!("INSERT DATA {{ GRAPH <{NS}g1> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}"),
+    );
+    let mut c = built(
+        &s,
+        &format!("SELECT ?a WHERE {{ ?a <{NS}p0> ?b }}"),
+        Provenance::why(),
+    );
+    let key = |gi: u8| FactKey::of_terms(&node(0), &pred(0), &node(1), Some(&g(gi)));
+    let wit = |c: &Circuit| {
+        let a = c.annotated_rows()[0].2.clone().unwrap();
+        (a.count, a.witnesses)
+    };
+    let one = |gi: u8| Witness::new(vec![Atom::Fact(key(gi))]);
+    assert_eq!(wit(&c), (1, vec![one(1)]));
+    // a second graph holds the triple: one row, two witnesses
+    sparql_update(
+        &s,
+        &format!("INSERT DATA {{ GRAPH <{NS}g2> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}"),
+    );
+    pass(&s, &mut c);
+    assert_eq!(c.annotated_rows().len(), 1);
+    let (n, mut w) = wit(&c);
+    w.sort();
+    let mut both = vec![one(1), one(2)];
+    both.sort();
+    assert_eq!((n, w), (2, both));
+    // the triple leaves the first graph and stays in the union
+    sparql_update(
+        &s,
+        &format!("DELETE DATA {{ GRAPH <{NS}g1> {{ <{NS}n0> <{NS}p0> <{NS}n1> }} }}"),
+    );
+    pass(&s, &mut c);
+    assert_eq!(wit(&c), (1, vec![one(2)]));
+    let r = c
+        .resolve_facts(&[key(2), key(1)], &Control::none())
+        .unwrap();
+    assert_eq!(r[0].1.as_ref().and_then(|q| q.1.clone()), Some(g(2)));
+    assert!(r[1].1.is_none(), "a removed quad does not resolve");
+    // a rebuild agrees with the passes
+    let fresh = built(
+        &s,
+        &format!("SELECT ?a WHERE {{ ?a <{NS}p0> ?b }}"),
+        Provenance::why(),
+    );
+    assert_eq!(wit(&fresh), wit(&c));
+}
+
+/// An OPTIONAL's filter reads left variables beyond the shared ones, so two rows
+/// without a match that differ only there have different conditions.
+#[test]
+fn optional_filters_bind_their_left_variables() {
+    let s = Store::in_memory(StoreOptions::default());
+    sparql_update(
+        &s,
+        &format!(
+            "INSERT DATA {{ <{NS}n0> <{NS}p0> 1 . <{NS}n0> <{NS}p0> 2 . <{NS}n0> <{NS}p1> 0 }}"
+        ),
+    );
+    let c = built(
+        &s,
+        &format!(
+            "SELECT ?s ?v WHERE {{ ?s <{NS}p0> ?v OPTIONAL {{ ?s <{NS}p1> ?x FILTER(?x > ?v) }} }}"
+        ),
+        Provenance::why(),
+    );
+    let absent: BTreeSet<Absence> = c
+        .annotated_rows()
+        .iter()
+        .flat_map(|(_, _, a)| a.clone().unwrap().witnesses)
+        .flat_map(|w| w.atoms().to_vec())
+        .filter_map(|a| match a {
+            Atom::Absent(x) => Some(x),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(absent.len(), 2);
+    let conds = c.conditions();
+    assert!(conds[0].1.contains("FILTER"), "{conds:?}");
+}
+
+/// A CONSTRUCT template with blank nodes keeps the derivation count of its solution,
+/// also when only the count changes.
+#[test]
+fn template_blank_nodes_keep_derivation_counts() {
+    let s = Store::in_memory(StoreOptions::default());
+    update(&s, &[], &[(0, 0, 1), (0, 0, 2)]);
+    let mut c = built(
+        &s,
+        &format!(
+            "CONSTRUCT {{ _:b <{NS}out> ?s }} WHERE {{ {{ SELECT DISTINCT ?s {{ ?s <{NS}p0> ?o }} }} }}"
+        ),
+        Provenance::Count,
+    );
+    let count = |c: &Circuit| -> Vec<i64> {
+        c.annotated_rows()
+            .iter()
+            .map(|(_, _, a)| a.clone().unwrap().count)
+            .collect()
+    };
+    assert_eq!(count(&c), vec![2]);
+    update(&s, &[], &[(0, 0, 3)]);
+    pass(&s, &mut c);
+    assert_eq!(count(&c), vec![3]);
+    update(&s, &[(0, 0, 1), (0, 0, 2), (0, 0, 3)], &[]);
+    pass(&s, &mut c);
+    assert!(c.annotated_rows().is_empty());
+}
+
+/// Turning provenance off clears every operator's annotations, so the state encodes
+/// as a circuit without provenance does.
+#[test]
+fn turning_provenance_off_clears_the_state() {
+    let s = Store::in_memory(StoreOptions::default());
+    update(&s, &[], &[(0, 0, 1), (1, 1, 2)]);
+    let text = format!(
+        "SELECT * WHERE {{ {{ SELECT DISTINCT ?a {{ ?a <{NS}p0> ?b }} }} {{ ?a <{NS}p0> ?c }} \
+         OPTIONAL {{ ?c <{NS}p1> ?d }} }}"
+    );
+    let mut c = built(&s, &text, Provenance::why());
+    c.set_provenance(Provenance::None).unwrap();
+    c.build(s.snapshot(), &Control::none()).unwrap();
+    let snap = s.snapshot();
+    let body = c.encode(&snap).unwrap();
+    let parsed = sparql::parse_query(&text, None, &[]).unwrap();
+    let mut plain = Circuit::new(compile(&parsed, None).unwrap(), None);
+    plain.decode(&body, &snap).unwrap();
+    assert!(c.annotation(&[]).is_none());
+}

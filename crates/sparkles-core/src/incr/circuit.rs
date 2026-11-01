@@ -340,10 +340,8 @@ impl Circuit {
         self.prov = mode;
         self.ann.clear();
         self.facts.clear();
-        if !mode.is_none() {
-            let mut next = 0;
-            self.root.enable_prov(mode, &mut next);
-        }
+        let mut next = 0;
+        self.root.enable_prov(mode, &mut next);
         Ok(())
     }
 
@@ -429,7 +427,7 @@ impl Circuit {
         let wanted: rustc_hash::FxHashSet<FactKey> = keys.iter().copied().collect();
         let mut terms = self.terms.clone();
         let vis = Vis::new(self.access.as_ref(), &snap);
-        let mut p = Pass::new(
+        let p = Pass::new(
             snap.clone(),
             None,
             &[],
@@ -440,22 +438,24 @@ impl Circuit {
             control,
             &self.vars,
         );
+        // quads are hashed as the scan visits them, and the scan stops once every key
+        // is found
+        let mut seen = 0u64;
         for b in self.root.bgps() {
             if found.len() == wanted.len() {
                 break;
             }
-            let mut quads = Vec::new();
             b.visit(&p, super::pass::Which::New, &mut |q| {
-                quads.push(q);
-                Ok(true)
-            })?;
-            for q in quads {
-                p.tick()?;
-                let k = p.fact_key(&q);
+                seen += 1;
+                if seen.is_multiple_of(1024) {
+                    control.check()?;
+                }
+                let k = p.fact_key_of(&q);
                 if wanted.contains(&k) {
                     found.insert(k, q);
                 }
-            }
+                Ok(found.len() < wanted.len())
+            })?;
         }
         drop(p);
         let term = |i: Id| self.terms.term(&snap, i);

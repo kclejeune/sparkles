@@ -162,11 +162,25 @@ impl Template {
         for (row, w, a) in c {
             p.tick()?;
             if blanks {
-                if w == 0 {
-                    continue;
+                // each occurrence's triples count one derivation, and the first
+                // occurrence's carry the solution's other derivations, so the triples of
+                // a solution count `count − weight + 1` there and 1 elsewhere
+                let extra = a.count() - w;
+                if extra != 0 {
+                    let keys: Vec<Vec<u8>> = row
+                        .iter()
+                        .map(|&i| p.terms.key(&p.new, i).unwrap_or_default())
+                        .collect();
+                    let mut first = Changes::new();
+                    self.emit(p, &row, &keys, None, 0, &mut first);
+                    for (t, _) in first {
+                        out.push((t, 0, Ann::unknown(mode, extra)));
+                    }
                 }
-                for (t, tw) in self.apply(p, vec![(row, w)])? {
-                    out.push((t, tw, Ann::unknown(mode, tw)));
+                if w != 0 {
+                    for (t, tw) in self.apply(p, vec![(row, w)])? {
+                        out.push((t, tw, Ann::unknown(mode, tw)));
+                    }
                 }
                 continue;
             }

@@ -207,13 +207,18 @@ impl<'a> Pass<'a> {
         if let Some(k) = self.facts.as_ref().and_then(|f| f.get(q)) {
             return k;
         }
-        let key = |i: Id| self.terms.key(&self.new, i).unwrap_or_default();
-        let g = (q[3] != Id::DEFAULT_GRAPH).then(|| key(q[3]));
-        let k = super::prov::FactKey::of_keys(&key(q[0]), &key(q[1]), &key(q[2]), g.as_deref());
+        let k = self.fact_key_of(q);
         if let Some(f) = self.facts.as_mut() {
             f.insert(*q, k);
         }
         k
+    }
+
+    /// [`fact_key`](Self::fact_key) without the cache.
+    pub fn fact_key_of(&self, q: &[Id; 4]) -> super::prov::FactKey {
+        let key = |i: Id| self.terms.key(&self.new, i).unwrap_or_default();
+        let g = (q[3] != Id::DEFAULT_GRAPH).then(|| key(q[3]));
+        super::prov::FactKey::of_keys(&key(q[0]), &key(q[1]), &key(q[2]), g.as_deref())
     }
 
     /// The annotation of one derivation that matched `quads`.
