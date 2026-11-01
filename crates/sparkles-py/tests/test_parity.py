@@ -55,7 +55,12 @@ DEFERRED = {
     "evidence.detach",
     "evidence.holds",
     "evidence.release_hold",
+    "evidence.resolve",
     "evidence.settings",
+    "ontology.axioms",
+    "ontology.check",
+    "ontology.edit",
+    "ontology.summary",
 }
 
 
@@ -67,8 +72,9 @@ def test_python_binding_names_resolve() -> None:
     for key, entry in bindings.items():
         name = entry["python"]
         if name.startswith("planned:"):
-            # Evidence settings and holds reach the bindings with the typed evidence operations
-            # of roadmap item 81, as spec C25 decides. No other key may be planned.
+            # The evidence operations reach the bindings with the typed evidence operations of
+            # roadmap item 81, as spec C25 decides, and the ontology handle with F21 Phase 2,
+            # roadmap item 537. No other key may be planned.
             assert key in DEFERRED, f"`{key}` still has a planned Python binding"
             assert name.split(":", 1)[1].strip(), f"`{key}` needs a reason"
             continue
