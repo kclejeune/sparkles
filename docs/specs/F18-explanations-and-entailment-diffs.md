@@ -623,10 +623,13 @@ derivation counts, so each support counts once. The two rules of F13 §5.1 then 
 this form. A kept witness always derives its fact, and a fact that is not truncated keeps
 exactly its minimal supports, the minimal sets of input quads whose closure holds it. A
 fact is truncated when its own evaluation may have lost a support, or when a premise of
-one of its instances is truncated, and the flag is the least such assignment. A fact with
-the empty support is exact whatever its premises keep. Facts derived through `noValue`,
-the GeoSPARQL default geometries and programs with head actions or `makeTemp` are
-truncated, since their instances do not show every support.
+one of its instances is truncated. Its evaluation loses supports when they pass the bound,
+when a rule instance's product passes its working bound of four times the bound or 16,384
+unions per premise, and when a fact has more than 4,096 instances. A fact with the empty
+support is exact whatever its premises keep. Facts derived through `noValue`, the
+GeoSPARQL default geometries and programs with head actions or `makeTemp` are truncated,
+since their instances do not show every support. Under such a program every asserted
+fact is truncated too, because a hidden derivation may give it another minimal support.
 
 An incremental run keeps the witnesses that avoid the removed quads, which for a monotone
 program are exactly the minimal supports that remain. Before the deletion it finds the
@@ -651,6 +654,11 @@ update they check that each kept witness derives its fact, that an exact fact ke
 exactly its minimal supports, and that every fact a fresh build keeps exactly is kept
 exactly and identically. `tests/witnesses.rs` checks the library surface, the move of a
 witness between input graphs and the bounds.
+
+The witnesses are charged to the run's memory budget as they grow, and a run past its
+`max_memory` stops with a memory error. Kept witnesses that a later run does not use,
+because it keeps none or keeps another bound, are dropped before the kept closure is
+charged to that run.
 
 The witnesses trade memory and time for supported visibility, and the
 [reasoning results](../benchmarks/reasoning/RESULTS.md#reasoner-witnesses) give the

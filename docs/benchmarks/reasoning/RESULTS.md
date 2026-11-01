@@ -190,12 +190,23 @@ The incremental runs change 1,000 triples of the LUBM data with 10 universities 
 | Change again | 8 ms | 6.6 s |
 | Kept closure | 83 MiB | 849 MiB |
 
+The reasoning latency harness of `mise run bench:reasoning-latency` ran on the same
+instance with 12 threads, five rounds and three repetitions, first for the base build and
+then for the witness build. Query-time reasoning does not use witnesses. The witness build
+measured a geometric mean of 0.938 of the base over the 100 timings, with every answer
+check passing. Five timings were 10% or more slower, all of them queries under 0.6 ms.
+They are `owl-rl` materialized `q4`, `q5` and `q12` at 0.08 to 0.12 ms, `rdfs` on read
+`q13` at 0.08 ms and `rdfs` demand-cached `q7` at 0.56 ms against 0.50 ms. Roadmap item
+NEW-ITEM-1 rechecks them on an Intel host.
+
 A change evaluated about 230,000 facts again, a third of the closure, because it reaches
 many truncated facts. Reading the closure back from the dataset builds the witnesses
 again, since they are not stored. The
 [run directory](runs/2026-11-01-witnesses-nsc/run.sh.txt) holds the commands, the
-[host](runs/2026-11-01-witnesses-nsc/env.txt) and every
-[output line](runs/2026-11-01-witnesses-nsc/mat.txt).
+[host](runs/2026-11-01-witnesses-nsc/env.txt), every
+[materialization line](runs/2026-11-01-witnesses-nsc/mat.txt) and the latency lines of the
+[base](runs/2026-11-01-witnesses-nsc/latency-base.jsonl) and
+[witness](runs/2026-11-01-witnesses-nsc/latency-witnesses.jsonl) builds.
 
 ## Query-time reasoning latency
 
