@@ -268,15 +268,26 @@ try:
         readies, prewarms = [], []
         failed = None
         if a.prewarm:
-            # a pass that leaves the query's blocks and pages in the list at shutdown
+            # a pass that leaves this query's blocks and pages in the list at shutdown,
+            # starting from no list, so that no other query's list carries over
+            (Path(a.db) / 'prewarm.json').unlink(missing_ok=True)
             evict()
             proc = start()
-            for _ in range(max(a.warmup, 1)):
-                urllib.request.urlopen(req, timeout=600).read()
+            try:
+                for _ in range(max(a.warmup, 1)):
+                    urllib.request.urlopen(req, timeout=600).read()
+            except (urllib.error.URLError, TimeoutError) as e:
+                if not a.keep_going:
+                    raise
+                failed = str(getattr(e, 'code', '') or e)
             stop(proc)
             proc = None
-        for i in range(a.runs + (0 if a.cold else a.warmup)):
+            # every sample reads the seed's list, not one its predecessor rewrote
+            seed = (Path(a.db) / 'prewarm.json').read_bytes() if failed is None else None
+        for i in range(0 if failed is not None else a.runs + (0 if a.cold else a.warmup)):
             if a.cold:
+                if a.prewarm:
+                    (Path(a.db) / 'prewarm.json').write_bytes(seed)
                 evict()
                 offset = log_size()
                 proc = start()
