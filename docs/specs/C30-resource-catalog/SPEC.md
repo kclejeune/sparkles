@@ -1,6 +1,6 @@
 # C30: Resource catalog
 
-> **Status:** planned.
+> **Status:** partially implemented (Phase 1).
 >
 > **Roadmap:** [item 458](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -194,8 +194,8 @@ larger than 16 MiB.
 Unit tests cover the licence table and expressions, the class order, the model's checks,
 the propagation of obligations, the NOTICE and the RDF description. Router tests cover
 the routes, `ETag` and `If-Match`, the read-only refusal, references that block removal,
-namespace ownership, acceptance withdrawal, both licence policies, the header read under
-a caller restricted to some graphs, and installation with and without conflicts. A
+namespace ownership, acceptance withdrawal, both licence policies, the header read and
+its disagreements, and installation with and without conflicts. A
 format test writes a file of format 2 and checks that every route refuses it and that
 the file is unchanged. The OpenAPI description, the generated client types and
 `api-compat.py --check-manifest` cover the new routes.
@@ -241,6 +241,42 @@ for redistributable data, and restricted sources are shared as recipes only.
 
 This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: DVC, DBpedia Databus, Hugging Face Hub, qlever-control, Databus, CKAN, OBO Foundry, LOV, GraphDB server files, Kaggle, Virtuoso load list, Qleverfile MULTI_INPUT_JSON, ODK import refresh, QLever Qleverfiles, TopBraid EDG, VocBench, OBO idranges, EDG, WebProtégé forms, OLS, OntoPortal, MLCommons Croissant, Databus linksets, SSSOM, prefix.cc, Bioregistry, OBO conventions, SPDX, TopBraid EDG includes and LOD Laundromat. No code from another project is copied.
 
+Phase 1 was written from the W3C Recommendations DCAT 3 (Data Catalog Vocabulary,
+Version 3), PROV-O and the VoID Vocabulary, the VANN vocabulary for annotating
+vocabulary descriptions, and the SPDX specification's License Expression syntax, License
+List identifiers and checksum terms. The licence table classifies SPDX License List
+identifiers by the terms of their licence texts. No Fluree source or documentation was
+used, and no code from another project is copied.
+
 ## Outcome
 
-Nothing is built. [Item 458](../../ROADMAP.md) tracks the work.
+Phase 1 has shipped. [Item 458](../../ROADMAP.md) keeps the remaining phases.
+
+The server keeps the catalog in `resources.json`, format 1, which `sparkles::formats`
+registers as a server settings file. The code is `crates/sparkles-server/src/resources`.
+The model, the licences, the propagation of obligations, the NOTICE, the DCAT
+description, the vocabulary header read and the prefix install follow the plan above.
+The header read runs through `CallerContext::read_options`, so it meets the server's
+query timeout and budgets. The install writes through the prefixes settings kind. The
+catalog reads its file on each request under one lock, which keeps it current after an
+operator edits the file and costs one parse of at most 16 MiB per request. That is
+small for an administrative catalog of at most 4,096 resources.
+
+A version of a dataset resource records its graphs and their sources by hand in this
+phase. Recording them when data is loaded, and reloading from sources, belong to the load
+manifest phase, which needs the source store for reload. The licence gate reports its
+verdict, and the export and publication routes apply it under NEW-ITEM-1. The Croissant
+export is NEW-ITEM-2. Only server administrators read the catalog, and a filtered read
+for dataset administrators belongs to the dataset manager phase.
+
+The catalog is per server, as the non-goals require. A vocabulary resource names the
+dataset graphs that hold the vocabulary, and each dataset keeps its own term dictionary.
+A dictionary shared across datasets is not adopted, because it would couple the
+lifecycles of the datasets, force renumbering when one changes, reveal through shared
+ids which terms another dataset holds and widen the reach of every change to its format.
+
+Unit tests cover the licence expressions and table, the class order, the model's checks,
+references, propagation, the NOTICE, the DCAT description and the file format. Router
+tests cover every route, the entity tags, the read-only refusal, an unreadable file on
+every route, both licence policies, acceptance, the header read and the install with and
+without conflicts.

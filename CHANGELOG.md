@@ -22,6 +22,20 @@ fails set `--ready-ignore-failed` and use `/$/ready/{ds}` for the datasets they 
 monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move to
 `/$/ready`. The Helm chart's startup probe now asks for `/$/ping`.
 
+### Added
+
+The server keeps a resource catalog of versioned sources, vocabularies and datasets
+under `/$/resources`, for server administrators. A version never changes once it is
+added, and its imports and graph sources pin versions that exist. Licences are SPDX
+expressions in four classes, obligations propagate through references to each graph of
+a dataset version, and `GET /$/resources/{id}/notice` writes the NOTICE. The licence
+gate of `serve --license-policy` warns by default and refuses only under `enforce`, and
+the export routes do not consult it yet. Restricted terms need a recorded acceptance. A
+vocabulary owns its namespaces, its header can be compared with the catalog, and
+`POST /$/resources/{id}/install/{ds}` installs its prefixes. The catalog is described in
+DCAT 3 with PROV-O, SPDX, VANN and VoID. Nothing is fetched, and the source store,
+loading and mirrors remain under item 458.
+
 ### Changed
 
 The library builds the options of a query with `sparkles::QueryRequest`, which applies a
@@ -886,6 +900,11 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The resource catalog is the server file `resources.json`, format 1, registered as a
+server settings file. A file of another format, or one that does not parse or breaks the
+catalog's rules, is never rewritten, and every catalog route answers
+`503 catalog-unreadable` while the datasets keep serving.
 
 Internal circuits are checkpointed to `circuits/{id}/main/state-{commit}.bin`, the new
 derived kind `internal-circuit-state` version 1 with the magic `SPKCIRC\0`. A file of
