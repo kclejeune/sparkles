@@ -11809,6 +11809,76 @@ writes the facts with the chosen IRIs, or with the candidates in `distinctFrom` 
 new entity. A client without elicitation, or of an older revision, gets the
 `possible-duplicate` error.
 
+### Evidence settings
+
+A dataset's evidence settings declare the graphs of the
+[evidence profile](ai/README.md#evidence-profile) and its named review policies. They are
+kept in `<db>/evidence.json` as format 1 and profile 1, and in the process for an
+in-memory dataset. The design is in
+[C25 §7](specs/C25-evidence-and-assessments.md#7-configuration-access-and-retention).
+
+```json
+{
+  "format": 1, "profile": 1, "enabled": true,
+  "sourceRecords": ["https://example.org/ev/sources"],
+  "proposals": ["https://example.org/ev/claims"],
+  "decisions": ["https://example.org/ev/decisions"],
+  "supports": ["https://example.org/ev/supports"],
+  "identity": ["https://example.org/ev/identity"],
+  "projections": ["https://example.org/ev/accepted"],
+  "policies": {
+    "advisories": {
+      "version": 1, "admittedKinds": ["reported", "observation"],
+      "requiredScope": ["https://example.org/release"], "conflicts": "refuse",
+      "boundary": ["https://example.org/ev/sources", "https://example.org/ev/claims"],
+      "decisions": "https://example.org/ev/decisions",
+      "supports": "https://example.org/ev/supports",
+      "output": "https://example.org/ev/accepted"
+    }
+  }
+}
+```
+
+Each role is a set of absolute graph IRIs, and the roles together name at most 1,024
+graphs. Enabled settings need `sourceRecords` and `proposals`. A graph may have several
+roles, except that a `projections` graph has no other role. The members after
+`proposals` may be left out and then default to empty. A policy name uses `a-z`, `0-9`
+and `-`, with at most 64 policies. A policy's `version` starts at 1, and
+`admittedKinds` names `reported`, `observation`, `hypothesis` or `preference`. Only
+positive claims of those kinds can be admitted. `requiredScope` names the scope
+predicates an admitted claim must carry. `conflicts` is `refuse` or `admitLabelled`.
+`boundary` lists the `sourceRecords` and `proposals` graphs whose records the
+policy's reviews may use. `decisions`, `supports` and `output` name one graph of the
+`decisions`, `supports` and `projections` roles, and each projection graph is the output
+of one policy. Anything else, including an unknown member, is a `400`. A `format` or
+`profile` other than 1 is a `409` with the code `unsupported-profile`.
+
+`GET /$/evidence/{ds}/settings` needs `admin` and answers the canonical settings with
+`digest`, the SHA-256 digest of `evidence.json`, the `revision` of the dataset's
+managed-graph registry, the role graphs that are `managed` and those that are
+`detached`. Before the first configuration it answers the disabled defaults, a `null`
+digest and revision 0. `PUT /$/evidence/{ds}/settings` needs `admin` and records its
+body. Enabled settings protect every graph of every role, so ordinary writes to them
+are refused with `409 profile-managed-graph`. The first configuration raises the
+dataset reader to 6, and the file holds the canonical bytes with sorted sets and keys.
+A configuration never weakens protection. Settings that would leave a protected graph
+without a role, or disable the profile while it protects a graph, are a `409` that
+writes nothing. A configuration that races with another change of the registry is also
+a `409` that writes nothing, and the client reads the settings again. A configuration
+interrupted between `evidence.json` and `managed.json` leaves every write refused with
+`503 managed-unavailable`, and the next `PUT` repairs it after checking its body against
+the protection that `managed.json` records. Disabled settings
+of a dataset that was never configured are a `400` unless they equal the defaults,
+which write nothing.
+
+`POST /$/evidence/{ds}/detach` with `{"graph": IRI}` needs `admin` and stops protecting
+one graph, which ordinary writes can then change. The settings keep the graph in its
+roles, and the next `PUT` protects it again. Protecting a graph does not authenticate
+what it already holds or what was written while it was detached. A graph that the
+profile does not protect is a `404`. A detach refuses with `503 managed-unavailable`
+and changes nothing when this build cannot read the recorded settings. A registry that this build cannot enforce answers
+`503 managed-unavailable` on all three routes.
+
 ### Suggested examples
 
 A reader who finds a good question and query can suggest it as an example, and a

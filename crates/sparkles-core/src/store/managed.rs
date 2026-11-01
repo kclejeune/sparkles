@@ -48,6 +48,18 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
     Some(state)
 }
 
+/// A coherent view of a dataset's managed-graph registry
+/// ([`Store::managed_snapshot`]).
+#[derive(Clone, Debug)]
+pub struct ManagedSnapshot {
+    pub graphs: ManagedGraphs,
+    /// Each owner's settings file, as the registry records it, or as found on disk
+    /// when the registry is unavailable.
+    pub settings: BTreeMap<OwnerKind, Arc<[u8]>>,
+    /// Why writes are refused until an owner is enabled again, when they are.
+    pub unavailable: Option<String>,
+}
+
 impl Store {
     fn managed_state(&self) -> Option<Arc<ManagedState>> {
         self.family.managed.load_full()
@@ -118,6 +130,45 @@ impl Store {
         entry: OwnerEntry,
         settings: &[u8],
     ) -> Result<ManagedGraphs> {
+        self.enable_managed_checked(owner, entry, settings, None)
+    }
+
+    /// [`enable_managed`](Self::enable_managed) only while the registry's revision is
+    /// still `expected`, which is 0 when no registry is installed. Under the writer lock
+    /// of main, any other revision refuses with a conflict and writes nothing, so a
+    /// caller that derived `entry` from the registry it read cannot overwrite a change
+    /// made since.
+    pub fn enable_managed_at(
+        &self,
+        owner: OwnerKind,
+        entry: OwnerEntry,
+        settings: &[u8],
+        expected: u64,
+    ) -> Result<ManagedGraphs> {
+        self.enable_managed_checked(owner, entry, settings, Some(expected))
+    }
+
+    /// The bytes of `owner`'s settings file as the installed registry records them,
+    /// `None` when the owner is not enabled. Fails with `managed-unavailable` when the
+    /// registry cannot be enforced.
+    pub fn managed_settings(&self, owner: OwnerKind) -> Result<Option<Arc<[u8]>>> {
+        match self.managed_state().as_deref() {
+            None => Ok(None),
+            Some(ManagedState::Installed(i)) => Ok(i.settings.get(&owner).cloned()),
+            Some(ManagedState::Unavailable { reason, .. }) => Err(ManagedError::error(
+                ManagedErrorKind::Unavailable,
+                reason.clone(),
+            )),
+        }
+    }
+
+    fn enable_managed_checked(
+        &self,
+        owner: OwnerKind,
+        entry: OwnerEntry,
+        settings: &[u8],
+        expected: Option<u64>,
+    ) -> Result<ManagedGraphs> {
         if !owner.supports_profile(entry.profile) {
             return Err(ManagedError::error(
                 ManagedErrorKind::UnsupportedProfile,
@@ -155,6 +206,14 @@ impl Store {
             )));
         }
         self.change_managed(|current| {
+            let revision = current.map_or(0, |i| i.graphs.revision);
+            if let Some(expected) = expected
+                && expected != revision
+            {
+                return Err(Error::Conflict(format!(
+                    "the managed-graph registry is at revision {revision}, not {expected}; read it again"
+                )));
+            }
             let mut graphs = current.map_or_else(
                 || ManagedGraphs {
                     revision: 0,
@@ -174,10 +233,100 @@ impl Store {
     /// it again. The owner keeps its other graphs and its settings. Dependent outputs
     /// are the owner's to mark unavailable.
     pub fn detach_managed(&self, owner: OwnerKind, graph: &str) -> Result<ManagedGraphs> {
+        self.detach_managed_checked(owner, graph, None)
+    }
+
+    /// [`detach_managed`](Self::detach_managed) only while the registry's revision is
+    /// still `expected`. Any other revision refuses with a conflict and writes nothing,
+    /// so a caller that checked the registry it read cannot detach under a newer one.
+    pub fn detach_managed_at(
+        &self,
+        owner: OwnerKind,
+        graph: &str,
+        expected: u64,
+    ) -> Result<ManagedGraphs> {
+        self.detach_managed_checked(owner, graph, Some(expected))
+    }
+
+    /// One coherent view of the dataset's registry: its graphs and the owner settings
+    /// files it records, from a single load. `None` without a registry. A registry
+    /// that enabling an owner again repairs, such as one whose owner settings file does
+    /// not match its digest or one whose change did not complete, is returned as
+    /// `managed.json` records it, or empty at revision 0 when there is no such file,
+    /// with the settings files on disk and [`ManagedSnapshot::unavailable`] set. Such a
+    /// registry of a store without a directory, as an in-memory clone can inherit,
+    /// fails with `managed-unavailable`. Any other registry that cannot
+    /// be enforced fails with `managed-unavailable`.
+    pub fn managed_snapshot(&self) -> Result<Option<ManagedSnapshot>> {
+        let Some(state) = self.managed_state() else {
+            return Ok(None);
+        };
+        match &*state {
+            ManagedState::Installed(i) => Ok(Some(ManagedSnapshot {
+                graphs: i.graphs.clone(),
+                settings: i.settings.clone(),
+                unavailable: None,
+            })),
+            ManagedState::Unavailable {
+                reason,
+                repairable: true,
+            } => {
+                // What `managed.json` records, or no registry at all when a first
+                // enablement stopped before writing it: the same state that enabling
+                // the owner again starts from.
+                // A store without a directory, such as an in-memory clone of a
+                // dataset whose change did not complete, has no recorded registry to
+                // repair from, so it is not repaired from nothing.
+                let Some(root) = self.managed_root() else {
+                    return Err(rootless_repair(reason));
+                };
+                let recorded = recorded_entries(&root).map_err(|e| {
+                    ManagedError::error(
+                        ManagedErrorKind::Unavailable,
+                        format!("{reason}; {}: {e}", crate::managed::FILE),
+                    )
+                })?;
+                let (graphs, settings) = match recorded {
+                    Some(i) => (i.graphs, i.settings),
+                    None => (
+                        ManagedGraphs {
+                            revision: 0,
+                            owners: BTreeMap::new(),
+                        },
+                        BTreeMap::new(),
+                    ),
+                };
+                Ok(Some(ManagedSnapshot {
+                    graphs,
+                    settings,
+                    unavailable: Some(reason.clone()),
+                }))
+            }
+            ManagedState::Unavailable { reason, .. } => Err(ManagedError::error(
+                ManagedErrorKind::Unavailable,
+                reason.clone(),
+            )),
+        }
+    }
+
+    fn detach_managed_checked(
+        &self,
+        owner: OwnerKind,
+        graph: &str,
+        expected: Option<u64>,
+    ) -> Result<ManagedGraphs> {
         self.change_managed(|current| {
             let Some(current) = current else {
                 return Err(not_enabled(owner));
             };
+            if let Some(expected) = expected
+                && expected != current.graphs.revision
+            {
+                return Err(Error::Conflict(format!(
+                    "the managed-graph registry is at revision {}, not {expected}; read it again",
+                    current.graphs.revision
+                )));
+            }
             let mut graphs = current.graphs.clone();
             let Some(entry) = graphs.owners.get_mut(&owner) else {
                 return Err(not_enabled(owner));
@@ -233,6 +382,10 @@ impl Store {
             (None, Some(ManagedState::Unavailable { .. }), Some(root)) => {
                 repaired = recorded_entries(root)?;
                 repaired.as_ref()
+            }
+            // Repairing without the recorded files could drop protected graphs.
+            (None, Some(ManagedState::Unavailable { reason, .. }), None) => {
+                return Err(rootless_repair(reason));
             }
             (i, _, _) => i,
         };
@@ -524,6 +677,13 @@ fn recorded_entries(root: &Path) -> Result<Option<Installed>> {
         settings,
     )
     .map(Some)
+}
+
+fn rootless_repair(reason: &str) -> Error {
+    ManagedError::error(
+        ManagedErrorKind::Unavailable,
+        format!("{reason}; a store without a directory has no recorded registry to repair it from"),
+    )
 }
 
 fn not_enabled(owner: OwnerKind) -> Error {

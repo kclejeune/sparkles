@@ -92,6 +92,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/geo/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/geo/{ds}/rebuild", &["POST"]),
     ("/$/geo/convert", &["POST"]),
+    // evidence-profile settings (C25 §7)
+    ("/$/evidence/{ds}/settings", &["GET", "PUT"]),
+    ("/$/evidence/{ds}/detach", &["POST"]),
     ("/$/queries/{ds}", &["GET"]),
     // suggested examples (C18 §4.6): readers suggest, admins list and remove
     ("/$/queries/{ds}/suggestions", &["GET", "POST", "DELETE"]),
@@ -503,6 +506,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/text/{ds}/rebuild"
         | "/$/geo/{ds}"
         | "/$/geo/{ds}/rebuild"
+        // the settings name the protected graphs and review policies
+        | "/$/evidence/{ds}/settings"
+        | "/$/evidence/{ds}/detach"
         | "/$/vector/{ds}/{name}"
         | "/$/vector/{ds}/{name}/rebuild"
         | "/$/vector/{ds}/{name}/reembed"

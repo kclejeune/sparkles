@@ -30,8 +30,8 @@ pub use prepare::{
 };
 
 pub use settings::{
-    CanonicalSettings, MAX_SETTINGS_BYTES, MAX_SETTINGS_GRAPH_IRI_BYTES, MAX_SETTINGS_GRAPHS,
-    Settings,
+    CanonicalSettings, ConflictMode, MAX_POLICIES, MAX_POLICY_NAME_BYTES, MAX_POLICY_SCOPE,
+    MAX_SETTINGS_BYTES, MAX_SETTINGS_GRAPH_IRI_BYTES, MAX_SETTINGS_GRAPHS, Policy, Settings,
 };
 
 pub use structured::{

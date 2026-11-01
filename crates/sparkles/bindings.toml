@@ -426,6 +426,21 @@ python = "Dataset.update"
 jvm = "Jena UpdateAction.parseExecute / UpdateExec.dataset(ds)"
 node = "Dataset.update"
 
+["evidence.configure"]
+python = "planned: evidence settings in the bindings with the typed evidence operations"
+jvm = "planned: evidence settings in the bindings with the typed evidence operations"
+node = "planned: evidence settings in the bindings with the typed evidence operations"
+
+["evidence.detach"]
+python = "planned: evidence settings in the bindings with the typed evidence operations"
+jvm = "planned: evidence settings in the bindings with the typed evidence operations"
+node = "planned: evidence settings in the bindings with the typed evidence operations"
+
+["evidence.settings"]
+python = "planned: evidence settings in the bindings with the typed evidence operations"
+jvm = "planned: evidence settings in the bindings with the typed evidence operations"
+node = "planned: evidence settings in the bindings with the typed evidence operations"
+
 ["fmt.format"]
 python = "skip: formatter and linter remain CLI tools"
 jvm = "SparklesHelpers.format"

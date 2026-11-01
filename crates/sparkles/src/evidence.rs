@@ -88,3 +88,203 @@ const V1: Profile = Profile {
 pub fn profile(version: u32) -> Option<&'static Profile> {
     (version == V1.version).then_some(&V1)
 }
+
+// ------------------------------------------------------------ settings ------------
+
+pub use sparkles_core::evidence::{CanonicalSettings, ClaimKind, ConflictMode, Policy, Settings};
+
+use crate::managed::{OwnerEntry, OwnerKind};
+use crate::task::Control;
+use crate::{Dataset, Error, Result};
+
+/// A dataset's evidence settings and the protection they have now.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsStatus {
+    /// The recorded settings, or the disabled defaults when the profile was never
+    /// configured.
+    pub settings: Settings,
+    /// The SHA-256 digest of the recorded `evidence.json`, `None` when there is none.
+    pub digest: Option<String>,
+    /// The revision of the dataset's managed-graph registry, 0 when it has none.
+    pub revision: u64,
+    /// The graphs of the settings' roles that ordinary writes cannot change.
+    pub managed: Vec<String>,
+    /// The graphs of the settings' roles that an administrator has detached, which
+    /// ordinary writes can change until the settings are configured again.
+    pub detached: Vec<String>,
+}
+
+/// The evidence settings of `dataset`. Fails with `managed-unavailable` when the
+/// dataset's managed-graph registry cannot be enforced.
+pub fn settings(dataset: &Dataset) -> Result<SettingsStatus> {
+    let snapshot = dataset.store().managed_snapshot()?;
+    if let Some(reason) = snapshot.as_ref().and_then(|s| s.unavailable.as_ref()) {
+        return Err(unavailable(reason.clone()));
+    }
+    let bytes = snapshot
+        .as_ref()
+        .and_then(|s| s.settings.get(&OwnerKind::Evidence).cloned());
+    status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref())
+}
+
+fn unavailable(reason: String) -> Error {
+    crate::managed::ManagedError::error(crate::managed::ManagedErrorKind::Unavailable, reason)
+}
+
+/// The recorded settings `bytes`, which must be readable by this build.
+fn recorded(bytes: &[u8]) -> Result<Settings> {
+    Settings::from_slice(bytes, &Control::none()).map_err(|e| {
+        unavailable(format!(
+            "{} cannot be read by this build: {e}",
+            OwnerKind::Evidence.settings_file()
+        ))
+    })
+}
+
+/// The status of one registry, `graphs`, and the evidence settings `bytes` it records.
+fn status_from(
+    graphs: Option<&crate::managed::ManagedGraphs>,
+    bytes: Option<&[u8]>,
+) -> Result<SettingsStatus> {
+    let revision = graphs.map_or(0, |g| g.revision);
+    let Some(bytes) = bytes else {
+        return Ok(SettingsStatus {
+            settings: Settings::default(),
+            digest: None,
+            revision,
+            managed: Vec::new(),
+            detached: Vec::new(),
+        });
+    };
+    let protected: &[String] = graphs
+        .and_then(|g| g.owners.get(&OwnerKind::Evidence))
+        .map_or(&[], |e| &e.graphs);
+    let settings = recorded(bytes)?;
+    let (managed, detached) = if settings.enabled {
+        settings
+            .managed_graphs()
+            .into_iter()
+            .partition(|g| protected.contains(g))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok(SettingsStatus {
+        settings,
+        digest: Some(crate::managed::settings_digest(bytes)),
+        revision,
+        managed,
+        detached,
+    })
+}
+
+/// Decode complete evidence settings from JSON. A `format` or `profile` this build
+/// does not support refuses as `unsupported-profile` before the rest is interpreted.
+pub fn parse_settings(bytes: &[u8], control: &Control) -> Result<Settings> {
+    Settings::from_slice(bytes, control).map_err(unsupported_profile)
+}
+
+fn unsupported_profile(e: Error) -> Error {
+    match e {
+        Error::Unsupported(message) => crate::managed::ManagedError::error(
+            crate::managed::ManagedErrorKind::UnsupportedProfile,
+            message
+                .strip_prefix("unsupported-profile: ")
+                .unwrap_or(&message)
+                .to_string(),
+        ),
+        e => e,
+    }
+}
+
+/// Record `settings` as the evidence settings of `dataset` and protect the graphs of
+/// their roles. Enabled settings hand every graph of every role to the evidence owner,
+/// including graphs that an administrator detached earlier, and write the canonical
+/// settings to `evidence.json`. The first configuration raises the dataset reader to
+/// 6 durably.
+///
+/// Configuration never weakens protection. Settings that would leave a protected graph
+/// without a role, or disable the profile while it protects a graph, are refused with
+/// a conflict, and the graph must first be detached with [`detach`]. A disabled
+/// configuration of a dataset that was never configured is refused unless it equals
+/// the defaults, which then write nothing. A configuration that races with another
+/// change of the dataset's managed-graph registry is refused with a conflict and
+/// writes nothing. A registry whose `evidence.json` does not match the digest that
+/// `managed.json` records, as after a crash between the two files, is checked against
+/// the protection `managed.json` records and repaired by the configuration.
+///
+/// Placing a graph under management does not authenticate what it already holds.
+/// Typed evidence operations trust a record only through its verified publication.
+pub fn configure(
+    dataset: &Dataset,
+    settings: &Settings,
+    control: &Control,
+) -> Result<SettingsStatus> {
+    let store = dataset.store();
+    let canonical = settings.canonical(control).map_err(unsupported_profile)?;
+    // A registry whose settings file does not match, as after a crash between the
+    // settings file and `managed.json`, is checked against what `managed.json`
+    // records and repaired by this configuration.
+    let snapshot = store.managed_snapshot()?;
+    let revision = snapshot.as_ref().map_or(0, |s| s.graphs.revision);
+    let current = snapshot
+        .as_ref()
+        .and_then(|s| s.graphs.owners.get(&OwnerKind::Evidence));
+    let roles = if settings.enabled {
+        settings.managed_graphs()
+    } else {
+        Vec::new()
+    };
+    if let Some(current) = current
+        && let Some(graph) = current.graphs.iter().find(|g| !roles.contains(g))
+    {
+        return Err(Error::Conflict(format!(
+            "the evidence settings would stop protecting <{graph}>; detach it first"
+        )));
+    }
+    if current.is_none() && !settings.enabled {
+        let defaults = Settings::default().canonical(control)?;
+        if canonical.bytes() != defaults.bytes() {
+            return Err(Error::invalid(
+                "the evidence profile is not enabled; enable it before storing disabled settings",
+            ));
+        }
+        if let Some(reason) = snapshot.as_ref().and_then(|s| s.unavailable.as_ref()) {
+            return Err(unavailable(reason.clone()));
+        }
+        let bytes = snapshot
+            .as_ref()
+            .and_then(|s| s.settings.get(&OwnerKind::Evidence).cloned());
+        return status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref());
+    }
+    control.check()?;
+    let entry = OwnerEntry::for_settings(settings.profile, roles, canonical.bytes());
+    let graphs =
+        store.enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), revision)?;
+    status_from(Some(&graphs), Some(canonical.bytes()))
+}
+
+/// Stop protecting `graph`, a graph of the evidence settings' roles, so that ordinary
+/// writes can change it. The settings keep the graph in its roles, and it is protected
+/// again by the next [`configure`]. Records written to the graph while it is detached
+/// are not authenticated by protecting it again.
+pub fn detach(dataset: &Dataset, graph: &str) -> Result<SettingsStatus> {
+    let store = dataset.store();
+    let Some(snapshot) = store.managed_snapshot()? else {
+        return Err(crate::managed::ManagedError::error(
+            crate::managed::ManagedErrorKind::UnsupportedProfile,
+            "the evidence profile does not manage graphs in this dataset",
+        ));
+    };
+    if let Some(reason) = snapshot.unavailable {
+        return Err(unavailable(reason));
+    }
+    // The recorded settings must be readable before protection is removed, and the
+    // revision check keeps them the settings of the registry that is changed.
+    let bytes = snapshot.settings.get(&OwnerKind::Evidence).cloned();
+    if let Some(bytes) = &bytes {
+        recorded(bytes)?;
+    }
+    let graphs = store.detach_managed_at(OwnerKind::Evidence, graph, snapshot.graphs.revision)?;
+    status_from(Some(&graphs), bytes.as_deref())
+}

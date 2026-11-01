@@ -27,6 +27,7 @@ mod csv_cmd;
 mod dataset_cmd;
 mod describe_cmd;
 mod dump_cmd;
+mod evidence;
 #[cfg(feature = "mcp")]
 mod explain;
 mod exposure;

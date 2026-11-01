@@ -312,6 +312,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         );
     // the spatial index (`/$/geo`)
     let app = app.merge(crate::geo::routes());
+    // evidence-profile settings (`/$/evidence`)
+    let app = app.merge(crate::evidence::routes());
     // the GraphQL endpoint (`/{ds}/graphql`, `/$/graphql`)
     #[cfg(feature = "graphql")]
     let app = app.merge(graphql::routes());

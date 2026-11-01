@@ -2926,6 +2926,47 @@ fn assist(p: &mut Paths) {
     p.add(
         op(
             GET,
+            "/$/evidence/{ds}/settings",
+            "getEvidenceSettings",
+            "Datasets",
+            "Get the evidence settings",
+        )
+        .doc("Needs `admin` on the dataset. Answers the disabled defaults before the first configuration.")
+        .see("evidence-settings")
+        .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
+        .errors(&[503]),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/evidence/{ds}/settings",
+            "putEvidenceSettings",
+            "Datasets",
+            "Set the evidence settings",
+        )
+        .doc("Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, or that races with another change, is a `409` that writes nothing.")
+        .see("evidence-settings")
+        .json_body(true, "EvidenceSettings")
+        .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
+        .errors(&[400, 409, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/detach",
+            "detachEvidenceGraph",
+            "Datasets",
+            "Stop protecting an evidence graph",
+        )
+        .doc("Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again.")
+        .see("evidence-settings")
+        .json_body(true, "EvidenceDetach")
+        .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
+        .errors(&[400, 404, 409, 503]),
+    );
+    p.add(
+        op(
+            GET,
             "/$/memory/{ds}/inbox",
             "getMemoryInbox",
             "Datasets",

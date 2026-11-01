@@ -40,6 +40,18 @@ reaches them. `RuntimeStats` counts them as `internal_circuits`.
 defines N table views on every store before the writes. `commit:Q` and `graph:N` are
 refused until the server maintains views at commit and keeps graph views.
 
+Administrators record a dataset's evidence settings with `GET` and `PUT
+/$/evidence/{ds}/settings` and stop protecting one graph with `POST
+/$/evidence/{ds}/detach`. Rust applications use `sparkles::evidence::configure` and
+`sparkles::evidence::detach`. The settings add `decisions`, `supports`, `identity` and
+`projections` roles and named review `policies` to `sourceRecords` and `proposals`.
+Enabled settings make every role graph a managed graph of the evidence owner, so
+ordinary writes to it are refused, and a configuration never stops protecting a graph.
+`Store::enable_managed_at` and `Store::detach_managed_at` change the managed-graph
+registry only at an expected revision. `Store::managed_snapshot` returns the registry
+and its owners' settings from one load, and `Store::managed_settings` returns one
+owner's recorded settings.
+
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
 node in both shortest modes, run Dijkstra's algorithm from both ends. Weighted path
 searches add costs in double-double arithmetic everywhere, so paths whose weights have
@@ -792,6 +804,10 @@ refuses writes the same way. A newer `managed.json` therefore does not refuse th
 and a backup or clone of a registry with an unknown format or owner is refused. Branches share
 the registry without copying the file, and backups, restores and clones carry both
 files.
+
+`evidence.json` format 1 and profile 1 now hold all six roles and `policies`, written
+canonically with sorted sets and keys. A file that names only `sourceRecords` and
+`proposals` still reads, with the other roles empty. An unknown member is refused.
 
 `memory.json` is format 2 while it holds `scratchBranches`, and it stays format 1 without
 that member, so datasets that do not use the setting remain readable by older releases.

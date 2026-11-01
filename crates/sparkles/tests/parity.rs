@@ -417,6 +417,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 .vector()
                 .projection("v", &Default::default(), &Control::none());
         }),
+        op!("getEvidenceSettings", "evidence.settings", |ds| {
+            let _ = sparkles::evidence::settings(ds);
+        }),
+        op!("putEvidenceSettings", "evidence.configure", |ds| {
+            let _ = sparkles::evidence::configure(ds, &any(), &any());
+        }),
+        op!("detachEvidenceGraph", "evidence.detach", |ds| {
+            let _ = sparkles::evidence::detach(ds, &any::<String>());
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),
