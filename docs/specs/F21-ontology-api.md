@@ -644,6 +644,16 @@ adds the budget and the A7 measurement on LUBM.
 the restricted forms, and `assertions: false` restricts it to the terminology. The
 assertions stream from the store and are never held by the ontology.
 
+**Removal scope.** A removal edits the graphs the request names and the graph the
+edit names as its target. An axiom read only from an imported graph is refused with
+`invalid` until the edit names that graph, as §5.4 asks. A structure stays when a triple
+of the graphs read refers to it, and the main triple of a removed axiom goes even when
+its subject is an expression another axiom shares.
+
+**Nesting.** A read follows class expressions and data ranges 128 levels deep. A deeper
+structure stays unmapped with the error diagnostic `nesting`, so that a long chain of
+blank nodes cannot exhaust the stack.
+
 **Removal.** A removal deletes only the declarations it names. `remove_entity` names the
 entity's declarations, the axioms that mention it and the assertions about it, which
 answers open question 3 for punned IRIs by removing both uses.

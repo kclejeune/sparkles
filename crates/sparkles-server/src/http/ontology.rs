@@ -202,6 +202,12 @@ pub(super) async fn summary(
     let req = request_of(&params)?;
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     blocking(move || {
+        // one deadline for the read and everything after it
+        let opts = ds
+            .dataset
+            .ontology()
+            .anchored(&opts)
+            .map_err(ontology_error)?;
         let o = ds
             .dataset
             .ontology()
@@ -263,6 +269,12 @@ pub(super) async fn axioms(
     let offset = number("offset", 0, usize::MAX)?;
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     blocking(move || {
+        // one deadline for the read and everything after it
+        let opts = ds
+            .dataset
+            .ontology()
+            .anchored(&opts)
+            .map_err(ontology_error)?;
         let o = ds
             .dataset
             .ontology()
@@ -502,6 +514,12 @@ pub(super) async fn check(
     }
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     blocking(move || {
+        // one deadline for the read and everything after it
+        let opts = ds
+            .dataset
+            .ontology()
+            .anchored(&opts)
+            .map_err(ontology_error)?;
         let o = ds
             .dataset
             .ontology()

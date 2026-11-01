@@ -389,3 +389,315 @@ fn removes_an_entity() {
         .unwrap();
     assert_eq!(none.removed, 0);
 }
+
+// ---- review regressions ----------------------------------------------------------
+
+/// A caller from whom triples with predicate `p` are hidden.
+fn hiding(p: &str) -> QueryOptions {
+    use crate::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "hidden".into(),
+                        predicates: Some(vec![p.into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        ))),
+        ..Default::default()
+    }
+}
+
+fn assertion(p: &str, a: &str, b: &str) -> Axiom {
+    AxiomKind::ObjectPropertyAssertion(
+        sparkles_owl::ObjectPropertyExpression::Property(ObjectProperty::new(ex(p))),
+        Individual::named(ex(a)),
+        Individual::named(ex(b)),
+    )
+    .into()
+}
+
+#[test]
+fn hidden_assertions_are_neither_present_nor_written() {
+    let ds = dataset(BASE);
+    let caller = hiding(&ex("p"));
+    let req = OntologyRequest::default();
+    let edit = |ax: Axiom| {
+        ds.ontology().edit(
+            &req,
+            &EditRequest {
+                add: vec![ax],
+                ..Default::default()
+            },
+            &caller,
+        )
+    };
+    // the stored :a :p :b and an absent :a :p :c answer alike
+    let existing = edit(assertion("p", "a", "b"));
+    let absent = edit(assertion("p", "a", "c"));
+    assert!(existing.is_err(), "{existing:?}");
+    assert!(absent.is_err(), "{absent:?}");
+    assert_eq!(
+        std::mem::discriminant(&existing.unwrap_err()),
+        std::mem::discriminant(&absent.unwrap_err())
+    );
+}
+
+#[test]
+fn hidden_imports_are_not_followed() {
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{
+            GRAPH :open {{ :o a owl:Ontology ; owl:imports :other . :A a owl:Class . }}
+            GRAPH :other {{ :other a owl:Ontology . :B a owl:Class . :A rdfs:subClassOf :B . }}
+        }}"
+    ))
+    .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::Named(ex("open"))],
+        ..Default::default()
+    };
+    let o = ds
+        .ontology()
+        .open(&req, &hiding("http://www.w3.org/2002/07/owl#imports"))
+        .unwrap();
+    assert_eq!(o.graphs.len(), 1, "{:?}", o.graphs);
+    assert!(o.imports.is_empty(), "{:?}", o.imports);
+    assert!(
+        !o.ontology
+            .contains(&Axiom::sub_class_of(class("A"), class("B")))
+    );
+}
+
+#[test]
+fn unreadable_references_do_not_keep_structures() {
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{
+            GRAPH :open {{ :o a owl:Ontology . :A a owl:Class . :B a owl:Class .
+                :p a owl:ObjectProperty .
+                :A rdfs:subClassOf _:r . _:r a owl:Restriction ; owl:onProperty :p ;
+                    owl:someValuesFrom :B . }}
+            GRAPH :secret {{ :x :points _:r . }}
+        }}"
+    ))
+    .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::Named(ex("open"))],
+        ..Default::default()
+    };
+    let mut limited = opts();
+    limited.graphs = Some(only(&["http://ex.org/open"]));
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                remove: vec![some_ab()],
+                ..Default::default()
+            },
+            &limited,
+        )
+        .unwrap();
+    assert_eq!((e.removed, e.kept, e.deleted), (1, 0, 4), "{e:?}");
+}
+
+#[test]
+fn annotated_assertions_round_trip() {
+    let ds = dataset(BASE);
+    let req = OntologyRequest::default();
+    let note = sparkles_owl::Annotation::new(
+        sparkles_owl::AnnotationProperty::new(vocab::RDFS_COMMENT),
+        sparkles_owl::AnnotationValue::Literal(sparkles_owl::Literal(
+            oxrdf::Literal::new_simple_literal("seen"),
+        )),
+    );
+    let mut ca: Axiom = AxiomKind::ClassAssertion(class("B"), Individual::named(ex("c"))).into();
+    ca.annotations.insert(note.clone());
+    let mut pa = assertion("p", "c", "a");
+    pa.annotations.insert(note);
+    let start = total(&ds);
+    ds.ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                add: vec![ca.clone(), pa.clone()],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    let o = ds.ontology().open(&req, &opts()).unwrap();
+    assert!(o.ontology.contains(&ca), "{:?}", o.ontology.diagnostics);
+    assert!(o.ontology.contains(&pa));
+    let mut streamed = Vec::new();
+    o.assertions(&opts(), |ax, _, _| {
+        streamed.push(ax);
+        Ok(true)
+    })
+    .unwrap();
+    // the main triples of the annotated assertions are read with their annotations
+    assert_eq!(streamed.len(), 3, "{streamed:?}");
+    let before = total(&ds);
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                remove: vec![ca, pa],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!(e.removed, 2, "{e:?}");
+    assert_eq!(total(&ds), before - e.deleted as u64);
+    assert_eq!(total(&ds), start);
+}
+
+#[test]
+fn removes_the_main_triple_of_a_shared_subject() {
+    let ds = dataset(
+        ":o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+         _:x a owl:Class ; owl:intersectionOf ( :A :B ) ; rdfs:subClassOf :C .
+         :D rdfs:subClassOf _:x .",
+    );
+    let req = OntologyRequest::default();
+    let ab = ClassExpression::and([class("A"), class("B")]);
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                remove: vec![Axiom::sub_class_of(ab.clone(), class("C"))],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!(e.removed, 1);
+    let o = ds.ontology().open(&req, &opts()).unwrap();
+    assert!(
+        !o.ontology
+            .contains(&Axiom::sub_class_of(ab.clone(), class("C")))
+    );
+    assert!(o.ontology.contains(&Axiom::sub_class_of(class("D"), ab)));
+}
+
+#[test]
+fn removals_leave_imported_graphs_unless_named() {
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{
+            GRAPH :local {{ :o a owl:Ontology ; owl:imports :lib . :A a owl:Class . }}
+            GRAPH :lib {{ :lib a owl:Ontology . :B a owl:Class . :A rdfs:subClassOf :B . }}
+        }}"
+    ))
+    .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::Named(ex("local"))],
+        ..Default::default()
+    };
+    let ab = Axiom::sub_class_of(class("A"), class("B"));
+    let remove = |graph: Option<GraphRef>| {
+        ds.ontology().edit(
+            &req,
+            &EditRequest {
+                remove: vec![ab.clone()],
+                graph,
+                ..Default::default()
+            },
+            &opts(),
+        )
+    };
+    let r = remove(None);
+    assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    assert!(
+        ds.ontology()
+            .open(&req, &opts())
+            .unwrap()
+            .ontology
+            .contains(&ab)
+    );
+    let e = remove(Some(GraphRef::Named(ex("lib")))).unwrap();
+    assert_eq!(e.removed, 1);
+    assert!(
+        !ds.ontology()
+            .open(&req, &opts())
+            .unwrap()
+            .ontology
+            .contains(&ab)
+    );
+}
+
+#[test]
+fn n_ary_axioms_match_their_pairwise_triples() {
+    let ds = dataset(BASE);
+    let req = OntologyRequest::default();
+    let before = total(&ds);
+    let eq: Axiom =
+        AxiomKind::EquivalentClasses([class("A"), class("B"), class("C")].into_iter().collect())
+            .into();
+    let inv: Axiom = AxiomKind::ObjectPropertyAssertion(
+        sparkles_owl::ObjectPropertyExpression::InverseOf(ObjectProperty::new(ex("p"))),
+        Individual::named(ex("b")),
+        Individual::named(ex("a")),
+    )
+    .into();
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                add: vec![eq.clone(), inv.clone()],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    // `:a :p :b` is BASE's
+    assert_eq!((e.added, e.present), (1, 1), "{e:?}");
+    let e = ds
+        .ontology()
+        .edit(
+            &req,
+            &EditRequest {
+                remove: vec![eq],
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!((e.removed, e.absent.len()), (1, 0), "{e:?}");
+    assert_eq!(total(&ds), before);
+}
+
+#[test]
+fn a_stopped_stream_stops() {
+    let ds = dataset(BASE);
+    let o = ds
+        .ontology()
+        .open(&OntologyRequest::default(), &opts())
+        .unwrap();
+    let mut n = 0;
+    o.assertions(&opts(), |_, _, _| {
+        n += 1;
+        Ok(false)
+    })
+    .unwrap();
+    assert_eq!(n, 1);
+}

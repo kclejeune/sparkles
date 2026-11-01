@@ -57,7 +57,7 @@ use crate::history::{At, HistoryOptions};
 use crate::id::Id;
 use crate::index::Perm;
 use crate::sparql::QueryOptions;
-use crate::store::Snapshot;
+use crate::store::{Chunk, Snapshot};
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_owl::profiles::{CheckOptions, Checker, Profile, Report};
@@ -156,6 +156,9 @@ struct Inner {
     graph_ids: Vec<Option<Id>>,
     /// the predicates whose triples were read eagerly
     terminological: FxHashSet<Id>,
+    /// the main triples of reified axioms whose predicate is not terminological, read
+    /// eagerly with their `owl:Axiom` node and left out of the assertion stream
+    mains: FxHashSet<[Id; 4]>,
 }
 
 /// One kept ontology.
@@ -226,38 +229,47 @@ impl Opened {
         opts: &QueryOptions,
         mut f: impl FnMut(Option<Axiom>, &Triple, u32) -> Result<bool>,
     ) -> Result<()> {
+        let opts = &*crate::overview::one_deadline(opts)?;
         let snap = &self.snapshot;
         let rdf_type = snap.lookup_iri(vocab::RDF_TYPE);
         let mut n = 0usize;
+        let stopped = std::cell::Cell::new(false);
         for (g, id) in self.inner.graph_ids.iter().enumerate() {
             let Some(id) = id else { continue };
-            let mut stop = false;
-            let r = snap.for_each_quad_in(&[id.0], |q| {
-                if stop {
-                    return Ok(());
-                }
+            let mut each = |q: &[Id; 4]| -> Result<bool> {
                 n += 1;
                 if n.is_multiple_of(4096) {
                     check(opts)?;
                 }
-                if self.inner.terminological.contains(&q[1]) {
-                    return Ok(());
+                if self.inner.terminological.contains(&q[1]) || self.inner.mains.contains(q) {
+                    return Ok(true);
                 }
                 let Some(t) = triple_of(snap, q) else {
-                    return Ok(());
+                    return Ok(true);
                 };
                 // class assertions with a structural type or a class expression were read
                 if Some(q[1]) == rdf_type && read::is_terminological(&t, &|_| false) {
-                    return Ok(());
+                    return Ok(true);
                 }
                 let ax = self.ontology.map_assertion(&t);
-                if !f(ax, &t, g as u32)? {
-                    stop = true;
+                let more = f(ax, &t, g as u32)?;
+                stopped.set(!more);
+                Ok(more)
+            };
+            snap.scan(Perm::Gspo, &[id.0], |c| {
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            if !each(&Perm::Gspo.to_quad(&b.key(i)))? {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => return each(&Perm::Gspo.to_quad(&k)),
                 }
-                Ok(())
-            });
-            r?;
-            if stop {
+                Ok(true)
+            })?;
+            if stopped.get() {
                 break;
             }
         }
@@ -383,6 +395,14 @@ impl Ontologies {
         Ok((snap, opts))
     }
 
+    /// `opts` with the dataset's defaults and one deadline, anchored now: pass the
+    /// answer to every stage of one request (open, check, listing), so that a relative
+    /// timeout covers them all.
+    pub fn anchored(&self, opts: &QueryOptions) -> Result<QueryOptions> {
+        let defaults = self.ds.with_query_defaults(opts);
+        Ok(crate::overview::one_deadline(&defaults)?.into_owned())
+    }
+
     /// Open the ontology `req` names, as the caller of `opts` may read it.
     pub fn open(&self, req: &OntologyRequest, opts: &QueryOptions) -> Result<Opened> {
         req.validate()?;
@@ -430,7 +450,7 @@ impl Ontologies {
             imports: req.imports,
             location_mapping: Default::default(),
         };
-        let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &readable);
+        let resolved = sparkles_reasoner::inputs::resolve_readable(&view, &inputs, &readable);
         let graphs = resolved.graphs.clone();
         let requested = req.graphs().len();
         let graph_ids: Vec<Option<Id>> = graphs
@@ -438,6 +458,7 @@ impl Ontologies {
             .map(|g| g.id(&view).filter(|id| readable(*id)))
             .collect();
         let (ontology, inner) = read_store(&view, &graph_ids, requested, req.mode, opts)?;
+        check(opts)?;
         let ontology = Arc::new(ontology);
         let inner = Arc::new(inner);
         if keep && ontology.triples.len() <= CACHE_MAX_TRIPLES {
@@ -476,9 +497,8 @@ impl Ontologies {
         check: &CheckRequest,
         opts: &QueryOptions,
     ) -> Result<Vec<Report>> {
-        let o = self.open(req, opts)?;
-        let defaults = self.ds.with_query_defaults(opts);
-        let opts = crate::overview::one_deadline(&defaults)?.into_owned();
+        let opts = self.anchored(opts)?;
+        let o = self.open(req, &opts)?;
         check_opened(&o, check, &opts)
     }
 
@@ -492,26 +512,7 @@ impl Ontologies {
         iri: &str,
         opts: &QueryOptions,
     ) -> Result<EditOutcome> {
-        let o = self.open(req, opts)?;
-        let mut remove: Vec<Axiom> = o
-            .ontology
-            .axiom_set()
-            .filter(|a| a.mentions(iri))
-            .cloned()
-            .collect();
-        o.assertions(opts, |ax, _, _| {
-            if let Some(ax) = ax
-                && ax.mentions(iri)
-            {
-                remove.push(ax);
-            }
-            Ok(true)
-        })?;
-        let edit = EditRequest {
-            remove,
-            ..Default::default()
-        };
-        self.edit(req, &edit, opts)
+        self.edit_with(req, &EditRequest::default(), Some(iri), opts)
     }
 
     /// Add and remove axioms in one commit. The ontology is read from the head the
@@ -527,6 +528,18 @@ impl Ontologies {
         edit: &EditRequest,
         opts: &QueryOptions,
     ) -> Result<EditOutcome> {
+        self.edit_with(req, edit, None, opts)
+    }
+
+    /// [`edit`](Self::edit), also removing what mentions `entity`, selected from the
+    /// head under the writer lock.
+    fn edit_with(
+        &self,
+        req: &OntologyRequest,
+        edit: &EditRequest,
+        entity: Option<&str>,
+        opts: &QueryOptions,
+    ) -> Result<EditOutcome> {
         req.validate()?;
         if req.at.is_some() {
             return Err(Error::invalid(
@@ -536,8 +549,7 @@ impl Ontologies {
         for ax in edit.add.iter().chain(&edit.remove) {
             sparkles_owl::validate::axiom(ax).map_err(|e| Error::invalid(e.0))?;
         }
-        let defaults = self.ds.with_query_defaults(opts);
-        let opts = crate::overview::one_deadline(&defaults)?.into_owned();
+        let opts = self.anchored(opts)?;
         let store = self.ds.store();
         let mut wopts = opts.write.clone();
         if wopts.graphs.is_none() {
@@ -567,6 +579,36 @@ impl Ontologies {
             ))?,
         };
         let mut outcome = Plan::default();
+        // removals edit the graphs the request names and the target it names (§5.4):
+        // an axiom read from an imported graph is removed there only when the edit
+        // names that graph
+        let mut scope: BTreeSet<u32> = (0..o.requested.min(o.graphs.len()) as u32).collect();
+        if let Some(g) = &edit.graph
+            && let Some(n) = o.graphs.iter().position(|x| x == g)
+        {
+            scope.insert(n as u32);
+        }
+        let mut removal: Vec<Axiom> = edit.remove.clone();
+        if let Some(iri) = entity {
+            removal.extend(
+                o.ontology
+                    .axioms
+                    .iter()
+                    .filter(|(a, origins)| {
+                        a.mentions(iri) && origins.iter().any(|x| scope.contains(&x.graph))
+                    })
+                    .map(|(a, _)| a.clone()),
+            );
+            o.assertions(&opts, |ax, _, g| {
+                if let Some(ax) = ax
+                    && scope.contains(&g)
+                    && ax.mentions(iri)
+                {
+                    removal.push(ax);
+                }
+                Ok(true)
+            })?;
+        }
         // removals first: an axiom removed and added again keeps its triples
         let mut deleted: Vec<[Id; 4]> = Vec::new();
         let mut users: FxHashMap<usize, usize> = FxHashMap::default();
@@ -577,37 +619,65 @@ impl Ontologies {
                 }
             }
         }
-        let removing: BTreeSet<&Axiom> = edit.remove.iter().collect();
+        let removing: BTreeSet<&Axiom> = removal.iter().collect();
         let mut drop: BTreeSet<usize> = BTreeSet::new();
+        let mut mains: FxHashSet<usize> = FxHashSet::default();
+        let mut done: BTreeSet<Axiom> = BTreeSet::new();
         for ax in &removing {
-            match o.ontology.axioms.get(*ax) {
-                Some(origins) => {
-                    outcome.removed += 1;
-                    for origin in origins {
-                        for i in &origin.triples {
-                            let u = users.get_mut(i).expect("counted");
-                            *u -= 1;
-                            if *u == 0 {
-                                drop.insert(*i);
+            let mut found = false;
+            for form in ax.normal_forms() {
+                if !done.insert(form.clone()) {
+                    found = true;
+                    continue;
+                }
+                match o.ontology.axioms.get(&form) {
+                    Some(origins) => {
+                        let mut here = false;
+                        for origin in origins.iter().filter(|x| scope.contains(&x.graph)) {
+                            here = true;
+                            mains.extend(origin.main);
+                            for i in &origin.triples {
+                                let u = users.get_mut(i).expect("counted");
+                                *u -= 1;
+                                if *u == 0 {
+                                    drop.insert(*i);
+                                }
                             }
+                        }
+                        if !here {
+                            if entity.is_some() {
+                                continue;
+                            }
+                            let g = origins.first().map_or(0, |x| x.graph);
+                            return Err(Error::invalid(format!(
+                                "{} is read from the imported graph {}: name that graph as \
+                                 the edit's graph to remove it there",
+                                form,
+                                o.graph_name(g)
+                            )));
+                        }
+                        found = true;
+                    }
+                    None => {
+                        if let Some(qs) = assertion_quads(&o, &form, &txn, &scope)? {
+                            found = true;
+                            deleted.extend(qs);
                         }
                     }
                 }
-                None => match assertion_quads(&o, ax, &txn)? {
-                    Some(qs) => {
-                        outcome.removed += 1;
-                        deleted.extend(qs);
-                    }
-                    None => outcome.absent.push((*ax).clone()),
-                },
+            }
+            if found {
+                outcome.removed += 1;
+            } else {
+                outcome.absent.push((*ax).clone());
             }
         }
         // a dropped triple stays when a triple outside the dropped set still points at
-        // its blank node subject
+        // its blank node subject, unless it is the main triple of a removed axiom
         let kept_nodes = referenced_elsewhere(&o, &drop)?;
         for i in drop {
             let q = o.inner.quads[i];
-            if kept_nodes.contains(&q[0]) {
+            if kept_nodes.contains(&q[0]) && !mains.contains(&i) {
                 outcome.kept += 1;
                 continue;
             }
@@ -622,13 +692,22 @@ impl Ontologies {
         }
         // additions
         let declare = edit.declare.unwrap_or(true);
+        let all_graphs: BTreeSet<u32> = (0..o.graphs.len() as u32).collect();
         let mut adding: Vec<Axiom> = Vec::new();
         let mut seen: BTreeSet<&Axiom> = BTreeSet::new();
         for ax in &edit.add {
             if !seen.insert(ax) {
                 continue;
             }
-            let present = o.ontology.contains(ax) || assertion_quads(&o, ax, &txn)?.is_some();
+            let mut present = true;
+            for form in ax.normal_forms() {
+                if !(o.ontology.contains(&form)
+                    || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some())
+                {
+                    present = false;
+                    break;
+                }
+            }
             if present && !removing.contains(ax) {
                 outcome.present += 1;
                 continue;
@@ -749,6 +828,7 @@ fn assertion_quads(
     o: &Opened,
     ax: &Axiom,
     txn: &crate::store::WriteTxn<'_>,
+    graphs: &BTreeSet<u32>,
 ) -> Result<Option<Vec<[Id; 4]>>> {
     use sparkles_owl::AxiomKind as K;
     if !ax.annotations.is_empty() {
@@ -778,9 +858,15 @@ fn assertion_quads(
         if o.ontology.map_assertion(t).as_ref() != Some(ax) {
             continue;
         }
-        for g in o.inner.graph_ids.iter().flatten() {
+        for (n, g) in o.inner.graph_ids.iter().enumerate() {
+            let Some(g) = g else { continue };
+            if !graphs.contains(&(n as u32)) {
+                continue;
+            }
             let q = [s, p, obj, *g];
-            if txn.contains(&q)? {
+            // through the caller's view, so a protected triple is absent, and as this
+            // transaction leaves it
+            if snap.contains(&q)? && txn.contains(&q)? {
                 out.push(q);
             }
         }
@@ -815,11 +901,12 @@ fn referenced_elsewhere(o: &Opened, drop: &BTreeSet<usize>) -> Result<FxHashSet<
         }
     }
     let dropped: FxHashSet<[Id; 4]> = drop.iter().map(|i| o.inner.quads[*i]).collect();
+    let read: FxHashSet<Id> = o.inner.graph_ids.iter().flatten().copied().collect();
     let mut kept = FxHashSet::default();
     for n in &nodes {
         for k in snap.scan_keys(Perm::Osp, &[n.0])? {
             let q = Perm::Osp.to_quad(&k);
-            if !dropped.contains(&q) {
+            if read.contains(&q[3]) && !dropped.contains(&q) {
                 kept.insert(*n);
             }
         }
@@ -838,6 +925,7 @@ fn referenced_elsewhere(o: &Opened, drop: &BTreeSet<usize>) -> Result<FxHashSet<
 
 /// Check an open ontology.
 pub fn check_opened(o: &Opened, req: &CheckRequest, opts: &QueryOptions) -> Result<Vec<Report>> {
+    let opts = &*crate::overview::one_deadline(opts)?;
     let copts = CheckOptions {
         max_violations: req.max_violations,
     };
@@ -881,6 +969,7 @@ fn read_store(
         graphs: &graph_of_id,
         quads: Vec::new(),
         seen: FxHashSet::default(),
+        opts,
     };
     let mut terminological: FxHashSet<Id> = FxHashSet::default();
     let predicates = vocab::STRUCTURAL_PREDICATES
@@ -929,6 +1018,43 @@ fn read_store(
             c.prefix(&[rdf_type.0, b.0])?;
         }
     }
+    // the main triples of reified axioms whose predicate was not read: an annotated
+    // assertion keeps its main triple outside the terminology's predicates
+    let mut mains: FxHashSet<[Id; 4]> = FxHashSet::default();
+    let ids = |p: &str| snap.lookup_iri(p);
+    if let (Some(src), Some(prop), Some(tgt)) = (
+        ids(vocab::OWL_ANNOTATED_SOURCE),
+        ids(vocab::OWL_ANNOTATED_PROPERTY),
+        ids(vocab::OWL_ANNOTATED_TARGET),
+    ) {
+        let mut parts: FxHashMap<(Id, Id), [Option<Id>; 3]> = FxHashMap::default();
+        for q in &c.quads {
+            let slot = if q[1] == src {
+                0
+            } else if q[1] == prop {
+                1
+            } else if q[1] == tgt {
+                2
+            } else {
+                continue;
+            };
+            parts.entry((q[0], q[3])).or_default()[slot] = Some(q[2]);
+        }
+        let graphs: Vec<Id> = graph_of_id.keys().copied().collect();
+        for (_, part) in parts {
+            let [Some(s), Some(p), Some(o)] = part else {
+                continue;
+            };
+            check(opts)?;
+            for g in &graphs {
+                let q = [s, p, o, *g];
+                if !terminological.contains(&p) && snap.contains(&q)? && c.seen.insert(q) {
+                    c.quads.push(q);
+                    mains.insert(q);
+                }
+            }
+        }
+    }
     let quads = c.quads;
     finish(
         snap,
@@ -937,7 +1063,7 @@ fn read_store(
         graph_ids.len(),
         requested,
         mode,
-        terminological,
+        (terminological, mains),
     )
 }
 
@@ -947,17 +1073,34 @@ struct Collect<'a> {
     graphs: &'a FxHashMap<Id, u32>,
     quads: Vec<[Id; 4]>,
     seen: FxHashSet<[Id; 4]>,
+    opts: &'a QueryOptions,
 }
 
 impl Collect<'_> {
     fn prefix(&mut self, prefix: &[u64]) -> Result<()> {
-        for k in self.snap.scan_keys(Perm::Pos, prefix)? {
-            let q = Perm::Pos.to_quad(&k);
-            if self.graphs.contains_key(&q[3]) && self.seen.insert(q) {
-                self.quads.push(q);
+        let mut n = 0usize;
+        let (graphs, seen, quads, opts) = (self.graphs, &mut self.seen, &mut self.quads, self.opts);
+        let mut each = |q: [Id; 4]| -> Result<()> {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                check(opts)?;
             }
-        }
-        Ok(())
+            if graphs.contains_key(&q[3]) && seen.insert(q) {
+                quads.push(q);
+            }
+            Ok(())
+        };
+        self.snap.scan(Perm::Pos, prefix, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        each(Perm::Pos.to_quad(&b.key(i)))?;
+                    }
+                }
+                Chunk::Row(k) => each(Perm::Pos.to_quad(&k))?,
+            }
+            Ok(true)
+        })
     }
 }
 
@@ -968,7 +1111,7 @@ fn finish(
     graphs: usize,
     requested: usize,
     mode: Mode,
-    terminological: FxHashSet<Id>,
+    (terminological, mains): (FxHashSet<Id>, FxHashSet<[Id; 4]>),
 ) -> Result<(read::Ontology, Inner)> {
     let mut triples = Vec::with_capacity(quads.len());
     let mut graph_of = Vec::with_capacity(quads.len());
@@ -1004,6 +1147,7 @@ fn finish(
             quads: kept,
             graph_ids,
             terminological,
+            mains,
         },
     ))
 }

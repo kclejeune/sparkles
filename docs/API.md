@@ -1872,8 +1872,9 @@ the terminology alone, which is faster on a large data graph.
 one commit. A removed axiom takes its triples with it, including the blank nodes of its
 class expressions and lists, except those another axiom or triple still uses. Removing an
 axiom that the ontology does not hold is not an error, and the answer lists it under
-`absent`. An added axiom goes to the graph `target` names, the first graph read by
-default. The edit also declares the entities the added axioms use that the ontology does
+`absent`. A removal edits the graphs `graph` names and the graph `target` names. An
+axiom read only from an imported graph is `400` until `target` names that graph. An
+added axiom goes to the graph `target` names, the first graph read by default. The edit also declares the entities the added axioms use that the ontology does
 not declare, unless `declare` is false. Named individuals are not declared. The answer
 counts the axioms added, already present and removed, and the triples inserted, deleted
 and kept. The route takes the parameters of the other writes, such as `dryRun` and
