@@ -208,6 +208,7 @@ check them against the W3C suites and Jena's own answers.
 ### Incremental views and live queries
 
 * Incremental views and live queries ([API.md](../API.md#incremental-views), spec [F13](../specs/F13-incremental-views-and-provenance.md) Phase 1). A `table` view keeps a SELECT or CONSTRUCT query's result current after every commit, through a circuit of Z-set operators compiled from the query that joins each commit's net changes against the store's own indexes. Basic graph patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS`, `VALUES`, `DISTINCT`, subqueries and `GROUP BY` with `COUNT`, `SUM` and `AVG` are maintained, and other operators are evaluated again as `recompute` nodes. A commit that misses a view's patterns skips it. Queries read a view with `SERVICE view:read`, and `GET /{ds}/live` streams a query's result and then its changes as server-sent events, resuming after a commit with `Last-Event-ID`. Views and live queries with the same query and access share one circuit. On a dataset with RDFS on read or materialized inferences in the default graph, a view or live query evaluates its whole query again with them at each commit that touches it, so it answers as the one-off query does, and the view's state reports `evaluation: recompute`. Turning either setting on or off switches existing views and live queries between the two modes without detaching them. View state is checkpointed and recovered from the change log, views read as their principal, and `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live` and Python's `Dataset.views` and `Dataset.live` expose them.
+* Internal circuits ([F13 §3.6](../specs/F13-incremental-views-and-provenance.md#internal-circuits)). Server code, or an embedding application through `Dataset::attach_internal`, can attach a circuit that no user defined. It keeps a query's rows, or counts the changed facts per key in each commit, so that a fact added and removed later counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the change feed lists them. The counts after any commit they cover are exact, and a commit whose changes are not known is reported as unknown. An internal circuit has no definition file, no entry in the list of views, no rows in `SERVICE view:read` and no route, binding or MCP tool, and it is checkpointed under `circuits/` and recovered from the change log like a view.
 
 
 ## Command line
@@ -334,6 +335,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   item 222.
 * View passes run on one thread per dataset, and the live query limits count per
   dataset. Roadmap items 223 and 224.
+* GraphRAG's automatic refresh still counts changed facts from the change feed rather
+  than from an internal circuit. Roadmap item 12.
 * Views and live queries never read the graphs that a disclosure guard protects. Roadmap
   item 227.
 

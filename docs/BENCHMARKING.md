@@ -874,6 +874,14 @@ full-text, spatial or embedding index on each store after loading it, and with `
 servers run with `--no-embedding`, so nothing leaves the instance. Each run's
 `metrics-<run>.txt` also records the server's peak resident memory.
 
+`--views async:N` defines N table views on each store after loading it, with
+`sparkles views put`, before any server starts. Each view selects the writers' literal
+predicate with its own filter, so each has a circuit of its own and every commit that
+writes a literal touches all of them. Write-path items of
+F13 compare `--views none` with `async:N` to measure what views add to a commit.
+`commit:Q` and `graph:N` are reserved for commit-time and graph views and are refused
+until the server has them.
+
 The instances synchronize in about 0.2 ms, which hides the cost of a slow device.
 `delay-us=4000` adds 4 ms to every synchronization and write-through write, which
 brings the ordinary writer down to the 230 transactions/s it reached on forge. Reader tails do not settle on

@@ -869,8 +869,9 @@ capabilities and remaining work are described by the spec status and Outcome.
 ## Outcome
 
 **Phase 1 delivered on 2026-10-24.** Item 413, the load-time checks and the split of the
-runtime into modules, was delivered on 2026-10-31. Phases 2 and 3 are not built, and
-[ROADMAP](../ROADMAP.md) item 17 tracks them as items 414 to 429.
+runtime into modules, was delivered on 2026-10-31, and so were the internal circuits of
+item 414, which [Internal circuits](#internal-circuits) records. The rest of Phases 2 and
+3 is not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 415 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
@@ -1090,6 +1091,109 @@ from about 0.24 to 1.55 ms. Tracing affects absolute latency, so this locates th
 without measuring a cost of the inference change. Item 265 tracks obtaining a comparison
 with matched durable-write latency.
 
+
+### Internal circuits
+
+Item 414 delivers §3.6. Server code attaches a circuit with `Runtime::attach_internal`,
+or `Dataset::attach_internal` in the library, from an `InternalSpec` and an
+`InternalAccess`, and holds the `InternalCircuit` handle it gets back. The circuit is
+maintained while a handle lives and is collected, after a final checkpoint, on the round
+after the last handle is dropped. `incr/internal.rs` holds the types and the
+accumulator's counts, and `incr/runtime/internal.rs` attaches, advances and checkpoints
+the circuits.
+
+- An `InternalSpec` names the circuit with an `id` that keeps its checkpoints, a query
+  with full IRIs, a sink and a memory budget of 256 MiB by default. The sink is `Rows`,
+  which `rows()` reads, or `Accumulator` with key columns. The spec is non-exhaustive, so
+  that the provenance setting of item 415 and the fixed-point state of item 417 can join
+  it without breaking server code.
+- An accumulator's query is a SELECT without grouping whose result has the key columns
+  and at least one other column, the changed fact's identity. A grouped query is refused,
+  because its rows hold net weights and lose the churn. `counts(after)` returns the total
+  per key of the commits after `after` up to the circuit's commit, and
+  `discard_through(commit)` drops the counts that server code has acted on. The counts
+  are kept per commit and key, so a read is exact for any `after` from the commit the
+  counts start after, which is the commit of the first build or of the last discard.
+  A read that reaches further back, or that spans a commit whose changes were not
+  known, names the reason in `unknown`, and C22's refresh then falls back as it does
+  for a commit the feed lists with counts only.
+- `InternalAccess::everything()` reads every quad, including the graphs that a
+  disclosure guard protects, and `InternalAccess::reading(access)` reads what a
+  `GraphAccess` that server code resolved lets it read. The type has no default, no
+  serialization and no conversion from anything a caller supplies. The access is fixed
+  when the circuit attaches, and server code attaches again to follow a policy reload.
+- Internal circuits live in a map of their own in the registry and never share a
+  circuit with a view or live query, even one with the same query and access. They
+  have no `view.json`, no entry in `GET /$/views/{ds}`, no rows in `SERVICE view:read`
+  and no view label in the metrics, and listing, reading, rebuilding or deleting a view
+  of the same name reaches only that view. `RuntimeStats` counts them separately as
+  `internal_circuits`. They read the stored quads as the change feed lists them, and
+  the dataset's inference does not apply to them.
+- An internal circuit's state over its budget fails the circuit with `over-budget`. An
+  accumulator's counts that pass the rest of the budget drop the oldest commits' counts
+  first, which moves the commit the counts start after.
+- Checkpoints are `circuits/{id}/main/state-{commit}.bin`
+  (`formats::INTERNAL_CIRCUIT_STATE`, version 1), with the view checkpoint's header under
+  the magic `SPKCIRC\0`. The body holds the circuit's state as a view checkpoint does,
+  then the accumulator's starting commit, unknown ranges, keys as vocabulary keys and
+  counts. They are written with the views' checkpoints and when a circuit is collected.
+  The fingerprint covers the compiler version, the id, the normalized query, the access
+  and the sink, so a changed spec builds the circuit again. A file of another format is
+  left in place and the circuit is built from the data, which a test checks.
+
+**Ordering against commits.** Internal circuits never run inside a commit, so they add
+nothing to a commit's latency and do not stop group commit. The argument that an
+accumulator counts every commit exactly once has six steps.
+
+1. A commit puts its changes in the ring of recent changes before it publishes its
+   snapshot, so a worker that the publication wakes lists them. The ring is filled while
+   any circuit is attached, internal ones included.
+2. The worker advances an accumulator's circuit from its commit `c` to the head `h` one
+   commit at a time. `DeltaSet::steps` lists commits `c+1` to `h` in order with each
+   commit's own net changes, and builds each commit's snapshot from the head's by
+   reversing the later commits' changes with `Snapshot::before_changes`. Commit `k` is
+   applied against the snapshots of `k−1` and `k`, and its counts are added before
+   commit `k+1` is read, so a later change cannot cancel them. Changes within one
+   commit are net, as the feed lists them, and an addition with a removal of the same
+   fact in one commit counts nothing in either counter.
+3. The circuit's commit and its counts change together under the circuit's state lock,
+   which readers also take. A read therefore sees every commit up to the circuit's
+   commit counted and no later one.
+4. A checkpoint holds the circuit's state and the counts at one commit `c`, written
+   under the lock, synced, and renamed into place. An attach takes the state lock before
+   the registry lists the circuit, so a round never builds it ahead of its recovery. The
+   attach loads the newest checkpoint, and the next round counts commits `c+1` to the
+   head from the ring or the change feed. Each commit is counted by the checkpoint or by
+   the replay, never both. A crash before a rename leaves the older checkpoint, and the
+   replay starts after its commit.
+5. When the ring and the change log cannot list a commit after `c`, when a run lists
+   more than 1,000,000 changes, or when a generation switch interrupts the listing, the
+   circuit is evaluated again at the head and the range is recorded as unknown. A read
+   that spans it says so instead of returning a low count.
+6. A discard lives in memory until the next checkpoint. A crash before it brings back
+   counts of commits that server code has already acted on, and a read after the
+   discarded commit leaves them out, so the counts it asks for stay exact.
+
+**Tests.** `incr/internal_tests.rs` compares the accumulator with a counter over the
+change feed for churn across commits, a replacement within one commit, deletions, a
+commit that adds and removes the same fact, and members who join and leave a team. Each
+workload runs with a round after every commit and with one round for the whole run, and
+the counts after every commit of the run are checked. A key that comes from a join is
+checked against evaluations of the query at every commit. Further tests cover discards,
+the rows sink, refused specs, restarts with the change log and without it, a checkpoint
+of an unknown format, and crashes after a commit, after a pass, before a checkpoint's
+rename and after a generation switch. The access test checks that no listing, read,
+rebuild, removal, backup capture or metric reaches an internal circuit, that a view and
+a live query of the same question have a circuit of their own, and that what callers do
+to views leaves the counts exact. In the server, `graphrag/refresh.rs` checks the
+accumulator against the counter that C22's refresh reads today for every community,
+and `router_tests/views.rs` checks the routes, `SERVICE view:read` and the metrics, and
+that no module under `http`, `mcp` or `auth` names `InternalAccess`.
+
+**Write benchmarks.** `scripts/nsc-writes.sh --views none|async:N|commit:Q|graph:N`
+defines views on every store before the writes. `async:N` defines N table views over the
+writers' literal predicate, each its own circuit. `commit:Q` and `graph:N` are refused
+until items 421 and 420 add commit-time maintenance and graph views.
 
 ### Maintained assessments and conservative dependencies
 

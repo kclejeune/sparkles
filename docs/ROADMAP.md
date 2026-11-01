@@ -105,8 +105,8 @@ Wave A holds the work that most improves the engine against objective measures.
   building, rank fusion and the commit publish tail.
 * The reasoning quick fixes of item 456 are items 485 to 487. They add closure operators,
   the missing OWL 2 RL rules and cost-based rule-body planning.
-* The remaining Stage A parts of item 17 are items 414 to 417. They deliver internal
-  circuits, the provenance algebra, reasoner witnesses and the fixed-point operator.
+* The remaining Stage A parts of item 17 are items 415 to 417. They deliver the
+  provenance algebra, reasoner witnesses and the fixed-point operator.
 * Small items that finish a capability run in free capacity, such as item 77.
 
 ### Wave A2: engine rewrites
@@ -121,8 +121,8 @@ query under 0.3 ms may be slower on an Intel host.
 ### Wave B: memory and entities
 
 Wave B starts with item 81 Phase 3, then items 341, 396 and 435 and the remaining C18
-work. Item 18 Phase 3 and item 12 follow once the item 17 parts they need have landed.
-Item 12 needs item 414, and item 18 Phase 3 needs items 415 and 416. The cheap agent
+work. Item 12 can move its refresh onto an internal circuit now, and item 18 Phase 3
+follows once items 415 and 416 have landed. The cheap agent
 tools of item 462 also belong to Wave B. They are the `ask` MCP tool in item 488, MCP tool
 profiles in item 489 and a hybrid search tool that embeds query text in item 490.
 
@@ -234,7 +234,7 @@ not to every extension in a spec or to phases that have already shipped.
 | Track | Open items | Specs |
 |---|---|---|
 | **Performance** | 1 refreshes the evidence while 7 and 4 address their remaining gates. 501 removes the last device flush of an annotated fence, and 502 measures write-through fences in the drive's fast state. Write-path work goes before item 421. | X06, X08 Phase 2, X09 Phase 4, X07 |
-| **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh waits for 414. | F14, C22, F13 |
+| **Graph features** | 8 closes algorithm surfaces and acceptance. Item 12's view-based refresh can use the internal circuits of F13. | F14, C22, F13 |
 | **Reasoning** | 9 and 19 complete their remaining scale and query-time phases. Item 18 Phase 3 waits for 415 and 416, and item 19 Phase 3 waits for 415 and 417, while existing explanations remain available. Item 456 completes OWL 2 RL and rebuilds the reasoner core, starting with items 485 to 487. | F16, F17, F13, F18, F23 |
 | **Engine architecture** | 453 unifies the executors behind the gates of 469 to 473, starting with items 474 to 484. Item 454 follows the executor merge, and 455 follows 4 and 14. | X14, X15, X16, X17, X05 |
 | **Ontology and data platform** | 71 is the root of the ontology workbench 457. Items 458 to 461 add the resource catalog, checks and protected merges, git sync and linked-data publishing once the policy plumbing of 480 to 483 has landed. | F21, F24, U12, C30, X18, C31, F25, C32 |
@@ -290,7 +290,6 @@ flowchart LR
     J["339 · Durable jobs and delivery"] --> A
     L2["415 · Provenance algebra"] --> L3["416 · Reasoner witnesses"]
     L2 --> L4["417 · Fixed-point operator"]
-    L1["414 · Internal circuits"] --> R["12 · View-based report refresh"]
     L2 --> V["18 · F18 Phase 3 supported visibility"]
     L3 --> V
     E --> V
@@ -304,8 +303,8 @@ flowchart LR
     D --> S["66 · Synchronous replication and fenced failover"]
 ```
 
-Item 226 goes with item 414, because the change ring is copied for every commit once an
-internal circuit consumes it. Item 223 comes before item 427, and item 222 comes before
+Item 226 comes before item 12 moves its refresh onto an internal circuit, because every
+commit copies its changes into the change ring while an internal circuit is attached. Item 223 comes before item 427, and item 222 comes before
 items 424 and 426. The other item 17 parts in Stage B and Stage C are listed in the
 [table of its parts](#parts-of-item-17).
 
@@ -354,7 +353,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F09](specs/F09-branches-and-merges.md#outcome) | 45 | Finish relink from the remote CLI and remote/archive cloning. Compare relink identities and clone contents with offline operations, including chosen commits, lineage, cancellation and corrupt-transfer refusal. |
 | [F10](specs/F10-replication.md#outcome) | 74, 280, 66 | Settle the replication contract before implementing replicas, bootstrap, archives, promotion, synchronous acknowledgement and fenced failover. Test exact primary identities, stream gaps, restart and declared data-loss guarantees, and separately complete multi-transaction patch and blank-node semantics. |
 | [F11](specs/F11-encryption-at-rest.md#outcome) | 61, 65, 58, 59 | Finish key workflows and recovery, Phase 2 chunking and write-only age-recipient repositories, then live-file and derived-index encryption. Pass the remaining phase acceptance for provider outages, read-authority separation, rotation, locked states and format compatibility. Standard builds include repository encryption with protected keys on Linux and macOS; later phases remain open. |
-| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 414–430, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
+| [F13](specs/F13-incremental-views-and-provenance.md#outcome) | 17, 415–430, 221, 222, 223, 224, 225, 226, 227, 265 | Complete graph and branch views, commit-time maintenance, transports, provenance and recursion, plus the named access, worker, guard and server-limit gaps. Differential, crash and subscriber/load tests must cover inferred data and measured commit costs. |
 | [F14](specs/F14-graph-algorithms.md#outcome) | 8 | Finish Graphalytics acceptance, completion, background progress and the remaining algorithm surfaces. The C23 writer is item 36 and openCypher procedures are item 20, and each belongs to its own capability. Items 79 and 80 extend weighted betweenness as optional work, and the exact refusal boundaries stand until a broader domain is defined and independently validated. |
 | [F16](specs/F16-materialization-at-scale.md#outcome) | 9, 113 | Deliver the separate derived layer, canonical equality representatives and the remaining barrier-free and incremental-equality execution. Re-run the scale, differential, datatype and kept-closure memory gates, and settle the named small-change costs with matched measurements. |
 | [F17](specs/F17-query-time-reasoning.md#outcome) | 19, 190, 192, 193 | Finish automatic cost selection, hybrid rules, OWL 2 QL, settings and client surfaces, then F13-maintained tables and provenance. Close Phase 1's cache accounting, DESCRIBE and per-query costs with demand/materialization equivalence tests. |
@@ -440,7 +439,7 @@ continues within its caller-visible evidence and measured-latency scope.
 | 8 | **Graph-algorithm library.** Algorithms and graph lenses are available. The full Graphalytics harness, algorithm-name completion, richer background progress and the remaining binding and JVM surfaces for the existing algorithms remain. New algorithms belong to item 463. The C23 writer is item 36 and openCypher procedures are item 20. JVM statistics inside a transaction use a binding copy of the library's statistics code, while Node.js and Python statistics read only the head, so a library method that takes the snapshot should give the bindings one implementation. | [F14](specs/F14-graph-algorithms.md#outcome) | S–M | High |
 | 9 | **Materialization at scale.** Phase 1 materialization is available. The separate derived-fact layer of Phase 2, `owl:sameAs` representatives of Phase 3 and eligible execution without iteration barriers and equality maintenance in Phase 4 remain. Representatives would also let derivation on demand read equality without the `eq-rep-*` rules. Today a demand on a small view where `owl:sameAs` relates classes and properties can take much longer than materializing the whole view. | [F16](specs/F16-materialization-at-scale.md), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
 | 456 | **Reasoning engine.** OWL 2 RL is incomplete, transitive relations run through generic rules, rule planning is greedy, and the reasoner's maintenance is separate from the incremental core of F13. Items 485 to 487 add closure operators, the missing rules and cost-based rule-body planning first. A columnar derived tier, compact provenance, a native n-ary Datalog core, SHACL-AF and translated SWRL, SPIN and N3 follow, and the shared maintenance core comes after item 417's LUBM measurements. | [F23](specs/F23-reasoner-core/README.md) | XL | High |
-| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit remains planned and waits for item 414. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
+| 12 | **GraphRAG community summaries.** Community reports, global answering and change-feed refresh are available. Counting changes with an accumulator on an internal F13 circuit, which F13 provides, remains planned. Item 226 measures the change ring's cost first. | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 14 | **Compaction and operation progress.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain. Shared controlled load and compaction progress must also reach the Node callbacks without weakening cancellation or memory budgets. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#operation-progress) | M | Medium–high |
 | 15 | **Ingestion of images and audio.** The remaining follow-ups are recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 113 | **Small changes and undos over a kept closure.** Changes of 100 triples at 16 threads and undos at 1 thread remain slower than before the F16 follow-up, and a profile of the full run should find or rule out a cost of about 5%. The options are an opt-in in-memory index of the input facts, charged to the memory budget, and per-thread counters in the block cache. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | M | Low |
@@ -450,16 +449,15 @@ continues within its caller-visible evidence and measured-latency scope.
 ### Parts of item 17
 
 Stage A makes the incremental core safe and supplies what items 12, 18 and 19 need.
-Items 12, 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 12 needs
-item 414, item 18 Phase 3 needs items 415 and 416, and item 19 Phase 3 needs
-items 415 and 417. Stage B delivers the rest of Phase 2. Stage C delivers view
+Items 12, 18 Phase 3 and 19 Phase 3 do not need all of Phase 2 and Phase 3. Item 18
+Phase 3 needs items 415 and 416, and item 19 Phase 3 needs items 415 and 417. Item 12
+uses the internal circuits that are already available. Stage B delivers the rest of Phase 2. Stage C delivers view
 provenance. The F13 spec records the design decisions that the parts follow. Items that
 affect the write path measure with the `--views none|async:N|commit:Q|graph:N` option of
-`scripts/nsc-writes.sh` that item 414 adds.
+`scripts/nsc-writes.sh`.
 
 | # | Item | Spec | Size | Depends on |
 |---|---|---|---|---|
-| 414 | **Internal circuits.** Let the server attach circuits that no user defined, with an accumulator sink and a server-only `InternalAccess`. The accumulator keeps each changed fact's identity to the sink, which sums the absolute weight per key and fact and then per key, so an addition followed by a removal counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the existing feed-based counter does. Item 12 counts per-community changes with one. Tests cover churn across commits, a same-commit replacement and deletion-only workloads against that counter. Item 226 goes with this item, and this item adds the `--views none\|async:N\|commit:Q\|graph:N` option to `scripts/nsc-writes.sh` so that write-path gates can measure views. | [F13](specs/F13-incremental-views-and-provenance.md#36-internal-circuits), [C22](specs/C22-graph-rag-community-summaries.md#5-refresh) | S–M | None |
 | 415 | **Provenance algebra.** Add the `count`, `lineage` and `why` annotations with a 128-bit `FactKey` over vocabulary keys and bounded witness sets. | [F13](specs/F13-incremental-views-and-provenance.md#5-provenance) | S–M | None |
 | 416 | **Reasoner witnesses.** Record witnesses in the reasoner with F13's algebra, off unless a protection needs supported visibility, and define how witness sets converge under truncation. | [F18](specs/F18-explanations-and-entailment-diffs.md#71-protections) | M | 415 |
 | 417 | **Fixed-point operator.** Host one fixed-point interface in F13 with a reasoner plug-in, maintain property paths with `+` and `*` through backward and forward rederivation, and add `VIEW_STATE` format 2 for its state. | [F13](specs/F13-incremental-views-and-provenance.md#43-added-in-phase-3), [F17](specs/F17-query-time-reasoning.md#63-kept-current-phase-3) | M | 415 |
@@ -622,7 +620,7 @@ spec sections.
 | 223 | **Parallel view passes.** Each dataset runs its view passes on one worker thread, which falls behind a fast writer with 100 views. `--view-threads`, a shared worker pool and joins whose large deltas split across threads are not built. Item 223 comes before item 427. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
 | 430 | **Streaming view reads.** `ViewRows` and the snapshot events of live queries decode the whole result before they return it. Stream the rows in bounded chunks, so that reading a large view or opening a large live query does not hold the whole result in memory. | [F13](specs/F13-incremental-views-and-provenance.md#22-reading-a-view), [X05](specs/X05-streaming-query-execution.md#outcome) | M |
 | 225 | **The F13 benchmarks.** The SNB update streams with live short reads and views, BSBM's mix with views and the fan-out test of 1,000 subscribers are not built. A grouped COUNT's pass is only 15 to 35 times cheaper than the query on synthetic data, short of the 100 times target. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
-| 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a two-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. Item 226 goes with item 414. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
+| 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a two-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. An internal circuit keeps the ring filled on every commit, so item 226 comes before item 12 attaches one to every dataset with automatic refresh. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
 | 240 | **Buffered output of streamed answers.** The cursor writers of streamed SELECT and graph answers still write a few bytes at a time through the response writer and are compiled with the server. Give them the engine-side buffer that eager answers use, with the same count of the rows the client received. | [Benchmarking](BENCHMARKING.md#release-build-settings) | S |
 | 241 | **Front coding on three warm DBpedia queries.** Since item 108, `pat-film-predicates` and `pat-film-predicate-list` take about 4% longer with front coding and `top-linked` 1.4% longer, in all 16 pinned rounds on forge. Count their instructions on both builds and remove the cost, or show that it comes from code placement. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
 | 243 | **Cheaper row accounting in the result buffer.** The buffer checks the row count at every write so that an answer cut partway reports the rows the client received. Serializers write one character at a time, so the check costs 7% of the instructions of `optional-chain` and 14% of its client time on forge, 150.8 ms against 132.0 ms. A row log that the serializers fill themselves measured no cheaper. Find a way to record row ends that costs nothing per write. | [Benchmarks](benchmarks/engine/RESULTS.md#the-cost-of-result-serialization) | S |
@@ -747,6 +745,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **414.** Internal circuits with a rows or accumulator sink and a server-only `InternalAccess`, and the `--views` option of `scripts/nsc-writes.sh`. [F13](specs/F13-incremental-views-and-provenance.md#internal-circuits)
 - **413.** Load-time checks of view definitions, the `COMPILER` version test and the views runtime split into modules. [F13](specs/F13-incremental-views-and-provenance.md#outcome)
 - **2.** Server-wide cache sizing and query memory pool. [X08](specs/X08-disk-spill-and-server-memory.md) Phase 1
 - **3.** Group commit as the default. [X09](specs/X09-group-commit-by-default.md)
