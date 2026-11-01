@@ -97,6 +97,12 @@ check them against the W3C suites and Jena's own answers.
   the resource, and `outgoing` keeps only the resource's own triples. Options add labels
   of linked IRIs and limit the size and depth. A dataset keeps its setting through
   `/$/describe/{ds}` and `sparkles describe-settings`, and a request can choose another.
+  A streamed DESCRIBE describes the new resources of each batch of solutions as the
+  batch arrives, so its first triples come before the WHERE clause has finished. The
+  resources, triples and nodes it has seen stay in memory under the query's budget, and
+  the labels of linked IRIs come last. When `maxTriples` cuts a streamed description
+  short, the triples kept can differ from the eager ones, because the resources are
+  described in the order the batches name them.
 
 ### Federated queries
 

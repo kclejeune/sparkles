@@ -1828,11 +1828,9 @@ fn graph_send_cancel_budget_and_describe_barrier_are_explicit_and_fused() {
     assert!(emitted > 0);
     assert_eq!(c.status(), CursorStatus::Failed);
     assert!(c.next_batch().unwrap().is_none());
+    // DESCRIBE describes each batch in turn, so the strict policy admits it
     let q = "DESCRIBE <urn:s:0>";
-    assert!(matches!(
-        graph_cursor(s.snapshot(), q, &Default::default(), &options(1)),
-        Err(Error::Unsupported(_))
-    ));
+    assert!(graph_cursor(s.snapshot(), q, &Default::default(), &options(1)).is_ok());
     let expected = query(s.snapshot(), q, &Default::default()).unwrap();
     let mut c = graph_cursor(
         s.snapshot(),
@@ -1844,8 +1842,8 @@ fn graph_send_cancel_budget_and_describe_barrier_are_explicit_and_fused() {
         },
     )
     .unwrap();
-    assert!(c.plan().materializes);
-    assert!(c.plan().full_input_before_output);
+    assert!(!c.plan().materializes);
+    assert!(!c.plan().full_input_before_output);
     let mut got = Vec::new();
     while let Some(batch) = c.next_batch().unwrap() {
         got.extend(batch.quads().iter().map(|q| q.to_string()));

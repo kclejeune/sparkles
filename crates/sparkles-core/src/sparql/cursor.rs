@@ -692,7 +692,7 @@ fn from_prepared(
     let variables = Arc::new(order.iter().map(|&i| names[i].clone()).collect());
     let bytes = plan_bytes(&prepared.node).saturating_add(query.len() as u64 * 16);
     let charge = OwnedCharge::new(&ctx, bytes)?;
-    let spec = graph::Spec::from_parsed(parsed, options, cursor.fallback)?;
+    let spec = graph::Spec::from_parsed(parsed, options)?;
     let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
     let plan = root.describe(&ctx);
     ctx.check()?;

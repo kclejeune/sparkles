@@ -289,33 +289,22 @@ struct Describer<'a> {
     truncated: bool,
     charge: DescriptionCharge<'a>,
     bytes: u64,
+    /// the triples earlier batches of a streamed DESCRIBE returned
+    emitted: u64,
 }
 
-/// Describe the IRIs and blank nodes of the solutions `t`. `explicit` says whether the
-/// query or the protocol gave a dataset (or the inference overlay changed the default
-/// graph). Without one, the default graph is the store's default graph, as in Jena,
-/// even when the store's queries see the union of its named graphs.
-pub(super) fn describe<'a>(
-    ctx: &'a Ctx,
-    t: &Table,
-    opts: &'a DescribeOptions,
-    explicit: bool,
-) -> Result<Described<'a>> {
-    let _resource_charge =
-        DescriptionCharge::new(ctx, t.mem_bytes().saturating_mul(8).saturating_add(4096))?;
-    let mut resources: Vec<Id> = Vec::new();
-    let mut seen_r = FxHashSet::default();
-    for col in &t.cols {
-        for id in col {
-            if !id.is_undef()
-                && id.tag() != Tag::Local
-                && matches!(ctx.kind(*id), TermKind::Iri | TermKind::BNode)
-                && seen_r.insert(*id)
-            {
-                resources.push(*id);
-            }
-        }
-    }
+/// Where a description reads: the graphs of the dataset and the reification
+/// predicates the store uses.
+#[derive(Clone)]
+struct Setup {
+    default: Option<GraphFilter>,
+    named: Option<GraphFilter>,
+    inferred: Option<u64>,
+    reifies: Option<Id>,
+    statement: Option<[Id; 3]>,
+}
+
+fn setup(ctx: &Ctx, opts: &DescribeOptions, explicit: bool) -> Result<Setup> {
     let ds = &ctx.dataset;
     let set_of = |set: &[Id]| {
         let mut v: Vec<u64> = set.iter().map(|g| g.0).collect();
@@ -366,14 +355,188 @@ pub(super) fn describe<'a>(
     } else {
         (None, None)
     };
-    let mut d = Describer {
-        ctx,
-        opts,
+    Ok(Setup {
         default,
         named,
         inferred: iri(INFERRED_GRAPH).map(|g| g.0),
         reifies,
         statement,
+    })
+}
+
+/// The IRIs and blank nodes of the solutions `t`, column by column, that `seen` does
+/// not hold yet, which it then holds.
+fn resources(ctx: &Ctx, t: &Table, seen: &mut FxHashSet<Id>) -> Vec<Id> {
+    let mut resources: Vec<Id> = Vec::new();
+    for col in &t.cols {
+        for id in col {
+            if !id.is_undef()
+                && id.tag() != Tag::Local
+                && matches!(ctx.kind(*id), TermKind::Iri | TermKind::BNode)
+                && seen.insert(*id)
+            {
+                resources.push(*id);
+            }
+        }
+    }
+    resources
+}
+
+impl Describer<'_> {
+    /// Describe `resources` in turn, and add the labels when `last` says no resources
+    /// follow.
+    fn describe_all(&mut self, resources: Vec<Id>, last: bool) -> Result<()> {
+        for r in resources {
+            if self.truncated {
+                break;
+            }
+            self.push(r, None, Dir::Out, 1)?;
+            if self.opts.mode == DescribeMode::Scbd {
+                self.push(r, None, Dir::In, 1)?;
+            }
+            self.run()?;
+        }
+        if last && self.opts.labels && !self.truncated {
+            self.labels()?;
+        }
+        Ok(())
+    }
+
+    fn warn_truncated(&self) {
+        self.ctx.warn(PlanWarning {
+            code: "describe-truncated",
+            message: format!(
+                "the DESCRIBE result stopped at its limit of {} triples",
+                self.opts.max_triples.unwrap_or_default()
+            ),
+        });
+    }
+}
+
+/// What a streamed DESCRIBE keeps from one batch of solutions to the next: the
+/// resources it described, the triples it returned, the nodes it visited, the reifiers
+/// it found and the IRIs whose labels it adds at the end. They grow with the
+/// description, as the eager traversal's state does, under one retained charge.
+#[derive(Default)]
+pub(super) struct Streamed {
+    setup: Option<Setup>,
+    described: FxHashSet<Id>,
+    seen: FxHashSet<(Id, Id, Id)>,
+    visited: FxHashMap<(Id, Option<Source>, Dir), u32>,
+    reifiers: FxHashMap<(Id, Id, Id), Vec<(Id, u64)>>,
+    linked: FxHashSet<(Id, Source)>,
+    truncated: bool,
+    emitted: u64,
+    charge: Option<RetainedCharge>,
+    bytes: u64,
+}
+
+impl Streamed {
+    pub(super) fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+/// The triples that describe the resources of the solutions `t` that no earlier batch
+/// named, after those that earlier batches returned. `last` says that no batch follows,
+/// so the labels of the linked IRIs come last. Only a cursor streams a DESCRIBE, and the
+/// state it keeps holds a retained charge.
+pub(super) fn describe_batch(
+    ctx: &Ctx,
+    t: &Table,
+    opts: &DescribeOptions,
+    explicit: bool,
+    state: &mut Streamed,
+    last: bool,
+) -> Result<Vec<Triple>> {
+    if state.truncated {
+        return Ok(Vec::new());
+    }
+    let setup = match &state.setup {
+        Some(setup) => setup.clone(),
+        None => {
+            let setup = setup(ctx, opts, explicit)?;
+            state.setup = Some(setup.clone());
+            setup
+        }
+    };
+    let before = state.described.len();
+    let resources = resources(ctx, t, &mut state.described);
+    let charge = match state.charge.take() {
+        Some(charge) => charge,
+        None => {
+            state.bytes = 4096;
+            ctx.retained_charge(state.bytes)?
+                .ok_or_else(|| Error::invalid("a streamed DESCRIBE runs in a cursor"))?
+        }
+    };
+    let mut d = Describer {
+        ctx,
+        opts,
+        default: setup.default,
+        named: setup.named,
+        inferred: setup.inferred,
+        reifies: setup.reifies,
+        statement: setup.statement,
+        out: Vec::new(),
+        seen: std::mem::take(&mut state.seen),
+        visited: std::mem::take(&mut state.visited),
+        reifiers: std::mem::take(&mut state.reifiers),
+        linked: std::mem::take(&mut state.linked),
+        queue: Vec::new(),
+        truncated: false,
+        charge: DescriptionCharge {
+            inner: DescriptionChargeKind::Cursor(charge),
+            bytes: state.bytes,
+        },
+        bytes: state.bytes,
+        emitted: state.emitted,
+    };
+    // the resources this batch added, in the set of described resources
+    let added = (state.described.len() - before) as u64 * 48;
+    let result = d
+        .reserve(added)
+        .and_then(|()| d.describe_all(resources, last));
+    if d.truncated {
+        d.warn_truncated();
+    }
+    state.seen = std::mem::take(&mut d.seen);
+    state.visited = std::mem::take(&mut d.visited);
+    state.reifiers = std::mem::take(&mut d.reifiers);
+    state.linked = std::mem::take(&mut d.linked);
+    state.truncated = d.truncated;
+    state.emitted = d.emitted.saturating_add(d.out.len() as u64);
+    state.bytes = d.bytes;
+    let DescriptionCharge { inner, .. } = d.charge;
+    if let DescriptionChargeKind::Cursor(charge) = inner {
+        state.charge = Some(charge);
+    }
+    result?;
+    Ok(d.out)
+}
+
+/// Describe the IRIs and blank nodes of the solutions `t`. `explicit` says whether the
+/// query or the protocol gave a dataset (or the inference overlay changed the default
+/// graph). Without one, the default graph is the store's default graph, as in Jena,
+/// even when the store's queries see the union of its named graphs.
+pub(super) fn describe<'a>(
+    ctx: &'a Ctx,
+    t: &Table,
+    opts: &'a DescribeOptions,
+    explicit: bool,
+) -> Result<Described<'a>> {
+    let _resource_charge =
+        DescriptionCharge::new(ctx, t.mem_bytes().saturating_mul(8).saturating_add(4096))?;
+    let resources = resources(ctx, t, &mut FxHashSet::default());
+    let setup = setup(ctx, opts, explicit)?;
+    let mut d = Describer {
+        ctx,
+        opts,
+        default: setup.default,
+        named: setup.named,
+        inferred: setup.inferred,
+        reifies: setup.reifies,
+        statement: setup.statement,
         out: Vec::new(),
         seen: FxHashSet::default(),
         visited: FxHashMap::default(),
@@ -383,28 +546,11 @@ pub(super) fn describe<'a>(
         truncated: false,
         charge: DescriptionCharge::new(ctx, 4096)?,
         bytes: 4096,
+        emitted: 0,
     };
-    for r in resources {
-        if d.truncated {
-            break;
-        }
-        d.push(r, None, Dir::Out, 1)?;
-        if opts.mode == DescribeMode::Scbd {
-            d.push(r, None, Dir::In, 1)?;
-        }
-        d.run()?;
-    }
-    if opts.labels && !d.truncated {
-        d.labels()?;
-    }
+    d.describe_all(resources, true)?;
     if d.truncated {
-        ctx.warn(PlanWarning {
-            code: "describe-truncated",
-            message: format!(
-                "the DESCRIBE result stopped at its limit of {} triples",
-                opts.max_triples.unwrap_or_default()
-            ),
-        });
+        d.warn_truncated();
     }
     Ok(Described {
         triples: d.out,
@@ -520,7 +666,8 @@ impl<'a> Describer<'a> {
                 break;
             }
             self.ctx.check()?;
-            self.ctx.check_rows(self.out.len())?;
+            self.ctx
+                .check_rows((self.emitted as usize).saturating_add(self.out.len()))?;
             let key = (it.node, it.src, it.dir);
             if self.visited.get(&key).is_some_and(|&l| l <= it.level) {
                 continue;
@@ -589,7 +736,7 @@ impl<'a> Describer<'a> {
         if self
             .opts
             .max_triples
-            .is_some_and(|m| self.out.len() as u64 >= m)
+            .is_some_and(|m| self.emitted.saturating_add(self.out.len() as u64) >= m)
         {
             self.truncated = true;
             return Ok(());
