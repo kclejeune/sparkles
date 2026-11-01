@@ -101,6 +101,13 @@ pub struct Origin {
     pub main: Option<usize>,
 }
 
+/// The two grammars of blank node expressions, each with its own memo and depths.
+#[derive(Clone, Copy)]
+enum Grammar {
+    Class = 0,
+    Data = 1,
+}
+
 /// The deepest nesting of class expressions and data ranges a read follows.
 pub const MAX_NESTING: usize = 128;
 
@@ -516,8 +523,9 @@ struct Parser<'a> {
     /// parsing in progress, to stop on cycles
     active: FxHashSet<BlankNode>,
     nesting_reported: bool,
-    /// the depth of each expression read, to bound expressions built from memoized ones
-    depth: FxHashMap<BlankNode, usize>,
+    /// the depth of each class expression and each data range read, to bound
+    /// expressions built from memoized ones
+    depth: [FxHashMap<BlankNode, usize>; 2],
     /// the deepest child of each expression being read
     frames: Vec<usize>,
     depth_failures: usize,
@@ -571,7 +579,7 @@ impl<'a> Parser<'a> {
             dr_memo: FxHashMap::default(),
             active: FxHashSet::default(),
             nesting_reported: false,
-            depth: FxHashMap::default(),
+            depth: [FxHashMap::default(), FxHashMap::default()],
             frames: Vec::new(),
             depth_failures: 0,
             shared_warned: FxHashSet::default(),
@@ -617,8 +625,8 @@ impl<'a> Parser<'a> {
 
     /// A memoized expression at `b`, unless using it here would nest the expression
     /// being read deeper than [`MAX_NESTING`].
-    fn reuse<T>(&mut self, b: &BlankNode, m: Option<T>) -> Option<T> {
-        let d = self.depth.get(b).copied().unwrap_or(1);
+    fn reuse<T>(&mut self, b: &BlankNode, g: Grammar, m: Option<T>) -> Option<T> {
+        let d = self.depth[g as usize].get(b).copied().unwrap_or(1);
         if self.active.len() + d > MAX_NESTING {
             self.too_deep(b);
             return None;
@@ -644,14 +652,14 @@ impl<'a> Parser<'a> {
     /// Finish reading the expression at `b`, recording its depth. Whether its result
     /// may be memoized: a failure that only the depth limit caused depends on where the
     /// expression was reached from, so it is not.
-    fn leave(&mut self, b: &BlankNode, failures: usize, ok: bool) -> bool {
+    fn leave(&mut self, b: &BlankNode, g: Grammar, failures: usize, ok: bool) -> bool {
         let inner = self.frames.pop().unwrap_or(0);
         self.active.remove(b);
         if !ok && self.depth_failures != failures {
             return false;
         }
         let d = inner + 1;
-        self.depth.insert(b.clone(), d);
+        self.depth[g as usize].insert(b.clone(), d);
         self.note_depth(d);
         true
     }
@@ -1531,7 +1539,7 @@ impl<'a> Parser<'a> {
             Term::BlankNode(b) => {
                 if let Some(m) = self.dr_memo.get(b) {
                     let m = m.clone();
-                    return self.reuse(b, m);
+                    return self.reuse(b, Grammar::Data, m);
                 }
                 let failures = self.enter(b)?;
                 let r = if self.check_shared(b) {
@@ -1539,7 +1547,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                if self.leave(b, failures, r.is_some()) {
+                if self.leave(b, Grammar::Data, failures, r.is_some()) {
                     self.dr_memo.insert(b.clone(), r.clone());
                 }
                 r
@@ -1676,7 +1684,7 @@ impl<'a> Parser<'a> {
             Term::BlankNode(b) => {
                 if let Some(m) = self.ce_memo.get(b) {
                     let m = m.clone();
-                    return self.reuse(b, m);
+                    return self.reuse(b, Grammar::Class, m);
                 }
                 let failures = self.enter(b)?;
                 let r = if self.check_shared(b) {
@@ -1684,7 +1692,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                if self.leave(b, failures, r.is_some()) {
+                if self.leave(b, Grammar::Class, failures, r.is_some()) {
                     self.ce_memo.insert(b.clone(), r.clone());
                 }
                 r

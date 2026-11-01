@@ -1095,7 +1095,8 @@ fn a_too_deep_root_does_not_spoil_a_shallow_suffix() {
         "{HEADER}:T a rdfs:Datatype . :U a rdfs:Datatype .\n:T owl:equivalentClass _:d{} .\n",
         n - 1
     );
-    body.push_str(":U owl:equivalentClass _:d1 .\n");
+    // the read of :T visits _:d100 before the limit stops it
+    body.push_str(":U owl:equivalentClass _:d100 .\n");
     body.push_str("_:d0 a rdfs:Datatype ; owl:datatypeComplementOf xsd:integer .\n");
     for i in 1..n {
         body.push_str(&format!(
@@ -1112,4 +1113,63 @@ fn a_too_deep_root_does_not_spoil_a_shallow_suffix() {
     };
     assert!(defined("U"));
     assert!(!defined("T"));
+}
+
+#[test]
+fn class_and_data_depths_stay_apart() {
+    // _:x is a shallow class expression and the root of a deep data range: either
+    // reading must not borrow the other's depth
+    let n = 120;
+    let mut body = decl(
+        ":A rdfs:subClassOf _:x . :C rdfs:subClassOf _:y . _:y owl:complementOf _:x .
+         _:x owl:complementOf :B ; owl:datatypeComplementOf _:d0 .
+         :T a rdfs:Datatype ; owl:equivalentClass _:x .\n",
+    );
+    for i in 0..n {
+        body.push_str(&format!(
+            "_:d{i} a rdfs:Datatype ; owl:datatypeComplementOf _:d{} .\n",
+            i + 1
+        ));
+    }
+    body.push_str(&format!(
+        "_:d{n} a rdfs:Datatype ; owl:datatypeComplementOf xsd:integer .\n"
+    ));
+    let o = lenient(&body);
+    for c in ["A", "C"] {
+        assert!(
+            o.axiom_set().any(
+                |a| matches!(&a.kind, AxiomKind::SubClassOf(ClassExpression::Class(k), _)
+                if k.as_str() == format!("http://example.org/{c}"))
+            ),
+            "{c}: {:?}",
+            o.diagnostics
+        );
+    }
+}
+
+#[test]
+fn a_failed_class_read_does_not_shorten_a_data_range() {
+    // every _:d{i} defines :T{i} and is also used, in vain, as a class: the deep data
+    // ranges built from the memo still meet the nesting limit
+    let n = 200;
+    let mut body =
+        format!("{HEADER}_:d0 a rdfs:Datatype ; owl:datatypeComplementOf xsd:integer .\n");
+    for i in 0..n {
+        body.push_str(&format!(
+            ":T{i} a rdfs:Datatype ; owl:equivalentClass _:d{i} . :K{i} a owl:Class ; rdfs:subClassOf _:d{i} .\n"
+        ));
+        if i > 0 {
+            body.push_str(&format!(
+                "_:d{i} a rdfs:Datatype ; owl:datatypeComplementOf _:d{} .\n",
+                i - 1
+            ));
+        }
+    }
+    let o = lenient(&body);
+    assert!(
+        !o.axiom_set()
+            .any(|a| matches!(&a.kind, AxiomKind::DatatypeDefinition(d, _)
+            if d.as_str() == format!("http://example.org/T{}", n - 1))),
+        "the deepest definition is not read"
+    );
 }
