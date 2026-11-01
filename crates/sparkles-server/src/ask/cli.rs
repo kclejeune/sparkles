@@ -105,7 +105,8 @@ pub struct AskArgs {
     /// several rows for "How many", keeping the first answer if the repair fails
     #[arg(long)]
     pub shape_check: bool,
-    /// Ask this many first drafts and keep the one whose result most drafts share
+    /// Ask this many first drafts and keep the one whose result most drafts share. A
+    /// preview with --no-run asks one, since the vote runs each draft
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub drafts: usize,
     /// Link each mention with the classes the words around it name, and show how many

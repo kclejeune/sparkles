@@ -1321,6 +1321,10 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
             )
             if choice is None:
                 out["clarification"] = {"basis": "unusable"}
+            elif expiring:
+                # The phase ended, so no second round starts and the first answer is
+                # kept as a case that did not finish.
+                failure = failure or "timeout"
             else:
                 c["first"], c["firstWall"], c["choice"] = out, wall, choice
                 send(c, 2, choice["answer"])

@@ -378,6 +378,13 @@ struct Asking<'a, 'e> {
     fallback: Option<Answered>,
 }
 
+/// What `run_query` returns: the compact result and, with `full_results`, the full one.
+type RunResult = (Value, Option<Value>);
+
+/// A draft with its output level and pair, and the query and result of its run when
+/// the vote of several drafts ran it.
+type Drafted = (Value, Level, Pair, Option<(String, RunResult)>);
+
 /// An answer with rows, before its summary.
 struct Answered {
     result: Value,
@@ -647,7 +654,7 @@ impl Asking<'_, '_> {
 
     /// Run a query with `sparql_query`: its compact result, and with `full_results` the
     /// same result in the form of `/{ds}/sparql`.
-    fn run_query(&self, query: &str) -> Result<(Value, Option<Value>), ToolError> {
+    fn run_query(&self, query: &str) -> Result<RunResult, ToolError> {
         profile::execution(|| self.run_query_unprofiled(query))
     }
 
@@ -1440,40 +1447,44 @@ impl Asking<'_, '_> {
 
     /// The first draft of several that their results vote for (`drafts`). Each
     /// further draft is asked with the same prompt while the ask has room, and each
-    /// query runs once. A first draft that asks for a clarification stands alone.
+    /// query runs once. A first draft that asks for a clarification stands alone. The
+    /// chosen draft keeps its own output level and pair, and its query's result, so
+    /// the pipeline does not run it again.
     fn vote_drafts(
         &mut self,
-        first: Value,
+        first: Drafted,
         prompt: &Prompt,
         schema: &crate::models::OutputSchema,
-    ) -> Value {
-        if normalize(&first).clarify.is_some() && self.o.clarification.is_none() {
+    ) -> Drafted {
+        if normalize(&first.0).clarify.is_some() && self.o.clarification.is_none() {
             return first;
         }
-        let mut values = vec![first];
-        while values.len() < self.o.drafts.min(MAX_DRAFTS) && self.room() {
+        let mut drafted = vec![first];
+        while drafted.len() < self.o.drafts.min(MAX_DRAFTS) && self.room() {
             match self.call(Role::Draft, prompt, schema) {
-                Ok((v, _, _)) => values.push(v),
+                Ok(x) => drafted.push((x.0, x.1, x.2, None)),
                 Err(_) => break,
             }
         }
-        let signatures: Vec<Option<String>> = values
-            .iter()
-            .map(|v| {
-                let d = normalize(v);
-                if d.query.is_empty() {
-                    return None;
+        let mut signatures = Vec::with_capacity(drafted.len());
+        for x in &mut drafted {
+            let d = normalize(&x.0);
+            let parsed = (!d.query.is_empty())
+                .then(|| self.parse(&d.query))
+                .flatten();
+            if parsed.is_none() || has_service(parsed.as_ref()) {
+                signatures.push(None);
+                continue;
+            }
+            let (q, _) = self.with_limit(&d.query, parsed.as_ref());
+            match self.run_query(&q) {
+                Ok(r) => {
+                    signatures.push(repair::signature(&r.0));
+                    x.3 = Some((q, r));
                 }
-                let parsed = self.parse(&d.query);
-                if parsed.is_none() || has_service(parsed.as_ref()) {
-                    return None;
-                }
-                let (q, _) = self.with_limit(&d.query, parsed.as_ref());
-                self.run_query(&q)
-                    .ok()
-                    .and_then(|(doc, _)| repair::signature(&doc))
-            })
-            .collect();
+                Err(_) => signatures.push(None),
+            }
+        }
         let chosen = repair::vote(&signatures);
         let agree = signatures
             .iter()
@@ -1481,9 +1492,9 @@ impl Asking<'_, '_> {
             .count();
         self.emit(
             "vote",
-            &json!({ "drafts": values.len(), "withRows": signatures.iter().filter(|s| s.is_some()).count(), "agree": agree, "chosen": chosen }),
+            &json!({ "drafts": drafted.len(), "withRows": signatures.iter().filter(|s| s.is_some()).count(), "agree": agree, "chosen": chosen }),
         );
-        values.swap_remove(chosen)
+        drafted.swap_remove(chosen)
     }
 
     fn draft_turns(&mut self, ground: &Ground, notes: &[String], context_tokens: u64) -> Value {
@@ -1534,6 +1545,7 @@ impl Asking<'_, '_> {
                 Ok(x) => x,
                 Err((code, message)) => return self.error(code, message),
             };
+            let mut ran: Option<(String, RunResult)> = None;
             if scoped && value["scope"].as_str() == Some("global") {
                 let sel = self.reports.take().unwrap_or(Value::Null);
                 self.emit(
@@ -1542,10 +1554,14 @@ impl Asking<'_, '_> {
                 );
                 return self.global(sel);
             }
-            let value = if attempt == 1 && self.o.drafts > 1 {
-                self.vote_drafts(value, &prompt, &schema)
+            // the vote runs each draft's query, so a preview that runs nothing asks once
+            let (value, level, pair) = if attempt == 1 && self.o.drafts > 1 && self.o.run {
+                let (value, level, pair, result) =
+                    self.vote_drafts((value, level, pair, None), &prompt, &schema);
+                ran = result;
+                (value, level, pair)
             } else {
-                value
+                (value, level, pair)
             };
             if self.level.is_none() {
                 self.level = Some(level);
@@ -1670,8 +1686,12 @@ impl Asking<'_, '_> {
             if self.cancelled() {
                 return self.error("cancelled", "the ask was cancelled");
             }
-            // step 5: the run
-            let (doc, full) = match self.run_query(&run_query) {
+            // step 5: the run, unless the vote of the drafts ran this query already
+            let outcome = match ran.take() {
+                Some((q, r)) if q == run_query => Ok(r),
+                _ => self.run_query(&run_query),
+            };
+            let (doc, full) = match outcome {
                 Err(e) => {
                     let ev = json!({"attempt": attempt, "error": {"code": e.code, "message": e.message}});
                     self.emit("run", &ev);

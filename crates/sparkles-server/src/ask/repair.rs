@@ -157,9 +157,18 @@ pub(super) fn shape_hint(question: &str, query: &str, doc: &Value) -> Option<Str
         })
         .collect();
     let one_number = rows.len() == 1 && rows[0].len() == 1 && numeric(rows[0][0]);
-    let counted = query.to_uppercase().contains("COUNT(");
+    let counted = query
+        .to_uppercase()
+        .split_whitespace()
+        .collect::<String>()
+        .contains("COUNT(");
     match form {
-        Form::Count if !boolean && !one_number => {
+        Form::Count | Form::Date | Form::Things if boolean => {
+            return Some(
+                "The question does not ask for yes or no, but the query is an ASK. Select the values that answer it.".into(),
+            );
+        }
+        Form::Count if !one_number => {
             return Some(format!(
                 "The question asks how many, so its answer is one number, but the query returned {} rows of {} columns. Count the distinct answers with COUNT(DISTINCT ...), or select the one property whose value is the number.",
                 rows.len(),
@@ -169,7 +178,7 @@ pub(super) fn shape_hint(question: &str, query: &str, doc: &Value) -> Option<Str
         Form::Boolean if !boolean => {
             return Some("The question asks for yes or no, so answer it with an ASK query.".into());
         }
-        Form::Date if !boolean && !rows.iter().flatten().any(|c| datelike(c)) => {
+        Form::Date if !rows.iter().flatten().any(|c| datelike(c)) => {
             return Some(
                 "The question asks when, but no value of the result is a date or a year. Select the property that holds the date.".into(),
             );
@@ -190,7 +199,12 @@ pub(super) fn shape_hint(question: &str, query: &str, doc: &Value) -> Option<Str
 
 /// What a draft's result is, for the vote of several drafts: the sorted rows of a
 /// result with rows, the boolean of an ASK, and `None` for an empty result or none.
+/// A result cut to its first rows or with shortened terms may hide a difference, so
+/// it has no signature either.
 pub(super) fn signature(doc: &Value) -> Option<String> {
+    if !doc["truncated"].is_null() || doc["termsShortened"].as_u64().unwrap_or(0) > 0 {
+        return None;
+    }
     if let Some(b) = doc["boolean"].as_bool() {
         return Some(b.to_string());
     }
@@ -253,6 +267,11 @@ mod tests {
         assert!(shape_hint("When was it built?", "SELECT ?x", &year).is_none());
         assert!(shape_hint("Which films are there?", "SELECT (COUNT(?x) AS ?n)", &n).is_some());
         assert!(shape_hint("Which films are there?", "SELECT ?x", &two).is_none());
+        assert!(shape_hint("Which films are there?", "SELECT (COUNT (?x) AS ?n)", &n).is_some());
+        let yes = json!({ "boolean": true });
+        assert!(shape_hint("How many films are there?", "ASK {}", &yes).is_some());
+        assert!(shape_hint("When was it built?", "ASK {}", &yes).is_some());
+        assert!(shape_hint("Which films are there?", "ASK {}", &yes).is_some());
         let repeated = rows(json!([["ex:a"], ["ex:a"]]));
         assert_eq!(
             shape_hint("What is it?", "SELECT ?x", &repeated).as_deref(),
@@ -273,6 +292,16 @@ mod tests {
             signature(&json!({ "rows": [["ex:a"], ["ex:b"]] }))
         );
         assert_eq!(signature(&json!({ "rows": [] })), None);
+        let cut = json!({ "rows": [["ex:a"]], "truncated": { "reason": "maxRows" } });
+        assert_eq!(signature(&cut), None);
+        assert_eq!(
+            signature(&json!({ "rows": [["ex:a"]], "termsShortened": 1 })),
+            None
+        );
+        assert!(
+            signature(&json!({ "rows": [["ex:a"]], "truncated": null, "termsShortened": 0 }))
+                .is_some()
+        );
     }
 
     #[test]

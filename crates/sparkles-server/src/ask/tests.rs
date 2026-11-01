@@ -877,3 +877,24 @@ fn drafts_vote_by_their_results() {
     assert_eq!(votes[0]["chosen"], 1);
     assert_eq!(out["usage"]["modelCalls"], 3);
 }
+
+#[test]
+fn a_preview_asks_one_draft_and_runs_no_vote() {
+    let s = server(ORG);
+    let teams = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let people = draft(&format!("{PREFIXES}SELECT ?p WHERE {{ ?p a ex:Person }}"));
+    let mock = scripted(vec![teams, people], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        run: false,
+        drafts: 2,
+        ..opts("Which teams are there?")
+    };
+    let mut votes = 0;
+    let mut on = |e: &str, _: &Value| votes += usize::from(e == "vote");
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "checked", "{out:#}");
+    assert_eq!(votes, 0);
+    assert_eq!(out["usage"]["modelCalls"], 1);
+}

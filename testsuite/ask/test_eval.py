@@ -1755,6 +1755,46 @@ class BatchCases(unittest.TestCase):
             )
         self.assertEqual([q["id"] for q, _, _ in results], ["q0", "q1"])
 
+    def test_a_clarification_queued_when_the_phase_expires_is_kept_unfinished(self):
+        runner = self.runner("normal", deadline=300)
+        runner.deadline = time.monotonic() + 1
+
+        class Proxy:
+            ledger = type("L", (), {"hold": lambda *a: True, "release": lambda *a: None})()
+            ordered_replies = False
+
+            def open_case(self, case):
+                return None
+
+            def close_case(self, token):
+                pass
+
+            def flush_replies(self, case):
+                pass
+
+            def wait_idle(self, timeout=None, case=None):
+                if case == eval_ask.case_of("p", {"id": "q0"}):
+                    time.sleep(max(0, runner.deadline - time.monotonic()) + 0.05)
+                return True
+
+            def case_cost(self, case):
+                return 0
+
+            def refusals_for(self, case):
+                return 0
+
+        qs = self.qs(3)  # q1 asks for a clarification
+        results = []
+        with self.assertRaises(eval_ask.HarnessFault):
+            eval_ask.run_batch(
+                runner, Proxy(), "p", qs, 3, lambda pair, qs: True, self.report(),
+                lambda q, a: False, results,
+            )
+        got = {q["id"]: a for q, _, a in results}
+        self.assertEqual(sorted(got), ["q0", "q1", "q2"])
+        self.assertEqual(got["q1"]["outcome"], "clarify")
+        self.assertEqual(got["q1"]["evalFailure"], "timeout")
+
     def test_an_eof_from_a_child_the_runner_had_to_kill_ends_the_run(self):
         qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(2))]
         with self.assertRaises(eval_ask.HarnessFault):
