@@ -869,6 +869,35 @@ fn limits_above_max_hits_are_refused_like_no_limit() {
     );
 }
 
+/// A SPARQL LIMIT without OFFSET over a search reaches the search, through a projection
+/// and a BIND, so it keeps only that many of its best hits: a search that would pass
+/// `maxHits` answers, with the hits of the same limit written in the call (roadmap
+/// item 7). An OFFSET passes nothing.
+#[test]
+fn a_query_limit_reaches_the_search() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    s.enable_text(TextConfig {
+        max_hits: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let run = |q: &str| query(s.snapshot(), &format!("{P}{q}"), &QueryOptions::default());
+    let mut limited = rows(
+        &s,
+        "SELECT ?s ?t { (?s ?sc) text:query \"brown\" BIND(STR(?s) AS ?t) } LIMIT 2",
+    );
+    let mut inline = rows(
+        &s,
+        "SELECT ?s ?t { (?s ?sc) text:query (\"brown\" 2) BIND(STR(?s) AS ?t) }",
+    );
+    limited.sort();
+    inline.sort();
+    assert_eq!(limited, inline);
+    assert_eq!(limited.len(), 2);
+    assert!(run("SELECT ?s { (?s ?sc) text:query \"brown\" } OFFSET 1 LIMIT 1").is_err());
+}
+
 /// A score or literal the query does not use is not produced, so the search reads no
 /// literal; one used anywhere else still is.
 #[test]
