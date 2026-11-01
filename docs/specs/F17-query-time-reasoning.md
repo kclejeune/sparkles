@@ -984,7 +984,8 @@ Roadmap item 417 delivered the fixed-point operator that §6.3 builds on, record
 [F13's Outcome](F13-incremental-views-and-provenance.md#fixed-point-operator). The
 reasoner plugs into it through `RuleProgram` in `crates/sparkles-reasoner/src/fixpoint.rs`,
 which runs forward Jena rules whose bodies are triple patterns over at most four variables
-and whose heads use only body variables. The operator keeps each derived triple with the
+and whose heads use only body variables. Constants the store lacks are kept as local
+terms, which its checkpoints carry. The operator keeps each derived triple with the
 rule instance that derived it first and maintains deletions by backward and forward
 rederivation, so cycles of classes and symmetric relations need no counts. Tests check
 random histories against a naive closure and check that each `why` witness derives its

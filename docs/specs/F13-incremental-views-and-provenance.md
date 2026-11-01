@@ -1369,17 +1369,20 @@ forward rules into it in `sparkles-reasoner/src/fixpoint.rs`.
   starts a walk, and with a constant end the walk starts there, backward for a constant
   object. A pass finds the starts that reach a changed step by walking the steps backward
   from it at both snapshots, so the step relation is probed from the store's
-  permutations and never copied. `*` adds the zero-length rows without state. They are
+  permutations and never copied. The walks a pass memoizes count against the budget
+  and are released when the pass ends. `*` adds the zero-length rows without state. They are
   the nodes of the active graph for two variable ends, and for a constant end the
   constant itself in each graph that exists under the reader's access, as the query
-  engine evaluates them. A path with `?`, a negated property set, a nested `*` or `+`, or
+  engine evaluates them, so a graph whose triples a protection hides does not exist. A path with `?`, a negated property set, a nested `*` or `+`, or
   a blank node end is still a `recompute` node, and `explain` names the reason.
 - **Reasoner plug-in.** `RuleProgram` runs the forward Jena rules whose bodies are
   triple patterns over at most four variables and whose heads use only body variables,
   and refuses the others. Its facts are triples, indexed by predicate, by predicate and
   subject, and by predicate and object, and a record names the rule and its variables.
-  Head constants that the store lacks are kept as local terms, and a pass that first
-  meets one in the store builds the program again. The reasoner's own maintenance is
+  Constants that the store lacks, in bodies and heads, are kept as local terms, so a
+  rule matches the triples another rule derives with them, and a pass that first meets
+  one in the store builds the program again. `RuleProgram::encode` and `decode`
+  checkpoint a fixed point with those terms. The reasoner's own maintenance is
   unchanged. Moving it onto the operator is item 456's shared maintenance core, after item
   NEW-ITEM-5 measures the plug-in on LUBM.
 - **Provenance.** With a provenance setting a fact counts one derivation, its recorded
@@ -1392,7 +1395,8 @@ forward rules into it in `sparkles-reasoner/src/fixpoint.rs`.
   sets for fixed-point rows are item NEW-ITEM-1.
 - **Budget and state.** The operator counts about 40 bytes for each fact, and its rows
   are counted again by an operator above it that keeps them, such as a join's
-  arrangement. A build or pass that takes the circuit over its memory budget stops with
+  arrangement. Annotations count as they are made, and the budget is checked again at
+  the end of every build and pass. A build or pass that takes the circuit over its memory budget stops with
   `BudgetExceeded`, and the view is `suspended` with `over-budget` as §3.5 describes for
   every operator. This memory buys
   passes that touch only the walks a change reaches.
@@ -1427,7 +1431,11 @@ restarts a path view from a format 2 checkpoint and refuses a checkpoint of the 
 format, and the generated circuit tests of Phase 1 now include path views and pass 3,000
 cases plain and masked. `sparkles-reasoner/src/fixpoint/tests.rs` maintains RDFS-style
 rules with cycles of classes and a symmetric relation against a naive closure, and checks
-that every witness derives its triple.
+that every witness derives its triple. Regressions from the review cover protections that
+hide every triple of a named graph, constants that only derived triples hold, a pass
+over many steps that reach nothing under a small budget, a rule body that repeats one
+premise, annotations over the budget, query variables named like the step's own, and a
+checkpoint of rules with local constants.
 
 **Measurements.** On an 8-vCPU Namespace instance at 200,000 people, four path views of
 the incremental benchmark passed in 0.02 to 0.24 ms at the 95th percentile, against 2.3 to

@@ -3075,7 +3075,9 @@ receives the difference as a diff or a `reset`. Views and live queries never rea
 protects. `ORDER BY` without `LIMIT` does not change a view's rows and is
 ignored. Operators that the circuit cannot maintain run as
 `recompute` nodes, which evaluate their subtree again at each commit that touches it and
-subtract the previous output. Property paths with `*`, `+` or `?`, `LIMIT` and
+subtract the previous output. A property path with `+` or `*` over a step of IRIs,
+inverses, sequences and alternatives is maintained by a fixed-point operator, which the
+plan names `FixedPoint`. Other property paths with `*`, `+` or `?`, `LIMIT` and
 `OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, and `MINUS`, aggregates,
 `DISTINCT`, `VALUES` and subqueries under `GRAPH ?g` are recompute nodes. A `FILTER EXISTS`
 or `FILTER NOT EXISTS` whose `*`, `?` or `{0,n}` path ends at a variable of the outer rows
