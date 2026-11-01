@@ -84,8 +84,16 @@ not a universal canonicalization rule for arbitrary importers.
 A stored-fact reference records dataset and branch UUIDs, a commit number, a graph kind
 and an expected triple term. The default graph has no `ev:graph` value. A named graph
 has one IRI, even if that IRI equals `ev:DefaultGraph`. The shapes check this structure
-without checking that the commit or triple exists. Reference resolution, blank-node
-anchoring and non-disclosing unavailable responses remain runtime work under item 81.
+without checking that the commit or triple exists. `POST /{ds}/claims/resolve` verifies
+the commit and triple under the caller's view.
+
+`POST /{ds}/claims` writes these records as an authenticated operation. The server sets
+`ev:availabilityReceipt`, `prov:wasGeneratedBy`, `ev:recordDigest` and each source
+revision's `ev:firstAvailableAt`, and describes the operation as an `ev:Operation` in
+every written graph with its `ev:payloadDigest`, optional `ev:idempotencyKey` and
+`ev:sourceHold` and the graph's `ev:graphProtection` nonce. The typed input has no field for
+these terms. A record digest covers the immutable content of a record and leaves out
+`ev:retainedBytes`, `ev:normalizedText` and the server-owned terms.
 
 Confidence records retain their evaluator and declared scale. `ev:ZeroToOne` requires
 an `xsd:decimal` in the closed interval from zero to one. The shapes validate its exact

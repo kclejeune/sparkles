@@ -494,7 +494,7 @@ revision, graph reservation or administration capability.
 identity or method resolution. A runtime must discharge those requirements through
 the caller's authorized view before publication. These helpers do not open a dataset,
 authenticate source availability, register managed graphs or authorize a write. The
-Phase 2 runtime remains incomplete.
+authenticated proposal writer described below discharges them.
 
 The runtime ownership prerequisite gives each opening one shared family identity.
 Persistent families retain a lease on the root process lock. Persistent and in-memory
@@ -862,8 +862,122 @@ compared byte for byte, including for references refused from their anchor alone
 4. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
    and the bindings for roadmap item 509.
 
-Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
-and claim creation with authenticated availability and guarded metadata, idempotency,
+Authenticated claim proposals are the fifth Phase 2 step. `sparkles::evidence::propose`
+and `POST /{ds}/claims` publish one batch of source revisions, renditions, passages,
+evidence references, claim occurrences, evidence links and assessments as one commit
+of the evidence owner. A claim describes its proposition with RDF 1.2 reification and
+never asserts it. Each record IRI is minted by the identity namespace of the dataset and
+the authenticated principal from the record's scope and occurrence keys, so an equal
+record from another occurrence key is another record and an equal payload gives the
+same IRIs. A record goes to the settings' single source or proposal graph, or to the
+one the request names when the settings have several. The server writes every
+server-owned field. Each record gets its `ev:availabilityReceipt`, which is the
+operation IRI, its `prov:wasGeneratedBy` and an `ev:recordDigest` over its immutable
+content in a canonical triple order. Each source revision gets its
+`ev:firstAvailableAt`, the commit's time. Each written graph receives the operation as an
+`ev:Operation` and `prov:Activity` with its agent, end time, dataset, branch, commit,
+payload digest, optional idempotency key and source hold, and the graph's protection
+nonce.
+
+The protection nonce is the operation marker that resolution decision 1 required.
+`managed.json` format 1 gains an additive `protections` map from each protected graph to
+a random UUID. Protecting a graph keeps its nonce while the owner keeps protecting it,
+detaching drops the nonce, and protecting it again chooses a new one. An older reader
+ignores the field, and a registry without it has no nonces, so its graphs take no typed
+writes until the owner protects them again. Resolution now requires the receipt to be an
+`ev:Operation` in the record's graph whose `ev:graphProtection` is that graph's current
+nonce, otherwise the answer is `origin-not-reproduced`. A record written while its graph
+was detached cannot name a nonce chosen after it. Resolution also reports each record's
+`ev:recordDigest`.
+
+A proposal runs in this order.
+
+1. The input is prepared, its records are minted and placed, and the caller's update
+   grants on every written graph are checked from the grants alone.
+2. The managed-write capability is taken, so any later change of the registry, such as
+   a detach, refuses the commit.
+3. An idempotency key derives the operation IRI as a name-based UUID of the dataset,
+   the principal and the key. When that operation is recorded on the branch, a payload
+   with the same digest returns its first receipt without writing, and another payload
+   is `409 idempotency-conflict`.
+4. The references to existing records and stored facts are resolved under the caller's
+   read access with the L4 resolver, so a reference the caller cannot read answers as a
+   missing one.
+5. The stored facts of this dataset are held under a hold whose id is the operation
+   UUID, and the hold is durable before step 6 starts.
+6. Under the branch writer, `ifHead` is checked as `409 head-changed`, the key is checked
+   again, every record identity is checked, the commit is stamped and the record and
+   operation quads are built. An existing identity in the same graph whose authenticated
+   record has an equal digest is reported as `existing` and not written again, and any
+   other existing identity is `409 immutable-record-conflict`. A publish hook then runs
+   on the committing thread inside the commit. It refuses when the hold is gone and
+   enters the host's authority fence, whose guard the thread keeps until the commit has
+   published or been refused.
+
+The hold comes before the commit because a reference recorded without a durable hold
+could lose its commit to retention before any hold existed. With this order a crash at
+any point leaves either nothing, a hold without a published operation or a published
+operation with its hold. A hold without an operation is an orphan. A retry with the same
+key acquires the same hold again, because the hold id is the operation UUID and the
+held commits are equal. `reconcile_operation_holds` releases each evidence hold that is
+older than its grace period and whose operation is recorded neither on `main` nor on any
+branch. Every published proposal runs it with an hour's grace, after its commit, and its
+failure never fails the proposal. The grace exceeds the request deadline, so an
+operation still on its way to its commit keeps its hold. The publish hook refuses a
+commit whose hold was released meanwhile, so a published operation always names a hold
+that protects it.
+
+The server's authority fence binds the commit to the caller's credential.
+`AuthorityRegistry::begin_hold` takes a shared guard on the authority generation, and
+`begin_revocation` takes it exclusively without changing the generation. Removing a
+token, removing a session and ending an OIDC session now take the exclusive guard, so a
+revocation waits for a publication that already passed the fence, and a publication
+after the revocation sees the credential gone and answers `503 authority-changed`. The
+fence also refuses a changed generation and an expired credential. The guard is not
+`Send`, so it lives in a thread-local slot that a drop guard clears, also on unwind.
+
+`POST /{ds}/claims` needs `write` on the dataset or branch through the update endpoint,
+an update grant on each written graph and read access to every referenced record and
+fact. Its principal is the caller's authenticated log name as a
+`urn:x-sparkles:principal:` IRI. A dry run checks everything except the hold and the
+fence and returns a preview of the inserted and deleted quads. The response gives the
+operation, whether it committed or replayed, the commit, branch, first availability,
+hold and each record's key, kind, IRI, graph, digest and `existing` flag. The new codes
+are `head-changed`, `idempotency-conflict` and `authority-changed`, and `GET /$/server`
+advertises `capabilities.claims` with profile 1 and both routes. The vocabulary adds
+`ev:Operation`, `ev:graphProtection`, `ev:payloadDigest`, `ev:idempotencyKey`,
+`ev:sourceHold`, `ev:recordDigest`, `ev:retainedBytes`, `ev:locator` and
+`ev:reportedRights`.
+
+Tests cover deterministic identities, graph choice, the server fields on every written
+graph, nonce persistence and renewal, each refusal code over Rust and HTTP, an equal
+payload replayed, another payload under the same key and the same key of another
+principal, a stale `ifHead`, a head moved by a concurrent write after the hold, an
+existing equal record and a conflicting one, records written while a graph was detached,
+a proposal on a branch, a dry run, missing update grants on one written graph, a
+referenced record the caller cannot read compared byte for byte with a missing one, an
+authority revoked between preparation and the commit, a token revoked after the hold
+over HTTP, and failpoints after the hold and after the commit followed by
+reconciliation and a retry.
+
+#### Proposal decisions
+
+1. **Unverifiable selections.** A passage of an existing rendition, a reference to an
+   existing passage and a structured value outside a retained JSON revision of the
+   same batch answer `incomplete-evidence`, because this step cannot yet verify them
+   against retained content. Roadmap item NEW-ITEM-2 tracks their verification.
+2. **Holds in other datasets.** A stored fact of another dataset is verified but not held.
+   Roadmap item NEW-ITEM-1 tracks holding it under the operation.
+3. **Records of an earlier protection.** A detach and a new protection invalidate the
+   records written before them, which then answer `origin-not-reproduced`. Roadmap item
+   NEW-ITEM-3 tracks an administered re-authentication.
+4. **Blank nodes.** Record content refuses blank nodes, except in a stored fact's
+   expected triple, so that the record digest and the conflict check compare ground
+   content.
+5. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
+   and the bindings for roadmap item 509.
+
+Roadmap item 81 retains the rest of this contract. Phase 2 adds guarded metadata,
 review, support ownership, projections and reversible identity decisions. The shared
 managed-write and admission boundary described above is the one C26 reuses for its
 control graphs. Phase 3 integrates the new records with C17/C18, F22 and C22.

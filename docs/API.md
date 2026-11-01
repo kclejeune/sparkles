@@ -12201,14 +12201,20 @@ graphs that the [evidence settings](#evidence-settings) give a role other than
 `projections` and that the profile protects now. A copy in an ordinary or detached graph
 is not a profile record. A record has exactly one `ev:availabilityReceipt`, whose
 `ev:datasetId` and `ev:branchId` name this dataset and one of its branches and whose
-`ev:commit` names the publishing commit. `kinds` limits the record's kind, and
+`ev:commit` names the publishing commit. The receipt is the `ev:Operation` of the
+[proposal](#evidence-proposals) that published the record, and its one
+`ev:graphProtection` in the record's graph is that graph's current protection nonce. A
+record written while its graph was detached cannot carry the nonce of the protection in
+force, so it answers `origin-not-reproduced`, as do the records of an earlier protection
+once the graph is detached and protected again. `kinds` limits the record's kind, and
 `contentDigest` is compared with the record's `ev:contentDigest`. A passage's
 `oa:hasSelector` start and end are checked as Unicode code point offsets against its
 rendition's `ev:normalizedText`, and the digest of the selected text against its
 `ev:textDigest`.
 
 The answer `200` is `{"resolved": [...]}` with each reference in order, its `key` and
-its verified `storedFact` or `record`. The first reference that does not verify stops
+its verified `storedFact` or `record`. A record's `recordDigest` is the digest of its
+immutable content that its proposal recorded. The first reference that does not verify stops
 the request, and the answer is `{error, code, reference}`.
 
 | Status and code | Meaning |
@@ -12217,7 +12223,7 @@ the request, and the answer is `{error, code, reference}`.
 | `422 incomplete-evidence` | Verification stopped within the 64 MiB resolution limit, or the caller's access policy cannot be prepared within it. This is not a finding that the fact is absent. |
 | `422 unanchored-evidence` | A triple with blank nodes has no stable reifier, or its reifier reifies more than one triple. |
 | `422 span-mismatch` | A passage selector or text digest does not match its rendition's retained text. |
-| `422 origin-not-reproduced` | A record's receipt is missing or names another dataset or an unknown branch. |
+| `422 origin-not-reproduced` | A record's receipt is missing, names another dataset or an unknown branch, or does not carry its graph's current protection. |
 | `409 immutable-record-conflict` | A record has another kind or digest than the reference expects, or is stored more than once. |
 
 A malformed reference is a `400` with code `invalid-reference` whose message starts with
@@ -12227,6 +12233,89 @@ prepares the caller's view of it once, within a 64 MiB allowance shared by all i
 references. That allowance charges up to 2 KiB for each quad in a state's unindexed
 delta, so a state with tens of thousands of recent writes that compaction has not yet
 folded in may answer `incomplete-evidence`.
+
+### Evidence proposals
+
+`POST /{ds}/claims` publishes one batch of [evidence profile](ai/README.md#evidence-profile)
+records as one commit: source revisions, renditions and passages, evidence references,
+claim occurrences, evidence links and assessments. Claims describe their propositions
+and never assert them. The route needs `write` on the dataset or branch through the
+update endpoint and counts as an update. The design is in
+[C25 §5 and §7](specs/C25-evidence-and-assessments.md#5-writes-review-and-accepted-projections).
+
+```json
+{
+  "idempotencyKey": "bulletin-2026-01",
+  "revisions": [{"key": "rev", "source": "https://example.org/bulletin",
+                 "sourceKey": "bulletin", "content": {"text": "Release 1.2 is affected."},
+                 "publishedAt": "2026-01-01T10:00:00Z"}],
+  "references": [{"key": "fact", "occurrenceKey": "inventory", "storedFact": {
+    "datasetId": "6f1c…", "branchId": "6f1c…", "commit": 42,
+    "graph": "https://example.org/inventory",
+    "triple": "<https://example.org/host> <https://example.org/runs> <https://example.org/release>"}}],
+  "claims": [{"key": "claim", "occurrenceKey": "c1", "revision": {"key": "rev"},
+              "proposition": "<https://example.org/release> <https://example.org/affectedBy> <https://example.org/cve>",
+              "kind": "reported", "polarity": "positive",
+              "author": "https://example.org/publisher"}],
+  "links": [{"key": "link", "occurrenceKey": "l1", "target": {"key": "claim"},
+             "evidence": {"key": "fact"}, "relation": "supports",
+             "author": "https://example.org/importer"}]
+}
+```
+
+A record names another record of the batch as `{"key"}` and an existing authenticated
+record as `{"iri"}`. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of content
+that is not retained. A proposition, scope value, rights term and conclusion is an
+N-Triples term without blank nodes. A stored fact has the form of
+[evidence resolution](#evidence-resolution). `ifHead`, `dryRun` and `message` have their
+usual meanings, and `sourceGraph` and `proposalGraph` choose among the settings' graphs
+when a role has more than one. A batch holds at most 1,000 claims, 10,000 links and
+16 MiB of decoded input, in a body of at most 24 MiB.
+
+Source revisions, renditions and passages go to the
+[evidence settings'](#evidence-settings) source-record graph, and the other records to
+the proposal graph. The caller needs update grants on every graph the batch writes, and
+read access to every record and stored fact it references, decided as evidence
+resolution decides it. A reference the caller cannot read answers as a missing one.
+Record IRIs are `urn:uuid:` identities derived from the dataset, the authenticated
+caller, what the record belongs to and its occurrence key, so the same caller publishing
+the same occurrence again names the same record.
+
+The server sets every field a client cannot be trusted with. Each record names the
+operation as its `ev:availabilityReceipt` and `prov:wasGeneratedBy`, and records the
+`ev:recordDigest` of its immutable content. A source revision's `ev:firstAvailableAt` is
+the commit's own time. The operation is an `ev:Operation` and `prov:Activity` whose
+`prov:wasAssociatedWith` is the caller, `urn:x-sparkles:principal:` followed by its
+log name. It records the dataset, branch and commit, the payload digest, the
+idempotency key, the source hold and each written graph's protection nonce. The stored
+facts of this dataset that the batch references are kept by a durable
+[source hold](#evidence-holds) named by the operation before the commit. Stored facts of
+other datasets are verified but not held.
+
+The answer `200` is `{operation, committed, replayed, commit, branchId,
+firstAvailableAt, hold, records}`, and each record is `{key, kind, iri, graph,
+recordDigest, existing}`. A record already published with equal content by an earlier
+operation is not written again and has `existing: true`. A repeated `idempotencyKey`
+with the same payload answers the first receipt with `replayed: true` and writes
+nothing. A dry run answers `committed: false` and `dryRun: {wouldCommit, inserted,
+deleted, error}`, and holds nothing.
+
+| Status and code | Meaning |
+|---|---|
+| `400 invalid-proposal`, `400 invalid-reference` | The body is malformed, or a field is invalid or inconsistent. The message names the field. |
+| `403` | The caller may not update a graph the batch writes. |
+| `409 head-changed` | `ifHead` is not the branch head. |
+| `409 idempotency-conflict` | The key was used with a different payload. |
+| `409 immutable-record-conflict` | A record identity already holds other content, or content that is not an authenticated record. |
+| `409 hold-conflict` | An earlier attempt of the operation holds other commits. |
+| `409 unsupported-profile` | The profile is not enabled, or a written graph is detached. |
+| `422` | A reference does not verify, with the codes of evidence resolution. A passage of an existing rendition and a structured value outside a retained JSON revision of the batch are `incomplete-evidence`. |
+| `503 authority-changed` | The caller's credential was revoked, expired or the access policy changed before the commit published. |
+
+A refusal writes nothing. A failure after the hold was acquired leaves the hold without
+an operation. The next published proposal releases such a hold once it is an hour
+old, and a retry with the same idempotency key acquires it again meanwhile. Capability discovery is in `GET /$/server`,
+whose `capabilities.claims` lists the profile versions this build serves.
 
 ### Suggested examples
 
