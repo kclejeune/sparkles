@@ -265,7 +265,11 @@ fn main() {
                 }
             }
         }
-        eprintln!("round {} of {rounds} done", round + 1);
+        let (tables, bytes, hits, misses) = sparkles_reasoner::tables::stats();
+        eprintln!(
+            "round {} of {rounds} done; derived-table cache: {tables} tables, {bytes} bytes, {hits} hits, {misses} misses",
+            round + 1
+        );
     }
 
     let median = |v: &[f64]| {
