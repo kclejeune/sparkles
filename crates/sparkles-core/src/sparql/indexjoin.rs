@@ -1489,7 +1489,7 @@ fn read_ranges_gallop(
                         end += 1;
                     }
                     if end > s + 1 {
-                        segment_part(ctx, idx, ranges, (r, x), mask, Some((s, end)), &mut looked)
+                        segment_part(ctx, idx, ranges, (r, x), mask, Some((s, end)), &mut looked)?
                     } else {
                         *cp
                     }
@@ -1498,11 +1498,11 @@ fn read_ranges_gallop(
                 // whole when it was read
                 (Some((cb, cp, _)), _) if *cb == x && *cp != 0 => {
                     let span = idx.segment_span(x, &lo, &hi);
-                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)
+                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)?
                 }
                 _ => {
                     let span = idx.read_span(&ctx.snap.cache, x, &lo, &hi, mask);
-                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)
+                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)?
                 }
             };
             let from = match &cur {
@@ -1573,10 +1573,10 @@ fn read_ranges_gallop(
 
 /// The part of block `x` that the reader of range `r` holds next: 0 for the whole
 /// columns, or one more than the first segment of `span`. At the first range of a block
-/// whose span has a cold segment, it reads the block whole when the ranges ahead read much of it
-/// ([`dense_ahead`]), instead of segment by segment until it turns dense, which a join of
-/// more ranges than its prefetch takes (`PREFETCH_RANGES`) would otherwise do in every
-/// block. `looked` keeps that walk to once per block.
+/// whose span has a cold segment, it reads the block whole when the ranges ahead read
+/// much of it ([`dense_ahead`]), instead of segment by segment until it turns dense,
+/// which a join of more ranges than its prefetch takes (`PREFETCH_RANGES`) would
+/// otherwise do in every block. `looked` keeps that walk to once per block.
 fn segment_part(
     ctx: &Ctx,
     idx: &crate::index::PermIndex,
@@ -1585,45 +1585,55 @@ fn segment_part(
     mask: ColMask,
     span: Option<(usize, usize)>,
     looked: &mut usize,
-) -> usize {
+) -> Result<usize> {
     let Some((s0, s1)) = span else {
-        return 0;
+        return Ok(0);
     };
     // a range's span starts at the segment before its first key's, which a reader of the
     // range before has often just read, so any cold segment of the span counts
     if *looked != x && (s0..s1).any(|s| !ctx.snap.cache.has_segment(idx, x, s, mask)) {
         *looked = x;
-        if dense_ahead(idx, ranges, r, x) {
+        if dense_ahead(ctx, idx, ranges, r, x)? {
             idx.mark_dense(x);
-            return 0;
+            return Ok(0);
         }
     }
-    s0 + 1
+    Ok(s0 + 1)
 }
 
 /// Whether the ranges from `r` on that lie in block `x` read more than a quarter of its
 /// segments, so that the reader should read the block whole now instead of reading
 /// segments one by one until the block turns dense (spec X07 §6.5). Ranges come in key
 /// order, so the walk stops at the first range past the block, or as soon as the answer
-/// is known.
-fn dense_ahead(idx: &crate::index::PermIndex, ranges: &Ranges, r: usize, x: usize) -> bool {
+/// is known. Many ranges in a few segments make a long walk, which checks the request
+/// every `PREFETCH_CHECK_STEPS` ranges.
+fn dense_ahead(
+    ctx: &Ctx,
+    idx: &crate::index::PermIndex,
+    ranges: &Ranges,
+    r: usize,
+    x: usize,
+) -> Result<bool> {
     let limit = idx.dense_limit(x);
     let last = idx.blocks[x].last;
     let mut seen = 0u64;
     for i in r..ranges.len() {
+        if (i - r) % PREFETCH_CHECK_STEPS as usize == PREFETCH_CHECK_STEPS as usize - 1 {
+            ctx.check()?;
+        }
         let (lo, hi) = ranges.get(i);
         if lo > last {
             break;
         }
         match idx.segment_span(x, &lo, &hi) {
-            None => return true,
+            None => return Ok(true),
             Some((s0, s1)) => seen |= ((1u64 << (s1 - s0)) - 1) << s0,
         }
         if seen.count_ones() as usize > limit {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Append row `k` of range `r` to its pattern's table if it passes `rule` (see
@@ -2432,6 +2442,7 @@ mod dense_ahead_tests {
         let b = (0..idx.blocks.len())
             .find(|&b| idx.segment_count(b).is_some_and(|n| n >= 8))
             .expect("a block of 8 segments or more");
+        let ctx = Ctx::new(snap.clone());
         let blk = idx.decode_block(b).unwrap();
         let p = blk.key(0)[0];
         let subjects: Vec<u64> = (0..blk.len()).map(|y| blk.key(y)[1]).collect();
@@ -2443,27 +2454,39 @@ mod dense_ahead_tests {
             prefix: &[p],
             keys: &spread,
         };
-        assert!(dense_ahead(idx, &ranges, 0, b));
+        assert!(dense_ahead(&ctx, idx, &ranges, 0, b).unwrap());
         // keys in the first segment only, and a single key, read their segments
         let first: Vec<u64> = subjects[..rows.min(50)].to_vec();
         let ranges = Ranges::Keys {
             prefix: &[p],
             keys: &first,
         };
-        assert!(!dense_ahead(idx, &ranges, 0, b));
+        assert!(!dense_ahead(&ctx, idx, &ranges, 0, b).unwrap());
         let one = [subjects[rows * 2]];
         let ranges = Ranges::Keys {
             prefix: &[p],
             keys: &one,
         };
-        assert!(!dense_ahead(idx, &ranges, 0, b));
+        assert!(!dense_ahead(&ctx, idx, &ranges, 0, b).unwrap());
         // the walk starts at the range it is given: from the last key of the spread on,
         // only one segment is left
         let ranges = Ranges::Keys {
             prefix: &[p],
             keys: &spread,
         };
-        assert!(!dense_ahead(idx, &ranges, spread.len() - 1, b));
+        assert!(!dense_ahead(&ctx, idx, &ranges, spread.len() - 1, b).unwrap());
+        // a long walk over many ranges in few segments answers a cancelled request
+        let few: Vec<u64> = subjects[..rows].to_vec();
+        let ranges = Ranges::Keys {
+            prefix: &[p],
+            keys: &few,
+        };
+        ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(few.len() > PREFETCH_CHECK_STEPS as usize);
+        assert!(matches!(
+            dense_ahead(&ctx, idx, &ranges, 0, b),
+            Err(Error::Cancelled)
+        ));
     }
 
     /// The segments of block `b` that the cache holds one by one.

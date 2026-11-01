@@ -164,3 +164,24 @@ fn a_restart_reads_the_list_the_last_run_recorded() {
     );
     assert!(query(&s).contains("\"v777\""));
 }
+
+#[test]
+fn an_interval_under_a_second_or_too_large_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    for bad in ["0", "1e-12", "0.5", "-3", "NaN", "inf", "1e20"] {
+        let out = Command::new(BIN)
+            .args(["serve", "--host", "127.0.0.1", "--port", "0", "--mem", "ds"])
+            .arg("--data")
+            .arg(tmp.path().join("data"))
+            .arg("--prewarm")
+            .arg(format!("--prewarm-interval={bad}"))
+            .env_remove("SPARKLES_AUTH_CONFIG")
+            .env_remove("SPARKLES_BACKUP_CONFIG")
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{bad} was accepted");
+        assert!(err.contains("--prewarm-interval"), "{bad}: {err}");
+    }
+}

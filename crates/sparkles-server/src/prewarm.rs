@@ -2,44 +2,78 @@
 //! read it again in the background after the next start is ready.
 //!
 //! The worker thread waits until the server is ready, prewarms each dataset in turn at a
-//! low CPU priority, and then records the lists every `interval`. The shutdown records
-//! them once more after the requests have drained ([`record_all`]).
+//! low CPU priority, and then records the lists every `interval`. The shutdown stops and
+//! joins it, and then records the lists once more after the requests have drained
+//! ([`record_all`]).
 
 use crate::state::{AppState, DbType};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Start the worker. It ends when the server begins to drain.
-pub fn start(st: Arc<AppState>, interval: Duration) {
+/// The worker thread, which [`Worker::stop_and_join`] ends before the server tears down.
+/// The thread holds the server's state, so a detached one would keep the datasets from
+/// closing when the process exits.
+pub struct Worker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    /// Tell the worker to stop and wait for it. A prewarm or recording in progress stops at
+    /// its next check.
+    pub fn stop_and_join(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Start the worker. It stops when the server begins to drain or [`Worker::stop_and_join`]
+/// asks it to.
+pub fn start(st: Arc<AppState>, interval: Duration) -> Option<Worker> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
     let spawned = std::thread::Builder::new()
         .name("prewarm".into())
-        .spawn(move || run(&st, interval));
-    if let Err(e) = spawned {
-        tracing::warn!("--prewarm: the worker thread did not start: {e}");
+        .spawn(move || run(&st, interval, &flag));
+    match spawned {
+        Ok(handle) => Some(Worker {
+            stop,
+            handle: Some(handle),
+        }),
+        Err(e) => {
+            tracing::warn!("--prewarm: the worker thread did not start: {e}");
+            None
+        }
     }
 }
 
-fn draining(st: &AppState) -> bool {
-    st.phase() == crate::obs::Phase::Draining
+fn stopped(st: &AppState, stop: &AtomicBool) -> bool {
+    stop.load(Ordering::SeqCst) || st.phase() == crate::obs::Phase::Draining
 }
 
-fn run(st: &AppState, interval: Duration) {
+fn run(st: &AppState, interval: Duration, stop: &AtomicBool) {
     while st.phase() == crate::obs::Phase::Starting {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    if draining(st) {
+    if stopped(st, stop) {
         return;
     }
     lower_priority();
     let t0 = Instant::now();
     for (name, ds) in st.datasets() {
-        if draining(st) {
+        if stopped(st, stop) {
             return;
         }
         if ds.kind != DbType::Persistent {
             continue;
         }
-        match ds.store.prewarm(&|| draining(st)) {
+        match ds.store.prewarm(&|| stopped(st, stop)) {
             Ok(done) => match &done.skipped {
                 None => tracing::info!(
                     "prewarm of /{name} finished: {} block parts and {:.1} MiB of pages in {:.1} ms",
@@ -61,7 +95,7 @@ fn run(st: &AppState, interval: Duration) {
     loop {
         let next = Instant::now() + interval;
         while Instant::now() < next {
-            if draining(st) {
+            if stopped(st, stop) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(250).min(interval));

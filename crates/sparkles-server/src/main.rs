@@ -3252,9 +3252,11 @@ fn run() -> Result<()> {
             rayon::broadcast(|_| ());
             alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
-            if prewarm && !(prewarm_interval.is_finite() && prewarm_interval > 0.0) {
-                bail!("--prewarm-interval expects a positive number of seconds");
-            }
+            // at least a second, and small enough for an `Instant` deadline
+            let prewarm_interval = match Duration::try_from_secs_f64(prewarm_interval) {
+                Ok(d) if (1.0..=1e9).contains(&prewarm_interval) => d,
+                _ => bail!("--prewarm-interval expects a number of seconds from 1 to 1e9"),
+            };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)
                 .enable_all()
@@ -3279,6 +3281,8 @@ fn run() -> Result<()> {
             let startup_slot: Arc<parking_lot::Mutex<Option<startup::Startup>>> =
                 Default::default();
             let startup_after = startup_slot.clone();
+            let prewarm_slot: Arc<parking_lot::Mutex<Option<prewarm::Worker>>> = Default::default();
+            let prewarm_after = prewarm_slot.clone();
             let mut open_options = startup::Options::default();
             if let Some(n) = open_threads {
                 open_options.threads = n as usize;
@@ -3389,7 +3393,7 @@ fn run() -> Result<()> {
                     });
                 let stop_opening = opening.stop_flag();
                 if prewarm {
-                    prewarm::start(st.clone(), Duration::from_secs_f64(prewarm_interval));
+                    *prewarm_slot.lock() = prewarm::start(st.clone(), prewarm_interval);
                 }
                 *startup_slot.lock() = Some(opening);
                 let st2 = st.clone();
@@ -3483,6 +3487,10 @@ fn run() -> Result<()> {
             }
             auth::flush(&st_after);
             if prewarm {
+                // the worker holds the server's state: it ends before the last recording
+                if let Some(w) = prewarm_after.lock().take() {
+                    w.stop_and_join();
+                }
                 prewarm::record_all(&st_after);
             }
             // flush spans and metrics of the last requests (bounded)
