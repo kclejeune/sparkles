@@ -9,7 +9,8 @@ the same format, and `--loc DIR` runs a set against a database.
 ## Public sets
 
 `scripts/qald9plus-convert` converts the 150 questions of the QALD-9-plus DBpedia test
-split. `scripts/text2sparql-convert --set db25` converts the 100 DBpedia questions of
+split, and `--split train` converts the 408 questions of its training split, whose IDs
+start with `qald9p-train-`. `scripts/text2sparql-convert --set db25` converts the 100 DBpedia questions of
 Text2SPARQL'25, and `--set ck25` the 50 questions over CK25, the challenge's corporate
 graph. `scripts/lcquad2-convert` converts the 6,046 questions of the LC-QuAD 2.0 test
 split over Wikidata, and `--sample N` keeps a fixed sample of them. Each converter pins
