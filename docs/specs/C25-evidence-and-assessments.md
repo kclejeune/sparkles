@@ -556,9 +556,9 @@ checks the restored identity separately from original-identity rollback. Existin
 without a known expected UUID retain the supported legacy metadata upgrade only when
 CURRENT already exists.
 
-These checks establish runtime closure only. Durable source holds and consumer release,
-operational observation, privacy visibility, typed writes and C25/C26 consumer
-composition remain separate dependencies.
+These checks establish runtime closure only. Operational observation, privacy
+visibility, typed writes and C25/C26 consumer composition remain separate dependencies.
+Durable source holds are described below.
 
 The managed-write boundary and its reader admission are available as the first Phase 2
 step. `sparkles_core::managed` defines owner kinds, a `ManagedGraphs` registry and a
@@ -689,6 +689,73 @@ The open questions of this step were decided as follows.
 9. **Vocabulary.** Terms for supports, withdrawals, resolution maps, operations and
    receipts are added with the operations that write those records, so that their
    shapes and fixtures are tested against real output.
+
+Durable source holds are the third Phase 2 step. `sparkles_core::holds` records in
+`holds.json` format 1 at the dataset root the commits that owners keep readable on
+`main` and every branch. A hold has an owner-chosen UUID, its owner, its creation time
+and a sorted set of commits, each named by the branch identity the caller gave and the
+branch store whose history serves it. A commit at or below a branch's starting point is
+served by its upstream. Together the holds of a dataset name at most 65,536 commits, and
+the file is refused above 32 MiB. `Store::acquire_hold`, `Store::release_holds`,
+`Store::source_holds` and `Store::reconcile_holds` change and list them through the main
+store, and `sparkles::evidence` and `/$/evidence/{ds}/holds` expose the evidence owner's
+holds to administrators. Acquiring the same hold again returns it, and other commits
+under its id are a `hold-conflict`. The first hold raises the dataset reader to 6, which
+already marks managed graphs, so a release that does not honor holds refuses the dataset
+instead of trimming held history.
+
+Every collector keeps a held commit. Each store's history state reads the family's held
+commits from one lock-free index when it decides which generations it needs, so the
+retention window and its generation and byte limits, compaction, retention changes,
+backup lease releases, branch deletions and the history tick keep every generation that
+serves a held commit. `sparkles check` counts holds among the generations it reports as
+retained. An in-memory store keeps the held states beside its window. A branch that a
+hold names is refused deletion as `branch-held`, and `DeleteOptions::release_holds`,
+`?releaseHolds=true` and `sparkles branch delete --release-holds` release those holds
+first. Releasing holds through a branch deletion needs `admin`. Holds of a retired
+upstream stay, since only a branch that started from it can name them.
+
+The ordering argument is as follows. An acquisition resolves the commits under the
+branch table, opens the stores that serve them, and then takes the table and the holds'
+lock, so that no named branch is deleted meanwhile. It publishes the new index first and
+then checks, under each serving store's history lock, that every commit is still
+readable. A collection decides what to remove and removes it from the generation table
+under the same history lock, reading the index there. Either the collection decided
+before the index was published, and the check then finds the commit gone and the
+acquisition fails with `history-gone` and restores the index, or the collection reads
+the new index and keeps the commit. The acquisition then raises the reader and replaces
+`holds.json` atomically, and returns only after the file and its directory are synced.
+It installs the hold as soon as the file is replaced, so the running store never
+protects less than the file records. A crash before the replacement leaves no hold, and
+a crash after it leaves the complete hold. A release replaces `holds.json` without the
+hold before it narrows the index, so a crash leaves either the hold in force or the
+hold gone. A branch deletion that releases holds makes the release durable before the
+branch table's commit point, so a crash in between leaves the branch without its holds.
+The lock order is a branch table, then the holds' lock, then a store's history.
+Acquisitions never take a writer lock, and collectors never take the holds' lock.
+
+An owner acquires its holds before the commit that refers to them. When that commit
+never publishes, the hold is an orphan. `Store::reconcile_holds` asks the owner about
+each of its holds older than a grace period, one hour by default, outside every lock and
+releases those it does not keep, unless the hold was acquired again meanwhile. The
+typed evidence operations supply that check when they record references. A
+`holds.json` that cannot be read or names another dataset keeps every past state and
+refuses hold changes and branch deletions with `holds-unavailable`, while reads and
+writes continue. A newer format refuses the open. Backups and clones carry no holds,
+because they carry no past states, and deleting a dataset deletes its holds. The file
+is rewritten whole for each change, which costs up to a few megabytes of writing at the
+bound. That keeps one atomic commit point per change.
+
+Tests cover reopening, compaction, the retention window with its byte limit and the
+tick, idempotent and conflicting acquisitions, refusals that record nothing, branch
+commits held in their upstream, branch deletion with and without released holds, an
+in-memory dataset and its branches, reconciliation with its grace period and failing
+checks, the exact 65,536-commit bound and its reopening, unreadable, foreign and newer
+files, offline retention, and crashes at every acquisition step, during a release and
+between a released hold and its branch deletion. A concurrency test races acquisitions
+and releases with commits and compactions and finds no held commit unreadable. HTTP
+tests cover acquisition, idempotence, paging, branch filters, deletion of a held
+branch, release and each refusal.
 
 Roadmap item 81 retains the rest of this contract. Phase 2 adds typed source, reference
 and claim creation with authenticated availability and guarded metadata, exact retained

@@ -3918,7 +3918,7 @@ including `main`.
 | POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
 | PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
-| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. A caller whose grants are limited to some graphs may delete only the scratch branches it created. |
+| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. A branch that an [evidence hold](#evidence-holds) names is refused with `409 branch-held`, and `?releaseHolds=true`, which needs `admin`, releases those holds first. Answers `204`. A caller whose grants are limited to some graphs may delete only the scratch branches it created. |
 | POST | `/$/branches/{ds}/{name}/relink` | Moves a linked branch onto `main`'s current index and answers the `RelinkResult`. See [Relinking](#relinking). |
 
 A read-only server (`serve --read-only`) refuses every route that changes branches with
@@ -4828,7 +4828,7 @@ type HistoryStatus = { dataset: string; datasetId: string; head: number;
   oldestReconstructable: number | null; reconstructable: { from: number; to: number }[];
   bytes: number;   // disk of kept non-current generations
   generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
-                 current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention"
+                 current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention", "source-holds"
   retention: Retention; schedules: Schedule[]; snapshots: number;
   catalog: { keepCommits: number | null; keepAge: string | null;   // the catalog horizon
              firstRetained: number };                              // the oldest commit listed
@@ -4842,6 +4842,8 @@ type HistoryStatus = { dataset: string; datasetId: string; head: number;
 
 A pin at the head costs nothing, because the next generation starts at that commit. A pin
 inside a generation keeps the whole generation, so its other commits stay readable too.
+[Evidence holds](#evidence-holds) keep generations the same way, listed as
+`source-holds`, and while `holds.json` cannot be read every generation is listed so.
 Removing a generation first renames it to `gen-NNNN.deleting`, so an interrupted removal
 is finished at the next open. `GET /$/commits/{ds}` adds `oldestReconstructable` and
 `reconstructable`, plus `reconstructable` and `snapshots` on each commit.
@@ -11878,6 +11880,43 @@ what it already holds or what was written while it was detached. A graph that th
 profile does not protect is a `404`. A detach refuses with `503 managed-unavailable`
 and changes nothing when this build cannot read the recorded settings. A registry that this build cannot enforce answers
 `503 managed-unavailable` on all three routes.
+
+### Evidence holds
+
+An evidence reference names a commit of a dataset branch by the branch's identity. A
+durable source hold keeps such commits readable. History trimming, the retention window
+and its limits, compaction and generation retirement keep the generations that serve a
+held commit, and an in-memory dataset keeps the held states. The holds of a dataset and
+all its branches are kept in `<db>/holds.json` as format 1, and in the process for an
+in-memory dataset. Together they name at most 65,536 commits. The design is in
+[C25 §7](specs/C25-evidence-and-assessments.md#7-configuration-access-and-retention).
+
+| Method and path | Needs | Effect |
+|---|---|---|
+| `GET /$/evidence/{ds}/holds` | `admin` | `{holds, next, heldCommits, maxCommits}`, the evidence holds by id. `?branch=NAME` lists the holds that name a branch, and `?after=ID&limit=N` pages them, with at most 1,000 in a page. |
+| `POST /$/evidence/{ds}/holds` | `admin` | Acquires `{id?, commits: [{branch?, branchId?, commit}]}` and answers `201` with the hold. |
+| `DELETE /$/evidence/{ds}/holds/{id}` | `admin` | Releases the hold, `204`, or `404` when there is none. |
+
+A hold is `{id, owner, created, commits}`, and each commit is `{branch, branchId,
+commit}`, where `branch` is `null` once the branch is deleted. A request names each
+commit's branch by `branch`, by `branchId` as an evidence reference does, or by neither
+for `main`. A commit at or below a branch's starting point is held in its upstream's
+history. A hold without an `id` gets a random one. The hold is durable when the answer
+arrives, and the first hold raises the dataset reader to 6. The same `id` with the same
+commits answers `200` with the existing hold. Other commits under that `id` are a `409`
+with code `hold-conflict`, and more than 65,536 held commits in the dataset are a `409`
+with code `holds-limit`. A commit that is no longer readable is `410 history-gone`, and
+a branch that is not listed is `404 no-such-branch`. A failed acquisition records
+nothing. A release is durable before the commits it held can be collected, and the next
+collection removes what only the hold kept.
+
+A branch that a hold names is deleted only with `?releaseHolds=true`, which releases
+those holds first. Deleting a dataset deletes its holds. Backups and clones do not carry
+holds, as they do not carry past states. A `holds.json` that cannot be read or belongs
+to another dataset keeps every past state of the dataset and its branches until it is
+repaired, and acquisitions, releases and branch deletions answer `503
+holds-unavailable` meanwhile. A `holds.json` of a newer format refuses the dataset's
+open.
 
 ### Suggested examples
 

@@ -242,6 +242,17 @@ configuration never stops protecting a graph. A graph leaves protection only thr
 configuration protects it again. Protection does not authenticate what a graph already
 holds. The typed operations that will use these settings remain under item 81.
 
+[Evidence holds](../API.md#evidence-holds) keep the commits that evidence references
+name readable. A hold names commits of `main` or any branch by the branch's identity, and
+history trimming, retention limits, compaction and generation retirement keep those
+commits until the hold is released. A held branch is deleted only by a deletion that
+releases its holds. Administrators acquire, list and release holds through
+`/$/evidence/{ds}/holds`, and Rust applications use `sparkles::evidence::acquire_hold`,
+`holds`, `release_hold` and `reconcile_holds`. The last releases old holds that the
+evidence owner no longer needs, such as those of an operation whose commit never
+published. The typed operations of item 81 will acquire holds for the references they
+record.
+
 Rust importers can prepare typed batches with `sparkles_core::evidence::prepare_input`.
 It checks local content digests and retained text or JSON selectors within its bounds.
 The result keeps explicit requirements for references needing authorized runtime
