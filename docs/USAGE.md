@@ -4580,6 +4580,17 @@ summary and the usage of each model call, and `--events` prints each step as a J
 as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
 out.
 
+`--questions FILE` asks every question of a JSON-lines file in place of the question
+argument, or of standard input with `-`. Each line is `{"id", "question",
+"clarification"?, "tryHarder"?, "modelSecrets"?}`, and the command prints one JSON
+result per line with its `id`, in input order. The store and the model configuration
+open once, so caches stay warm across the questions as they do in a running server.
+`--jobs N` asks up to N questions at once. Every other option applies to each question,
+and each keeps its own deadline, token budget and query memory budget. A line that is
+invalid or fails gets its own error result while the rest go on. A line's
+`modelSecrets`, as `NAME=SOURCE` strings, replace the `--model-secret` of the same name
+for that question.
+
 Each query of an Ask runs under a memory budget of 2048 MiB, as in `sparkles mcp`, and
 `--query-memory-mb N` changes it, with `0` for no budget. On a database of more than ten
 million quads, the schema that grounds the question and checks the query comes from the
