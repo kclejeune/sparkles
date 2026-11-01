@@ -665,10 +665,9 @@ dataset's `send` policy lets the draft and repair providers receive rows.
 `scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
 file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1
 Sol through the Chat Completions API under a wallet of its own, capped at USD 50 per
-ledger. The proxy prices
-OpenAI's cache reads and writes, checks the model that served each reply for both
-providers, and its ledger, now format version 3, names its provider. Model
-configurations take `reasoningEffort`, which an `openai` model sends as
+ledger. The proxy prices OpenAI's cache reads and writes, checks the model that served
+each reply for both providers, and its ledger, now format version 3, names its provider.
+Model configurations take `reasoningEffort`, which an `openai` model sends as
 `reasoning_effort` with `max_completion_tokens` and an `anthropic` model as
 `output_config.effort`, and an OpenAI answer's cached and written prompt tokens count
 as cache reads and writes. Sonnet 5.5 cache reads cost $0.10 per million in the proxy,
