@@ -167,6 +167,9 @@ struct Op {
     marks: FxHashMap<u64, u32>,
     /// given back to the ordinary evaluator
     off: bool,
+    /// the charge of `marks` and of the base's cached counts of the predicates the
+    /// operator has probed, which both last for the run: it only grows
+    kept: Option<Held>,
 }
 
 /// What one closure step did.
@@ -185,8 +188,6 @@ pub(crate) struct Closures {
     /// `rdf:first` and `rdf:rest` when a rule reads lists: a derived fact of either makes
     /// what the list builtins read depend on when it appears
     lists: Option<[u64; 2]>,
-    /// the charge of the operators' marks and of the counts they probe
-    held: Option<Held>,
 }
 
 /// A run with closure operators derived list structure that rules read, so it starts
@@ -328,6 +329,7 @@ impl Closures {
                 irreflexive,
                 marks: FxHashMap::default(),
                 off: false,
+                kept: None,
             };
             if let Over::Fixed(c) = over
                 && let Some(&(si, _)) = syms.iter().find(|s| s.1 == c)
@@ -343,12 +345,7 @@ impl Closures {
             op.rules.retain(|&r| taken.insert(r));
         }
         ops.retain(|op| !op.rules.is_empty());
-        (!ops.is_empty()).then_some(Closures {
-            ops,
-            start,
-            lists,
-            held: None,
-        })
+        (!ops.is_empty()).then_some(Closures { ops, start, lists })
     }
 
     /// Whether rule `ri` is evaluated by an operator now.
@@ -386,20 +383,22 @@ impl Closures {
         self.check_lists(g)?;
         let start = self.start;
         let mut poll = Poll::new(cancel);
-        let held = self.held.get_or_insert_with(|| Held::new(budget));
         for op in &mut self.ops {
             if op.off {
                 continue;
             }
             let now = g.len();
-            let preds = op.predicates(g, now, budget, &mut poll)?;
+            // the predicates and their charge, kept while they are read
+            let (preds, _preds_held) = op.predicates(g, now, budget, &mut poll)?;
             // the marks the operator keeps and the base's cached count of each predicate
-            held.try_set(
-                table_bytes(
-                    op.marks.capacity().max(preds.len()),
-                    size_of::<(u64, u32)>(),
-                ) + table_bytes(preds.len(), size_of::<(u64, u64)>()),
-            )?;
+            let kept = op.kept.get_or_insert_with(|| Held::new(budget));
+            let want = table_bytes(
+                op.marks.capacity().max(preds.len()),
+                size_of::<(u64, u32)>(),
+            ) + table_bytes(preds.len(), size_of::<(u64, u64)>());
+            if want > kept.bytes() {
+                kept.try_set(want)?;
+            }
             let mut outs: Vec<Vec<Triple>> = Vec::new();
             let mut held = Held::new(budget);
             let mut done: Vec<u64> = Vec::new();
@@ -507,11 +506,11 @@ impl Op {
         now: u32,
         budget: &Arc<Budget>,
         poll: &mut Poll,
-    ) -> anyhow::Result<Vec<u64>> {
+    ) -> anyhow::Result<(Vec<u64>, Held)> {
         match self.over {
-            Over::Fixed(c) => Ok(vec![c]),
+            Over::Fixed(c) => Ok((vec![c], Held::new(budget))),
             Over::Guarded(gp, go) => {
-                // charged as it grows; the caller keeps a charge for its length after
+                // charged as it grows, and returned with the vector
                 let mut held = Held::new(budget);
                 let mut out: Vec<u64> = Vec::new();
                 if let Some(b) = g.base()
@@ -544,7 +543,7 @@ impl Op {
                 }
                 out.sort_unstable();
                 out.dedup();
-                Ok(out)
+                Ok((out, held))
             }
         }
     }

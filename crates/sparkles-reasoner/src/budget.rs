@@ -193,7 +193,6 @@ impl Held {
         Ok(h)
     }
 
-    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
