@@ -48,6 +48,18 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
     Some(state)
 }
 
+/// A coherent view of a dataset's managed-graph registry
+/// ([`Store::managed_snapshot`]).
+#[derive(Clone, Debug)]
+pub struct ManagedSnapshot {
+    pub graphs: ManagedGraphs,
+    /// Each owner's settings file, as the registry records it, or as found on disk
+    /// when the registry is unavailable.
+    pub settings: BTreeMap<OwnerKind, Arc<[u8]>>,
+    /// Why writes are refused until an owner is enabled again, when they are.
+    pub unavailable: Option<String>,
+}
+
 impl Store {
     fn managed_state(&self) -> Option<Arc<ManagedState>> {
         self.family.managed.load_full()
@@ -221,10 +233,85 @@ impl Store {
     /// it again. The owner keeps its other graphs and its settings. Dependent outputs
     /// are the owner's to mark unavailable.
     pub fn detach_managed(&self, owner: OwnerKind, graph: &str) -> Result<ManagedGraphs> {
+        self.detach_managed_checked(owner, graph, None)
+    }
+
+    /// [`detach_managed`](Self::detach_managed) only while the registry's revision is
+    /// still `expected`. Any other revision refuses with a conflict and writes nothing,
+    /// so a caller that checked the registry it read cannot detach under a newer one.
+    pub fn detach_managed_at(
+        &self,
+        owner: OwnerKind,
+        graph: &str,
+        expected: u64,
+    ) -> Result<ManagedGraphs> {
+        self.detach_managed_checked(owner, graph, Some(expected))
+    }
+
+    /// One coherent view of the dataset's registry: its graphs and the owner settings
+    /// files it records, from a single load. `None` without a registry. A registry
+    /// whose owner settings file does not match its digest, which enabling the owner
+    /// again repairs, is returned as recorded in `managed.json` with the settings files
+    /// on disk and [`ManagedSnapshot::unavailable`] set. Any other registry that cannot
+    /// be enforced fails with `managed-unavailable`.
+    pub fn managed_snapshot(&self) -> Result<Option<ManagedSnapshot>> {
+        let Some(state) = self.managed_state() else {
+            return Ok(None);
+        };
+        match &*state {
+            ManagedState::Installed(i) => Ok(Some(ManagedSnapshot {
+                graphs: i.graphs.clone(),
+                settings: i.settings.clone(),
+                unavailable: None,
+            })),
+            ManagedState::Unavailable {
+                reason,
+                repairable: true,
+            } => {
+                let recorded = self
+                    .managed_root()
+                    .map(|root| recorded_entries(&root))
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .flatten();
+                match recorded {
+                    Some(i) => Ok(Some(ManagedSnapshot {
+                        graphs: i.graphs,
+                        settings: i.settings,
+                        unavailable: Some(reason.clone()),
+                    })),
+                    None => Err(ManagedError::error(
+                        ManagedErrorKind::Unavailable,
+                        reason.clone(),
+                    )),
+                }
+            }
+            ManagedState::Unavailable { reason, .. } => Err(ManagedError::error(
+                ManagedErrorKind::Unavailable,
+                reason.clone(),
+            )),
+        }
+    }
+
+    fn detach_managed_checked(
+        &self,
+        owner: OwnerKind,
+        graph: &str,
+        expected: Option<u64>,
+    ) -> Result<ManagedGraphs> {
         self.change_managed(|current| {
             let Some(current) = current else {
                 return Err(not_enabled(owner));
             };
+            if let Some(expected) = expected
+                && expected != current.graphs.revision
+            {
+                return Err(Error::Conflict(format!(
+                    "the managed-graph registry is at revision {}, not {expected}; read it again",
+                    current.graphs.revision
+                )));
+            }
             let mut graphs = current.graphs.clone();
             let Some(entry) = graphs.owners.get_mut(&owner) else {
                 return Err(not_enabled(owner));

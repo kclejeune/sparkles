@@ -53,6 +53,7 @@ mod lock;
 #[cfg(test)]
 mod lock_tests;
 mod managed;
+pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod managed_tests;
 mod mem_history;

@@ -193,8 +193,8 @@ fn a_stale_registry_revision_is_refused() {
     assert_eq!(evidence::settings(&ds).unwrap().revision, 2);
 }
 
-/// Concurrent configurations either succeed one after another or refuse as stale, and
-/// a detach that races with a configuration is never undone by it.
+/// Concurrent configurations and a detach either succeed one after another or refuse
+/// as stale, and a committed detach is undone only by a configuration after it.
 #[test]
 fn concurrent_configuration_and_detach_keep_one_consistent_registry() {
     for _ in 0..20 {
@@ -219,23 +219,34 @@ fn concurrent_configuration_and_detach_keep_one_consistent_registry() {
             })
         };
         let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-        let detached = detacher.join().unwrap().unwrap();
-        for r in &results {
+        let detached = detacher.join().unwrap();
+        for r in results.iter().chain(std::iter::once(&detached)) {
             match r {
                 Ok(_) | Err(sparkles::Error::Conflict(_)) => {}
                 Err(e) => panic!("{e}"),
             }
         }
-        let succeeded = results.iter().filter(|r| r.is_ok()).count() as u64;
-        let status = evidence::settings(&ds).unwrap();
-        // every successful change raised the revision exactly once
-        assert_eq!(status.revision, 1 + succeeded + 1);
-        // the accepted graph is protected only if a configuration ran after the detach
-        let reattached = results
+        let mut committed: Vec<u64> = results
             .iter()
-            .any(|r| matches!(r, Ok(revision) if *revision > detached));
-        assert_eq!(status.managed.contains(&ACCEPTED.to_string()), reattached);
-        assert_eq!(insert(&ds, ACCEPTED).is_ok(), !reattached);
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        committed.extend(detached.as_ref().ok().copied());
+        committed.sort_unstable();
+        // each change answers the revision it committed, and every one raised it once
+        let expected: Vec<u64> = (2..2 + committed.len() as u64).collect();
+        assert_eq!(committed, expected);
+        let status = evidence::settings(&ds).unwrap();
+        assert_eq!(status.revision, 1 + committed.len() as u64);
+        // the accepted graph is unprotected only if the detach committed and no
+        // configuration committed after it
+        let unprotected = match &detached {
+            Ok(at) => !results
+                .iter()
+                .any(|r| matches!(r, Ok(revision) if revision > at)),
+            Err(_) => false,
+        };
+        assert_eq!(status.managed.contains(&ACCEPTED.to_string()), !unprotected);
+        assert_eq!(insert(&ds, ACCEPTED).is_ok(), unprotected);
     }
 }
 
@@ -272,5 +283,131 @@ fn persistent_settings_survive_reopen_and_unknown_versions_refuse_writes() {
     assert_eq!(
         code(evidence::configure(&ds, &reviewed(), &Control::none())),
         "managed-unavailable"
+    );
+}
+
+/// Detaching refuses before removing protection when the recorded settings cannot be
+/// read by this build, and leaves the revision and protection unchanged.
+#[test]
+fn detach_refuses_unreadable_recorded_settings_without_removing_protection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ds");
+    {
+        let ds = Dataset::open(&path).unwrap();
+        evidence::configure(&ds, &reviewed(), &Control::none()).unwrap();
+    }
+    // the same format and profile, with a member this build does not read
+    let canonical = reviewed().canonical(&Control::none()).unwrap();
+    let mut v: serde_json::Value = serde_json::from_slice(canonical.bytes()).unwrap();
+    v["future"] = 1.into();
+    let unknown = serde_json::to_vec(&v).unwrap();
+    std::fs::write(path.join("evidence.json"), &unknown).unwrap();
+    let managed = std::fs::read(path.join("managed.json")).unwrap();
+    let mut m: serde_json::Value = serde_json::from_slice(&managed).unwrap();
+    m["owners"]["evidence"]["settingsDigest"] = sparkles::managed::settings_digest(&unknown).into();
+    std::fs::write(path.join("managed.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+    let ds = Dataset::open(&path).unwrap();
+    let before = ds.store().managed_graphs().unwrap().unwrap();
+    assert_eq!(code(evidence::detach(&ds, ACCEPTED)), "managed-unavailable");
+    assert_eq!(ds.store().managed_graphs().unwrap().unwrap(), before);
+    assert_eq!(code(insert(&ds, ACCEPTED)), "profile-managed-graph");
+    assert_eq!(code(evidence::settings(&ds)), "managed-unavailable");
+    // configuring again replaces the unreadable settings
+    let status = evidence::configure(&ds, &reviewed(), &Control::none()).unwrap();
+    assert_eq!(status.revision, before.revision + 1);
+    assert_eq!(
+        evidence::detach(&ds, ACCEPTED).unwrap().detached,
+        [ACCEPTED]
+    );
+}
+
+/// A crash after `evidence.json` is replaced and before `managed.json` is published
+/// refuses every write until a configuration repairs it, which is checked against the
+/// protection `managed.json` records.
+#[test]
+fn configuration_repairs_an_interrupted_settings_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ds");
+    {
+        let ds = Dataset::open(&path).unwrap();
+        evidence::configure(&ds, &reviewed(), &Control::none()).unwrap();
+    }
+    // the settings file of a configuration that did not reach its commit point
+    let interrupted = enabled().canonical(&Control::none()).unwrap();
+    std::fs::write(path.join("evidence.json"), interrupted.bytes()).unwrap();
+    let ds = Dataset::open(&path).unwrap();
+    assert_eq!(code(insert(&ds, "urn:ordinary")), "managed-unavailable");
+    assert_eq!(code(evidence::settings(&ds)), "managed-unavailable");
+    assert_eq!(code(evidence::detach(&ds, ACCEPTED)), "managed-unavailable");
+    // the narrower settings would stop protecting what managed.json records
+    assert!(matches!(
+        evidence::configure(&ds, &enabled(), &Control::none()),
+        Err(sparkles::Error::Conflict(_))
+    ));
+    assert_eq!(code(insert(&ds, "urn:ordinary")), "managed-unavailable");
+    let status = evidence::configure(&ds, &reviewed(), &Control::none()).unwrap();
+    assert_eq!(status.revision, 2);
+    assert_eq!(status.settings, reviewed());
+    insert(&ds, "urn:ordinary").unwrap();
+    assert_eq!(code(insert(&ds, ACCEPTED)), "profile-managed-graph");
+    drop(ds);
+    let ds = Dataset::open(&path).unwrap();
+    assert_eq!(evidence::settings(&ds).unwrap().revision, 2);
+    insert(&ds, "urn:ordinary").unwrap();
+}
+
+/// Each status pairs settings with the registry that recorded them, while another
+/// thread keeps changing both.
+#[test]
+fn status_reads_are_coherent_under_concurrent_configuration() {
+    let ds = Dataset::memory();
+    evidence::configure(&ds, &reviewed(), &Control::none()).unwrap();
+    let mut wider = reviewed();
+    wider.identity = vec!["urn:ev:identity".into()];
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let ds = ds.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut revisions = Vec::new();
+            for round in 0..200 {
+                let s = if round % 2 == 0 {
+                    wider.clone()
+                } else {
+                    reviewed()
+                };
+                // the narrower settings would drop the identity graph: detach it first
+                if round % 2 == 1 {
+                    let status = evidence::detach(&ds, "urn:ev:identity").unwrap();
+                    revisions.push(status.revision);
+                }
+                let status = evidence::configure(&ds, &s, &Control::none()).unwrap();
+                assert_eq!(status.settings, s);
+                assert_eq!(status.managed, s.managed_graphs());
+                revisions.push(status.revision);
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            revisions
+        })
+    };
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let status = evidence::settings(&ds).unwrap();
+        let mut all = status.managed.clone();
+        all.extend(status.detached.iter().cloned());
+        all.sort();
+        assert_eq!(all, status.settings.managed_graphs(), "{status:?}");
+        let canonical = status.settings.canonical(&Control::none()).unwrap();
+        assert_eq!(
+            status.digest.as_deref(),
+            Some(sparkles::managed::settings_digest(canonical.bytes()).as_str())
+        );
+        // only the identity graph is ever detached
+        assert!(status.detached.iter().all(|g| g == "urn:ev:identity"));
+    }
+    let revisions = writer.join().unwrap();
+    // each mutation answers the revision it committed
+    assert!(
+        revisions.windows(2).all(|w| w[1] == w[0] + 1),
+        "{revisions:?}"
     );
 }
