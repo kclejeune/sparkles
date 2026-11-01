@@ -23,7 +23,8 @@ identify exceptions to the reference hardware, memory limits and request timing.
 
 ## Where Sparkles loses
 
-This table lists recorded comparisons where another engine is ahead by more than 10%.
+This table lists recorded comparisons where another engine is ahead by about 10% or more,
+including paired passes when only one clears that threshold.
 Fluree's warm advantages on `distinct-obj` at 1.05M, `count-all` at 10.5M and two small
 DBpedia 50M queries are within 10%. SP²Bench `q12b` is also within 8% of Oxigraph.
 
@@ -63,7 +64,7 @@ partially complete and planned implementation scope.
 | Query, load and write comparisons | Measured with partial coverage | Published tables cover their named data, engines and timing contracts. Larger suites, sustained workloads and broader hardware remain open. |
 | Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
-| Evidence and maintained analysis | Unmeasured | C25 and C27 supply RDF profile resources and queries. Their managed runtime operations and C26, F22 and C22b remain planned, with no performance claim. |
+| Evidence and maintained analysis | Unmeasured | C25 provides authenticated evidence proposals and resolution, and C27 supplies temporal profile resources and queries. Review-controlled projections and the managed analysis work in C26, F22 and C22b remain planned. |
 
 ## Reading the comparisons
 

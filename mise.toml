@@ -355,10 +355,14 @@ description = "Check formatting and ShellCheck for tracked shell scripts outside
 run = "bash scripts/check-shell.sh"
 
 [tasks."lint:doc-paths"]
-sources = ["@group:rust", "@group:docs", "scripts/check-doc-paths.py"]
+sources = ["@group:rust", "@group:docs", "scripts/check-doc-paths.py", "scripts/check-doc-links.py"]
 outputs = []
-description = "Check that every crates/sparkles… path cited in the README, public docs and the Rust comments exists"
-run = "python3 scripts/check-doc-paths.py --code"
+description = "Check cited source paths and public documentation entry-page links"
+run = ["python3 scripts/check-doc-paths.py --code", "python3 scripts/check-doc-links.py"]
+
+[tasks."test:quickstart"]
+description = "Build the server and exercise the README quick start"
+run = "mbx sparkles-task -- bash -ec 'mbx build -p sparkles-server && python3 scripts/test-quickstart.py'"
 
 [tasks.check]
 description = "Fast compile check of all crates and targets + UI type check"

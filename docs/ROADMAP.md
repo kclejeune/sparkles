@@ -1,7 +1,7 @@
 # Roadmap
 
-This roadmap prioritizes making Sparkles the best graph database by objective measures.
-These are correctness, conformance, performance, robustness and the standard features.
+This roadmap prioritizes correctness, standards conformance, performance, robustness
+and the standard features expected of a graph database.
 Embedded agent memory and entity representation follow, and applications built on top of
 Sparkles, such as the supply-chain pilot, come after them. New features enter the delivery
 path when a concrete use case or an adopted dependency requires them. A separate analyst
@@ -15,7 +15,14 @@ testing and the API compatibility contract advance alongside capability completi
 The [feature index](FEATURES.md) and its category guides describe what Sparkles does
 and does not do today. Every known gap names the roadmap item that addresses it.
 [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) records the measured results and the
-workloads where Sparkles loses. This document holds only the work that remains.
+workloads where Sparkles loses. The tiers list remaining work, followed by a record of
+completed items.
+
+The current priorities are to complete engine correctness and performance work, advance
+recovery and release contracts, and then complete the shared evidence and agent-memory
+capabilities. The [delivery priorities](#delivery-priorities) explain their dependencies.
+The numbered tiers are the detailed backlog, and [Completed](#completed) records finished
+items.
 
 ## Contents
 
@@ -72,8 +79,8 @@ ordered by their tier alone.
 
 ## Delivery priorities
 
-The goal comes first. Sparkles should be the best graph database by objective measures,
-which are correctness, conformance, performance, robustness and the standard features.
+The first priority is correctness, conformance, performance, robustness and the
+standard features expected of a graph database.
 Embedded agent memory in C17 and C18 comes second, and shared entity representation in
 A01 and C25 comes third. Applications built on top of Sparkles, such as the cyber and
 public-health supply-chain pilot, come after these. The engine supplies generic
@@ -120,8 +127,7 @@ query under 0.3 ms may be slower on an Intel host.
 
 Wave B starts with item 81 Phase 3, then items 341, 396 and 435 and the remaining C18
 work. Item 12 can move its refresh onto an internal circuit now, and item 18 Phase 3
-follows once item 416 has landed. The cheap agent
-tools of item 462 also belong to Wave B. They are the `ask` MCP tool in item 488, MCP tool
+follows once item 416 has landed. The MCP tools of item 462 also belong to Wave B. They are the `ask` MCP tool in item 488, MCP tool
 profiles in item 489 and a hybrid search tool that embeds query text in item 490.
 
 ### Wave C: ontology and data platform
@@ -331,7 +337,7 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [C06](specs/C06-clone-to-sandbox.md#outcome) | 45 | Remote and archive clones preserve a chosen branch/commit's data, stored blank identities, prefixes and configuration while creating correct new lineage. Interrupted, corrupt or cancelled transfers publish no destination. |
 | [C17](specs/C17-agent-memory.md#outcome) | 81, 435 | Scratch branches honor a per-principal limit, warnings before expiry and a keep option, beside the dataset-layered expiry that works over HTTP and stdio. Adopt the shared evidence profile with its source, review and independent-support acceptance queries; server model calls use the successor C18 contract. |
 | [C18](specs/C18-natural-language-questions-and-ingest/SPEC.md#outcome) | 6, 15, 27, 77, 81, 263, 318 | Finish the remaining evaluation matrix, multimodal ingestion, redaction and verified rewrites, and test grounding and VALUES changes against caller-visible data. Publish matching accuracy and latency evidence, preserving clarification for ambiguity and the original secret, budget and citation guarantees. |
-| [C25](specs/C25-evidence-and-assessments.md#outcome) | 81, 395 | Finish Phase 2's authenticated source, reference and claim operations, protected metadata, retained-view resolution, reader admission, review, support ownership and reversible identity decisions. Phase 3 integrates recall, ingestion, reports and maintained analyses, with exact identity, authorization, retry and crash acceptance. |
+| [C25](specs/C25-evidence-and-assessments.md#outcome) | 81, 395 | Build review-controlled projections, withdrawal, support ownership and reversible identity decisions on the available authenticated proposals, protected metadata and retained-view resolution. Phase 3 integrates recall, ingestion, reports and maintained analyses, with exact identity, authorization, retry and crash acceptance. |
 | [C27](specs/C27-valid-time-profiles.md#outcome) | 341 | Complete Phase 1 with authenticated availability and backdating refusal through C25 Phase 2 and protected writes. Then add the temporal projection helper, event-time controls and expiry integration with interval, visibility and recovery acceptance. |
 | [C21](specs/C21-outbound-notifications.md#outcome) | 46 | Add email, the administration UI and complete backup-failure coverage. A slow destination cannot delay another channel, and delivery tests retain retry, outbound, secret and disabled-channel guarantees. |
 | [C22](specs/C22-graph-rag-community-summaries.md#outcome) | 12, 100, 260, 261, 262, 264 | Add refresh counting with an accumulator on an internal F13 circuit, finish person-checked and broader-corpus evaluation, and validate global-question routing and schema-order decisions. Multiple report configurations follow C22b under 100, retaining shared spending and disclosure controls. |

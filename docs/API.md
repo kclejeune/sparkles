@@ -9,6 +9,8 @@ validation, to access control and the agent endpoints.
 
 [USAGE.md](USAGE.md) provides workflows and CLI and binding examples. This document owns
 the HTTP contracts. [openapi.json](openapi.json) is their machine-readable description.
+For a first request and deployment guidance, start with
+[getting started and operations](GETTING-STARTED.md).
 
 All admin endpoints live under `/$/`. Dataset names match `[A-Za-z0-9_.-]+` and are
 addressed as `/{ds}`. JSON responses use `application/json`.

@@ -1,6 +1,8 @@
 # Usage
 
-This guide covers running and operating Sparkles. Its sections are grouped by task. The
+Start with [getting started and operations](GETTING-STARTED.md) for a first query,
+deployment and security guidance. This guide covers running and operating Sparkles in
+detail. Its sections are grouped by task. The
 first group covers the server, the command-line tools, maintenance, backups and outbound
 requests. The next ones cover branches, path search, graph algorithms and embeddings,
 then the web UI, then the MCP server, agent memory and the model-backed features. The

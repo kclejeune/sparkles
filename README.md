@@ -1,9 +1,9 @@
 # Sparkles ✨
 
-Sparkles is a fast RDF, SPARQL and OWL database written in Rust. It reimplements
-[Apache Jena](https://jena.apache.org/) and Fuseki, with their protocols, semantics and
-operational model, on the index and execution architecture of
-[QLever](https://github.com/ad-freiburg/qlever). It ships as an embeddable library with
+Sparkles is an RDF database written in Rust, with SPARQL queries, validation and
+reasoning. It implements selected [Apache Jena](https://jena.apache.org/) and Fuseki
+protocols and behavior using indexes and execution inspired by
+[QLever](https://github.com/ad-freiburg/qlever). It provides an embeddable library with
 Rust, Python, JVM and JavaScript APIs, a Fuseki-compatible server and CLI, and a web UI.
 The JVM binding implements Jena's `DatasetGraph`, letting Java and Kotlin applications
 use Sparkles through Jena's existing query, model and transaction APIs.
@@ -19,16 +19,72 @@ use Sparkles through Jena's existing query, model and transaction APIs.
 
 ![A CONSTRUCT query's results drawn as a graph of people, who they know and where they work, with one person's neighborhood highlighted](docs/images/graph.png)
 
+## Getting started
+
+To build the server, install Rust with the toolchain in `rust-toolchain.toml`. Linux
+servers also need system CA certificates. Build the optional web UI first if you want
+it embedded in the binary. The UI build requires Node.js and pnpm.
+
+```sh
+pnpm -C ui install && pnpm -C ui build  # optional web UI
+cargo build --release -p sparkles-server
+export PATH="$PWD/target/release:$PATH"
+```
+
+The binary is `target/release/sparkles`. Create a small dataset and query it before
+starting the server.
+
+```sh
+cat > books.ttl <<'EOF'
+<https://example.org/book> <https://example.org/title> "A book" .
+EOF
+sparkles load --loc ./books books.ttl
+sparkles query --loc ./books --results csv 'SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
+```
+
+The query returns the CSV header `n` and one row with a count of `1`. Start the server
+in a terminal.
+
+```sh
+sparkles serve --data ./data --loc books=./books
+```
+
+In another terminal, query the running server. The response contains a CSV header `n`
+and a row with `1`.
+
+```sh
+curl -fsS localhost:3030/books/sparql -H 'Accept: text/csv' \
+  --data-urlencode 'query=SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
+```
+
+The server opens datasets after it starts listening. Retry the request if the dataset is
+still opening. The server holds the database lock while it runs. Use HTTP while it is
+running, or stop it before using a command with `--loc`. If built, the UI is at
+<http://localhost:3030/ui/>. `sparkles help COMMAND` describes each command.
+
+Nix and Docker provide alternative ways to run the server.
+
+```sh
+nix run github:kclejeune/sparkles -- serve --data ./data
+docker compose up --build -d
+```
+
+See [getting started and operations](docs/GETTING-STARTED.md) for setup, security and
+recovery guidance, and [libraries and clients](docs/README.md#libraries-and-clients)
+for the Rust, Python, JVM and Node.js APIs. The binding packages are not published to a
+registry.
+
 ## Why Sparkles
 
 Jena and Fuseki have the protocols, tools and operational model that RDF applications
 depend on, and QLever has an index and executor built for speed. Sparkles puts the first
 on top of the second:
 
-1. **Jena-compatible where users can see it.** Clients using the supported Fuseki
+1. **Jena and Fuseki integration.** Clients using the supported Fuseki
    protocols can keep their existing request format. Sparkles implements the SPARQL 1.1
-   Query, Update and Graph Store protocols, Fuseki's endpoints and `/$/` admin API, Jena's formats and dataset semantics, and
-   TDB2's model of bulk loads, transactions, compaction and backups. The JVM binding
+   Query, Update and Graph Store protocols, supported Fuseki administration endpoints,
+   and Jena's RDF formats and dataset semantics. It also provides bulk loads, transactions,
+   compaction and backups. The JVM binding
    brings that compatibility into the application: open a Sparkles dataset and keep
    using Jena's `Model`, RIOT, `Txn` and `QueryExecution` APIs.
 2. **QLever-style internals where performance matters.** Terms are 64-bit ids with
@@ -44,9 +100,9 @@ on top of the second:
 
 ## Highlights
 
-* **Query performance.** Sparkles is the fastest engine on most of the published
-  comparisons. See [Performance](#performance) and
-  [SPARQL](docs/querying/README.md#sparql-queries-and-updates).
+* **Query performance.** Published comparisons cover synthetic and standard query
+  workloads, loading, writes and memory. See [Performance](#performance) and the
+  [benchmark summary](docs/BENCHMARKS.md).
 * **Standards conformance.** Sparkles passes the W3C suites for SPARQL 1.0, 1.1 Query,
   1.1 Update and 1.2, SHACL Core and SHACL-SPARQL, and supports RDF 1.2, Jena's ARQ
   extensions and GeoSPARQL 1.1. See [Standards conformance](docs/querying/README.md#standards-conformance) and
@@ -87,7 +143,8 @@ on top of the second:
 * Reasoning, incremental views, GeoSPARQL, GraphRAG, bindings and the web UI are
   available, with further phases planned.
 * Evidence and valid-time vocabularies, shapes and query resources are available.
-  Authenticated evidence writes and review-controlled projections remain planned.
+  Authenticated evidence proposals and reference resolution are available. Review-controlled
+  projections remain planned.
 * Durable jobs, maintained analysis, temporal runtime helpers and ChatGPT-plan model access
   remain planned.
 
@@ -97,11 +154,13 @@ remaining scope of each capability.
 ## Performance
 
 These comparisons use an Intel Core i5-13500 with 16 GiB of RAM, with engines running
-alone, result caches off and answers checked before timing.
+alone and result caches off. Answer checks qualify the reported comparisons.
 
-* At 10.5M synthetic triples, Sparkles loads in **3.67 s** and has the lowest measured
-  mean on **27 of 28 queries**. It ties Fluree on `count-all` within the 10% band and has a
-  median **3.8×** speedup over QLever.
+* At 10.5M synthetic triples, Sparkles loads in **3.67 s** and has the lowest native
+  endpoint mean on **27 of 28 queries** among the qualified results. It ties Fluree on
+  `count-all` within the 10% band and has a median **3.8×** speedup over QLever. Fluree
+  uses a different result encoding and one query exceeds its memory limit. The
+  [synthetic report](docs/benchmarks/synthetic/RESULTS.md) describes those limits.
 * With 16 clients running `star-join` at that scale, throughput is **239 queries/s**,
   against QLever's 90.
 * On WatDiv at 10.97M triples, geometric mean latency is **4.63 ms**, against
@@ -268,49 +327,6 @@ panel below it has more workflows and detail views.
 
 </details>
 
-## Getting started
-
-Build the server from source, or run it with Nix or Docker. Building the UI first embeds
-it in the binary.
-
-```sh
-pnpm -C ui install && pnpm -C ui build        # the web UI, optional
-cargo build --release                         # builds target/release/sparkles
-nix run github:kclejeune/sparkles -- serve --data ./data
-docker compose up --build -d                  # UI and server on 127.0.0.1:3030
-```
-
-With the `sparkles` binary on the `PATH`, load a file into a database, serve it, and run a
-first query over HTTP or from the command line.
-
-```sh
-sparkles load --loc ./books books.ttl
-sparkles serve --data ./data --loc books=./books
-
-curl localhost:3030/books/sparql -H 'Accept: text/csv' \
-  --data-urlencode 'query=SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10'
-sparkles query --loc ./books 'SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
-```
-
-The web UI is at <http://localhost:3030/ui/>, and `sparkles help COMMAND` describes each
-command. Java and Kotlin programs open a Sparkles dataset in place of a TDB2 one and keep
-using Jena's query, model, RDF I/O and transaction APIs.
-
-```java
-try (DatasetGraphSparkles dsg = SparklesDatasets.open(Path.of("mydb"))) {
-    Dataset ds = DatasetFactory.wrap(dsg);
-    Txn.executeRead(ds, () -> { /* QueryExecution, Model and RIOT as usual */ });
-}
-```
-
-[docs/USAGE.md](docs/USAGE.md#running-the-server) covers the server, the
-[JVM binding](docs/USAGE.md#jvm-apache-jena), the
-[Rust library](docs/USAGE.md#embedding-the-library), [Python](docs/USAGE.md#python),
-[Node.js](docs/USAGE.md#javascript-and-typescript) and the
-[MCP server for agents](docs/USAGE.md#mcp-server-llm-agents). The binding packages are not
-published to a registry, so build them with `mise run jvm:build`, `mise run py:build` or
-`mise run node:build`.
-
 ## Documentation
 
 | Document | Contents |
@@ -329,9 +345,8 @@ published to a registry, so build them with `mise run jvm:build`, `mise run py:b
 
 ## Status and license
 
-Sparkles has no release. The current work aims at the best results on the published
-benchmarks and fills the remaining feature gaps, and the first release, its packages and a
-stability contract follow it. [docs/ROADMAP.md](docs/ROADMAP.md) orders the work.
+Sparkles has no release. The [roadmap](docs/ROADMAP.md) covers the remaining correctness,
+performance, recovery and packaging work and the planned stability contract.
 
 Sparkles is licensed under the [Apache License 2.0](LICENSE). The vendored `spargebra`
 keeps its MIT OR Apache-2.0 license. The licenses of the crates and npm packages that ship

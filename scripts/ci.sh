@@ -37,7 +37,7 @@ main() {
   full=(
     fmt:check ui:fmt:check node:fmt:check lint:shell lint:doc-paths api:check test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
-    test ui:test client:types:check
+    test test:quickstart ui:test client:types:check
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check
   )
   fast=(fmt:check lint:shell lint:doc-paths api:check client:types:check lint test)
@@ -117,7 +117,7 @@ main() {
   prep=()
   for t in "${tasks[@]}"; do
     case "$t" in
-      lint | lint:features | test | test:features | ui:check | ui:test | licenses:check) prep+=(ui:build) ;;
+      lint | lint:features | test | test:features | test:quickstart | ui:check | ui:test | licenses:check) prep+=(ui:build) ;;
       ui:fmt:check) prep+=(ui:install) ;;
       node:fmt:check | node:client:check) prep+=(node:install) ;;
       node:test) prep+=(node:build) ;;
@@ -212,7 +212,7 @@ main() {
   # optional feature set after another, so it takes turns too.
   links_server() {
     case "$1" in
-      test | test:features | node:test) return 0 ;;
+      test | test:features | test:quickstart | node:test) return 0 ;;
       *) return 1 ;;
     esac
   }

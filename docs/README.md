@@ -7,12 +7,22 @@ This index lists the Sparkles documentation by what a reader wants to do. The re
 
 | Document | What it covers |
 |---|---|
+| [Getting started and operations](GETTING-STARTED.md) | Build and try Sparkles, evaluate compatibility, secure a server and plan recovery. |
 | [Usage](USAGE.md) | How to run the server, load and query data, and operate datasets, with the [CLI tools](USAGE.md#command-line-tools), [Docker](USAGE.md#docker) and [NixOS](USAGE.md#deploying-on-nixos). |
 | [Libraries and bindings](USAGE.md#embedding-the-library) | How to embed the engine from [Rust](USAGE.md#embedding-the-library), [Python](USAGE.md#python), the [JVM through Jena](USAGE.md#jvm-apache-jena) and [Node.js](USAGE.md#javascript-and-typescript), or connect with the [Rust client](USAGE.md#rust-client). |
 | [Agents and models](USAGE.md#mcp-server-llm-agents) | How to connect an agent over MCP, use [agent memory](USAGE.md#agent-memory) and [answer questions with a model](USAGE.md#asking-questions-with-a-model). |
 | [HTTP API](API.md) | The request and response contract of every endpoint, with status codes, parameters, formats and protocol semantics. |
 | [OpenAPI](openapi.json) | The machine-readable HTTP contract, checked against the server's route table. |
 | [Editor integration](editors.md) | How to format SPARQL and RDF in an editor and use the language server. |
+
+## Libraries and clients
+
+The engine can be embedded with [Rust](USAGE.md#embedding-the-library),
+[Python](USAGE.md#python), [Java and Kotlin through Jena](USAGE.md#jvm-apache-jena),
+or [Node.js](USAGE.md#javascript-and-typescript). The
+[Rust HTTP client](USAGE.md#rust-client) connects to a server. The
+[integration guide](integrations/README.md#libraries-and-bindings) describes the
+surfaces and limits of each binding.
 
 ## Understanding Sparkles
 
@@ -57,4 +67,5 @@ This index lists the Sparkles documentation by what a reader wants to do. The re
 * The source audit is historical context, and the guides describe supported behavior.
 * Keep heading anchors when moving sections, or update every link to them. Check local
   links and cited source paths after a move. `mise run lint:doc-paths` checks cited source
-  paths, but not every Markdown link or anchor.
+  paths and links on the public entry pages. `mise run test:quickstart` runs the README's
+  query examples against a freshly built server.
