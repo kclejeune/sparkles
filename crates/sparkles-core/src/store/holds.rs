@@ -144,8 +144,13 @@ impl Store {
             if existing.hold.owner == owner && existing.hold.commits == commits {
                 // a reconciliation that looked before this no longer releases it
                 existing.touch = touch;
+                let hold = existing.hold.clone();
+                // the hold is durable before it is acknowledged again
+                if self.family.holds.uncertain.load(Ordering::Relaxed) {
+                    self.persist_holds(records)?;
+                }
                 return Ok(Acquired {
-                    hold: existing.hold.clone(),
+                    hold,
                     created: false,
                 });
             }
@@ -201,13 +206,19 @@ impl Store {
             let path = root.join(holds::FILE);
             let tmp = path.with_extension("tmp");
             super::write_synced(&tmp, &holds::encode(self.owner_dataset_id(), &next))?;
-            std::fs::rename(&tmp, &path)?;
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                // the file may or may not have been replaced
+                self.family.holds.uncertain.store(true, Ordering::Relaxed);
+                return Err(e.into());
+            }
         }
         undo.previous = None;
         *state = HoldsState::Ready(next);
         if let Some(root) = &root {
+            self.family.holds.uncertain.store(true, Ordering::Relaxed);
             self.failpoint("holds-renamed");
             super::sync_dir(root)?;
+            self.family.holds.uncertain.store(false, Ordering::Relaxed);
             self.failpoint("holds-published");
         }
         Ok(Acquired {
@@ -313,15 +324,23 @@ impl Store {
         self.settle_members(touched);
     }
 
-    /// Write `holds.json` for `records` durably (nothing for an in-memory store).
+    /// Write `holds.json` for `records` durably (nothing for an in-memory store), under
+    /// the holds' lock. A failure leaves the file uncertain until a later write succeeds.
     pub(super) fn persist_holds(&self, records: &BTreeMap<uuid::Uuid, Record>) -> Result<()> {
-        if let Some(root) = self.managed_root() {
+        let Some(root) = self.managed_root() else {
+            return Ok(());
+        };
+        let written = crate::commit::require_reader(&root, holds::READER).and_then(|()| {
             write_atomic(
                 &root.join(holds::FILE),
                 &holds::encode(self.owner_dataset_id(), records),
-            )?;
-        }
-        Ok(())
+            )
+        });
+        self.family
+            .holds
+            .uncertain
+            .store(written.is_err(), Ordering::Relaxed);
+        written
     }
 
     /// Fail with `410 history-gone` unless commit `seq` of this store is readable now,

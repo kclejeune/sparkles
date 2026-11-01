@@ -842,3 +842,29 @@ fn concurrent_memory_holds_never_lose_a_held_state() {
     assert_eq!(lost.load(Ordering::SeqCst), 0);
     assert!(s.mem_history.as_ref().unwrap().lock().held.is_empty());
 }
+
+#[test]
+fn an_uncertain_write_is_repeated_before_a_hold_is_acknowledged_again() {
+    let (_dir, root, s) = setup();
+    s.set_failpoint("holds-renamed", Some(Arc::new(|_| panic!("sync failed"))));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.acquire_hold(EV, id(1), &[at(&s, 1)])
+    }));
+    assert!(r.is_err());
+    s.set_failpoint("holds-renamed", None);
+    // as if the rename had not survived
+    std::fs::remove_file(root.join(crate::holds::FILE)).unwrap();
+    let again = s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    assert!(!again.created);
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+    // a certain file is not written for a repeated acquisition
+    let before = std::fs::metadata(root.join(crate::holds::FILE))
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::remove_file(root.join(crate::holds::FILE)).unwrap();
+    s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    assert!(!root.join(crate::holds::FILE).exists(), "{before:?}");
+}

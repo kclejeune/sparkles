@@ -11893,9 +11893,11 @@ in-memory dataset. Together they name at most 65,536 commits. The design is in
 
 | Method and path | Needs | Effect |
 |---|---|---|
-| `GET /$/evidence/{ds}/holds` | `admin` | `{holds, next, heldCommits, maxCommits}`, the evidence holds by id. `?branch=NAME` lists the holds that name a branch, and `?after=ID&limit=N` pages them, with at most 1,000 in a page. |
-| `POST /$/evidence/{ds}/holds` | `admin` | Acquires `{id?, commits: [{branch?, branchId?, commit}]}` and answers `201` with the hold. |
-| `DELETE /$/evidence/{ds}/holds/{id}` | `admin` | Releases the hold, `204`, or `404` when there is none. |
+| `GET /$/evidence/{ds}/holds` | `admin` on the dataset | `{holds, next, heldCommits, maxCommits}`, the evidence holds by id. `?onBranch=NAME` lists the holds that name a branch, and `?after=ID&limit=N` pages them, with at most 1,000 in a page. |
+| `POST /$/evidence/{ds}/holds` | `admin` on the dataset | Acquires `{id?, commits: [{branch?, branchId?, commit}]}` and answers `201` with the hold. |
+| `DELETE /$/evidence/{ds}/holds/{id}` | `admin` on the dataset | Releases the hold, `204`, or `404` when there is none. |
+
+The three routes need `admin` on every branch and graph of the dataset, because holds name commits of any branch and decide what history is retained. A grant limited to some branches or graphs does not give it.
 
 A hold is `{id, owner, created, commits}`, and each commit is `{branch, branchId,
 commit}`, where `branch` is `null` once the branch is deleted. A request names each

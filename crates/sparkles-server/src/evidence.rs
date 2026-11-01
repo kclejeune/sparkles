@@ -8,8 +8,10 @@
 //! `{ds}`. The settings name the dataset's protected graphs and policies, and holds
 //! name commits of any branch and decide what history is retained.
 
+use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err};
 use crate::state::AppState;
+use axum::Extension;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -105,6 +107,18 @@ async fn detach(
 
 // ------------------------------------------------------------------ holds ------
 
+/// The hold routes name commits of every branch, so they need `admin` on all of the
+/// dataset, not only on `main`.
+fn admin_everywhere(p: &Principal, ds: &str) -> ApiResult<()> {
+    if p.admin_everywhere(ds) {
+        return Ok(());
+    }
+    Err(err(
+        StatusCode::FORBIDDEN,
+        format!("source holds need admin on every branch and graph of /{ds}"),
+    ))
+}
+
 /// The most holds one page lists.
 const MAX_PAGE: usize = 1000;
 
@@ -141,8 +155,9 @@ fn hold_json(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ListHolds {
-    /// only the holds that name this branch
-    branch: Option<String>,
+    /// only the holds that name this branch (not `branch`, which selects the branch a
+    /// request acts on)
+    on_branch: Option<String>,
     /// the id after which the page starts
     after: Option<uuid::Uuid>,
     limit: Option<usize>,
@@ -152,8 +167,10 @@ struct ListHolds {
 async fn list_holds(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     Query(q): Query<ListHolds>,
 ) -> ApiResult<Json<J>> {
+    admin_everywhere(&p, &name)?;
     let ds = dataset(&st, &name)?;
     let limit = q.limit.unwrap_or(MAX_PAGE);
     if limit == 0 || limit > MAX_PAGE {
@@ -165,7 +182,7 @@ async fn list_holds(
     blocking(move || {
         let store = ds.dataset.store();
         let names = branch_names(store)?;
-        let branch = match &q.branch {
+        let branch = match &q.on_branch {
             None => None,
             Some(b) => Some(branch_id(store, b)?),
         };
@@ -222,8 +239,10 @@ struct Acquire {
 async fn acquire_hold(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     AdminBody(bytes): AdminBody,
 ) -> ApiResult {
+    admin_everywhere(&p, &name)?;
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -284,7 +303,12 @@ async fn acquire_hold(
 
 /// `DELETE /$/evidence/{ds}/holds/{id}`: release the hold; `204`, or `404` when the
 /// dataset has no evidence hold of that id.
-async fn release_hold(State(st): St, Path((name, id)): Path<(String, String)>) -> ApiResult {
+async fn release_hold(
+    State(st): St,
+    Path((name, id)): Path<(String, String)>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult {
+    admin_everywhere(&p, &name)?;
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }

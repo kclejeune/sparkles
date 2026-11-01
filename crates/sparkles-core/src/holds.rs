@@ -184,6 +184,11 @@ pub(crate) struct FamilyHolds {
     pub index: Arc<arc_swap::ArcSwap<HeldIndex>>,
     /// the last [`Record::touch`] given out
     pub touches: std::sync::atomic::AtomicU64,
+    /// Set, under the holds' lock, when a write of `holds.json` failed after it may
+    /// have replaced the file, so that the file may differ from the installed holds.
+    /// The next change or repeated acquisition writes the installed holds again before
+    /// it answers.
+    pub uncertain: std::sync::atomic::AtomicBool,
 }
 
 impl Default for FamilyHolds {
@@ -192,6 +197,7 @@ impl Default for FamilyHolds {
             state: parking_lot::Mutex::new(HoldsState::default()),
             index: Arc::new(arc_swap::ArcSwap::from_pointee(HeldIndex::default())),
             touches: Default::default(),
+            uncertain: Default::default(),
         }
     }
 }

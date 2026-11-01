@@ -2975,7 +2975,7 @@ fn assist(p: &mut Paths) {
         )
         .doc("Needs `admin` on the dataset. Lists the durable source holds of the evidence profile by id, a page at a time.")
         .see("evidence-holds")
-        .query("branch", s(), "Only holds that name this branch.")
+        .query("onBranch", s(), "Only holds that name this branch.")
         .query("after", json!({ "type": "string", "format": "uuid" }), "Start after this hold id, the `next` of the previous page.")
         .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 1000 }), "The most holds in the page, 1000 by default.")
         .json("200", "A page of holds.", "EvidenceHoldList")

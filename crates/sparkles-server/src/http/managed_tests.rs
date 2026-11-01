@@ -391,7 +391,7 @@ async fn evidence_holds_are_acquired_listed_and_released_over_http() {
     let (status, j) = call(
         &app,
         "GET",
-        "/$/evidence/d/holds?branch=dev&limit=1",
+        "/$/evidence/d/holds?onBranch=dev&limit=1",
         None,
         "",
     )

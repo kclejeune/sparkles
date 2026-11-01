@@ -712,7 +712,7 @@ serves a held commit. `sparkles check` counts holds among the generations it rep
 retained. An in-memory store keeps the held states beside its window. A branch that a
 hold names is refused deletion as `branch-held`, and `DeleteOptions::release_holds`,
 `?releaseHolds=true` and `sparkles branch delete --release-holds` release those holds
-first. Releasing holds through a branch deletion needs `admin`. Holds of a retired
+first. The hold routes and a branch deletion that releases holds need `admin` on every branch and graph of the dataset. Holds of a retired
 upstream stay, since only a branch that started from it can name them.
 
 The ordering argument is as follows. An acquisition resolves the commits under the
@@ -727,7 +727,9 @@ acquisition fails with `history-gone` and restores the index, or the collection 
 the new index and keeps the commit. The acquisition then raises the reader and replaces
 `holds.json` atomically, and returns only after the file and its directory are synced.
 It installs the hold as soon as the file is replaced, so the running store never
-protects less than the file records. A crash before the replacement leaves no hold, and
+protects less than the file records. A write that fails after it may have replaced the
+file marks the holds uncertain, and the next change or repeated acquisition writes the
+installed holds again before it answers. A crash before the replacement leaves no hold, and
 a crash after it leaves the complete hold. A release replaces `holds.json` without the
 hold before it narrows the index, so a crash leaves either the hold in force or the
 hold gone. A branch deletion that releases holds makes the release durable before the
