@@ -34,8 +34,12 @@ IGNORE = {
 }
 XSD = "http://www.w3.org/2001/XMLSchema#"
 DRAFT_SYSTEM = "You translate"
-# How Ask's repair_text opens a repair request.
-REPAIR = "Your previous query was:\n```sparql"
+# How Ask's repair prompts open: a repair quotes the failed query, and an exploration
+# after a draft without a query says so.
+REPAIRS = (
+    "Your previous query was:\n```sparql",
+    "Your previous answer gave no query",
+)
 # A prefix name as store::valid_prefix_name accepts it, including the empty one.
 PREFIX = r"(?:[A-Za-z](?:[\w.-]*[\w-])?)?"
 
@@ -89,7 +93,7 @@ def drafts(replies_path):
         if not system_text(req).startswith(DRAFT_SYSTEM):
             continue
         text = prompt_text(req)
-        if REPAIR in text.split("Question:", 1)[-1]:
+        if any(r in text.split("Question:", 1)[-1] for r in REPAIRS):
             continue  # a repair quotes the failed query
         reply = r.get("reply")
         u = reply.get("usage") if r.get("status") == 200 and isinstance(reply, dict) else None

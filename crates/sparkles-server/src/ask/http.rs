@@ -271,6 +271,7 @@ async fn ask_route(
         mode: b.mode,
         reviewed_only: b.reviewed_only,
         report_context,
+        ..AskOptions::default()
     };
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
     let finish = {

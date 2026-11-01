@@ -113,6 +113,10 @@ def load_questions(args):
     return qset
 
 
+# The pipeline options a run may pass to every Ask, besides --drafts=N.
+ASK_OPTIONS = ("--explore", "--shape-check", "--type-hints")
+
+
 def validate_args(args):
     for value in (args.deadline, args.timeout, args.max_tokens):
         finite_positive(value)
@@ -127,6 +131,9 @@ def validate_args(args):
         # at once only inside one batch child.
         raise Invalid("--jobs above 1 needs --batch")
     memory_wrapper(getattr(args, "child_memory_max", None))
+    for flag in getattr(args, "ask_option", None) or []:
+        if flag not in ASK_OPTIONS and not re.fullmatch(r"--drafts=[1-5]", flag):
+            raise Invalid("unknown --ask-option")
     binary = pathlib.Path(args.sparkles)
     if (
         not binary.is_absolute()
@@ -474,6 +481,7 @@ class Runner:
             cmd += ["--model-secret", secret]
         if self.args.allow_loopback:
             cmd += ["--outbound-allow", "127.0.0.1/32"]
+        cmd += getattr(self.args, "ask_option", None) or []
         return cmd
 
     def ask(self, pair, q, config=None):
@@ -1724,6 +1732,13 @@ def parse_args(argv=None):
         help="answer an answerable question's clarification from its gold, or score it",
     )
     ap.add_argument("--allow-loopback", action="store_true")
+    ap.add_argument(
+        "--ask-option",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help="a pipeline option passed to every Ask: --explore, --shape-check, --type-hints or --drafts=N",
+    )
     ap.add_argument("--self-test", action="store_true")
     return ap.parse_args(argv)
 

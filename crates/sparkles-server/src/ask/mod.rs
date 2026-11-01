@@ -28,6 +28,7 @@ pub mod http;
 mod http_tests;
 pub(crate) mod profile;
 mod prompts;
+mod repair;
 #[cfg(test)]
 mod routing_tests;
 #[cfg(test)]
@@ -71,6 +72,14 @@ const USAGE_SAMPLE_TRIPLES: usize = 5000;
 const USAGE_SAMPLE_INSTANCES: usize = 200;
 /// The longest one predicate-use query may run.
 const USAGE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// The entities an exploration reads, the predicates it lists for each as subject and
+/// as object, and the further link candidates it shows for each mention.
+const EXPLORE_ENTITIES: usize = 3;
+const EXPLORE_OUT: usize = 40;
+const EXPLORE_IN: usize = 20;
+const EXPLORE_CANDIDATES: usize = 5;
+/// The most first drafts that vote on an answer.
+pub const MAX_DRAFTS: usize = 5;
 /// The most earlier turns a follow-up question carries (§5.1).
 pub const MAX_CONTEXT: usize = 5;
 /// Below this context window the grounding is trimmed (§3.6).
@@ -193,6 +202,17 @@ pub struct AskOptions {
     /// the draft and repair pairs may receive rows, so their grounding may hold the
     /// communities of the linked entities (C22 §7.3)
     pub report_context: bool,
+    /// explore the data once when a draft gives no query or its query returns no rows,
+    /// and draft again with what the exploration found
+    pub explore: bool,
+    /// repair once when a result's shape does not fit the form of the question, and
+    /// keep the first answer when the repair does not answer
+    pub shape_check: bool,
+    /// the first drafts asked, whose results vote on the query, 1 to [`MAX_DRAFTS`]
+    pub drafts: usize,
+    /// link each mention with the classes that the words around it name as type
+    /// hints, and show how many triples name each candidate
+    pub type_hints: bool,
 }
 
 impl Default for AskOptions {
@@ -224,6 +244,10 @@ impl Default for AskOptions {
             mode: AskMode::Auto,
             reviewed_only: false,
             report_context: false,
+            explore: false,
+            shape_check: false,
+            drafts: 1,
+            type_hints: false,
         }
     }
 }
@@ -278,6 +302,7 @@ pub fn ask(
         trimmed: Value::Null,
         answered_by: None,
         reports: None,
+        fallback: None,
     };
     let mut out = a.run();
     // an event stream learns of the endings without their own event here
@@ -349,6 +374,17 @@ struct Asking<'a, 'e> {
     /// the community reports a global answer may use, as `community_reports` returns
     /// them, when the question may be answered from them (C22 §7)
     reports: Option<Value>,
+    /// the answer that a repair of its result's shape may replace
+    fallback: Option<Answered>,
+}
+
+/// An answer with rows, before its summary.
+struct Answered {
+    result: Value,
+    query: String,
+    doc: Value,
+    rows: u64,
+    by: Option<(Role, Pair)>,
 }
 
 /// The grounding of §4.1 step 1.
@@ -364,6 +400,56 @@ struct Ground {
     best_example: Option<String>,
     /// a mention links `exact`, which makes the question local (C22 §7.1)
     exact: bool,
+    /// the question's mentions, the IRIs of the candidates the context shows, the
+    /// entities its predicate use reads, how many candidates each mention showed, and
+    /// the schema's prefixes, which an exploration reads
+    mentions: Vec<String>,
+    shown: std::collections::BTreeSet<String>,
+    usage_entities: Vec<String>,
+    link_k: usize,
+    prefixes: Map<String, Value>,
+}
+
+/// The graphs that usage queries read.
+struct UsageScope {
+    named: bool,
+    inferred: String,
+}
+
+impl UsageScope {
+    /// `pattern` over the default graph and, when the caller can read one, every
+    /// named graph, binding the graph to `?g`.
+    fn view(&self, pattern: &str, g: &str) -> String {
+        if !self.named {
+            return format!("{{ {pattern} }}");
+        }
+        format!(
+            "{{ {{ {pattern} }} UNION {{ GRAPH ?{g} {{ {pattern} }}{} }} }}",
+            self.inferred.replace("{g}", g)
+        )
+    }
+}
+
+/// A link candidate as a line of the context: its IRI, label and types, and with
+/// `uses` how many triples name it as their object.
+fn candidate_line(c: &Value, uses: bool) -> String {
+    let types: Vec<&str> = c["types"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut line = format!(
+        "  {} {} types: {}",
+        c["iri"].as_str().unwrap_or(""),
+        label(c),
+        types.join(" ")
+    );
+    if uses && let Some(n) = c["uses"].as_u64() {
+        line.push_str(&format!(" uses: {n}"));
+    }
+    line.push('\n');
+    line
 }
 
 /// A normalized draft.
@@ -918,8 +1004,26 @@ impl Asking<'_, '_> {
         let mentions = mentions(&self.o.question);
         let mut entities = Vec::new();
         let mut link_prefixes = Value::Null;
+        let mut shown = std::collections::BTreeSet::new();
         if !mentions.is_empty() {
-            let list: Vec<Value> = mentions.iter().map(|m| json!({ "text": m })).collect();
+            let list: Vec<Value> = mentions
+                .iter()
+                .map(|m| {
+                    let mut v = json!({ "text": m });
+                    if self.o.type_hints {
+                        let around = crate::mcp::relevance::words(&repair::mention_context(
+                            &self.o.question,
+                            m,
+                        ));
+                        let types =
+                            grounding::matched_classes(&classes, &around, &schema["prefixes"], 2);
+                        if !types.is_empty() {
+                            v["types"] = json!(types);
+                        }
+                    }
+                    v
+                })
+                .collect();
             if let Ok(v) = self
                 .ground_tool(
                     profile::Stage::Linker,
@@ -978,18 +1082,10 @@ impl Asking<'_, '_> {
                     }
                     lines.push_str(&format!("{} ({verdict}):\n", Value::from(text)));
                     for c in &cands {
-                        let types: Vec<&str> = c["types"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .collect();
-                        lines.push_str(&format!(
-                            "  {} {} types: {}\n",
-                            c["iri"].as_str().unwrap_or(""),
-                            label(c),
-                            types.join(" ")
-                        ));
+                        if let Some(i) = c["iri"].as_str() {
+                            shown.insert(grounding::expanded(i, &v["prefixes"]));
+                        }
+                        lines.push_str(&candidate_line(c, self.o.type_hints));
                     }
                 }
                 if !lines.is_empty() {
@@ -1001,6 +1097,14 @@ impl Asking<'_, '_> {
         // The predicates that the linked entities and the instances of the question's
         // classes use, from the data itself, so that a relation the question names in
         // other words than the schema's labels still reaches the context.
+        // the first candidate of each mention that links, which an exploration reads
+        // whether or not the grounding read their predicate use
+        let mut usage_entities: Vec<String> = entities
+            .iter()
+            .filter(|e| matches!(e["verdict"].as_str(), Some("exact" | "ambiguous")))
+            .filter_map(|e| e["candidates"][0]["iri"].as_str())
+            .map(|i| grounding::expanded(i, &link_prefixes))
+            .collect();
         if !small {
             let words = crate::mcp::relevance::words(&self.o.question);
             let mut iris: Vec<String> = Vec::new();
@@ -1032,8 +1136,10 @@ impl Asking<'_, '_> {
             let section = self.predicate_use(&iris, &classes, &words, &prefixes);
             if !section.is_empty() {
                 ctx.push_str(&section);
-                ground_event["predicateUse"] = json!({ "entities": iris, "classes": classes });
+                ground_event["predicateUse"] = json!({ "entities": &iris, "classes": classes });
             }
+            iris.extend(usage_entities);
+            usage_entities = iris;
         }
         // C22 §7.3: the communities of the linked entities, at most three
         let linked: Vec<Value> = entities
@@ -1090,7 +1196,136 @@ impl Asking<'_, '_> {
             ambiguous,
             best_example,
             exact,
+            mentions,
+            shown,
+            usage_entities,
+            link_k: candidates_k,
+            prefixes: schema["prefixes"].as_object().cloned().unwrap_or_default(),
         }
+    }
+
+    /// One bounded query of the grounding or an exploration: at most 200 rows, within
+    /// the ask's deadline and five seconds. A query that fails or times out gives none.
+    fn usage_query(&self, stage: profile::Stage, q: String) -> Option<Value> {
+        let cfg = self.server.cfg();
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        let secs = left
+            .min(USAGE_QUERY_TIMEOUT)
+            .min(cfg.max_timeout)
+            .as_secs_f64();
+        if secs < 0.5 {
+            return None;
+        }
+        self.ground_tool(
+            stage,
+            "sparql_query",
+            json!({"query": q, "format": "json", "maxRows": cfg.max_rows.min(200), "timeoutSeconds": secs}),
+            false,
+        )
+        .ok()
+    }
+
+    /// The graphs a usage query reads: the default graph and every named graph the
+    /// caller may read, as the linker searches them, without materialized inferences
+    /// unless the ask reads them.
+    fn usage_scope(&self) -> UsageScope {
+        let inferred = if self.o.reasoning == Some(true) {
+            String::new()
+        } else {
+            format!(" FILTER(?{{g}} != <{}>)", crate::http::INFERRED_GRAPH)
+        };
+        // A union with GRAPH patterns costs a scan of every named graph for each pattern,
+        // so it is used only when the caller can read a named graph at all.
+        let named = self
+            .usage_query(
+                profile::Stage::PredicateUse,
+                format!(
+                    "SELECT ?g WHERE {{ GRAPH ?g {{ ?s ?p ?o }}{} }} LIMIT 1",
+                    inferred.replace("{g}", "g")
+                ),
+            )
+            .is_none_or(|v| v["rows"].as_array().is_none_or(|rows| !rows.is_empty()));
+        UsageScope { named, inferred }
+    }
+
+    /// One exploration of the data around a question whose draft found nothing: the
+    /// further link candidates of each mention that the context did not show, and the
+    /// predicates that the failed query's entities and the linked entities use as
+    /// subject and as object, with counts and a sample value. Every query is bounded
+    /// like the predicate-use grounding, and the text is empty when nothing was found.
+    fn explore(&self, ground: &Ground, entities: &[String]) -> String {
+        let mut out = String::new();
+        if !ground.mentions.is_empty() && ground.link_k > 0 {
+            let list: Vec<Value> = ground
+                .mentions
+                .iter()
+                .map(|m| json!({ "text": m }))
+                .collect();
+            let k = (ground.link_k * 2).min(20);
+            if let Ok(v) = self.tool(
+                "link_entities",
+                json!({"mentions": list, "k": k, "popularity": true}),
+                true,
+            ) {
+                for m in v["mentions"].as_array().into_iter().flatten() {
+                    let more: Vec<&Value> = m["candidates"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|c| {
+                            c["iri"].as_str().is_some_and(|i| {
+                                !ground
+                                    .shown
+                                    .contains(&grounding::expanded(i, &v["prefixes"]))
+                            })
+                        })
+                        .take(EXPLORE_CANDIDATES)
+                        .collect();
+                    if more.is_empty() {
+                        continue;
+                    }
+                    out.push_str(&format!(
+                        "More entities that {} may name:\n",
+                        Value::from(m["text"].as_str().unwrap_or(""))
+                    ));
+                    for c in more {
+                        out.push_str(&candidate_line(c, true));
+                    }
+                }
+            }
+        }
+        let mut iris: Vec<String> = entities.to_vec();
+        iris.extend(ground.usage_entities.iter().cloned());
+        let mut seen = std::collections::BTreeSet::new();
+        iris.retain(|i| grounding::safe_iri(i) && seen.insert(i.clone()));
+        iris.truncate(EXPLORE_ENTITIES);
+        let scope = self.usage_scope();
+        let max_rows = self.server.cfg().max_rows.min(200);
+        for e in &iris {
+            let name = grounding::compact(e, &ground.prefixes);
+            let outgoing = format!(
+                "SELECT ?p (COUNT(*) AS ?n) (SAMPLE(?o) AS ?x) WHERE {{ {} }} GROUP BY ?p ORDER BY DESC(?n) LIMIT {max_rows}",
+                scope.view(&format!("<{e}> ?p ?o"), "g")
+            );
+            let incoming = format!(
+                "SELECT ?p (COUNT(*) AS ?n) (SAMPLE(?s) AS ?x) WHERE {{ {{ SELECT ?p ?s WHERE {{ {} }} LIMIT {USAGE_SAMPLE_TRIPLES} }} }} GROUP BY ?p ORDER BY DESC(?n) LIMIT {max_rows}",
+                scope.view(&format!("?s ?p <{e}>"), "g")
+            );
+            for (q, side, max) in [
+                (outgoing, "subject", EXPLORE_OUT),
+                (incoming, "object", EXPLORE_IN),
+            ] {
+                if let Some(l) = self
+                    .usage_query(profile::Stage::PredicateUse, q)
+                    .and_then(|v| {
+                        repair::usage_line(&format!("{name} as {side}"), &v, &ground.prefixes, max)
+                    })
+                {
+                    out.push_str(&l);
+                }
+            }
+        }
+        out
     }
 
     /// Lines naming the predicates each of `entities` uses as subject and as object, and
@@ -1110,53 +1345,15 @@ impl Asking<'_, '_> {
             "http://www.w3.org/2004/02/skos/core#prefLabel",
             "http://www.w3.org/2004/02/skos/core#altLabel",
         ];
-        let cfg = self.server.cfg();
-        let max_rows = cfg.max_rows.min(200);
-        let run = |q: String| -> Option<Value> {
-            let left = self.deadline.saturating_duration_since(Instant::now());
-            let secs = left
-                .min(USAGE_QUERY_TIMEOUT)
-                .min(cfg.max_timeout)
-                .as_secs_f64();
-            if secs < 0.5 {
-                return None;
-            }
-            self.ground_tool(
-                profile::Stage::PredicateUse,
-                "sparql_query",
-                json!({"query": q, "format": "json", "maxRows": max_rows, "timeoutSeconds": secs}),
-                false,
-            )
-            .ok()
-        };
+        let max_rows = self.server.cfg().max_rows.min(200);
+        let run = |q: String| self.usage_query(profile::Stage::PredicateUse, q);
         let line = |subject: String, rows: &Value, max: usize| -> Option<String> {
             let ranked = grounding::ranked_usage(rows, words, &SKIP, max);
             (!ranked.is_empty())
                 .then(|| format!("{subject}: {}\n", grounding::grouped(&ranked, prefixes)))
         };
-        // The default graph and every named graph the caller may read, as the linker
-        // searches them, without materialized inferences unless the ask reads them.
-        let inferred = if self.o.reasoning == Some(true) {
-            String::new()
-        } else {
-            format!(" FILTER(?{{g}} != <{}>)", crate::http::INFERRED_GRAPH)
-        };
-        // A union with GRAPH patterns costs a scan of every named graph for each pattern,
-        // so it is used only when the caller can read a named graph at all.
-        let named = run(format!(
-            "SELECT ?g WHERE {{ GRAPH ?g {{ ?s ?p ?o }}{} }} LIMIT 1",
-            inferred.replace("{g}", "g")
-        ))
-        .is_none_or(|v| v["rows"].as_array().is_none_or(|rows| !rows.is_empty()));
-        let view = |pattern: &str, g: &str| -> String {
-            if !named {
-                return format!("{{ {pattern} }}");
-            }
-            format!(
-                "{{ {{ {pattern} }} UNION {{ GRAPH ?{g} {{ {pattern} }}{} }} }}",
-                inferred.replace("{g}", g)
-            )
-        };
+        let scope = self.usage_scope();
+        let view = |pattern: &str, g: &str| scope.view(pattern, g);
         let mut lines = String::new();
         for e in entities.iter().filter(|e| grounding::safe_iri(e)) {
             let name = grounding::compact(e, prefixes);
@@ -1205,11 +1402,97 @@ impl Asking<'_, '_> {
     }
 
     /// Steps 3 to 7: draft, check, run, repair at most twice, then summarize, moving
-    /// along the role lists on the signals of §5.5.
+    /// along the role lists on the signals of §5.5. When a repair of a result's shape
+    /// does not answer, the first answer stands.
     fn draft_loop(&mut self, ground: &Ground, notes: &[String], context_tokens: u64) -> Value {
+        let out = self.draft_turns(ground, notes, context_tokens);
+        if out["outcome"] == "answered" {
+            return out;
+        }
+        match self.fallback.take() {
+            Some(a) => {
+                self.notes.push(
+                    "the repair of the result's shape did not answer, so the first answer stands"
+                        .into(),
+                );
+                self.answered_by = a.by.clone();
+                self.answer(a, context_tokens)
+            }
+            None => out,
+        }
+    }
+
+    /// The answered outcome of a result with rows, with its summary.
+    fn answer(&mut self, a: Answered, context_tokens: u64) -> Value {
+        self.emit("result", &a.result);
+        let mut out = json!({ "outcome": "answered", "result": a.result });
+        if let Some(s) = self.summarize(&a.query, &a.doc, a.rows, context_tokens) {
+            out["summary"] = s;
+        }
+        out
+    }
+
+    /// Whether the ask has the time and tokens for one more model call.
+    fn room(&self) -> bool {
+        self.tokens() < self.o.max_tokens
+            && self.deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(10)
+    }
+
+    /// The first draft of several that their results vote for (`drafts`). Each
+    /// further draft is asked with the same prompt while the ask has room, and each
+    /// query runs once. A first draft that asks for a clarification stands alone.
+    fn vote_drafts(
+        &mut self,
+        first: Value,
+        prompt: &Prompt,
+        schema: &crate::models::OutputSchema,
+    ) -> Value {
+        if normalize(&first).clarify.is_some() && self.o.clarification.is_none() {
+            return first;
+        }
+        let mut values = vec![first];
+        while values.len() < self.o.drafts.min(MAX_DRAFTS) && self.room() {
+            match self.call(Role::Draft, prompt, schema) {
+                Ok((v, _, _)) => values.push(v),
+                Err(_) => break,
+            }
+        }
+        let signatures: Vec<Option<String>> = values
+            .iter()
+            .map(|v| {
+                let d = normalize(v);
+                if d.query.is_empty() {
+                    return None;
+                }
+                let parsed = self.parse(&d.query);
+                if parsed.is_none() || has_service(parsed.as_ref()) {
+                    return None;
+                }
+                let (q, _) = self.with_limit(&d.query, parsed.as_ref());
+                self.run_query(&q)
+                    .ok()
+                    .and_then(|(doc, _)| repair::signature(&doc))
+            })
+            .collect();
+        let chosen = repair::vote(&signatures);
+        let agree = signatures
+            .iter()
+            .filter(|s| s.is_some() && **s == signatures[chosen])
+            .count();
+        self.emit(
+            "vote",
+            &json!({ "drafts": values.len(), "withRows": signatures.iter().filter(|s| s.is_some()).count(), "agree": agree, "chosen": chosen }),
+        );
+        values.swap_remove(chosen)
+    }
+
+    fn draft_turns(&mut self, ground: &Ground, notes: &[String], context_tokens: u64) -> Value {
         let mut repair: Option<String> = None;
         let mut repairs = 0;
         let mut attempt = 0;
+        let mut explored = !self.o.explore;
+        let mut shaped = !self.o.shape_check;
+        let mut entity_terms: Vec<String> = Vec::new();
         loop {
             attempt += 1;
             let role = if attempt == 1 {
@@ -1259,6 +1542,11 @@ impl Asking<'_, '_> {
                 );
                 return self.global(sel);
             }
+            let value = if attempt == 1 && self.o.drafts > 1 {
+                self.vote_drafts(value, &prompt, &schema)
+            } else {
+                value
+            };
             if self.level.is_none() {
                 self.level = Some(level);
                 if level == Level::Text {
@@ -1299,6 +1587,18 @@ impl Asking<'_, '_> {
             }
             if d.query.is_empty() {
                 self.attempts.push(record);
+                if !explored && self.room() {
+                    explored = true;
+                    let found = self.explore(ground, &entity_terms);
+                    if !found.is_empty() {
+                        self.emit(
+                            "diagnosis",
+                            &json!({ "attempt": attempt, "kind": "explore", "text": found }),
+                        );
+                        repair = Some(repair::explore_text(None, &found));
+                        continue;
+                    }
+                }
                 return json!({
                     "outcome": "unanswerable",
                     "result": { "explanation": d.explanation, "assumptions": d.assumptions },
@@ -1325,6 +1625,13 @@ impl Asking<'_, '_> {
                 });
             self.emit("check", &check);
             record["check"] = json!({ "ok": check["ok"], "issues": check["issues"] });
+            entity_terms = check["terms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t["kind"] == "entity")
+                .filter_map(|t| t["iri"].as_str().map(str::to_string))
+                .collect();
             if check["ok"] != Value::Bool(true) {
                 let diagnosis = issues_text(&check["issues"]);
                 self.emit(
@@ -1430,6 +1737,18 @@ impl Asking<'_, '_> {
                     repair = Some(repair_text(&run_query, &diagnosis));
                     continue;
                 }
+                if !explored && self.room() {
+                    explored = true;
+                    let found = self.explore(ground, &entity_terms);
+                    if !found.is_empty() {
+                        self.emit(
+                            "diagnosis",
+                            &json!({ "attempt": attempt, "kind": "explore", "text": found }),
+                        );
+                        repair = Some(repair::explore_text(Some(&run_query), &found));
+                        continue;
+                    }
+                }
                 let mut r = result(&d, &run_query, &check, Some(&doc), limit_added, attempt);
                 if let Some(f) = full {
                     r["results"] = f;
@@ -1440,17 +1759,48 @@ impl Asking<'_, '_> {
                 self.emit("result", &r);
                 return json!({ "outcome": "empty", "result": r });
             }
-            self.attempts.push(record);
             let mut r = result(&d, &run_query, &check, Some(&doc), limit_added, attempt);
             if let Some(f) = full {
                 r["results"] = f;
             }
-            self.emit("result", &r);
-            let mut out = json!({ "outcome": "answered", "result": r });
-            if let Some(s) = self.summarize(&run_query, &doc, rows, context_tokens) {
-                out["summary"] = s;
+            if !shaped {
+                shaped = true;
+                if let Some(hint) = repair::shape_hint(&self.o.question, &run_query, &doc)
+                    && self.room()
+                {
+                    self.emit(
+                        "diagnosis",
+                        &json!({ "attempt": attempt, "kind": "shape", "text": hint }),
+                    );
+                    record["diagnosis"] = hint.clone().into();
+                    self.attempts.push(record);
+                    let (rows_seen, _) = rows_text(&doc, 10);
+                    repair = Some(repair::shape_text(&run_query, &hint, &rows_seen));
+                    self.fallback = Some(Answered {
+                        result: r,
+                        query: run_query,
+                        doc,
+                        rows,
+                        by: self.answered_by.clone(),
+                    });
+                    // the shape's repair is the last: a failure keeps the first answer
+                    repairs = MAX_REPAIRS;
+                    explored = true;
+                    continue;
+                }
             }
-            return out;
+            self.attempts.push(record);
+            self.fallback = None;
+            return self.answer(
+                Answered {
+                    result: r,
+                    query: run_query,
+                    doc,
+                    rows,
+                    by: None,
+                },
+                context_tokens,
+            );
         }
     }
 

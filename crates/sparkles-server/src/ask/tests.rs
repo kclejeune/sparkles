@@ -758,3 +758,122 @@ mod profile_tests;
 
 #[path = "consumer_tests.rs"]
 mod consumer_tests;
+
+/// With `explore`, a draft without a query gets one exploration of the data around the
+/// question's entities, and the next draft answers from it.
+#[test]
+fn an_exploration_follows_a_draft_without_a_query() {
+    let s = server(ORG);
+    let mock = scripted(
+        vec![
+            draft(""),
+            draft(&format!(
+                "{PREFIXES}SELECT ?t WHERE {{ ?t ex:partOf res:acme }}"
+            )),
+        ],
+        json!({}),
+    );
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        explore: true,
+        ..opts("Which teams belong to Acme?")
+    };
+    let (out, events) = run(&s, &m, &o);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert_eq!(out["result"]["attempt"], 2);
+    assert!(events.contains(&"diagnosis".to_string()));
+    let explored = mock::prompt_of(&mock.requests()[1]);
+    assert!(explored.contains(repair::NO_QUERY), "{explored}");
+    assert!(
+        explored.contains("as object") && explored.contains("ex:partOf"),
+        "{explored}"
+    );
+    // without the option the first answer stands
+    let mock = scripted(vec![draft("")], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let (out, _) = run(
+        &s,
+        &m,
+        &AskOptions {
+            summary: false,
+            ..opts("Which teams belong to Acme?")
+        },
+    );
+    assert_eq!(out["outcome"], "unanswerable");
+    assert_eq!(mock.requests().len(), 1);
+}
+
+/// With `shape_check`, a "How many" answer of several rows is repaired once; a repair
+/// that does not answer keeps the first answer.
+#[test]
+fn a_result_whose_shape_does_not_fit_is_repaired_once() {
+    let s = server(ORG);
+    let list = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let count = draft(&format!(
+        "{PREFIXES}SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE {{ ?t a ex:Team }}"
+    ));
+    let mock = scripted(vec![list.clone(), count], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        shape_check: true,
+        ..opts("How many teams are there?")
+    };
+    let (out, _) = run(&s, &m, &o);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(
+        out["result"]["query"].as_str().unwrap().contains("COUNT"),
+        "{out:#}"
+    );
+    assert!(mock::prompt_of(&mock.requests()[1]).contains("asks how many"));
+    // the repair returns no rows, so the list stands
+    let none = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Nothing }}"));
+    let mock = scripted(vec![list, none], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let (out, _) = run(&s, &m, &o);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(
+        !out["result"]["query"].as_str().unwrap().contains("Nothing"),
+        "{out:#}"
+    );
+    assert_eq!(mock.requests().len(), 2);
+    assert!(
+        out["notes"].to_string().contains("first answer stands"),
+        "{out:#}"
+    );
+}
+
+/// With `drafts`, the result that most first drafts share wins.
+#[test]
+fn drafts_vote_by_their_results() {
+    let s = server(ORG);
+    let teams = draft(&format!("{PREFIXES}SELECT ?t WHERE {{ ?t a ex:Team }}"));
+    let people = draft(&format!("{PREFIXES}SELECT ?p WHERE {{ ?p a ex:Person }}"));
+    let same = draft(&format!(
+        "{PREFIXES}SELECT DISTINCT ?x WHERE {{ ?x ex:partOf res:acme }}"
+    ));
+    let mock = scripted(vec![people, teams, same], json!({}));
+    let m = models(&mock.url(), json!({}));
+    let o = AskOptions {
+        summary: false,
+        drafts: 3,
+        ..opts("Which teams are there?")
+    };
+    let mut votes = Vec::new();
+    let mut on = |e: &str, v: &Value| {
+        if e == "vote" {
+            votes.push(v.clone());
+        }
+    };
+    let out = ask(&s, &m, &Principal::local(), &o, &mut on);
+    assert_eq!(out["outcome"], "answered", "{out:#}");
+    assert!(
+        out["result"]["query"].as_str().unwrap().contains("ex:Team"),
+        "{out:#}"
+    );
+    assert_eq!(votes[0]["drafts"], 3);
+    assert_eq!(votes[0]["agree"], 2);
+    assert_eq!(votes[0]["chosen"], 1);
+    assert_eq!(out["usage"]["modelCalls"], 3);
+}

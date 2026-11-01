@@ -47,6 +47,7 @@ FIELDS = {
     "sets",
     "clarifications",
     "contextTokens",
+    "askOptions",
 }
 
 
@@ -284,6 +285,7 @@ def main():
         "askTokenBudget": run["askTokenBudget"],
         "clarifications": run.get("clarifications", "answer"),
         "contextTokens": run.get("contextTokens"),
+        "askOptions": run.get("askOptions", []),
         "jobs": args.jobs,
         "batch": not args.no_batch,
         "sets": {},
@@ -335,6 +337,8 @@ def main():
             if set_.get("loc"):
                 argv += ["--loc", set_["loc"]]
             argv += ["--clarifications", run.get("clarifications", "answer")]
+            for flag in run.get("askOptions", []):
+                argv += ["--ask-option=" + flag]
             argv += ["--jobs", str(args.jobs)]
             if not args.no_batch:
                 argv.append("--batch")

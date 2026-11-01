@@ -97,6 +97,21 @@ pub struct AskArgs {
     /// index statistics instead of scanning the indexes; `off` always scans
     #[arg(long, value_name = "QUADS", default_value_t = crate::state::StatisticsAbove::default())]
     pub schema_statistics_above: crate::state::StatisticsAbove,
+    /// Explore the data once when a draft gives no query or its query returns no rows:
+    /// further link candidates and the predicates the entities use, with samples
+    #[arg(long)]
+    pub explore: bool,
+    /// Repair once when the result's shape does not fit the question's form, such as
+    /// several rows for "How many", keeping the first answer if the repair fails
+    #[arg(long)]
+    pub shape_check: bool,
+    /// Ask this many first drafts and keep the one whose result most drafts share
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub drafts: usize,
+    /// Link each mention with the classes the words around it name, and show how many
+    /// triples name each candidate
+    #[arg(long)]
+    pub type_hints: bool,
     /// Print the result as one JSON object
     #[arg(long, conflicts_with = "events")]
     pub json: bool,
@@ -138,6 +153,9 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
     }
     if !(1..=64).contains(&args.jobs) {
         bail!("--jobs expects 1 to 64");
+    }
+    if !(1..=super::MAX_DRAFTS).contains(&args.drafts) {
+        bail!("--drafts expects 1 to {}", super::MAX_DRAFTS);
     }
     let pairs = parse_pairs(&args.pairs)?;
     // a local command reaches local providers such as Ollama by default
@@ -302,6 +320,10 @@ fn options(
         mode: args.mode,
         reviewed_only: args.reviewed_only,
         report_context,
+        explore: args.explore,
+        shape_check: args.shape_check,
+        drafts: args.drafts,
+        type_hints: args.type_hints,
         complexity_threshold: routing
             .complexity_threshold
             .or(model_routing.complexity_threshold)
