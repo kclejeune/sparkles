@@ -418,6 +418,11 @@ pub struct AppState {
     /// whether a server with a dataset that failed to open still reports ready
     /// (`serve --ready-ignore-failed`; spec C01 §4.1)
     pub ready_ignore_failed: bool,
+    /// the resource catalog of spec C30 (`<dataDir>/resources.json`)
+    pub resources: crate::resources::Resources,
+    /// what the licence gate does with data that may not be redistributed
+    /// (`serve --license-policy`)
+    pub license_policy: crate::resources::license::Policy,
     /// the datasets whose startup has not finished: those of `serve --mem`, `--loc` and
     /// `--fuseki-config` until they are attached, and those that startup configures
     /// (`--text`, `--geo`, `--validate`, `--rdfs`, data files) until it has; requests
@@ -771,6 +776,8 @@ impl AppState {
             rate_limit: None,
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             ready_ignore_failed: false,
+            resources: crate::resources::Resources::in_dir(data_dir),
+            license_policy: Default::default(),
             startup_pending: Default::default(),
             holding: AtomicBool::new(false),
             auth: None,
@@ -844,6 +851,8 @@ impl AppState {
             metrics: crate::obs::Metrics::new(false, 100),
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             ready_ignore_failed: false,
+            resources: crate::resources::Resources::in_dir(std::path::Path::new("")),
+            license_policy: Default::default(),
             startup_pending: Default::default(),
             holding: AtomicBool::new(false),
             auto_reason: None,

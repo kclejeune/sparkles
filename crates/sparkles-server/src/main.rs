@@ -73,6 +73,7 @@ mod rdfs;
 mod reasoning;
 #[cfg(feature = "auth")]
 mod remote;
+mod resources;
 mod secrets_cmd;
 mod server_memory;
 mod settings;
@@ -1290,6 +1291,10 @@ enum Cmd {
         /// still `degraded` in GET /$/ready
         #[arg(long)]
         ready_ignore_failed: bool,
+        /// What the licence gate of the resource catalog does with data that may not be
+        /// redistributed: `warn` reports it, `enforce` refuses it
+        #[arg(long, value_enum, default_value_t = resources::license::Policy::Warn)]
+        license_policy: resources::license::Policy,
         /// Stop the server when a dataset fails to open, instead of serving the others
         /// degraded
         #[arg(long)]
@@ -2751,6 +2756,7 @@ fn run() -> Result<()> {
             max_dataset_mb,
             shutdown_grace,
             ready_ignore_failed,
+            license_policy,
             require_all_datasets,
             open_threads,
             mut auth_config,
@@ -2899,6 +2905,7 @@ fn run() -> Result<()> {
                 pool_bytes,
             )?;
             st.ready_ignore_failed = ready_ignore_failed;
+            st.license_policy = license_policy;
             st.admission.profile = cli_memory_profile;
             st.admission.wait = Duration::from_secs_f64(query_admission_wait);
             let mode = spill.unwrap_or(SpillMode::On);

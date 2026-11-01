@@ -150,6 +150,16 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // outbound notifications (C21 §8)
     ("/$/notifications", &["GET"]),
     ("/$/notifications/test/{channel}", &["POST"]),
+    // the resource catalog (C30)
+    ("/$/resources", &["GET", "POST"]),
+    ("/$/resources/{id}", &["GET", "PUT", "DELETE"]),
+    ("/$/resources/{id}/versions", &["POST"]),
+    ("/$/resources/{id}/versions/{version}", &["DELETE"]),
+    ("/$/resources/{id}/acceptance", &["POST", "DELETE"]),
+    ("/$/resources/{id}/license", &["GET"]),
+    ("/$/resources/{id}/notice", &["GET"]),
+    ("/$/resources/{id}/header", &["GET"]),
+    ("/$/resources/{id}/install/{ds}", &["POST"]),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
     ("/$/asks/{ds}/{id}/feedback", &["POST"]),
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
@@ -404,6 +414,17 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         }
         // the operator's notification channels and their deliveries (C21 §8)
         "/$/notifications" | "/$/notifications/test/{channel}" => Server(ServerPerm::ServerAdmin),
+        // the server's resource catalog (C30); installing a vocabulary's prefixes changes
+        // one dataset's settings
+        "/$/resources/{id}/install/{ds}" => Dataset(Admin),
+        "/$/resources"
+        | "/$/resources/{id}"
+        | "/$/resources/{id}/versions"
+        | "/$/resources/{id}/versions/{version}"
+        | "/$/resources/{id}/acceptance"
+        | "/$/resources/{id}/license"
+        | "/$/resources/{id}/notice"
+        | "/$/resources/{id}/header" => Server(ServerPerm::ServerAdmin),
         // only the caller's own entries, whatever its role (C18 §6.4)
         "/$/asks/{ds}" | "/$/asks/{ds}/{id}/feedback" => Dataset(Read),
         // endpoints, models, budgets and the secret names of the operator's providers

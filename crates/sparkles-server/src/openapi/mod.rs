@@ -512,12 +512,16 @@ fn parameters() -> Map<String, J> {
         "notifications"
     ]);
     put("kind", kind);
-    put("id", path("id", "The id of the task, token or lock."));
+    put(
+        "id",
+        path("id", "The id of the task, token, lock or catalog resource."),
+    );
     put(
         "channel",
         path("channel", "The name of a notification channel."),
     );
     put("task", path("task", "The id of the ingestion task."));
+    put("version", path("version", "A version of the resource."));
     put("repo", path("repo", "The backup repository."));
     put("backup", path("backup", "The backup's id."));
     put("policy", path("policy", "The backup policy."));
@@ -980,6 +984,11 @@ fn tags() -> J {
             "write-time-validation"
         ),
         t("Tasks", "Background tasks.", "datasets-admin"),
+        t(
+            "Catalog",
+            "The resource catalog of sources, vocabularies and datasets, with licences.",
+            "resource-catalog"
+        ),
         t(
             "Backups",
             "Backups of a dataset, in N-Quads files or backup repositories.",

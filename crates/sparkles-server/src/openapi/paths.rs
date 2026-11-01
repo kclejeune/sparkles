@@ -526,12 +526,149 @@ pub(super) fn add_all(p: &mut Paths) {
     branches(p);
     search(p);
     settings(p);
+    resources(p);
     format_and_mcp(p);
     assist(p);
     backups(p);
     auth(p);
     protocol(p);
     openapi(p);
+}
+
+/// The resource catalog of spec C30.
+fn resources(p: &mut Paths) {
+    let tag = "Catalog";
+    let rdf_or_json = || {
+        let mut m = Map::new();
+        m.insert(
+            "application/json".into(),
+            json!({ "schema": sref("ResourceList") }),
+        );
+        media(RDF, &mut m);
+        J::Object(m)
+    };
+    let format = json!({ "type": "string", "enum": ["json", "turtle", "ntriples", "nquads", "trig", "rdfxml", "jsonld"] });
+    let etag = json!({ "ETag": { "description": "The resource's entity tag.", "schema": s() } });
+    p.add(
+        op(GET, "/$/resources", "listResources", tag, "List the resource catalog")
+            .doc("Every source, vocabulary and dataset resource of the server with its versions, as JSON, or the catalog in DCAT 3 with PROV-O, SPDX, VANN and VoID on `Accept` or `format=`. Needs server `admin`.")
+            .see("resource-catalog")
+            .query("format", format.clone(), "`json`, or the RDF syntax of the description. `Accept` decides when it is left out.")
+            .resp("200", "The catalog.", Some(rdf_or_json()))
+            .errors(&[400, 503]),
+    );
+    p.add(
+        op(POST, "/$/resources", "createResource", tag, "Add a resource")
+            .doc("Adds a resource with any initial versions, which may reference earlier ones in the list. A `mirrored` or `synced` ownership policy is refused, since this build keeps owned resources. Needs server `admin`.")
+            .see("resource-catalog")
+            .json_body(true, "ResourceCreate")
+            .resp_h("201", "The resource, with `Location`.", Some(json!({ "application/json": { "schema": sref("Resource") } })), json!({
+                "ETag": { "description": "The resource's entity tag.", "schema": s() },
+                "Location": { "description": "The resource's route.", "schema": s() },
+            }))
+            .errors(&[400, 403, 404, 409, 503]),
+    );
+    p.add(
+        op(GET, "/$/resources/{id}", "getResource", tag, "Get a resource")
+            .doc("The resource with its `ETag`, or its description in DCAT on `Accept` or `format=`. Needs server `admin`.")
+            .see("resource-catalog")
+            .query("format", format, "`json`, or the RDF syntax of the description.")
+            .resp_h("200", "The resource.", Some({
+                let mut m = Map::new();
+                m.insert("application/json".into(), json!({ "schema": sref("Resource") }));
+                media(RDF, &mut m);
+                J::Object(m)
+            }), etag.clone())
+            .errors(&[400, 404, 503]),
+    );
+    p.add(
+        op(PUT, "/$/resources/{id}", "replaceResource", tag, "Replace a resource's description")
+            .doc("Replaces the descriptive members. The kind stays, and `versions` is refused, since versions are added and removed on their own routes. A change of the licences withdraws the acceptance of restricted terms. Needs server `admin`.")
+            .see("resource-catalog")
+            .param("ifMatch")
+            .json_body(true, "ResourceUpdate")
+            .resp_h("200", "The resource.", Some(json!({ "application/json": { "schema": sref("Resource") } })), etag.clone())
+            .errors(&[400, 403, 404, 409, 412, 503]),
+    );
+    p.add(
+        op(DELETE, "/$/resources/{id}", "deleteResource", tag, "Remove a resource")
+            .doc("Removes a resource that no version of another resource references (`409 resource-in-use` otherwise). Needs server `admin`.")
+            .see("resource-catalog")
+            .param("ifMatch")
+            .no_content("Removed.")
+            .errors(&[403, 404, 409, 412, 503]),
+    );
+    p.add(
+        op(POST, "/$/resources/{id}/versions", "addResourceVersion", tag, "Add a version")
+            .doc("Adds a version, which never changes afterwards. Its imports and graph sources pin versions that exist. Needs server `admin`.")
+            .see("resource-catalog")
+            .json_body(true, "ResourceVersionInput")
+            .resp_h("201", "The resource with the new version.", Some(json!({ "application/json": { "schema": sref("Resource") } })), etag.clone())
+            .errors(&[400, 403, 404, 409, 503]),
+    );
+    p.add(
+        op(DELETE, "/$/resources/{id}/versions/{version}", "deleteResourceVersion", tag, "Remove a version")
+            .doc("Removes a version that nothing references (`409 resource-in-use` otherwise). Needs server `admin`.")
+            .see("resource-catalog")
+            .no_content("Removed.")
+            .errors(&[403, 404, 409, 503]),
+    );
+    p.add(
+        op(POST, "/$/resources/{id}/acceptance", "acceptResourceTerms", tag, "Accept restricted terms")
+            .doc("Records the caller's acceptance of the resource's restricted terms, with the licences it accepts. A resource without restricted terms is `409 not-restricted`. Needs server `admin`.")
+            .see("resource-licences")
+            .resp_h("200", "The resource.", Some(json!({ "application/json": { "schema": sref("Resource") } })), etag.clone())
+            .errors(&[403, 404, 409, 503]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/resources/{id}/acceptance",
+            "withdrawResourceTerms",
+            tag,
+            "Withdraw an acceptance",
+        )
+        .doc("Withdraws the acceptance of the resource's terms. Needs server `admin`.")
+        .see("resource-licences")
+        .resp_h(
+            "200",
+            "The resource.",
+            Some(json!({ "application/json": { "schema": sref("Resource") } })),
+            etag,
+        )
+        .errors(&[403, 404, 503]),
+    );
+    p.add(
+        op(GET, "/$/resources/{id}/license", "getResourceLicense", tag, "Get a version's licence obligations")
+            .doc("The licences that apply to a version, propagated through its imports and its graphs' sources, the class of each graph, whether the data may be redistributed and the verdict of the licence gate under `serve --license-policy`. Needs server `admin`.")
+            .see("resource-licences")
+            .query("version", s(), "The version; the current version by default.")
+            .json("200", "The report.", "LicenseReport")
+            .errors(&[404, 503]),
+    );
+    p.add(
+        op(GET, "/$/resources/{id}/notice", "getResourceNotice", tag, "Get a version's NOTICE")
+            .doc("The NOTICE of a version as plain text, with each licence, its attribution, its page and the graphs it covers. Needs server `admin`.")
+            .see("resource-licences")
+            .query("version", s(), "The version; the current version by default.")
+            .resp("200", "The NOTICE.", Some(json!({ "text/plain": { "schema": s() } })))
+            .errors(&[404, 503]),
+    );
+    p.add(
+        op(GET, "/$/resources/{id}/header", "getVocabularyHeader", tag, "Read a vocabulary's header")
+            .doc("Reads the `owl:Ontology` or `skos:ConceptScheme` header of each graph that holds the vocabulary, under the caller's grants and the server's query timeout and budgets, and lists where it disagrees with the current version's record. Changes nothing. Needs server `admin`.")
+            .see("vocabulary-resources")
+            .json("200", "The headers.", "VocabularyHeader")
+            .errors(&[404, 409, 503]),
+    );
+    p.add(
+        op(POST, "/$/resources/{id}/install/{ds}", "installVocabularyPrefixes", tag, "Install a vocabulary's prefixes")
+            .doc("Binds the namespaces of the vocabulary and of the vocabularies its current version imports as prefixes of the dataset in one settings write, which honours the operator's locks and the prefix limit. A prefix the dataset binds to another IRI is `409 prefix-conflict` unless `replace=true`. Needs `admin` on the dataset.")
+            .see("vocabulary-resources")
+            .query("replace", boolean(), "Rebind prefixes that the dataset binds to other IRIs.")
+            .json("200", "What the write bound.", "PrefixInstall")
+            .errors(&[400, 403, 404, 409, 503]),
+    );
 }
 
 /// Editing forms generated from SHACL shapes (U02).

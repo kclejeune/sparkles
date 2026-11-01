@@ -209,7 +209,7 @@
         }
       },
       "id": {
-        "description": "The id of the task, token or lock.",
+        "description": "The id of the task, token, lock or catalog resource.",
         "in": "path",
         "name": "id",
         "required": true,
@@ -463,6 +463,15 @@
         "name": "validate",
         "schema": {
           "type": "boolean"
+        }
+      },
+      "version": {
+        "description": "A version of the resource.",
+        "in": "path",
+        "name": "version",
+        "required": true,
+        "schema": {
+          "type": "string"
         }
       }
     },
@@ -10523,6 +10532,164 @@
         ],
         "type": "string"
       },
+      "LicenseReport": {
+        "description": "The licence obligations of a version and the gate's verdict.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-licences"
+        },
+        "properties": {
+          "class": {
+            "description": "The most restrictive class of the obligations.",
+            "enum": [
+              "open",
+              "attribution",
+              "share-alike",
+              "restricted",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "graphs": {
+            "items": {
+              "properties": {
+                "class": {
+                  "enum": [
+                    "open",
+                    "attribution",
+                    "share-alike",
+                    "restricted",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "obligations": {
+                  "description": "`resource version` keys of the obligations.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "redistributable": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "graph",
+                "class",
+                "redistributable",
+                "obligations"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "obligations": {
+            "items": {
+              "properties": {
+                "accepted": {
+                  "description": "For restricted terms, whether an administrator accepted them.",
+                  "type": "boolean"
+                },
+                "attribution": {
+                  "type": "string"
+                },
+                "class": {
+                  "enum": [
+                    "open",
+                    "attribution",
+                    "share-alike",
+                    "restricted",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "license": {
+                  "type": "string"
+                },
+                "resource": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "version": {
+                  "description": "Empty for a resource without versions.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "resource",
+                "title",
+                "version",
+                "class"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "policy": {
+            "enum": [
+              "warn",
+              "enforce"
+            ],
+            "type": "string"
+          },
+          "redistributable": {
+            "type": "boolean"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "unaccepted": {
+            "description": "Resources with restricted terms that no administrator accepted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verdict": {
+            "description": "`refuse` only under `--license-policy enforce`.",
+            "enum": [
+              "allow",
+              "warn",
+              "refuse"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "resource",
+          "class",
+          "redistributable",
+          "policy",
+          "verdict",
+          "obligations",
+          "warnings"
+        ],
+        "type": "object"
+      },
       "Limits": {
         "description": "The server's per-request budgets. 0 means unlimited.",
         "properties": {
@@ -14698,6 +14865,87 @@
         ],
         "type": "object"
       },
+      "PrefixInstall": {
+        "description": "The prefixes an install bound.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vocabulary-resources"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "installed": {
+            "items": {
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "replaced": {
+            "items": {
+              "properties": {
+                "bound": {
+                  "description": "The IRI the dataset bound before.",
+                  "type": "string"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                },
+                "resource": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "iri",
+                "bound",
+                "resource"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "unchanged": {
+            "items": {
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "installed",
+          "replaced",
+          "unchanged"
+        ],
+        "type": "object"
+      },
       "PrefixWarning": {
         "additionalProperties": false,
         "description": "A prefix whose name is well-known but whose IRI differs (spec C20).",
@@ -16584,6 +16832,691 @@
         },
         "required": [
           "repositories"
+        ],
+        "type": "object"
+      },
+      "Resource": {
+        "description": "A resource of the catalog.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "properties": {
+          "acceptance": {
+            "additionalProperties": false,
+            "description": "An administrator's acceptance of restricted terms.",
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "by": {
+                "type": "string"
+              },
+              "licenses": {
+                "description": "The licences of the resource and its versions that were accepted.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "by",
+              "at",
+              "licenses"
+            ],
+            "type": "object"
+          },
+          "attribution": {
+            "description": "The attribution text that the NOTICE carries.",
+            "type": "string"
+          },
+          "created": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "description": "An RFC 3339 time.",
+                "type": "string"
+              },
+              "by": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "by",
+              "at"
+            ],
+            "type": "object"
+          },
+          "dataset": {
+            "description": "The server dataset a dataset resource describes.",
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "graphs": {
+            "description": "The dataset graphs that hold a vocabulary.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "dataset": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "dataset",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "homepage": {
+            "description": "An absolute IRI.",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "source",
+              "vocabulary",
+              "dataset"
+            ],
+            "type": "string"
+          },
+          "license": {
+            "description": "An SPDX licence expression. Absent means no licence is known, which forbids redistribution.",
+            "type": "string"
+          },
+          "licenseClass": {
+            "description": "The licence's class, needed for identifiers outside the built-in table and for `LicenseRef-`.",
+            "enum": [
+              "open",
+              "attribution",
+              "share-alike",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "licenseUrl": {
+            "description": "The licence's page, for a licence outside the SPDX list.",
+            "type": "string"
+          },
+          "modified": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "description": "An RFC 3339 time.",
+                "type": "string"
+              },
+              "by": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "by",
+              "at"
+            ],
+            "type": "object"
+          },
+          "namespaces": {
+            "description": "The namespaces a vocabulary owns. A prefix and a namespace belong to one vocabulary of the server.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "ownership": {
+            "description": "`owned`; this build refuses `mirrored` and `synced`.",
+            "enum": [
+              "owned",
+              "mirrored",
+              "synced"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/ResourceVersion"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "title",
+          "ownership",
+          "versions",
+          "created",
+          "modified"
+        ],
+        "type": "object"
+      },
+      "ResourceCreate": {
+        "additionalProperties": false,
+        "description": "A resource to add, with any initial versions.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "properties": {
+          "attribution": {
+            "description": "The attribution text that the NOTICE carries.",
+            "type": "string"
+          },
+          "dataset": {
+            "description": "The server dataset a dataset resource describes.",
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "graphs": {
+            "description": "The dataset graphs that hold a vocabulary.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "dataset": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "dataset",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "homepage": {
+            "description": "An absolute IRI.",
+            "type": "string"
+          },
+          "id": {
+            "description": "1 to 64 letters, digits, `.`, `_` and `-`, starting with a letter or digit.",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "source",
+              "vocabulary",
+              "dataset"
+            ],
+            "type": "string"
+          },
+          "license": {
+            "description": "An SPDX licence expression. Absent means no licence is known, which forbids redistribution.",
+            "type": "string"
+          },
+          "licenseClass": {
+            "description": "The licence's class, needed for identifiers outside the built-in table and for `LicenseRef-`.",
+            "enum": [
+              "open",
+              "attribution",
+              "share-alike",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "licenseUrl": {
+            "description": "The licence's page, for a licence outside the SPDX list.",
+            "type": "string"
+          },
+          "namespaces": {
+            "description": "The namespaces a vocabulary owns. A prefix and a namespace belong to one vocabulary of the server.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "ownership": {
+            "description": "`owned`; this build refuses `mirrored` and `synced`.",
+            "enum": [
+              "owned",
+              "mirrored",
+              "synced"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/ResourceVersionInput"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "title"
+        ],
+        "type": "object"
+      },
+      "ResourceList": {
+        "description": "The resources of the catalog.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "properties": {
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/Resource"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "resources"
+        ],
+        "type": "object"
+      },
+      "ResourceUpdate": {
+        "additionalProperties": false,
+        "description": "The descriptive members of a resource.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "properties": {
+          "attribution": {
+            "description": "The attribution text that the NOTICE carries.",
+            "type": "string"
+          },
+          "dataset": {
+            "description": "The server dataset a dataset resource describes.",
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "graphs": {
+            "description": "The dataset graphs that hold a vocabulary.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "dataset": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "dataset",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "homepage": {
+            "description": "An absolute IRI.",
+            "type": "string"
+          },
+          "id": {
+            "description": "The route's id, when given.",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "source",
+              "vocabulary",
+              "dataset"
+            ],
+            "type": "string"
+          },
+          "license": {
+            "description": "An SPDX licence expression. Absent means no licence is known, which forbids redistribution.",
+            "type": "string"
+          },
+          "licenseClass": {
+            "description": "The licence's class, needed for identifiers outside the built-in table and for `LicenseRef-`.",
+            "enum": [
+              "open",
+              "attribution",
+              "share-alike",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "licenseUrl": {
+            "description": "The licence's page, for a licence outside the SPDX list.",
+            "type": "string"
+          },
+          "namespaces": {
+            "description": "The namespaces a vocabulary owns. A prefix and a namespace belong to one vocabulary of the server.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "ownership": {
+            "description": "`owned`; this build refuses `mirrored` and `synced`.",
+            "enum": [
+              "owned",
+              "mirrored",
+              "synced"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title"
+        ],
+        "type": "object"
+      },
+      "ResourceVersion": {
+        "description": "A version, with who added it and when.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "properties": {
+          "added": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "description": "An RFC 3339 time.",
+                "type": "string"
+              },
+              "by": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "by",
+              "at"
+            ],
+            "type": "object"
+          },
+          "distributions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "byteSize": {
+                  "type": "integer"
+                },
+                "mediaType": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "description": "The SHA-256 digest in hexadecimal.",
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graphs": {
+            "description": "A dataset version's graphs.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "sources": {
+                  "description": "The pinned source versions the graph was built from.",
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "resource": {
+                        "type": "string"
+                      },
+                      "version": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "resource",
+                      "version"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "imports": {
+            "description": "Pinned versions this version imports.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "resource": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "resource",
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "issued": {
+            "description": "A date (`YYYY-MM-DD`) or an RFC 3339 time.",
+            "type": "string"
+          },
+          "license": {
+            "description": "The version's SPDX licence expression, which overrides the resource's.",
+            "type": "string"
+          },
+          "licenseClass": {
+            "enum": [
+              "open",
+              "attribution",
+              "share-alike",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "licenseUrl": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "version": {
+            "description": "1 to 64 letters, digits, `.`, `_`, `+` and `-`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "added"
+        ],
+        "type": "object"
+      },
+      "ResourceVersionInput": {
+        "additionalProperties": false,
+        "description": "A version to add. It never changes once it is added.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "properties": {
+          "distributions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "byteSize": {
+                  "type": "integer"
+                },
+                "mediaType": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "description": "The SHA-256 digest in hexadecimal.",
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graphs": {
+            "description": "A dataset version's graphs.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "sources": {
+                  "description": "The pinned source versions the graph was built from.",
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "resource": {
+                        "type": "string"
+                      },
+                      "version": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "resource",
+                      "version"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "imports": {
+            "description": "Pinned versions this version imports.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "resource": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "resource",
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "issued": {
+            "description": "A date (`YYYY-MM-DD`) or an RFC 3339 time.",
+            "type": "string"
+          },
+          "license": {
+            "description": "The version's SPDX licence expression, which overrides the resource's.",
+            "type": "string"
+          },
+          "licenseClass": {
+            "enum": [
+              "open",
+              "attribution",
+              "share-alike",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "licenseUrl": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "version": {
+            "description": "1 to 64 letters, digits, `.`, `_`, `+` and `-`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version"
         ],
         "type": "object"
       },
@@ -21664,6 +22597,84 @@
           "dataset",
           "name",
           "task"
+        ],
+        "type": "object"
+      },
+      "VocabularyHeader": {
+        "description": "The header of each graph that holds a vocabulary.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vocabulary-resources"
+        },
+        "properties": {
+          "graphs": {
+            "items": {
+              "properties": {
+                "dataset": {
+                  "type": "string"
+                },
+                "disagreements": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "error": {
+                  "type": "string"
+                },
+                "found": {
+                  "type": "boolean"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "header": {
+                  "type": "string"
+                },
+                "license": {
+                  "type": "string"
+                },
+                "namespace": {
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "versionIRI": {
+                  "type": "string"
+                },
+                "versionInfo": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "dataset",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "version": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "resource",
+          "version",
+          "graphs"
         ],
         "type": "object"
       },
@@ -34705,6 +35716,1014 @@
         "summary": "Verify every backup of a repository",
         "tags": [
           "Backup repositories"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources": {
+      "get": {
+        "description": "Every source, vocabulary and dataset resource of the server with its versions, as JSON, or the catalog in DCAT 3 with PROV-O, SPDX, VANN and VoID on `Accept` or `format=`. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "operationId": "listResources",
+        "parameters": [
+          {
+            "description": "`json`, or the RDF syntax of the description. `Accept` decides when it is left out.",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "json",
+                "turtle",
+                "ntriples",
+                "nquads",
+                "trig",
+                "rdfxml",
+                "jsonld"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceList"
+                }
+              },
+              "application/ld+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-quads": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+protobuf": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                }
+              },
+              "application/rdf+thrift": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/trig": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The catalog."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the resource catalog",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "post": {
+        "description": "Adds a resource with any initial versions, which may reference earlier ones in the list. A `mirrored` or `synced` ownership policy is refused, since this build keeps owned resources. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "operationId": "createResource",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceCreate"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resource"
+                }
+              }
+            },
+            "description": "The resource, with `Location`.",
+            "headers": {
+              "ETag": {
+                "description": "The resource's entity tag.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "The resource's route.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Add a resource",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}": {
+      "delete": {
+        "description": "Removes a resource that no version of another resource references (`409 resource-in-use` otherwise). Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "operationId": "deleteResource",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove a resource",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "get": {
+        "description": "The resource with its `ETag`, or its description in DCAT on `Accept` or `format=`. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "operationId": "getResource",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "`json`, or the RDF syntax of the description.",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "json",
+                "turtle",
+                "ntriples",
+                "nquads",
+                "trig",
+                "rdfxml",
+                "jsonld"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resource"
+                }
+              },
+              "application/ld+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-quads": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/n-triples": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+json": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/rdf+protobuf": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                }
+              },
+              "application/rdf+thrift": {
+                "schema": {
+                  "contentMediaType": "application/octet-stream",
+                  "type": "string"
+                }
+              },
+              "application/rdf+xml": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/trig": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The resource.",
+            "headers": {
+              "ETag": {
+                "description": "The resource's entity tag.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a resource",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "put": {
+        "description": "Replaces the descriptive members. The kind stays, and `versions` is refused, since versions are added and removed on their own routes. A change of the licences withdraws the acceptance of restricted terms. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "operationId": "replaceResource",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceUpdate"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resource"
+                }
+              }
+            },
+            "description": "The resource.",
+            "headers": {
+              "ETag": {
+                "description": "The resource's entity tag.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Replace a resource's description",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/acceptance": {
+      "delete": {
+        "description": "Withdraws the acceptance of the resource's terms. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-licences"
+        },
+        "operationId": "withdrawResourceTerms",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resource"
+                }
+              }
+            },
+            "description": "The resource.",
+            "headers": {
+              "ETag": {
+                "description": "The resource's entity tag.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Withdraw an acceptance",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "post": {
+        "description": "Records the caller's acceptance of the resource's restricted terms, with the licences it accepts. A resource without restricted terms is `409 not-restricted`. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-licences"
+        },
+        "operationId": "acceptResourceTerms",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resource"
+                }
+              }
+            },
+            "description": "The resource.",
+            "headers": {
+              "ETag": {
+                "description": "The resource's entity tag.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Accept restricted terms",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/header": {
+      "get": {
+        "description": "Reads the `owl:Ontology` or `skos:ConceptScheme` header of each graph that holds the vocabulary, under the caller's grants and the server's query timeout and budgets, and lists where it disagrees with the current version's record. Changes nothing. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vocabulary-resources"
+        },
+        "operationId": "getVocabularyHeader",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VocabularyHeader"
+                }
+              }
+            },
+            "description": "The headers."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read a vocabulary's header",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/install/{ds}": {
+      "post": {
+        "description": "Binds the namespaces of the vocabulary and of the vocabularies its current version imports as prefixes of the dataset in one settings write, which honours the operator's locks and the prefix limit. A prefix the dataset binds to another IRI is `409 prefix-conflict` unless `replace=true`. Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vocabulary-resources"
+        },
+        "operationId": "installVocabularyPrefixes",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Rebind prefixes that the dataset binds to other IRIs.",
+            "in": "query",
+            "name": "replace",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrefixInstall"
+                }
+              }
+            },
+            "description": "What the write bound."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Install a vocabulary's prefixes",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/resources/{id}/license": {
+      "get": {
+        "description": "The licences that apply to a version, propagated through its imports and its graphs' sources, the class of each graph, whether the data may be redistributed and the verdict of the licence gate under `serve --license-policy`. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-licences"
+        },
+        "operationId": "getResourceLicense",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "The version; the current version by default.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenseReport"
+                }
+              }
+            },
+            "description": "The report."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a version's licence obligations",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/notice": {
+      "get": {
+        "description": "The NOTICE of a version as plain text, with each licence, its attribution, its page and the graphs it covers. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-licences"
+        },
+        "operationId": "getResourceNotice",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "The version; the current version by default.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The NOTICE."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a version's NOTICE",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/versions": {
+      "post": {
+        "description": "Adds a version, which never changes afterwards. Its imports and graph sources pin versions that exist. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "operationId": "addResourceVersion",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceVersionInput"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resource"
+                }
+              }
+            },
+            "description": "The resource with the new version.",
+            "headers": {
+              "ETag": {
+                "description": "The resource's entity tag.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Add a version",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/versions/{version}": {
+      "delete": {
+        "description": "Removes a version that nothing references (`409 resource-in-use` otherwise). Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+        },
+        "operationId": "deleteResourceVersion",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/version"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove a version",
+        "tags": [
+          "Catalog"
         ],
         "x-sparkles-permission": "server-admin"
       }
@@ -48578,6 +50597,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
       },
       "name": "Tasks"
+    },
+    {
+      "description": "The resource catalog of sources, vocabularies and datasets, with licences.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#resource-catalog"
+      },
+      "name": "Catalog"
     },
     {
       "description": "Backups of a dataset, in N-Quads files or backup repositories.",
