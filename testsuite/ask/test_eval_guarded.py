@@ -54,8 +54,8 @@ def lenient(gold, got, labels):
     ok, _ = guarded.compare(gold, got)
     if ok:
         return True
-    g, a, _ = guarded.canonical(gold, got, labels)
-    return guarded.compare(g, a)[0]
+    found = guarded.lenient_compare(gold, got, labels)
+    return bool(found and found[0])
 
 
 class GuardedScore(unittest.TestCase):
@@ -97,18 +97,32 @@ class GuardedScore(unittest.TestCase):
         self.assertFalse(lenient(gold, rel(["c"], [uri("ex:Podgorica")]), {"ex:Podgorica": {"Podgorica"}}))
         self.assertEqual(guarded.label_requests(gold, rel(["c"], [uri("ex:Podgorica")])), ([], []))
 
+    def test_a_label_column_survives_number_canonicalization(self):
+        gold = rel(["x", "l", "n"], [uri("ex:a"), lit("Alice"), lit("1", "integer")])
+        got = rel(["x", "l", "n"], [uri("ex:a"), lit("Alice"), lit("1", "nonNegativeInteger")])
+        self.assertTrue(lenient(gold, got, {"ex:a": {"Alice"}}))
+        self.assertTrue(lenient(gold, got, {}))
+        wrong = rel(["x", "l", "n"], [uri("ex:a"), lit("Bob"), lit("1", "nonNegativeInteger")])
+        self.assertFalse(lenient(gold, wrong, {"ex:a": {"Alice"}}))
+
     def test_empty_strings_drop_from_both_sides(self):
         gold = rel(["x"], [uri("ex:a")], [lit("")])
         g2, n = guarded.drop_empty(gold)
         self.assertEqual(n, 1)
         self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")]))[0])[0])
-        self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")], [lit("", lang="en")]), gold=False)[0])[0])
+        self.assertTrue(guarded.compare(g2, guarded.drop_empty(rel(["y"], [uri("ex:a")], [lit("", lang="en")]))[0])[0])
         # an unbound row holds no empty string and stays
         unbound = rel(["y", "l"], [uri("ex:a"), lit("A")], [None, None])
-        self.assertEqual(guarded.drop_empty(unbound, gold=False)[1], 0)
+        self.assertEqual(guarded.drop_empty(unbound)[1], 0)
         # an empty label beside a wrong answer keeps that answer
         got = rel(["y", "l"], [uri("ex:a"), lit("A")], [uri("ex:b"), lit("")])
-        self.assertFalse(guarded.compare(g2, guarded.drop_empty(got, gold=False)[0])[0])
+        self.assertFalse(guarded.compare(g2, guarded.drop_empty(got)[0])[0])
+        # an empty side cell beside a gold answer keeps that answer
+        gold = rel(["x", "l"], [uri("ex:a"), lit("A")], [uri("ex:b"), lit("")])
+        g3, n = guarded.drop_empty(gold)
+        self.assertEqual(n, 0)
+        self.assertTrue(guarded.compare(g3, guarded.drop_empty(gold)[0])[0])
+        self.assertFalse(guarded.compare(g3, rel(["x", "l"], [uri("ex:a"), lit("A")]))[0])
 
     def test_extra_column_cap_and_flags(self):
         gold = rel(["x"], [uri("ex:a")])
@@ -192,6 +206,14 @@ class GroundingRecall(unittest.TestCase):
             (p / "s" / "report.json").write_text(json.dumps(dict(report, pairs=["m", "n"])))
             with self.assertRaises(ValueError):
                 grounding_recall.recall(qset, p)
+            # a prompt whose response failed was still sent and still counts
+            (p / "s" / "report.json").write_text(json.dumps(report))
+            (p / "replies.jsonl").write_text(json.dumps({"case": "c1", "status": 529, "request": {
+                "system": "You translate", "messages": [{"content": "<http://ex.org/p> Question: Q?"}]}}) + "\n")
+            rows = grounding_recall.recall(qset, p)
+            self.assertTrue(rows["a"]["prompt"])
+            self.assertIsNone(rows["a"]["promptTokens"])
+            self.assertEqual(grounding_recall.summary(rows)["promptTokensKnown"], 0)
 
 
 class KilledChild(unittest.TestCase):

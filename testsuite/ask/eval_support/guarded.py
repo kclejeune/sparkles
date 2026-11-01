@@ -102,17 +102,16 @@ def empty_string(cell):
     )
 
 
-def drop_empty(rel, gold=True):
-    """`rel` without its rows that hold an empty string. A gold row goes when any cell
-    is empty. An answer row goes only when every bound cell is empty, so that an empty
-    label beside a wrong answer cannot hide that answer."""
-    if gold:
-        keep = lambda r: not any(empty_string(c) for c in r)  # noqa: E731
-    else:
-        keep = lambda r: not (  # noqa: E731
-            any(empty_string(c) for c in r)
-            and all(empty_string(c) or c == UNBOUND for c in r)
+def drop_empty(rel):
+    """`rel` without its rows whose bound cells are all empty strings. A row with an
+    empty label beside a real value keeps that value, on either side, so that an
+    empty cell can neither hide a wrong answer nor remove a gold answer."""
+
+    def keep(r):
+        return not (
+            any(empty_string(c) for c in r) and all(empty_string(c) or c == UNBOUND for c in r)
         )
+
     rows = frozenset(r for r in rel.rows if keep(r))
     return Relation(rel.variables, rows, rel.duplicates), len(rel.rows) - len(rows)
 
@@ -246,6 +245,23 @@ def canonical(gold, got, labels):
         Relation(got.variables, a, got.duplicates),
         changes,
     )
+
+
+def lenient_compare(gold, got, labels, check=lambda: None):
+    """(correct, detail, changes, gold, got) of the lenient comparison, or None when
+    canonicalization changes nothing. It tries labels as IRIs and then numbers alone,
+    since turning an answer's label into its IRI can break a label column that already
+    matched the gold's literal."""
+    first = None
+    for names in (labels, {}) if labels else ({},):
+        g, a, changes = canonical(gold, got, names)
+        if not any(changes.values()):
+            continue
+        ok, detail = compare(g, a, check)
+        if ok:
+            return ok, detail, changes, g, a
+        first = first or (ok, detail, changes, g, a)
+    return first
 
 
 def compare(gold, got, check=lambda: None):

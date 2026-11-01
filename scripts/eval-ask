@@ -585,17 +585,15 @@ class Runner:
         got = self.last_got
         if got is None or type(got) is bool:
             return dict(out, correct=False, status=strict_detail.get("status"))
-        got2, dropped_got = guarded.drop_empty(got, gold=False)
+        got2, dropped_got = guarded.drop_empty(got)
         detail = {"droppedEmptyGoldRows": dropped_gold, "droppedEmptyAnswerRows": dropped_got}
         ok, cmp = guarded.compare(gold2, got2, self.check)
         if not ok and cmp.get("status") is None:
             iris, texts = guarded.label_requests(gold2, got2)
             labels = self.labels(iris, texts) if iris and texts else {}
-            g3, a3, changes = guarded.canonical(gold2, got2, labels)
-            if any(changes.values()):
-                ok, cmp = guarded.compare(g3, a3, self.check)
-                detail["lenient"] = changes
-                gold2, got2 = g3, a3
+            found = guarded.lenient_compare(gold2, got2, labels, self.check)
+            if found:
+                ok, cmp, detail["lenient"], gold2, got2 = found
         detail.update(cmp)
         if ok and cmp.get("extraColumns"):
             detail["flags"] = guarded.flags(gold2, got2, cmp, self.predicates)

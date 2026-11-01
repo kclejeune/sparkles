@@ -60,18 +60,24 @@ def drafts(replies_path):
     out = collections.defaultdict(list)
     for line in open(replies_path):
         r = json.loads(line)
-        if not r.get("case") or r.get("status") != 200:
+        # The prompt sent counts whatever the provider answered, so a failed
+        # response keeps its request and only loses its token count.
+        req = r.get("request")
+        if not r.get("case") or not isinstance(req, dict):
             continue
-        req = r["request"]
         if not system_text(req).startswith(DRAFT_SYSTEM):
             continue
         text = prompt_text(req)
         if "```sparql" in text.split("Question:", 1)[-1]:
             continue  # a repair quotes the failed query
-        u = (r.get("reply") or {}).get("usage") or {}
-        tokens = sum(
-            u.get(k) or 0
-            for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+        u = (r.get("reply") or {}).get("usage") if r.get("status") == 200 else None
+        tokens = (
+            sum(
+                u.get(k) or 0
+                for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+            )
+            if isinstance(u, dict)
+            else None
         )
         out[r["case"]].append((system_text(req) + "\n" + text, tokens))
     return out
@@ -160,7 +166,7 @@ def summary(rows):
     terms_s = sum(len(r["schema"]) for r in have)
     terms_r = sum(len(r["resources"]) for r in have)
     chars = sorted(r["promptChars"] for r in have)
-    toks = sorted(r["promptTokens"] for r in have)
+    toks = sorted(r["promptTokens"] for r in have if r["promptTokens"] is not None)
     return {
         "questions": n,
         "withPrompt": len(have),
@@ -172,6 +178,7 @@ def summary(rows):
         "promptCharsMean": sum(chars) / len(chars) if chars else None,
         "promptCharsMax": chars[-1] if chars else None,
         "promptTokensMean": sum(toks) / len(toks) if toks else None,
+        "promptTokensKnown": len(toks),
     }
 
 
