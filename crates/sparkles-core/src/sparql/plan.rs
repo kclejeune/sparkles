@@ -713,7 +713,6 @@ pub(super) const FILTER_SELECTIVITY: f64 = 0.3;
 /// A pattern with one variable estimated at this many rows or fewer is read at planning
 /// time, and bound to its value when it has one row (see `Planner::point_value`).
 const POINT_ROWS: f64 = 4.0;
-const DP_LIMIT: usize = 12;
 
 pub struct Planner<'a> {
     pub ctx: &'a Ctx,
@@ -3307,15 +3306,13 @@ impl<'a> Planner<'a> {
                     .unwrap();
                 *filters = rest;
                 best
-            } else if self.ctx.opt.pruned_join_order {
-                match super::joinorder::order(self, items, filters)? {
-                    Ok(plan) => plan,
-                    Err(items) => self.dp(items, filters)?,
-                }
-            } else if items.len() <= DP_LIMIT {
-                self.dp(items, filters)?
             } else {
-                self.greedy(items, filters)?
+                #[cfg(test)]
+                if REFERENCE_JOIN_ORDER.with(|r| r.get()) {
+                    parts.push(self.place_filters(self.reference_order(items, filters)?, settled));
+                    continue;
+                }
+                super::joinorder::order(self, items, filters)?
             };
             parts.push(self.place_filters(plan, settled));
         }
@@ -3390,161 +3387,6 @@ impl<'a> Planner<'a> {
         } else {
             filter(n, now, self.ctx)
         }
-    }
-
-    fn dp(&self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>) -> Result<Node> {
-        let n = items.len();
-        let filter_vars: Vec<Vec<VarId>> = filters
-            .iter()
-            .map(|f| {
-                if f.has_exists() {
-                    vec![VarId::MAX]
-                } else {
-                    f.var_set()
-                }
-            })
-            .collect();
-        // table: mask → candidates (one per first sort var)
-        let mut table: FxHashMap<u32, Vec<(Node, u64)>> = FxHashMap::default();
-        for (i, opts) in items.into_iter().enumerate() {
-            let mut v = Vec::new();
-            for o in opts {
-                let (o, fm) = self.apply_dp_filters(o, 0, filters, &filter_vars);
-                v.push((o, fm));
-            }
-            table.insert(1 << i, v);
-        }
-        for size in 2..=n {
-            let masks: Vec<u32> = (1u32..(1 << n))
-                .filter(|m| m.count_ones() as usize == size)
-                .collect();
-            for mask in masks {
-                self.ctx.check()?;
-                let mut cands: Vec<(Node, u64)> = Vec::new();
-                // enumerate splits (sub, mask^sub) with sub < rest to avoid duplicates
-                let mut sub = (mask - 1) & mask;
-                while sub > 0 {
-                    let rest = mask ^ sub;
-                    if sub < rest
-                        && let (Some(l), Some(r)) = (table.get(&sub), table.get(&rest))
-                    {
-                        for (a, fa) in l {
-                            for (b, fb) in r {
-                                if !a.vars.iter().any(|v| b.vars.contains(v)) {
-                                    continue;
-                                }
-                                for c in join_candidates(a, b, self.ctx) {
-                                    let (c, fm) =
-                                        self.apply_dp_filters(c, fa | fb, filters, &filter_vars);
-                                    cands.push((c, fm));
-                                }
-                            }
-                        }
-                    }
-                    sub = (sub - 1) & mask;
-                }
-                if cands.is_empty() {
-                    continue;
-                }
-                // prune: best per first sort var
-                let mut best: FxHashMap<Option<VarId>, (Node, u64)> = FxHashMap::default();
-                for (c, fm) in cands {
-                    let key = c.sorted.first().copied();
-                    match best.get(&key) {
-                        Some((b, _)) if b.cost <= c.cost => {}
-                        _ => {
-                            best.insert(key, (c, fm));
-                        }
-                    }
-                }
-                // in order of the sort variable, so that ties break the same way in every
-                // run and in the join ordering on cost summaries
-                let mut best: Vec<(Option<VarId>, (Node, u64))> = best.into_iter().collect();
-                best.sort_unstable_by_key(|(k, _)| *k);
-                table.insert(mask, best.into_iter().map(|(_, c)| c).collect());
-            }
-        }
-        let full = (1u32 << n) - 1;
-        let cands = table
-            .remove(&full)
-            .ok_or_else(|| Error::invalid("join planning failed"))?;
-        let (best, fm) = cands
-            .into_iter()
-            .min_by(|a, b| a.0.cost.total_cmp(&b.0.cost))
-            .unwrap();
-        // remove applied filters; the mask covers only the first 64, which are the only
-        // ones apply_dp_filters places, so any later filter stays for the caller
-        let mut i = 0;
-        filters.retain(|_| {
-            let keep = i >= 64 || fm & (1u64 << i) == 0;
-            i += 1;
-            keep
-        });
-        Ok(best)
-    }
-
-    pub(super) fn apply_dp_filters(
-        &self,
-        n: Node,
-        applied: u64,
-        filters: &[Expr],
-        fvars: &[Vec<VarId>],
-    ) -> (Node, u64) {
-        let mut now = Vec::new();
-        let mut mask = applied;
-        for (i, f) in filters.iter().enumerate().take(64) {
-            if mask & (1 << i) == 0
-                && !fvars[i].is_empty()
-                && fvars[i].iter().all(|v| n.vars.contains(v))
-            {
-                now.push(f.clone());
-                mask |= 1 << i;
-            }
-        }
-        if now.is_empty() {
-            (n, mask)
-        } else {
-            (filter(n, now, self.ctx), mask)
-        }
-    }
-
-    fn greedy(&self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>) -> Result<Node> {
-        let mut plans: Vec<Node> = items
-            .into_iter()
-            .map(|mut o| {
-                o.sort_by(|a, b| a.cost.total_cmp(&b.cost));
-                o.swap_remove(0)
-            })
-            .map(|p| self.place_filters(p, filters))
-            .collect();
-        while plans.len() > 1 {
-            self.ctx.check()?;
-            let mut best: Option<(usize, usize, Node)> = None;
-            for i in 0..plans.len() {
-                for j in i + 1..plans.len() {
-                    if !plans[i].vars.iter().any(|v| plans[j].vars.contains(v)) {
-                        continue;
-                    }
-                    for c in join_candidates(&plans[i], &plans[j], self.ctx) {
-                        if best.as_ref().is_none_or(|(_, _, b)| {
-                            c.est < b.est || (c.est == b.est && c.cost < b.cost)
-                        }) {
-                            best = Some((i, j, c));
-                        }
-                    }
-                }
-            }
-            let Some((i, j, c)) = best else { break };
-            plans.remove(j);
-            plans.remove(i);
-            plans.push(self.place_filters(c, filters));
-        }
-        let mut it = plans.into_iter();
-        let mut acc = it.next().unwrap();
-        for p in it {
-            acc = self.place_filters(join(acc, p, self.ctx), filters);
-        }
-        Ok(acc)
     }
 
     // --------------------------------------------------------------- paths ------
@@ -6177,5 +6019,164 @@ fn count_patterns(gp: &GraphPattern, out: &mut FxHashMap<SeenPattern, u32>) {
             | GP::Service { inner, .. } => todo.push(inner),
             GP::Values { .. } => {}
         }
+    }
+}
+
+// ------------------------------------------------------ reference ordering ------
+
+#[cfg(test)]
+thread_local! {
+    /// Plan connected groups with the reference join ordering of the tests instead of
+    /// the program on cost summaries (see [`Planner::reference_order`]).
+    pub(crate) static REFERENCE_JOIN_ORDER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The join ordering the program on cost summaries replaced, kept as the tests' oracle:
+/// the exhaustive dynamic program over plan trees for up to 12 inputs, and a greedy
+/// ordering beyond.
+#[cfg(test)]
+impl Planner<'_> {
+    fn reference_order(&self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>) -> Result<Node> {
+        if items.len() <= 12 {
+            self.reference_dp(items, filters)
+        } else {
+            self.reference_greedy(items, filters)
+        }
+    }
+
+    fn reference_dp(&self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>) -> Result<Node> {
+        let n = items.len();
+        let filter_vars: Vec<Vec<VarId>> = filters
+            .iter()
+            .map(|f| {
+                if f.has_exists() {
+                    vec![VarId::MAX]
+                } else {
+                    f.var_set()
+                }
+            })
+            .collect();
+        // table: mask → candidates (one per first sort var)
+        let mut table: FxHashMap<u32, Vec<(Node, u64)>> = FxHashMap::default();
+        for (i, opts) in items.into_iter().enumerate() {
+            let mut v = Vec::new();
+            for o in opts {
+                let (o, fm) = super::joinorder::place_masked(self, o, 0, filters, &filter_vars);
+                v.push((o, fm));
+            }
+            table.insert(1 << i, v);
+        }
+        for size in 2..=n {
+            let masks: Vec<u32> = (1u32..(1 << n))
+                .filter(|m| m.count_ones() as usize == size)
+                .collect();
+            for mask in masks {
+                self.ctx.check()?;
+                let mut cands: Vec<(Node, u64)> = Vec::new();
+                // enumerate splits (sub, mask^sub) with sub < rest to avoid duplicates
+                let mut sub = (mask - 1) & mask;
+                while sub > 0 {
+                    let rest = mask ^ sub;
+                    if sub < rest
+                        && let (Some(l), Some(r)) = (table.get(&sub), table.get(&rest))
+                    {
+                        for (a, fa) in l {
+                            for (b, fb) in r {
+                                if !a.vars.iter().any(|v| b.vars.contains(v)) {
+                                    continue;
+                                }
+                                for c in join_candidates(a, b, self.ctx) {
+                                    let (c, fm) = super::joinorder::place_masked(
+                                        self,
+                                        c,
+                                        fa | fb,
+                                        filters,
+                                        &filter_vars,
+                                    );
+                                    cands.push((c, fm));
+                                }
+                            }
+                        }
+                    }
+                    sub = (sub - 1) & mask;
+                }
+                if cands.is_empty() {
+                    continue;
+                }
+                // prune: best per first sort var
+                let mut best: FxHashMap<Option<VarId>, (Node, u64)> = FxHashMap::default();
+                for (c, fm) in cands {
+                    let key = c.sorted.first().copied();
+                    match best.get(&key) {
+                        Some((b, _)) if b.cost <= c.cost => {}
+                        _ => {
+                            best.insert(key, (c, fm));
+                        }
+                    }
+                }
+                // in order of the sort variable, so that ties break the same way in every
+                // run and in the join ordering on cost summaries
+                let mut best: Vec<(Option<VarId>, (Node, u64))> = best.into_iter().collect();
+                best.sort_unstable_by_key(|(k, _)| *k);
+                table.insert(mask, best.into_iter().map(|(_, c)| c).collect());
+            }
+        }
+        let full = (1u32 << n) - 1;
+        let cands = table
+            .remove(&full)
+            .ok_or_else(|| Error::invalid("join planning failed"))?;
+        let (best, fm) = cands
+            .into_iter()
+            .min_by(|a, b| a.0.cost.total_cmp(&b.0.cost))
+            .unwrap();
+        // remove applied filters; the mask covers only the first 64, which are the only
+        // ones `place_masked` places, so any later filter stays for the caller
+        let mut i = 0;
+        filters.retain(|_| {
+            let keep = i >= 64 || fm & (1u64 << i) == 0;
+            i += 1;
+            keep
+        });
+        Ok(best)
+    }
+
+    fn reference_greedy(&self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>) -> Result<Node> {
+        let mut plans: Vec<Node> = items
+            .into_iter()
+            .map(|mut o| {
+                o.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+                o.swap_remove(0)
+            })
+            .map(|p| self.place_filters(p, filters))
+            .collect();
+        while plans.len() > 1 {
+            self.ctx.check()?;
+            let mut best: Option<(usize, usize, Node)> = None;
+            for i in 0..plans.len() {
+                for j in i + 1..plans.len() {
+                    if !plans[i].vars.iter().any(|v| plans[j].vars.contains(v)) {
+                        continue;
+                    }
+                    for c in join_candidates(&plans[i], &plans[j], self.ctx) {
+                        if best.as_ref().is_none_or(|(_, _, b)| {
+                            c.est < b.est || (c.est == b.est && c.cost < b.cost)
+                        }) {
+                            best = Some((i, j, c));
+                        }
+                    }
+                }
+            }
+            let Some((i, j, c)) = best else { break };
+            plans.remove(j);
+            plans.remove(i);
+            plans.push(self.place_filters(c, filters));
+        }
+        let mut it = plans.into_iter();
+        let mut acc = it.next().unwrap();
+        for p in it {
+            acc = self.place_filters(join(acc, p, self.ctx), filters);
+        }
+        Ok(acc)
     }
 }

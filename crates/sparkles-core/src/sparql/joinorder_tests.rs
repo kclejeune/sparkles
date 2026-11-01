@@ -7,7 +7,7 @@
 //! cost and rows exactly.
 
 use super::indexjoin::FORCE_INDEX_JOIN;
-use super::plan::Node;
+use super::plan::{Node, REFERENCE_JOIN_ORDER};
 use super::*;
 use crate::io::{RdfFormat, Source};
 use crate::store::{Store, StoreOptions};
@@ -125,8 +125,13 @@ fn random_group(next: &mut impl FnMut() -> u64, shape: u64, n: usize) -> String 
     q
 }
 
-fn pruned_off() -> Optimizations {
-    Optimizations::ALL.disable("pruned_join_order").unwrap()
+/// `f` with connected groups planned by the reference join ordering, the exhaustive
+/// program over plan trees up to 12 patterns and the greedy ordering beyond.
+fn reference<T>(f: impl FnOnce() -> T) -> T {
+    REFERENCE_JOIN_ORDER.with(|r| r.set(true));
+    let out = f();
+    REFERENCE_JOIN_ORDER.with(|r| r.set(false));
+    out
 }
 
 /// The plan of `q`.
@@ -188,11 +193,7 @@ fn check(snap: &Arc<Snapshot>, q: &str, n: usize, dense: bool, opt: Optimization
         answer(snap, q, opt);
         return;
     }
-    let off = Optimizations {
-        pruned_join_order: false,
-        ..opt
-    };
-    let (new, old) = (plan(snap, q, opt), plan(snap, q, off));
+    let (new, old) = (plan(snap, q, opt), reference(|| plan(snap, q, opt)));
     if n <= 10 || n >= 13 {
         assert!(
             new.cost <= old.cost * (1.0 + 1e-12),
@@ -201,7 +202,11 @@ fn check(snap: &Arc<Snapshot>, q: &str, n: usize, dense: bool, opt: Optimization
             old.cost
         );
     }
-    assert_eq!(answer(snap, q, opt), answer(snap, q, off), "{q}");
+    assert_eq!(
+        answer(snap, q, opt),
+        reference(|| answer(snap, q, opt)),
+        "{q}"
+    );
 }
 
 #[test]
@@ -231,11 +236,10 @@ fn ordering_on_summaries_with_index_joins_off_and_forced() {
         // forced index joins cost their input and one more row, so many plans tie on
         // cost and differ in rows: only the solutions are compared
         FORCE_INDEX_JOIN.with(|f| f.set(true));
-        let off = pruned_off();
         if !shape.is_multiple_of(4) || n < 10 {
             assert_eq!(
                 answer(&snap, &q, Optimizations::ALL),
-                answer(&snap, &q, off),
+                reference(|| answer(&snap, &q, Optimizations::ALL)),
                 "{q}"
             );
         }
@@ -273,4 +277,31 @@ fn large_groups_plan_quickly() {
             "{n} patterns took {took:?} to plan"
         );
     }
+}
+
+/// A group whose inputs share more than the 128 variables the program tracks keeps the
+/// greedy plan, and answers as the reference ordering does.
+#[test]
+fn groups_sharing_more_than_128_variables_plan_greedily() {
+    let snap = store(0x2545_f491_4f6c_dd1d, 40);
+    let vars: Vec<String> = (0..130).map(|i| format!("?w{i}")).collect();
+    let row = |k: usize| {
+        let vals: Vec<String> = (0..130).map(|i| format!("{}", (i + k) % 7)).collect();
+        format!("({})", vals.join(" "))
+    };
+    let values = |rows: &[usize]| {
+        format!(
+            "{{ VALUES ({}) {{ {} }} }}",
+            vars.join(" "),
+            rows.iter().map(|&k| row(k)).collect::<Vec<_>>().join(" ")
+        )
+    };
+    let q = format!(
+        "SELECT * WHERE {{ {} {} ?s ex:p5 ?w0 . ?s a ?c }}",
+        values(&[0, 1, 2]),
+        values(&[1, 2, 3])
+    );
+    let got = answer(&snap, &q, Optimizations::ALL);
+    assert!(!got.is_empty(), "{q}");
+    assert_eq!(got, reference(|| answer(&snap, &q, Optimizations::ALL)));
 }

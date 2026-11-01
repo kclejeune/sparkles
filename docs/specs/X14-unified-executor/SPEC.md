@@ -194,3 +194,20 @@ and the thread-per-call `sync_commit` is deleted. A bulk commit now reads the si
 its new log before the switch rather than after it, so a failed read can no longer
 leave the writer on the old log after `CURRENT` moved. Behaviour is otherwise unchanged,
 and the existing compaction, bulk-load, relink and crash-boundary tests cover the paths.
+
+### One join-order planner
+
+Item 475 shipped. The planner orders every connected group with the program on cost
+summaries in `joinorder.rs`, and the `pruned_join_order` toggle is gone with the
+exhaustive program over plan trees and the planner's own greedy ordering that it chose
+between. A group that the program cannot track, with more than 16 inputs or more than
+128 variables shared between inputs, keeps the greedy plan of `joinorder.rs`, which
+tracks variables in sets of any size. Before, a group of up to 12 inputs that shared
+more than 128 variables fell back to the exhaustive program. The filter placement that
+both programs shared moved into `joinorder.rs`. The deleted ordering survives only as
+the oracle of `joinorder_tests.rs`, behind a test-only switch, so the tests still
+compare the program's costs and answers with the exhaustive program's. With every
+optimization off, a group is now planned on cost summaries as well, where it used to
+take the exhaustive program. Default plans change only for groups that share more than
+128 variables, since every other group already took the program on cost summaries or
+its greedy plan.

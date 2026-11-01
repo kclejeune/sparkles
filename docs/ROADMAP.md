@@ -483,7 +483,6 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 
 | # | Item | Spec | Size | Workstream |
 |---|---|---|---|---|
-| 475 | **One join-order planner.** Keep `joinorder.rs` only, lift its 128-variable fallback, and delete the old DP and greedy planners with the `pruned_join_order` toggle, so that item 84 lands on one planner. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
 | 476 | **Superseded replacement toggles.** Remove the off paths of about 15 toggles whose replacements shipped, keep the algorithm toggles used for diagnosis and move reference evaluation into a test-only evaluator. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | M | 453 |
 | 477 | **Shared format registry and small helpers.** One registry of format names, extensions and media types, one inferred-graph constant, one duration parser and one durable atomic-write helper replace their copies, and the draft mapping writer escapes Turtle strings as the main writer does. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | S | 453 |
 | 478 | **Test-only implementation switches.** Environment switches, implementation-only store options and measurement switches become test-only or go once item 4 closes X07. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | S | 453 |
@@ -746,6 +745,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **475.** One join-order planner, the program on cost summaries, with its greedy plan for groups it cannot track. [X14](specs/X14-unified-executor/SPEC.md#one-join-order-planner)
 - **474.** The dead compaction arm of `rebuild_locked` and one shared generation switch for bulk commits and compactions. [X14](specs/X14-unified-executor/SPEC.md#dead-compaction-arm-and-one-generation-switch)
 - **413.** Load-time checks of view definitions, the `COMPILER` version test and the views runtime split into modules. [F13](specs/F13-incremental-views-and-provenance.md#outcome)
 - **2.** Server-wide cache sizing and query memory pool. [X08](specs/X08-disk-spill-and-server-memory.md) Phase 1

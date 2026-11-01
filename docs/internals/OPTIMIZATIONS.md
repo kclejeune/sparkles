@@ -438,7 +438,8 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **Whole-block scans under graph filters.** A block slice is copied column-wise whenever
   every row passes the graph filter (one pass over the graph column), so default-graph
   queries avoid row-by-row filtering.
-* **Join ordering on cost summaries** (`pruned_join_order`). The dynamic program runs on
+* **Join ordering on cost summaries.** The planner orders the joins of a group with one
+  program, which cannot be switched off. The dynamic program runs on
   small summaries of plans, which hold the cost, the estimated rows, the sort variable and
   the distinct-value estimates that later joins read. The plan tree is built once, for the
   chosen joins only. A greedy plan is made first, and a partial plan that costs more than
@@ -449,7 +450,9 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   rare cases where a dropped plan is the one that a later filter would have favored. Every
   WatDiv and `scripts/bench.sh` query plans at the same cost as before, and a star of nine
   patterns (WatDiv S1) plans in about a millisecond instead of 400 ms. A group whose
-  subsets have too many splits to enumerate in about a millisecond is planned in rounds.
+  subsets have too many splits to enumerate in about a millisecond is planned in rounds. A
+  group of more than 16 inputs, or one whose inputs share more than 128 variables, keeps
+  the greedy plan.
   Each round plans the subsets up to the size that fits, and the cheapest plan of that
   size becomes one input of the next round. That plan never costs more than the greedy
   one. Groups of more than 16 patterns keep the greedy plan, which costs each pair of

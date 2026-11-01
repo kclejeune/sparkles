@@ -141,10 +141,6 @@ pub struct Optimizations {
     /// quads in graphs the query does not read, instead of being used only when neither
     /// exists
     pub delta_statistics: bool,
-    /// join ordering runs the dynamic program on cost summaries, over subsets connected
-    /// by shared variables, and drops partial plans dearer than a greedy plan; off: the
-    /// program builds every candidate plan tree for every split
-    pub pruned_join_order: bool,
     /// COUNT(*) over a FILTER on one variable of a single scan tests the filter once per
     /// run of the variable in a permutation sorted on it and sums the run lengths
     pub count_filter_runs: bool,
@@ -231,7 +227,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 46] = [
+    pub const NAMES: [&str; 45] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -250,7 +246,6 @@ impl Optimizations {
         "anti_join",
         "topk_first_key",
         "delta_statistics",
-        "pruned_join_order",
         "count_filter_runs",
         "filter_scan_runs",
         "filter_key_ranges",
@@ -300,7 +295,6 @@ impl Optimizations {
         anti_join: true,
         topk_first_key: true,
         delta_statistics: true,
-        pruned_join_order: true,
         count_filter_runs: true,
         filter_scan_runs: true,
         filter_key_ranges: true,
@@ -350,7 +344,6 @@ impl Optimizations {
         anti_join: false,
         topk_first_key: false,
         delta_statistics: false,
-        pruned_join_order: false,
         count_filter_runs: false,
         filter_scan_runs: false,
         filter_key_ranges: false,
@@ -400,7 +393,6 @@ impl Optimizations {
             "anti_join" => &mut self.anti_join,
             "topk_first_key" => &mut self.topk_first_key,
             "delta_statistics" => &mut self.delta_statistics,
-            "pruned_join_order" => &mut self.pruned_join_order,
             "count_filter_runs" => &mut self.count_filter_runs,
             "filter_scan_runs" => &mut self.filter_scan_runs,
             "filter_key_ranges" => &mut self.filter_key_ranges,

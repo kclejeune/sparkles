@@ -649,6 +649,12 @@ instead of starting a thread for each sync. A bulk commit reads the size of its 
 log before it switches `CURRENT`, so a failed read no longer leaves the writer on the
 old log after the switch (X14, item 474).
 
+The `pruned_join_order` optimization switch is gone, because the planner now orders
+joins with the program on cost summaries only. `SPARKLES_DISABLE_OPTIMIZATIONS` warns
+about the name as it does about any unknown one. A group of up to 12 inputs that share
+more than 128 variables now keeps the greedy plan instead of the exhaustive program's
+(X14, item 475).
+
 ### Fixed
 
 A PDF converted in a child process no longer fails with "the converter stopped on it"
