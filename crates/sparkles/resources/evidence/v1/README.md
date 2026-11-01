@@ -88,12 +88,13 @@ without checking that the commit or triple exists. `POST /{ds}/claims/resolve` v
 the commit and triple under the caller's view.
 
 `POST /{ds}/claims` writes these records as an authenticated operation. The server sets
-`ev:availabilityReceipt`, `prov:wasGeneratedBy`, `ev:recordDigest` and each source
+`ev:availabilityReceipt`, `prov:wasGeneratedBy`, `ev:graphProtection`, `ev:recordDigest` and each source
 revision's `ev:firstAvailableAt`, and describes the operation as an `ev:Operation` in
 every written graph with its `ev:payloadDigest`, optional `ev:idempotencyKey` and
 `ev:sourceHold` and the graph's `ev:graphProtection` nonce. The typed input has no field for
-these terms. A record digest covers the immutable content of a record and leaves out
-`ev:retainedBytes`, `ev:normalizedText` and the server-owned terms.
+these terms. A record digest covers the immutable content of a record. It counts
+`ev:retainedBytes` and `ev:normalizedText` by their presence only and leaves out the
+server-owned terms.
 
 Confidence records retain their evaluator and declared scale. `ev:ZeroToOne` requires
 an `xsd:decimal` in the closed interval from zero to one. The shapes validate its exact

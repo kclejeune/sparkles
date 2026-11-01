@@ -423,7 +423,7 @@ fn enabling_raises_the_reader_and_survives_a_reopen() {
     crate::commit::check_dataset_value_as(&v, 6).unwrap();
     let file: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("managed.json")).unwrap()).unwrap();
-    assert_eq!(file["format"], 1);
+    assert_eq!(file["format"], 2);
     assert_eq!(file["revision"], 1);
     assert_eq!(file["owners"]["evidence"]["graphs"][0], M);
     assert_eq!(std::fs::read(root.join("evidence.json")).unwrap(), SETTINGS);
@@ -468,7 +468,7 @@ fn an_unenforceable_registry_refuses_writes_and_keeps_reads() {
         (
             "managed.json",
             "newer format",
-            |v| v["format"] = 2.into(),
+            |v| v["format"] = 3.into(),
             false,
         ),
         (
@@ -910,7 +910,7 @@ fn copies_of_unknown_owners_are_refused() {
                 });
                 std::fs::write(root.join("jobs.json"), b"{}").unwrap();
             }
-            "newer format" => edit(&root, "managed.json", |v| v["format"] = 2.into()),
+            "newer format" => edit(&root, "managed.json", |v| v["format"] = 3.into()),
             _ => edit(&root, "managed.json", |v| {
                 v["owners"]["evidence"]["settingsDigest"] = "sha256:00".into()
             }),

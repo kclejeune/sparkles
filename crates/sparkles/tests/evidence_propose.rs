@@ -660,6 +660,197 @@ fn a_typed_write_on_a_branch_authenticates_there() {
     );
 }
 
+#[test]
+fn a_planted_record_cannot_borrow_a_later_operations_marker() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let mut o = options();
+    o.idempotency_key = Some("future".into());
+    // the operation IRI of a key is predictable
+    let dry = {
+        let mut d = o.clone();
+        d.dry_run = true;
+        propose(&ds, &small("c1", proposition()), &d).unwrap()
+    };
+    let future = dry.operation.clone();
+    evidence::detach(&ds, CLAIMS).unwrap();
+    ds.update(&format!(
+        "PREFIX ev: <urn:x-sparkles:evidence:>
+         INSERT DATA {{ GRAPH <{CLAIMS}> {{ <urn:planted> a ev:Claim ; ev:availabilityReceipt <{}> . }} }}",
+        future.as_str()
+    ))
+    .unwrap();
+    configured(&ds);
+    // the later typed write describes that operation with the current nonce
+    let p = propose(&ds, &small("c1", proposition()), &o).unwrap();
+    assert_eq!(p.operation, future);
+    assert!(record(&ds, &iri_of(&p, "claim"), RecordKind::Claim).is_ok());
+    assert_eq!(
+        code(record(&ds, &iri("urn:planted"), RecordKind::Claim)),
+        "origin-not-reproduced"
+    );
+}
+
+#[test]
+fn a_record_reference_is_checked_even_when_a_batch_key_spells_its_iri() {
+    let (_dir, ds) = retained();
+    let fact = with_fact(&ds);
+    configured(&ds);
+    let missing = "urn:uuid:00000000-0000-4000-8000-000000000000";
+    let mut input = small("c1", proposition());
+    input.revisions.clear();
+    input.claims[0].revision = RecordRef::Existing(iri(missing));
+    input.references = vec![EvidenceRefInput {
+        version: RecordVersion::V1,
+        key: key(missing),
+        occurrence_key: key("fact"),
+        target: EvidenceRefTarget::StoredFact(StoredFactRef {
+            dataset: ds.dataset_id(),
+            branch: ds.dataset_id(),
+            commit: fact,
+            graph: GraphIdentity::Named(iri(FACTS)),
+            expected: proposition(),
+            anchor: None,
+        }),
+    }];
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(propose(&ds, &input, &options())),
+        "evidence-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+    // one existing record used as two kinds is checked against each
+    let p = propose(&ds, &small("c1", proposition()), &options()).unwrap();
+    let rev = iri_of(&p, "rev");
+    let mut twice = small("c2", proposition());
+    twice.revisions.clear();
+    twice.claims[0].revision = RecordRef::Existing(rev.clone());
+    twice.assessments = vec![AssessmentInput {
+        version: RecordVersion::V1,
+        key: key("assessment"),
+        occurrence_key: key("a1"),
+        target: RecordRef::Existing(rev),
+        conclusion: Term::NamedNode(iri("urn:conclusion:plausible")),
+        method: method("urn:method:review"),
+        configuration_digest: sha("config"),
+        evaluated_at: Literal::new_typed_literal(
+            "2026-01-01T10:00:00Z",
+            iri("http://www.w3.org/2001/XMLSchema#dateTime"),
+        ),
+        attributed_evaluator: iri("urn:analyst"),
+        confidence: None,
+        scope: Default::default(),
+    }];
+    assert_eq!(
+        code(propose(&ds, &twice, &options())),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, p.commit);
+}
+
+#[test]
+fn a_key_used_for_records_in_other_graphs_conflicts() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let mut o = options();
+    o.idempotency_key = Some("k".into());
+    let mut revisions = small("c1", proposition());
+    revisions.claims.clear();
+    let first = propose(&ds, &revisions, &o).unwrap();
+    assert!(first.records.iter().all(|r| r.graph.as_str() == SOURCES));
+    let mut claims = small("c1", proposition());
+    claims.revisions.clear();
+    claims.claims[0].revision = RecordRef::Existing(iri_of(&first, "rev"));
+    let head = ds.store().head_commit().seq;
+    assert_eq!(code(propose(&ds, &claims, &o)), "idempotency-conflict");
+    assert_eq!(ds.store().head_commit().seq, head);
+}
+
+#[test]
+fn a_replay_keeps_the_existing_flags_of_the_first_answer() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    propose(&ds, &small("c1", proposition()), &options()).unwrap();
+    let mut o = options();
+    o.idempotency_key = Some("again".into());
+    let second = propose(&ds, &small("c1", proposition()), &o).unwrap();
+    assert!(second.records.iter().all(|r| r.existing));
+    let replayed = propose(&ds, &small("c1", proposition()), &o).unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.records, second.records);
+}
+
+#[test]
+fn a_published_operation_keeps_its_hold_after_its_graph_is_protected_again() {
+    let (_dir, ds) = retained();
+    let fact = with_fact(&ds);
+    configured(&ds);
+    let p = propose(&ds, &batch(&ds, fact), &options()).unwrap();
+    let hold = p.hold.unwrap();
+    evidence::detach(&ds, CLAIMS).unwrap();
+    configured(&ds);
+    assert!(
+        evidence::reconcile_operation_holds(&ds, 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(evidence::holds(&ds).unwrap().iter().any(|h| h.id == hold));
+}
+
+/// Releases the operation's hold from another thread while the commit is between its
+/// hold check and its publication, and records whether the release finished first.
+struct ReleaseDuringPublication {
+    ds: Dataset,
+    released_early: Arc<AtomicBool>,
+    release: std::sync::Mutex<Option<std::thread::JoinHandle<bool>>>,
+}
+
+impl AuthorityFence for ReleaseDuringPublication {
+    fn enter(&self) -> sparkles::Result<Box<dyn std::any::Any>> {
+        let id = evidence::holds(&self.ds).unwrap()[0].id;
+        let ds = self.ds.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let r = evidence::release_hold(&ds, id).unwrap();
+            let _ = tx.send(());
+            r
+        });
+        if rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_ok()
+        {
+            self.released_early.store(true, Ordering::SeqCst);
+        }
+        *self.release.lock().unwrap() = Some(handle);
+        Ok(Box::new(()))
+    }
+}
+
+#[test]
+fn a_release_waits_for_a_publication_that_passed_its_hold_check() {
+    let (_dir, ds) = retained();
+    let fact = with_fact(&ds);
+    configured(&ds);
+    let fence = Arc::new(ReleaseDuringPublication {
+        ds: ds.clone(),
+        released_early: Default::default(),
+        release: Default::default(),
+    });
+    let mut o = options();
+    o.authority = Some(fence.clone());
+    let p = propose(&ds, &batch(&ds, fact), &o).unwrap();
+    assert!(p.committed);
+    assert!(
+        !fence.released_early.load(Ordering::SeqCst),
+        "the release finished before the publication"
+    );
+    let handle = fence.release.lock().unwrap().take().unwrap();
+    assert!(
+        handle.join().unwrap(),
+        "the release runs once the commit published"
+    );
+}
+
 #[cfg(feature = "failpoints")]
 mod crashes {
     use super::*;

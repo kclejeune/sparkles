@@ -169,8 +169,8 @@ fn managed(kind: ManagedErrorKind, message: impl Into<String>) -> Error {
     ManagedError::error(kind, message)
 }
 
-/// The settings recorded in `main` and whether the profile can take typed writes.
-fn settings_of(main: &Dataset) -> Result<Settings> {
+/// The settings recorded in `main`, and their recorded bytes.
+fn settings_of(main: &Dataset) -> Result<(Settings, Arc<[u8]>)> {
     let Some(snapshot) = main.store().managed_snapshot()? else {
         return Err(managed(
             ManagedErrorKind::UnsupportedProfile,
@@ -186,7 +186,7 @@ fn settings_of(main: &Dataset) -> Result<Settings> {
             "the evidence profile is not enabled in this dataset",
         ));
     };
-    super::recorded(bytes)
+    Ok((super::recorded(bytes)?, bytes.clone()))
 }
 
 /// The record-role graphs of `settings`, other than accepted projections.
@@ -251,6 +251,7 @@ fn result(plan: &Plan, skip: &[bool]) -> Vec<ProposedRecord> {
 fn replay(
     plan: &Plan,
     found: write::RecordedOperation,
+    reads: &mut Reads<'_>,
     branch: Uuid,
     hold: Option<Uuid>,
 ) -> Result<Proposed> {
@@ -269,6 +270,16 @@ fn replay(
             "this idempotency key was used with a different payload",
         ));
     }
+    // A record whose receipt is another operation was already published when the
+    // first operation ran, which reported it as existing.
+    let mut existing = Vec::with_capacity(plan.records.len());
+    for r in &plan.records {
+        existing.push(
+            reads
+                .receipt_of(&r.iri, &r.graph)?
+                .is_some_and(|op| op != plan.operation_iri),
+        );
+    }
     Ok(Proposed {
         operation: plan.operation_iri.clone(),
         committed: false,
@@ -277,7 +288,7 @@ fn replay(
         branch: found.branch.unwrap_or(branch),
         first_available_at: found.ended_at.map(|l| l.value().to_string()),
         hold: (!plan.held.is_empty()).then_some(hold).flatten(),
-        records: result(plan, &[]),
+        records: result(plan, &existing),
         preview: None,
     })
 }
@@ -307,9 +318,8 @@ fn references(
                 record,
                 expected_kinds,
             } => {
-                if out.iter().any(|(k, _)| k == record.as_str()) {
-                    continue;
-                }
+                // every use is resolved with its own kinds, and record IRIs never stand
+                // for the batch keys of other references
                 out.push((
                     record.as_str().to_string(),
                     Reference::Record(RecordRequest {
@@ -447,7 +457,7 @@ pub fn propose(
             "a proposal names the dataset's main store and one of its branches",
         ));
     }
-    let settings = settings_of(main)?;
+    let (settings, settings_bytes) = settings_of(main)?;
     let prepared =
         sparkles_core::evidence::prepare_input(input, control).map_err(prepared_error)?;
     let plan = write::plan(
@@ -474,8 +484,14 @@ pub fn propose(
     }
     let store = logical.store();
     let branch = store.branch_id();
-    // From here on a change of the registry refuses the commit.
+    // From here on a change of the registry refuses the commit. The plan must come from
+    // the settings of the registry state the capability is valid for.
     let capability = store.managed_writer(OwnerKind::Evidence, plan.operation)?;
+    if capability.settings().as_deref() != Some(&settings_bytes[..]) {
+        return Err(Error::Conflict(
+            "the evidence settings changed while the proposal was prepared; retry".into(),
+        ));
+    }
     let targets: Vec<ProtectedGraph> = plan
         .graphs
         .iter()
@@ -502,10 +518,9 @@ pub fn propose(
     if options.idempotency_key.is_some() {
         let head = store.snapshot();
         let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
-        if let Some(found) =
-            Reads::new(&preparation, &head).operation(&plan.operation_iri, &targets)?
-        {
-            return replay(&plan, found, branch, hold);
+        let mut reads = Reads::new(&preparation, &head);
+        if let Some(found) = reads.operation(&plan.operation_iri, &records)? {
+            return replay(&plan, found, &mut reads, branch, hold);
         }
     }
     // The caller's reads decide every reference, before anything is written.
@@ -515,17 +530,17 @@ pub fn propose(
         resolution.all(catalog, main, logical, &refs, read)?;
     }
     // The hold is durable before the commit that records it.
+    let commits: Vec<crate::branch::CommitRef> = plan
+        .held
+        .iter()
+        .map(|h| crate::branch::CommitRef {
+            branch_id: h.branch,
+            seq: h.commit,
+        })
+        .collect();
     if let Some(id) = hold
         && !options.dry_run
     {
-        let commits: Vec<crate::branch::CommitRef> = plan
-            .held
-            .iter()
-            .map(|h| crate::branch::CommitRef {
-                branch_id: h.branch,
-                seq: h.commit,
-            })
-            .collect();
         main.store()
             .acquire_hold(OwnerKind::Evidence, id, &commits)
             .map_err(|e| match e {
@@ -543,20 +558,16 @@ pub fn propose(
     let before_publish = {
         let authority = options.authority.clone();
         let held_by = main.clone();
+        let dry_run = options.dry_run;
         crate::guard::PublishHook::new(move || {
-            // An administrator's release, or a reconciliation of a request that ran past
-            // the grace period, leaves the references unheld: refuse rather than record
-            // a hold that no longer protects them.
-            if let Some(id) = hold
-                && !held_by
+            // An administrator's release leaves the references unheld: refuse rather
+            // than record a hold that no longer protects them. The guard keeps every
+            // release waiting until this commit has published or been refused.
+            if let Some(id) = hold.filter(|_| !dry_run) {
+                let guard = held_by
                     .store()
-                    .source_holds()?
-                    .iter()
-                    .any(|h| h.id == id && h.owner == OwnerKind::Evidence)
-            {
-                return Err(Error::Conflict(format!(
-                    "the operation's source hold {id} was released before it published; retry"
-                )));
+                    .hold_publication(OwnerKind::Evidence, id, &commits)?;
+                FENCES.with(|f| f.borrow_mut().push(Box::new(guard)));
             }
             if let Some(authority) = &authority {
                 let guard = authority.enter()?;
@@ -592,9 +603,9 @@ pub fn propose(
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let mut reads = Reads::new(&preparation, &head);
     if options.idempotency_key.is_some()
-        && let Some(found) = reads.operation(&plan.operation_iri, &targets)?
+        && let Some(found) = reads.operation(&plan.operation_iri, &records)?
     {
-        return replay(&plan, found, branch, hold);
+        return replay(&plan, found, &mut reads, branch, hold);
     }
     // An identity already published with equal content is not written again. Any other
     // content under the identity, or content that is not an authenticated record, is
@@ -685,23 +696,6 @@ pub fn propose(
 /// Whether the operation `id` is recorded as an authenticated typed operation in the
 /// evidence graphs of `main` or one of its branches, at their current heads.
 pub fn operation_recorded(main: &Dataset, id: Uuid, control: &Control) -> Result<bool> {
-    let settings = settings_of(main)?;
-    let Some(registry) = main.store().managed_graphs()? else {
-        return Ok(false);
-    };
-    let entry = registry.owners.get(&OwnerKind::Evidence);
-    let graphs: Vec<ProtectedGraph> = record_graphs(&settings)
-        .into_iter()
-        .map(|g| {
-            let n = entry.and_then(|e| {
-                e.graphs
-                    .contains(&g.as_str().to_string())
-                    .then(|| e.protections.get(g.as_str()).copied())
-                    .flatten()
-            });
-            (g, n)
-        })
-        .collect();
     let op = operation_iri(id);
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let mut stores = vec![main.clone()];
@@ -713,10 +707,7 @@ pub fn operation_recorded(main: &Dataset, id: Uuid, control: &Control) -> Result
     for ds in &stores {
         control.check()?;
         let head = ds.store().snapshot();
-        if Reads::new(&preparation, &head)
-            .operation(&op, &graphs)?
-            .is_some_and(|o| o.authenticated)
-        {
+        if Reads::new(&preparation, &head).described_anywhere(&op)? {
             return Ok(true);
         }
     }

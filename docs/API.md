@@ -12202,10 +12202,10 @@ graphs that the [evidence settings](#evidence-settings) give a role other than
 is not a profile record. A record has exactly one `ev:availabilityReceipt`, whose
 `ev:datasetId` and `ev:branchId` name this dataset and one of its branches and whose
 `ev:commit` names the publishing commit. The receipt is the `ev:Operation` of the
-[proposal](#evidence-proposals) that published the record, and its one
-`ev:graphProtection` in the record's graph is that graph's current protection nonce. A
-record written while its graph was detached cannot carry the nonce of the protection in
-force, so it answers `origin-not-reproduced`, as do the records of an earlier protection
+[proposal](#evidence-proposals) that published the record. The receipt and the record
+each carry one `ev:graphProtection` in the record's graph, and both must be that
+graph's current protection nonce. A record written while its graph was detached cannot
+carry the nonce of the protection in force, so it answers `origin-not-reproduced`, as do the records of an earlier protection
 once the graph is detached and protected again. `kinds` limits the record's kind, and
 `contentDigest` is compared with the record's `ev:contentDigest`. A passage's
 `oa:hasSelector` start and end are checked as Unicode code point offsets against its
@@ -12282,8 +12282,8 @@ caller, what the record belongs to and its occurrence key, so the same caller pu
 the same occurrence again names the same record.
 
 The server sets every field a client cannot be trusted with. Each record names the
-operation as its `ev:availabilityReceipt` and `prov:wasGeneratedBy`, and records the
-`ev:recordDigest` of its immutable content. A source revision's `ev:firstAvailableAt` is
+operation as its `ev:availabilityReceipt` and `prov:wasGeneratedBy`, and records its
+graph's `ev:graphProtection` nonce and the `ev:recordDigest` of its immutable content. A source revision's `ev:firstAvailableAt` is
 the commit's own time. The operation is an `ev:Operation` and `prov:Activity` whose
 `prov:wasAssociatedWith` is the caller, `urn:x-sparkles:principal:` followed by its
 log name. It records the dataset, branch and commit, the payload digest, the
@@ -12314,8 +12314,11 @@ deleted, error}`, and holds nothing.
 
 A refusal writes nothing. A failure after the hold was acquired leaves the hold without
 an operation. The next published proposal releases such a hold once it is an hour
-old, and a retry with the same idempotency key acquires it again meanwhile. Capability discovery is in `GET /$/server`,
-whose `capabilities.claims` lists the profile versions this build serves.
+old and no graph describes its operation, and a retry with the same idempotency key
+acquires it again meanwhile. Releasing a hold waits for a commit that is publishing a
+reference to it, and a commit whose hold was released before it published is a `409
+hold-conflict`. Capability discovery is in `GET /$/server`, whose `capabilities.claims`
+lists the profile versions this build serves.
 
 ### Suggested examples
 

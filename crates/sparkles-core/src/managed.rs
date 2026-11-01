@@ -10,7 +10,7 @@
 //! The registry is recorded in `managed.json` at the dataset root:
 //!
 //! ```json
-//! {"format": 1, "revision": 3,
+//! {"format": 2, "revision": 3,
 //!  "owners": {"evidence": {"profile": 1, "settingsDigest": "sha256:…", "graphs": ["…"],
 //!                            "protections": {"…": "<uuid>"},
 //!                            "visibility": "public", "merge": "refuse"}}}
@@ -54,8 +54,16 @@ pub const FILE: &str = "managed.json";
 /// `dataset.json`).
 pub const READER: u32 = 6;
 
-/// The `managed.json` format this build reads and writes.
-pub const FORMAT: u32 = 1;
+/// The `managed.json` format this build writes. Format 2 adds each owner's
+/// `protections`. Format 1, which has none, is read as a registry whose graphs have no
+/// protection nonces, so they take no typed writes until their owner protects them
+/// again.
+pub const FORMAT: u32 = 2;
+
+/// Whether this build reads the `managed.json` format `f`.
+fn reads_format(f: u64) -> bool {
+    f == 1 || f == u64::from(FORMAT)
+}
 
 /// The most graphs one owner may manage.
 pub const MAX_GRAPHS: usize = 4096;
@@ -518,6 +526,15 @@ impl ManagedWrite {
             ManagedState::Unavailable { .. } => None,
         }
     }
+
+    /// The owner's settings file in the registry this capability is valid for, so that
+    /// a writer plans from the same registry state that its commit is checked against.
+    pub fn settings(&self) -> Option<Arc<[u8]>> {
+        match &*self.state {
+            ManagedState::Installed(i) => i.settings.get(&self.owner).cloned(),
+            ManagedState::Unavailable { .. } => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ManagedWrite {
@@ -641,11 +658,11 @@ fn decode_inner(
         serde_json::from_slice(bytes).map_err(|e| (format!("{FILE} is not JSON: {e}"), false))?;
     match v.get("format").map(serde_json::Value::as_u64) {
         None => {}
-        Some(Some(f)) if f == u64::from(FORMAT) => {}
+        Some(Some(f)) if reads_format(f) => {}
         Some(Some(f)) => {
             return Err((
                 format!(
-                    "{FILE} has format {f}; Sparkles {} reads format {FORMAT}. It was written by a newer release",
+                    "{FILE} has format {f}; Sparkles {} reads formats 1 and {FORMAT}. It was written by a newer release",
                     crate::formats::SPARKLES_VERSION
                 ),
                 false,
@@ -654,7 +671,7 @@ fn decode_inner(
         Some(None) => return Err((format!("{FILE}: format is not a version"), false)),
     }
     let raw: RawFile = serde_json::from_value(v).map_err(|e| (format!("{FILE}: {e}"), false))?;
-    debug_assert_eq!(raw.format, u64::from(FORMAT));
+    debug_assert!(reads_format(raw.format));
     let mut owners = BTreeMap::new();
     let mut settings = BTreeMap::new();
     for (name, value) in raw.owners {
@@ -677,6 +694,12 @@ fn decode_inner(
         }
         if let Some(why) = entry.reserved() {
             return Err((format!("{FILE}: owner {name}: {why}"), false));
+        }
+        if raw.format < 2 && !entry.protections.is_empty() {
+            return Err((
+                format!("{FILE}: owner {name}: format 1 has no protections"),
+                false,
+            ));
         }
         check_graphs(&entry.graphs).map_err(|e| (format!("{FILE}: owner {name}: {e}"), false))?;
         let file = owner.settings_file();
@@ -716,7 +739,7 @@ pub(crate) fn recorded_owners(bytes: &[u8]) -> std::result::Result<Vec<OwnerKind
         serde_json::from_slice(bytes).map_err(|e| format!("{FILE} is not JSON: {e}"))?;
     match v.get("format") {
         None => {}
-        Some(f) if f.as_u64() == Some(u64::from(FORMAT)) => {}
+        Some(f) if f.as_u64().is_some_and(reads_format) => {}
         Some(f) => {
             return Err(format!(
                 "{FILE} has format {f}, which this build does not read"
@@ -778,7 +801,7 @@ mod tests {
         };
         let bytes = file_bytes(&graphs);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["format"], 1);
+        assert_eq!(v["format"], 2);
         assert_eq!(v["revision"], 2);
         assert_eq!(v["owners"]["evidence"]["graphs"][0], "http://e/g");
         assert_eq!(v["owners"]["evidence"]["visibility"], "public");
@@ -812,6 +835,46 @@ mod tests {
     }
 
     #[test]
+    fn format_1_has_no_protections() {
+        let mut e = entry(&["http://e/g"], b"{}");
+        e.protections = [("http://e/g".to_string(), uuid::Uuid::from_u128(7))].into();
+        let graphs = ManagedGraphs {
+            revision: 1,
+            owners: [(OwnerKind::Evidence, e)].into(),
+        };
+        let mut v: serde_json::Value = serde_json::from_slice(&file_bytes(&graphs)).unwrap();
+        assert_eq!(
+            v["owners"]["evidence"]["protections"]["http://e/g"],
+            uuid::Uuid::from_u128(7).to_string()
+        );
+        v["format"] = 1.into();
+        // a format 1 file with protections is not one this build wrote
+        assert!(matches!(
+            decode(&serde_json::to_vec(&v).unwrap(), |_| Ok(Some(
+                b"{}".to_vec()
+            ))),
+            ManagedState::Unavailable { .. }
+        ));
+        // without them it reads as graphs that have no nonces yet
+        v["owners"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("protections");
+        match decode(&serde_json::to_vec(&v).unwrap(), |_| {
+            Ok(Some(b"{}".to_vec()))
+        }) {
+            ManagedState::Installed(i) => {
+                assert!(i.graphs.owners[&OwnerKind::Evidence].protections.is_empty());
+                assert_eq!(
+                    i.graphs.owners[&OwnerKind::Evidence].graphs,
+                    vec!["http://e/g".to_string()]
+                );
+            }
+            s => panic!("{s:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_states_are_unavailable() {
         let graphs = ManagedGraphs {
             revision: 1,
@@ -819,7 +882,7 @@ mod tests {
         };
         let good = file_bytes(&graphs);
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
-        v["format"] = 2.into();
+        v["format"] = 3.into();
         let newer = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["owners"]["jobs"] = v["owners"]["evidence"].clone();

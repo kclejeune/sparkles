@@ -186,11 +186,15 @@ repeated `idempotencyKey` returns the first receipt, and the codes `409 head-cha
 `409 idempotency-conflict`, `409 immutable-record-conflict` and `503 authority-changed`
 are new. The stored facts of the dataset that a proposal references are held before
 its commit, and holds of operations that never published are released after an hour.
-`GET /$/server` advertises `capabilities.claims`. Each managed graph now has a
-protection nonce in `managed.json`, which a proposal records and resolution requires,
-so a record written while its graph was detached answers `origin-not-reproduced`, and
-evidence resolution reports each record's `recordDigest`. Revoking a token or ending a
-session now waits for the typed writes it authorized that are publishing. The
+`GET /$/server` advertises `capabilities.claims`. `managed.json` is now format 2, which
+gives each managed graph a protection nonce. Older releases refuse format 2, and this
+release reads format 1 as graphs that take no typed writes until they are protected
+again. A proposal records the nonce on the operation and on each record, and resolution
+requires both, so a record written while its graph was detached answers
+`origin-not-reproduced`. Evidence resolution reports each record's `recordDigest`.
+Revoking a token, ending a session and a login that evicts sessions now wait for the
+typed writes those credentials authorized that are publishing, and releasing a source
+hold waits for a commit that is publishing a reference to it. The
 vocabulary adds `ev:Operation`, `ev:graphProtection`, `ev:payloadDigest`,
 `ev:idempotencyKey`, `ev:sourceHold`, `ev:recordDigest`, `ev:retainedBytes`,
 `ev:locator` and `ev:reportedRights`.

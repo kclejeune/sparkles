@@ -26,19 +26,22 @@
 //! fields and those of its selector and confidence nodes, which are named
 //! `<record>#selector`, `<record>#sourceConfidence`, `<record>#extractionConfidence` and
 //! `<record>#analystConfidence`. Its `ev:recordDigest` is the SHA-256 digest of the
-//! sorted digests of those triples, without the retained bytes and normalized text,
-//! whose `ev:contentDigest` the content already carries. The server-owned fields are
-//! not part of it, so a record published again by another operation with equal content
-//! has the same digest.
+//! sorted digests of those triples. The retained bytes and normalized text count only
+//! by their presence, because the record's `ev:contentDigest` already covers them. The
+//! server-owned fields are not part of it, so a record published again by another
+//! operation with equal content has the same digest.
 //!
 //! # The operation marker
 //!
 //! Every graph an operation writes gets the operation's description, whose
 //! `ev:graphProtection` is that graph's current protection nonce (see
 //! [`crate::managed`]). Every record names the operation as its
-//! `ev:availabilityReceipt`. A resolver trusts a record only when its receipt carries
-//! the nonce of the protection in force, which a write made while the graph was
-//! detached cannot know.
+//! `ev:availabilityReceipt` and carries the same `ev:graphProtection` itself. A
+//! resolver trusts a record only when both the record and its receipt carry the nonce
+//! of the protection in force, which a write made while the graph was detached cannot
+//! know. The nonce on the record matters because operation IRIs derived from an
+//! idempotency key are predictable, so a planted record could otherwise name an
+//! operation that a later typed write describes with the current nonce.
 
 use super::canonical::FrameHash;
 use super::prepare::PreparedInput;
@@ -327,6 +330,11 @@ fn record_digest(kind: RecordKind, triples: &[Triple], control: &Control) -> Res
     let mut each = Vec::with_capacity(triples.len());
     for t in triples {
         if LARGE.contains(&t.predicate.as_str()) {
+            // which form of retained content the record has is part of its identity,
+            // so that a metadata-only rendition never stands for one with text
+            let mut frame = FrameHash::new(b"sparkles-evidence-record-retained-v1", control)?;
+            frame.field(1, t.predicate.as_str().as_bytes())?;
+            each.push(frame.finish()?);
             continue;
         }
         let mut frame = FrameHash::new(b"sparkles-evidence-record-triple-v1", control)?;
@@ -888,6 +896,15 @@ impl Plan {
                 &r.graph,
             );
             quad(&r.iri, prov("wasGeneratedBy"), op.clone().into(), &r.graph);
+            // the record carries its graph's nonce itself, so that no record planted
+            // while the graph was detached can borrow a later operation's marker
+            let nonce = protection(&r.graph).expect("every written graph is protected");
+            quad(
+                &r.iri,
+                ev("graphProtection"),
+                string(&nonce.to_string()),
+                &r.graph,
+            );
             quad(
                 &r.iri,
                 ev("recordDigest"),
@@ -1030,16 +1047,39 @@ impl<'a> Reads<'a> {
         self.snap.contains(&[s, p, o, g])
     }
 
+    /// The single protection nonce that `s` carries in `g`.
+    fn nonce_of(&mut self, s: &str, g: &str) -> Result<Option<Uuid>> {
+        Ok(self
+            .one_string(s, &format!("{EV}graphProtection"), g)?
+            .and_then(|v| Uuid::parse_str(&v).ok()))
+    }
+
     /// Whether `op` is an operation in `g` whose marker is `nonce`.
     fn marked(&mut self, op: &str, g: &str, nonce: Option<Uuid>) -> Result<bool> {
         let Some(nonce) = nonce else {
             return Ok(false);
         };
-        Ok(self.is_operation(op, g)?
-            && self
-                .one_string(op, &format!("{EV}graphProtection"), g)?
-                .and_then(|v| Uuid::parse_str(&v).ok())
-                == Some(nonce))
+        Ok(self.is_operation(op, g)? && self.nonce_of(op, g)? == Some(nonce))
+    }
+
+    /// Whether `op` is described as an `ev:Operation` in any graph, whatever its marker.
+    /// A reconciliation keeps the hold of such an operation, since a changed protection
+    /// does not show that it never published.
+    pub fn described_anywhere(&mut self, op: &NamedNode) -> Result<bool> {
+        let (Some(s), Some(p), Some(o)) = (
+            self.id(op.as_str())?,
+            self.id(RDF_TYPE)?,
+            self.id(&format!("{EV}Operation"))?,
+        ) else {
+            return Ok(false);
+        };
+        let mut found = false;
+        self.preparation
+            .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0], |_| {
+                found = true;
+                Ok(false)
+            })?;
+        Ok(found)
     }
 
     /// The operation `op` as `graphs` describe it, `None` when none does.
@@ -1094,6 +1134,20 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
+    /// The single availability receipt of `iri` in `g`.
+    pub fn receipt_of(&mut self, iri: &NamedNode, g: &NamedNode) -> Result<Option<NamedNode>> {
+        Ok(
+            match self.one(
+                iri.as_str(),
+                &format!("{EV}availabilityReceipt"),
+                g.as_str(),
+            )? {
+                Some(Term::NamedNode(op)) => Some(op),
+                _ => None,
+            },
+        )
+    }
+
     /// Where the record identity `iri` has content among `graphs`.
     pub fn record(&mut self, iri: &NamedNode, graphs: &[ProtectedGraph]) -> Result<ExistingRecord> {
         let mut found = ExistingRecord::Absent;
@@ -1113,7 +1167,10 @@ impl<'a> Reads<'a> {
                 &format!("{EV}availabilityReceipt"),
                 g.as_str(),
             )? {
-                Some(Term::NamedNode(op)) => self.marked(op.as_str(), g.as_str(), *nonce)?,
+                Some(Term::NamedNode(op)) => {
+                    self.marked(op.as_str(), g.as_str(), *nonce)?
+                        && self.nonce_of(iri.as_str(), g.as_str())? == *nonce
+                }
                 _ => false,
             };
             found = ExistingRecord::Present {

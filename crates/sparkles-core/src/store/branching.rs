@@ -2496,6 +2496,7 @@ impl Store {
         // releases them. A failure after that leaves the branch without its holds. The
         // holds' lock comes before the table, which a collection takes under its
         // history lock while an acquisition holds the holds' lock.
+        let _publishing = self.family.holds.publishing.write();
         let mut holds = self.family.holds.state.lock();
         // the commit point: the table without the name
         let mut t = set.table.lock();

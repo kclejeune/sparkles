@@ -129,7 +129,7 @@ async fn ordinary_writes_to_a_managed_graph_are_refused() {
     drop(state);
     let path = root.join("managed.json");
     let mut v: J = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    v["format"] = 2.into();
+    v["format"] = 3.into();
     std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
     let state = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
@@ -551,7 +551,8 @@ async fn evidence_references_are_resolved_over_http() {
     let trig = format!(
         "PREFIX ev: <urn:x-sparkles:evidence:>
          GRAPH <urn:ev:sources> {{
-           <urn:rev> a ev:SourceRevision ; ev:availabilityReceipt <urn:receipt> .
+           <urn:rev> a ev:SourceRevision ; ev:availabilityReceipt <urn:receipt> ;
+             ev:graphProtection \"{nonce}\" .
            <urn:receipt> a ev:Operation ; ev:graphProtection \"{nonce}\" ;
              ev:datasetId \"{id}\" ; ev:branchId \"{id}\" ; ev:commit {seq} .
          }}"

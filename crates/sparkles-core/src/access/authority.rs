@@ -99,7 +99,14 @@ impl AuthorityHold {
 /// Do not acquire a dataset writer or another guard of the same registry while
 /// holding it.
 pub struct AuthorityRevocation<'a> {
-    _epoch: RwLockWriteGuard<'a, u64>,
+    epoch: RwLockWriteGuard<'a, u64>,
+}
+
+impl AuthorityRevocation<'_> {
+    /// The stable generation, which a revocation does not change.
+    pub fn generation(&self) -> u64 {
+        *self.epoch
+    }
 }
 
 impl AuthorityRegistry {
@@ -147,7 +154,7 @@ impl AuthorityRegistry {
     /// the shared fence.
     pub fn begin_revocation(&self) -> AuthorityRevocation<'_> {
         AuthorityRevocation {
-            _epoch: self.epoch.write(),
+            epoch: self.epoch.write(),
         }
     }
 }

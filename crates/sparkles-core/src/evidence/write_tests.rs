@@ -170,3 +170,39 @@ fn the_server_fields_and_the_marker_go_to_every_written_graph() {
             .any(|q| q.subject.to_string() == format!("<{rev}>"))
     );
 }
+
+#[test]
+fn the_form_of_retained_content_is_part_of_a_record_digest() {
+    use crate::evidence::{MethodRef, RenditionContent, RenditionInput};
+    let c = Control::none();
+    let text = "some text";
+    let digest = Sha256Digest::of_bytes(text.as_bytes(), &c).unwrap();
+    let with = |content: RenditionContent| {
+        let mut i = input("o", "urn:o");
+        i.claims.clear();
+        i.renditions = vec![RenditionInput {
+            version: RecordVersion::V1,
+            key: RecordKey::new("text").unwrap(),
+            revision: RecordRef::Local(RecordKey::new("rev").unwrap()),
+            occurrence_key: RecordKey::new("text").unwrap(),
+            conversion: MethodRef {
+                method: iri("urn:method"),
+                version: RecordKey::new("1").unwrap(),
+            },
+            media_type: "text/plain".into(),
+            language: None,
+            content,
+            expected_digest: None,
+        }];
+        let p = plan_of(&i, &settings(&["urn:s"], &["urn:c"]), None).unwrap();
+        let r = p.records.iter().find(|r| r.key == "text").unwrap();
+        (r.iri.clone(), r.digest)
+    };
+    let (a, da) = with(RenditionContent::MetadataOnly(digest));
+    let (b, db) = with(RenditionContent::NormalizedText(text.into()));
+    assert_eq!(a, b, "the same identity");
+    assert_ne!(
+        da, db,
+        "a metadata-only rendition never stands for one with text"
+    );
+}

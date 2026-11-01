@@ -13,6 +13,12 @@
 //! protection and keeps the commit. A release makes `holds.json` durable without the
 //! hold before it removes the protection, so a crash leaves the hold in place.
 //!
+//! A release takes the publication lock exclusively before the holds' lock, and a commit
+//! that records a reference to a hold shares it from its check of the hold until it
+//! has published (see [`Store::hold_publication`]). A reconciliation asks again under
+//! that exclusive lock which holds to keep, so it never releases the hold of an
+//! operation that published after it first looked.
+//!
 //! Lock order: the family's holds before a branch table or a store's history, since a
 //! collection can take the table under its history lock. Nothing that holds a table or a
 //! history lock waits for the holds' lock. An acquisition never takes a writer lock, and
@@ -34,6 +40,12 @@ pub struct Acquired {
     /// false when a hold of that id already held the same commits
     pub created: bool,
 }
+
+/// Keeps a hold from being released until the commit that records it has published or
+/// been refused. See [`Store::hold_publication`].
+pub struct HoldPublication(
+    #[allow(dead_code)] parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>,
+);
 
 /// Puts the protection back to what `holds.json` records when an acquisition fails.
 struct Unpublished<'a> {
@@ -237,6 +249,34 @@ impl Store {
         })
     }
 
+    /// Keep the hold `id` of `owner`, holding exactly `commits`, from being released
+    /// while the returned guard lives. A commit that records a reference to the hold
+    /// takes it right before it publishes and keeps it until the commit returns. A hold
+    /// that is gone or holds other commits is a `hold-conflict`.
+    pub fn hold_publication(
+        &self,
+        owner: OwnerKind,
+        id: uuid::Uuid,
+        commits: &[CommitRef],
+    ) -> Result<HoldPublication> {
+        let guard = self.family.holds.publishing.read_arc();
+        let mut commits = commits.to_vec();
+        commits.sort_unstable();
+        commits.dedup();
+        match &*self.family.holds.state.lock() {
+            HoldsState::Ready(r) => match r.get(&id) {
+                Some(rec) if rec.hold.owner == owner && rec.hold.commits == commits => {}
+                _ => {
+                    return Err(holds::conflict(format!(
+                        "source hold {id} was released or changed before the commit that records it published"
+                    )));
+                }
+            },
+            HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
+        }
+        Ok(HoldPublication(guard))
+    }
+
     /// Release the holds `ids` of `owner` that exist, and return their ids.
     /// `holds.json` is durable without them before the commits they held may be
     /// collected. Unknown ids and holds of other owners are ignored, so a retried
@@ -268,18 +308,28 @@ impl Store {
                 .collect(),
             HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
         };
-        let mut orphans: Vec<(uuid::Uuid, u64)> = Vec::new();
-        for (h, touch) in &candidates {
-            if !keep(h)? {
-                orphans.push((h.id, *touch));
+        let mut orphans: Vec<(SourceHold, u64)> = Vec::new();
+        for (h, touch) in candidates {
+            if !keep(&h)? {
+                orphans.push((h, touch));
             }
         }
         if orphans.is_empty() {
             return Ok(Vec::new());
         }
         let _family = self.shared_family(&Default::default())?;
-        self.release_where(|r| {
-            orphans
+        // No commit is publishing a reference to a hold from here on, so asking again
+        // sees every publication that passed its check before this point, and a later
+        // one finds its hold gone and is refused.
+        let _publishing = self.family.holds.publishing.write();
+        let mut confirmed: Vec<(uuid::Uuid, u64)> = Vec::new();
+        for (h, touch) in &orphans {
+            if !keep(h)? {
+                confirmed.push((h.id, *touch));
+            }
+        }
+        self.release_locked(|r| {
+            confirmed
                 .iter()
                 .any(|(id, touch)| r.hold.id == *id && r.touch == *touch)
         })
@@ -287,6 +337,12 @@ impl Store {
 
     /// Release the holds `which` selects.
     fn release_where(&self, which: impl Fn(&Record) -> bool) -> Result<Vec<uuid::Uuid>> {
+        let _publishing = self.family.holds.publishing.write();
+        self.release_locked(which)
+    }
+
+    /// [`Store::release_where`] under the exclusive publication lock.
+    fn release_locked(&self, which: impl Fn(&Record) -> bool) -> Result<Vec<uuid::Uuid>> {
         let mut state = self.family.holds.state.lock();
         let records = match &*state {
             HoldsState::Ready(r) => r,

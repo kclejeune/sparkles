@@ -439,8 +439,8 @@ fn reconciliation_releases_old_orphans_only() {
         .unwrap();
     assert_eq!(
         asked,
-        [id(1), id(2)],
-        "only old holds of the owner are asked"
+        [id(1), id(2), id(1)],
+        "only old holds of the owner are asked, and an orphan again under the publication lock"
     );
     assert_eq!(released, [id(1)]);
     let left: Vec<_> = s
@@ -1044,4 +1044,56 @@ fn an_uncertain_write_is_repeated_before_a_hold_is_acknowledged_again() {
     std::fs::remove_file(root.join(crate::holds::FILE)).unwrap();
     s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
     assert!(!root.join(crate::holds::FILE).exists(), "{before:?}");
+}
+
+#[test]
+fn reconciliation_keeps_a_hold_whose_operation_published_after_the_first_look() {
+    let (_dir, _root, s) = setup();
+    s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    // the first answer says the operation never published, and by the time the
+    // reconciliation holds the publication lock it has
+    let mut calls = 0;
+    let released = s
+        .reconcile_holds(EV, 0, &mut |_| {
+            calls += 1;
+            Ok(calls > 1)
+        })
+        .unwrap();
+    assert!(released.is_empty());
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+}
+
+#[test]
+fn a_publication_guard_holds_off_releases_and_checks_the_commits() {
+    let (_dir, _root, s) = setup();
+    s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    assert!(
+        s.hold_publication(EV, id(1), &[at(&s, 2)]).is_err(),
+        "other commits"
+    );
+    assert!(
+        s.hold_publication(OwnerKind::Test, id(1), &[at(&s, 1)])
+            .is_err()
+    );
+    let guard = s.hold_publication(EV, id(1), &[at(&s, 1)]).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            tx.send(s.release_holds(EV, &[id(1)]).unwrap()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the release waits for the publication"
+        );
+        drop(guard);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+            vec![id(1)]
+        );
+    });
+    assert!(
+        s.hold_publication(EV, id(1), &[at(&s, 1)]).is_err(),
+        "released"
+    );
 }

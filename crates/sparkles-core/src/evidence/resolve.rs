@@ -1017,14 +1017,19 @@ fn receipt(
     {
         return Err(origin(key));
     }
-    match lookups
-        .one(receipt.as_str(), &format!("{EV}graphProtection"), graph)
-        .map_err(|e| classify(key, e))?
-    {
-        One::Some(Term::Literal(l))
-            if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string"
-                && Uuid::parse_str(l.value()).ok() == Some(nonce) => {}
-        _ => return Err(origin(key)),
+    // The record and its operation both carry the nonce. A record planted while the
+    // graph was detached cannot, even when it names an operation that a later typed
+    // write records with the current nonce.
+    for subject in [receipt.as_str(), iri.as_str()] {
+        match lookups
+            .one(subject, &format!("{EV}graphProtection"), graph)
+            .map_err(|e| classify(key, e))?
+        {
+            One::Some(Term::Literal(l))
+                if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string"
+                    && Uuid::parse_str(l.value()).ok() == Some(nonce) => {}
+            _ => return Err(origin(key)),
+        }
     }
     Ok(Receipt {
         iri: receipt,
