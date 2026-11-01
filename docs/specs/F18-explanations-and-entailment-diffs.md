@@ -660,7 +660,8 @@ The witnesses are charged to the run's memory budget as they grow, and a run pas
 are kept, the tables by their capacity and the search state of each pass. It does not
 count the spare capacity of growing lists or the old table while a table is moved, so
 the allocated heap can exceed the charge by up to about twice the size of the largest
-growing list or table, which roadmap item NEW-ITEM-5 addresses. Kept witnesses that a later run does not use,
+growing list or table. The rule plans are charged once they are built, as incremental
+updates charge theirs. Roadmap item NEW-ITEM-5 addresses both. Kept witnesses that a later run does not use,
 because it keeps none or keeps another bound, are dropped before the kept closure is
 charged to that run.
 
