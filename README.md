@@ -19,60 +19,7 @@ use Sparkles through Jena's existing query, model and transaction APIs.
 
 ![A CONSTRUCT query's results drawn as a graph of people, who they know and where they work, with one person's neighborhood highlighted](docs/images/graph.png)
 
-## Getting started
-
-To build the server, install Rust with the toolchain in `rust-toolchain.toml`. Linux
-servers also need system CA certificates. Build the optional web UI first if you want
-it embedded in the binary. The UI build requires Node.js and pnpm.
-
-```sh
-pnpm -C ui install && pnpm -C ui build  # optional web UI
-cargo build --release -p sparkles-server
-export PATH="$PWD/target/release:$PATH"
-```
-
-The binary is `target/release/sparkles`. Create a small dataset and query it before
-starting the server.
-
-```sh
-cat > books.ttl <<'EOF'
-<https://example.org/book> <https://example.org/title> "A book" .
-EOF
-sparkles load --loc ./books books.ttl
-sparkles query --loc ./books --results csv 'SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
-```
-
-The query returns the CSV header `n` and one row with a count of `1`. Start the server
-in a terminal.
-
-```sh
-sparkles serve --data ./data --loc books=./books
-```
-
-In another terminal, query the running server. The response contains a CSV header `n`
-and a row with `1`.
-
-```sh
-curl -fsS localhost:3030/books/sparql -H 'Accept: text/csv' \
-  --data-urlencode 'query=SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
-```
-
-The server opens datasets after it starts listening. Retry the request if the dataset is
-still opening. The server holds the database lock while it runs. Use HTTP while it is
-running, or stop it before using a command with `--loc`. If built, the UI is at
-<http://localhost:3030/ui/>. `sparkles help COMMAND` describes each command.
-
-Nix and Docker provide alternative ways to run the server.
-
-```sh
-nix run github:kclejeune/sparkles -- serve --data ./data
-docker compose up --build -d
-```
-
-See [getting started and operations](docs/GETTING-STARTED.md) for setup, security and
-recovery guidance, and [libraries and clients](docs/README.md#libraries-and-clients)
-for the Rust, Python, JVM and Node.js APIs. The binding packages are not published to a
-registry.
+The [web UI tour](#web-ui) shows the main workflows in screenshots.
 
 ## Why Sparkles
 
@@ -137,19 +84,76 @@ on top of the second:
 [docs/FEATURES.md](docs/FEATURES.md) lists every feature and the
 [known gaps](docs/FEATURES.md#known-gaps), including compatibility differences from Jena.
 
-## Capability status
+## Getting started
 
-* RDF and SPARQL support passes the documented conformance suites.
-* Reasoning, incremental views, GeoSPARQL, GraphRAG, bindings and the web UI are
-  available, with further phases planned.
-* Evidence and valid-time vocabularies, shapes and query resources are available.
-  Authenticated evidence proposals and reference resolution are available. Review-controlled
-  projections remain planned.
-* Durable jobs, maintained analysis, temporal runtime helpers and ChatGPT-plan model access
-  remain planned.
+To build the server, install Rust with the toolchain in `rust-toolchain.toml`. Linux
+servers also need system CA certificates. Build the optional web UI first if you want
+it embedded in the binary. The UI build requires Node.js and pnpm.
 
-The [feature matrix](docs/FEATURES.md#capability-status) gives the complete status and
-remaining scope of each capability.
+```sh
+pnpm -C ui install && pnpm -C ui build  # optional web UI
+cargo build --release -p sparkles-server
+export PATH="$PWD/target/release:$PATH"
+```
+
+The binary is `target/release/sparkles`. Create a small dataset and query it before
+starting the server.
+
+```sh
+cat > books.ttl <<'EOF'
+<https://example.org/book> <https://example.org/title> "A book" .
+EOF
+sparkles load --loc ./books books.ttl
+sparkles query --loc ./books --results csv 'SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
+```
+
+The query returns the CSV header `n` and one row with a count of `1`. Start the server
+in a terminal.
+
+```sh
+sparkles serve --data ./data --loc books=./books
+```
+
+In another terminal, query the running server. The response contains a CSV header `n`
+and a row with `1`.
+
+```sh
+curl -fsS localhost:3030/books/sparql -H 'Accept: text/csv' \
+  --data-urlencode 'query=SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
+```
+
+The server opens datasets after it starts listening. Retry the request if the dataset is
+still opening. The server holds the database lock while it runs. Use HTTP while it is
+running, or stop it before using a command with `--loc`. If built, the UI is at
+<http://localhost:3030/ui/>. `sparkles help COMMAND` describes each command.
+
+Nix and Docker provide alternative ways to run the server.
+
+```sh
+nix run github:kclejeune/sparkles -- serve --data ./data
+docker compose up --build -d
+```
+
+See [getting started and operations](docs/GETTING-STARTED.md) for setup, security and
+recovery guidance, and [libraries and clients](docs/README.md#libraries-and-clients)
+for the Rust, Python, JVM and Node.js APIs. The binding packages are not published to a
+registry.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [Features](docs/FEATURES.md) | Every capability, area by area, and the known gaps. |
+| [Benchmarks](docs/benchmarks/README.md) | Results against Jena, QLever, Fluree and Oxigraph, with setup, raw-run catalogs, charts and measured losses. |
+| [Architecture](docs/ARCHITECTURE.md) | Library boundaries, storage, execution and the main design decisions. |
+| [Comparison](docs/COMPARISON.md) | Feature gaps per engine and where Sparkles departs from Jena and QLever. |
+| [Usage](docs/USAGE.md) | The server, the CLI, the bindings, MCP, backups and deployment. |
+| [HTTP API](docs/API.md) | Fuseki's endpoints and the Sparkles extensions. |
+| [Development](docs/DEVELOPMENT.md) | Project layout, builds, tests and mise tasks. |
+| [Roadmap](docs/ROADMAP.md) | Planned work in priority order. |
+| [Design specs](docs/specs/README.md) | The design and outcome of each larger feature. |
+
+[The documentation index](docs/README.md) lists every guide and reference.
 
 ## Performance
 
@@ -327,26 +331,22 @@ panel below it has more workflows and detail views.
 
 </details>
 
-## Documentation
-
-| Document | Contents |
-|---|---|
-| [Features](docs/FEATURES.md) | Every capability, area by area, and the known gaps. |
-| [Benchmarks](docs/benchmarks/README.md) | Results against Jena, QLever, Fluree and Oxigraph, with setup, raw-run catalogs, charts and measured losses. |
-| [Architecture](docs/ARCHITECTURE.md) | Library boundaries, storage, execution and the main design decisions. |
-| [Comparison](docs/COMPARISON.md) | Feature gaps per engine and where Sparkles departs from Jena and QLever. |
-| [Usage](docs/USAGE.md) | The server, the CLI, the bindings, MCP, backups and deployment. |
-| [HTTP API](docs/API.md) | Fuseki's endpoints and the Sparkles extensions. |
-| [Development](docs/DEVELOPMENT.md) | Project layout, builds, tests and mise tasks. |
-| [Roadmap](docs/ROADMAP.md) | Planned work in priority order. |
-| [Design specs](docs/specs/README.md) | The design and outcome of each larger feature. |
-
-[The documentation index](docs/README.md) lists every guide and reference.
-
-## Status and license
+## Status, capabilities and license
 
 Sparkles has no release. The [roadmap](docs/ROADMAP.md) covers the remaining correctness,
 performance, recovery and packaging work and the planned stability contract.
+
+* RDF and SPARQL support passes the documented conformance suites.
+* Reasoning, incremental views, GeoSPARQL, GraphRAG, bindings and the web UI are
+  available, with further phases planned.
+* Evidence and valid-time vocabularies, shapes and query resources are available.
+  Authenticated evidence proposals and reference resolution are available. Review-controlled
+  projections remain planned.
+* Durable jobs, maintained analysis, temporal runtime helpers and ChatGPT-plan model access
+  remain planned.
+
+The [feature matrix](docs/FEATURES.md#capability-status) gives the complete status and
+remaining scope of each capability.
 
 Sparkles is licensed under the [Apache License 2.0](LICENSE). The vendored `spargebra`
 keeps its MIT OR Apache-2.0 license. The licenses of the crates and npm packages that ship
