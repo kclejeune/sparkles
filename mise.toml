@@ -1337,3 +1337,29 @@ python3 scripts/bench-gate.py metrics "$out/metrics.jsonl" --gate insn-screen --
   --manifest rustc="$(rustc -V)" --setting items="$usage_items" --setting commits="$usage_commits" \
   --setting reps="$usage_reps" --setting harness="crates/sparkles-core/tests/insn_screen.rs"
 '''
+
+[tasks."bench:reasoning-latency"]
+description = "Derivation on demand and RDFS on read against materialized inferences (item 472): the 14 LUBM queries on LUBM-style data, interleaved rounds, into a gate record"
+usage = '''
+flag "--universities <n>" default="10" help="LUBM-style universities (about 125,000 triples each)"
+flag "--rounds <n>" default="5" help="rounds over every query and mode"
+flag "--reps <n>" default="3" help="timed runs of each query and mode per round"
+flag "--threads <n>" default="12" help="RAYON_NUM_THREADS"
+flag "--out <dir>" help="results directory (default .artifacts/bench-reasoning-latency/<UTC time>)"
+'''
+run = '''
+set -e
+out=$(realpath -m "${usage_out:-.artifacts/bench-reasoning-latency/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+[ ! -e "$out/metrics.jsonl" ] || { echo "$out already holds a run" >&2; exit 1; }
+started=$(date -u +%FT%TZ)
+RAYON_NUM_THREADS="$usage_threads" mbx run --release -p sparkles-reasoner --example reasoning_latency -- \
+  "$usage_universities" "$usage_rounds" "$usage_reps" "$out/metrics.jsonl" | tee "$out/output.md"
+python3 scripts/bench-gate.py metrics "$out/metrics.jsonl" --gate reasoning-latency --suite lubm-style \
+  --scale "$usage_universities universities" --threshold 0.10 --out "$out/record.json" \
+  --manifest commit="$(git rev-parse HEAD)" --manifest dirty_files="$(git status --porcelain | grep -c . || true)" \
+  --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" \
+  --manifest rustc="$(rustc -V)" --setting universities="$usage_universities" \
+  --setting rounds="$usage_rounds" --setting reps="$usage_reps" --setting threads="$usage_threads" \
+  --setting harness="crates/sparkles-reasoner/examples/reasoning_latency.rs"
+'''
