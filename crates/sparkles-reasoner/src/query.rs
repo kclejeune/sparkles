@@ -465,6 +465,7 @@ impl Session {
             cancel: Some(flag.clone()),
             progress: None,
             budget: self.budget.clone(),
+            closures: false,
         };
         let terms = &self.terms;
         let ends = &mut self.compact_rounds;

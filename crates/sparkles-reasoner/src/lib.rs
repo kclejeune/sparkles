@@ -20,6 +20,7 @@ mod alloc_probe;
 pub mod analysis;
 mod budget;
 mod builtins;
+mod closure;
 mod demand;
 pub mod diagnostics;
 mod engine;
@@ -186,6 +187,11 @@ pub struct ReasonOptions {
     /// The reasoning pool runs evaluate on and are admitted to (the server's), see
     /// [`ReasoningPool`].
     pub pool: Option<Arc<ReasoningPool>>,
+    /// Evaluate transitive and equivalence rules with closure operators, which reach the
+    /// same closure in fewer iterations. `true` by default. `false` evaluates them as
+    /// ordinary rules, for differential tests and measurements.
+    #[doc(hidden)]
+    pub closure_operators: bool,
 }
 
 impl Default for ReasonOptions {
@@ -200,6 +206,7 @@ impl Default for ReasonOptions {
             max_memory: None,
             threads: None,
             pool: None,
+            closure_operators: true,
         }
     }
 }
@@ -215,6 +222,7 @@ impl fmt::Debug for ReasonOptions {
             .field("max_memory", &self.max_memory)
             .field("threads", &self.threads)
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
+            .field("closure_operators", &self.closure_operators)
             .finish()
     }
 }
@@ -388,6 +396,7 @@ fn derive_here(
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
         budget: budget.clone(),
+        closures: opts.closure_operators && opts.analysis.is_none(),
     };
     progress(opts, 0.1, "reasoning");
     let out = engine::run(&mut g, &compiled, &terms, &limits, None)?;
@@ -1353,6 +1362,7 @@ fn update_closure(
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
         budget: budget.clone(),
+        closures: false,
     };
     let ch = &ch;
     progress(opts, 0.1, "updating the closure");
@@ -1638,6 +1648,7 @@ pub fn dred_overdeletion(
         cancel: None,
         progress: None,
         budget: Budget::unlimited(),
+        closures: false,
     };
     let mut c = d.into_closure()?;
     Ok(incremental::dred_overdeletion(

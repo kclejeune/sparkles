@@ -1432,6 +1432,58 @@ impl Graph {
         out
     }
 
+    /// The objects of `(s p ?)` among rows `< hi`, or the error of a base-tier read.
+    pub fn try_objects(
+        &self,
+        memo: &mut Memo,
+        s: u64,
+        p: u64,
+        hi: u32,
+    ) -> anyhow::Result<Vec<u64>> {
+        self.try_ends(memo, Some(s), p, None, hi, 2)
+    }
+
+    /// The subjects of `(? p o)` among rows `< hi`, or the error of a base-tier read.
+    pub fn try_subjects(
+        &self,
+        memo: &mut Memo,
+        p: u64,
+        o: u64,
+        hi: u32,
+    ) -> anyhow::Result<Vec<u64>> {
+        self.try_ends(memo, None, p, Some(o), hi, 0)
+    }
+
+    fn try_ends(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: u64,
+        o: Option<u64>,
+        hi: u32,
+        at: usize,
+    ) -> anyhow::Result<Vec<u64>> {
+        let mut out = Vec::new();
+        if let Some(b) = &self.base
+            && self.reads_base(0, hi)
+        {
+            b.for_each_with(memo, s, Some(p), o, |t| {
+                out.push(t[at]);
+                true
+            })?;
+        }
+        let c = self.cands(s, Some(p), o, 0, hi);
+        out.extend(
+            (0..c.len())
+                .map(|i| c.get(i))
+                .filter(|&i| self.alive(i))
+                .map(|i| self.triple(i))
+                .filter(|t| s.is_none_or(|x| x == t[0]) && t[1] == p && o.is_none_or(|x| x == t[2]))
+                .map(|t| t[at]),
+        );
+        Ok(out)
+    }
+
     /// Members of an RDF list (`rdf:first` / `rdf:rest`), or `None` if `head` is not a
     /// well-formed list (missing links or cycles).
     pub fn list(
