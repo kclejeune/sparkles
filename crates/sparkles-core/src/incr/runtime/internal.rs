@@ -352,13 +352,23 @@ impl Runtime {
         }
         let failed = status_error(&st.status);
         drop(st);
+        if let Some(e) = failed {
+            // a circuit that could not be built is not attached
+            let mut reg = self.reg.lock();
+            if reg
+                .internal
+                .get(&cell.spec.id)
+                .is_some_and(|c| Arc::ptr_eq(c, &cell))
+                && cell.handles.fetch_sub(1, Ordering::AcqRel) == 1
+            {
+                reg.internal.remove(&cell.spec.id);
+            }
+            return Err(e);
+        }
         let handle = InternalCircuit {
             cell,
             rt: Arc::downgrade(self),
         };
-        if let Some(e) = failed {
-            return Err(e);
-        }
         self.kick();
         Ok(handle)
     }
@@ -383,7 +393,9 @@ impl Runtime {
                         None => st.tally = Some(Tally::new(st.key_cols.clone(), snap.commit)),
                     }
                 }
-                self.internal_budget(st);
+                if let Some(e) = self.internal_budget(st) {
+                    self.fail_internal(cell, st, &e);
+                }
             }
             Err(e) => self.fail_internal(cell, st, &e),
         }

@@ -300,6 +300,17 @@ fn attach_checks_its_spec() {
             .to_string()
             .contains("cannot name")
     );
+    // a state over its budget fails the circuit
+    let small = refused(InternalSpec::rows("small", FACTS).with_memory(16));
+    assert!(
+        matches!(&small, crate::Error::Component(c) if c.code == "over-budget"),
+        "{small}"
+    );
+    assert_eq!(
+        rt.internal_count(),
+        0,
+        "a circuit that failed its build is not attached"
+    );
     let a = attach(&rt, &s, "facts", FACTS, "s");
     // the same spec joins the circuit, another one under the same id is refused
     let b = attach(&rt, &s, "facts", FACTS, "s");
