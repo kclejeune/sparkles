@@ -98,7 +98,7 @@ fn a_hold_keeps_its_generation_across_compaction_and_reopens() {
     assert!(!readable(&s, 4), "commit 4 was only in gen-0002");
     drop(s);
     let s = Store::open(&root, StoreOptions::default()).unwrap();
-    assert_eq!(s.source_holds().unwrap(), [a.hold.clone()]);
+    assert_eq!(s.source_holds().unwrap(), std::slice::from_ref(&a.hold));
     assert_eq!(gens(&root), ["gen-0001", "gen-0003"]);
     assert!(readable(&s, 1));
     // a release collects what only the hold kept
