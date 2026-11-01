@@ -1149,7 +1149,15 @@ fn run_node(
                 }
                 None => child(1, infos)?,
             };
-            left_join(ctx, &l, &r, expr.as_ref(), &mut note)?
+            let t = left_join(ctx, &l, &r, expr.as_ref(), &mut note)?;
+            if let Some(e) = expr {
+                let (exists, c) = super::exists::explain(ctx, std::slice::from_ref(e));
+                if let Some(x) = exists {
+                    note = Some(note.map_or(x.clone(), |n| format!("{n} {x}")));
+                }
+                counters = merge_counters(counters, c);
+            }
+            t
         }
         Kind::KeyedLeftJoin { expr, left, right } => {
             let l = child(0, infos)?;
@@ -1212,6 +1220,7 @@ fn run_node(
             let mut t = child(0, infos)?;
             ctx.check_output(t.len(), 1)?;
             let col = compute_column(ctx, &t, e, &mut expr_report)?;
+            (note, counters) = super::exists::explain(ctx, std::slice::from_ref(e));
             t.vars.push(*v);
             t.cols.push(col);
             t
@@ -4893,9 +4902,13 @@ fn sorted_on(t: &Table, c: usize) -> bool {
 }
 
 /// Which rows of `joined` pass the OPTIONAL's FILTER `e`.
-fn left_filter(ctx: &Ctx, joined: &Table, e: &Expr) -> Vec<bool> {
+fn left_filter(ctx: &Ctx, joined: &Table, e: &Expr) -> Result<Vec<bool>> {
+    // a condition `EXISTS { P }` from the key set of P
+    if let Some(mask) = super::exists::mask(ctx, joined, e)? {
+        return Ok(mask);
+    }
     let map = joined.var_map(ctx.nvars());
-    (0..joined.len())
+    Ok((0..joined.len())
         .map(|i| {
             ebv(
                 e,
@@ -4909,7 +4922,7 @@ fn left_filter(ctx: &Ctx, joined: &Table, e: &Expr) -> Vec<bool> {
             )
             .unwrap_or(false)
         })
-        .collect()
+        .collect())
 }
 
 pub(super) fn left_join(
@@ -4933,7 +4946,7 @@ pub(super) fn left_join(
     let mut pairs = join_pairs(ctx, l, r, &lay, false, note)?;
     let mut joined = materialize(l, r, &lay, &pairs);
     if let Some(e) = expr {
-        let keep = left_filter(ctx, &joined, e);
+        let keep = left_filter(ctx, &joined, e)?;
         joined.filter_rows(&keep);
         let mut k = keep.iter();
         pairs.retain(|_| *k.next().unwrap());
@@ -5000,7 +5013,7 @@ fn keyed_join(
             left_join(ctx, l, r, Some(expr), note)
         } else {
             let mut t = cross(ctx, l, r)?;
-            let keep = left_filter(ctx, &t, expr);
+            let keep = left_filter(ctx, &t, expr)?;
             t.filter_rows(&keep);
             Ok(t)
         }
@@ -5054,7 +5067,7 @@ fn keyed_join(
             ctx.check()?;
             ctx.check_output(out.len().saturating_add(chunk.len()), w)?;
             let mut joined = materialize(l, r, &lay, chunk);
-            let keep = left_filter(ctx, &joined, expr);
+            let keep = left_filter(ctx, &joined, expr)?;
             if optional {
                 for (k, &(i, _)) in keep.iter().zip(chunk.iter()) {
                     if *k {
@@ -5167,7 +5180,7 @@ fn merge_left_join(
             .map(|(&i, &j)| (i, j))
             .collect();
         let joined = materialize(l, r, lay, &matched);
-        let mut keep = left_filter(ctx, &joined, e).into_iter();
+        let mut keep = left_filter(ctx, &joined, e)?.into_iter();
         drop(joined);
         let (mut li2, mut rj2) = (Vec::with_capacity(li.len()), Vec::with_capacity(li.len()));
         let mut k = 0;
@@ -5642,6 +5655,12 @@ pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<E
 
 /// Evaluate the filter row by row.
 pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
+    // `EXISTS { P }` from the key set of P, as an OPTIONAL condition tests it
+    if let [e] = exprs
+        && let Some(mask) = super::exists::mask(ctx, t, e)?
+    {
+        return Ok(mask);
+    }
     if let [Expr::Cmp(a, b, op)] = exprs
         && let (Expr::Var(x), Expr::Var(y)) = (&**a, &**b)
         && let Some(keep) = string_order_mask(ctx, t, (*x, *y), *op, &exprs[0])?
@@ -5783,6 +5802,10 @@ pub(super) fn compute_column(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Vec<Id>> {
+    // `EXISTS { P }` from the key set of P when the rows have enough distinct keys
+    if let Some(col) = super::exists::column(ctx, t, e)? {
+        return Ok(col);
+    }
     if ctx.is_cursor() {
         return match super::exprcache::cursor_column(ctx, t, e, report, |v| column_rows(ctx, v, e))?
         {

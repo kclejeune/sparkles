@@ -266,3 +266,51 @@ fn exists_with_an_outer_bound_risky_variable_stays_eager() {
         assert_eq!(bag(got), bag(expected), "{q}");
     }
 }
+
+/// A BIND of EXISTS or NOT EXISTS takes its values from the pattern's key set in a
+/// strict cursor as well as eagerly, and both give the answers of evaluation per key,
+/// including rows that leave a key unbound.
+#[test]
+fn bind_exists_streams_from_the_key_set() {
+    use sparkles_core::sparql::{FallbackPolicy, select_cursor};
+    let s = store();
+    let per_key = QueryOptions {
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            decorrelate_exists: false,
+            ..sparkles_core::sparql::Optimizations::ALL
+        }),
+        ..Default::default()
+    };
+    for q in [
+        PER_KEY[1],
+        "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(NOT EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
+        "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o } BIND(EXISTS { ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
+    ] {
+        let expected = query(s.snapshot(), q, &per_key).unwrap().rows();
+        assert_eq!(
+            query(s.snapshot(), q, &Default::default()).unwrap().rows(),
+            expected,
+            "{q}"
+        );
+        for batch_rows in [1000, 4096] {
+            let cursor = CursorOptions {
+                batch_rows,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), q, &Default::default(), &cursor)
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            let mut rows = Vec::new();
+            while let Some(b) = c.next_batch().unwrap() {
+                for i in 0..b.len() {
+                    rows.push(b.row(i).unwrap());
+                }
+            }
+            assert_eq!(
+                ordered(rows),
+                ordered(expected.clone()),
+                "{q}; {batch_rows}"
+            );
+        }
+    }
+}
