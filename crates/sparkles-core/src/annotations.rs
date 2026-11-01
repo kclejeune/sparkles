@@ -421,8 +421,10 @@ impl Annotations {
             Err(e) => {
                 // The old handle names the file the rename replaced, and creating the
                 // file again would erase the records that the new one holds, so no
-                // record is written until the store reopens.
+                // record is written until the store reopens. The old tail goes, since
+                // its zeros were withdrawn above.
                 self.broken = true;
+                self.tail = None;
                 Err(e.into())
             }
         }
@@ -1058,8 +1060,14 @@ mod tests {
         for (seq, m) in [(1, "one"), (2, "two")] {
             a.append(seq, message(m), id, || MAX_PREALLOC).unwrap();
         }
+        let (_, zeros) = a.take_prealloc();
+        assert!(zeros > 0);
         a.fail_reopen = true;
         assert!(a.prune_before(2, id).is_err());
+        // the replaced file's zeros are withdrawn once, and a close withdraws nothing more
+        assert_eq!(a.take_prealloc(), (zeros, 0));
+        a.trim();
+        assert_eq!(a.take_prealloc(), (0, 0));
         assert!(a.append(3, message("three"), id, || MAX_PREALLOC).is_err());
         assert!(a.append_queued(3, message("three"), id).is_err());
         assert!(a.prune_before(3, id).is_err());
