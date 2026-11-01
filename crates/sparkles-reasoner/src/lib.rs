@@ -957,13 +957,17 @@ fn materialize_admitted(
         .copied()
         .collect();
     let (rules, iterations, budget) = (d.rules, d.iterations, d.budget.clone());
-    let (base_scans, threads) = (d.base_scans, d.threads);
+    let (mut base_scans, threads) = (d.base_scans, d.threads);
     let (closure, witnesses) = match wanted_witnesses(opts)? {
         Some(max) => {
             progress(opts, 0.9, "recording witnesses");
             let mut c = d.into_closure()?;
             let w =
                 exec.install(|| build_witnesses(&mut c, profile, extras, max, &budget, opts))?;
+            // the witness pass reads the input graphs too
+            if let Some(b) = c.graph.base() {
+                base_scans = base_scans.max(b.scans());
+            }
             (ClosureState::Ready(c), Some(w))
         }
         None => (ClosureState::Derived(d), None),
@@ -1482,7 +1486,7 @@ fn update_closure(
         (up, rayon::current_num_threads())
     });
     let up = up?;
-    let base_scans = base.scans();
+    let mut base_scans = base.scans();
     drop(base);
     let mut generalized = prev.generalized;
     let mut gen_changes = maintain::GeneralizedChanges::default();
@@ -1532,6 +1536,12 @@ fn update_closure(
             }
         }
     };
+    // the witness pass reads the input graphs too
+    if witnesses.is_some()
+        && let Some(b) = closure.graph.base()
+    {
+        base_scans = base_scans.max(b.scans());
+    }
     progress(opts, 0.8, "writing inferred graph");
     let candidates = up
         .deleted

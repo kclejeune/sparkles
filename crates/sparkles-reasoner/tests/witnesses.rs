@@ -179,6 +179,19 @@ fn a_small_bound_truncates() {
     let got = cache.witnesses(&t("i", &ty(), "C")).unwrap();
     assert!(got.annotation.truncated);
     assert_eq!(got.annotation.witnesses.len(), 1);
+    // regression (eleventh review): the count is that of the kept witnesses
+    assert_eq!(got.annotation.count, 1);
+}
+
+/// Regression (eleventh review of item 416): the input scans of the witness pass count
+/// in the report.
+#[test]
+fn witness_scans_are_reported() {
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, None, &[t("i", &ty(), "A"), t("A", &sub(), "C")], &[]);
+    let plain = run(&s, None, &Cache::default(), &ReasonOptions::default()).base_scans;
+    let with_w = run(&s, None, &Cache::default(), &with(8)).base_scans;
+    assert!(with_w > plain, "{with_w} {plain}");
 }
 
 /// Without the option no witnesses are kept, and turning it on or changing the bound

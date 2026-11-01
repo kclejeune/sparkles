@@ -843,7 +843,11 @@ impl Witnesses {
     /// quad as its only witness.
     pub(crate) fn report_of(&self, c: &Closure, t: &Triple) -> Option<Annotation> {
         if let Some(a) = self.ann(t) {
-            return Some(a.report(self.max));
+            // the count is that of the kept witnesses; the unknown support only marks
+            // the annotation truncated
+            let mut r = a.report(self.max);
+            r.count = r.witnesses.len() as i64;
+            return Some(r);
         }
         if !c.graph.contains(t) || kind(c, t) != Kind::Base {
             return None;
