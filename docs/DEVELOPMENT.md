@@ -132,7 +132,8 @@ Node, pnpm or Rust on the host. `mise run docker:build` builds the image of
 ## mise tasks
 
 [`mise.toml`](../mise.toml) pins Mr. Boxington, Node, pnpm, hyperfine, prek, shfmt, shellcheck, a Java 17
-and a Java 21 JDK, and Gradle. Rust comes from `rust-toolchain.toml`. `mise.toml` also defines the everyday tasks, and
+and a Java 21 JDK, and Gradle. Its hyperfine is the only source of the benchmark runners'
+timer, since the Nix development shell does not provide one. Rust comes from `rust-toolchain.toml`. `mise.toml` also defines the everyday tasks, and
 `mise tasks` lists them all:
 
 ```sh

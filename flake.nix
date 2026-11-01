@@ -231,7 +231,6 @@
                 })
                 pkgs.nodejs_24
                 pkgs.pnpm_10
-                pkgs.hyperfine
                 # the scripts, and the Python bindings' tests (`mise run py:test`)
                 (pkgs.python3.withPackages (ps: [
                   ps.pytest

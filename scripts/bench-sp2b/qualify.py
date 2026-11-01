@@ -16,6 +16,10 @@ import math
 import pathlib
 import re
 import statistics
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import bench_hyperfine  # noqa: E402
 
 POLICY = "sp2bench-source-triple-reconstruction-v1"
 CANONICALIZATION = {
@@ -116,7 +120,7 @@ def qualify(directory, bindings):
         require(isinstance(actual["rows"], int) and not isinstance(actual["rows"], bool) and actual["rows"] >= 0, "invalid row count")
         require(all(re.fullmatch(r"row-sha256-v1:[0-9a-f]{64}", actual[key]) for key in ("exact", "value")), "wrong canonicalization algorithm")
         require(row["answer"]["rows"] == actual["rows"] and row["answer"]["hash"] == actual["value"], "timing answer is not the checked answer")
-        timing = sources[expected_query["timing_role"]]["results"]
+        timing = bench_hyperfine.normalize(sources[expected_query["timing_role"]])["results"]
         require(len(timing) == 1 and timing[0]["command"] == bindings["engine"], "wrong raw timing source")
         timing = timing[0]
         samples = row["samples_ms"]

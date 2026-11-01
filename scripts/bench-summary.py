@@ -17,11 +17,13 @@ from the majority are footnoted and not ranked. The best value of each row is bo
 import importlib.util
 from pathlib import Path
 import json, os, statistics, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_hyperfine
 d, names = sys.argv[1], sys.argv[2:]
 ORDER = ["sparkles", "jena-fuseki", "qlever", "fluree", "oxigraph"]
 LOADNAME = {"jena-fuseki": "jena-tdb2"}
 def load(f):
-    return {r["command"]: r for r in json.load(open(f))["results"]} if os.path.exists(f) else {}
+    return bench_hyperfine.by_command(f)
 seen = set()
 THROUGHPUT = sorted(f[:-5] for f in os.listdir(d) if f.startswith("throughput") and f.endswith(".json"))
 for n in names + ["update-latency"] + THROUGHPUT:

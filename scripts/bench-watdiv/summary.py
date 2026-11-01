@@ -22,6 +22,9 @@ import math
 import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import bench_hyperfine  # noqa: E402
+
 d, triples, params, names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 ORDER = ["sparkles", "jena-fuseki", "qlever", "fluree", "oxigraph"]
 LOADNAME = {"jena-fuseki": "jena-tdb2"}
@@ -30,7 +33,7 @@ CATEGORIES = {"L": "linear", "S": "star", "F": "snowflake", "C": "complex"}
 
 def load(f):
     p = os.path.join(d, f)
-    return {r["command"]: r for r in json.load(open(p))["results"]} if os.path.exists(p) else {}
+    return bench_hyperfine.by_command(p)
 
 
 def majority(vals):

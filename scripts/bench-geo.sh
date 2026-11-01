@@ -44,27 +44,20 @@ if [ ! -f geo.nt ]; then
 fi
 echo "dataset: $(wc -l < geo.nt) triples"
 
-# merge <new.json> <dest.json>: replace/add hyperfine results by command name
+# merge <new.json> <dest.json>: replace/add hyperfine results by command name, in the
+# hyperfine 1 layout (scripts/bench_hyperfine.py)
 merge() {
-  python3 - "$1" "$2" << 'EOF'
-import json, os, sys
-new, dest = sys.argv[1], sys.argv[2]
-n = json.load(open(new))
-old = json.load(open(dest)) if os.path.exists(dest) else {"results": []}
-cmds = {r["command"] for r in n["results"]}
-old["results"] = [r for r in old["results"] if r["command"] not in cmds] + n["results"]
-json.dump(old, open(dest, "w"), indent=1)
-EOF
+  python3 "$ROOT/scripts/bench_hyperfine.py" merge "$1" "$2"
   rm -f "$1"
 }
 
 if [ -z "${SKIP_LOAD:-}" ]; then
   rm -rf "$DB"
-  hyperfine --runs 1 --style basic --command-name load "$SPARKLES load --loc $DB geo.nt" \
+  hyperfine --shell=sh --runs 1 --style basic --command-name load "$SPARKLES load --loc $DB geo.nt" \
     --export-json results/geo-load.new.json
   merge results/geo-load.new.json results/geo-load.json
   # the index build, from a disabled index each time
-  hyperfine --runs 1 --style basic --prepare "$SPARKLES geo-index --loc $DB --disable" \
+  hyperfine --shell=sh --runs 1 --style basic --prepare "$SPARKLES geo-index --loc $DB --disable" \
     --command-name build "$SPARKLES geo-index --loc $DB" --export-json results/geo-build.new.json
   merge results/geo-build.new.json results/geo-build.json
 fi
@@ -111,7 +104,7 @@ run() {
   done
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
+    hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
       --command-name "$engine" "$(q "$n")" --export-json "results/$n.new.json"
     merge "results/$n.new.json" "results/$n.json"
   done
@@ -137,11 +130,12 @@ if [ -n "$PLAIN_QUERIES" ]; then
   QUERIES=$QUERIES_ALL
 fi
 
-python3 - "$WORK/results" "${NAMES[@]}" << 'EOF'
+PYTHONPATH="$ROOT/scripts" python3 - "$WORK/results" "${NAMES[@]}" << 'EOF'
 import json, os, sys
+import bench_hyperfine
 d, names = sys.argv[1], sys.argv[2:]
 def load(f):
-    return {r["command"]: r for r in json.load(open(f))["results"]} if os.path.exists(f) else {}
+    return bench_hyperfine.by_command(f)
 answers = json.load(open(f"{d}/geo-answers.json")) if os.path.exists(f"{d}/geo-answers.json") else {}
 def ms(r):
     if any(e != 0 for e in r.get("exit_codes", [])):

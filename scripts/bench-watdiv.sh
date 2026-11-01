@@ -166,17 +166,10 @@ selected() { # selected <instance>: QUERIES lists templates or instances
 resolve_tools
 use_hyperfine
 
-# merge <new.json> <dest.json>: replace/add hyperfine results by command name
+# merge <new.json> <dest.json>: replace/add hyperfine results by command name, in the
+# hyperfine 1 layout (scripts/bench_hyperfine.py)
 merge() {
-  python3 - "$1" "$2" << 'EOF'
-import json, os, sys
-new, dest = sys.argv[1], sys.argv[2]
-n = json.load(open(new))
-old = json.load(open(dest)) if os.path.exists(dest) else {"results": []}
-cmds = {r["command"] for r in n["results"]}
-old["results"] = [r for r in old["results"] if r["command"] not in cmds] + n["results"]
-json.dump(old, open(dest, "w"), indent=1)
-EOF
+  python3 "$ROOT/scripts/bench_hyperfine.py" merge "$1" "$2"
   rm -f "$1"
 }
 
@@ -193,7 +186,7 @@ if [ -z "${SKIP_LOAD:-}" ]; then
   fi
   if has fluree; then LOAD+=(--prepare 'rm -rf fluree' --command-name fluree "mkdir -p fluree && cd fluree && $FLUREE init -q && $FLUREE --memory-budget-mb 8192 create bench --from ../data.nt --chunk-size-mb 16"); fi
   if has oxigraph; then LOAD+=(--prepare 'rm -rf oxigraph.db' --command-name oxigraph "$OXIGRAPH load --location oxigraph.db --format nt < data.nt && $OXIGRAPH optimize --location oxigraph.db"); fi
-  hyperfine --runs 1 --style basic "${LOAD[@]}" --export-json results/load.new.json
+  hyperfine --shell=sh --runs 1 --style basic "${LOAD[@]}" --export-json results/load.new.json
   merge results/load.new.json results/load.json
 fi
 

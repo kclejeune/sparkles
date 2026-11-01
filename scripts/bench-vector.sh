@@ -174,13 +174,14 @@ done
 hyperfine -N --warmup "$WARMUP" --runs "$RUNS" --export-json results/hyperfine.json "${args[@]}" > results/hyperfine.log 2>&1
 
 # ------------------------------------------------------------------------ summary
-python3 - "$N" "$DIM" "$M" "$EFC" > summary.md << 'EOF'
+PYTHONPATH="$ROOT/scripts" python3 - "$N" "$DIM" "$M" "$EFC" > summary.md << 'EOF'
 import json, os, sys
+import bench_hyperfine
 n, dim, m, efc = sys.argv[1:5]
 b = json.load(open("results/build.json")) if os.path.exists("results/build.json") else {}
 st = json.load(open("results/status.json")) if os.path.exists("results/status.json") else {}
 r = json.load(open("results/recall.json"))
-hf = {x["command"]: x for x in json.load(open("results/hyperfine.json"))["results"]}
+hf = bench_hyperfine.by_command("results/hyperfine.json")
 mem = st.get("memory", {})
 print(f"# Vector search: {n} x {dim}\n")
 print(f"Clustered vectors, cosine, HNSW M={m}, efConstruction={efc}, {r['queries']} queries, top {r['k']}.\n")

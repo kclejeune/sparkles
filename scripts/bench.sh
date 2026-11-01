@@ -154,12 +154,7 @@ suite() {
     [ -f "$1" ] || return 1
     local names=() e
     for e in $ENGINES; do names+=("${NAME[$e]}"); done
-    python3 -I - "$1" "${names[@]}" << 'EOF'
-import json, sys
-with open(sys.argv[1]) as f:
-    have = {r.get("command") for r in json.load(f).get("results", [])}
-sys.exit(0 if set(sys.argv[2:]) <= have else 1)
-EOF
+    python3 -I "$ROOT/scripts/bench_hyperfine.py" has "$1" "${names[@]}"
   }
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
@@ -194,7 +189,7 @@ EOF
     ARGS+=(--prepare "$(upd "$e" queries/_delete.ru)" --command-name "${NAME[$e]}" "$(upd "$e" queries/_update.ru)")
   done
   if [ ${#ARGS[@]} -gt 0 ]; then
-    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
+    "${CLIENT[@]}" hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
       "${ARGS[@]}" --export-json "$RES/update-latency.new.json"
     merge "$RES/update-latency.new.json" "$RES/update-latency.json"
   fi
@@ -212,7 +207,7 @@ EOF
   pcmd() { par "${URL[$1]}"; }
   mapfile -d '' ARGS < <(engine_args pcmd)
   for e in $ENGINES; do reset_peak "$e"; done
-  hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
+  hyperfine --shell=sh --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
     "${ARGS[@]}" --export-json "$RES/throughput.new.json"
   merge "$RES/throughput.new.json" "$RES/throughput.json"
   kv=()

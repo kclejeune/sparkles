@@ -8,12 +8,13 @@
 
 `manifest` writes the run manifest at the start of a run: the commit of the scripts' checkout,
 the commit of the Sparkles binary when it is known, and the binary
-hash, every engine's version, binary hash and license, the host, the memory limit, the CPU
-pinning, the data hashes and the start time. `finish` adds the end time.
+hash, every engine's version, binary hash and license, the version of the hyperfine that times
+the run, the host, the memory limit, the CPU pinning, the data hashes and the start time. `finish` adds the end time.
 
 `build` turns the files a harness leaves in a results directory into one record. It reads
 
-* `<query>.json`: hyperfine's output, one result per engine (warm runs). The files
+* `<query>.json`: hyperfine's output, one result per engine (warm runs), in the JSON of
+  hyperfine 1 or 2 (scripts/bench_hyperfine.py). The files
   `update-latency.json` and `throughput*.json` are read as the modes `update` and
   `throughput`, with the query name taken from the file,
 * `cold.json` and `cold-runs.json`: the restarts of bench.sh's cold mode,
@@ -76,6 +77,9 @@ import re
 import statistics
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_hyperfine  # noqa: E402
 
 # Version 3 distinguishes unresolved answer disagreements from failed data oracles.
 # Versions 1 and 2 remain readable; older tools refuse the new version cleanly.
@@ -215,6 +219,8 @@ def cmd_manifest(a):
             e["version"] = "unknown"
         engines[name] = e
     m["engines"] = engines
+    if a.hyperfine:
+        m["hyperfine"] = version_of(a.hyperfine, ["--version"])
     m["memory_limit"] = a.memory_limit or None
     m["client_cpu"] = a.client_cpu or None
     data = {}
@@ -369,8 +375,13 @@ def result(engine, query, mode, samples_s, codes, answer, clients=1, **extra):
     return r
 
 
+def load_hyperfine(d, name):
+    """hyperfine's JSON in d, in the hyperfine 1 layout whichever version wrote it."""
+    return bench_hyperfine.load(os.path.join(d, name))
+
+
 def hyperfine_results(d, name, mode, fps, clients=1, query=None):
-    j = load_json(d, name + ".json")
+    j = load_hyperfine(d, name + ".json")
     out = []
     for r in (j or {}).get("results", []):
         en = engine_name(r["command"])
@@ -489,7 +500,7 @@ def cmd_build(a):
     results += hyperfine_results(d, "update-latency", "update", fps)
     for f in sorted(os.listdir(d)):
         if f.startswith("throughput") and f.endswith(".json") and not f.endswith((".new.json", ".hf.json")):
-            j = load_json(d, f)
+            j = load_hyperfine(d, f)
             q = f[:-5] if f != "throughput.json" else "star-join"
             for r in j["results"]:
                 en = engine_name(r["command"])
@@ -674,6 +685,7 @@ def main():
     m.add_argument("--client-cpu", default="")
     m.add_argument("--workdir", default=".")
     m.add_argument("--license-note", action="append")
+    m.add_argument("--hyperfine", default="", help="path of the hyperfine that times the run")
     m.set_defaults(f=cmd_manifest)
     f = sub.add_parser("finish")
     f.add_argument("manifest")

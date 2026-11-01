@@ -95,17 +95,10 @@ start_server() { # start_server <db>
   exit 1
 }
 
-# merge <new.json> <dest.json>: replace/add hyperfine results by command name
+# merge <new.json> <dest.json>: replace/add hyperfine results by command name, in the
+# hyperfine 1 layout (scripts/bench_hyperfine.py)
 merge() {
-  python3 - "$1" "$2" << 'EOF'
-import json, os, sys
-new, dest = sys.argv[1], sys.argv[2]
-n = json.load(open(new))
-old = json.load(open(dest)) if os.path.exists(dest) else {"results": []}
-cmds = {r["command"] for r in n["results"]}
-old["results"] = [r for r in old["results"] if r["command"] not in cmds] + n["results"]
-json.dump(old, open(dest, "w"), indent=1)
-EOF
+  python3 "$ROOT/scripts/bench_hyperfine.py" merge "$1" "$2"
   rm -f "$1"
 }
 
@@ -237,7 +230,7 @@ for delta in "${DELTAS[@]}"; do
         echo "unexpected validation status for $mode" >&2
         exit 1
       }
-      hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic \
+      hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic \
         --prepare "$(upd "delete-$w.ru")" --command-name "$mode/$w/delta=$delta" "$(upd "insert-$w.ru")" \
         --export-json "results/$RES.new.json"
       merge "results/$RES.new.json" "results/$RES.json"
@@ -248,11 +241,12 @@ done
 
 args=()
 for k in "${!FULL_MS[@]}"; do args+=("$k=${FULL_MS[$k]}"); done
-python3 - "results/$RES.json" "results/$RES.md" "$N" "$(wc -l < "$DATA")" "$LANG_SEL" "${args[@]}" << 'EOF'
+PYTHONPATH="$ROOT/scripts" python3 - "results/$RES.json" "results/$RES.md" "$N" "$(wc -l < "$DATA")" "$LANG_SEL" "${args[@]}" << 'EOF'
 import json, sys
+import bench_hyperfine
 src, dest, people, triples, lang = sys.argv[1:6]
 full = dict(kv.split("=", 1) for kv in sys.argv[6:])
-res = {r["command"]: r for r in json.load(open(src))["results"]}
+res = bench_hyperfine.by_command(src)
 deltas = sorted({c.split("delta=")[1] for c in res}, key=int)
 writes = [w for w in ("plain", "person") if any(f"/{w}/" in c for c in res)]
 ms = lambda r: f'{r["mean"] * 1e3:.2f} ± {r["stddev"] * 1e3:.2f}' if r.get("stddev") is not None else f'{r["mean"] * 1e3:.2f}'
