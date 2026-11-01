@@ -1097,3 +1097,22 @@ fn a_publication_guard_holds_off_releases_and_checks_the_commits() {
         "released"
     );
 }
+
+#[test]
+fn a_publication_after_the_candidates_were_chosen_keeps_the_hold() {
+    let (_dir, _root, s) = setup();
+    s.acquire_hold(EV, id(1), &[at(&s, 1)]).unwrap();
+    // a commit passes its hold check while the reconciliation is asking, and both
+    // answers come before its operation is visible
+    let mut first = true;
+    let released = s
+        .reconcile_holds(EV, 0, &mut |h| {
+            if std::mem::take(&mut first) {
+                drop(s.hold_publication(EV, h.id, &[at(&s, 1)]).unwrap());
+            }
+            Ok(false)
+        })
+        .unwrap();
+    assert!(released.is_empty());
+    assert_eq!(s.source_holds().unwrap().len(), 1);
+}

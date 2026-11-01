@@ -15,9 +15,10 @@
 //!
 //! A release takes the publication lock exclusively before the holds' lock, and a commit
 //! that records a reference to a hold shares it from its check of the hold until it
-//! has published (see [`Store::hold_publication`]). A reconciliation asks again under
-//! that exclusive lock which holds to keep, so it never releases the hold of an
-//! operation that published after it first looked.
+//! has published (see [`Store::hold_publication`]). That check also renews the hold's
+//! touch, so a reconciliation that chose its candidates before it releases nothing of
+//! it. A reconciliation asks again under the exclusive lock which holds to keep, and so
+//! sees every publication that passed its check before the candidates were chosen.
 //!
 //! Lock order: the family's holds before a branch table or a store's history, since a
 //! collection can take the table under its history lock. Nothing that holds a table or a
@@ -250,7 +251,8 @@ impl Store {
     }
 
     /// Keep the hold `id` of `owner`, holding exactly `commits`, from being released
-    /// while the returned guard lives. A commit that records a reference to the hold
+    /// while the returned guard lives, and from a reconciliation that chose its
+    /// candidates before this call. A commit that records a reference to the hold
     /// takes it right before it publishes and keeps it until the commit returns. A hold
     /// that is gone or holds other commits is a `hold-conflict`.
     pub fn hold_publication(
@@ -263,9 +265,12 @@ impl Store {
         let mut commits = commits.to_vec();
         commits.sort_unstable();
         commits.dedup();
-        match &*self.family.holds.state.lock() {
-            HoldsState::Ready(r) => match r.get(&id) {
-                Some(rec) if rec.hold.owner == owner && rec.hold.commits == commits => {}
+        match &mut *self.family.holds.state.lock() {
+            HoldsState::Ready(r) => match r.get_mut(&id) {
+                Some(rec) if rec.hold.owner == owner && rec.hold.commits == commits => {
+                    // a reconciliation that looked before this no longer releases it
+                    rec.touch = self.family.holds.touches.fetch_add(1, Ordering::Relaxed) + 1;
+                }
                 _ => {
                     return Err(holds::conflict(format!(
                         "source hold {id} was released or changed before the commit that records it published"

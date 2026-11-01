@@ -719,33 +719,33 @@ pub fn operation_recorded(main: &Dataset, id: Uuid, control: &Control) -> Result
 /// commit. The grace period must exceed the longest request deadline, so that an
 /// operation still on its way to its commit keeps its hold. Returns the released ids.
 ///
-/// The store asks again, under the lock that every release takes, which holds to
-/// keep. That second answer reads the current snapshots of the stores found first and
-/// takes no writer, since a commit waiting for that lock may hold one. A branch listed
-/// since the first look keeps every hold, as its operations were not looked at.
+/// The stores are found at the first question, after the store chose its candidates,
+/// so nothing is opened when no hold is old enough. A commit that passed its hold
+/// check before then published on one of them, and one that passes it later renews
+/// the hold, which the store then does not release. The store asks again under the
+/// lock that every release takes, and that second answer reads only current
+/// snapshots of those stores and takes no writer or branch table, since a commit
+/// waiting for the lock may hold its writer.
 pub fn reconcile_operation_holds(main: &Dataset, grace_ms: i64) -> Result<Vec<Uuid>> {
     let control = Control::none();
-    // the listed branches, found without their heads, so without their writers
-    let mut stores = vec![main.clone()];
-    for id in main.store().listed_branch_ids() {
-        if let Some(name) = main.store().listed_branch_name(id, &Default::default())? {
-            stores.push(main.branch(&name)?);
-        }
-    }
-    let known: std::collections::BTreeSet<Uuid> =
-        stores.iter().map(|d| d.store().branch_id()).collect();
+    let mut stores: Option<Vec<Dataset>> = None;
     super::reconcile_holds(main, grace_ms, &mut |hold| {
-        if main
-            .store()
-            .listed_branch_ids()
-            .iter()
-            .any(|id| !known.contains(id))
-        {
-            return Ok(true);
-        }
+        let stores = match &mut stores {
+            Some(s) => s,
+            None => {
+                // the listed branches, found without their heads, so without writers
+                let mut found = vec![main.clone()];
+                for id in main.store().listed_branch_ids() {
+                    if let Some(name) = main.store().listed_branch_name(id, &Default::default())? {
+                        found.push(main.branch(&name)?);
+                    }
+                }
+                stores.insert(found)
+            }
+        };
         let op = operation_iri(hold.id);
         let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
-        for ds in &stores {
+        for ds in stores.iter() {
             let head = ds.store().snapshot();
             if Reads::new(&preparation, &head).described_anywhere(&op)? {
                 return Ok(true);

@@ -934,7 +934,10 @@ describes as an `ev:Operation`, whatever its nonce. A changed protection does no
 that an operation never published, so such a hold stays. Every published proposal runs
 the reconciliation with an hour's grace, after its commit, and its failure never fails
 the proposal. Every release takes the publication lock exclusively, and a
-reconciliation asks again under it which holds to keep. A release therefore either
+reconciliation asks again under it which holds to keep, reading only the current
+snapshots of the stores it found and taking no writer. A commit's hold check also
+renews the hold, so a reconciliation that chose its candidates before the check does
+not release it. A release therefore either
 comes before a commit's hold check, which then refuses the commit, or waits until the
 commit has published, and a reconciliation never releases the hold of an operation
 that published after it first looked. A published operation always names a hold that
