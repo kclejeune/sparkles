@@ -467,6 +467,7 @@ fn commit_path_without_views() {
         );
     };
     let start = s.snapshot().commit;
+    let quads = s.snapshot().len();
     let mut all = Vec::new();
     for round in 0..3 {
         let (med, p99, rate) = commits(&s, 3000);
@@ -500,6 +501,28 @@ fn commit_path_without_views() {
         "commit-path/commits",
         head == start + 18_000,
         format!("{} commits from {start}", head - start),
+    );
+    // every commit wrote two new quads, a team and an age of a new :w subject
+    let written = sparql::query(
+        s.snapshot(),
+        &format!("{PREFIX}SELECT (COUNT(*) AS ?n) (SUM(?a) AS ?t) WHERE {{ ?w :memberOf ?m ; :age ?a FILTER(STRSTARTS(STR(?w), \"http://ex/w\")) }}"),
+        &QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let added = s.snapshot().len() - quads;
+    let rows: Vec<String> = written.rows()[0]
+        .iter()
+        .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
+        .collect();
+    let rows = rows.join(" ");
+    check_with(
+        "commit-path/written",
+        added == 36_000 && rows.starts_with("\"18000\""),
+        format!("{added} quads added, {rows}"),
+        Some(format!("{added} quads, {rows}")),
     );
     drop(live);
 }

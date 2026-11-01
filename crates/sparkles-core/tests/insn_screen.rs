@@ -437,6 +437,16 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
             .collect();
         let sorted: Vec<u64> = (0..n).step_by(7).collect();
         let random = ids(n, 50_000);
+        // each prefix's range, from the scanned keys, before the ranges are counted
+        for p in &prefixes {
+            let lo = all.partition_point(|k| k.as_slice() < p.as_slice()) as u64;
+            let hi = lo
+                + all[lo as usize..]
+                    .iter()
+                    .take_while(|k| k.starts_with(p))
+                    .count() as u64;
+            assert_eq!(v.prefix_range(p), (lo, hi), "{name}: prefix range");
+        }
         // the ids and keys of the sorted and random reads, compared in full before they
         // are counted
         let mut got = Vec::with_capacity(sorted.len());
