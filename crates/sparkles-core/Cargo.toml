@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 oxrdf.workspace = true
+# the OWL 2 functional-style syntax reader (spec F21 Phase 3)
+sparkles-owl.workspace = true
 oxrdfio.workspace = true
 oxttl.workspace = true
 oxiri.workspace = true

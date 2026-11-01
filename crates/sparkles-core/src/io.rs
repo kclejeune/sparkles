@@ -223,12 +223,31 @@ impl ReaderSource {
 pub enum RdfSyntax {
     Rdf(RdfFormat),
     Jena(JenaFormat),
+    /// The OWL 2 functional-style syntax, read as the triples its axioms map to (OWL 2
+    /// Mapping to RDF Graphs §2). It is an input syntax only: no writer produces it.
+    OwlFunctional,
+}
+
+/// The names, file extensions and media type of the OWL 2 functional-style syntax.
+const OFN_NAMES: &[&str] = &["ofn", "owl-functional", "functional", "owl/functional"];
+const OFN_EXTENSIONS: &[&str] = &["ofn"];
+/// The media type of the W3C OWL 2 functional-style syntax note.
+pub const OFN_MEDIA_TYPE: &str = "text/owl-functional";
+
+fn ofn_extension(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, e)| OFN_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 impl RdfSyntax {
     /// The syntax of a file path by its extension, looking past a compression extension
     /// (`data.trix.gz`, `data.ttl.zst`).
     pub fn from_path(path: &Path) -> Option<RdfSyntax> {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && ofn_extension(Codec::strip_extension(name))
+        {
+            return Some(RdfSyntax::OwlFunctional);
+        }
         JenaFormat::from_path(path)
             .map(RdfSyntax::Jena)
             .or_else(|| format_for_path(path).map(|(f, _)| RdfSyntax::Rdf(f)))
@@ -238,6 +257,11 @@ impl RdfSyntax {
     /// `rdf/json`, `application/rdf+protobuf`, …), in any case. A media type may carry
     /// parameters.
     pub fn from_name(name: &str) -> Option<RdfSyntax> {
+        let lower = name.trim().to_ascii_lowercase();
+        let base = lower.split(';').next().unwrap_or("").trim();
+        if OFN_NAMES.contains(&base) || base == OFN_MEDIA_TYPE {
+            return Some(RdfSyntax::OwlFunctional);
+        }
         JenaFormat::from_name(name)
             .map(RdfSyntax::Jena)
             .or_else(|| {
@@ -250,6 +274,9 @@ impl RdfSyntax {
     /// The syntax of a file extension without its dot (`ttl`, `nq`, `trix`, `rt`, `rj`).
     pub fn from_extension(ext: &str) -> Option<RdfSyntax> {
         let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+        if OFN_EXTENSIONS.contains(&ext.as_str()) {
+            return Some(RdfSyntax::OwlFunctional);
+        }
         JenaFormat::from_file_name(&format!("x.{ext}"))
             .map(RdfSyntax::Jena)
             .or_else(|| {
@@ -261,14 +288,14 @@ impl RdfSyntax {
     pub fn rdf(self) -> Option<RdfFormat> {
         match self {
             RdfSyntax::Rdf(f) => Some(f),
-            RdfSyntax::Jena(_) => None,
+            RdfSyntax::Jena(_) | RdfSyntax::OwlFunctional => None,
         }
     }
 
     /// Jena's syntax, when it is one.
     pub fn jena(self) -> Option<JenaFormat> {
         match self {
-            RdfSyntax::Rdf(_) => None,
+            RdfSyntax::Rdf(_) | RdfSyntax::OwlFunctional => None,
             RdfSyntax::Jena(j) => Some(j),
         }
     }
@@ -277,6 +304,7 @@ impl RdfSyntax {
         match self {
             RdfSyntax::Rdf(f) => f.name(),
             RdfSyntax::Jena(j) => j.name(),
+            RdfSyntax::OwlFunctional => "OWL functional-style syntax",
         }
     }
 
@@ -285,6 +313,7 @@ impl RdfSyntax {
         match self {
             RdfSyntax::Rdf(f) => f.media_type(),
             RdfSyntax::Jena(j) => j.media_type(),
+            RdfSyntax::OwlFunctional => OFN_MEDIA_TYPE,
         }
     }
 
@@ -293,6 +322,7 @@ impl RdfSyntax {
         match self {
             RdfSyntax::Rdf(f) => f.supports_datasets(),
             RdfSyntax::Jena(j) => j.quads(),
+            RdfSyntax::OwlFunctional => false,
         }
     }
 }
@@ -663,6 +693,14 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
         parse_jena_bulk(src, j, parallelism, make_sink)?;
         return Ok(BTreeMap::new());
     }
+    if src.format == RdfSyntax::OwlFunctional {
+        let mut prefixes = BTreeMap::new();
+        pipe_quads(parallelism, make_sink, |emit| {
+            prefixes = parse_ofn(src, emit)?;
+            Ok(())
+        })?;
+        return Ok(prefixes);
+    }
     let format = src.rdf_format()?;
     let parser = source_parser(src)?;
     let codec = src.codec()?;
@@ -821,6 +859,10 @@ pub fn parse_source_into(
         parse_jena(src, j, false, |q, _| sink(q))?;
         return Ok(BTreeMap::new());
     }
+    if src.format == RdfSyntax::OwlFunctional {
+        let mut sink = sink;
+        return parse_ofn(src, &mut |q, _| sink(q));
+    }
     if src.parse_mode == ParseMode::Buffered {
         let bytes = load_bytes(src)?;
         crate::nesting::check(src.rdf_format()?, bytes.as_ref(), &src.name)?;
@@ -886,6 +928,92 @@ fn parse_jena(
             sink(q, bytes)
         },
     )
+}
+
+/// Read a source in the OWL 2 functional-style syntax: decode the document, read its
+/// axioms one at a time and hand on the triples each maps to (OWL 2 Mapping to RDF
+/// Graphs §2), in the source's graph. The document's bytes are held while it is read,
+/// as for the other whole-document syntaxes, and one axiom's triples at a time. A blank
+/// node the mapping generates and an anonymous individual are each one blank node for
+/// the whole document. The triples count against [`Source::max_decompressed`] as
+/// N-Quads lines, as a Jena body's quads do, since a short axiom can map to many
+/// triples. Returns the document's prefix declarations.
+fn parse_ofn(
+    src: &Source,
+    sink: &mut dyn FnMut(Quad, u64) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    use oxrdf::{BlankNode, NamedOrBlankNode, Term};
+    use rustc_hash::FxHashMap;
+    let bytes = load_bytes(src)?;
+    let text = std::str::from_utf8(bytes.as_ref()).map_err(|e| {
+        Error::RdfParse(format!(
+            "{}: the functional-style document is not UTF-8: {e}",
+            src.name
+        ))
+    })?;
+    let failed = |e: sparkles_owl::ofn_read::ParseError| {
+        Error::RdfParse(format!("{}: OWL functional-style syntax, {e}", src.name))
+    };
+    let mut reader = sparkles_owl::ofn_read::Reader::new(text).map_err(failed)?;
+    let graph = match &src.graph {
+        Some(g) => GraphName::NamedNode(g.clone()),
+        None => GraphName::DefaultGraph,
+    };
+    let mut expansion = crate::jena_formats::Expansion::new(src.max_decompressed);
+    // The writer labels the nodes it generates `g(<n>`, which no label of the document
+    // can be, since `(` ends one. The output labels generated nodes `o<n>` and
+    // anonymous individuals `a<n>`, so the two never meet.
+    let mut generated = 0u64;
+    let mut fresh = move || {
+        generated += 1;
+        BlankNode::new_unchecked(format!("g({generated}"))
+    };
+    let mut anonymous: FxHashMap<String, BlankNode> = FxHashMap::default();
+    let mut rename = |b: BlankNode| -> BlankNode {
+        if let Some(n) = b.as_str().strip_prefix("g(") {
+            return BlankNode::new_unchecked(format!("o{n}"));
+        }
+        let n = anonymous.len();
+        anonymous
+            .entry(b.into_string())
+            .or_insert_with(|| BlankNode::new_unchecked(format!("a{n}")))
+            .clone()
+    };
+    let mut emit = |t: oxrdf::Triple, rename: &mut dyn FnMut(BlankNode) -> BlankNode| {
+        let subject = match t.subject {
+            NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(rename(b)),
+            s => s,
+        };
+        let object = match t.object {
+            Term::BlankNode(b) => Term::BlankNode(rename(b)),
+            o => o,
+        };
+        let q = Quad::new(subject, t.predicate, object, graph.clone());
+        let size = crate::jena_formats::nquads_len(&q);
+        expansion.add(size)?;
+        sink(q, size)
+    };
+    let mut w = sparkles_owl::write::Writer::new(&mut fresh);
+    let header = reader.header().clone();
+    let node: NamedOrBlankNode = match &header.iri {
+        Some(i) => i.clone().into(),
+        None => BlankNode::new_unchecked("g(0").into(),
+    };
+    w.header(&header, &node);
+    for t in std::mem::take(&mut w.triples) {
+        emit(t, &mut rename)?;
+    }
+    for ax in reader.by_ref() {
+        w.axiom(&ax.map_err(failed)?);
+        for t in std::mem::take(&mut w.triples) {
+            emit(t, &mut rename)?;
+        }
+    }
+    Ok(reader
+        .prefixes()
+        .iter()
+        .map(|(p, n)| (p.clone(), n.clone()))
+        .collect())
 }
 
 /// Quads a decoder hands to the sinks at once.

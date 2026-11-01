@@ -187,6 +187,7 @@ fn files_of_every_syntax_load_by_extension_plain_and_compressed() {
     let ext = |s: RdfSyntax| match s {
         RdfSyntax::Rdf(f) => f.file_extension(),
         RdfSyntax::Jena(j) => j.file_extension(),
+        RdfSyntax::OwlFunctional => unreachable!("no writer"),
     };
     for syntax in every_syntax() {
         let bytes = written(&ds, syntax);
@@ -258,6 +259,7 @@ fn sparql_load_reads_every_syntax_from_a_file() {
         let ext = match syntax {
             RdfSyntax::Rdf(f) => f.file_extension(),
             RdfSyntax::Jena(j) => j.file_extension(),
+            RdfSyntax::OwlFunctional => unreachable!("no writer"),
         };
         let path = dir.path().join(format!("l.{ext}"));
         std::fs::write(&path, written(&ds, syntax)).unwrap();
@@ -391,4 +393,89 @@ fn jenas_bad_trix_files_are_refused_with_the_file_name() {
         refused += 1;
     }
     assert!(refused >= 5, "{refused} files");
+}
+
+const OFN: &str = r#"Prefix(:=<http://ex.org/>)
+Ontology(<http://ex.org/onto>
+  Declaration(Class(:A))
+  Declaration(ObjectProperty(:p))
+  SubClassOf(:A ObjectSomeValuesFrom(:p :B))
+  ObjectPropertyAssertion(:p _:x _:x)
+)"#;
+
+/// The triples of [`OFN`], with its blank nodes as `_:`.
+fn ofn_expected() -> Vec<String> {
+    vec![
+        "<http://ex.org/A> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> .",
+        "<http://ex.org/A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> _: .",
+        "<http://ex.org/onto> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Ontology> .",
+        "<http://ex.org/p> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#ObjectProperty> .",
+        "_: <http://ex.org/p> _: .",
+        "_: <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Restriction> .",
+        "_: <http://www.w3.org/2002/07/owl#onProperty> <http://ex.org/p> .",
+        "_: <http://www.w3.org/2002/07/owl#someValuesFrom> <http://ex.org/B> .",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn without_labels(ds: &Dataset) -> Vec<String> {
+    let mut v: Vec<String> = canonical(ds)
+        .into_iter()
+        .map(|l| {
+            l.split(' ')
+                .map(|t| if t.starts_with("_:") { "_:" } else { t })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn functional_syntax_files_load_by_extension_and_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("o.ofn");
+    let zipped = dir.path().join("o.ofn.gz");
+    std::fs::write(&plain, OFN).unwrap();
+    std::fs::write(&zipped, gzip(OFN.as_bytes())).unwrap();
+    for path in [&plain, &zipped] {
+        let ds = Dataset::memory();
+        ds.load_file(path).unwrap();
+        assert_eq!(without_labels(&ds), ofn_expected(), "{}", path.display());
+        // the anonymous individual is one node: the assertion links it to itself
+        let line = canonical(&ds)
+            .into_iter()
+            .find(|l| l.contains("<http://ex.org/p> _:"))
+            .unwrap();
+        let parts: Vec<&str> = line.split(' ').collect();
+        assert_eq!(parts[0], parts[2], "{line}");
+    }
+    for name in ["ofn", "text/owl-functional", "owl-functional"] {
+        let syntax = RdfSyntax::from_name(name).unwrap();
+        assert_eq!(syntax, RdfSyntax::OwlFunctional);
+        let ds = Dataset::memory();
+        ds.load_bytes(OFN.as_bytes(), syntax, None, None).unwrap();
+        assert_eq!(without_labels(&ds), ofn_expected());
+    }
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "LOAD <file://{}> INTO GRAPH <http://ex.org/g>",
+        plain.display()
+    ))
+    .unwrap();
+    assert_eq!(ds.len(), 8);
+    // no writer produces the syntax
+    let e = ds.dump(Vec::new(), RdfSyntax::OwlFunctional).unwrap_err();
+    assert!(matches!(e, Error::Unsupported(_)), "{e}");
+    // a syntax error names the file, the syntax and the position
+    let bad = dir.path().join("bad.ofn");
+    std::fs::write(&bad, "Ontology(\n SubClassOf(:A))").unwrap();
+    let e = Dataset::memory().load_file(&bad).unwrap_err();
+    assert!(
+        matches!(&e, Error::RdfParse(m) if m.contains("bad.ofn") && m.contains("functional") && m.contains("line 2")),
+        "{e}"
+    );
 }

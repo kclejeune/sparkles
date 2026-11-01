@@ -286,6 +286,11 @@ impl NativeRdfSerializer {
         let v = parse(&options)?;
         let control = Control::new(&v, cancel).map_err(err)?;
         let fmt = streams::syntax(&v).map_err(err)?;
+        if fmt == sparkles::io::RdfSyntax::OwlFunctional {
+            return Err(invalid(
+                "the OWL functional-style syntax is read, not written",
+            ));
+        }
         let codec = streams::codec(&v).map_err(err)?;
         let (sender, mut rx) = mpsc::channel::<oxrdf::Quad>(2);
         let (tx, receiver) = mpsc::channel(2);
@@ -318,6 +323,11 @@ impl NativeRdfSerializer {
                                 sink.flush_buffer()?;
                             }
                             writer.finish()?
+                        }
+                        sparkles::io::RdfSyntax::OwlFunctional => {
+                            return Err(EngineError::Unsupported(
+                                "the OWL functional-style syntax is read, not written".into(),
+                            ));
                         }
                         sparkles::io::RdfSyntax::Jena(j) => {
                             let mut writer = sparkles::jena_formats::RdfWriter::new(j, writer);

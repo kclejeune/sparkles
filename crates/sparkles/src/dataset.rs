@@ -1096,6 +1096,11 @@ impl Dataset {
         let format = match format.into() {
             RdfSyntax::Rdf(f) => f,
             RdfSyntax::Jena(j) => return self.dump_jena(w, j),
+            RdfSyntax::OwlFunctional => {
+                return Err(crate::Error::Unsupported(
+                    "the OWL functional-style syntax is read, not written: the ontology handle writes axioms".into(),
+                ));
+            }
         };
         let snap = self.inner.store.snapshot();
         let quads_format = format.supports_datasets();
@@ -1190,6 +1195,11 @@ impl Dataset {
         let format = match format.into() {
             RdfSyntax::Rdf(f) => f,
             RdfSyntax::Jena(j) => return self.dump_graph_jena(graph, w, j),
+            RdfSyntax::OwlFunctional => {
+                return Err(crate::Error::Unsupported(
+                    "the OWL functional-style syntax is read, not written: the ontology handle writes axioms".into(),
+                ));
+            }
         };
         let ser = crate::io::with_prefixes(
             oxrdfio::RdfSerializer::from_format(format),

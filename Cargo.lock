@@ -5816,6 +5816,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparkles-alloc",
+ "sparkles-owl",
  "stacker",
  "tantivy",
  "tantivy-fst",
