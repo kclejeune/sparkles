@@ -248,8 +248,11 @@ modes:
   restriction has `owl:someValuesFrom` with a class is an object property). A blank node
   structure used more than once is parsed once and shared. Every such repair is listed
   as a warning with the triples involved.
-- **Strict**: an undeclared entity or a shared blank node is an unmapped triple and an
-  error in the report, as an OWL 2 DL parser would treat it.
+- **Strict**: an undeclared entity or a shared list cell is an unmapped triple and an
+  error in the report, as an OWL 2 DL parser would treat it. A class expression, data
+  range or property expression used more than once is read once, shared and listed as a
+  warning, because OWL 2 DL ontologies such as the W3C test case Restriction-002 share
+  them.
 
 Punning (one IRI used as a class and an individual) is accepted in both modes, as OWL 2
 allows it, and listed by the DL check of §6.4.
@@ -453,9 +456,9 @@ that graph again gives an equal axiom set.
 to what they were before, and the diff between the two commits is empty.
 
 **A4. Shared structures.** A graph where two `rdfs:subClassOf` triples share one
-restriction blank node reads in lenient mode as two axioms and one warning, and in
-strict mode as unmapped triples. Removing one of the two axioms keeps the restriction
-and lists it as kept.
+restriction blank node reads in both modes as two axioms and one warning. A graph where
+two expressions share one list cell reads in strict mode as unmapped triples. Removing
+one of the two axioms keeps the restriction and lists it as kept.
 
 **A5. EL check.** An ontology with `SubClassOf(ex:A ObjectAllValuesFrom(ex:p ex:B))` and
 `FunctionalObjectProperty(ex:p)` fails the EL check with two violations naming those
@@ -596,11 +599,12 @@ Property tests write random axioms to triples and read them back.
 
 ### Decisions and departures from the design
 
-**Shared expressions in strict mode.** §4.2 and A4 make a blank node structure used more
-than once unmapped in a strict read. The W3C test case Restriction-002 shares a
-restriction and is in OWL 2 DL, so a strict read accepts a shared class expression, data
-range or property expression and warns. A shared list cell is still unmapped in a strict
-read. Removing one of two axioms that share a structure keeps the structure, as A4 asks.
+**Shared expressions in strict mode.** The first design made a blank node structure used
+more than once unmapped in a strict read. The W3C test case Restriction-002 shares a
+restriction and is in OWL 2 DL, so §4.2 and A4 now accept a shared class expression, data
+range or property expression in a strict read with a warning, which keeps the reader
+compatible with the W3C suite. A shared list cell is still unmapped in a strict read.
+Removing one of two axioms that share a structure keeps the structure, as A4 asks.
 
 **The ontology header.** The Mapping §3.1.2 requires exactly one ontology header, so an
 ontology without one is outside OWL 2 DL. When several nodes are typed `owl:Ontology`,
