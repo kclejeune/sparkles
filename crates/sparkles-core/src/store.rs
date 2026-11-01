@@ -1302,7 +1302,9 @@ pub struct StoreOptions {
     /// `fdatasync`. The write returns once the commit is durable, as the sync did, and a
     /// device that supports FUA persists only the written block instead of flushing its
     /// whole cache. Where the file system does not take direct I/O, commits use the
-    /// buffered path. On by default.
+    /// buffered path. On by default. Only tests turn it off, to run the buffered path on a
+    /// file system that takes direct I/O.
+    #[doc(hidden)]
     pub wal_direct_writes: bool,
     /// Group commit: concurrent commits of a persistent store share one synchronization,
     /// and each is acknowledged once the prefix that holds it is durable. On by default,
@@ -1313,8 +1315,9 @@ pub struct StoreOptions {
     pub group_commit: bool,
     /// With group commit on, a commit that is the only writer (nothing queued, no fence
     /// running, no transaction waiting for the writer lock) takes the ordinary path with
-    /// its write-through writes, which need no cache flush. On by default; off, every
-    /// admitted commit goes through the group, for comparing and for tests of the group.
+    /// its write-through writes, which need no cache flush. On by default. Only tests turn
+    /// it off, to send every admitted commit through the group.
+    #[doc(hidden)]
     pub group_commit_idle_direct: bool,
     /// Record each commit's net changes in the change log ([`ChangeLog`]), which history
     /// queries read and which outlives compactions. A dataset's `changelog.json` can

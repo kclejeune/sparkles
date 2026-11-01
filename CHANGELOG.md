@@ -673,6 +673,12 @@ and column names, including in the template of a table without a primary key, wh
 could produce invalid Turtle, and escapes backslashes in template column names (X14,
 item 477).
 
+The environment variables `SPARKLES_NUMERIC_COLUMN` and `SPARKLES_WRITEBACK` and the
+hidden server flags `--no-wal-direct-writes` and `--no-group-commit-idle-direct` are
+gone. They selected an implementation for comparisons, and the numeric column, steady
+writeback, direct log writes and the idle group bypass now always apply outside tests
+(X14, item 478).
+
 ### Fixed
 
 A PDF converted in a child process no longer fails with "the converter stopped on it"

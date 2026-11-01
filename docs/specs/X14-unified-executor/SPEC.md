@@ -269,3 +269,21 @@ keep a file's mode are not durable replacements in this sense. The day-based `as
 ages accept fractions and years, the rate limiter parses rates, and Fuseki's timeouts
 are milliseconds. The client and the formatter do not depend on `sparkles-core` and keep
 their extension tables.
+
+### Test-only implementation switches
+
+Item 478 shipped for the switches that X07 does not measure. `SPARKLES_NUMERIC_COLUMN`
+and `SPARKLES_WRITEBACK` are deleted with their switches. Vocabularies always read their
+numeric column when they have one, and a vocabulary without the file, which the numeric
+column tests open, takes the path the switch used to select. Index builds always send
+their files to the device as they write them. The hidden server flags `--no-wal-direct-writes` and `--no-group-commit-idle-direct`
+are gone, and the store options they set, `wal_direct_writes` and
+`group_commit_idle_direct`, are hidden fields that the tests of the buffered log path
+and of the group set. The buffered path still serves a file system that refuses direct
+I/O. The undocumented `SPARKLES_DEBUG_CACHE` printout of result-cache keys is deleted.
+
+The cold-read switches `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB` and
+`SPARKLES_READ_WINDOW_KB`, and the prefetch and decoding switches of `Optimizations`,
+remain until item 4 has measured them, and item NEW-ITEM-2 makes them test-only then.
+`SPARKLES_NO_IN_PLACE` remains as the method of the published memory benchmark, which
+compares the in-place runner with the blocking pool.

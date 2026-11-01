@@ -205,19 +205,11 @@ struct Cli {
     /// journal commit, which on ext4 and XFS takes a fraction of the time
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_WAL_PREALLOC_BYTES >> 10)]
     wal_prealloc_kb: u64,
-    /// Write commits to the write-ahead log with buffered writes and fdatasync instead of
-    /// direct writes with O_DSYNC (Linux), for comparing the two
-    #[arg(long, global = true, hide = true)]
-    no_wal_direct_writes: bool,
     /// Commit each write with its own synchronization instead of letting concurrent
     /// commits share one (group commit, on by default). SPARKLES_GROUP_COMMIT=off does the
     /// same
     #[arg(long, global = true)]
     no_group_commit: bool,
-    /// With group commit on, send every commit through the group, including one that is
-    /// the only writer (which otherwise commits with write-through writes), for comparing
-    #[arg(long, global = true, hide = true)]
-    no_group_commit_idle_direct: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -2218,7 +2210,6 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
-        wal_direct_writes: !cli.no_wal_direct_writes,
         group_commit: {
             let (on, warning) = group_commit_setting(
                 cli.no_group_commit,
@@ -2229,7 +2220,6 @@ fn store_opts(cli: &Cli) -> StoreOptions {
             }
             on
         },
-        group_commit_idle_direct: !cli.no_group_commit_idle_direct,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
         build: sparkles::builder::BuildOptions {

@@ -484,7 +484,7 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 | # | Item | Spec | Size | Workstream |
 |---|---|---|---|---|
 | NEW-ITEM-1 | **Test-only reference evaluator.** The differential tests use `Optimizations::NONE` as their oracle, so a generic operator that a deleted off path would leave is still part of the engine. A test-only evaluator that follows the SPARQL algebra literally replaces that oracle, after which the remaining replacement-style off paths that only the tests reach can go. | [X14](specs/X14-unified-executor/SPEC.md#superseded-replacement-toggles) | M | 453 |
-| 478 | **Test-only implementation switches.** Environment switches, implementation-only store options and measurement switches become test-only or go once item 4 closes X07. | [X14](specs/X14-unified-executor/SPEC.md#stage-1-cheap-deletions) | S | 453 |
+| NEW-ITEM-2 | **Cold-read switches made test-only.** Once item 4 has measured them, make `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB`, `SPARKLES_READ_WINDOW_KB` and the prefetch and decoding switches of `Optimizations` test-only or remove them. It depends on item 4. | [X14](specs/X14-unified-executor/SPEC.md#test-only-implementation-switches) | S | 453 |
 | 479 | **First-release format cutoff.** Fix the cutoff, refuse older formats with the dump-and-reload message or migrate each one, and drop the pre-release readers and the legacy WAL machinery. It lands after item 343 and before the release artifacts of items 58 and 59. | [X16](specs/X16-storage-consolidation/SPEC.md#candidate-phases) | M | 455 |
 | 480 | **One execution-policy function.** One core function chooses execution from what the consumer needs, so that HTTP, the CLI, MCP, GraphQL and the bindings state their needs instead of encoding a policy. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
 | 481 | **Typed reasoning mode and one inference view.** A typed reasoning mode and one inference view on `Dataset` replace about eight places that choose inferred data by string matching. Items 19 and 221 build on it. | [X14](specs/X14-unified-executor/SPEC.md#stage-3-policy-and-plumbing) | M | 453 |
@@ -744,6 +744,7 @@ for them.
 These items are finished. [FEATURES.md](FEATURES.md) describes what they deliver, and the
 linked spec Outcome records how they landed.
 
+- **478.** Test-only implementation switches for the numeric column, steady writeback, direct log writes and the idle group bypass. The X07 cold-read switches remain under item NEW-ITEM-2. [X14](specs/X14-unified-executor/SPEC.md#test-only-implementation-switches)
 - **477.** One registry of RDF syntax names, extensions and media types, one inferred-graph constant, one duration parser, one durable atomic write, and Turtle escaping in the R2RML draft writer. [X14](specs/X14-unified-executor/SPEC.md#shared-format-registry-and-small-helpers)
 - **476.** The off paths of five superseded optimization switches, `flat_hash_join`, `selective_columns`, `delta_statistics`, `filter_key_ranges` and `filter_id_ranges`. The test-only reference evaluator remains under item NEW-ITEM-1. [X14](specs/X14-unified-executor/SPEC.md#superseded-replacement-toggles)
 - **475.** One join-order planner, the program on cost summaries, with its greedy plan for groups it cannot track. [X14](specs/X14-unified-executor/SPEC.md#one-join-order-planner)

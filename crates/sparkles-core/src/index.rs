@@ -85,24 +85,12 @@ pub fn set_sparse_vocab(on: bool) {
     SPARSE_VOCAB.set(on);
 }
 
-/// Whether vocabularies opened from now on read the values of numeric literals from
-/// their numeric column (`vocab.num`, see [`crate::vocab::numeric`]) when they have one.
-/// On by default, `off` in `SPARKLES_NUMERIC_COLUMN` turns it off for a process.
-pub fn numeric_column() -> bool {
-    NUMERIC_COLUMN.get()
-}
-
-/// Turn the use of [`numeric_column`] on or off for vocabularies opened from now on.
-pub fn set_numeric_column(on: bool) {
-    NUMERIC_COLUMN.set(on);
-}
-
-static NUMERIC_COLUMN: EnvSwitch = EnvSwitch::new("SPARKLES_NUMERIC_COLUMN");
 static IO_HINTS: EnvSwitch = EnvSwitch::new("SPARKLES_IO_HINTS");
 static SPARSE_VOCAB: EnvSwitch = EnvSwitch::new("SPARKLES_SPARSE_VOCAB");
 
 /// A process-wide switch, on unless its environment variable says `off`, `0` or
-/// `false`, and settable for tests and A/B runs.
+/// `false`, and settable for tests and A/B runs. Only the cold-read switches of X07 are
+/// environment switches, until roadmap item 4 has measured them.
 pub(crate) struct EnvSwitch {
     var: &'static str,
     /// 0 = not read from the environment yet, 1 = on, 2 = off
