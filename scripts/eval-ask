@@ -1094,6 +1094,9 @@ class Batch:
         if not kill:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 self.proc.wait(timeout=max(0, wait))
+        # A child the runner has to signal did not end on its own, so its exit status
+        # says nothing about why it stopped.
+        self.record["terminatedByRunner"] = self.proc.poll() is None
         for sig in (signal.SIGTERM, signal.SIGKILL):
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(self.proc.pid, sig)
@@ -1231,6 +1234,16 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
 
     def fail_flight(status):
         record = batch.close(kill=True)
+        # Results the child printed before it ended still count. The reader has
+        # queued every line it read once close() has joined it.
+        while flight:
+            try:
+                kind, raw = batch.lines.get_nowait()
+            except queue.Empty:
+                break
+            if kind != "line":
+                break
+            receive(raw)
         while flight:
             c, rnd, _ = flight.popleft()
             code = "killed" if status == "killed" else "timeout"
@@ -1256,6 +1269,51 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
             if watch(c["q"], c["answer"]):
                 stopped = True
             finished += 1
+
+    def receive(raw):
+        """Take the result line of the oldest line in flight."""
+        c, rnd, sent = flight.popleft()
+        try:
+            obj = strict_json(raw)
+            if not isinstance(obj, dict) or obj.get("id") != f"{c['case']}#{rnd}":
+                raise Invalid("batch result out of order")
+            obj.pop("id")
+            out, failure = Runner.classify_output(validate_ask_record(obj))
+        except Invalid:
+            batch.close(kill=True)
+            raise HarnessFault("batch output invalid") from None
+        wall = ((out.get("usage") or {}).get("elapsedMs") or 0) / 1000
+        out["execution"] = {"batch": batch.record["pid"], "round": rnd}
+        refused = proxy and proxy.refusals_for(c["case"]) > 0
+        if (
+            rnd == 1
+            and not failure
+            and not refused
+            and runner.clarifications == "answer"
+            and c["q"]["kind"] == "answerable"
+            and out.get("outcome") == "clarify"
+        ):
+            choice = choose_clarification(
+                out.get("clarify"), runner.header + c["q"]["gold"]
+            )
+            if choice is None:
+                out["clarification"] = {"basis": "unusable"}
+            else:
+                c["first"], c["firstWall"], c["choice"] = out, wall, choice
+                send(c, 2, choice["answer"])
+                return
+        if rnd == 2:
+            out, wall = merge_clarified(c["first"], out, c["choice"], c["firstWall"], wall)
+        if refused:
+            failure = "budget_refused"
+        if failure:
+            out["evalFailure"] = failure
+        out["wallSeconds"] = wall
+        out["cliEstimatedCostKnown"] = (
+            runner.proxy is None and pair in runner.cli_priced_pairs
+        )
+        done(c, out)
+        finalize()
 
     def restart():
         # A new child for the lines a broken one did not take and the cases left. A
@@ -1320,7 +1378,11 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
                 # other end, or a result line past the cap, cannot be trusted and
                 # ends the run.
                 record = batch.close(wait=min(5, phase_left()))
-                if kind != "eof" or not killed(record, batch.directory):
+                if (
+                    kind != "eof"
+                    or record.get("terminatedByRunner")
+                    or not killed(record, batch.directory)
+                ):
                     raise HarnessFault(
                         "batch output too long"
                         if kind != "eof"
@@ -1328,48 +1390,7 @@ def run_batch(runner, proxy, pair, qs, jobs, admit, report, watch, results=None)
                     )
                 fail_flight("killed")
                 continue
-            c, rnd, sent = flight.popleft()
-            try:
-                obj = strict_json(raw)
-                if not isinstance(obj, dict) or obj.get("id") != f"{c['case']}#{rnd}":
-                    raise Invalid("batch result out of order")
-                obj.pop("id")
-                out, failure = Runner.classify_output(validate_ask_record(obj))
-            except Invalid:
-                batch.close(kill=True)
-                raise HarnessFault("batch output invalid") from None
-            wall = ((out.get("usage") or {}).get("elapsedMs") or 0) / 1000
-            out["execution"] = {"batch": batch.record["pid"], "round": rnd}
-            refused = proxy and proxy.refusals_for(c["case"]) > 0
-            if (
-                rnd == 1
-                and not failure
-                and not refused
-                and runner.clarifications == "answer"
-                and c["q"]["kind"] == "answerable"
-                and out.get("outcome") == "clarify"
-            ):
-                choice = choose_clarification(
-                    out.get("clarify"), runner.header + c["q"]["gold"]
-                )
-                if choice is None:
-                    out["clarification"] = {"basis": "unusable"}
-                else:
-                    c["first"], c["firstWall"], c["choice"] = out, wall, choice
-                    send(c, 2, choice["answer"])
-                    continue
-            if rnd == 2:
-                out, wall = merge_clarified(c["first"], out, c["choice"], c["firstWall"], wall)
-            if refused:
-                failure = "budget_refused"
-            if failure:
-                out["evalFailure"] = failure
-            out["wallSeconds"] = wall
-            out["cliEstimatedCostKnown"] = (
-                runner.proxy is None and pair in runner.cli_priced_pairs
-            )
-            done(c, out)
-            finalize()
+            receive(raw)
         record = batch.close(wait=min(30, phase_left()))
         if record["returncode"] != 0 and not cases[finished:]:
             # Every line was answered, so a failed exit after them is reported only.

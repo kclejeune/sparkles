@@ -1407,6 +1407,10 @@ for raw in sys.stdin:
         time.sleep(600)
     if mode == "no-read":
         time.sleep(600)
+    if mode == "close-stdout-ignore-term":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.close(1)
+        time.sleep(600)
     token = None
     for s in line.get("modelSecrets", []):
         name, src = s.split("=", 1)
@@ -1434,6 +1438,10 @@ for raw in sys.stdin:
         print(json.dumps(out), flush=True)
         sys.exit(0)
     print(json.dumps(out), flush=True)
+    stopped = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stopped")
+    if mode == "stop-reading-once" and not os.path.exists(stopped):
+        open(stopped, "w").close()
+        time.sleep(600)  # the first child answers one line and reads no more
     if mode == "close-after-each":
         # An end the runner trusts, as when a memory cap kills the child.
         sys.stdin.close()
@@ -1675,6 +1683,23 @@ class BatchCases(unittest.TestCase):
                 lambda q, a: False, [],
             )
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_an_answer_queued_before_a_write_times_out_is_kept(self):
+        qs = [dict(q, question="x" * 1990) for q in self.qs(40)]
+        with mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0), mock.patch.object(
+            eval_ask, "BATCH_SLACK_SECONDS", 0.5
+        ):
+            out, report = self.run_batch(self.runner("stop-reading-once", deadline=0.5), qs, jobs=40)
+        status = [a.get("evalFailure") for _, _, a in out]
+        self.assertEqual([q["id"] for q, _, _ in out], [q["id"] for q in qs])
+        self.assertIsNone(status[0])
+        self.assertTrue(set(status) <= {None, "timeout"}, status)
+        self.assertGreaterEqual(len(report["batches"]), 2)
+
+    def test_an_eof_from_a_child_the_runner_had_to_kill_ends_the_run(self):
+        qs = [dict(q, question=f"question {i}") for i, q in enumerate(self.qs(2))]
+        with self.assertRaises(eval_ask.HarnessFault):
+            self.run_batch(self.runner("close-stdout-ignore-term"), qs, jobs=1)
 
     def test_proxy_draining_is_bounded_by_the_phase_deadline(self):
         class Proxy:
