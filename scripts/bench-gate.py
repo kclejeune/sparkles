@@ -321,8 +321,7 @@ def executors(args):
                      "queries_sha256": corpus_digest(root / "queries"),
                      "generator_sha256": manifest.get("generator sha256"),
                      "data_sha256": data_digests,
-                     **({"runtime_env": json.loads(manifest["runtime env"])}
-                        if manifest.get("runtime env", "{}") != "{}" else {}),
+                     "runtime_env": manifest.get("runtime env"),
                      "metric": "medians per request of the server's execMs (/exec) and of curl's time_total (/wall)",
                      "variants": manifest.get("variants"), "run": manifest.get("settings"),
                      "harness": "scripts/bench-executors.sh with scripts/nsc-bench-remote.sh"},

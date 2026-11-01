@@ -142,8 +142,9 @@ NQ=$(find "$OUT/queries" -name '*.rq' | wc -l)
   # the compilers, from the binary's .comment section, for compare's toolchain check
   echo "compilers: $(python3 "$ROOT/scripts/bench-gate.py" compilers "$BIN")"
   [ -z "$BUILD_CONFIG" ] || echo "build config: $BUILD_CONFIG"
-  # the servers inherit these, and compare requires them to match
-  echo "runtime env: $(python3 -c 'import json, os; print(json.dumps({k: v for k, v in sorted(os.environ.items()) if k.startswith("SPARKLES_")}))')"
+  # the cells run with a clean environment, so SPARKLES_ switches and the remote
+  # runner's own options, such as SERVE_ARGS, come only from run.env
+  echo "runtime env: clean"
   echo "scripts commit: $(git -C "$ROOT" rev-parse HEAD 2> /dev/null || echo unknown)"
   echo "scripts dirty: $(git -C "$ROOT" status --porcelain 2> /dev/null | grep -c . || true)"
   echo "host: $(hostname)"
@@ -203,7 +204,8 @@ ENV
       echo "data sha256: $data_sha"
     } > "$d/manifest.txt"
     log "$cell: start, load $(cut -d' ' -f1-3 /proc/loadavg)"
-    bash "$d/nsc-bench-remote.sh" > "$d/remote.log" 2>&1 || die "$cell failed, see $d/results/progress.log"
+    env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C.UTF-8}" \
+      bash "$d/nsc-bench-remote.sh" > "$d/remote.log" 2>&1 || die "$cell failed, see $d/results/progress.log"
     grep -q '^ok' "$d/results/done" || die "$cell did not finish: $(cat "$d/results/done")"
     rm -rf "$d/stores" "$d/srv" "$d/data.nt" "$d"/bin-*.zst "$d/A" "$d/B" "$d/resp.json" "$d/ans.tsv"
     python3 "$ROOT/scripts/nsc-bench-summary.py" "$d" > "$d/summary.md"

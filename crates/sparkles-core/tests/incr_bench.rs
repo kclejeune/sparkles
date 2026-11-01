@@ -156,13 +156,7 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
     let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
     // the evaluated answer's variables and rows, which stay the same across builds, so that
     // a change that breaks the view and its query alike still differs from the baseline
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for row in std::iter::once(&fresh.vars.join(" ")).chain(&want) {
-        for b in row.bytes().chain(*b"\n") {
-            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    let fingerprint = format!("{} rows, {h:016x}", want.len());
+    let fingerprint = answer_fingerprint(&fresh.vars, &want);
     let (ok, detail) = match read {
         Ok(r) if r.commit != snap.commit => (
             false,
@@ -189,6 +183,18 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
         Err(e) => (false, e.to_string()),
     };
     check_with(&format!("{key}/answer"), ok, detail, Some(fingerprint));
+}
+
+/// The row count and an FNV-1a digest of the variables and the sorted rows, which stay
+/// the same across builds.
+fn answer_fingerprint(vars: &[String], rows: &[String]) -> String {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for row in std::iter::once(&vars.join(" ")).chain(rows) {
+        for b in row.bytes().chain(*b"\n") {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{} rows, {h:016x}", rows.len())
 }
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -545,6 +551,30 @@ fn pass_breakdown() {
                 c.applied,
                 s.snapshot().commit
             ),
+        );
+        // the circuit's own answer, outside the timed intervals
+        let fresh = sparql::query(
+            s.snapshot(),
+            &format!("{PREFIX}{q}"),
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
+        let got = rows_of(&c.rows());
+        check_with(
+            &format!("breakdown/{name}/answer"),
+            c.columns() == fresh.vars && got == want,
+            format!(
+                "columns {:?} against {:?}, {} rows against {}",
+                c.columns(),
+                fresh.vars,
+                got.len(),
+                want.len()
+            ),
+            Some(answer_fingerprint(&fresh.vars, &want)),
         );
         let (r, o, a) = (pct(&mut read, 0.5), pct(&mut old, 0.5), pct(&mut adv, 0.5));
         println!("| {name} | {r:.1} | {o:.1} | {a:.1} |");
