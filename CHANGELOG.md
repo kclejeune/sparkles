@@ -24,6 +24,13 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+The library names the reasoning of a query with `sparkles::reasoning::ReasoningMode`
+and selects its inferred data with one `InferenceView` from `Dataset::inference_view`.
+The view gives the query options, the input of incremental views and the source of an
+explanation. The server's `reasoning` parameter, the CLI's `--reasoning` and the MCP
+tools' `reasoning` argument read a mode and apply its view, and each reads the data it
+read before.
+
 The library chooses how a query runs in one function. `sparkles::sparql::choose_execution`
 takes a `Consumer`, which states the mode a caller asked for, the mode it runs in without
 one and what its consumer needs, and returns the execution mode or a refusal of a cursor

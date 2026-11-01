@@ -670,16 +670,15 @@ impl Tools<'_> {
         }
         // the dataset's query defaults (RDFS on read, the inferred overlay and DESCRIBE),
         // as over HTTP
-        let mut defaults = self
-            .server
-            .state
-            .datasets()
-            .get(ds)
+        let dataset = self.server.state.datasets().get(ds).cloned();
+        let mut defaults = dataset
+            .as_ref()
             .map(|d| d.dataset.query_options())
             .unwrap_or_default();
-        if !reasoning {
-            defaults.default_graph_extra.clear();
-            defaults.rdfs = None;
+        if let Some(d) = &dataset {
+            d.dataset
+                .stored_inference_view(reasoning)
+                .apply(&mut defaults);
         }
         let mut opts = QueryOptions {
             timeout: Some(remaining(deadline)?),

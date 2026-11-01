@@ -161,7 +161,7 @@ mod enabled {
             guard,
             schema_format,
             graph,
-            use_inferred: params.get("reasoning").is_none_or(|v| v != "false"),
+            use_inferred: crate::http::reasoning_mode(params).reads_inferences(),
             only_nonconformant,
             format,
             timeout: timeout_param(st, params),

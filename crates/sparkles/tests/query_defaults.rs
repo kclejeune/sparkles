@@ -134,3 +134,123 @@ fn describe_follows_the_setting_unless_the_caller_sets_it() {
     };
     assert_eq!(ds.query_with(q, &given).unwrap().triples.len(), 1);
 }
+
+/// One inference view per reasoning mode chooses what a query reads: the materialized
+/// inferences and RDFS on read for materialized reasoning, the asserted data alone when
+/// reasoning is off, and the same inferred data for incremental views. Automatic
+/// reasoning is refused.
+#[test]
+fn inference_views_select_the_inferred_data() {
+    use sparkles::reasoning::ReasoningMode;
+    use sparkles::reasoning::explain::ExplainSource;
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<urn:child> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:parent> .
+         <urn:s> a <urn:child> .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let view = |mode| ds.inference_view(mode).unwrap();
+    let materialized = view(ReasoningMode::Materialized);
+    assert!(
+        materialized.inference().is_none(),
+        "nothing to read beyond the quads"
+    );
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Graph("default".into()))
+        .unwrap();
+    ds.state()
+        .set_reasoning(Some(ReasoningRecord {
+            profile: "rdfs".into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let materialized = view(ReasoningMode::Materialized);
+    let opts = materialized.query_options();
+    assert_eq!(opts.default_graph_extra, [INFERRED_GRAPH]);
+    assert!(opts.rdfs.is_some());
+    assert!(ds.query_with(ASK, &opts).unwrap().boolean);
+    let inference = materialized.inference().unwrap();
+    assert!(inference.rdfs.is_some());
+    assert_eq!(inference.default_graph_extra, [INFERRED_GRAPH]);
+    assert_eq!(
+        materialized.explain_source(),
+        Some(ExplainSource::Materialized)
+    );
+    // a caller's own RDFS on read survives materialized reasoning
+    let mut own = QueryOptions {
+        rdfs: None,
+        ..ds.query_options()
+    };
+    materialized.apply(&mut own);
+    assert!(own.rdfs.is_none());
+    let off = view(ReasoningMode::Off);
+    let opts = off.query_options();
+    assert!(opts.default_graph_extra.is_empty() && opts.rdfs.is_none());
+    assert!(!ds.query_with(ASK, &opts).unwrap().boolean);
+    assert!(off.inference().is_none());
+    assert_eq!(off.explain_source(), None);
+    assert!(
+        ds.stored_inference_view(false)
+            .query_options()
+            .rdfs
+            .is_none()
+    );
+    assert!(
+        ds.stored_inference_view(true)
+            .query_options()
+            .rdfs
+            .is_some()
+    );
+    let auto = ds.inference_view(ReasoningMode::Auto).unwrap_err();
+    assert!(auto.to_string().contains("reasoning=auto"), "{auto}");
+    for (name, mode) in [
+        ("false", ReasoningMode::Off),
+        ("true", ReasoningMode::Materialized),
+        ("materialized", ReasoningMode::Materialized),
+        ("auto", ReasoningMode::Auto),
+    ] {
+        assert_eq!(ReasoningMode::parse(name), Some(mode.clone()));
+        assert_eq!(ReasoningMode::from_param(Some(name)), mode);
+    }
+    assert!(matches!(
+        ReasoningMode::parse("demand"),
+        Some(ReasoningMode::Demand(_))
+    ));
+    assert_eq!(
+        ReasoningMode::from_param(Some("off")),
+        ReasoningMode::Materialized
+    );
+    assert_eq!(ReasoningMode::from_param(None), ReasoningMode::Materialized);
+}
+
+/// Demand reasoning installs the query-time reasoner, which derives what materialized
+/// reasoning would read, and fails without a profile when the dataset has no record.
+#[cfg(feature = "reasoning")]
+#[test]
+fn a_demand_view_installs_the_query_time_reasoner() {
+    use sparkles::reasoning::explain::ExplainSource;
+    use sparkles::reasoning::{Demand, ReasoningMode};
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<urn:child> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:parent> .
+         <urn:s> a <urn:child> .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let missing = ds
+        .inference_view(ReasoningMode::Demand(Demand::default()))
+        .unwrap_err();
+    assert!(missing.to_string().contains("needs a profile"), "{missing}");
+    let demand = ds
+        .inference_view(ReasoningMode::Demand(Demand {
+            profile: Some(sparkles::reasoning::reasoner::Profile::Rdfs),
+            max_derived: None,
+        }))
+        .unwrap();
+    assert_eq!(demand.explain_source(), Some(ExplainSource::Demand));
+    let opts = demand.query_options();
+    assert!(opts.reasoning.is_some());
+    assert!(ds.query_with(ASK, &opts).unwrap().boolean);
+}

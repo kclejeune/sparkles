@@ -764,13 +764,10 @@ impl Dataset {
     /// turn RDFS on read off for one query.
     pub fn query_options(&self) -> QueryOptions {
         let state = &self.inner;
+        let (rdfs, default_graph_extra) = crate::reasoning::mode::materialized(state);
         QueryOptions {
-            rdfs: state.rdfs.read().clone(),
-            default_graph_extra: if state.reasoning.read().is_some() {
-                vec![crate::reasoning::INFERRED_GRAPH.to_string()]
-            } else {
-                Vec::new()
-            },
+            rdfs,
+            default_graph_extra,
             describe: state.store.describe_settings(),
             pool: state.pool.clone(),
             algo_projections: Some(state.algo.clone()),

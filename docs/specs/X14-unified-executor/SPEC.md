@@ -314,6 +314,31 @@ compare it with each surface's former rules for every combination of their input
 server's tests of Thrift, stored queries with values and an eager server default, the
 CLI's execution tests and the FFI's automatic execution tests cover the surfaces.
 
+### Typed reasoning mode and one inference view
+
+Item 481 shipped. `sparkles::reasoning::ReasoningMode` is `Off`, `Materialized`,
+`Demand` with an optional profile and limit of derived facts, or `Auto`.
+`ReasoningMode::parse` reads `false`, `true`, `materialized`, `demand` and `auto`, and
+`from_param` reads a request parameter, where an absent or unknown value keeps the
+materialized inferences as the endpoints always have. `Dataset::inference_view` turns a
+mode into an `InferenceView`. Its query options read the selected data, its `apply`
+changes a caller's options as the mode changes the dataset's defaults, its `inference` is
+the input of incremental views and live queries, and `explain_source` names the source of
+an explanation. Demand builds the query-time reasoner and fails as `query_reasoner`
+does, and `Auto` is refused. `stored_inference_view` gives the infallible views of the
+materialized inferences or of the asserted data alone.
+
+The HTTP query options, `reasoning=demand` and `reasoning=auto` on queries and
+explanations, the reasoning diagnostics, SHACL and ShEx validation over HTTP, the CLI's
+`--reasoning` with its profile, rules and limit, and the MCP tools' `reasoning` argument
+now read a mode and apply its view. `Dataset::query_options` and the views runtime read the
+materialized inferences through one function, where each repeated the rule before. The
+schema report and the GraphQL draft keep their own true-or-false parameters, which reject
+other values or default to off, and the explanation request keeps its `source`, which
+names only `materialized` or `demand`. Behaviour is unchanged. The new CLI test covers
+`--reasoning false`, `true`, `materialized` and `demand` with and without a profile and
+with an unlimited limit, and the library tests cover each view.
+
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries

@@ -1314,10 +1314,9 @@ pub(crate) fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiErr
 /// overlay and RDFS on read out, so the request reads the asserted data alone.
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     let mut defaults = ds.dataset.query_options();
-    if params.get("reasoning") == Some("false") {
-        defaults.default_graph_extra.clear();
-        defaults.rdfs = None;
-    }
+    ds.dataset
+        .stored_inference_view(reasoning_mode(params).reads_inferences())
+        .apply(&mut defaults);
     QueryOptions {
         timeout: Some(timeout_param(st, params)),
         max_rows: Some(st.limits.max_rows),
@@ -1337,6 +1336,12 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     }
 }
 
+/// The reasoning mode a request's `reasoning` parameter names. An absent or unknown value
+/// reads the dataset's materialized inferences, and `false` reads the asserted data alone.
+pub(crate) fn reasoning_mode(params: &Params) -> sparkles::reasoning::ReasoningMode {
+    sparkles::reasoning::ReasoningMode::from_param(params.get("reasoning"))
+}
+
 /// Query-time reasoning a query asks for with `reasoning=demand` (spec F17 Phase 1): the
 /// reasoner of the dataset, with the profile `reasoningProfile` names or the last
 /// materialization's, and at most `maxDerived` derived facts, never more than the
@@ -1348,9 +1353,10 @@ fn query_reasoning(
     params: &Params,
     opts: &mut QueryOptions,
 ) -> ApiResult<()> {
-    match params.get("reasoning") {
-        Some("demand") => {}
-        Some("auto") => {
+    use sparkles::reasoning::ReasoningMode;
+    match reasoning_mode(params) {
+        ReasoningMode::Demand(_) => {}
+        ReasoningMode::Auto => {
             return Err(err_code(
                 StatusCode::BAD_REQUEST,
                 "reasoning-mode",
@@ -1379,8 +1385,13 @@ fn query_reasoning(
                 }
             },
         };
-        let reasoner = ds.dataset.query_reasoner(profile)?.with_max_derived(max);
-        opts.reasoning = Some(reasoner.provider());
+        let demand = sparkles::reasoning::Demand {
+            profile,
+            max_derived: Some(max),
+        };
+        ds.dataset
+            .inference_view(ReasoningMode::Demand(demand))?
+            .apply(opts);
         Ok(())
     }
     #[cfg(not(feature = "reasoning"))]
@@ -5297,7 +5308,7 @@ async fn reason_diagnostics(
     // the inferences follow from the default graph: included by default when it is checked
     let inferences = reasoning.record().is_some()
         && match params.get("reasoning") {
-            Some(v) => v != "false",
+            Some(v) => sparkles::reasoning::ReasoningMode::from_param(Some(v)).reads_inferences(),
             None => graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH),
         };
     let mut prefixes: Vec<(String, String)> = ds.store.prefixes().into_iter().collect();
@@ -5654,7 +5665,7 @@ async fn shacl(
                 .unwrap_or(ReportFormat::Rdf(RdfFormat::Turtle))
         }
     };
-    let use_inferred = params.get("reasoning").is_none_or(|v| v != "false");
+    let use_inferred = reasoning_mode(&params).reads_inferences();
     let has_inferred = ds.reasoning.read().is_some();
     let timeout = timeout_param(&st, &params);
     let at = history::at_param(&params)?;
