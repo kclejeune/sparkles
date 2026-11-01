@@ -1317,6 +1317,24 @@ conditions, the state encoding of every mode, fact resolution, and a format 2 ch
 across a restart. Regressions from the review cover witnesses over the union default
 graph, many graphs holding one triple, `OPTIONAL` filters, template blank nodes, a
 circuit whose provenance is turned off, and cancelled fact resolution.
+Measurements found and fixed two costs. A state's annotation map keeps the total size of
+its annotations, so the memory a round reads does not visit every row. An annotated build
+reads the pattern with the fewest estimated quads next, and it estimates each scan prefix
+once per pass. Tests check the size against a recomputed sum, the build's scans on a
+large team and the number of estimates.
+
+**Measurements.** On an 8-vCPU Namespace instance at 200,000 people, an annotated pass of
+the five views of the incremental benchmark costs at most 0.025 ms more than a plain one.
+`lineage` makes a state 4 to 80 times larger and `why` 4 to 8 times, and `count` doubles
+the state of a view with 200,000 output rows. This memory buys exact deletions without
+evaluating the query again. An annotated build matches its patterns with index probes and
+takes 1.3 to 10 times as long as a plain build, and 240 times as long, 2.2 seconds, for a
+three-pattern join that the plain build evaluates with the engine's joins. Views without
+annotations kept their pass costs, apart from 2 µs on one view whose plain operators did
+not change, and a query screen gave a geometric mean of 0.987. The
+[writes benchmark](../benchmarks/writes/RESULTS.md#provenance-annotations) has the tables,
+and NEW-ITEM-2, NEW-ITEM-3 and NEW-ITEM-4 track the forge check, the plain pattern order
+and faster annotated builds.
 
 ### Maintained assessments and conservative dependencies
 
