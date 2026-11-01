@@ -22,6 +22,8 @@ pub(super) struct Registry {
     /// the dataset's inference that every circuit is compiled for
     pub(super) inference: Option<Arc<Inference>>,
     pub(super) views: BTreeMap<String, ViewEntry>,
+    /// the internal circuits by id (spec F13 §3.6), which no view or live query shares
+    pub(super) internal: BTreeMap<String, Arc<InternalCell>>,
     /// why the definitions could not be read; views cannot be changed until it is fixed
     pub(super) broken: Option<String>,
 }

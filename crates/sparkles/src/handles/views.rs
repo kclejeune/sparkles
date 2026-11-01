@@ -177,6 +177,21 @@ impl Dataset {
         start(&self.inner, None);
         self.inner.views.live(&self.inner.store, query, access, o)
     }
+
+    /// Attach an internal circuit for server code (spec F13 §3.6): a circuit that no
+    /// user defined, which no view listing, read, rebuild or removal reaches. Only the
+    /// embedding process constructs an [`InternalAccess`](crate::incr::InternalAccess),
+    /// and the bindings and the server's routes never offer this method to callers.
+    pub fn attach_internal(
+        &self,
+        spec: crate::incr::InternalSpec,
+        access: crate::incr::InternalAccess,
+    ) -> Result<crate::incr::InternalCircuit> {
+        start(&self.inner, None);
+        self.inner
+            .views
+            .attach_internal(&self.inner.store, spec, access)
+    }
 }
 
 impl Views {

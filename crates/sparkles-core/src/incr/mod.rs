@@ -14,6 +14,7 @@ pub mod circuit;
 pub mod compile;
 pub mod footprint;
 pub mod inference;
+pub mod internal;
 pub mod live;
 pub mod ops;
 pub mod pass;
@@ -28,6 +29,8 @@ mod definition_tests;
 #[cfg(test)]
 mod r#gen;
 #[cfg(test)]
+mod internal_tests;
+#[cfg(test)]
 mod runtime_tests;
 #[cfg(test)]
 mod tests;
@@ -35,9 +38,10 @@ mod tests;
 pub use circuit::{Circuit, DeltaSet};
 pub use compile::{Compiled, Kind, compile};
 pub use inference::Inference;
+pub use internal::{Counts, InternalAccess, InternalRows, InternalSpec, Sink};
 pub use live::{LiveEvent, LiveOptions, LiveQuery, LiveRow};
 pub use ops::{Mode, PlanNode};
-pub use runtime::{Host, OpenHost, Runtime, RuntimeOptions, RuntimeStats};
+pub use runtime::{Host, InternalCircuit, OpenHost, Runtime, RuntimeOptions, RuntimeStats};
 pub use views::{ViewDef, ViewInfo, ViewState};
 
 /// The IRI of the local SERVICE that reads a `table` view (`view:read`).

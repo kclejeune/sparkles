@@ -353,6 +353,18 @@ pub const VIEW_STATE: FileKind = FileKind {
     reads: &[1],
 };
 
+/// The checkpoints of the internal circuits that server code attaches (spec F13 §3.6).
+/// A version this build does not read is left in place and the circuit is built again
+/// from the data.
+pub const INTERNAL_CIRCUIT_STATE: FileKind = FileKind {
+    id: "internal-circuit-state",
+    files: "circuits/ID/BRANCH/state-COMMIT.bin",
+    marker: "the u32 after the `SPKCIRC` magic; another version is ignored and the circuit rebuilt",
+    class: Class::Derived,
+    writes: 1,
+    reads: &[1],
+};
+
 /// The spill files of cursor operators that outgrow their memory budget. Only the
 /// process that wrote a file reads it, and a start removes what dead processes left.
 pub const SPILL: FileKind = FileKind {
@@ -567,6 +579,7 @@ pub const KINDS: &[&FileKind] = &[
     &GEO,
     &VALIDATION_TYPING,
     &VIEW_STATE,
+    &INTERNAL_CIRCUIT_STATE,
     &SPILL,
     &BACKUP_LAYOUT,
     &BACKUP_BLOB,
@@ -1003,6 +1016,10 @@ mod tests {
         assert_eq!(GEO.writes, crate::geo::config::FORMAT_VERSION);
         assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
         assert_eq!(VIEW_STATE.writes, crate::incr::persist::FORMAT);
+        assert_eq!(
+            INTERNAL_CIRCUIT_STATE.writes,
+            crate::incr::persist::INTERNAL_FORMAT
+        );
         assert_eq!(
             crate::incr::views::PAUSED_FORMAT,
             settings_file(crate::incr::views::FILE).unwrap().writes

@@ -24,6 +24,22 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+Server code can attach internal circuits to a dataset's incremental views runtime
+(spec F13 §3.6) with `Runtime::attach_internal`, or `Dataset::attach_internal` in the
+library. Such a circuit keeps a query's rows, or counts the changed facts per key in each
+commit through an accumulator sink, so that a fact added by one commit and removed by a
+later one counts 2, a replacement within one commit counts 2 and a deletion counts 1, as
+the change feed lists them. The runtime applies an accumulator's circuit one commit at a
+time, also when it is behind, and keeps the counts per commit, so a read of the counts
+after any commit they cover is exact and a commit whose changes are not known is
+reported as unknown. Internal circuits read through an `InternalAccess` that only the
+embedding process constructs. They have no `view.json`, are not listed under
+`/$/views/{ds}`, are not read by `SERVICE view:read`, and no route, binding or MCP tool
+reaches them. `RuntimeStats` counts them as `internal_circuits`.
+`scripts/nsc-writes.sh` and `mise run bench:nsc-writes` take `--views none|async:N`, which
+defines N table views on every store before the writes. `commit:Q` and `graph:N` are
+refused until the server maintains views at commit and keeps graph views.
+
 Weighted `path:allShortest` between one pair, and the cheapest weighted cycles through a
 node in both shortest modes, run Dijkstra's algorithm from both ends. Weighted path
 searches add costs in double-double arithmetic everywhere, so paths whose weights have
@@ -756,6 +772,12 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+Internal circuits are checkpointed to `circuits/{id}/main/state-{commit}.bin`, the new
+derived kind `internal-circuit-state` version 1 with the magic `SPKCIRC\0`. A file of
+another version is left in place and the circuit is built from the data, and an
+accumulator built so counts from its build. Releases without internal circuits ignore
+the directory.
 
 The dataset reader capability 6 marks protected managed graphs. Enabling a profile
 owner raises `minimumReader` to 6 durably, writes the owner's settings file such as

@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn failure(e: &Error) -> (String, String) {
+pub(super) fn failure(e: &Error) -> (String, String) {
     let code = match e {
         Error::Timeout | Error::Cancelled => "pass-timeout",
         Error::BudgetExceeded(_) => "over-budget",
@@ -46,6 +46,14 @@ impl Runtime {
             let bytes = cell.info.lock().bytes;
             over.push((cell.clone(), bytes));
         }
+        let internal: Vec<Arc<InternalCell>> = self.reg.lock().internal.values().cloned().collect();
+        for cell in &internal {
+            if cell.handles.load(Ordering::Acquire) > 0 && self.round_internal(store, cell) {
+                worked = true;
+            }
+        }
+        drop(internal);
+        self.collect_internal(store);
         self.budgets(&over);
         self.gc();
         if self.root.is_some() {
@@ -334,7 +342,7 @@ impl Runtime {
                     None => true,
                 }
         });
-        if reg.cells.is_empty() {
+        if reg.cells.is_empty() && reg.internal.is_empty() {
             *self.subscription.lock() = None;
         }
     }
@@ -345,6 +353,8 @@ impl Runtime {
             return;
         };
         *self.last_checkpoint.lock() = Instant::now();
+        let internal: Vec<Arc<InternalCell>> = self.reg.lock().internal.values().cloned().collect();
+        self.checkpoint_internal(store, &internal);
         let todo: Vec<(String, Arc<Cell>, u64)> = self
             .reg
             .lock()

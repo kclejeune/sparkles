@@ -296,3 +296,103 @@ async fn a_read_only_server_refuses_rebuilds() {
     let r = send(&app, req("POST", "/$/views/ds/v/rebuild", "")).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
 }
+
+/// An internal circuit that server code attached (spec F13 §3.6) is not a view: the
+/// routes neither list, read, rebuild nor remove it, `SERVICE view:read` and a view
+/// of the same name do not reach it, and the metrics name no view for it.
+#[tokio::test]
+async fn internal_circuits_stay_out_of_the_routes() {
+    use sparkles::incr::{InternalAccess, InternalSpec};
+    let s = server();
+    let ds = s.state.datasets()["ds"].clone();
+    let c = ds
+        .dataset
+        .attach_internal(
+            InternalSpec::accumulator("internal", "SELECT ?s ?p ?o WHERE { ?s ?p ?o }", ["s"]),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    let start = c.commit();
+    let r = send(&s.app, req("GET", "/$/views/ds", "")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["views"], serde_json::json!([]), "{}", r.text());
+    for (method, uri) in [
+        ("GET", "/$/views/ds/internal"),
+        ("DELETE", "/$/views/ds/internal"),
+        ("POST", "/$/views/ds/internal/rebuild"),
+    ] {
+        let r = send(&s.app, req(method, uri, "")).await;
+        assert_eq!(
+            r.status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri}: {}",
+            r.text()
+        );
+        assert_eq!(r.json()["code"], "view-not-found");
+    }
+    let q = "PREFIX view: <urn:x-sparkles:view#> SELECT * WHERE { SERVICE view:read { [] view:name \"internal\" ; view:bind ?s, ?p, ?o } }";
+    let r = send(
+        &s.app,
+        Request::get(format!("/ds/sparql?query={}", enc(q)))
+            .header("accept", "application/sparql-results+json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    // a view of the same name and question is another object, and removing it leaves
+    // the internal circuit counting
+    let body = serde_json::json!({ "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o }" }).to_string();
+    let r = send(&s.app, req("PUT", "/$/views/ds/internal", &body)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = send(&s.app, req("DELETE", "/$/views/ds/internal", "")).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = send(
+        &s.app,
+        Request::post("/ds/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from("INSERT DATA { <http://ex/n> <http://ex/p> 1 }"))
+            .unwrap(),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    assert!(c.wait(ds.store.head_commit().seq, Duration::from_secs(10)));
+    let counts = c.counts(start).unwrap();
+    assert!(counts.complete(), "{counts:?}");
+    assert_eq!(counts.keys.len(), 1, "{counts:?}");
+    let r = send(&s.app, req("GET", "/$/metrics", "")).await;
+    assert!(!r.text().contains("view=\"internal\""), "{}", r.text());
+}
+
+/// No route or MCP tool of the server constructs an internal circuit's access: only
+/// server code that attaches an internal circuit names it.
+#[test]
+fn no_route_constructs_internal_access() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    for sub in ["http", "mcp", "auth"] {
+        walk(&root.join(sub), &mut files);
+    }
+    files.push(root.join("http.rs"));
+    for f in files {
+        if f.components().any(|c| c.as_os_str() == "router_tests") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            !text.contains("InternalAccess") && !text.contains("attach_internal"),
+            "{} names an internal circuit's access",
+            f.display()
+        );
+    }
+}

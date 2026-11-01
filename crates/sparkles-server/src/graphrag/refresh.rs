@@ -482,6 +482,126 @@ mod tests {
         );
     }
 
+    /// The counts of the feed-based counter after commit `after`, per community.
+    fn feed_counter(
+        s: &sparkles::store::Store,
+        st: &BuildState,
+        settings: &GraphragSettings,
+        after: u64,
+    ) -> Vec<usize> {
+        let mut counter = Counter::new(st, settings);
+        let page = s.changes(after, &ChangesOptions::default()).unwrap();
+        for c in &page.commits {
+            assert!(c.complete());
+            for (_, q) in c.iter() {
+                let GraphName::NamedNode(g) = &q.graph_name else {
+                    continue;
+                };
+                if is_guarded(g.as_str()) || !super::super::projection::named(settings, g.as_str())
+                {
+                    continue;
+                }
+                counter.change(&q.subject, &q.predicate.to_string(), &q.object);
+            }
+        }
+        counter.changed
+    }
+
+    /// An accumulator on an internal circuit (spec F13 §3.6) counts what the feed-based
+    /// counter of step 1 counts for every community, through churn across commits, a
+    /// replacement within one commit and deletion-only commits, whether the runtime
+    /// follows each commit or applies a run of them (ROADMAP item 414).
+    #[test]
+    fn an_internal_accumulator_counts_as_the_feed_counter_does() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+        use sparkles::io::{RdfFormat, Source};
+        let mut settings = GraphragSettings::default();
+        settings.projection.graphs = vec!["urn:g:*".into()];
+        let st = state();
+        // the facts of each subject in the projection's graphs, as the counter reads
+        // them: neither rdf:type nor a blank or triple object
+        let query = format!(
+            "SELECT ?s ?g ?p ?o WHERE {{ GRAPH ?g {{ ?s ?p ?o }} \
+             FILTER(STRSTARTS(STR(?g), \"urn:g:\") && ?p != {RDF_TYPE} \
+             && (isIRI(?o) || isLiteral(?o))) }}"
+        );
+        let workloads: [&[&str]; 3] = [
+            // churn: facts added by one commit and removed by a later one
+            &[
+                "INSERT DATA { GRAPH <urn:g:a> { <http://ex/a> <http://ex/p> 1 } }",
+                "DELETE DATA { GRAPH <urn:g:a> { <http://ex/a> <http://ex/p> 1 } }",
+                "INSERT DATA { GRAPH <urn:g:a> { <http://ex/b> <http://ex/p> 2 . <http://ex/x> <http://ex/p> 3 } }",
+                "DELETE DATA { GRAPH <urn:g:a> { <http://ex/b> <http://ex/p> 2 } }",
+            ],
+            // replacements within one commit
+            &[
+                "DELETE { GRAPH <urn:g:a> { <http://ex/a> <http://ex/name> \"A\" } } \
+                 INSERT { GRAPH <urn:g:a> { <http://ex/a> <http://ex/name> \"A2\" } } WHERE {}",
+                "DELETE { GRAPH <urn:g:a> { <http://ex/b> <http://ex/name> \"B\" } } \
+                 INSERT { GRAPH <urn:g:b> { <http://ex/b> <http://ex/name> \"B\" } } WHERE {}",
+            ],
+            // deletions only, with changes outside the projection and of non-facts
+            &[
+                "DELETE DATA { GRAPH <urn:g:a> { <http://ex/a> <http://ex/age> 30 } }",
+                "DELETE DATA { GRAPH <urn:g:a> { <http://ex/b> <http://ex/age> 40 . <http://ex/a> a <http://ex/T> } }",
+                "DELETE DATA { GRAPH <urn:other> { <http://ex/a> <http://ex/age> 1 } }",
+            ],
+        ];
+        for (n, workload) in workloads.iter().enumerate() {
+            for per_commit in [true, false] {
+                let s = sparkles::store::Store::in_memory(Default::default());
+                s.load(&[Source::from_bytes(
+                    b"<urn:g:a> { <http://ex/a> <http://ex/name> \"A\" ; <http://ex/age> 30 ; a <http://ex/T> . \
+                      <http://ex/b> <http://ex/name> \"B\" ; <http://ex/age> 40 . } \
+                      <urn:other> { <http://ex/a> <http://ex/age> 1 . }"
+                        .to_vec(),
+                    RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+                let rt = Runtime::open(None, s.dataset_id(), Default::default());
+                rt.set_host(Arc::new(OpenHost));
+                let c = rt
+                    .attach_internal(
+                        &s,
+                        InternalSpec::accumulator("graphrag-refresh", query.clone(), ["s"]),
+                        InternalAccess::everything(),
+                    )
+                    .unwrap();
+                let after = s.head_commit().seq;
+                let opts = sparkles::sparql::QueryOptions::default();
+                for u in workload.iter() {
+                    sparkles::sparql::update::update(&s, u, &opts).unwrap();
+                    if per_commit {
+                        rt.round(&s);
+                    }
+                }
+                rt.round(&s);
+                let counts = c.counts(after).unwrap();
+                assert!(counts.complete(), "{counts:?}");
+                // the counts per subject, totalled per community as the counter does
+                let counter = Counter::new(&st, &settings);
+                let mut got = vec![0usize; counter.communities.len()];
+                for (key, n) in &counts.keys {
+                    let Some(Term::NamedNode(sub)) = &key[0] else {
+                        continue;
+                    };
+                    for &i in counter
+                        .of
+                        .get(sub.to_string().as_str())
+                        .into_iter()
+                        .flatten()
+                    {
+                        got[i] += *n as usize;
+                    }
+                }
+                let want = feed_counter(&s, &st, &settings, after);
+                assert!(want.iter().any(|&n| n > 0), "workload {n} changes facts");
+                assert_eq!(got, want, "workload {n}, per commit: {per_commit}");
+            }
+        }
+    }
+
     #[test]
     fn graphrag_commits_alone_change_no_source() {
         use sparkles::io::{RdfFormat, Source};

@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 mod attach;
 mod catalog;
 mod cell;
+mod internal;
 mod key;
 mod read;
 mod registry;
@@ -56,6 +57,8 @@ use registry::*;
 use worker::*;
 
 pub(crate) use cell::{Cell, Slot};
+use internal::InternalCell;
+pub use internal::InternalCircuit;
 pub use key::{access_fingerprint, covers, whole_reason};
 use stats::Counters;
 pub use stats::{RuntimeStats, ViewStat};

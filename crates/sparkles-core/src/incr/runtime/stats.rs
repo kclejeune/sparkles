@@ -29,6 +29,9 @@ pub struct RuntimeStats {
     pub views: Vec<ViewStat>,
     pub live_queries: usize,
     pub circuits: usize,
+    /// the internal circuits server code attached (spec F13 §3.6), which `views` and
+    /// `circuits` leave out
+    pub internal_circuits: usize,
     pub passes: u64,
     pub skipped: u64,
     pub resets: u64,
@@ -72,6 +75,7 @@ impl Runtime {
             views,
             live_queries: self.live_count(),
             circuits: reg.cells.len(),
+            internal_circuits: reg.internal.len(),
             passes: c.passes.load(Ordering::Relaxed),
             skipped: c.skipped.load(Ordering::Relaxed),
             resets: c.resets.load(Ordering::Relaxed),

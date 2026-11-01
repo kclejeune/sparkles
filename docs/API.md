@@ -3143,6 +3143,17 @@ database directory or, with `--server`, of a server (see
 [Usage](USAGE.md#incremental-views)). The Rust API is `Dataset::views()` and
 `sparkles::incr`.
 
+Server code can also attach internal circuits, which no user defines and no route
+reaches (spec F13 §3.6). `Dataset::attach_internal` takes an `InternalSpec`, either
+`InternalSpec::rows(id, query)` or `InternalSpec::accumulator(id, query, key)`, and an
+`InternalAccess`, which only the embedding process constructs. The returned
+`InternalCircuit` reads the rows with `rows()`, or an accumulator's changed facts per key
+since a commit with `counts(after)`, and drops counts that were acted on with
+`discard_through(commit)`. An accumulator's query is a SELECT without grouping whose
+result has the key columns and the changed fact's own columns. Internal circuits are
+not listed under `/$/views/{ds}`, `SERVICE view:read` does not read them, and they
+are checkpointed under `circuits/{id}/main/`.
+
 ## Live queries
 
 `GET /{ds}/live?query=…` runs a SELECT, ASK or CONSTRUCT query that a view could be and

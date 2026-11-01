@@ -365,9 +365,9 @@ case $mode in
 esac
 
 if [ $auto = 1 ]; then
-  # idle[h]=1 when h is reachable with its lock free and no gate units; full[h]=1 when h has
+  # idle[h]=1 when h is reachable with its lock free and no gate units; roomy[h]=1 when h has
   # the disk for a whole gate and half[h]=1 when it has the disk for a conformance half.
-  declare -A idle=() full=() half=() units=()
+  declare -A idle=() roomy=() half=() units=()
   # GATE_HELPER=none or --helper none keeps every choice below a whole gate.
   split_ok=1
   [ "$helper" = none ] && split_ok=0
@@ -376,20 +376,20 @@ if [ $auto = 1 ]; then
     p=$(probe "$h")
     report+="$h [$p] "
     read -r l u d <<< "$p" || true
-    idle[$h]=0 full[$h]=0 half[$h]=0 units[$h]=999
+    idle[$h]=0 roomy[$h]=0 half[$h]=0 units[$h]=999
     [ "$l" = unreachable ] && continue
     units[$h]=${u:-0}
     [ "$l" = free ] && [ "${u:-0}" = 0 ] && idle[$h]=1
-    [ "${d:-0}" -ge "${GATE_MIN_FREE_GB:-40}" ] && full[$h]=1
+    [ "${d:-0}" -ge "${GATE_MIN_FREE_GB:-40}" ] && roomy[$h]=1
     [ "${d:-0}" -ge "${GATE_MIN_FREE_HALF_GB:-20}" ] && half[$h]=1
   done
   chosen=
-  if [ "$helper" != none ] && [ "${idle[$primary]:-0}" = 1 ] && [ "${full[$primary]:-0}" = 1 ] &&
+  if [ "$helper" != none ] && [ "${idle[$primary]:-0}" = 1 ] && [ "${roomy[$primary]:-0}" = 1 ] &&
     [ "${idle[$helper]:-0}" = 1 ] && [ "${half[$helper]:-0}" = 1 ]; then
     chosen="split"
   else
     for h in "$primary" "${gate_hosts[@]}"; do
-      if [ "${idle[$h]:-0}" = 1 ] && [ "${full[$h]:-0}" = 1 ]; then
+      if [ "${idle[$h]:-0}" = 1 ] && [ "${roomy[$h]:-0}" = 1 ]; then
         primary=$h helper=none chosen=whole
         break
       fi
@@ -400,7 +400,7 @@ if [ $auto = 1 ]; then
     # kept only when a helper's queue is no longer, since the merge waits for both halves.
     best=
     for h in "$primary" "${gate_hosts[@]}"; do
-      [ "${full[$h]:-0}" = 1 ] || continue
+      [ "${roomy[$h]:-0}" = 1 ] || continue
       if [ -z "$best" ] || [ "${units[$h]}" -lt "${units[$best]}" ]; then best=$h; fi
     done
     [ -n "$best" ] && primary=$best
