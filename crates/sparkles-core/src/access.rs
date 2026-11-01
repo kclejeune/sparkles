@@ -199,10 +199,20 @@ impl GraphRule {
 
     /// Whether the named graph `iri` is in the set.
     pub fn matches_iri(&self, iri: &str) -> bool {
+        self.matches_iri_with(iri, false)
+    }
+
+    /// [`matches_iri`](Self::matches_iri), with every undecided guard read as letting
+    /// the graph through when `undecided_pass` is set.
+    fn matches_iri_with(&self, iri: &str, undecided_pass: bool) -> bool {
         if self.excluded.iter().any(|p| glob(p, iri)) {
             return false;
         }
-        if self.guards.iter().any(|g| !g.passes(iri)) {
+        if self
+            .guards
+            .iter()
+            .any(|g| !(undecided_pass && g.decide.is_some()) && !g.passes(iri))
+        {
             return false;
         }
         if self.iris.binary_search_by(|x| x.as_str().cmp(iri)).is_ok() {
@@ -266,6 +276,19 @@ impl Graphs {
             }
             (Graphs::Only(r), Some(Term::BlankNode(_))) => r.blank_nodes,
             (Graphs::Only(_), Some(_)) => false,
+        }
+    }
+
+    /// Whether the graph named by `term` may be in the set once its undecided guards are
+    /// decided: `false` only when the set leaves it out whatever those guards decide.
+    pub fn may_allow(&self, term: Option<&Term>) -> bool {
+        match (self, term) {
+            (Graphs::Only(r), Some(Term::NamedNode(n)))
+                if n.as_str() != DEFAULT_GRAPH_IRI && n.as_str() != UNION_GRAPH_IRI =>
+            {
+                r.matches_iri_with(n.as_str(), true)
+            }
+            _ => self.allows(term),
         }
     }
 
@@ -482,6 +505,14 @@ impl GraphAccess {
     /// Whether the graph named by `term` (the default graph when `None`) is readable.
     pub fn readable(&self, term: Option<&Term>) -> bool {
         self.read.allows(term)
+    }
+
+    /// Whether the graph named by `term` may be readable once the view's undecided
+    /// guards are bound to a snapshot: `false` only when the grants refuse it whatever
+    /// a guard decides. A reader that must not disclose what a snapshot holds refuses
+    /// such a graph before preparing the snapshot.
+    pub fn may_read(&self, term: Option<&Term>) -> bool {
+        self.read.may_allow(term)
     }
 
     /// Whether the graph named by `term` (the default graph when `None`) is writable.

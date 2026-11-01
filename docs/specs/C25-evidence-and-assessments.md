@@ -819,7 +819,13 @@ resolve as an authenticated record, and the digest of the selected text must equ
 passage's `ev:textDigest`, or the answer is `span-mismatch`. The text is read as its
 stored bytes under the allowance rather than decoded as a term. The registry is read
 from the running state without a copy, and its settings decoding is charged before it
-allocates.
+allocates. Each record reads the running registry again, so a detach or another
+management change made during one resolution applies to its later records.
+
+A graph that the caller's grants refuse is refused before any history is read. A
+GraphRAG disclosure guard is decided only once the view is bound to its snapshot, so the
+check made before the read treats each undecided guard as passing and applies every
+other rule.
 
 `POST /{ds}/claims/resolve` exposes both reference forms. It needs `read` on `{ds}`
 through the query endpoint and builds each referenced dataset's view with the server's
@@ -832,10 +838,11 @@ field-specific `400` errors.
 Tests cover exact commits against later heads, the default and named graphs, literal
 datatypes and languages, triple terms, renamed, deleted and recreated branches and
 datasets, starting commits served by the upstream, a held starting commit after its
-history was trimmed, graph grants, guards decided at the snapshot, triple protections,
+history was trimmed, graph grants, guards decided at the snapshot, static graph
+denials under an undecided guard with an allowance too small for the view, triple protections,
 blank nodes with and without reifiers, the allowance and cancellation, branch lookups
 while the branch table is held, view reuse, the record kinds, digests, receipts, detached
-and ordinary copies, passages with code point selectors over a 4 MiB rendition, and the
+and ordinary copies, a detach between two records of one resolution, passages with code point selectors over a 4 MiB rendition, and the
 HTTP route with and without authentication. The unauthorized and missing answers are
 compared byte for byte, including for references refused from their anchor alone.
 

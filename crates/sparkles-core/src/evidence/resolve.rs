@@ -237,14 +237,25 @@ struct Cached {
     _retained: Reservation,
 }
 
+/// The record graphs of one dataset, derived from one running managed state. A
+/// management change installs a new state, so a list kept for an earlier one is
+/// rederived.
+struct RecordGraphs {
+    dataset: Uuid,
+    state: Option<Arc<crate::managed::ManagedState>>,
+    graphs: Vec<NamedNode>,
+    _held: Reservation,
+}
+
 /// One operation's resolution state. Views prepared for one reference are reused by
 /// later references to the same commit under the same access, and stay charged to
 /// the operation's allowance until the resolver is dropped.
 pub struct Resolver {
     preparation: Preparation,
     views: BTreeMap<ViewKey, Vec<Cached>>,
-    /// The record graphs of one dataset, charged while they are kept.
-    record_graphs: Option<(Uuid, Vec<NamedNode>, Reservation)>,
+    /// The record graphs of one dataset under one installed registry, charged while
+    /// they are kept.
+    record_graphs: Option<RecordGraphs>,
 }
 
 impl Resolver {
@@ -285,8 +296,10 @@ impl Resolver {
             GraphIdentity::Default => None,
             GraphIdentity::Named(n) => Some(Term::NamedNode(n.clone())),
         };
-        // A guard that is decided at the snapshot is checked once the view is bound.
-        if !access.read.undecided() && !access.readable(graph_term.as_ref()) {
+        // Grants that refuse the graph whatever a guard decides refuse it before
+        // anything is read; a guard decided at the snapshot is checked once the view is
+        // bound.
+        if !access.may_read(graph_term.as_ref()) {
             return Err(unavailable(key));
         }
         let view_key = ViewKey {
@@ -357,24 +370,35 @@ impl Resolver {
         {
             return Err(unavailable(key));
         }
-        if self
-            .record_graphs
-            .as_ref()
-            .is_none_or(|(dataset, _, _)| *dataset != main.dataset_id())
-        {
+        // The running state is read on every record, so a detach or any other
+        // management change since an earlier record is seen.
+        let state = main.managed_state_shared();
+        let current = self.record_graphs.as_ref().is_some_and(|r| {
+            r.dataset == main.dataset_id()
+                && match (&r.state, &state) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        });
+        if !current {
             self.record_graphs = None;
             let (graphs, held) =
-                record_graphs(main, &self.preparation).map_err(|e| classify(key, e))?;
-            self.record_graphs = Some((main.dataset_id(), graphs, held));
+                record_graphs(state.as_deref(), &self.preparation).map_err(|e| classify(key, e))?;
+            self.record_graphs = Some(RecordGraphs {
+                dataset: main.dataset_id(),
+                state,
+                graphs,
+                _held: held,
+            });
         }
-        let all_graphs = &self.record_graphs.as_ref().expect("prepared").1;
-        // A guard that is decided at the snapshot is checked once the view is bound.
-        let decided = !access.read.undecided();
-        if all_graphs.is_empty()
-            || decided
-                && !all_graphs
-                    .iter()
-                    .any(|g| access.readable(Some(&Term::NamedNode(g.clone()))))
+        let all_graphs = &self.record_graphs.as_ref().expect("prepared").graphs;
+        // Grants that refuse every record graph whatever a guard decides refuse the
+        // record before anything is read; a guard decided at the snapshot is checked
+        // once the view is bound.
+        if !all_graphs
+            .iter()
+            .any(|g| access.may_read(Some(&Term::NamedNode(g.clone()))))
         {
             return Err(unavailable(key));
         }
@@ -390,15 +414,21 @@ impl Resolver {
             })
             .map_err(|e| classify(key, e))?;
         let cached = &self.views[&view_key][index];
-        let all_graphs = &self.record_graphs.as_ref().expect("prepared").1;
-        let mut graphs = Vec::new();
+        let all_graphs = &self.record_graphs.as_ref().expect("prepared").graphs;
+        // The readable record graphs are borrowed from the charged list.
+        let mut graphs: Vec<&NamedNode> = Vec::new();
+        let _filtered = self
+            .preparation
+            .reserve((all_graphs.len() as u64).saturating_mul(8))
+            .map_err(|e| classify(key, e))?;
+        graphs
+            .try_reserve_exact(all_graphs.len())
+            .map_err(|_| classify(key, self.preparation.exhausted()))?;
+        let bound = cached.view.access();
         for g in all_graphs {
-            if cached
-                .view
-                .access()
-                .readable(Some(&Term::NamedNode(g.clone())))
-            {
-                graphs.push(g.clone());
+            self.preparation.check()?;
+            if bound.readable(Some(&Term::NamedNode(g.clone()))) {
+                graphs.push(g);
             }
         }
         if graphs.is_empty() {
@@ -675,14 +705,14 @@ fn isomorphic(a: &Triple, b: &Triple) -> bool {
 /// The graphs that hold authenticated records: every graph the evidence settings give
 /// a record role, other than the accepted projections, that the evidence owner protects
 /// now. None when the profile is not configured or its registry cannot be enforced.
-fn record_graphs(main: &Store, preparation: &Preparation) -> Result<(Vec<NamedNode>, Reservation)> {
+fn record_graphs(
+    state: Option<&crate::managed::ManagedState>,
+    preparation: &Preparation,
+) -> Result<(Vec<NamedNode>, Reservation)> {
     use crate::managed::ManagedState;
     let mut held = preparation.reserve(0)?;
     // The registry is borrowed from the running state, never copied.
-    let Some(state) = main.managed_state_shared() else {
-        return Ok((Vec::new(), held));
-    };
-    let ManagedState::Installed(installed) = &*state else {
+    let Some(ManagedState::Installed(installed)) = state else {
         return Ok((Vec::new(), held));
     };
     let Some(bytes) = installed.settings.get(&OwnerKind::Evidence) else {
@@ -887,7 +917,7 @@ enum Text<R> {
 /// The graph and kind of `iri` among `graphs`, when it is a profile record there.
 fn find_record(
     lookups: &mut Lookups<'_>,
-    graphs: &[NamedNode],
+    graphs: &[&NamedNode],
     iri: &NamedNode,
     key: &str,
 ) -> Result<Option<(NamedNode, RecordKind)>> {
@@ -904,7 +934,7 @@ fn find_record(
                         "the record is stored more than once or with more than one kind",
                     ));
                 }
-                found = Some((graph.clone(), kind));
+                found = Some(((*graph).clone(), kind));
             }
         }
     }
@@ -995,7 +1025,7 @@ fn single_digest(
 /// Verify a passage's selector and text digest against its rendition's retained text.
 fn verify_passage(
     lookups: &mut Lookups<'_>,
-    graphs: &[NamedNode],
+    graphs: &[&NamedNode],
     graph: &NamedNode,
     iri: &NamedNode,
     main: &Store,
@@ -1046,7 +1076,7 @@ fn verify_passage(
 #[allow(clippy::too_many_arguments)]
 fn verify_with_selector(
     lookups: &mut Lookups<'_>,
-    graphs: &[NamedNode],
+    graphs: &[&NamedNode],
     graph: &NamedNode,
     iri: &NamedNode,
     rendition: &NamedNode,

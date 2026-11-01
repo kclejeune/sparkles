@@ -460,28 +460,32 @@ fn limits_and_controls_refuse_without_a_verdict() {
     assert_eq!(r.preparation().inner_used(), used);
 }
 
+use crate::access::{Decider, Exemptions, GuardDecision};
+
+/// A guard decision that exempts the listed graphs through the controlled contract.
+struct Exempt(&'static [&'static str]);
+
+impl GuardDecision for Exempt {
+    fn exempt(&self, _: &Arc<Snapshot>) -> Vec<String> {
+        unreachable!("only the controlled contract is used")
+    }
+    fn exempt_controlled(
+        &self,
+        _: &Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<Exemptions> {
+        let mut out = Exemptions::new(preparation)?;
+        for g in self.0 {
+            out.push(g)?;
+        }
+        Ok(out)
+    }
+}
+
 /// A guard decided at the snapshot exempts its graph through the controlled provider
 /// contract, so a reference into an exempt guarded graph verifies.
 #[test]
 fn a_guarded_graph_is_decided_at_the_snapshot() {
-    use crate::access::{Decider, Exemptions, GuardDecision};
-    struct Exempt(&'static [&'static str]);
-    impl GuardDecision for Exempt {
-        fn exempt(&self, _: &Arc<Snapshot>) -> Vec<String> {
-            unreachable!("only the controlled contract is used")
-        }
-        fn exempt_controlled(
-            &self,
-            _: &Arc<Snapshot>,
-            preparation: &Preparation,
-        ) -> Result<Exemptions> {
-            let mut out = Exemptions::new(preparation)?;
-            for g in self.0 {
-                out.push(g)?;
-            }
-            Ok(out)
-        }
-    }
     let (_dir, s) = setup();
     let main = s.dataset_id();
     let guarded = |exempt: &'static [&'static str]| {
@@ -575,4 +579,41 @@ fn anchors_are_checked_before_any_lookup() {
     assert!(check_anchor("r", &f).unwrap());
     f.expected = ab();
     assert!(!check_anchor("r", &f).unwrap());
+}
+
+/// A graph the grants refuse whatever a guard decides is refused before the history is
+/// read, so an existing commit and a missing one answer alike even when preparing the
+/// existing commit's view would exceed the allowance.
+#[test]
+fn static_graph_denials_hold_under_an_undecided_guard() {
+    let (_dir, s) = setup();
+    let main = s.dataset_id();
+    let guarded = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["urn:other", "urn:guarded:*"], &[]))
+            .guarded_by("urn:guarded:*", Decider(Arc::new(Exempt(&[])))),
+        Graphs::none(),
+    ));
+    assert!(guarded.read.undecided());
+    let answer = |commit: u64| {
+        let mut r = Resolver::new(Control::none(), 2048).unwrap();
+        message(r.stored_fact(
+            "r",
+            &s,
+            Some(&guarded),
+            &fact(&s, main, commit, Some(G), ab()),
+        ))
+    };
+    assert_eq!(answer(1), "evidence reference `r` is unavailable");
+    assert_eq!(answer(1), answer(99));
+    // the same allowance with a readable graph reaches the view and is incomplete
+    let mut r = Resolver::new(Control::none(), 2048).unwrap();
+    assert_eq!(
+        code(r.stored_fact(
+            "r",
+            &s,
+            Some(&guarded),
+            &fact(&s, main, 1, Some("urn:other"), ab())
+        )),
+        "incomplete-evidence"
+    );
 }

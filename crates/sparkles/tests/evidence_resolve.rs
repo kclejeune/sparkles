@@ -337,6 +337,45 @@ fn unauthenticated_copies_and_foreign_receipts_do_not_resolve() {
     );
 }
 
+/// One resolution sees a detach made between two of its records, so a record written
+/// afterwards by an ordinary update into the detached graph does not authenticate.
+#[test]
+fn a_detach_during_a_resolution_is_seen_by_its_later_records() {
+    let ds = configured();
+    typed(
+        &ds,
+        &format!(
+            "GRAPH <{CLAIMS}> {{ <urn:claim> a ev:Claim ; ev:availabilityReceipt <urn:c1> .
+               <urn:c1> {{receipt}} . }}"
+        ),
+    );
+    let mut resolution = Resolution::new(Control::none()).unwrap();
+    resolution
+        .record("a", &ds, &ds, all(), &request("urn:claim", &[]))
+        .unwrap();
+    evidence::detach(&ds, CLAIMS).unwrap();
+    let seq = ds.store().head_commit().seq + 1;
+    ds.update(&format!(
+        "PREFIX ev: <{EV}>
+         PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+         INSERT DATA {{ GRAPH <{CLAIMS}> {{
+           <urn:forged> a ev:Claim ; ev:availabilityReceipt <urn:f1> .
+           <urn:f1> ev:datasetId \"{}\" ; ev:branchId \"{}\" ; ev:commit {seq} .
+         }} }}",
+        ds.dataset_id(),
+        ds.store().branch_id()
+    ))
+    .unwrap();
+    assert_eq!(
+        code(resolution.record("b", &ds, &ds, all(), &request("urn:forged", &[]))),
+        "evidence-unavailable"
+    );
+    assert_eq!(
+        code(resolution.record("c", &ds, &ds, all(), &request("urn:claim", &[]))),
+        "evidence-unavailable"
+    );
+}
+
 #[test]
 fn passages_verify_their_selection_against_the_retained_rendition() {
     let ds = configured();
