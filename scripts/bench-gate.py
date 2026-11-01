@@ -244,22 +244,26 @@ def executors(args):
             # ORDER_DIGEST, a digest of the ORDER BY keys in the returned order
             v, q, n, h = row[:4]
             answers[q][v] = (n, h) + tuple(o for o in row[4:5] if o != "-")
+            if q in unordered:
+                # rows may differ, but not their number or how many are distinct
+                answers[q][v] = (n,) + tuple(o for o in row[4:5] if o.startswith("distinct:"))
         # the timed format's answer after each server process's timed requests
         warm = defaultdict(set)
         for row in read_tsv(d / "results" / "warm-answers.tsv"):
             _, v, q, digest = row[:4]
-            # unordered LIMIT answers may hold other rows, but not another count or schema
-            warm[q].add(",".join(digest.split(",")[:2]) if q in unordered else digest)
+            # unordered LIMIT answers may hold other rows, but not another count, schema or
+            # number of distinct rows
+            warm[q].add(",".join(digest.split(",")[:3]) if q in unordered else digest)
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the
             # counts must agree
-            got = {v: (a[0] if q in unordered else a) for v, a in answers[q].items()}
+            got = dict(answers[q])
             agree = set(got) == {"A", "B"} and len(set(got.values())) == 1 and "error" not in str(answers[q])
             eager = answers[q].get("A", ("error", "error"))
             # LIMIT without ORDER BY may return other rows, so only the count is kept
-            fingerprint = eager[0] if q in unordered else ", ".join(
-                [f"{eager[0]} rows", eager[1]] + [f"order {o}" for o in eager[2:]])
+            fingerprint = ", ".join([f"{eager[0]} rows"] + list(eager[1:])) if q in unordered else ", ".join(
+                [f"{eager[0]} rows", eager[1]] + [o if o.startswith("distinct:") else f"order {o}" for o in eager[2:]])
             checks.append({"name": f"{cell}/{q}/answers", "ok": agree, "fingerprint": fingerprint,
                            "detail": {MODES[v]: list(a) for v, a in sorted(answers[q].items())}})
             if warm:
@@ -628,7 +632,8 @@ def compare(args):
 # --------------------------------------------------------------------------- order-digest
 
 def order_digest(args):
-    """A digest of a TSV answer's order, or "-" for a query without a top-level ORDER BY.
+    """A digest of a TSV answer's order, or for a query without a top-level ORDER BY the
+    number of its distinct rows (`distinct:N`).
     When the ORDER BY lists projected variables, the digest covers those key columns in
     the returned order (`keys:`), which rows that tie on the keys cannot change. Otherwise,
     such as for an expression, it covers every row in the returned order (`rows:`), which
@@ -643,7 +648,9 @@ def order_digest(args):
         header = f.readline().rstrip("\n").split("\t")
         names = [h.lstrip("?") for h in header]
         if ba._after_order_by(query) is None:
-            print("-")
+            # the number of distinct rows, so that a LIMIT without ORDER BY, whose rows may
+            # be any, still cannot repeat rows unnoticed
+            print(f"distinct:{len(set(f))}")
             return
         keys = ba.order_keys(query, set(names))
         cols = [names.index(k) for k in keys] if keys else None
@@ -685,7 +692,8 @@ def build_config_cmd(args):
     for f in configs:
         if f.is_file():
             c = tomllib.loads(f.read_text())
-            out[str(f)] = {k: c[k] for k in ("profile", "build", "target") if k in c}
+            # [env] reaches the build scripts that compile C code, such as mimalloc's
+            out[str(f)] = {k: c[k] for k in ("profile", "build", "target", "env") if k in c}
     out["env"] = {k: v for k, v in sorted(os.environ.items()) if BUILD_ENV.match(k)}
     # Boxington's effective incremental, linker and cache policy, which its own resolver
     # reads from the environment and the global configuration, as mise's validation keys do
@@ -731,6 +739,7 @@ def native_digest(args):
     # the query type and the projected variables, in order, belong to the answer
     head = f"{r.get('queryType')} " + " ".join(names)
     out = [f"{len(rows)} rows", "schema " + hashlib.sha256(head.encode()).hexdigest()[:8],
+           f"distinct {len(set(rows))}",
            hashlib.sha256((head + "\n" + "\n".join(sorted(rows))).encode()).hexdigest()[:16]]
     if ba._after_order_by(query) is not None:
         keys = ba.order_keys(query, set(names))

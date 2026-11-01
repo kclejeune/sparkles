@@ -241,8 +241,14 @@ class GateTests(unittest.TestCase):
             out = Path(d) / "record.json"
             self.assertEqual(run("executors", root, "--out", out).returncode, 0)
             rec = json.loads(out.read_text())
-            self.assertEqual([(c["ok"], c["fingerprint"]) for c in rec["checks"]], [(True, "5")])
+            self.assertEqual([(c["ok"], c["fingerprint"]) for c in rec["checks"]], [(True, "5 rows")])
             self.assertEqual(run("compare", out, out).returncode, 0)
+            # one mode repeating a row keeps the count but not the distinct rows
+            res.joinpath("answers.tsv").write_text(
+                "A\texport\t5\tx\tdistinct:5\nB\texport\t5\ty\tdistinct:1\n")
+            self.assertEqual(run("executors", root, "--out", out).returncode, 0)
+            rec = json.loads(out.read_text())
+            self.assertEqual([(c["ok"], c["fingerprint"]) for c in rec["checks"]], [(False, "5 rows, distinct:5")])
 
     def test_baseline_checks_must_be_in_the_candidate(self):
         with tempfile.TemporaryDirectory() as d:
@@ -353,7 +359,7 @@ class GateTests(unittest.TestCase):
             self.assertTrue(e.startswith("rows:"))
             self.assertNotEqual(e, digest([("<c>", "50"), ("<b>", "10"), ("<a>", "90")]))
             q.write_text("SELECT ?p WHERE { ?p <age> ?a }")
-            self.assertEqual(digest([("<a>", "90")]), "-")
+            self.assertEqual(digest([("<a>", "90"), ("<a>", "90")]), "distinct:1")
 
     def test_executors_compares_the_order_of_ordered_answers(self):
         with tempfile.TemporaryDirectory() as d:
@@ -405,6 +411,16 @@ class GateTests(unittest.TestCase):
             return subprocess.run([sys.executable, str(GATE), "build-config", "--root", str(SCRIPTS.parent)],
                                   capture_output=True, text=True, env=dict(os.environ, **extra)).stdout
         self.assertNotEqual(config(MBX_INCREMENTAL="off"), config(MBX_INCREMENTAL="on"))
+
+    def test_build_config_reads_cargo_env_tables(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "Cargo.toml").write_text("[profile.release]\nlto = true\n")
+            (Path(d) / ".cargo").mkdir()
+            cfg = Path(d) / ".cargo" / "config.toml"
+            cfg.write_text('[env]\nCFLAGS = { value = "-O0", force = true }\n')
+            a = run("build-config", "--root", d).stdout
+            cfg.write_text('[env]\nCFLAGS = { value = "-O3", force = true }\n')
+            self.assertNotEqual(a, run("build-config", "--root", d).stdout)
 
     def test_matrix_queries_must_match(self):
         with tempfile.TemporaryDirectory() as d:

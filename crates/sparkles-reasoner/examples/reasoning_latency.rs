@@ -75,9 +75,12 @@ fn store(universities: usize) -> Store {
     s
 }
 
-/// The row count and an order-independent digest of the rows, FNV-1a over the sorted rows,
-/// which stays the same across builds so that a gate can compare it with a baseline.
+/// The row count and an order-independent digest of the query kind, the projected
+/// variables in order and the rows, FNV-1a over the sorted rows, which stays the same
+/// across builds so that a gate can compare it with a baseline. A row of another width
+/// than the variables gives a digest of its own.
 fn answer(r: &QueryResult) -> (usize, u64) {
+    let head = format!("{:?} {}", r.kind, r.vars.join(" "));
     let mut rows: Vec<String> = r
         .rows()
         .into_iter()
@@ -89,8 +92,11 @@ fn answer(r: &QueryResult) -> (usize, u64) {
         })
         .collect();
     rows.sort_unstable();
+    if r.rows().iter().any(|row| row.len() != r.vars.len()) {
+        rows.push("rows of another width than the variables".into());
+    }
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for row in &rows {
+    for row in std::iter::once(&head).chain(&rows) {
         for b in row.bytes().chain(*b"\n") {
             h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
         }
