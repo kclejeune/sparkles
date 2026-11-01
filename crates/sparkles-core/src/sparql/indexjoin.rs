@@ -1423,6 +1423,8 @@ fn read_ranges_gallop(
     // where the range before ended
     let mut b = 0usize;
     let mut cur: Option<(usize, usize, Block)> = None;
+    // the last block whose ranges ahead `segment_part` walked
+    let mut looked = usize::MAX;
     let mut row = 0usize;
     let mut seen = 0usize;
     for r in 0..ranges.len() {
@@ -1484,23 +1486,13 @@ fn read_ranges_gallop(
                 // another segment of the held block, whose columns the cache did not hold
                 // whole when it was read
                 (Some((cb, cp, _)), _) if *cb == x && *cp != 0 => {
-                    idx.segment_span(x, &lo, &hi).map_or(0, |(s0, _)| s0 + 1)
+                    let span = idx.segment_span(x, &lo, &hi);
+                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)
                 }
-                _ => match idx.read_span(&ctx.snap.cache, x, &lo, &hi, mask) {
-                    // a cold segment of a block that the ranges ahead read much of: the
-                    // block is read whole now, instead of segment by segment until it
-                    // turns dense, which a join of more ranges than its prefetch takes
-                    // (`PREFETCH_RANGES`) would otherwise do in every block
-                    Some((s0, _))
-                        if !ctx.snap.cache.has_segment(idx, x, s0, mask)
-                            && dense_ahead(idx, ranges, r, x) =>
-                    {
-                        idx.mark_dense(x);
-                        0
-                    }
-                    Some((s0, _)) => s0 + 1,
-                    None => 0,
-                },
+                _ => {
+                    let span = idx.read_span(&ctx.snap.cache, x, &lo, &hi, mask);
+                    segment_part(ctx, idx, ranges, (r, x), mask, span, &mut looked)
+                }
             };
             let from = match &cur {
                 Some((cb, cp, _)) if *cb == x && *cp == part => Some(row),
@@ -1566,6 +1558,36 @@ fn read_ranges_gallop(
     }
     ctx.check_output(total(out), width)?;
     Ok(())
+}
+
+/// The part of block `x` that the reader of range `r` holds next: 0 for the whole
+/// columns, or one more than the first segment of `span`. At the first range of a block
+/// whose span has a cold segment, it reads the block whole when the ranges ahead read much of it
+/// ([`dense_ahead`]), instead of segment by segment until it turns dense, which a join of
+/// more ranges than its prefetch takes (`PREFETCH_RANGES`) would otherwise do in every
+/// block. `looked` keeps that walk to once per block.
+fn segment_part(
+    ctx: &Ctx,
+    idx: &crate::index::PermIndex,
+    ranges: &Ranges,
+    (r, x): (usize, usize),
+    mask: ColMask,
+    span: Option<(usize, usize)>,
+    looked: &mut usize,
+) -> usize {
+    let Some((s0, s1)) = span else {
+        return 0;
+    };
+    // a range's span starts at the segment before its first key's, which a reader of the
+    // range before has often just read, so any cold segment of the span counts
+    if *looked != x && (s0..s1).any(|s| !ctx.snap.cache.has_segment(idx, x, s, mask)) {
+        *looked = x;
+        if dense_ahead(idx, ranges, r, x) {
+            idx.mark_dense(x);
+            return 0;
+        }
+    }
+    s0 + 1
 }
 
 /// Whether the ranges from `r` on that lie in block `x` read more than a quarter of its
@@ -2419,5 +2441,71 @@ mod dense_ahead_tests {
             keys: &spread,
         };
         assert!(!dense_ahead(idx, &ranges, spread.len() - 1, b));
+    }
+
+    /// The segments of block `b` that the cache holds one by one.
+    fn single_segments(snap: &crate::store::Snapshot, b: usize) -> usize {
+        let idx = snap.perm(Perm::Pso);
+        snap.cache.held_parts(&[idx])[0]
+            .iter()
+            .filter(|&&(blk, part, _)| blk as usize == b && part != 0)
+            .count()
+    }
+
+    #[test]
+    fn a_join_reads_a_block_whole_at_its_first_cold_segment() {
+        for preseed in [false, true] {
+            let (_dir, s) = store();
+            let snap = s.snapshot();
+            let idx = snap.perm(Perm::Pso);
+            let b = (0..idx.blocks.len())
+                .find(|&b| idx.segment_count(b).is_some_and(|n| n >= 8))
+                .expect("a block of 8 segments or more");
+            let blk = idx.decode_block(b).unwrap();
+            let p = blk.key(0)[0];
+            let n = idx.segment_count(b).unwrap();
+            let rows = blk.len().div_ceil(n);
+            let keys: Vec<u64> = (0..blk.len())
+                .step_by(rows)
+                .map(|y| blk.key(y)[1])
+                .collect();
+            let ranges = Ranges::Keys {
+                prefix: &[p],
+                keys: &keys,
+            };
+            let mask = 0b111;
+            // the first segment warm, the others cold: the walk runs at the next one
+            if preseed {
+                snap.cache.get_segment(idx, b, 0, mask, false).unwrap();
+            }
+            let ctx = Ctx::new(snap.clone());
+            let rule = RowRule {
+                graph: &GraphFilter::All,
+                graph_col: Perm::Pso.col_of(G),
+                eqs: &[],
+                dedup: false,
+            };
+            let mut out = vec![Table::new(vec![0])];
+            let mut stats = Stats::default();
+            read_ranges_gallop(
+                &ctx,
+                Perm::Pso,
+                &ranges,
+                &[vec![2]],
+                &rule,
+                &mut out,
+                &mut stats,
+            )
+            .unwrap();
+            assert_eq!(out[0].len(), keys.len());
+            assert!(idx.is_dense(b));
+            assert!(snap.cache.has_cols(idx, b, mask));
+            // no segment past the preseeded one was decoded on its own
+            assert_eq!(
+                single_segments(&snap, b),
+                preseed as usize,
+                "preseed {preseed}"
+            );
+        }
     }
 }
