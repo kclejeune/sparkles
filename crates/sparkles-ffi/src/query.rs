@@ -362,7 +362,20 @@ impl FfiQuery {
     ///
     /// [`ExecutionMode::Auto`]: sparkles::sparql::ExecutionMode::Auto
     pub fn execute_with(&self, first_rows: u32, auto: bool) -> FfiResult<Execution> {
-        if !auto || !self.cursor_allowed {
+        // `auto` is the binding's default rather than a request, so a write transaction
+        // runs the query eagerly instead of refusing it
+        use sparkles::sparql::{Consumer, ExecutionMode};
+        let mode = sparkles::sparql::choose_execution(&Consumer {
+            default: if auto {
+                ExecutionMode::Auto
+            } else {
+                ExecutionMode::Eager
+            },
+            in_transaction: !self.cursor_allowed,
+            ..Consumer::default()
+        })
+        .map_err(|e| FfiError::new(ErrorKind::Invalid, e.message()))?;
+        if mode == ExecutionMode::Eager {
             return self.execute(first_rows);
         }
         if self.executed.swap(true, Ordering::SeqCst) {
@@ -384,7 +397,7 @@ impl FfiQuery {
             &self.text,
             &self.opts,
             &options,
-            sparkles::sparql::ExecutionMode::Auto,
+            mode,
         )?;
         match execution {
             sparkles::sparql::QueryExecution::Select(cursor) => {

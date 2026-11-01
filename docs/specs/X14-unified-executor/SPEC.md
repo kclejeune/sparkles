@@ -178,7 +178,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Stage 1 is under way, and [item 453](../../ROADMAP.md) tracks the rest of the work.
+Stage 1 has shipped and stage 3 is under way, and [item 453](../../ROADMAP.md) tracks the
+rest of the work.
 
 ### Dead compaction arm and one generation switch
 
@@ -287,6 +288,31 @@ The cold-read switches `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB` and
 remain until item 4 has measured them, and item 513 makes them test-only then.
 `SPARKLES_NO_IN_PLACE` remains as the method of the published memory benchmark, which
 compares the in-place runner with the blocking pool.
+
+### One execution policy
+
+Item 480 shipped. `sparkles::sparql::choose_execution` decides how a query runs from a
+`Consumer`, the description of what the consumer of the answer needs. A consumer names
+the mode it asked for and the mode it runs in without one, and states whether it needs the
+exact total before its first row, the eager plan explanation or the whole answer at once,
+whether it runs inside a write transaction, whether its format has a cursor writer and
+whether the query has initial bindings. A requested mode wins over the default. Inside a
+write transaction a requested cursor or automatic execution is refused, and a query that
+asked for nothing runs eagerly. Automatic execution runs eagerly for a format without a
+cursor writer and for a query with initial bindings. `ExecutionMode::parse` reads the
+names `eager`, `streaming` and `auto`.
+
+The HTTP query endpoint, `sparkles query`, the Node addon and the FFI's `execute_with`
+state their needs and take the mode the policy returns. SPARQL Results Thrift is a format
+without a cursor writer, the CLI's text table needs the exact total, `--explain` needs the
+plan, a Node or FFI transaction is a write transaction, and the FFI's `auto` argument is a
+default rather than a request. The MCP tools, GraphQL and the Python `query` methods read
+whole answers through the eager query APIs, which is the policy's answer for a whole-result
+consumer. The HTTP server's in-place quick runner remains a scheduling choice after the
+policy, as stage 6 keeps it. Behaviour is unchanged, and the unit tests of the policy
+compare it with each surface's former rules for every combination of their inputs. The
+server's tests of Thrift, stored queries with values and an eager server default, the
+CLI's execution tests and the FFI's automatic execution tests cover the surfaces.
 
 ### Measurements of stage 1
 

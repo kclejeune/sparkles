@@ -24,6 +24,13 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Changed
 
+The library chooses how a query runs in one function. `sparkles::sparql::choose_execution`
+takes a `Consumer`, which states the mode a caller asked for, the mode it runs in without
+one and what its consumer needs, and returns the execution mode or a refusal of a cursor
+inside a write transaction. `ExecutionMode::parse` reads the names `eager`, `streaming`
+and `auto`. The HTTP query endpoint, `sparkles query`, the Node addon and the FFI use it,
+and each chooses the mode it chose before.
+
 Server code can attach internal circuits to a dataset's incremental views runtime
 (spec F13 §3.6) with `Runtime::attach_internal`, or `Dataset::attach_internal` in the
 library. Such a circuit keeps a query's rows, or counts the changed facts per key in each

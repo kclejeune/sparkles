@@ -1564,17 +1564,14 @@ pub(crate) async fn run_query(
     bindings: Vec<(String, oxrdf::Term)>,
 ) -> ApiResult {
     let io = io_profile(&params, &p)?;
-    let execution = match params.get("execution") {
-        None => st.default_execution,
-        Some("eager") => sparkles::sparql::ExecutionMode::Eager,
-        Some("streaming") => sparkles::sparql::ExecutionMode::Streaming,
-        Some("auto") => sparkles::sparql::ExecutionMode::Auto,
-        Some(_) => {
-            return Err(err(
+    let requested = match params.get("execution") {
+        None => None,
+        Some(name) => Some(sparkles::sparql::ExecutionMode::parse(name).ok_or_else(|| {
+            err(
                 StatusCode::BAD_REQUEST,
                 "execution must be eager, streaming or auto",
-            ));
-        }
+            )
+        })?),
     };
     let mut opts = query_options(&st, &ds, &params);
     query_reasoning(&st, &ds, &params, &mut opts)?;
@@ -1601,10 +1598,18 @@ pub(crate) async fn run_query(
     // otherwise name for nobody (item 180).
     opts.no_plan_patterns = sfmt != SolutionsFormat::Sparkles && !params_wants_sparkles(&headers);
     // Automatic execution decides once the query is planned, and a plan it keeps eager
-    // continues below exactly as an eager request does. Some requests run eagerly
-    // without asking. SPARQL Results Thrift has no cursor writer, and initial bindings
-    // rule out every automatic plan.
-    let auto = execution == sparkles::sparql::ExecutionMode::Auto && !thrift && bindings.is_empty();
+    // continues below exactly as an eager request does. The policy runs some requests
+    // eagerly without asking, since SPARQL Results Thrift has no cursor writer and
+    // initial bindings rule out every automatic plan.
+    let execution = sparkles::sparql::choose_execution(&sparkles::sparql::Consumer {
+        requested,
+        default: st.default_execution,
+        cursor_format: !thrift,
+        initial_bindings: !bindings.is_empty(),
+        ..Default::default()
+    })
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e.message()))?;
+    let auto = execution == sparkles::sparql::ExecutionMode::Auto;
     if execution == sparkles::sparql::ExecutionMode::Streaming {
         let rdf_format = rdf_format(&params, &headers, false);
         let native_graph = params_wants_sparkles(&headers);
