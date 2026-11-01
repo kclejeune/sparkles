@@ -1960,6 +1960,18 @@ there. `fences_write_their_annotation_records_through` checks the path and the q
 of the zeros, and the tests that take annotation records out of a crash image now find the
 records' end by decoding the file.
 
+Campaigns on `forge` measured the fences of commit `4082759b`, which write the records
+through, against those of commit `4bd70845`, which synchronize the file, with four grouped
+writers at 1.05M whose commits all carry a commit message, as the
+[annotation record results](../benchmarks/writes/RESULTS.md#written-through-annotation-records)
+record. A fence that synchronized the file issued one device cache flush, 0.50 to 0.53 per
+commit, and a fence that writes the records through issued 0.001 to 0.005 per commit. The
+writers committed 2.102 times as many transactions/s on the spatial dataset and 2.214 times
+as many on the full-text dataset, paired, with paired fence time ratios of 0.427 and 0.407.
+Serial commits, which take the ordinary path and write their record through before their
+log records, issued 0.005 to 0.007 flushes per commit instead of 1.105 to 1.109, with paired
+p50 and p90 latency ratios of 0.618 and 0.627.
+
 **Fences in each drive state (item 502).** Four probe runs on `forge` on 2026-11-01
 measured the two fence shapes on their own, outside the engine, with the drive in each
 state, as the [fence probe results](../benchmarks/writes/RESULTS.md#fences-in-each-drive-state)
@@ -1979,9 +1991,15 @@ counters stayed at zero, so temperature does not explain the slow state, and the
 autonomous power state transitions start only after 100 ms without commands, which a
 running fence load never leaves.
 
-A write-through write therefore never takes about 0.47 ms. The device time of 0.47 ms per
-write in the campaigns of item 446 is the mean over a process in which the drive spent part
-of its time in each state, and the flushing processes that outran every write-through
-process ran wholly in the fast state, where any fence is fast. Write-through fences are
-faster in both states, so fences keep writing through, and no choice between the two paths
-by measured cost was built.
+In neither state does a write-through write take about 0.47 ms. The campaigns of item 446
+kept only each process's means, so they cannot show how long the drive stayed in each
+state. The reading that their data fit is that the device time of 0.47 ms per write is the
+mean over processes in which the drive spent part of their time in each state, and that the
+flushing processes that outran every write-through process ran wholly in the fast state,
+where any fence is fast. The campaigns of item 501 support it. Every one of their
+write-through processes had 17 to 57 percent of its fences under 0.5 ms and 42 to 80
+percent between 1 and 2.5 ms, with at most 9.1 percent between, and device samples every
+100 ms showed a fast spell of 5.6 to 5.8 seconds near the start of three of four sampled
+processes and the slow state for the rest. Write-through fences are faster in both states,
+so fences keep writing through, and no choice between the two paths by measured cost was
+built.

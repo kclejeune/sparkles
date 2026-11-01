@@ -141,7 +141,8 @@ These read paths are tuned for queries over data that is not yet in memory
   commits at once. When the records fit in the space the log has preallocated and in one
   write of at most 64 KiB, and the terms and the commit messages and digests fit the same
   way in the vocabulary and in `annotations.bin`, all three go through write-through
-  handles, so the fence persists without a device cache flush on a drive with FUA.
+  handles, so the fence persists without a device cache flush on a drive with FUA
+  ([results](../benchmarks/writes/RESULTS.md#written-through-annotation-records)).
   Otherwise the file that does not fit, such as the vocabulary of a fence that adds a
   long literal, is written with a buffered write and `fdatasync`. The next fence
   synchronizes while the last one publishes and applies its full-text changes.
@@ -359,7 +360,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   write-through write takes about 0.2 ms, and a slow state, in which every write-through
   write and every cache flush takes about 1.5 ms. Write-through fences are faster in both
   states, and their gain over flushing fences is smaller in the slow state
-  ([results](../benchmarks/writes/RESULTS.md#write-through-fences)).
+  ([results](../benchmarks/writes/RESULTS.md#fences-in-each-drive-state)).
 * Automatic execution streams eligible large scans, groupings and ASK joins. Other
   plans remain eager, including an EXISTS evaluated once per outer key when its cursor
   is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays

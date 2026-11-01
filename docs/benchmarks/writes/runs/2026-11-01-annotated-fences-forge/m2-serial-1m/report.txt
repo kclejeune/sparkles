@@ -1,0 +1,3 @@
+geo-100000 serial-literal: pairs=6 tps B/A median 1.669 [4.45 1.59 1.57 2.73 1.75 1.07] p50 0.618 p90 0.627 fence nan
+   A: tps median 442.4 range 233-891
+   B: tps median 1401.2 range 390-1423

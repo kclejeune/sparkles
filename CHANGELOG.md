@@ -275,9 +275,10 @@ now wait on the heap, at most 4 MiB per dataset, until their fence writes them. 
 vocabulary writes a large set of terms as several chunks of at most 1 MiB, or of one
 longer term, so a fence with more than 4 GiB of new terms stays readable. On `forge` the fences issued 0.001 to 0.005 device cache flushes per commit instead of
 1.00 to 1.14, and four writers on the spatial dataset at 1.05M committed 2.05 times as many
-transactions/s with the drive in its slow state. In the drive's fast state, flushing
-fences were faster than write-through ones in three of ten pairs, because those
-processes ran with the drive in its fast state and the write-through ones did not.
+transactions/s with the drive in its slow state. Flushing fences were faster than
+write-through ones in three of ten pairs. The reading that the data fit, which the
+fence histograms of later runs support, is that those flushing processes ran with the
+drive in its fast state and the write-through ones spent part of their time in each.
 
 Group commit fences write their commits' messages and digests through as well. Grouped
 commits queue their annotation records, and the fence's leader writes them to
@@ -286,7 +287,11 @@ commits queue their annotation records, and the fence's leader writes them to
 annotated commits no longer flushes the device cache. Ordinary commits write their
 record the same way before their log records. The file grows by zero bytes in steps of
 64 to 256 KiB, which the quota does not count, and a close cuts them. The format of the
-file is unchanged. Probes on `forge` that alternate a write-through fence and a flushing
+file is unchanged. On `forge`, four grouped writers whose commits all carry a message
+committed 2.10 times as many transactions/s on the spatial dataset at 1.05M and 2.21 times
+as many on the full-text dataset, and serial commits with a message reached their p50 in
+0.62 times the time, with about 0.005 device cache flushes per commit instead of 0.5 for
+the writers and 1.1 for serial commits. Probes on `forge` that alternate a write-through fence and a flushing
 fence every second found the write-through fence faster with the drive in each state,
 at 0.24 against 0.34 ms in its fast state and 1.61 against 1.71 ms in its slow state.
 

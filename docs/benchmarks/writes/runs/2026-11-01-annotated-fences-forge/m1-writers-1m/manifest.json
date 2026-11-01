@@ -1,0 +1,48 @@
+{
+  "settings": {
+    "provider": null,
+    "binary": "/home/kclejeune/lanes/fence-sync-501-502/bin/sparkles-4bd70845",
+    "compare_binary": "/home/kclejeune/lanes/fence-sync-501-502/bin/sparkles-4082759b",
+    "write_bench": "/home/kclejeune/lanes/fence-sync-501-502/bin/write-bench",
+    "out": "runs/m1-writers-1m",
+    "source_commit": "4bd70845-vs-4082759b",
+    "blocks": 5,
+    "people": [
+      100000
+    ],
+    "indexes": [
+      "geo",
+      "text"
+    ],
+    "scenarios": [
+      "writers"
+    ],
+    "message": "fence-sync",
+    "serial_changes": 2000,
+    "warmup": 200,
+    "writer_changes": 50000,
+    "write_rate": 0,
+    "rate_fraction": 0.8,
+    "slow_sync_ms": 0,
+    "drive_probe": 64,
+    "port": 42900,
+    "provider_port": 42901,
+    "server_cpus": "0-11",
+    "client_cpus": "12-13",
+    "provider_cpus": "14",
+    "heavy_lock": "/home/kclejeune/lanes/.heavy.lock"
+  },
+  "binary_sha256": "b7a2a18b869854cbaebe76a8e9672d97c8cc298349b60fa5e551248b1780028f",
+  "compare_binary_sha256": "4d6e7d2eca39609fc667f6b84c061a3df1c277206334dbdc9f61565c791d1d61",
+  "client_sha256": "7b95d22ad87f3ea8d2d496b3c6ea51d94b313d4dae316c5605b59b577b1d8433",
+  "harness_sha256": "745e3aea22728870439df98c256b61e7a5ad24eb6b0da149acb8c50c24d116b8",
+  "uname": [
+    "Linux",
+    "forge",
+    "7.2.9",
+    "#1-NixOS SMP PREEMPT_DYNAMIC Sat Oct  3 10:43:16 UTC 2026",
+    "x86_64"
+  ],
+  "started_unix": 1793573918.9180722,
+  "scope": "native storage; no injected sync delay"
+}
