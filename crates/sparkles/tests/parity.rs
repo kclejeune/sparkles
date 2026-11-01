@@ -435,6 +435,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("releaseEvidenceHold", "evidence.release_hold", |ds| {
             let _ = sparkles::evidence::release_hold(ds, any());
         }),
+        op!("proposeClaims", "evidence.propose", |ds| {
+            let _ =
+                sparkles::evidence::propose(None, ds, ds, &any(), &any(), &mut |_, _| None, &any());
+        }),
         op!("resolveEvidence", "evidence.resolve", |ds| {
             let _ = sparkles::evidence::resolve::Resolution::new(any())
                 .and_then(|mut r| r.all(None, ds, ds, &[], &mut |_, _| None));
