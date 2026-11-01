@@ -63,6 +63,32 @@ Each report row therefore also gives `executionAccuracyEqualWidth` and
 `correctByProjection`, and `--scoring-policy rdf-term-set-global-columns-v1` scores under
 the first policy.
 
+Every case is also scored under a guarded secondary policy,
+`rdf-term-set-projected-guarded-lenient-v3`, which `eval_support/guarded.py` defines.
+The strict policy above stays the score of record, and the report gives both side by
+side. The guarded score repairs evaluation defects that checks of the paid baseline
+demonstrated, and it closes the ways the projected policy can be gamed.
+
+- The gold errata `gold-errata-v1` take a question out of the guarded denominator when
+  its gold uses `SELECT *`, when a gold column is unbound in every row, as after a cast
+  that fails, or when `gold-errata-v1.json` names the question with the SHA256 of its
+  gold text and a reason.
+- A row that holds an empty string is dropped from the gold and from the answer.
+- Two literals with XSD numeric datatypes match when their values are equal.
+- A literal in the answer matches a gold IRI when its text is an `rdfs:label` or
+  `skos:prefLabel` of that IRI and of no other gold IRI. A literal in a gold column that
+  also holds IRIs matches an answer IRI the same way.
+- An answer with more than three columns beyond the gold's is wrong.
+- A pass whose extra column holds only predicates of the data, or whose projection drops
+  answer rows, is flagged, and `executionAccuracyGuardedUnflagged` leaves it out. A pass
+  whose matched column is not the first while another extra column holds terms of the
+  same kind is flagged as a rival column and only counted, since a related resource
+  beside the answer raises that flag as well.
+
+Each case keeps its guarded detail under `guarded`, and each row gives
+`executionAccuracyGuarded`, `executionAccuracyGuardedUnflagged`, the excluded questions,
+the flagged and lenient passes and the count of each flag.
+
 `scripts/eval-ask-rescore --report OUT/SET/report.json --sparkles BIN --out DIR` scores
 the saved answers of a run again under the current policy, or the first one with
 `--scoring-policy`. It runs only `sparkles query` on the set's data. It refuses a set, a

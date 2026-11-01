@@ -40,6 +40,7 @@ from evaluator import (
     strict_json,
     validate_ask_record,
 )
+import guarded
 from evaluator import (
     norm_term as norm_term,  # noqa: PLC0414 -- retained scoring import for recomputation
 )
@@ -186,6 +187,8 @@ class Runner:
         )
         self.header = prefix_header(qset.get("prefixes", {}))
         self.gold_cache, self.serial, self.last_record = {}, 0, None
+        self.last_got = None
+        self.errata = guarded.load_errata()
         self.policy = getattr(args, "scoring_policy", None) or POLICY
         if self.policy not in POLICIES:
             raise Invalid("unknown scoring policy")
@@ -468,12 +471,101 @@ class Runner:
             }
 
     def score(self, q, out):
+        self.last_got = None
         ok, scores, detail = self.score_one(q, out)
+        detail["guarded"] = self.score_guarded(q, ok, detail)
         if q.get("orderMatters") is True:
             # The source scores this question's row order, and this scorer compares
             # sets of rows, so the report marks it.
             detail["orderNotScored"] = True
         return ok, scores, detail
+
+    def safe_iri(self, iri):
+        return not any(c in iri for c in '<>"{}|^`\\') and not any(
+            c.isspace() for c in iri
+        )
+
+    def labels(self, iris, texts):
+        """The label texts of `iris` among `texts`, from the set's data. A lookup
+        that fails or passes the row cap leaves those IRIs without labels."""
+        found = {}
+        iris = [i for i in iris if self.safe_iri(i)][:400]
+        texts = texts[:200]
+        if not iris or not texts:
+            return found
+        strings = ", ".join(json.dumps(t, ensure_ascii=False) for t in texts)
+        preds = " ".join(f"<{p}>" for p in guarded.LABEL_PREDICATES)
+        for k in range(0, len(iris), 100):
+            values = " ".join(f"<{i}>" for i in iris[k : k + 100])
+            text = (
+                f"SELECT ?s ?l WHERE {{ VALUES ?s {{ {values} }} VALUES ?p {{ {preds} }} "
+                f"?s ?p ?l FILTER(isLiteral(?l) && STR(?l) IN ({strings})) }}"
+            )
+            try:
+                rel, _ = self.query(text, "labels")
+            except HarnessFault:
+                raise
+            except Invalid:
+                continue
+            for row in rel.rows:
+                if row[0][0] == "uri" and row[1][0] in ("literal", "lang"):
+                    found.setdefault(row[0][1], set()).add(row[1][1])
+        return found
+
+    def predicates(self, iris):
+        """The subset of `iris` used as a predicate in the set's data, or None."""
+        iris = [i for i in iris if self.safe_iri(i)]
+        if not iris:
+            return set()
+        values = " ".join(f"<{i}>" for i in iris)
+        text = f"SELECT DISTINCT ?p WHERE {{ VALUES ?p {{ {values} }} FILTER EXISTS {{ ?s ?p ?o }} }}"
+        try:
+            rel, _ = self.query(text, "predicates")
+        except HarnessFault:
+            raise
+        except Invalid:
+            return None
+        return {row[0][1] for row in rel.rows if row[0][0] == "uri"}
+
+    def score_guarded(self, q, strict_ok, strict_detail):
+        """The secondary score under `guarded.POLICY_V3`, beside the strict one."""
+        out = {"policy": guarded.POLICY_V3, "errata": guarded.ERRATA_VERSION}
+        if q["kind"] != "answerable":
+            return dict(out, correct=bool(strict_ok))
+        gold = self.gold(q)
+        excluded = guarded.errata_exclusion(q, gold, self.errata)
+        if excluded:
+            return dict(out, correct=False, excluded=excluded)
+        if type(gold) is bool:
+            return dict(out, correct=bool(strict_ok))
+        gold2, dropped_gold = guarded.drop_empty(gold)
+        if gold.rows and not gold2.rows:
+            return dict(
+                out,
+                correct=False,
+                excluded={
+                    "rule": "empty-strings-only",
+                    "reason": "every gold row holds an empty string",
+                },
+            )
+        got = self.last_got
+        if got is None or type(got) is bool:
+            return dict(out, correct=False, status=strict_detail.get("status"))
+        got2, dropped_got = guarded.drop_empty(got)
+        detail = {"droppedEmptyGoldRows": dropped_gold, "droppedEmptyAnswerRows": dropped_got}
+        ok, cmp = guarded.compare(gold2, got2, self.check)
+        if not ok and cmp.get("status") is None:
+            iris, texts = guarded.label_requests(gold2, got2)
+            labels = self.labels(iris, texts) if iris and texts else {}
+            g3, a3, changes = guarded.canonical(gold2, got2, labels)
+            if any(changes.values()):
+                ok, cmp = guarded.compare(g3, a3, self.check)
+                detail["lenient"] = changes
+                gold2, got2 = g3, a3
+        detail.update(cmp)
+        if ok and cmp.get("extraColumns"):
+            detail["flags"] = guarded.flags(gold2, got2, cmp, self.predicates)
+        return dict(out, correct=bool(ok), **detail)
 
     def score_one(self, q, out):
         kind, outcome = q["kind"], out.get("outcome")
@@ -514,6 +606,7 @@ class Runner:
             raise
         except Invalid:
             return failure("candidate_query_failure")
+        self.last_got = got
         ok, scores, detail = score_sets(gold, got, self.check, self.policy)
         detail["firstDraft"] = first
         return ok, scores, detail
@@ -594,10 +687,40 @@ def summarize_pair(pair, qs, answers, scores):
     projected = sum(
         bool(scores[i][0] and scores[i][2].get("extraColumns")) for i in answerable
     )
+    g = [scores[i][2].get("guarded") or {} for i in answerable]
+    g_excluded = [qs[i]["id"] for i, d in zip(answerable, g) if d.get("excluded")]
+    g_correct = sum(bool(d.get("correct")) for d in g)
+    # A pass flagged for a predicate column or for rows its projection drops is set
+    # apart. A rival column is only reported, since a related resource beside the
+    # answer, such as each country beside its capital, raises it as well.
+    g_flagged = [
+        qs[i]["id"]
+        for i, d in zip(answerable, g)
+        if d.get("correct") and set(d.get("flags") or ()) & guarded.SET_APART
+    ]
+    g_flags = {}
+    for d in g:
+        if d.get("correct"):
+            for f in d.get("flags") or []:
+                g_flags[f] = g_flags.get(f, 0) + 1
+    g_den = len(answerable) - len(g_excluded)
+    guarded_row = {
+        "guardedPolicy": guarded.POLICY_V3,
+        "goldErrata": guarded.ERRATA_VERSION,
+        "executionAccuracyGuarded": ratio(g_correct, g_den),
+        "executionAccuracyGuardedUnflagged": ratio(g_correct - len(g_flagged), g_den),
+        "guardedExcluded": g_excluded,
+        "guardedFlaggedPasses": g_flagged,
+        "guardedFlags": g_flags,
+        "guardedLenientPasses": [
+            qs[i]["id"] for i, d in zip(answerable, g) if d.get("correct") and d.get("lenient")
+        ],
+    }
     return [
         {
             "pair": pair,
             "role": "demo-pipeline",
+            **guarded_row,
             "questions": n,
             "executionAccuracy": ratio(correct, len(answerable)),
             "executionAccuracyEqualWidth": ratio(correct - projected, len(answerable)),
