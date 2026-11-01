@@ -302,7 +302,7 @@ with the run's effort as `reasoningEffort`, so their requests carry
 object format and nothing else, so it refuses tools and explicit cache options. It asks
 for the default service tier and relies on OpenAI's default prompt caching, whose
 writes last 30 minutes. Ask's prompts keep the stable grounding before the question, so
-repairs read the prefix that the first draft wrote. One ledger holds at most USD 40 of
+repairs read the prefix that the first draft wrote. One ledger holds at most USD 50 of
 the OpenAI wallet, apart from any Anthropic ledger.
 
 The rates come from OpenAI's pricing page and prompt caching guide of 2026-11-01. A
@@ -328,13 +328,18 @@ million prompt tokens, and the ledger charges them at 1.25 times input. It stand
 4.6% above the bill, which suggests that some of those writes were billed at a lower
 rate. The provider never reported more than the ledger.
 
+The OpenAI wallet of 2026-11-01 began at USD 40, and the person who pays raised it to
+USD 50 the same day after the Luna baselines. A ledger's cap is fixed in its header, so
+the first ledger closed with USD 0.8548 settled and nothing unresolved, and a second
+ledger holds the rest with a cap of USD 49.1452. The two caps together equal the wallet.
+
 ## A paid run
 
 `run.example.json` shows the run file. Copy it and set the paths. It holds the sets and
 the models of each set, the effort, `maxOutputTokens`, the request and Ask timeouts, the
 query timeout, the cap, the carryover, the ledger, the output directory and the binary
 with its SHA256. The carryover is required, zero for a fresh authorization, and the cap
-plus the carryover cannot pass USD 50, or USD 40 for an OpenAI run. `clarifications` is `answer` unless the run file
+plus the carryover cannot pass USD 50 for either provider. `clarifications` is `answer` unless the run file
 sets `score`. `contextTokens` gives every model its context window. Without it the server
 assumes 8192 tokens, treats each model as a small one and trims the grounding to 30
 classes, 60 predicates, two examples and three candidates per mention, which is how the

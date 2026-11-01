@@ -664,7 +664,8 @@ dataset's `send` policy lets the draft and repair providers receive rows.
 
 `scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
 file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1
-Sol through the Chat Completions API under a USD 40 wallet of its own. The proxy prices
+Sol through the Chat Completions API under a wallet of its own, capped at USD 50 per
+ledger. The proxy prices
 OpenAI's cache reads and writes, checks the model that served each reply for both
 providers, and its ledger, now format version 3, names its provider. Model
 configurations take `reasoningEffort`, which an `openai` model sends as

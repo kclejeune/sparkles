@@ -32,8 +32,9 @@ LEDGER_VERSION = 3
 # each provider's wallet. The person who pays sets each campaign's total, and a
 # campaign may use several ledgers, each in its own directory. USD 25 bounded the
 # first campaign of 2026-10-15 to 2026-10-19. The campaign of 2026-10-24 has USD 90
-# over ledgers of USD 50 and 30. The OpenAI wallet of 2026-11-01 is USD 40.
-HARD_CAPS = {"anthropic": 50 * 10**9, "openai": 40 * 10**9}
+# over ledgers of USD 50 and 30. The OpenAI wallet of 2026-11-01 began at USD 40 and
+# was raised to USD 50 the same day. Its second ledger holds what the first did not spend.
+HARD_CAPS = {"anthropic": 50 * 10**9, "openai": 50 * 10**9}
 HARD_CAP = HARD_CAPS["anthropic"]
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024

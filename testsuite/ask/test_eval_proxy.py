@@ -1227,7 +1227,7 @@ class OpenAI(Base):
                 SOL: ((2000, 2500, 5000, 100, 10000), (4000, 5000, 10000, 200, 15000)),
             },
         )
-        self.assertEqual(px.HARD_CAPS, {"anthropic": 50 * 10**9, "openai": 40 * 10**9})
+        self.assertEqual(px.HARD_CAPS, {"anthropic": 50 * 10**9, "openai": 50 * 10**9})
 
     def test_cost_splits_reads_writes_and_long_context(self):
         u = CHAT_REPLY["usage"]
@@ -1366,7 +1366,7 @@ class OpenAI(Base):
         with self.assertRaises(Invalid):
             px.Ledger(self.root / "ledger.jsonl", 10**10)  # read as an Anthropic ledger
         with self.assertRaises(Invalid):
-            px.Ledger(self.root / "other.jsonl", 40 * 10**9 + 1, provider="openai")
+            px.Ledger(self.root / "other.jsonl", 50 * 10**9 + 1, provider="openai")
         # a version 2 ledger is an Anthropic ledger
         old = self.root / "old.jsonl"
         old.write_text('{"ledger":2,"capNanodollars":5}\n')
