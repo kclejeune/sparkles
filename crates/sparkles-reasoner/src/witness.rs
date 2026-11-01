@@ -326,13 +326,9 @@ fn product(
     Ok((r, over))
 }
 
-/// The heap of the instances found for one fact.
-fn found_bytes(f: &Found) -> usize {
-    size_of::<Found>()
-        + f.bodies
-            .iter()
-            .map(|b| b.len() * size_of::<Triple>() + 2 * size_of::<usize>())
-            .sum::<usize>()
+/// The heap of one instance body of `n` premises as [`Found`] keeps it.
+fn body_bytes(n: usize) -> usize {
+    n * size_of::<Triple>() + 2 * size_of::<usize>()
 }
 
 fn bind_atom(a: &engine::Atom, t: &Triple, b: &mut [u64]) -> bool {
@@ -455,10 +451,18 @@ impl<'a> Cx<'a> {
 
     /// The rule instances that derive `t`, with their premises: the facts their atoms
     /// match, the facts `listForAll` reads and the cells of the lists they read.
-    fn instances(&self, t: Triple, memo: &mut Memo) -> anyhow::Result<Found> {
+    /// Each instance's body is charged through `charge` before it is kept, and the
+    /// search stops at the first charge that does not fit.
+    fn instances(
+        &self,
+        t: Triple,
+        memo: &mut Memo,
+        charge: &mut dyn FnMut(usize) -> Result<(), MemoryExceeded>,
+    ) -> anyhow::Result<Found> {
         let g = &self.c.graph;
         let mut f = Found::default();
         let mut lmemo = Memo::default();
+        let mut refused: Option<MemoryExceeded> = None;
         for (ri, hi) in self.plans.heads(t[1]) {
             let Some((steps, pre)) = &self.plans.back[ri][hi] else {
                 continue;
@@ -478,6 +482,10 @@ impl<'a> Cx<'a> {
                     if body.iter().chain(implicit).any(|u| *u == t) {
                         return true;
                     }
+                    if f.bodies.len() >= MAX_INSTANCES {
+                        f.capped = true;
+                        return false;
+                    }
                     let mut all: Vec<Triple> = body.iter().chain(implicit).copied().collect();
                     if !self.list_cells(rule, vals, &mut all, &mut lmemo) {
                         f.unknown = true;
@@ -485,8 +493,9 @@ impl<'a> Cx<'a> {
                     }
                     all.sort_unstable();
                     all.dedup();
-                    if f.bodies.len() >= MAX_INSTANCES {
-                        f.capped = true;
+                    // charged before it is kept, list cells included
+                    if let Err(e) = charge(body_bytes(all.len())) {
+                        refused = Some(e);
                         return false;
                     }
                     f.bodies.push(all.into());
@@ -513,6 +522,9 @@ impl<'a> Cx<'a> {
                 (ev.err.take(), ev.take_memo())
             };
             *memo = m;
+            if let Some(e) = refused.take() {
+                return Err(e.into());
+            }
             if let Some(e) = failed {
                 return Err(e);
             }
@@ -830,8 +842,8 @@ impl Witnesses {
                     if cancelled(&cx) {
                         anyhow::bail!("reasoning cancelled");
                     }
-                    let f = cx.instances(t, &mut memo)?;
-                    meter.add(found_bytes(&f))?;
+                    meter.add(size_of::<Found>())?;
+                    let f = cx.instances(t, &mut memo, &mut |n| meter.add(n))?;
                     out.push(f);
                 }
                 Ok((out, meter.into_bytes()))
@@ -1055,17 +1067,21 @@ impl Witnesses {
                 continue;
             };
             self.rev_entries -= v.len().min(self.rev_entries);
+            let entries = v.len();
             for i in v {
                 let n = &mut self.nodes[i as usize];
                 if !n.live {
                     continue;
                 }
-                let before = n.w.len();
+                let (before, bytes) = (n.w.len(), n.bytes());
                 n.w.retain(|x| x.atoms().binary_search(&Atom::Fact(*k)).is_err());
                 if n.w.len() != before {
+                    let gone = bytes - n.bytes();
+                    self.held.shrink(gone);
                     seeds.push(i);
                 }
             }
+            self.held.shrink(entries * REV_ENTRY_BYTES);
         }
         // the facts that left the closure
         for t in deleted.iter().chain(removed).chain(touched) {
@@ -1163,6 +1179,8 @@ impl Witnesses {
             }
         }
         self.rev = rev;
+        self.held
+            .shrink(self.rev_entries.saturating_sub(n) * REV_ENTRY_BYTES);
         self.rev_entries = n;
     }
 
@@ -1198,14 +1216,19 @@ impl Witnesses {
     ) -> anyhow::Result<&'p Ins> {
         if let std::collections::hash_map::Entry::Vacant(_) = pass.ins.entry(i) {
             let t = self.nodes[i as usize].t;
-            let f = cx.instances(t, memo)?;
+            let held = pass.scratch.get_or_insert_with(|| Held::new(cx.budget));
+            // the bodies are charged as they are found, and their nodes before they are kept
+            let mut found = 0usize;
+            let f = cx.instances(t, memo, &mut |n| {
+                found += n;
+                held.try_grow(n)
+            })?;
+            held.try_grow(f.bodies.iter().map(|b| b.len() * 4 + 32).sum::<usize>() + 64)?;
             let mut ins = Ins {
                 bodies: Vec::with_capacity(f.bodies.len()),
                 unknown: f.unknown,
                 capped: f.capped,
             };
-            let held = pass.scratch.get_or_insert_with(|| Held::new(cx.budget));
-            held.try_grow(f.bodies.iter().map(|b| b.len() * 4 + 32).sum::<usize>() + 64)?;
             for body in f.bodies {
                 let ids: Box<[u32]> = body
                     .iter()
@@ -1228,6 +1251,7 @@ impl Witnesses {
                     .collect();
                 ins.bodies.push(ids);
             }
+            held.shrink(found);
             pass.ins.insert(i, ins);
         }
         Ok(&pass.ins[&i])
@@ -2062,5 +2086,52 @@ mod tests {
             w.remove_node(i);
         }
         assert!(w.held.bytes() < held / 2, "{}", w.held.bytes());
+    }
+
+    /// Regression (second review of item 416): a fact's instances were charged only
+    /// after the search had kept every body, so a fact with many large instances could
+    /// pass the limit by far before the run refused it. Each body is now charged before it
+    /// is kept, and the search stops at the first refusal.
+    #[test]
+    fn instances_are_charged_as_they_are_found() {
+        let v = Vocab::new();
+        let (p0, p1, i0) = (ex(&v, "p0"), ex(&v, "p1"), ex(&v, "i0"));
+        let text = format!(
+            "[r: (?s <{e}p0> ?o) -> (<{e}i0> <{e}p1> <{e}i0>)]",
+            e = crate::incremental::tests::EX
+        );
+        let base: FxHashSet<Triple> = (0..8)
+            .flat_map(|a| (0..8).map(move |b| (a, b)))
+            .map(|(a, b)| [ex(&v, &format!("i{a}")), p0, ex(&v, &format!("i{b}"))])
+            .collect();
+        let mut c = full(&v, &text, &base);
+        let rules = compiled(&text, &c.terms);
+        let plans = Plans::new(&mut c.graph, &rules).unwrap();
+        let abort = AtomicBool::new(false);
+        let l = limits();
+        let cx = Cx::new(&c, &rules, &plans, &abort, &l);
+        let head = [i0, p1, i0];
+        let mut all = 0usize;
+        let f = cx
+            .instances(head, &mut Memo::default(), &mut |n| {
+                all += n;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(f.bodies.len(), 64);
+        let one = body_bytes(1);
+        assert_eq!(all, 64 * one);
+        let budget = Budget::new(Some(10 * one + one / 2));
+        let mut held = Held::new(&budget);
+        let mut charged = 0usize;
+        let Err(e) = cx.instances(head, &mut Memo::default(), &mut |n| {
+            held.try_grow(n)?;
+            charged += n;
+            Ok(())
+        }) else {
+            panic!("the search passed the limit");
+        };
+        assert!(e.downcast_ref::<MemoryExceeded>().is_some(), "{e:#}");
+        assert!(charged <= 10 * one, "{charged}");
     }
 }

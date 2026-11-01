@@ -394,3 +394,61 @@ fn witnesses_fail_within_the_memory_limit() {
         "{e:#}"
     );
 }
+
+/// Regression (second review of item 416): an update that discards witnesses, here every
+/// witness of a chain whose quads move to a second input graph, kept charging their
+/// memory until it finished, and failed under a limit that a full build fits.
+#[test]
+fn discarded_witnesses_release_their_memory() {
+    let (g1, g2) = ("g1", "g2");
+    let n = 40;
+    let mut chain: Vec<Triple> = (0..n)
+        .map(|k| t(&format!("C{k}"), &sub(), &format!("C{}", k + 1)))
+        .collect();
+    chain.push(t("i", &ty(), "C0"));
+    let opts = |max_memory| ReasonOptions {
+        witnesses: Some(8),
+        max_memory,
+        inputs: Inputs {
+            data_graphs: vec![
+                GraphRef::Named(iri(g1).into_string()),
+                GraphRef::Named(iri(g2).into_string()),
+            ],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, Some(g1), &chain, &[]);
+    change(&s, Some(g2), &chain, &[]);
+    let cache = Cache::default();
+    let r = run(&s, None, &cache, &opts(None));
+    let peak = r.peak_bytes as usize;
+    let w = r.witnesses.unwrap();
+    assert_eq!(w.truncated, 0, "{w:?}");
+    // the quads of the smaller keys go, so that nearly every witness changes
+    let gone: Vec<Triple> = chain
+        .iter()
+        .filter(|q| key(q, Some(g1)) < key(q, Some(g2)))
+        .cloned()
+        .collect();
+    let keep: Vec<Triple> = chain
+        .iter()
+        .filter(|q| key(q, Some(g1)) > key(q, Some(g2)))
+        .cloned()
+        .collect();
+    change(&s, Some(g1), &[], &gone);
+    change(&s, Some(g2), &[], &keep);
+    let r = run(
+        &s,
+        Some(r.receipt.unwrap().commit.seq),
+        &cache,
+        // the update fits in the full build's peak once the discarded witnesses are
+        // given back; before, it needed about 1.24 times that peak
+        &opts(Some(peak)),
+    );
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+    let got = cache.witnesses(&t("i", &ty(), &format!("C{n}"))).unwrap();
+    assert!(!got.annotation.truncated);
+    assert_eq!(got.annotation.witnesses.len(), 1);
+}
