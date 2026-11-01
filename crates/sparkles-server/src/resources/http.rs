@@ -474,6 +474,10 @@ fn licence_key(s: &str) -> LicenceKey {
         && matches!(u.scheme(), "http" | "https")
         && u.host_str()
             .is_some_and(|h| h.eq_ignore_ascii_case("spdx.org"))
+        // `port` is `None` for the scheme's default port
+        && u.port().is_none()
+        && u.username().is_empty()
+        && u.password().is_none()
         && u.query().is_none()
         && u.fragment().is_none()
         && let Some(id) = u.path().strip_prefix("/licenses/")

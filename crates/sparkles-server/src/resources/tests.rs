@@ -1122,6 +1122,9 @@ fn headers_compare_whole_versions_and_exact_licence_urls() {
     assert_eq!(lic("https://SPDX.org/licenses/MIT.html"), 0);
     assert_eq!(lic("http://spdx.org/licenses/mit"), 0);
     assert_eq!(lic("spdx:mit"), 1);
+    assert_eq!(lic("https://spdx.org:8443/licenses/MIT.html"), 1);
+    assert_eq!(lic("https://spdx.org:443/licenses/MIT.html"), 0);
+    assert_eq!(lic("https://user@spdx.org/licenses/MIT.html"), 1);
     assert_eq!(lic("https://spdx.org/licenses/MIT.html?x=1"), 1);
     assert_eq!(lic("https://spdx.org/licenses/Apache-2.0"), 1);
 }
