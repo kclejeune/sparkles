@@ -48,6 +48,10 @@ def _resolve(tree: ast.Module, name: str) -> None:
             raise AssertionError(f"`{part}` cannot contain a binding method")
 
 
+# Keys whose Python binding is deliberately deferred.
+DEFERRED = {"evidence.configure", "evidence.detach", "evidence.settings"}
+
+
 def test_python_binding_names_resolve() -> None:
     if not STUB.is_file() or not BINDINGS.is_file():
         pytest.skip("source parity needs the repository stub and bindings.toml")
@@ -55,7 +59,12 @@ def test_python_binding_names_resolve() -> None:
     bindings = tomllib.loads(BINDINGS.read_text())
     for key, entry in bindings.items():
         name = entry["python"]
-        assert not name.startswith("planned:"), f"`{key}` still has a planned Python binding"
+        if name.startswith("planned:"):
+            # Evidence settings reach the bindings with the typed evidence operations
+            # of roadmap item 81, as spec C25 decides. No other key may be planned.
+            assert key in DEFERRED, f"`{key}` still has a planned Python binding"
+            assert name.split(":", 1)[1].strip(), f"`{key}` needs a reason"
+            continue
         if name.startswith("skip:"):
             assert key in {"fmt.format", "fmt.lint"}, f"unexpected Python exemption: {key}"
             assert name.split(":", 1)[1].strip(), f"`{key}` needs a reason"

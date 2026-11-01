@@ -683,6 +683,9 @@ The open questions of this step were decided as follows.
 8. **C19 layering.** `evidence.json` holds the complete canonical object whose digest
    `managed.json` records, so the settings are not a C19 layered kind in this step.
    Declared settings and drift refusal are roadmap item NEW-ITEM-1.
+10. **Bindings.** The settings operations are HTTP and Rust only in this step. The
+   Python, JVM and Node.js bindings receive them with the typed evidence operations,
+   as roadmap item NEW-ITEM-2 records.
 9. **Vocabulary.** Terms for supports, withdrawals, resolution maps, operations and
    receipts are added with the operations that write those records, so that their
    shapes and fixtures are tested against real output.
