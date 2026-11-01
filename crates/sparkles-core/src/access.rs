@@ -13,7 +13,6 @@
 
 pub mod authority;
 mod preparation;
-pub mod source;
 pub mod triples;
 pub use preparation::{Exemptions, Preparation, PreparedView, Reservation};
 pub use triples::{Caller, Limits, Mask, Protection, Rule, TripleRules};

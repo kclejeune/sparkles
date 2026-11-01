@@ -710,7 +710,11 @@ fn verify_local_passages(
     Ok(())
 }
 
-fn locate_boundaries(text: &str, offsets: &[u64], control: &Control) -> Result<Vec<usize>> {
+pub(super) fn locate_boundaries(
+    text: &str,
+    offsets: &[u64],
+    control: &Control,
+) -> Result<Vec<usize>> {
     let mut positions = Vec::with_capacity(offsets.len());
     let mut count = 0u64;
     for (byte, _) in text.char_indices() {
@@ -739,7 +743,7 @@ fn locate_boundaries(text: &str, offsets: &[u64], control: &Control) -> Result<V
     Ok(positions)
 }
 
-fn has_blank(triple: &Triple) -> bool {
+pub(super) fn has_blank(triple: &Triple) -> bool {
     if matches!(triple.subject, NamedOrBlankNode::BlankNode(_)) {
         return true;
     }

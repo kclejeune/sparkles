@@ -1472,11 +1472,11 @@ impl Store {
                 Err(error) => return Err(error),
             }
         };
-        let table = crate::access::source::lock(&set.table, options)?;
+        let table = controlled_lock(&set.table, options)?;
         if table.by_id(id).is_none() {
             return Ok(None);
         }
-        let stores = crate::access::source::lock(&set.stores, options)?;
+        let stores = controlled_lock(&set.stores, options)?;
         let store = stores
             .get(&id)
             .filter(|store| !store.branching.retired.load(Ordering::Acquire))
@@ -1545,6 +1545,53 @@ impl Store {
             return Ok(self.dataset_id);
         }
         Ok(self.owned_set()?.entry(name)?.id)
+    }
+
+    /// The current name of the listed branch whose identity is `id`, `main` for the
+    /// dataset id, through the dataset's main store. `None` for a deleted, retired or
+    /// unknown identity. Reads only the branch table, so no branch store is opened.
+    pub fn listed_branch_name(&self, id: uuid::Uuid) -> Result<Option<String>> {
+        if id == self.dataset_id && !self.is_branch() {
+            return Ok(Some(MAIN.to_string()));
+        }
+        match &self.branching.set {
+            SetRef::Owner(s) => Ok(s.table.lock().by_id(id).map(|e| e.name.clone())),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether `id` names `main`, a listed branch, a retired branch or a deleted branch
+    /// whose starting point the table still records, of this store's dataset.
+    pub(crate) fn branch_known(&self, id: uuid::Uuid) -> bool {
+        if id == self.owner_dataset_id() {
+            return true;
+        }
+        let Some(set) = self.branching.set() else {
+            return false;
+        };
+        let table = set.table.lock();
+        table.any_by_id(id).is_some() || table.deleted.iter().any(|d| d.id == id)
+    }
+
+    /// Fail with `no-such-branch` unless `branch` is a listed branch of this main.
+    pub(super) fn listed_limited(
+        &self,
+        branch: uuid::Uuid,
+        limit: &crate::history::ReadLimit<'_>,
+    ) -> Result<()> {
+        let missing = || crate::branch::no_such_branch(&branch.to_string());
+        let set = match &self.branching.set {
+            SetRef::Owner(set) => set,
+            _ => return Err(missing()),
+        };
+        let table = limit.lock(&set.table)?;
+        for entry in table.branches.iter() {
+            limit.check(0)?;
+            if entry.id == branch {
+                return Ok(());
+            }
+        }
+        Err(missing())
     }
 
     /// The number of branches, `main` included.
@@ -2978,5 +3025,27 @@ mod source_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+/// Take `mutex` under the cancellation, deadline and no-wait choice of `options`.
+fn controlled_lock<'a, T>(
+    mutex: &'a parking_lot::Mutex<T>,
+    options: &crate::guard::WriteOptions,
+) -> Result<parking_lot::MutexGuard<'a, T>> {
+    loop {
+        options.check()?;
+        let guard = if options.no_wait {
+            mutex.try_lock()
+        } else {
+            mutex.try_lock_for(std::time::Duration::from_millis(10))
+        };
+        if let Some(guard) = guard {
+            options.check()?;
+            return Ok(guard);
+        }
+        if options.no_wait {
+            return Err(Error::WriterBusy);
+        }
     }
 }

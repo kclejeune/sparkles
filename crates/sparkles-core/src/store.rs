@@ -1558,8 +1558,6 @@ pub struct Store {
     /// which prefix names loaded data may bind (spec C20 §3.4), set by the server
     prefix_filter: Mutex<Option<PrefixFilter>>,
     dataset_id: uuid::Uuid,
-    /// Process-local identity of this exact store opening, never a disk capability.
-    opening: uuid::Uuid,
     /// `forkedFrom` of an in-memory clone (a persistent one keeps it in `dataset.json`)
     forked_mem: Option<ForkedFrom>,
     catalog: Arc<Mutex<Catalog>>,
@@ -1806,14 +1804,6 @@ fn check_existing_root(root: &Path, expected: Option<uuid::Uuid>) -> Result<()> 
 }
 
 impl Store {
-    pub(crate) fn same_source_family(&self, other: &Store) -> bool {
-        Arc::ptr_eq(&self.family, &other.family)
-    }
-
-    pub(crate) fn source_opening(&self) -> uuid::Uuid {
-        self.opening
-    }
-
     /// A fresh in-memory store (Jena `DatasetGraphFactory.createTxnMem()` equivalent).
     pub fn in_memory(opts: StoreOptions) -> Store {
         let root = CommitInfo {
@@ -1930,7 +1920,6 @@ impl Store {
             family: family.clone(),
             _close_complete: Arc::new(()),
             dataset_id,
-            opening: uuid::Uuid::new_v4(),
             forked_mem: forked_from,
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
             annotations: Mutex::new(crate::annotations::Annotations::memory(opts.commit_digests)),
@@ -2426,7 +2415,6 @@ impl Store {
             family: family.clone(),
             _close_complete: Arc::new(()),
             dataset_id,
-            opening: uuid::Uuid::new_v4(),
             forked_mem: None,
             catalog: Arc::new(Mutex::new(catalog)),
             annotations: Mutex::new(annotations),
