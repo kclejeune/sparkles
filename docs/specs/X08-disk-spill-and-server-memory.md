@@ -1107,9 +1107,9 @@ every 1,024 lookups and every 65,536 scanned quads. A path without inputs under 
 `LIMIT` or `ASK` is walked one start node at a time in eager execution, as a cursor
 walks it. An alternative of predicates and inverse predicates with a bound or constant
 end is walked by one index lookup per predicate instead of an edge plan. On the same
-data the three `why_empty` calls finish in 0.5 to 7.2 seconds with peaks of 1.4 to
-3.7 GB, the `ASK` over `?cat skos:broader* ?c` answers in 0.6 seconds, and the full
-closure fails with the timeout. The alternative with two unbound ends still builds its
+data the three `why_empty` calls finish in 1.6 to 7.7 seconds with resident peaks of 1.8
+to 4.1 GB, which include the mapped index pages. The `ASK` over `?cat skos:broader* ?c`
+answers in 0.2 seconds, and the full closure fails with the timeout. The alternative with two unbound ends still builds its
 edge relation and fails the budget, which `why_empty` now reports as an unknown check.
 
 ### Grant routing (2026-10-23)
