@@ -1117,13 +1117,14 @@ fn a_too_deep_root_does_not_spoil_a_shallow_suffix() {
 
 #[test]
 fn class_and_data_depths_stay_apart() {
-    // _:x is a shallow class expression and the root of a deep data range: either
-    // reading must not borrow the other's depth
-    let n = 120;
+    // _:x is a shallow class expression and the root of a data range 128 levels deep:
+    // the class read after the data range must not borrow its depth
+    let n = 126;
     let mut body = decl(
-        ":A rdfs:subClassOf _:x . :C rdfs:subClassOf _:y . _:y owl:complementOf _:x .
-         _:x owl:complementOf :B ; owl:datatypeComplementOf _:d0 .
-         :T a rdfs:Datatype ; owl:equivalentClass _:x .\n",
+        ":A rdfs:subClassOf _:x .
+         :T a rdfs:Datatype ; owl:equivalentClass _:x .
+         :C rdfs:subClassOf _:y . _:y owl:complementOf _:x .
+         _:x owl:complementOf :B ; owl:datatypeComplementOf _:d0 .\n",
     );
     for i in 0..n {
         body.push_str(&format!(
