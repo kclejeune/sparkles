@@ -411,7 +411,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   questions they answer 33, 32 and 19. Missing predicates in the grounding
   context and missed entity links cause most wrong answers. A generated query with a
   property path can exhaust memory under Ask, because the default query memory budget and
-  timeout do not bound property-path evaluation. Model-dependent
+  timeout do not bound property-path evaluation, which roadmap item NEW-ITEM-1 tracks.
+  Model-dependent
   accuracy and contextual namesake resolution remain roadmap item 263, and the higher
   median end-to-end latency is item 318. Local and OpenAI-compatible models, LC-QuAD 2.0,
   which needs a Wikidata load from the full dump, and an evaluation of independent roles

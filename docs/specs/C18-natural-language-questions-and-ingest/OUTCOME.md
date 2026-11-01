@@ -1721,8 +1721,8 @@ binary. The projected-column policy is the headline score.
 
 Two runs of one model differ on 4 to 10 of the 107 questions, and the 95% half-width of
 the paired difference between two single runs is about 6 points on QALD. Missing
-predicates in the grounding context cause the most wrong answers for every model, and
-wrong or unlinked resources the second most. Opus leads Sonnet by 8 points on QALD and
+predicates in the grounding context and wrong or unlinked resources cause the most wrong
+answers for Haiku and Sonnet, while wrong query shape is the largest cause for Opus. Opus leads Sonnet by 8 points on QALD and
 by one question on db25. It gains mainly by answering when the needed predicate is
 missing from the prompt, so its gain comes from vocabulary knowledge and reasoning rather
 than from better context. Nine gold answers are broken on
@@ -1759,8 +1759,12 @@ The proposed improvements, in order of expected effect, are these.
    that rely on predicate columns or dropped rows separately.
 
 For tuning, the 107 QALD questions are split by the seed `ask-eval-baseline-split-v1`
-into 72 for training and 35 for validation, and the 74 db25 questions are held out as the
-test set and run only for a final comparison. The paid record lists the three sets. On
+into 72 for training and 35 for validation, and the 74 db25 questions form the test set
+that tuning runs never use. This analysis already read the db25 failures to rank the
+proposed improvements, so a final db25 comparison is weaker evidence than an unseen set.
+A fresh set that has not informed the improvements, such as questions from the
+QALD-9-plus training split converted on this release, should be reserved for the final
+check. The paid record lists the three sets. On
 35 questions one paired run resolves only about 10 points, so a variant chosen on the
 validation questions needs at least three runs there or a confirming run on all 107
 before it is run on the test set.
@@ -1769,7 +1773,8 @@ Generated queries ran the Ask process out of memory three times, twice at about 
 a zero-or-more property path over redirects and once at a 12 GB cap on
 `skos:broader?/skos:broader?` from an unbound category. Ask's default query memory budget
 of 2048 MiB and 60-second query timeout did not stop them. Ask needs an enforced default
-memory budget and timeout that also cover property paths, which needs a new roadmap item.
+memory budget and timeout that also cover property paths, which
+[ROADMAP](../../ROADMAP.md) item NEW-ITEM-1 tracks.
 The campaign made 1,965 ledger-reserved requests for $39.22 under a cap of $45. That
 includes $5.34 for a Sonnet attempt and $3.40 for Opus attempts that host failures
 interrupted, and the 22 answers that the first Opus attempt completed are part of its

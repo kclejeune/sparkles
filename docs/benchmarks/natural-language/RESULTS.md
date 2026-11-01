@@ -89,8 +89,9 @@ answers per run.
 | Gold answer wrong or broken on this release | 7.0 | 7.0 | 6 | 1 | 1 | 1 |
 | Provider error, truncation or an out-of-memory failure | 0.3 | 0 | 2 | 0 | 0 | 0 |
 
-Missing grounding is the largest cause for Haiku and Sonnet, and the second largest for
-Opus. One example is "What is the highest mountain in Germany?", whose prompt lists
+Missing grounding is the largest cause for Haiku, ties with wrong resources for Sonnet on
+QALD and leads for Sonnet on db25. For Opus, wrong query shape is the largest cause on
+both sets. One example is "What is the highest mountain in Germany?", whose prompt lists
 dozens of predicates that contain "highest" or "mountain" but not `dbo:elevation`, so Haiku and Sonnet answer that the data cannot
 rank mountains. Entity linking is the second cause. The five candidates for "Mars",
 "Texas" and "Scream" do not include `dbr:Mars`, `dbr:Texas` or `dbr:The_Scream`, and
@@ -106,8 +107,11 @@ of scorer error. Three QALD gold queries cast an `xsd:gYear` to `xsd:date`, whic
 1.1 refuses, so their gold is one row with no binding. One projects a variable that is
 never bound, and one more, in db25, uses `SELECT *` and so demands the book beside each
 author. One gold answer is the infobox text "SeeList of nicknames for San Francisco", and
-three include an empty string beside the real answers. No answer can match these, so
-the cleaned denominators are 99 for QALD and 73 for db25.
+three include an empty string beside the real answers. The four that have no binding or
+an unbound column cannot be matched. The other five can be matched only by returning the
+same defective data, which happened for one of them in every QALD run and for two in the
+Opus run. Without these nine questions, the projected scores are 27, 28 and 26 of 99 for
+Haiku, 31 and 33 for Sonnet and 39 for Opus on QALD, and 19, 32 and 33 of 73 on db25.
 
 The scorer marks a right answer wrong when a count has another integer datatype, when it
 names labels for gold IRIs, when the gold mixes a literal with IRIs, and when the gold is
@@ -125,9 +129,11 @@ labels 65 times, numbers or dates such as the ranking key 34 times, related reso
 42 times and predicates 19 times, the last from queries that try several predicates
 in one `VALUES` list. Fifteen of them repeat an answer on several rows. A guard that caps
 extra columns at three and reports separately any pass whose extra column holds
-predicates or whose projection drops rows would close the synthetic cases and keep every
-label and ranking pass. It would flag 26 current passes, from none to 7 per run, with the
-most for Opus and Sonnet.
+predicates or whose projection drops rows would close the many-column and repeated-row
+cases and keep every label and ranking pass. It would flag 26 current passes, from none to
+7 per run, with the most for Opus and Sonnet. It does not catch two competing guesses on
+one row, so the guard also needs to report a pass whose matched column is not the first
+column when another extra column holds values of the same kind as the gold column.
 
 #### Memory
 
@@ -135,7 +141,8 @@ Generated queries ran the `sparkles ask` process out of memory three times. A
 zero-or-more property path over redirects and disambiguations reached about 28 GB twice,
 and `skos:broader?/skos:broader?` from an unbound category reached a 12 GB cap. Ask's
 default query memory budget of 2048 MiB and 60-second timeout did not stop them. Ask
-needs an enforced default memory budget and timeout that cover property-path evaluation.
+needs an enforced default memory budget and timeout that cover property-path evaluation,
+which [ROADMAP](../../ROADMAP.md) item NEW-ITEM-1 tracks.
 
 [ROADMAP](../../ROADMAP.md) item 263 holds the accuracy work. The
 [paid record](../2026-11-01-ask-model-baseline-paid.json) gives per-run and per-case
