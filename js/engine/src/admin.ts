@@ -289,6 +289,72 @@ export interface OntologyAxiomPage extends OntologyState {
   offset: number;
   next: bigint | null;
 }
+/** One entity of a listing: its kind and IRI. */
+export interface OntologyEntityRef {
+  kind: string;
+  iri: string;
+}
+export interface OntologyEntityPage extends OntologyState {
+  entities: OntologyEntityRef[];
+  total: number;
+  offset: number;
+  next: bigint | null;
+}
+/** An expression of an entity answer: its functional-style form and its JSON form. */
+export interface OntologyExpression {
+  ofn: string;
+  expression: unknown;
+}
+/** What the ontology says about one entity, by kind (see "Ontology" in API.md). */
+export interface OntologyEntity extends OntologyState {
+  iri: string;
+  kinds: string[];
+  labels: Configuration[];
+  annotations: { ofn: string; annotation: Configuration }[];
+  class?: {
+    superClasses: OntologyExpression[];
+    subClasses: OntologyExpression[];
+    equivalentClasses: OntologyExpression[];
+    disjointClasses: OntologyExpression[];
+    disjointUnions: OntologyExpression[][];
+    keys: { objectProperties: OntologyExpression[]; dataProperties: string[] }[];
+    instances: OntologyExpression[];
+  };
+  objectProperty?: {
+    domains: OntologyExpression[];
+    ranges: OntologyExpression[];
+    superProperties: OntologyExpression[];
+    subProperties: OntologyExpression[];
+    equivalentProperties: OntologyExpression[];
+    disjointProperties: OntologyExpression[];
+    inverseProperties: OntologyExpression[];
+    characteristics: string[];
+  };
+  dataProperty?: {
+    domains: OntologyExpression[];
+    ranges: OntologyExpression[];
+    superProperties: string[];
+    subProperties: string[];
+    equivalentProperties: string[];
+    disjointProperties: string[];
+    functional: boolean;
+  };
+  annotationProperty?: {
+    superProperties: string[];
+    subProperties: string[];
+    domains: string[];
+    ranges: string[];
+  };
+  datatype?: { definitions: OntologyExpression[] };
+  namedIndividual?: {
+    types: OntologyExpression[];
+    sameIndividuals: OntologyExpression[];
+    differentIndividuals: OntologyExpression[];
+    assertions: OntologyAxiom[];
+  };
+  assertions: boolean;
+  truncated: boolean;
+}
 export interface OntologyCheck extends OntologyState {
   conforms: boolean;
   assertions: boolean;
@@ -477,6 +543,14 @@ export class Administration {
       profiles: o.profiles,
       maxViolations: o.maxViolations,
     });
+    // the members that name a read
+    const readSelection = (o: OntologyRead) => ({
+      graph: o.graph,
+      imports: o.imports,
+      mode: o.mode,
+      at: o.at === undefined || typeof o.at === 'string' ? o.at : unsigned(o.at),
+      inferences: o.inferences,
+    });
     // what an edit or a diff reads; `at` and `inferences` go on, for the native call to refuse
     const writeSelection = (o: OntologySelection) => {
       const { at, inferences } = o as OntologyRead;
@@ -528,6 +602,46 @@ export class Administration {
           },
         };
       },
+      /** One page of the entities of the kinds in `kind` (all kinds by default). */
+      entities: (
+        o: OntologyRead &
+          OperationOptions & { kind?: string | string[]; limit?: number; offset?: number } = {},
+      ) =>
+        call<OntologyEntityPage>(
+          'ontology.entities',
+          {
+            ...readSelection(o),
+            kind: Array.isArray(o.kind) ? o.kind.join(',') : o.kind,
+            limit: o.limit,
+            offset: o.offset,
+          },
+          o,
+          false,
+        ),
+      /**
+       * What the ontology says about the entity `iri`: its kinds, labels and annotations,
+       * and for each kind its superclasses, domains, ranges, types and the other accessors.
+       * With `assertions`, the instances, types and property assertions the store holds too,
+       * at most `limit` of each. An IRI the ontology does not have as an entity is a
+       * not-found error.
+       */
+      entity: (
+        iri: string | { termType: 'NamedNode'; value: string },
+        o: OntologyRead &
+          OperationOptions & { kind?: string; assertions?: boolean; limit?: number } = {},
+      ) =>
+        call<OntologyEntity>(
+          'ontology.entity',
+          {
+            ...readSelection(o),
+            iri: typeof iri === 'string' ? iri : iri.value,
+            kind: o.kind,
+            assertions: o.assertions,
+            limit: o.limit,
+          },
+          o,
+          false,
+        ),
       /** One report per profile (`el`, `ql`, `rl`, `dl`; `dl` by default). */
       check: (
         o: OntologyRead &

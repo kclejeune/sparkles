@@ -1,5 +1,6 @@
 //! The OWL 2 ontology of a dataset over HTTP (spec F21 §2.4): the summary
-//! `GET /$/ontology/{ds}`, the axioms `GET /$/ontology/{ds}/axioms`, the profile checks
+//! `GET /$/ontology/{ds}`, the axioms `GET /$/ontology/{ds}/axioms`, the entities
+//! `GET /$/ontology/{ds}/entities` and `GET /$/ontology/{ds}/entity`, the profile checks
 //! `POST /$/ontology/{ds}/check`, edits `POST /$/ontology/{ds}/axioms` and the diff of
 //! the axioms of two commits `GET /$/ontology/{ds}/diff`. The library
 //! reads, checks and edits (`sparkles::handles::ontology`); these handlers parse the
@@ -263,6 +264,98 @@ pub(super) async fn axioms(
         }
         let j = page_body(&ds.name, &o, &req, &r, &page);
         Ok(with_commit(Json(j).into_response(), &ds, seq))
+    })
+    .await
+}
+
+fn number_param(
+    params: &Params,
+    k: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> ApiResult<usize> {
+    match params.get(k) {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (min..=max).contains(n))
+            .ok_or_else(|| bad(format!("{k} must be an integer from {min} to {max}"))),
+    }
+}
+
+/// `GET /$/ontology/{ds}/entities`: the entities the ontology declares or, in a lenient
+/// read, types by use, of the kinds in `kind` (all by default), one page at a time.
+pub(super) async fn entities(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let req = request_of(&params)?;
+    let kinds = match params.get("kind") {
+        None => None,
+        Some(k) => Some(onto::wire::parse_entity_kinds(k).map_err(|e| bad(e.to_string()))?),
+    };
+    let limit = number_param(&params, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)?;
+    let offset = number_param(&params, "offset", 0, 0, usize::MAX)?;
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    blocking(move || {
+        let handle = ds.dataset.ontology();
+        let opts = handle.anchored(&opts).map_err(ontology_error)?;
+        let o = handle.open(&req, &opts).map_err(ontology_error)?;
+        let j = onto::wire::entities_body(&ds.name, &o, &req, kinds.as_ref(), limit, offset);
+        Ok(with_commit(Json(j).into_response(), &ds, o.snapshot.commit))
+    })
+    .await
+}
+
+/// `GET /$/ontology/{ds}/entity`: what the ontology says about the entity `iri`: its
+/// kinds, labels and annotations, and for each kind its superclasses, domains, ranges,
+/// types and the other accessors of spec F21 §2.1. `assertions=true` also streams the
+/// instances of a class and the types and property assertions of an individual from the
+/// store, at most `limit` of each.
+pub(super) async fn entity(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let req = request_of(&params)?;
+    let iri = params
+        .get("iri")
+        .ok_or_else(|| bad("iri names the entity"))?
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string();
+    let kind = match params.get("kind") {
+        None => None,
+        Some(k) => Some(owl::EntityKind::parse(k).ok_or_else(|| {
+            bad(format!(
+                "kind must be one of {}, not '{k}'",
+                owl::EntityKind::ALL.map(|k| k.name()).join(", ")
+            ))
+        })?),
+    };
+    let q = onto::wire::EntityQuery {
+        iri,
+        kind,
+        assertions: params.get("assertions").is_some_and(truthy),
+        limit: number_param(&params, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)?,
+    };
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    blocking(move || {
+        let handle = ds.dataset.ontology();
+        let opts = handle.anchored(&opts).map_err(ontology_error)?;
+        let o = handle.open(&req, &opts).map_err(ontology_error)?;
+        let j = onto::wire::entity_body(&ds.name, &o, &req, &renderer(&ds), &q, &opts)
+            .map_err(ontology_error)?;
+        Ok(with_commit(Json(j).into_response(), &ds, o.snapshot.commit))
     })
     .await
 }

@@ -45,6 +45,16 @@ carry when asked. The MCP tool `ontology_axioms` lists axioms, and on a server t
 allows updates adds and removes them with previews, `ifHead` and PROV-O provenance
 written as axiom annotations (spec F21 Phase 3).
 
+The ontology handle answers entity accessors (roadmap item 540). Rust's read ontology
+lists entities by kind and answers the superclasses, subclasses, equivalent and disjoint
+classes of a class, the domains, ranges, hierarchy and characteristics of a property and
+the types of an individual, and the open handle streams the instances of a class and an
+individual's assertions from the store. `ds.ontology().graph(iri)` builds a read and
+takes a closure that edits in one commit. `GET /$/ontology/{ds}/entities` and
+`GET /$/ontology/{ds}/entity` serve the accessors, as `entities` and `entity` do in
+Python, Node.js and on the JVM. Python's `sparkles.owl` and Node.js's `owl` namespace
+build axioms with typed constructors named after their functional-style forms.
+
 The OWL 2 DL check, and so every profile report, checks literals. A literal of a
 datatype in the OWL 2 datatype map needs a lexical form of that datatype, a datatype
 restriction needs facets and values that its datatype supports, and a datatype that a

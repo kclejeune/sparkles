@@ -1303,3 +1303,248 @@ fn json_operations_answer_in_the_route_forms() {
         assert!(matches!(call(op, a), Err(Error::Invalid(_))), "{op}");
     }
 }
+
+// ---------------------------------------------- roadmap item 540: accessors ------
+
+const ENTITIES: &str = ":o a owl:Ontology .
+    :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+    :p a owl:ObjectProperty . :q a owl:ObjectProperty . :d a owl:DatatypeProperty .
+    :A rdfs:subClassOf :B , [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :C ] .
+    :A owl:equivalentClass :D . :B owl:disjointWith :C .
+    :A rdfs:label \"A\" , \"Ah\"@fr .
+    :p rdfs:domain :A ; rdfs:range :B ; rdfs:subPropertyOf :q ; a owl:TransitiveProperty .
+    :p owl:inverseOf :q .
+    :d rdfs:domain :A ; rdfs:range xsd:integer ; a owl:FunctionalProperty .
+    :a a :A , :B . :a :p :b . :a :d 3 . :c a :A .
+    :e a owl:NamedIndividual , [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue :a ] .";
+
+#[test]
+fn entity_accessors_answer_from_the_terminology() {
+    let ds = dataset(ENTITIES);
+    let o = ds.ontology().graph("default").open().unwrap();
+    let onto = &o.ontology;
+    let names = |cs: Vec<Class>| {
+        cs.iter()
+            .map(|c| c.as_str().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(onto.classes()), [ex("A"), ex("B"), ex("C"), ex("D")]);
+    assert_eq!(onto.object_properties().len(), 2);
+    let a = o.class(&ex("A")).unwrap();
+    assert_eq!(
+        onto.super_classes(&a),
+        vec![
+            class("B"),
+            ClassExpression::some(ObjectProperty::new(ex("p")), class("C"))
+        ]
+    );
+    assert_eq!(onto.sub_classes(class("B")), vec![class("A")]);
+    assert_eq!(onto.equivalent_classes(&a), vec![class("D")]);
+    assert_eq!(onto.disjoint_classes(class("B")), vec![class("C")]);
+    assert_eq!(onto.labels(&ex("A")).len(), 2);
+    let p = o.object_property(&ex("p")).unwrap();
+    assert_eq!(onto.object_property_domains(&p), vec![class("A")]);
+    assert_eq!(onto.object_property_ranges(&p), vec![class("B")]);
+    assert_eq!(
+        onto.super_object_properties(&p),
+        vec![ObjectProperty::new(ex("q")).into()]
+    );
+    assert_eq!(
+        onto.inverse_object_properties(ObjectProperty::new(ex("q"))),
+        vec![p.clone().into()]
+    );
+    assert_eq!(
+        onto.object_property_characteristics(&p),
+        vec![AxiomType::TransitiveObjectProperty]
+    );
+    let d = o.data_property(&ex("d")).unwrap();
+    assert_eq!(onto.data_property_domains(&d), vec![class("A")]);
+    assert!(onto.is_functional_data_property(&d));
+    assert_eq!(onto.data_property_ranges(&d).len(), 1);
+    // §2.5: an IRI not used as the asked kind is NotFound
+    assert!(matches!(o.class(&ex("p")), Err(Error::NotFound(_))));
+    assert!(matches!(o.class(&ex("nothing")), Err(Error::NotFound(_))));
+    // the class assertion of a class expression is read with the terminology
+    assert_eq!(onto.types(&Individual::named(ex("e"))).len(), 1);
+}
+
+#[test]
+fn instances_types_and_property_assertions_stream_from_the_store() {
+    let ds = dataset(ENTITIES);
+    let o = ds.ontology().graph("default").open().unwrap();
+    // assertions of named classes stay in the store
+    assert!(o.ontology.instances(class("A")).is_empty());
+    let mut instances = Vec::new();
+    o.instances(&Class::new(ex("A")), &opts(), |i, _| {
+        instances.push(i);
+        Ok(true)
+    })
+    .unwrap();
+    instances.sort();
+    assert_eq!(
+        instances,
+        vec![Individual::named(ex("a")), Individual::named(ex("c"))]
+    );
+    // a stopped stream stops
+    let mut first = 0;
+    o.instances(&Class::new(ex("A")), &opts(), |_, _| {
+        first += 1;
+        Ok(false)
+    })
+    .unwrap();
+    assert_eq!(first, 1);
+    let a = Individual::named(ex("a"));
+    let mut types = Vec::new();
+    o.types_of(&a, &opts(), |c, _| {
+        types.push(c);
+        Ok(true)
+    })
+    .unwrap();
+    types.sort();
+    assert_eq!(types, vec![class("A"), class("B")]);
+    let mut asserted = Vec::new();
+    o.property_assertions(&a, &opts(), |ax, _| {
+        asserted.push(ax.axiom_type());
+        Ok(true)
+    })
+    .unwrap();
+    asserted.sort();
+    assert_eq!(
+        asserted,
+        vec![
+            AxiomType::ObjectPropertyAssertion,
+            AxiomType::DataPropertyAssertion
+        ]
+    );
+    // an individual the store does not hold has none
+    let mut none = 0;
+    o.types_of(&Individual::named(ex("zz")), &opts(), |_, _| {
+        none += 1;
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(none, 0);
+}
+
+#[test]
+fn streams_read_only_the_graphs_of_the_ontology() {
+    let ds = dataset(&format!(
+        "GRAPH :g {{ {ENTITIES} }} GRAPH :other {{ :x a :A . }}"
+    ));
+    let o = ds.ontology().graph(&ex("g")).open().unwrap();
+    let mut instances = Vec::new();
+    o.instances(&Class::new(ex("A")), &opts(), |i, g| {
+        assert_eq!(o.graph_name(g), ex("g"));
+        instances.push(i);
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(instances.len(), 2, "{instances:?}");
+}
+
+#[test]
+fn the_scope_builds_reads_checks_and_edits() {
+    let ds = dataset(BASE);
+    let scope = ds.ontology().graph("default").imports(false);
+    assert_eq!(scope.request().imports, ImportMode::None);
+    let reports = scope.check(&[Profile::El]).unwrap();
+    assert_eq!(reports.len(), 1);
+    let done = scope
+        .edit(|e| {
+            e.remove(&some_ab())?
+                .add(Axiom::sub_class_of(class("B"), class("C")))?
+                .message("builder");
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(done.removed, 1);
+    assert_eq!(done.added, 1);
+    let o = scope.open().unwrap();
+    assert_eq!(o.ontology.super_classes(class("B")), vec![class("C")]);
+    // an axiom the forward mapping cannot write is refused before anything is written
+    let head = ds.head_commit().seq;
+    let bad = scope.edit(|e| {
+        e.add(Axiom::disjoint_classes([class("A")]))?;
+        Ok(())
+    });
+    assert!(matches!(bad, Err(Error::Invalid(_))), "{:?}", bad.err());
+    assert_eq!(ds.head_commit().seq, head);
+    // an invalid graph IRI is reported by the call that ends the scope
+    assert!(matches!(
+        ds.ontology().graph("not an iri").open(),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        ds.ontology()
+            .graph("default")
+            .at(At::Commit(1))
+            .edit(|_| Ok(())),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn entity_operations_answer_in_the_route_forms() {
+    let ds = dataset(ENTITIES);
+    let call = |op: &str, a: serde_json::Value| wire::call(&ds, op, &a, &opts());
+    let page = call(
+        "entities",
+        serde_json::json!({"kind": "Class,ObjectProperty", "limit": 3}),
+    )
+    .unwrap();
+    assert_eq!(page["total"], 6, "{page}");
+    assert_eq!(page["entities"].as_array().unwrap().len(), 3);
+    assert_eq!(page["next"], 3);
+    let a = call("entity", serde_json::json!({"iri": ex("A")})).unwrap();
+    assert_eq!(a["kinds"], serde_json::json!(["Class"]));
+    assert_eq!(
+        a["class"]["superClasses"].as_array().unwrap().len(),
+        2,
+        "{a}"
+    );
+    assert_eq!(a["class"]["instances"], serde_json::json!([]));
+    assert_eq!(a["labels"].as_array().unwrap().len(), 2);
+    let streamed = call(
+        "entity",
+        serde_json::json!({"iri": ex("A"), "assertions": true, "limit": 1}),
+    )
+    .unwrap();
+    assert_eq!(streamed["class"]["instances"].as_array().unwrap().len(), 1);
+    assert_eq!(streamed["truncated"], true);
+    let p = call(
+        "entity",
+        serde_json::json!({"iri": ex("p"), "kind": "ObjectProperty"}),
+    )
+    .unwrap();
+    assert_eq!(
+        p["objectProperty"]["characteristics"],
+        serde_json::json!(["TransitiveObjectProperty"])
+    );
+    assert_eq!(p["objectProperty"]["domains"][0]["expression"], ex("A"));
+    let i = call(
+        "entity",
+        serde_json::json!({"iri": ex("e"), "assertions": true}),
+    )
+    .unwrap();
+    assert_eq!(
+        i["namedIndividual"]["types"][0]["expression"]["type"], "ObjectHasValue",
+        "{i}"
+    );
+    for (a, not_found) in [
+        (serde_json::json!({"iri": ex("nothing")}), true),
+        (serde_json::json!({"iri": ex("p"), "kind": "Class"}), true),
+        (serde_json::json!({"iri": ex("A"), "kind": "Thing"}), false),
+        (serde_json::json!({}), false),
+    ] {
+        let r = call("entity", a.clone());
+        if not_found {
+            assert!(matches!(r, Err(Error::NotFound(_))), "{a}");
+        } else {
+            assert!(matches!(r, Err(Error::Invalid(_))), "{a}");
+        }
+    }
+    assert!(matches!(
+        call("entities", serde_json::json!({"kind": "Thing"})),
+        Err(Error::Invalid(_))
+    ));
+}

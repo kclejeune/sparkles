@@ -726,6 +726,16 @@ python = "Dataset.ontology.axioms"
 jvm = "SparklesOnt.axioms"
 node = "Dataset.ontology.axioms"
 
+["ontology.entities"]
+python = "Dataset.ontology.entities"
+jvm = "SparklesOnt.entities"
+node = "Dataset.ontology.entities"
+
+["ontology.entity"]
+python = "Dataset.ontology.entity"
+jvm = "SparklesOnt.entity"
+node = "Dataset.ontology.entity"
+
 ["ontology.check"]
 python = "Dataset.ontology.check"
 jvm = "SparklesOnt.check"
@@ -740,6 +750,11 @@ node = "Dataset.ontology.diff"
 python = "Dataset.ontology.edit"
 jvm = "SparklesOnt.edit"
 node = "Dataset.ontology.edit"
+
+["ontology.remove_entity"]
+python = "Dataset.ontology.remove_entity"
+jvm = "SparklesOnt.removeEntity"
+node = "Dataset.ontology.removeEntity"
 
 ["ontology.summary"]
 python = "Dataset.ontology.summary"

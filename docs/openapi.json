@@ -35738,6 +35738,238 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/entities": {
+      "get": {
+        "description": "The entities the ontology declares or, in a lenient read, types by their use, with their kinds, in IRI order and one page at a time.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "listOntologyEntities",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "Also read the materialized inferences while the dataset has them.",
+            "in": "query",
+            "name": "inferences",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Entity kinds, comma separated, such as `Class,ObjectProperty` (all kinds by default).",
+            "in": "query",
+            "name": "kind",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most entities listed, from 1 to 10,000 (100 by default).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The entities skipped.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "One page of entities."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Ontology entities",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/entity": {
+      "get": {
+        "description": "What the ontology says about one entity: its kinds, labels and annotations, and for each kind the superclasses, subclasses, equivalent and disjoint classes, keys and instances of a class, the domains, ranges, hierarchy, inverses and characteristics of a property, the definitions of a datatype, and the types, equalities and property assertions of an individual. Each expression comes in functional-style syntax and in its JSON form. With `assertions=true`, the instances of a class and the types and property assertions of an individual also come from the assertions the store holds, at most `limit` of each. An IRI that the ontology neither declares nor uses as an entity, or as the `kind` asked for, is `404`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "getOntologyEntity",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "Also read the materialized inferences while the dataset has them, so that the superclasses include the materialized closure.",
+            "in": "query",
+            "name": "inferences",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The entity's IRI.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The one entity kind answered, such as `Class` (every kind the IRI has by default).",
+            "in": "query",
+            "name": "kind",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Also read the instances, types and property assertions the store holds.",
+            "in": "query",
+            "name": "assertions",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The most entries of each streamed list, from 1 to 10,000 (100 by default).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The entity."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Ontology entity",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/openapi.json": {
       "get": {
         "externalDocs": {

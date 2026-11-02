@@ -33,7 +33,9 @@ import {
   factory,
   ConflictError,
   InvalidInputError,
+  NotFoundError,
   QueryTimeoutError,
+  owl,
 } from '../dist/index.js';
 import { native } from '../dist/native.js';
 const temp = () => mkdtemp(join(tmpdir(), 'sparkles-node-admin-'));
@@ -912,4 +914,91 @@ test('the ontology handle reads, checks, edits and diffs axioms', async (t) => {
       await new Promise((r) => setTimeout(r, 60));
     }
   }, QueryTimeoutError);
+});
+
+test('the ontology handle lists entities and answers entity accessors', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :o a owl:Ontology . :A a owl:Class . :B a owl:Class .
+      :p a owl:ObjectProperty . :p rdfs:domain :A .
+      :A rdfs:subClassOf :B . :A rdfs:label "A" . :a a :A . }`);
+  const onto = ds.ontology;
+  const classes = await onto.entities({ kind: ['Class'] });
+  assert.deepEqual(
+    classes.entities.map((e) => e.iri),
+    ['http://ex.org/A', 'http://ex.org/B'],
+  );
+  const a = await onto.entity('http://ex.org/A');
+  assert.deepEqual(a.kinds, ['Class']);
+  assert.deepEqual(
+    a.class.superClasses.map((c) => c.expression),
+    ['http://ex.org/B'],
+  );
+  assert.equal(a.labels[0]['@value'], 'A');
+  assert.deepEqual(a.class.instances, []);
+  const streamed = await onto.entity('http://ex.org/A', { assertions: true });
+  assert.deepEqual(
+    streamed.class.instances.map((i) => i.expression),
+    ['http://ex.org/a'],
+  );
+  const p = await onto.entity(factory.namedNode('http://ex.org/p'), { kind: 'ObjectProperty' });
+  assert.deepEqual(
+    p.objectProperty.domains.map((c) => c.expression),
+    ['http://ex.org/A'],
+  );
+  await assert.rejects(onto.entity('http://ex.org/nothing'), NotFoundError);
+});
+
+test('the owl constructors build axioms an edit takes', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  const EX = 'http://ex.org/';
+  const ax = owl.SubClassOf(
+    owl.Class(EX + 'Professor'),
+    owl.ObjectSomeValuesFrom(owl.ObjectProperty(EX + 'teaches'), owl.Class(EX + 'Course')),
+    { annotations: [owl.Annotation('http://www.w3.org/2000/01/rdf-schema#comment', 'why')] },
+  );
+  assert.deepEqual(ax, {
+    type: 'SubClassOf',
+    subClass: EX + 'Professor',
+    superClass: { type: 'ObjectSomeValuesFrom', property: EX + 'teaches', class: EX + 'Course' },
+    annotations: [
+      { property: 'http://www.w3.org/2000/01/rdf-schema#comment', value: { '@value': 'why' } },
+    ],
+  });
+  const added = [
+    ax,
+    owl.Declaration(owl.DataProperty(EX + 'age')),
+    owl.DataPropertyRange(
+      EX + 'age',
+      owl.DatatypeRestriction(owl.XSD + 'integer', [owl.XSD + 'minInclusive', 0]),
+    ),
+    owl.SubObjectPropertyOf(
+      owl.ObjectPropertyChain(EX + 'p', owl.ObjectInverseOf(EX + 'q')),
+      EX + 'r',
+    ),
+    owl.HasKey(EX + 'Professor', [], [EX + 'age']),
+    owl.DataPropertyAssertion(EX + 'age', EX + 'ann', 42),
+    owl.AnnotationAssertion(
+      'http://www.w3.org/2000/01/rdf-schema#seeAlso',
+      EX + 'ann',
+      owl.IRI(EX + 'bob'),
+    ),
+    owl.DisjointClasses([EX + 'Professor', owl.ObjectComplementOf(EX + 'Person')]),
+  ];
+  const done = await ds.ontology.edit({ add: added });
+  assert.ok(Number(done.added) >= added.length);
+  const page = await ds.ontology.axiomPage({ limit: 1000 });
+  const ofn = page.axioms.map((a) => a.ofn);
+  assert.ok(
+    ofn.some((s) => s.includes('ObjectPropertyChain(')),
+    ofn.join('\n'),
+  );
+  assert.ok(
+    ofn.some((s) => s.includes('xsd:minInclusive "0"^^xsd:integer')),
+    ofn.join('\n'),
+  );
+  assert.throws(() => owl.Declaration(EX + 'A'), TypeError);
+  assert.throws(() => owl.ObjectMinCardinality(-1, EX + 'p'), TypeError);
 });

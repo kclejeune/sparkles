@@ -493,3 +493,67 @@ async fn inferred_views_say_what_they_read() {
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+#[tokio::test]
+async fn entity_routes_answer_the_accessors() {
+    let s = server();
+    let r = get(&s.app, "/$/ontology/t/entities?kind=Class").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["total"], 3, "{}", r.text());
+    let r = get(&s.app, "/$/ontology/t/entities?kind=Thing").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let prof = enc("http://ex.org/Professor");
+    let r = get(&s.app, &format!("/$/ontology/t/entity?iri={prof}")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["kinds"], json!(["Class"]));
+    assert_eq!(
+        j["class"]["superClasses"].as_array().unwrap().len(),
+        2,
+        "{j}"
+    );
+    assert_eq!(j["class"]["instances"], json!([]));
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/t/entity?iri={prof}&assertions=true"),
+    )
+    .await;
+    assert_eq!(
+        r.json()["class"]["instances"][0]["expression"],
+        "http://ex.org/ada"
+    );
+    let r = get(
+        &s.app,
+        &format!(
+            "/$/ontology/t/entity?iri={}&assertions=true",
+            enc("http://ex.org/ada")
+        ),
+    )
+    .await;
+    // an individual that only the stored assertions use is found by them
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["kinds"], json!(["NamedIndividual"]), "{j}");
+    assert_eq!(
+        j["namedIndividual"]["types"][0]["expression"],
+        "http://ex.org/Professor"
+    );
+    assert_eq!(
+        j["namedIndividual"]["assertions"][0]["type"],
+        "ObjectPropertyAssertion"
+    );
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/t/entity?iri={}", enc("http://ex.org/nobody")),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = get(
+        &s.app,
+        &format!("/$/ontology/t/entity?iri={prof}&kind=ObjectProperty"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = get(&s.app, "/$/ontology/t/entity").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
