@@ -456,9 +456,15 @@ run_remote() {
   rsh "cat > $s/run.sh" << EOF
 #!/usr/bin/env bash
 set -uo pipefail
-# The share's process group is recorded before any setup, so a cleanup can stop it at any
-# point. A cleanup writes cancel before it reads pid, and this checks cancel after writing
-# pid, so either the cleanup sees the pid or the share sees the request.
+# The share leads its own process group, so its pid names the group even after it exits
+# and a child lives on. setsid without a fork keeps the pid when the shell is not a group
+# leader already, as under a terminal service.
+if [ "\$(ps -o pgid= -p \$\$ | tr -d ' ')" != "\$\$" ] && command -v setsid > /dev/null; then
+  exec setsid bash "\$0"
+fi
+# The group is recorded before any setup, so a cleanup can stop it at any point. A cleanup
+# writes cancel before it reads pid, and this checks cancel after writing pid, so either
+# the cleanup sees the pid or the share sees the request.
 echo \$\$ > $s/pid
 [ -e $s/cancel ] && exit 0
 cd $root
@@ -569,37 +575,37 @@ remote_cleanup() {
     fi
     return 0
   fi
-  if rsh "$(stop_share)" < /dev/null; then
+  if rsh "bash -s" <<< "$(stop_share)"; then
     rm -f "$d/remote-locked"
   else
     echo "test-partitioned.sh: could not confirm that the share on $h stopped; its directory and $root.share-lock stay" >&2
   fi
 }
 
-# The remote shell code that stops a share and releases its directory. It asks the share
-# to cancel, waits up to 30 s for a launched share to record its process group, sends TERM
-# to the group, then KILL after 30 s, and removes the directory and the lock only once no
-# process of the group is left. It exits 1, keeping both, when the group survives.
+# The bash program that stops a share and releases its directory, which the remote side
+# reads with `bash -s`, whatever its login shell. It asks the share to cancel, waits up to
+# 30 s for a launched share to record its process group, sends TERM to the group, then
+# KILL after 30 s, and removes the directory and the lock only once no process of the group
+# is left, whether or not its leader still runs. It exits 1, keeping both, when the group
+# survives. STOP_SHARE_WAIT shortens the 30 s waits for the script's tests.
 stop_share() {
-  local s=$root/.artifacts/test-share
+  local s=$root/.artifacts/test-share w=${STOP_SHARE_WAIT:-30}
   cat << EOF
 s=$s
 if [ -d \$s ]; then
   touch \$s/cancel
   i=0
-  while [ -e \$s/launched ] && [ ! -s \$s/pid ] && [ \$i -lt 30 ]; do sleep 1; i=\$((i + 1)); done
+  while [ -e \$s/launched ] && [ ! -s \$s/pid ] && [ \$i -lt $w ]; do sleep 1; i=\$((i + 1)); done
   if [ -e \$s/launched ] && [ ! -s \$s/pid ]; then echo 'the share launched but recorded no process'; exit 1; fi
   if [ -s \$s/pid ]; then
-    pg=\$(ps -o pgid= -p "\$(cat \$s/pid)" 2> /dev/null | tr -d ' ')
-    if [ -n "\$pg" ]; then
-      kill -TERM -- "-\$pg" 2> /dev/null
-      i=0
-      while kill -0 -- "-\$pg" 2> /dev/null && [ \$i -lt 30 ]; do sleep 1; i=\$((i + 1)); done
-      kill -KILL -- "-\$pg" 2> /dev/null
-      i=0
-      while kill -0 -- "-\$pg" 2> /dev/null && [ \$i -lt 10 ]; do sleep 1; i=\$((i + 1)); done
-      if kill -0 -- "-\$pg" 2> /dev/null; then echo "process group \$pg survived KILL"; exit 1; fi
-    fi
+    pg=\$(cat \$s/pid)
+    kill -TERM -- "-\$pg" 2> /dev/null
+    i=0
+    while kill -0 -- "-\$pg" 2> /dev/null && [ \$i -lt $w ]; do sleep 1; i=\$((i + 1)); done
+    kill -KILL -- "-\$pg" 2> /dev/null
+    i=0
+    while kill -0 -- "-\$pg" 2> /dev/null && [ \$i -lt 10 ]; do sleep 1; i=\$((i + 1)); done
+    if kill -0 -- "-\$pg" 2> /dev/null; then echo "process group \$pg survived KILL"; exit 1; fi
   fi
 fi
 if [ -z '$keep' ] && [ -e $root/.sparkles-test-share ]; then rm -rf $root; fi
@@ -620,7 +626,7 @@ cleanup() {
     [ -f "$f" ] || continue
     h=$(cat "$f")
     # shellcheck disable=SC2029
-    ssh "${ssh_opts[@]}" "$h" "$(stop_share)" < /dev/null > /dev/null 2>&1 ||
+    ssh "${ssh_opts[@]}" "$h" "bash -s" <<< "$(stop_share)" > /dev/null 2>&1 ||
       echo "test-partitioned.sh: could not confirm that the share on $h stopped; check it and remove $root.share-lock there" >&2
     rm -f "$f"
   done
