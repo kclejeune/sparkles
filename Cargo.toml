@@ -140,6 +140,12 @@ opt-level = 1
 debug-assertions = true
 overflow-checks = true
 
+# Experiment: basic optimization for sparkles-core's tests (docs/PERFORMANCE-EXPERIMENTS.md).
+[profile.dev.package.sparkles-core]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
+
 # The formatter's browser build (scripts/build-fmt-wasm.sh, nix/fmt-wasm.nix) is built for
 # size: opt-level "z", one codegen unit, fat LTO, no debug info, symbols stripped.
 [profile.fmt-wasm]
