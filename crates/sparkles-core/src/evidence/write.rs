@@ -1146,6 +1146,33 @@ impl<'a> Reads<'a> {
         Ok((out, more))
     }
 
+    /// The number of triples whose subject is `s` in `g`, counting at most `limit`.
+    pub fn subject_triples(&mut self, s: &str, g: &str, limit: usize) -> Result<usize> {
+        let (Some(s), Some(g)) = (self.id(s)?, self.id(g)?) else {
+            return Ok(0);
+        };
+        let mut n = 0;
+        self.preparation
+            .scan(self.snap, Perm::Gspo, &[g.0, s.0], |_| {
+                n += 1;
+                Ok(n < limit)
+            })?;
+        Ok(n)
+    }
+
+    /// Whether `g` holds any quad.
+    pub fn graph_nonempty(&mut self, g: &str) -> Result<bool> {
+        let Some(g) = self.id(g)? else {
+            return Ok(false);
+        };
+        let mut found = false;
+        self.preparation.scan(self.snap, Perm::Gspo, &[g.0], |_| {
+            found = true;
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
     /// Whether the quad `s p o g` is in the snapshot. `o` is a ground term.
     pub fn contains(&mut self, s: &str, p: &str, o: &Term, g: &str) -> Result<bool> {
         let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {

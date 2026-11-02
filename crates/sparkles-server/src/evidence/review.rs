@@ -6,8 +6,8 @@
 //! policy's decisions, supports and output graphs and read access to each target and,
 //! for an acceptance, to the target's evidence, decided as `POST /{ds}/claims/resolve`
 //! decides it. A withdrawal needs update grants on each claim's graph and on the output
-//! graph, and read grants on the decisions, supports and output graphs, of every policy
-//! whose evidence boundary holds that graph. A record the caller cannot read answers
+//! graph, and read grants on the decisions, supports and output graphs, of every review
+//! policy. A record the caller cannot read answers
 //! as a missing one. The caller's credential is checked again right before the commit
 //! publishes, as for `POST /{ds}/claims`.
 

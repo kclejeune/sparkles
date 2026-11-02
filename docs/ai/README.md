@@ -306,7 +306,9 @@ and labelled, as the policy says. `POST /{ds}/claims/withdraw` and
 their supports without inventing a contrary claim. Both operations report the supports
 and projected triples they changed. A detach and new protection of a projection's graph
 makes later reviews under its policy refuse with `projection-unavailable`, because its
-supports no longer authenticate. Identity proposals and reviewed resolution maps are
+supports no longer authenticate. Readers of an output graph read it under their own
+grants, so an administrator gives them read access to the policy's evidence boundary.
+Identity proposals and reviewed resolution maps are
 not available, and neither are reviews through the bindings or MCP.
 
 The Rust controlled permission helper can prepare graph, predicate and class masks

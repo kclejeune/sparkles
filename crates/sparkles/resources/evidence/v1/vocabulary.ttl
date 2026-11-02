@@ -89,6 +89,8 @@ ev:decision a rdf:Property ; rdfs:comment "The review decision that admitted an 
 ev:output a rdf:Property ; rdfs:comment "The projection graph a support or projection writes." .
 ev:supportedTriple a rdf:Property ; rdfs:comment "The projected triple an acceptance support owns." .
 ev:conflictsWith a rdf:Property ; rdfs:comment "A contrary link or claim that a labelled projection admitted its support against." .
+ev:withdraws a rdf:Property ; rdfs:comment "The claim occurrence a withdrawal withdraws." .
+ev:projectionNote a rdf:Property ; rdfs:comment "Why an acceptance did not project its claim under its policy." .
 ev:Withdrawal a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "The withdrawal of a claim occurrence's admission; it makes no contrary claim." .
 ev:Projection a rdfs:Class ; rdfs:subClassOf prov:Entity ; rdfs:comment "A review policy's projection under one policy version, with its conflict mode and the protections it was written under." .
 ev:conflictMode a rdf:Property ; rdfs:comment "Whether a projection refuses conflicts or admits them labelled; neither is a consistent logical closure." .

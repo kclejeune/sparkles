@@ -74,7 +74,8 @@ its exact target, target digest, policy, policy version, disposition and, throug
 `ev:supersedes`, the decision it replaces. An `ev:AcceptanceSupport` names the admitted
 claim, its decision, the policy, the output graph and the `ev:supportedTriple` it owns,
 and `ev:conflictsWith` names contrary records a labelled projection admitted it against.
-An `ev:Withdrawal` names a withdrawn claim and its `prov:invalidatedAtTime`. An
+An `ev:Withdrawal` names the claim it `ev:withdraws` and its `prov:invalidatedAtTime`. A
+decision that accepts without projecting records why as `ev:projectionNote`. An
 `ev:Projection` names a policy version, its output graph, its `ev:conflictMode` of
 `ev:Refuse` or `ev:AdmitLabelled`, and the protection nonces of the decisions, supports
 and output graphs it was written under. Whether a support is live is derived from the

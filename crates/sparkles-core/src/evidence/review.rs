@@ -189,7 +189,8 @@ fn mint(
 
 /// The decision `d` of the operation `operation` by `principal` under the policy
 /// `policy` at `version`, in `graph`. Its identity is minted from the target, the
-/// policy and the operation, so a replayed operation names the same decision.
+/// policy and the operation, so a replayed operation names the same decision. An
+/// acceptance that does not project its claim records why as `ev:projectionNote`.
 #[allow(clippy::too_many_arguments)]
 pub fn decision_record(
     dataset: Uuid,
@@ -198,6 +199,7 @@ pub fn decision_record(
     policy: &str,
     version: u32,
     d: &DecisionInput,
+    projection_note: Option<&str>,
     graph: &NamedNode,
     control: &Control,
 ) -> Result<PlannedRecord> {
@@ -217,6 +219,9 @@ pub fn decision_record(
     r.add(ev("disposition"), d.disposition.iri());
     if let Some(prior) = &d.supersedes {
         r.add(ev("supersedes"), prior.clone());
+    }
+    if let Some(note) = projection_note {
+        r.add(ev("projectionNote"), string(note));
     }
     r.add(prov("wasAttributedTo"), principal.clone());
     planned(&d.key, RecordKind::ReviewDecision, r, graph, control)
@@ -299,7 +304,7 @@ pub fn withdrawal_record(
         control,
     )?;
     let mut r = Record::new(&iri, RecordKind::Withdrawal);
-    r.add(ev("target"), w.target.clone());
+    r.add(ev("withdraws"), w.target.clone());
     r.add(ev("targetDigest"), string(&w.target_digest.to_string()));
     r.add(prov("wasAttributedTo"), principal.clone());
     planned(&w.key, RecordKind::Withdrawal, r, graph, control)

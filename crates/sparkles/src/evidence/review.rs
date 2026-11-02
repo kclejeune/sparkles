@@ -193,6 +193,10 @@ fn incomplete(what: &str) -> Error {
 /// The derived state an operation reads at its head.
 struct State<'a> {
     reads: Reads<'a>,
+    /// The caller's view of the head when its access hides triples.
+    seen: Option<Reads<'a>>,
+    /// The proposal graphs, where claims and their withdrawals are.
+    claim_graphs: Vec<G>,
     /// Decisions this operation supersedes.
     superseded: BTreeSet<NamedNode>,
     /// Claims this operation withdraws.
@@ -217,6 +221,27 @@ impl State<'_> {
             return Err(incomplete(what));
         }
         Ok(v)
+    }
+
+    /// Up to [`MAX_EVIDENCE`] subjects of `?s p o` in `g`, and whether more exist. The
+    /// caller resolves them in order before it reports the bound, so that a hidden
+    /// record is refused before a count that includes it is reported.
+    fn candidates(&mut self, p: &str, o: &Term, g: &G) -> Result<(Vec<NamedNode>, bool)> {
+        self.reads.subjects_up_to(p, o, g.0.as_str(), MAX_EVIDENCE)
+    }
+
+    /// Refuse as `key`'s unavailable target unless every triple of `s` in `g` is in the
+    /// caller's view, which hides none when its access has no triple protections.
+    fn visible(&mut self, key: &str, s: &NamedNode, g: &NamedNode) -> Result<()> {
+        let Some(seen) = self.seen.as_mut() else {
+            return Ok(());
+        };
+        const LIMIT: usize = 1 << 20;
+        let all = self.reads.subject_triples(s.as_str(), g.as_str(), LIMIT)?;
+        if seen.subject_triples(s.as_str(), g.as_str(), LIMIT)? != all {
+            return Err(unavailable(key));
+        }
+        Ok(())
     }
 
     fn iri(&mut self, s: &NamedNode, p: &str, g: &G) -> Result<Option<NamedNode>> {
@@ -291,7 +316,7 @@ impl State<'_> {
     /// The authenticated withdrawal of `claim` in its graph `g`, if any.
     fn withdrawal(&mut self, claim: &NamedNode, g: &G) -> Result<Option<NamedNode>> {
         for w in self.subjects(
-            &ev("target"),
+            &ev("withdraws"),
             &Term::NamedNode(claim.clone()),
             g,
             "withdrawals",
@@ -303,12 +328,14 @@ impl State<'_> {
         Ok(None)
     }
 
-    /// Whether `claim`, found in one of `boundary`, is withdrawn, also by this operation.
-    fn is_withdrawn(&mut self, claim: &NamedNode, boundary: &[G]) -> Result<bool> {
+    /// Whether `claim` is withdrawn in one of the proposal graphs, also by this
+    /// operation.
+    fn is_withdrawn(&mut self, claim: &NamedNode) -> Result<bool> {
         if self.withdrawn.contains(claim) {
             return Ok(true);
         }
-        for g in boundary {
+        for g in self.claim_graphs.clone() {
+            let g = &g;
             if self.withdrawal(claim, g)?.is_some() {
                 return Ok(true);
             }
@@ -332,7 +359,7 @@ impl State<'_> {
         let Some(claim) = self.iri(s, &ev("claim"), &p.supports)? else {
             return Ok(false);
         };
-        Ok(!self.is_withdrawn(&claim, &p.boundary)?)
+        Ok(!self.is_withdrawn(&claim)?)
     }
 
     /// The supported triple of the support `s` when it projects into `p.output`.
@@ -394,7 +421,8 @@ impl State<'_> {
 
     /// Refuse when a projection record of the policy was written under protections
     /// that are no longer the current ones, so that its supports no longer
-    /// authenticate while its output still holds their triples. Returns whether the
+    /// authenticate while its output still holds their triples, or when the output
+    /// holds triples and no projection record of the policy exists. Returns whether the
     /// record of `p`'s version exists with the content `planned` would give it.
     fn check_projection(
         &mut self,
@@ -402,18 +430,21 @@ impl State<'_> {
         planned: Option<&sparkles_core::evidence::write::PlannedRecord>,
     ) -> Result<bool> {
         let policy = Term::NamedNode(p.policy_iri.clone());
-        let records = self.subjects(&ev("reviewPolicy"), &policy, &p.supports, "projections")?;
+        let class = Term::NamedNode(NamedNode::new_unchecked(ev("Projection")));
+        let records = self.subjects(RDF_TYPE, &class, &p.supports, "projections")?;
         let current = p.nonces();
         let mut existing = false;
+        let mut found = false;
         for r in records {
             if !self.reads.contains(
                 r.as_str(),
-                RDF_TYPE,
-                &Term::NamedNode(NamedNode::new_unchecked(ev("Projection"))),
+                &ev("reviewPolicy"),
+                &policy,
                 p.supports.0.as_str(),
             )? {
                 continue;
             }
+            found = true;
             let mut recorded = Vec::new();
             for predicate in rv::NONCE_PREDICATES {
                 recorded.push(
@@ -447,6 +478,11 @@ impl State<'_> {
                 }
                 existing = true;
             }
+        }
+        // An output that holds triples without a verifiable projection lost its
+        // lineage, as when the supports graph was detached and cleared.
+        if !found && self.reads.graph_nonempty(p.output.0.as_str())? {
+            return Err(projection_unavailable(&p.name));
         }
         Ok(existing)
     }
@@ -667,17 +703,15 @@ impl Evidence<'_, '_> {
     ) -> Result<Vec<NamedNode>> {
         let mut contrary = Vec::new();
         for g in boundary {
-            for link in state.subjects(
-                &ev("target"),
-                &Term::NamedNode(target.clone()),
-                g,
-                "evidence links",
-            )? {
+            let (candidates, more) =
+                state.candidates(&ev("target"), &Term::NamedNode(target.clone()), g)?;
+            for link in candidates {
                 if !state.typed(&link, g, RecordKind::EvidenceLink)? {
                     continue;
                 }
                 self.record(key, &link, &[RecordKind::EvidenceLink])
                     .map_err(|e| hidden(key, e))?;
+                state.visible(key, &link, &g.0)?;
                 if state
                     .iri(&link, &ev("relation"), g)?
                     .is_some_and(|r| r.as_str() == ev("Contradicts"))
@@ -690,6 +724,7 @@ impl Evidence<'_, '_> {
                 let found = self
                     .record(key, &reference, &[RecordKind::EvidenceRef])
                     .map_err(|e| hidden(key, e))?;
+                state.visible(key, &reference, &found.graph)?;
                 let rg: G = (found.graph.clone(), None);
                 if let Some(fact) = stored_fact_of(state, &reference, &rg)? {
                     self.fact(key, &fact).map_err(|e| hidden(key, e))?;
@@ -700,9 +735,13 @@ impl Evidence<'_, '_> {
                     ("passage", RecordKind::Passage),
                 ] {
                     if let Some(r) = state.iri(&reference, &ev(p), &rg)? {
-                        self.record(key, &r, &[kind]).map_err(|e| hidden(key, e))?;
+                        let named = self.record(key, &r, &[kind]).map_err(|e| hidden(key, e))?;
+                        state.visible(key, &r, &named.graph)?;
                     }
                 }
+            }
+            if more {
+                return Err(incomplete("the evidence links of a target"));
             }
         }
         Ok(contrary)
@@ -1029,10 +1068,15 @@ pub fn review(
     let branch = store.branch_id();
     let head = store.snapshot();
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
+    let masked = caller_view(access.as_ref(), &head, &preparation)?;
     // The preconditions read the stored decisions; this operation's supersessions
     // count once they have all been checked.
     let mut state = State {
         reads: Reads::new(&preparation, &head),
+        seen: masked
+            .as_ref()
+            .map(|v| Reads::new(&preparation, v.snapshot())),
+        claim_graphs: claim_graphs(&settings, &capability),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
     };
@@ -1045,6 +1089,7 @@ pub fn review(
             policy_name,
             policy_version,
             d,
+            None,
             &p.decisions.0,
             control,
         )?
@@ -1074,6 +1119,26 @@ pub fn review(
                         .record(&support, std::slice::from_ref(&p.supports))?,
                     sparkles_core::evidence::write::ExistingRecord::Present { .. }
                 );
+                // the first answer's metadata, from the records it wrote
+                let not_projected = state
+                    .text(&iri, &ev("projectionNote"), &p.decisions)?
+                    .and_then(|n| NOTES.iter().copied().find(|k| *k == n));
+                let conflicts = if present {
+                    let (v, _) = state.reads.objects_up_to(
+                        support.as_str(),
+                        &ev("conflictsWith"),
+                        p.supports.0.as_str(),
+                        MAX_EVIDENCE,
+                    )?;
+                    v.into_iter()
+                        .filter_map(|t| match t {
+                            Term::NamedNode(n) => Some(n),
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 out.push(Decided {
                     key: d.key.clone(),
                     iri,
@@ -1081,8 +1146,8 @@ pub fn review(
                     disposition: d.disposition,
                     supersedes: d.supersedes.clone(),
                     support: present.then_some(support),
-                    not_projected: None,
-                    conflicts: Vec::new(),
+                    not_projected,
+                    conflicts,
                 });
             }
             return Ok(Reviewed {
@@ -1117,6 +1182,8 @@ pub fn review(
         read,
         count: 0,
     };
+    let retained = crate::access::Preparation::new(control.clone(), super::resolve::MEMORY_BYTES)?;
+    let mut held = Vec::new();
     let mut pending = Vec::with_capacity(decisions.len());
     for d in decisions {
         control.check()?;
@@ -1155,6 +1222,9 @@ pub fn review(
         }
         let is_claim = target.kind == RecordKind::Claim;
         let accepted = d.disposition == Disposition::Accepted;
+        if accepted {
+            state.visible(&d.key, &d.target, &tg.0)?;
+        }
         if accepted && is_claim && state.withdrawal(&d.target, &tg)?.is_some() {
             return Err(managed(
                 ManagedErrorKind::TargetWithdrawn,
@@ -1174,14 +1244,14 @@ pub fn review(
         if accepted && is_claim {
             let facts = claim_facts(&mut state, &d.target, &tg)?;
             item.not_projected = if !facts.positive {
-                Some("the claim is not positive")
+                Some(NOTES[0])
             } else if !facts
                 .kind
                 .is_some_and(|k| policy.admitted_kinds.contains(&k))
             {
-                Some("the policy does not admit the claim's kind")
+                Some(NOTES[1])
             } else if facts.proposition.is_none() {
-                Some("the claim reifies no ground triple")
+                Some(NOTES[2])
             } else {
                 let mut missing = None;
                 for predicate in &policy.required_scope {
@@ -1192,7 +1262,7 @@ pub fn review(
                         1,
                     )?;
                     if v.is_empty() {
-                        missing = Some("the claim lacks a scope the policy requires");
+                        missing = Some(NOTES[3]);
                         break;
                     }
                 }
@@ -1203,7 +1273,8 @@ pub fn review(
                 // can change the answer, so the reviewer must be able to read it
                 let tt = Term::Triple(Box::new(facts.proposition.clone().expect("checked")));
                 for g in &p.boundary {
-                    for other in state.subjects(RDF_REIFIES, &tt, g, "claims")? {
+                    let (candidates, more) = state.candidates(RDF_REIFIES, &tt, g)?;
+                    for other in candidates {
                         if other == d.target || !state.typed(&other, g, RecordKind::Claim)? {
                             continue;
                         }
@@ -1213,15 +1284,29 @@ pub fn review(
                         evidence
                             .record(&d.key, &other, &[RecordKind::Claim])
                             .map_err(|e| hidden(&d.key, e))?;
+                        state.visible(&d.key, &other, &g.0)?;
                         if state.withdrawal(&other, g)?.is_none() {
                             item.negative_claims.push(other);
                         }
                     }
+                    if more {
+                        return Err(incomplete("the claims of a proposition"));
+                    }
                 }
+            }
+            if let Some(t) = &facts.proposition {
+                // the proposition is kept until the commit, and copied for its support
+                // and output changes
+                let bytes = (t.to_string().len() as u64).saturating_mul(4);
+                held.push(
+                    retained
+                        .reserve(bytes)
+                        .map_err(|_| incomplete("the propositions of the acceptances"))?,
+                );
             }
             item.facts = Some(facts);
         } else if accepted {
-            item.not_projected = Some("only claims are projected");
+            item.not_projected = Some(NOTES[4]);
         }
         pending.push(item);
     }
@@ -1286,6 +1371,9 @@ pub fn review(
     let mut touched: Vec<Triple> = Vec::new();
     let mut owned_now: HashSet<Triple> = HashSet::new();
     for ((d, item), found) in decisions.iter().zip(&pending).zip(conflicts) {
+        let note = item
+            .not_projected
+            .filter(|_| d.disposition == Disposition::Accepted);
         let record = rv::decision_record(
             main.dataset_id(),
             &options.principal,
@@ -1293,6 +1381,7 @@ pub fn review(
             policy_name,
             policy_version,
             d,
+            note,
             &p.decisions.0,
             control,
         )?;
@@ -1301,7 +1390,14 @@ pub fn review(
         // the supports of the superseded decision end with it
         if let Some(prior) = &d.supersedes {
             for s in state.supports_by(&ev("decision"), prior, &p)? {
-                if let Some(t) = state.supported(&s, &p)? {
+                let Some(t) = state.supported(&s, &p)? else {
+                    continue;
+                };
+                // live apart from this operation's supersessions
+                let mut superseded = std::mem::take(&mut state.superseded);
+                let before = state.live(&s, &p);
+                std::mem::swap(&mut state.superseded, &mut superseded);
+                if before? {
                     changed.supports_ended.push(s);
                     touched.push(t);
                 }
@@ -1370,10 +1466,12 @@ pub fn review(
         batch.graphs.dedup();
     }
     let changes = output_changes(&mut state, &p, touched, &owned_now, &mut changed)?;
+    check_identities(&mut state, &batch, &records, &skip)?;
     drop(state);
     let committed = publish(
         main, logical, capability, if_head, &batch, &skip, &changes, options, control,
     )?;
+    drop(held);
     Ok(Reviewed {
         operation: batch.operation_iri.clone(),
         committed: committed.committed,
@@ -1384,6 +1482,76 @@ pub fn review(
         changed,
         preview: committed.preview,
     })
+}
+
+/// The reasons an acceptance does not project its claim, as `ev:projectionNote` records
+/// them.
+const NOTES: [&str; 5] = [
+    "the claim is not positive",
+    "the policy does not admit the claim's kind",
+    "the claim reifies no ground triple",
+    "the claim lacks a scope the policy requires",
+    "only claims are projected",
+];
+
+/// The caller's controlled view of `head` when its access hides triples, `None` when
+/// the unmasked head shows exactly what it may read in a readable graph.
+fn caller_view(
+    access: Option<&Arc<GraphAccess>>,
+    head: &Arc<crate::store::Snapshot>,
+    preparation: &crate::access::Preparation,
+) -> Result<Option<crate::access::PreparedView>> {
+    match access.filter(|a| a.hides_triples()) {
+        None => Ok(None),
+        Some(a) => a
+            .masked_controlled(head, preparation)
+            .map(Some)
+            .map_err(|e| match e {
+                Error::Unsupported(m) => managed(ManagedErrorKind::IncompleteEvidence, m),
+                e => e,
+            }),
+    }
+}
+
+/// The proposal graphs of `settings`, where claims and their withdrawals are.
+fn claim_graphs(settings: &Settings, capability: &ManagedWrite) -> Vec<G> {
+    settings
+        .proposals
+        .iter()
+        .filter_map(|g| NamedNode::new(g.as_str()).ok())
+        .map(|g| {
+            let n = capability.protection(g.as_str());
+            (g, n)
+        })
+        .collect()
+}
+
+/// Refuse when a record identity the operation mints already has content in a record
+/// graph, unless `skip` leaves it out as an equal authenticated record, so that content
+/// planted under a predictable identity is never authenticated by a later write.
+fn check_identities(
+    state: &mut State<'_>,
+    batch: &Batch,
+    records: &[G],
+    skip: &[bool],
+) -> Result<()> {
+    use sparkles_core::evidence::write::ExistingRecord;
+    for (i, r) in batch.records.iter().enumerate() {
+        if skip.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        if !matches!(state.reads.record(&r.iri, records)?, ExistingRecord::Absent) {
+            return Err(managed(
+                ManagedErrorKind::ImmutableRecordConflict,
+                format!(
+                    "{}: <{}> is already recorded with other content",
+                    r.key,
+                    r.iri.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The insertions and deletions in `p.output` that leave exactly the triples a live
@@ -1448,7 +1616,8 @@ fn record_graph_nonces(settings: &Settings, capability: &ManagedWrite) -> Vec<G>
 ///
 /// The caller needs update grants on each claim's graph, read access to each claim, and
 /// read and update grants on the output graph and read grants on the decisions and
-/// supports graphs of every policy whose evidence boundary holds a claim's graph.
+/// supports graphs of every review policy, since a support admitted under an earlier
+/// policy version ends with its claim whatever the boundary is now.
 /// `options.if_head` is optional, and the head the reads were made at must still be the
 /// head when the commit is made, or the answer is `head-changed`.
 ///
@@ -1494,6 +1663,8 @@ pub fn withdraw(
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let mut state = State {
         reads: Reads::new(&preparation, &head),
+        seen: None,
+        claim_graphs: claim_graphs(&settings, &capability),
         superseded: BTreeSet::new(),
         withdrawn: withdrawals.iter().map(|w| w.target.clone()).collect(),
     };
@@ -1528,12 +1699,10 @@ pub fn withdraw(
         graphs.insert(found.graph.as_str().to_string(), found.graph.clone());
         targets.push(found.graph);
     }
-    // The policies whose boundary holds a withdrawn claim's graph, decided statically.
+    // Every policy, decided statically: a support admitted under an earlier version
+    // whose boundary no longer holds the claim's graph still ends with the claim.
     let mut policies = Vec::new();
     for (name, policy) in &settings.policies {
-        if !policy.boundary.iter().any(|b| graphs.contains_key(b)) {
-            continue;
-        }
         let p = PolicyGraphs::new(name, policy, &capability)?;
         writable(options.write.as_ref(), &p.output.0)?;
         for g in [&p.decisions.0, &p.supports.0, &p.output.0] {
@@ -1673,8 +1842,9 @@ pub fn withdraw(
             &mut changed,
         )?);
     }
-    drop(state);
     let skip = vec![false; batch.records.len()];
+    check_identities(&mut state, &batch, &records, &skip)?;
+    drop(state);
     let committed = publish(
         main,
         logical,

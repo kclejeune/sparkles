@@ -768,7 +768,7 @@ fn a_withdrawal_is_recorded_once() {
     assert_eq!(count(&ds, "Withdrawal", CLAIMS), 1);
     // the withdrawal carries its time and makes no contrary claim
     assert!(ds.ask(&format!(
-        "ASK {{ GRAPH <{CLAIMS}> {{ ?w a <{EV}Withdrawal> ; <{EV}target> <{}> ; <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }}",
+        "ASK {{ GRAPH <{CLAIMS}> {{ ?w a <{EV}Withdrawal> ; <{EV}withdraws> <{}> ; <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }}",
         a.0.as_str()
     )).unwrap());
     assert_eq!(count(&ds, "Claim", CLAIMS), 1);
@@ -833,4 +833,172 @@ fn written_records_conform_to_the_profile_shapes() {
             "{class}"
         );
     }
+}
+
+/// A triple protection that hides a claim's proposition from the reviewer makes an
+/// acceptance answer exactly as an unreadable target does.
+#[test]
+fn a_hidden_proposition_answers_as_an_unavailable_target() {
+    use sparkles::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+    let masked = Some(Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(Protection {
+                    name: "propositions".into(),
+                    predicates: Some(vec![
+                        "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies".into(),
+                    ]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    )));
+    let answer = |target: (NamedNode, Sha256Digest)| {
+        let e = review_as(
+            &ds,
+            &[decision("a", &target, Disposition::Accepted, None)],
+            &reviewer(),
+            masked.clone(),
+        )
+        .unwrap_err();
+        (e.code().to_string(), e.to_string())
+    };
+    let hidden = answer(a.clone());
+    let missing = answer((iri("urn:uuid:00000000-0000-4000-8000-000000000000"), a.1));
+    assert_eq!(hidden.0, "evidence-unavailable");
+    assert_eq!(hidden, missing);
+    assert!(accepted(&ds).is_empty());
+}
+
+/// Content planted under a predictable keyed decision identity while the decisions
+/// graph was detached is never authenticated by the keyed review.
+#[test]
+fn a_planted_decision_identity_refuses_the_review() {
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+    let mut o = reviewer();
+    o.idempotency_key = Some("k".into());
+    o.dry_run = true;
+    let d = [decision("a", &a, Disposition::Accepted, None)];
+    let planned = review_as(&ds, &d, &o, all()).unwrap().decisions[0]
+        .iri
+        .clone();
+    evidence::detach(&ds, DECISIONS).unwrap();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{DECISIONS}> {{ <{}> <{EV}disposition> <{EV}Rejected> }} }}",
+        planned.as_str()
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    o.dry_run = false;
+    let head = ds.store().head_commit().seq;
+    assert_eq!(
+        code(review_as(&ds, &d, &o, all())),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+}
+
+/// A projection whose supports graph was detached and cleared refuses later
+/// operations instead of leaving its triples without an owner.
+#[test]
+fn a_cleared_supports_graph_keeps_the_projection_unavailable() {
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+    let b = claim_of(&propose(&ds, &occurrence("mirror", Polarity::Positive)));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    evidence::detach(&ds, SUPPORTS).unwrap();
+    ds.update(&format!(
+        "DELETE WHERE {{ GRAPH <{SUPPORTS}> {{ ?s ?p ?o }} }}"
+    ))
+    .unwrap();
+    evidence::configure(&ds, &settings(ConflictMode::Refuse), &Control::none()).unwrap();
+    let w = evidence::withdraw(
+        &ds,
+        &ds,
+        &[WithdrawalInput {
+            key: "w".into(),
+            target: a.0.clone(),
+            target_digest: a.1,
+        }],
+        &reviewer(),
+        &mut |_, _| all(),
+        &Control::none(),
+    );
+    assert_eq!(code(w), "projection-unavailable");
+    assert_eq!(
+        code(review(
+            &ds,
+            &[decision("b", &b, Disposition::Accepted, None)]
+        )),
+        "projection-unavailable"
+    );
+    assert_eq!(accepted(&ds), affected_line());
+}
+
+/// A support admitted under an earlier policy version ends with its claim's
+/// withdrawal even when the policy's boundary no longer holds the claim's graph.
+#[test]
+fn a_withdrawal_ends_supports_of_an_earlier_boundary() {
+    let ds = configured(ConflictMode::Refuse);
+    let a = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+    review(&ds, &[decision("a", &a, Disposition::Accepted, None)]).unwrap();
+    let mut s = settings(ConflictMode::Refuse);
+    let p = s.policies.get_mut("main").unwrap();
+    p.version = 2;
+    p.boundary = vec![SOURCES.into(), OTHER.into()];
+    evidence::configure(&ds, &s, &Control::none()).unwrap();
+    let w = withdraw(&ds, &a);
+    assert_eq!(w.changed.removed.len(), 1, "{w:?}");
+    assert!(accepted(&ds).is_empty());
+}
+
+/// A replay answers the first receipt's projection notes and conflicts, and a
+/// supersession of a support that a withdrawal already ended reports no change.
+#[test]
+fn replays_keep_their_metadata_and_ended_supports_are_reported_once() {
+    let ds = configured(ConflictMode::AdmitLabelled);
+    let yes = claim_of(&propose(&ds, &occurrence("advisory", Polarity::Positive)));
+    let no = claim_of(&propose(&ds, &occurrence("vendor", Polarity::Negative)));
+    let mut o = reviewer();
+    o.idempotency_key = Some("k".into());
+    o.if_head = Some(ds.store().head_commit().seq);
+    let d = [
+        decision("y", &yes, Disposition::Accepted, None),
+        decision("n", &no, Disposition::Accepted, None),
+    ];
+    let first = review_as(&ds, &d, &o, all()).unwrap();
+    let again = review_as(&ds, &d, &o, all()).unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.decisions, first.decisions);
+    assert_eq!(first.decisions[0].conflicts, vec![no.0.clone()]);
+    assert_eq!(
+        first.decisions[1].not_projected,
+        Some("the claim is not positive")
+    );
+    withdraw(&ds, &yes);
+    let r = review(
+        &ds,
+        &[decision(
+            "y2",
+            &yes,
+            Disposition::Rejected,
+            Some(&first.decisions[0].iri),
+        )],
+    )
+    .unwrap();
+    assert!(r.changed.supports_ended.is_empty(), "{:?}", r.changed);
 }

@@ -12398,7 +12398,9 @@ saw, and its disposition is `accepted`, `rejected` or `needsEvidence`. When the 
 already has a decision under the policy, the new decision names it as `supersedes`, and
 the new decision becomes the current one. `ifHead` is required, and every read of the
 review is made at that head. A request holds at most 1,000 decisions, one per target.
-The caller is the reviewer of record, and no client field can name another one.
+The caller is the reviewer of record, and no client field can name another one. An
+acceptance that does not project records its reason as the decision's
+`ev:projectionNote`, so a replay answers it again.
 
 An acceptance projects a claim when the claim is positive, its kind is one of the
 policy's admitted kinds and it carries every required scope predicate. The server then
@@ -12432,8 +12434,14 @@ contrary claim. The claim's supports stop being live, and each projected triple 
 without a live support leaves its output graph. A claim that is already withdrawn
 answers `existing: true`. A withdrawal needs update grants on each claim's graph and on
 the output graph, and read grants on the decisions, supports and output graphs, of every
-policy whose boundary holds that graph. `ifHead` is optional for a withdrawal. A
+review policy, because a support admitted under an earlier policy version ends with its
+claim whatever the policy's boundary is now. `ifHead` is optional for a withdrawal. A
 withdrawn claim cannot be accepted again, and a new occurrence must be proposed instead.
+
+An acceptance copies a proposition into the output graph, which callers read under
+their own grants. A review checks only the reviewer's access, so an administrator must
+give every reader of an output graph read access to its policy's boundary. Sparkles does
+not yet check that grant, and a reviewed decision does not declassify its evidence.
 
 The review answer is `{operation, committed, replayed, commit, branchId, decisions,
 changed}`, and each decision is `{key, iri, target, disposition, supersedes, support,
@@ -12447,6 +12455,7 @@ results that depend on them. A replay answers the first receipt with an empty
 | Status and code | Meaning |
 |---|---|
 | `400 invalid-proposal`, `400 invalid-reference` | The body is malformed, a field is invalid, or the policy is unknown. The message names the field. |
+| `409 immutable-record-conflict` | A record identity the operation mints already holds content, as after content was written while its graph was detached. |
 | `403` | The caller may not update or read a graph the operation needs. |
 | `409 policy-changed` | `policyVersion` is not the policy's version. |
 | `409 head-changed` | `ifHead` is not the branch head, or the head moved while the operation read it. |
@@ -12457,7 +12466,7 @@ results that depend on them. A replay answers the first receipt with an empty
 | `409 idempotency-conflict` | The key was used with a different payload. |
 | `422 evidence-unavailable` | A target, or evidence that an acceptance must read, is missing, unreadable or outside the policy's boundary. |
 | `422 incomplete-evidence` | The acceptances need more than 10,000 evidence records. |
-| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate. |
+| `503 projection-unavailable` | A graph of the policy's projection was detached and protected again, so its supports no longer authenticate, or its output holds triples without a projection record. |
 | `503 authority-changed` | The caller's credential or the access policy changed before the commit published. |
 
 A refusal writes nothing. `GET /$/server` lists both routes in `capabilities.claims`.
