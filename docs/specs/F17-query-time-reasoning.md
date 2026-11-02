@@ -992,6 +992,14 @@ random histories against a naive closure and check that each `why` witness deriv
 triple. Tables are not views on the operator, and Phase 3 remains to build them from the
 demand program with its seeds fixed.
 
+### The OWL 2 QL check
+
+The profile check that §7 and §10 place in `qlrewrite.rs` is F21's
+`sparkles_owl::profiles::partition` with OWL 2 QL, delivered with F21 Phase 2. It splits
+the ontology's axioms into those the QL grammar allows, which PerfectRef is to read, and
+the violations of the others, which the status is to list. The `owl-ql` mode and its
+rewriting remain in Phase 2 of this spec, roadmap item 19.
+
 ### Scope changes
 
 **OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 DL or EL reasoning. OWL 2 EL classification is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md). OWL 2 DL reasoning stays a non-goal of this spec.

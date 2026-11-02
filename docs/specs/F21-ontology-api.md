@@ -1,21 +1,22 @@
 # F21: An OWL 2 ontology API
 
-> **Status:** partially implemented
+> **Status:** implemented
 >
-> **Phases:** Phases 1 and 3 are delivered. Phase 1 provides the axiom model, reading and writing it
-> through the OWL 2 mapping to RDF graphs, the OWL 2 EL, QL and RL profile checks and the
-> OWL 2 DL structural restrictions, the Rust library API, `/$/ontology/{ds}` and
-> `sparkles ontology`. Phase 2 adds the Python and Node.js surfaces, the JVM entry point
-> that runs Jena's `jena-ontapi` over a Sparkles graph, entity views that include
-> materialized inferences, and the reasoner's use of the profile checks, and remains
-> planned. Phase 3 provides the functional-style syntax reader, an MCP tool and
-> ontology diffs between commits.
+> **Phases:** Phases 1 to 3 are delivered. Phase 1 provides the axiom model, reading and
+> writing it through the OWL 2 mapping to RDF graphs, the OWL 2 EL, QL and RL profile
+> checks and the OWL 2 DL structural restrictions, the Rust library API,
+> `/$/ontology/{ds}` and `sparkles ontology`. Phase 2 provides the Python and Node.js
+> surfaces, the JVM entry point that runs Jena's `jena-ontapi` over a Sparkles graph,
+> reads that include materialized inferences, the OWL 2 RL warning of reasoning runs and
+> the profile partition that F17's OWL 2 QL rewriting is to use. Phase 3 provides the
+> functional-style syntax reader, an MCP tool and ontology diffs between commits. Roadmap
+> items 539, 540, 541 and 559 extend the delivered phases.
 >
 > **User docs:** [OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies) and
 > [API: Ontology](../API.md#ontology).
 >
 > The design below is the one written before implementation. The [Outcome](#outcome)
-> section records how Phases 1 and 3 landed and where they depart from the design.
+> section records how the phases landed and where they depart from the design.
 
 This design was written from the W3C recommendations *OWL 2 Web Ontology Language
 Structural Specification and Functional-Style Syntax*, *OWL 2 Web Ontology Language
@@ -563,8 +564,15 @@ capabilities and remaining work are described by the spec status and Outcome.
   `all.rdf` of the OWL Working Group's test repository (W3C Test Suite licence), which
   `scripts/fetch-test-suites.sh` fetches by checksum and which is not vendored. No code of
   Jena's `jena-ontapi` or of any other ontology library was read or copied, and no new
-  third-party dependency was added. `jena-ontapi` remains planned as an optional
-  dependency of `sparkles-jena` in Phase 2.
+  third-party dependency was added.
+- **Implementation (Phase 2):** written from this spec, the W3C OWL 2 Profiles
+  recommendation (§4.3 and the OWL 2 RL/RDF rule tables) and the public Javadoc of
+  Apache Jena's `jena-ontapi` module (`OntModelFactory.createModel`, `OntSpecification`,
+  `OntModel` and `OntClass`). No Jena code was read. `jena-ontapi` 5.6.0, under the
+  Apache License 2.0 as the rest of Jena, is a compile-only dependency of
+  `sparkles-jena`. The jar does not bundle it, and a program that calls
+  `SparklesOnt.model` adds it. It is recorded in `jvm/gradle/libs.versions.toml`, the
+  Gradle lock and verification files and `nix/jvm-deps.json`.
 - **Rejected** (spec §13):
   - a native implementation of `jena-ontapi`'s interfaces in the JVM binding;
   - an ontology store separate from the triples;
@@ -573,8 +581,8 @@ capabilities and remaining work are described by the spec status and Outcome.
 
 ## Outcome
 
-Phase 1 is delivered as roadmap item 71 and Phase 3 as roadmap item 538. Phase 2
-remains as roadmap item 537.
+Phase 1 is delivered as roadmap item 71, Phase 2 as roadmap item 537 and Phase 3 as
+roadmap item 538.
 
 ### Phase 1
 
@@ -597,6 +605,81 @@ round-trip. The 31 known differences in `crates/sparkles-owl/tests/w3c_owl_known
 are cases that type entities the OWL 1 way, use anonymous individuals in EL or QL, which
 their grammars do not allow, or omit the ontology header that the mapping requires.
 Property tests write random axioms to triples and read them back.
+
+### Phase 2
+
+**One JSON surface.** `sparkles::handles::ontology::wire` holds the JSON forms of the
+routes' answers, which the server, the MCP tool and every binding share. Its `call`
+function reads a request in the same form and answers it. The operations are `summary`,
+`axioms`, `check`, `edit`, `removeEntity` and `diff`, with the members of the routes. An
+axiom argument is its JSON form or a string in functional-style syntax with the dataset's
+prefixes, as the MCP tool takes it. The bindings therefore answer what the HTTP routes
+answer, and a new member reaches all of them at once.
+
+**Python.** `Dataset.ontology` is an `Ontologies` handle with `summary`, `axioms`,
+`check`, `edit`, `remove_entity` and `diff`. Each takes the graph as its first argument
+and the other members as keyword arguments, with `cancel` and `timeout`. `Axiom` is a
+frozen axiom with structural equality and hashing. `Axiom(text)` and `Axiom.parse` read
+functional-style syntax, `Axiom.from_json` reads the JSON form, `str()` writes
+functional-style syntax with the standard prefixes, and `json()` and `ofn()` give the
+other forms. Listings and diffs answer dicts whose entries carry an `Axiom`, and edits
+take `Axiom` objects, strings or dicts. The wheel's `ontology` feature is on by default.
+
+**Node.js.** `dataset.ontology` has `summary`, `axiomPage`, `axioms`, `check`, `edit`,
+`removeEntity` and `diff`, each returning a promise except `axioms`. `axioms` is an async
+iterable that reads pages of `batch` axioms (1,000 by default) from the commit of the
+first page, so that a commit made during the listing does not mix into it. Axioms are
+plain objects in the JSON form, with a `type` member, and the 64-bit counts are `bigint`,
+as in the other administration answers.
+
+**JVM.** `SparklesOnt.model(dataset, graphIri, spec)` returns the `OntModel` that Jena's
+`OntModelFactory` builds over a Sparkles graph with the given `OntSpecification`. The
+model reads an in-memory copy of the graph that one native call, `find_all`, fills from
+the thread's transaction or the head, so the per-`find` cost that P04 §3.10 describes
+does not apply. A write to the model goes to the copy and to the Sparkles graph, in the
+thread's write transaction when there is one, so a transaction's edits make one commit.
+`SparklesOnt` also runs the native operations over one graph, and
+`DatasetGraphSparkles.ontology()` is the full handle with `summary`, `axioms`, `check`,
+`edit`, `removeEntity` and `diff`.
+
+**Reads with inferences.** A read with `inferences` adds the graph
+`urn:x-sparkles:inferred` to the graphs read while the dataset records a
+materialization. The flag is `OntologyRequest::inferences` in Rust, `inferences=true` on
+the summary, axioms and check routes, and an argument of that name in the bindings. An
+axiom listing about an entity then includes the materialized closure, such as the
+transitive superclasses of a class. `Opened::inferences` and the answers' `inferences`
+member give the materialization's profile and the freshness at the state read, which is
+the staleness that the `Sparkles-Inferences` header gives a query. Without a
+materialization the read covers the asserted axioms and says that it included no
+inferences. It never runs the reasoner. An axiom that the inferred graph holds names that
+graph among its origins. Edits and diffs refuse the flag, since they change and compare
+the asserted axioms.
+
+**The OWL 2 RL warning.** A materialization under `owl-rl` reads the terminology of its
+input graphs and their dataset imports before it runs. This holds for the library, the
+server's `/$/reason/{ds}` and `sparkles infer`. The run adds a warning with the count of
+axioms outside the OWL 2 RL grammar and the first of them with its rule, since the rules
+are complete only for ontologies in the profile (OWL 2 Profiles §4.3, Theorem PR1). A
+second warning counts the axioms in OWL 2 RL whose rule the rule subset covers only up to
+a size, from `crates/sparkles-reasoner/rules/owl-rl.gaps` beside the rules file. These
+are property chains of more than three properties (`prp-spo2`) and keys of more than two
+(`prp-key`), and a test checks the table against the rule names. The warnings are in the
+run's report and in the reasoning record.
+
+**The profile partition for F17.** `sparkles_owl::profiles::partition` splits an
+ontology's axioms by one profile's grammar into those inside it and the violations of the
+others. Unlike a check, it leaves out the OWL 2 DL global restrictions. It is the QL check
+that F17 §7 plans in `qlrewrite.rs`, so the rewriting reads the axioms inside OWL 2 QL and
+reports those set aside. The RL warning uses the same partition.
+
+**Testing.** Library tests cover reads with and without inferences, a view that hides the
+inferred graph, the RL warning of A10, the gap table, and every JSON operation and its
+refusals. The CLI test runs A10 through `sparkles infer`. The binding tests cover each
+operation in Python, Node.js and the JVM, `Axiom` equality and hashing, the batched
+Node.js listing, and A9. In A9, `OntModel.classes()` lists the classes of A1, a superclass
+added inside a write transaction makes one commit, and a model over 10,000 classes and
+20,000 triples is filled by one native read. The OWL 2 tests cover the partition of A6's
+ontology.
 
 ### Phase 3
 
@@ -730,7 +813,31 @@ question 5. An edit reads the ontology from the head it writes on, under the wri
 datatypes, roadmap item 541. A8 is tested with graph views, not with C12b
 triple protections.
 
-The parity test of the library administration API (P06) does not cover the handle.
+The parity test of the library administration API (P06) maps each route to its library
+call and to its Python, Node.js and JVM names.
+
+**Binding surfaces.** §2.2 sketched `ds.ontology(graph, imports=True)` returning an
+ontology and `ds.ontology_edit(graph)` as a context manager. The bindings mirror the Rust
+handle instead, as the routes do. A handle on the dataset takes the graph and the other
+members with each operation and answers in the routes' JSON forms. Python has one frozen
+`Axiom` class, read from functional-style syntax or the JSON form, rather than a class
+per axiom type, so that an axiom is written as the recommendation writes it. Node.js
+axioms keep IRIs as strings in the JSON form rather than RDF/JS terms, so that they are
+the objects the HTTP client sends and receives. Typed axiom constructors in Python and
+Node.js come with the Rust edit builder of roadmap item 540.
+
+**The JVM model's copy.** The copy that `SparklesOnt.model` reads is filled once, so a
+commit made through another handle after the model is built is not seen by it. A program
+builds a new model to read later commits. Writes through the model reach the Sparkles
+graph at once, and they are not read back from it.
+
+**Inferences of other graphs.** The inferred graph holds the inferences of every input of
+the materialization, so a read with inferences of one graph also reads what the run
+derived from the other graphs it read.
+
+**F17's QL check.** F17's `owl-ql` mode is not built, roadmap item 19. Phase 2 provides
+the partition that its rewriting reads and the QL half of A6, and the fallback half of A6
+is tested with F17's mode.
 
 ### Scope changes
 
