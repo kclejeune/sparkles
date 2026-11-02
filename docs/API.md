@@ -12416,7 +12416,7 @@ Contrary evidence is an `ev:Contradicts` link to the claim or a negative claim o
 same proposition in the policy's evidence boundary whose current decision is not a
 rejection. A policy with `conflicts: "refuse"` refuses such an acceptance. A policy with
 `admitLabelled` admits it, lists the contrary records in the support's
-`ev:conflictsWith` and in the answer's `conflicts`, and its `ev:Projection` record names
+`ev:conflictsWith` and in the answer's `conflicts`, sorted by IRI, and its `ev:Projection` record names
 that mode. Conflicts are decided against the request's final decisions when it is
 admitted. Later contrary evidence does not relabel or remove a support.
 

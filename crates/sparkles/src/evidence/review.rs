@@ -1072,7 +1072,6 @@ pub fn review(
     // the resolver's allowance.
     let mask_preparation =
         crate::access::Preparation::new(control.clone(), super::resolve::MEMORY_BYTES)?;
-    let masked;
     // The preconditions read the stored decisions; this operation's supersessions
     // count once they have all been checked.
     let mut state = State {
@@ -1175,7 +1174,7 @@ pub fn review(
             ),
         ));
     }
-    masked = caller_view(access.as_ref(), &head, &mask_preparation)?;
+    let masked = caller_view(access.as_ref(), &head, &mask_preparation)?;
     state.seen = masked
         .as_ref()
         .map(|v| Reads::new(&mask_preparation, v.snapshot()));
