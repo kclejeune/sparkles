@@ -669,6 +669,11 @@ where the latest user message ends, so the repair then reads the prefix that the
 draft wrote, where before every OpenAI repair missed the cache and paid the write price
 again. The settings form still offers prompt caching for the `anthropic` kind only.
 
+The `openai` provider preset starts with GPT-6 Luna in place of `gpt-5-mini`. In a
+comparison of six Claude and OpenAI models on 150 held-out QALD-9-plus questions, Luna
+answers 106 at $0.0021 a question, within the noise of the best model's 113, and is the
+cheapest per correct answer. The `anthropic` preset keeps Sonnet 5.5 by the same rule.
+
 `scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
 file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1
 Sol through the Chat Completions API under a wallet of its own, capped at USD 50 per

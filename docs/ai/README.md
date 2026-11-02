@@ -434,11 +434,16 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   and 74 DBpedia-only questions
   ([C18](../specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12),
   [BENCHMARKS.md](../benchmarks/natural-language/RESULTS.md#ask-grounding-from-predicate-use)).
-  With predicate-use grounding, Haiku answers 77 and Sonnet 86 of 150 QALD-9-plus training
-  questions that no tuning step read, against 37 and 64 before, under projected-column
-  scoring. On the 107 retained QALD-9-plus test questions, which Ask grounding was tuned
-  on, Opus answers 57, Sonnet 48 and Haiku 42.0 over three runs. On the 74 retained
-  Text2SPARQL'25 DBpedia questions they answer 42, 41 and 31. A gold resource
+  With the current build, on 150 held-out QALD-9-plus training questions that no tuning
+  step read, GPT-6.1 Sol answers 113, Opus 5.5 111, GPT-6.1 Terra 108, GPT-6 Luna and
+  Sonnet 5.5 106 and Haiku 5.5 95 under projected-column scoring, against 41 to 72 for
+  the build before predicate-use grounding. Luna costs $0.0021 per question, Sonnet
+  $0.029 and Opus $0.062. On the 107 retained QALD-9-plus test questions, which Ask
+  grounding was tuned on, Opus answers 60, Sonnet 55 and Luna 47, and on the 74 retained
+  Text2SPARQL'25 DBpedia questions 46, 45 and 40
+  ([results](../benchmarks/natural-language/RESULTS.md#ask-across-providers)). The
+  `openai` provider preset starts with Luna and the `anthropic` preset with Sonnet, the
+  cheapest models per correct answer within the noise of the best one. A gold resource
   missing from the prompt causes about half of the wrong answers, and wrong query shape
   most of the rest. A generated query with a
   property path can exhaust memory under Ask, because the default query memory budget and

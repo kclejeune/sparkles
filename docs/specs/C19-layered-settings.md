@@ -383,7 +383,7 @@ fills can be changed before or after the provider is added.
 | Preset | `kind` | `endpoint` | `apiKey.secret` | Starting model |
 |---|---|---|---|---|
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | `anthropic` | `claude-sonnet-5-5` |
-| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-5-mini` |
+| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-6-luna` |
 | `ollama` | `ollama` | `http://127.0.0.1:11434` | none | `qwen3:8b` |
 
 The starting model becomes an entry of the provider's `models`, so that

@@ -277,6 +277,111 @@ different classes. The exploration with the shape check and voting scores no hig
 the exploration alone and costs 59% more per question. Every option stays available
 through `assistant.json`, the ask request and the command line.
 
+#### Ask across providers
+
+Six models answered the same three sets with the baseline build and the final build:
+Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5, and OpenAI GPT-6 Luna, GPT-6.1 Terra and
+GPT-6.1 Sol. The baseline is commit `2d43aa5a`, before the grounding changes above, and
+the final build is commit `dfc799dc` with the exploration on and the other repair
+options off. The OpenAI builds add the OpenAI request support and the follow-up form of
+repairs, which repeats the first draft's message so that OpenAI's prompt cache serves
+the repair, and they make no other change. Unseen is 150 QALD-9-plus training questions
+that no tuning step read, disjoint from the fresh set, and it is the primary held-out
+measure. QALD and db25 shaped the changes, so they are checks.
+
+| Measurement context | |
+|---|---|
+| Date and host | 2026-11-01 and 2026-11-02 on a development laptop that was running other work, with binaries built on atlas |
+| Builds | Anthropic `2d43aa5a` and `dfc799dc`. OpenAI `dd0d5430` and `3a138901`, which are the same commits with the OpenAI support and the follow-up repair form. |
+| Settings | Effort `medium`, a 200,000-token context, answered clarifications and one question per Ask child for the baselines, with six questions at once for the final builds |
+| Cost | $51.72 for the Anthropic runs and $33.95 for the OpenAI runs in the tables |
+| Not run | Opus on unseen with the baseline build, deferred for budget |
+
+The strict projected score is the headline. Guarded is the secondary
+`rdf-term-set-projected-guarded-lenient-v3` score over the questions its gold rules
+keep. Opus answered unseen in three blocks of 50 questions, because the harness admits a
+block only when the 90th-percentile case cost of the model times the block's questions
+fits what the cap leaves. The blocks use the same build, settings and questions, and
+their reports combine into one.
+
+QALD-9-plus test, 107 questions
+
+| Model | Build | Strict | Guarded | Correct after clarification | Macro-F1 | Cost per question | Cost per correct answer |
+|---|---|---|---|---|---|---|---|
+| Haiku 5.5 | Baseline | 26 (24%) | 26 of 102 | 19 | 0.28 | $0.0017 | $0.0072 |
+| Haiku 5.5 | Final | 46 (43%) | 48 of 102 | 38 | 0.47 | $0.0023 | $0.0054 |
+| Sonnet 5.5 | Baseline | 35 (33%) | 34 of 102 | 26 | 0.40 | $0.0274 | $0.0838 |
+| Sonnet 5.5 | Final | 55 (51%) | 56 of 102 | 46 | 0.59 | $0.0296 | $0.0576 |
+| Opus 5.5 | Baseline | 39 (36%) | 41 of 102 | 30 | 0.51 | $0.0619 | $0.1700 |
+| Opus 5.5 | Final | 60 (56%) | 62 of 102 | 48 | 0.66 | $0.0660 | $0.1177 |
+| GPT-6 Luna | Baseline | 28 (26%) | 27 of 102 | 22 | 0.27 | $0.0018 | $0.0069 |
+| GPT-6 Luna | Final | 47 (44%) | 49 of 102 | 37 | 0.50 | $0.0023 | $0.0051 |
+| GPT-6.1 Terra | Baseline | 30 (28%) | 29 of 102 | 24 | 0.36 | $0.0168 | $0.0599 |
+| GPT-6.1 Terra | Final | 52 (49%) | 54 of 102 | 43 | 0.58 | $0.0183 | $0.0376 |
+| GPT-6.1 Sol | Baseline | 33 (31%) | 30 of 102 | 27 | 0.35 | $0.0312 | $0.1013 |
+| GPT-6.1 Sol | Final | 52 (49%) | 53 of 102 | 44 | 0.58 | $0.0345 | $0.0711 |
+
+Text2SPARQL'25 db25, 74 questions
+
+| Model | Build | Strict | Guarded | Correct after clarification | Macro-F1 | Cost per question | Cost per correct answer |
+|---|---|---|---|---|---|---|---|
+| Haiku 5.5 | Baseline | 21 (28%) | 23 of 73 | 16 | 0.34 | $0.0017 | $0.0061 |
+| Haiku 5.5 | Final | 37 (50%) | 39 of 73 | 28 | 0.58 | $0.0020 | $0.0039 |
+| Sonnet 5.5 | Baseline | 32 (43%) | 33 of 73 | 24 | 0.55 | $0.0281 | $0.0649 |
+| Sonnet 5.5 | Final | 45 (61%) | 47 of 73 | 33 | 0.70 | $0.0287 | $0.0473 |
+| Opus 5.5 | Baseline | 34 (46%) | 36 of 73 | 25 | 0.59 | $0.0579 | $0.1260 |
+| Opus 5.5 | Final | 46 (62%) | 48 of 73 | 35 | 0.70 | $0.0613 | $0.0986 |
+| GPT-6 Luna | Baseline | 22 (30%) | 23 of 73 | 16 | 0.34 | $0.0019 | $0.0062 |
+| GPT-6 Luna | Final | 40 (54%) | 42 of 73 | 29 | 0.62 | $0.0021 | $0.0038 |
+| GPT-6.1 Terra | Baseline | 25 (34%) | 27 of 73 | 20 | 0.40 | $0.0163 | $0.0483 |
+| GPT-6.1 Terra | Final | 43 (58%) | 45 of 73 | 32 | 0.67 | $0.0171 | $0.0295 |
+| GPT-6.1 Sol | Baseline | 28 (38%) | 30 of 73 | 22 | 0.41 | $0.0302 | $0.0798 |
+| GPT-6.1 Sol | Final | 42 (57%) | 44 of 73 | 31 | 0.66 | $0.0325 | $0.0572 |
+
+Unseen, 150 QALD-9-plus training questions
+
+| Model | Build | Strict | Guarded | Correct after clarification | Macro-F1 | Cost per question | Cost per correct answer |
+|---|---|---|---|---|---|---|---|
+| Haiku 5.5 | Baseline | 41 (27%) | 42 of 150 | 35 | 0.30 | $0.0017 | $0.0063 |
+| Haiku 5.5 | Final | 95 (63%) | 97 of 150 | 79 | 0.69 | $0.0020 | $0.0032 |
+| Sonnet 5.5 | Baseline | 72 (48%) | 73 of 150 | 64 | 0.55 | $0.0264 | $0.0550 |
+| Sonnet 5.5 | Final | 106 (71%) | 106 of 150 | 92 | 0.76 | $0.0288 | $0.0407 |
+| Opus 5.5 | Baseline | Not run, deferred for budget | | | | | |
+| Opus 5.5 | Final | 111 (74%) | 112 of 150 | 93 | 0.78 | $0.0624 | $0.0843 |
+| GPT-6 Luna | Baseline | 41 (27%) | 41 of 150 | 36 | 0.30 | $0.0019 | $0.0069 |
+| GPT-6 Luna | Final | 106 (71%) | 107 of 150 | 88 | 0.76 | $0.0021 | $0.0029 |
+| GPT-6.1 Terra | Baseline | 42 (28%) | 43 of 150 | 34 | 0.34 | $0.0169 | $0.0604 |
+| GPT-6.1 Terra | Final | 108 (72%) | 109 of 150 | 92 | 0.77 | $0.0170 | $0.0237 |
+| GPT-6.1 Sol | Baseline | 44 (29%) | 44 of 150 | 36 | 0.32 | $0.0313 | $0.1068 |
+| GPT-6.1 Sol | Final | 113 (75%) | 114 of 150 | 96 | 0.79 | $0.0329 | $0.0437 |
+
+The final build gains 12 to 69 questions over the baseline for every model and set.
+Luna rises from 41 to 106 on unseen and Haiku from 41 to 95. The OpenAI baselines score
+lower than the Claude baselines of a similar price, and the final build closes that gap.
+With the follow-up form, an OpenAI repair reads the first draft's prompt from the cache,
+and a final run costs 1 to 28% more per question than its baseline.
+
+##### The default model
+
+The default is the cheapest model per correct answer on unseen whose score is within
+the noise of the best model's. Within the noise means that the paired bootstrap 95%
+interval of the difference between the best model and the candidate, over the 150
+questions with 10,000 resamples, contains zero. Sol scores best with 113, and Opus scores
+111. Luna's interval against Sol runs from 0.7 points below to 10.0 points above, and
+against Opus from 2.7 points below to 9.3 points above, so Luna passes. Its cost per
+correct answer is $0.0029, the lowest of the six. Haiku's interval against Sol runs from
+5.3 to 19.3 points, so Haiku fails. GPT-6 Luna is therefore the default model of the
+`openai` preset. Within the Claude models, the same rule picks Sonnet 5.5, which is
+within the noise of Opus while Haiku is not, so the `anthropic` preset keeps Sonnet.
+
+The tradeoff is plain on unseen. Sol answers 7 more of 150 than Luna at 15.7 times the
+cost per question, Opus 5 more at 29.7 times, Terra 2 more at 8.1 times, and Sonnet the
+same number at 13.7 times. The check sets favour the larger models more. On QALD Luna
+answers 47 of 107 against Opus's 60, and on db25 40 of 74 against Opus's 46, and both
+gaps are outside the noise, so a dataset like the tuning sets gains more from a larger
+model. The [paid record](../2026-11-02-ask-fair-matrix-paid.json) holds every run, the
+per-case results, the bootstrap intervals and the ledgers.
+
 ### Global answering
 
 Sonnet 5.5 answered 30 generated questions about the whole demo organisation graph four

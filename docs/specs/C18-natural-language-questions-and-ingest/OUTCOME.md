@@ -1888,6 +1888,25 @@ give the secondary scores and the [paid
 record](../../benchmarks/2026-11-01-ask-hillclimb-paid.json) gives the per-case results,
 costs and source digests.
 
+The final build was then compared with the baseline across six models on QALD, db25 and
+150 held-out QALD-9-plus training questions. OpenAI's prompt cache writes a prefix only
+where the latest user message ends, so OpenAI repairs at first never read the cache. An
+`openai` provider with `promptCaching.enabled` now sends a repair as the first draft's
+message followed by a second user message, and the repair reads the cached question. A
+first version that sent the repair as a developer message was replaced, because a
+document chunk or a diagnosis that carries data would have gained developer authority.
+On the held-out set Sol answers 113, Opus 111, Terra 108, Luna and Sonnet 106 and Haiku
+95, against 41 to 72 for the baseline build. Luna is the cheapest model per correct
+answer whose paired bootstrap interval against the best model contains zero, so it is
+the `openai` preset's model, and Sonnet keeps that place in the `anthropic` preset. The
+larger models lead by more on QALD and db25. Opus with the baseline build was not run on
+the held-out set for budget, and NEW-ITEM-7 tracks it. The
+[results](../../benchmarks/natural-language/RESULTS.md#ask-across-providers) give every
+set and the [paid record](../../benchmarks/2026-11-02-ask-fair-matrix-paid.json) every
+run. The Anthropic spend of $51.72 and the OpenAI spend of $33.95 stand in the ledgers.
+OpenAI's reports match its ledger, and the Anthropic ledger awaits reconciliation
+against the Console's usage export.
+
 ### Roadmap follow-ups
 
 #### Agent platform workstream

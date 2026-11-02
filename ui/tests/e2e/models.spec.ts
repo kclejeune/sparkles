@@ -148,7 +148,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
     'https://api.openai.com/v1',
   );
   await expect(add.getByLabel('Key (secret name)')).toHaveValue('openai');
-  await expect(add.getByLabel('Model', { exact: true })).toHaveValue('gpt-5-mini');
+  await expect(add.getByLabel('Model', { exact: true })).toHaveValue('gpt-6-luna');
   await add.getByLabel('Name', { exact: true }).fill('oai');
   await add.getByLabel('Key (secret name)').fill('oai-key');
   await add.getByRole('button', { name: 'Add', exact: true }).click();
@@ -159,7 +159,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
     kind: 'openai',
     endpoint: 'https://api.openai.com/v1',
     apiKey: { secret: 'oai-key' },
-    models: { 'gpt-5-mini': { structuredOutput: 'auto' } },
+    models: { 'gpt-6-luna': { structuredOutput: 'auto' } },
   });
 
   // turning certificate checks off needs the acknowledgement; Cancel sends nothing

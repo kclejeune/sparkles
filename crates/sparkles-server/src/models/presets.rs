@@ -34,7 +34,7 @@ pub const PRESETS: &[Preset] = &[
         kind: "openai",
         endpoint: "https://api.openai.com/v1",
         secret: Some("openai"),
-        model: "gpt-5-mini",
+        model: "gpt-6-luna",
     },
     Preset {
         name: "ollama",
@@ -81,6 +81,10 @@ mod tests {
         }
         assert!(preset("ollama").is_some());
         assert!(preset("gateway").is_none());
+        // the hosted presets start with the models the Ask comparison chose by its rule
+        // (docs/benchmarks/natural-language/RESULTS.md, Ask across providers)
+        assert_eq!(preset("openai").unwrap().model, "gpt-6-luna");
+        assert_eq!(preset("anthropic").unwrap().model, "claude-sonnet-5-5");
     }
 
     /// The UI's table holds the same presets in the same order.

@@ -122,7 +122,9 @@ Connect agents through [MCP](ai/README.md#mcp-server), turn
 MCP entity linking exposes bounded, versioned candidate evidence and can order label
 matches by use. Ask uses it for full choice identities and conservative ordering while
 retaining required clarification. Ask also grounds each question with the predicates
-that its entities and best-matching classes use in the data.
+that its entities and best-matching classes use in the data. GPT-6 Luna, the `openai`
+preset's model, answers 106 of 150 held-out QALD-9-plus questions at $0.0021 each,
+within the noise of the best model measured.
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
 and execution timings while the remaining accuracy and latency work stays open.

@@ -5062,8 +5062,14 @@ sparkles secrets set anthropic < anthropic.key
 | Preset | Kind | Endpoint | Key secret | Model |
 |---|---|---|---|---|
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | `anthropic` | `claude-sonnet-5-5` |
-| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-5-mini` |
+| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-6-luna` |
 | `ollama` | `ollama` | `http://127.0.0.1:11434` | none | `qwen3:8b` |
+
+The models of the two hosted presets come from the Ask comparison in the
+[natural-language benchmark](benchmarks/natural-language/RESULTS.md#ask-across-providers).
+Each is the cheapest model per correct answer whose score on 150 held-out questions is
+within the noise of its provider's best model. GPT-6 Luna is also the cheapest of all six
+models measured that meets that bar against the best of them.
 
 The command refuses a provider name that is already in use. An OpenAI-compatible
 gateway, such as vLLM or LiteLLM, has no preset. Add it with the `openai` kind and its
@@ -7242,7 +7248,7 @@ models:
           endpoint: https://api.openai.com/v1
           apiKey: {secret: openai}
       roles:
-        draft: [{provider: openai, model: gpt-5-mini}]
+        draft: [{provider: openai, model: gpt-6-luna}]
   secrets:
     openai: {secretName: model-keys, key: openai}
 ```
