@@ -34,7 +34,7 @@ The workbench edits entities, axioms and annotations through the axiom model of
 
 **Editable schema diagram.** Draw the schema diagram from declared axioms as well as observed data, with restrictions as labelled edges, an optional VOWL notation and SVG, Mermaid and PlantUML export, and turn it into a modeling canvas that adds classes, properties and restrictions by drawing. Stardog Designer and Gra.fo offer the same canvas. It depends on item 31.
 
-**Ontology browser.** Browse an ontology or thesaurus as linked articles: a search page ranks entities by label, synonym and definition in any language, and each entity's page shows its definition, an infobox of types and key annotations, breadcrumbs up the hierarchy, its axioms rendered as prose with links, related entities and a "what links here" list. The editor, the DL Query tab and the term pages of [C32](../C32-linked-data-publishing/README.md) reuse these pages.
+**Ontology browser.** Browse an ontology or thesaurus as linked articles, taking cues from the term pages of the EBI Ontology Lookup Service and Ontobee while keeping a clean, uncluttered layout. A search page ranks entities by label, synonym and definition in any language. Each entity's page shows its label, IRI and short form, definition, synonyms and cross-references, an infobox of types and key annotations, a collapsible hierarchy tree centred on the entity, its axioms rendered as prose with links, instances, the ontologies that reuse the term, a "what links here" list and downloads of the entity in each RDF format. The editor, the DL Query tab and the term pages of [C32](../C32-linked-data-publishing/README.md) reuse these pages.
 
 **Visual SHACL shape editor.** Author node and property shapes as trees and forms, with targets, paths, constraints and severities, validated live against sample data and written as previewed commits. TopBraid Composer and EDG offer it.
 
@@ -69,7 +69,7 @@ The ontology-editing exclusions of U02 §1 and U07 §1 are lifted for this spec.
 
 ## Provenance
 
-This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: VocBench, PoolParty, EDG Taxonomy, EDG Tagger, TopBraid Composer, Protégé, WebProtégé, Protégé DL Query, Cellfie, ROBOT template, DOSDP, Stardog Designer and OntoGraf. No code from another project is copied.
+This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: VocBench, PoolParty, the EBI Ontology Lookup Service, Ontobee, EDG Taxonomy, EDG Tagger, TopBraid Composer, Protégé, WebProtégé, Protégé DL Query, Cellfie, ROBOT template, DOSDP, Stardog Designer and OntoGraf. No code from another project is copied.
 
 ## Outcome
 
