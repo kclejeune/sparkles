@@ -30,6 +30,7 @@ pub(crate) fn started() {
 /// Run the start hook on a thread that is about to start long-lived threads it does not
 /// control, such as the workers that a Tantivy writer starts when it opens and after
 /// each commit, so that they inherit the CPUs the hook gives.
+#[cfg(feature = "text")]
 pub(crate) fn spawning() {
     started();
 }
@@ -40,21 +41,17 @@ mod tests {
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// The test hook: it counts the starts of the hook test's own thread, since the
-    /// engine threads that other tests of the process start call the hook too, and on
-    /// Linux it moves the calling thread to CPU 0 and 1, as the server's hook moves a
-    /// thread to every CPU.
-    fn hook() {
+    /// Counts the starts of this test's own thread only, since the engine threads that
+    /// other tests of the process start call the hook too.
+    fn count() {
         if std::thread::current().name() == Some("threads-hook-test") {
             CALLS.fetch_add(1, Ordering::SeqCst);
         }
-        #[cfg(target_os = "linux")]
-        linux::pin(&[0, 1]);
     }
 
     #[test]
     fn the_first_hook_runs_at_each_thread_start() {
-        if !super::set_start_hook(hook) {
+        if !super::set_start_hook(count) {
             // another test of this process set a hook first
             return;
         }
@@ -68,43 +65,88 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
-        // Tantivy's workers, started from a thread on CPU 0 alone, take the CPUs the hook
-        // gives when the engine calls it before it opens a writer
-        #[cfg(all(target_os = "linux", feature = "text"))]
-        if linux::cpus(0).is_some_and(|c| c.len() >= 2 && c.starts_with(&[0, 1])) {
-            let workers = |spawning: bool| {
-                std::thread::spawn(move || {
-                    linux::pin(&[0]);
-                    let before = linux::threads();
-                    if spawning {
-                        super::spawning();
-                    }
-                    let mut schema = tantivy::schema::Schema::builder();
-                    schema.add_text_field("t", tantivy::schema::TEXT);
-                    let index = tantivy::Index::create_in_ram(schema.build());
-                    let writer: tantivy::IndexWriter =
-                        index.writer_with_num_threads(1, 15_000_000).unwrap();
-                    let started: Vec<_> = linux::threads()
-                        .into_iter()
-                        .filter(|t| !before.contains(t))
-                        .filter_map(linux::cpus)
-                        .collect();
-                    drop(writer);
-                    started
-                })
-                .join()
-                .unwrap()
-            };
-            let inherited = workers(false);
-            assert!(!inherited.is_empty());
-            assert!(inherited.iter().all(|c| c == &[0]), "{inherited:?}");
-            let placed = workers(true);
-            assert!(!placed.is_empty());
-            assert!(placed.iter().all(|c| c == &[0, 1]), "{placed:?}");
-        }
     }
 
-    #[cfg(target_os = "linux")]
+    /// Set in the process that [`tantivy_workers_take_the_hooks_cpus`] starts.
+    #[cfg(all(target_os = "linux", feature = "text"))]
+    const ALONE: &str = "SPARKLES_THREADS_TEST_ALONE";
+
+    /// Tantivy's workers, started from a thread on CPU 0 alone when a writer opens and
+    /// after it commits, take the CPUs that the hook gives when the engine runs it first.
+    /// The check reads the CPUs of every thread that the writer starts, so it runs in a
+    /// process of its own, where no other test starts threads.
+    #[cfg(all(target_os = "linux", feature = "text"))]
+    #[test]
+    fn tantivy_workers_take_the_hooks_cpus() {
+        if std::env::var_os(ALONE).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "threads::tests::tantivy_workers_take_the_hooks_cpus",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(ALONE, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains(" 1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        if !linux::cpus(0).is_some_and(|c| c.starts_with(&[0, 1])) {
+            return;
+        }
+        fn widen() {
+            linux::pin(&[0, 1]);
+        }
+        assert!(super::set_start_hook(widen));
+        // the CPUs of the threads that `f` starts from a thread on CPU 0 alone
+        let started = |spawning: bool| {
+            std::thread::spawn(move || {
+                linux::pin(&[0]);
+                let mut schema = tantivy::schema::Schema::builder();
+                let t = schema.add_text_field("t", tantivy::schema::TEXT);
+                let index = tantivy::Index::create_in_ram(schema.build());
+                let mut seen = Vec::new();
+                let new_threads = |before: &[i32], seen: &mut Vec<Vec<usize>>| {
+                    for tid in linux::threads().into_iter().filter(|t| !before.contains(t)) {
+                        seen.extend(linux::cpus(tid));
+                    }
+                };
+                let before = linux::threads();
+                if spawning {
+                    super::spawning();
+                }
+                let mut writer: tantivy::IndexWriter =
+                    index.writer_with_num_threads(1, 15_000_000).unwrap();
+                new_threads(&before, &mut seen);
+                linux::pin(&[0]);
+                writer.add_document(tantivy::doc!(t => "a")).unwrap();
+                let before = linux::threads();
+                if spawning {
+                    super::spawning();
+                }
+                writer.prepare_commit().unwrap().commit().unwrap();
+                new_threads(&before, &mut seen);
+                drop(writer);
+                seen
+            })
+            .join()
+            .unwrap()
+        };
+        let inherited = started(false);
+        assert!(!inherited.is_empty());
+        assert!(inherited.iter().all(|c| c == &[0]), "{inherited:?}");
+        let placed = started(true);
+        assert!(!placed.is_empty());
+        assert!(placed.iter().all(|c| c == &[0, 1]), "{placed:?}");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "text"))]
     mod linux {
         /// Run the calling thread only on `cpus`.
         pub fn pin(cpus: &[usize]) {
