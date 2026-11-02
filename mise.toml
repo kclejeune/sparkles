@@ -429,6 +429,11 @@ mbx test $pkgs --doc
 ''',
 ]
 
+[tasks."test:partitioned"]
+description = "The workspace's nextest tests, built once and run in shares here and on the configured hosts or Namespace instances, with a coverage check (scripts/test-partitioned.sh)"
+depends = ["ui:build"]
+run = "scripts/test-partitioned.sh"
+
 [tasks."test:cargo"]
 description = "All Rust tests with `mbx test`, one test binary after another"
 depends = ["ui:build"]
