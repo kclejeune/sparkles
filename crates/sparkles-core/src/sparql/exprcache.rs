@@ -329,13 +329,26 @@ pub fn per_value<T: Send>(
     let Some(d) = distinct(ctx, t, exprs, always, report)? else {
         return Ok(None);
     };
+    // The slots, the distinct values and their results live until the caller has
+    // expanded or read them, so they stay charged until then in both accounting modes.
+    let held = (d.slot.as_ref().map_or(0, Vec::capacity) as u64)
+        .saturating_mul(4)
+        .saturating_add(d.values.mem_bytes());
+    let Ok(mut charge) = ctx.retained_charge(held) else {
+        return Ok(None);
+    };
     let vals = eval(&d.values)?;
     debug_assert_eq!(vals.len(), d.values.len());
+    if let Some(charge) = &mut charge {
+        charge.resize(held.saturating_add(
+            (vals.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64),
+        ))?;
+    }
     ctx.check()?;
     Ok(Some(PerValue {
         vals,
         slot: d.slot,
-        _charge: None,
+        _charge: charge,
     }))
 }
 
@@ -726,11 +739,13 @@ fn batch_filter(
         };
     };
     let vals = match (key_bytes, v) {
-        (Some(_), Some(v)) => {
-            let kf = super::keyfilter::KeyFilter::new_for(ctx, exprs, v)
-                .expect("key-test admission matches compilation");
-            key_filter_mask(ctx, &kf, &d.values.cols[0], v, exprs)?
-        }
+        // The shape admits key tests, but a pattern that does not compile or a charge
+        // that does not fit leaves the values to the general evaluator, where an
+        // invalid pattern is an error and so fails the filter.
+        (Some(_), Some(v)) => match super::keyfilter::KeyFilter::new_for(ctx, exprs, v) {
+            Some(kf) => key_filter_mask(ctx, &kf, &d.values.cols[0], v, exprs)?,
+            None => super::exec::filter_mask(ctx, &d.values, exprs)?,
+        },
         _ => super::exec::filter_mask(ctx, &d.values, exprs)?,
     };
     ctx.check()?;

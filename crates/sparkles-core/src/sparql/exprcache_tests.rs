@@ -242,9 +242,47 @@ fn random_queries_agree_with_and_without_the_cache() {
     }
 }
 
+/// The sorted rows of a cursor with `batch_rows` rows a batch.
+fn cursor_rows(
+    snap: &Arc<crate::store::Snapshot>,
+    text: &str,
+    opt: Optimizations,
+    batch_rows: usize,
+) -> Vec<String> {
+    let opts = QueryOptions {
+        optimizations: Some(opt),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = super::cursor::CursorOptions {
+        batch_rows,
+        ..Default::default()
+    };
+    let text = format!("{PREFIXES}{text}");
+    let mut c = select_cursor(snap.clone(), &text, &opts, &cursor)
+        .unwrap_or_else(|e| panic!("{text}: {e}"));
+    let mut rows = Vec::new();
+    while let Some(b) = c.next_batch().unwrap_or_else(|e| panic!("{text}: {e}")) {
+        for i in 0..b.len() {
+            rows.push(
+                b.row(i)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.map_or("UNDEF".to_string(), |t| t.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
+    rows.sort();
+    rows
+}
+
 /// Inputs above `exec::PAR_THRESHOLD` rows take the table algorithms (an estimate of
 /// the distinct inputs and a parallel expansion) and inputs below it the batch
-/// algorithms, in both accounting modes, and both agree with evaluation row by row.
+/// algorithms, in both accounting modes, and both agree with evaluation row by row:
+/// eager execution of the whole table, and cursors with batches on both sides of the
+/// threshold.
 #[test]
 fn the_table_and_batch_algorithms_agree_with_rows_on_both_sides_of_the_threshold() {
     let mut next = xorshift(0x51_7cc1_b727_220a);
@@ -255,9 +293,28 @@ fn the_table_and_batch_algorithms_agree_with_rows_on_both_sides_of_the_threshold
         let shape = SHAPES[i % SHAPES.len()];
         let e = EXPRS[(next() % EXPRS.len() as u64) as usize];
         let p = PATTERNS[(next() % PATTERNS.len() as u64) as usize];
-        cached += check(&snap, &shape.replace("{E}", e).replace("{P}", p)) as usize;
+        let q = shape.replace("{E}", e).replace("{P}", p);
+        cached += check(&snap, &q) as usize;
+        if q.contains("ORDER BY") || q.contains("GROUP BY") {
+            continue;
+        }
+        let expected = cursor_rows(&snap, &q, without(), 4096);
+        for batch_rows in [4096, super::exec::PAR_THRESHOLD + 4096] {
+            assert_eq!(
+                cursor_rows(&snap, &q, Optimizations::ALL, batch_rows),
+                expected,
+                "{q}; {batch_rows}"
+            );
+        }
     }
     assert!(cached > 0);
+    // A pattern that does not compile fails the filter on every row in both modes,
+    // where the key tests decline it.
+    let q = "SELECT ?s WHERE { ?s ex:v ?v FILTER(REGEX(STR(?v), \"[\")) }";
+    assert!(show(&run_on(snap.clone(), q, Optimizations::ALL)).is_empty());
+    for batch_rows in [4096, super::exec::PAR_THRESHOLD + 4096] {
+        assert!(cursor_rows(&snap, q, Optimizations::ALL, batch_rows).is_empty());
+    }
 }
 
 /// The cache runs on repeated values, says how often it reused a result, and steps
