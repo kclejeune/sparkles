@@ -32,10 +32,12 @@
 //! ```
 
 mod index;
+mod query;
 mod saturate;
 mod taxonomy;
 
 pub use index::Gap;
+pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
 
 use crate::model::*;
@@ -113,6 +115,15 @@ pub struct Stats {
     pub taxonomy: Duration,
 }
 
+/// The result of a run that saturates without building a taxonomy
+/// ([`Classifier::saturate`]).
+#[derive(Clone, Debug)]
+pub struct Saturation {
+    /// false when the ontology has no model
+    pub consistent: bool,
+    pub stats: Stats,
+}
+
 /// The result of a run.
 #[derive(Clone, Debug)]
 pub struct Classification {
@@ -155,6 +166,8 @@ pub struct Classifier {
     chain_ranges: BTreeMap<AxiomKind, String>,
     /// set when a run stopped part way, so that the next run starts again
     dirty: bool,
+    /// whether the last run that ended found the ontology consistent
+    last_consistent: bool,
 }
 
 impl Default for Classifier {
@@ -237,6 +250,7 @@ impl Classifier {
             partial: BTreeMap::new(),
             chain_ranges: BTreeMap::new(),
             dirty: true,
+            last_consistent: true,
         }
     }
 
@@ -474,7 +488,26 @@ impl Classifier {
     /// Classifies the axioms held, saturating again only what changed since the last
     /// run.
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
-        let r = self.run(limits);
+        let r = self.run(limits, true);
+        self.after(r)
+            .map(|(consistent, taxonomy, stats)| Classification {
+                consistent,
+                taxonomy: taxonomy.expect("a taxonomy was asked for"),
+                stats,
+            })
+    }
+
+    /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
+    /// changed since the last run, but builds no taxonomy. [`describe`](Self::describe)
+    /// then answers for one class from the saturated contexts, which costs far less than
+    /// a taxonomy of every class when only a few classes are asked about.
+    pub fn saturate(&mut self, limits: &Limits) -> Result<Saturation, Error> {
+        let r = self.run(limits, false);
+        self.after(r)
+            .map(|(consistent, _, stats)| Saturation { consistent, stats })
+    }
+
+    fn after<T>(&mut self, r: Result<T, Error>) -> Result<T, Error> {
         if r.is_err() && self.dirty {
             // the next run starts again, so the state of this one is of no use
             self.index = None;
@@ -484,7 +517,11 @@ impl Classifier {
         r
     }
 
-    fn run(&mut self, limits: &Limits) -> Result<Classification, Error> {
+    fn run(
+        &mut self,
+        limits: &Limits,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         let mut stats = Stats::default();
         let start = Instant::now();
         // a run that starts again needs no copies of the changed axioms
@@ -580,17 +617,20 @@ impl Classifier {
         self.index = Some(ix);
         let t = Instant::now();
         let consistent = self.consistent(&ax);
-        let stop = || poll(limits).is_err();
-        let taxonomy = taxonomy::build(self, consistent, &stop)
-            .ok_or_else(|| poll(limits).err().unwrap_or(Error::Cancelled))?;
+        self.last_consistent = consistent;
+        let taxonomy = if with_taxonomy {
+            let stop = || poll(limits).is_err();
+            Some(
+                taxonomy::build(self, consistent, &stop)
+                    .ok_or_else(|| poll(limits).err().unwrap_or(Error::Cancelled))?,
+            )
+        } else {
+            None
+        };
         stats.taxonomy = t.elapsed();
         stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
         poll(limits)?;
-        Ok(Classification {
-            consistent,
-            taxonomy,
-            stats,
-        })
+        Ok((consistent, taxonomy, stats))
     }
 
     fn consistent(&self, ax: &Axioms) -> bool {

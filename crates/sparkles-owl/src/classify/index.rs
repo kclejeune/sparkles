@@ -602,7 +602,7 @@ pub fn class_expression(
                     partial = partial.or(p);
                     Ok(e)
                 })
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<_, &'static str>>()?;
             es.sort_unstable();
             es.dedup();
             es.retain(|&e| e != TOP);
