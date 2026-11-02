@@ -99,8 +99,8 @@ resources and source identity go ahead of unrelated feature expansion.
 
 The first release fixes the storage formats that later versions must read and completes
 backup. Item 343 settles the dataset-local codec settings, item 479 then sets the
-first-release format cutoff, and item 61 completes backup. These items take free capacity
-alongside the waves below. Published artifacts follow the first release: the server
+first-release format cutoff, and item 61 completes backup. The feature waves below come
+first, and these items take only capacity that the waves leave free. Published artifacts follow the first release: the server
 binaries and container images of item 59 and the PyPI, Maven Central and npm packages of
 item 58, both after the format cutoff. The later encryption phases of item 65, security and audit in item 466, the developer ecosystem of
 items 468 and 47, notifications in item 46, the per-crate Nix builds of item 92 and the
