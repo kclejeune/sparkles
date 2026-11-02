@@ -374,6 +374,10 @@ pub fn per_value<T: Send>(
 /// Fixed-size numeric ORDER keys can reuse input IDs without retaining decoded
 /// strings or populating the eager value cache. Own the reservation with the
 /// returned values/slots; it must survive until the sort has finished.
+///
+/// An input of more than [`super::exec::PAR_THRESHOLD`] rows takes this path only when
+/// its integers span a dense range, which [`cursor_integer_distinct`] reads in parallel,
+/// and leaves other inputs to [`per_value`].
 pub(super) fn cursor_numeric_values(
     ctx: &Ctx,
     t: &Table,
@@ -416,12 +420,19 @@ pub(super) fn cursor_numeric_values(
     {
         return Ok(None);
     }
-    let bytes = (t.len() as u64).saturating_mul(256).saturating_add(4096);
+    let large = t.len() > super::exec::PAR_THRESHOLD;
+    // A large input holds its slots and at most one position of each value in the range.
+    let bytes = if large {
+        (t.len() as u64 * 4).saturating_add(DENSE_SPAN as u64 * 64 + 4096)
+    } else {
+        (t.len() as u64).saturating_mul(256).saturating_add(4096)
+    };
     let Ok(mut charge) = ctx.retained_charge(bytes) else {
         return Ok(None);
     };
     let d = match cursor_integer_distinct(ctx, t, &[e], v, report)? {
         Some(d) => Some(d),
+        None if large => None,
         None => cursor_key_distinct(ctx, t, &[e], v, false, report)?,
     };
     let Some(d) = d else {
@@ -890,6 +901,9 @@ fn numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<boo
 
 /// The caller holds the cursor reservation through expansion. Keep this batch
 /// algorithm separate from eager distinct admission and its reuse estimator.
+/// The widest range of integers that [`cursor_integer_distinct`] maps directly.
+const DENSE_SPAN: usize = 1 << 16;
+
 fn cursor_integer_distinct(
     ctx: &Ctx,
     t: &Table,
@@ -900,6 +914,9 @@ fn cursor_integer_distinct(
     let Some(column) = t.col_of(v) else {
         return Ok(None);
     };
+    if t.len() > super::exec::PAR_THRESHOLD {
+        return par_integer_distinct(ctx, t, exprs, v, column, report);
+    }
     let mut lo = u64::MAX;
     let mut hi = 0;
     for (row, id) in t.cols[column].iter().enumerate() {
@@ -913,7 +930,7 @@ fn cursor_integer_distinct(
         hi = hi.max(id.payload());
     }
     let span = hi.saturating_sub(lo).saturating_add(1);
-    if span > (t.len() / 2).min(1 << 16) as u64 {
+    if span > (t.len() / 2).min(DENSE_SPAN) as u64 {
         return Ok(None);
     }
     let mut positions = vec![u32::MAX; span as usize];
@@ -942,6 +959,75 @@ fn cursor_integer_distinct(
         }
         slot.push(positions[(id.payload() - lo) as usize]);
     }
+    values.sorted = vec![v];
+    report.push(ctx, exprs, t.len(), Ok(values.len));
+    Ok(Some(Distinct {
+        values,
+        slot: Some(slot),
+    }))
+}
+
+/// [`cursor_integer_distinct`] for an input of more than [`super::exec::PAR_THRESHOLD`]
+/// rows, whose range, observed values and slots are found in parallel pieces.
+fn par_integer_distinct(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[&Expr],
+    v: VarId,
+    column: usize,
+    report: &mut Report,
+) -> Result<Option<Distinct>> {
+    const PIECE: usize = 1 << 16;
+    let col = &t.cols[column];
+    ctx.check()?;
+    let range = col
+        .par_chunks(PIECE)
+        .map(|piece| {
+            piece.iter().try_fold((u64::MAX, 0), |(lo, hi), id| {
+                (id.tag() == Tag::Int).then(|| (lo.min(id.payload()), hi.max(id.payload())))
+            })
+        })
+        .try_reduce(|| (u64::MAX, 0), |a, b| Some((a.0.min(b.0), a.1.max(b.1))));
+    let Some((lo, hi)) = range else {
+        return Ok(None);
+    };
+    let span = hi.saturating_sub(lo).saturating_add(1);
+    if span > (t.len() / 2).min(DENSE_SPAN) as u64 {
+        return Ok(None);
+    }
+    let span = span as usize;
+    ctx.check()?;
+    let seen = col
+        .par_chunks(PIECE)
+        .map(|piece| {
+            let mut seen = vec![false; span];
+            for id in piece {
+                seen[(id.payload() - lo) as usize] = true;
+            }
+            seen
+        })
+        .reduce(
+            || vec![false; span],
+            |mut a, b| {
+                a.iter_mut().zip(b).for_each(|(a, b)| *a |= b);
+                a
+            },
+        );
+    ctx.check()?;
+    let mut values = Table::new(vec![v]);
+    let mut positions = vec![u32::MAX; span];
+    for (offset, seen) in seen.into_iter().enumerate() {
+        if seen {
+            positions[offset] = values.len as u32;
+            values.push_row(&[Id::new(Tag::Int, lo + offset as u64)]);
+        }
+    }
+    let slot: Vec<u32> = col
+        .par_iter()
+        .with_min_len(super::exec::PAR_MIN_LEN)
+        .map(|id| positions[(id.payload() - lo) as usize])
+        .collect();
+    ctx.check()?;
     values.sorted = vec![v];
     report.push(ctx, exprs, t.len(), Ok(values.len));
     Ok(Some(Distinct {

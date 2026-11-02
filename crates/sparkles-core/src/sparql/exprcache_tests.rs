@@ -305,6 +305,11 @@ fn sorts_agree_on_both_sides_of_the_threshold() {
          ORDER BY ?v LIMIT 30",
         "SELECT (xsd:double(?v) AS ?d) WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) } \
          ORDER BY DESC(?v) LIMIT 30",
+        // keys over a dense range of computed integers
+        "SELECT ?s ?k WHERE { ?s ex:v ?v BIND(STRLEN(STR(?v)) AS ?k) } \
+         ORDER BY DESC(ABS(?k - 6)) ?s STR(?v) LIMIT 40",
+        "SELECT ?s ?k WHERE { ?s ex:v ?v BIND(STRLEN(STR(?v)) AS ?k) } \
+         ORDER BY (?k * 2) ?s STR(?v)",
     ];
     for (seed, n) in [
         (0x2f0e_11d3_95a1_c407, super::exec::PAR_THRESHOLD / 2),

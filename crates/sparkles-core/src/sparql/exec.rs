@@ -6483,15 +6483,16 @@ fn key_per_value(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Option<super::exprcache::PerValue<Option<Value>>>> {
-    // Up to `PAR_THRESHOLD` rows, numeric keys reuse their input ids and a variable's
-    // values are decoded once each in key order. A larger input evaluates each distinct
-    // value once, in parallel.
+    // Numeric keys reuse their input ids, from a dense range of integers at any size and
+    // from a sort up to `PAR_THRESHOLD` rows. Up to that size a variable's values are
+    // decoded once each in key order, and a larger input evaluates each distinct value
+    // once, in parallel.
+    if let Some(values) =
+        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| key_rows(ctx, v, e, None))?
+    {
+        return Ok(Some(values));
+    }
     if t.len() <= PAR_THRESHOLD {
-        if let Some(values) = super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| {
-            key_rows(ctx, v, e, None)
-        })? {
-            return Ok(Some(values));
-        }
         return super::exprcache::cursor_variable_values(ctx, t, e);
     }
     if t.len() < super::exprcache::MIN_ROWS {
