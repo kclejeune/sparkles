@@ -138,7 +138,8 @@ checks the profiles, edits axioms, removes entities and diffs commits, and answe
 JSON forms of the `/$/ontology` routes ([API.md](../API.md#ontology)). Python's `Axiom`
 is a frozen axiom with structural equality and hashing, read from functional-style
 syntax or the JSON form, and the listings carry `Axiom` objects. Node.js's `axioms` is
-an async iterable that reads pages from the commit of the first page. Python takes
+an async iterable that reads pages from the commit of the first page, and its `timeout`
+bounds the whole listing. Python takes
 `cancel` and `timeout`, Node.js the operation options, and the JVM a
 `SparklesOperation`.
 
@@ -147,8 +148,8 @@ an async iterable that reads pages from the commit of the first page. Python tak
 programs use `jena-ontapi`'s own interfaces. One native call copies the graph into a
 Jena in-memory graph, from the thread's transaction or the head. Writes through the
 model go to the copy and to the Sparkles graph in the thread's write transaction, so a
-transaction's edits make one commit, and a commit made through another handle later is
-not seen by the model. `jena-ontapi` is not bundled, and a program that calls `model`
+transaction's edits make one commit. A transaction that aborts undoes its writes in the
+copy too, and a commit made through another handle later is not seen by the model. `jena-ontapi` is not bundled, and a program that calls `model`
 adds `org.apache.jena:jena-ontapi` of its Jena version. `SparklesOnt.check` and the
 other `SparklesOnt` functions run the native operations over one graph.
 

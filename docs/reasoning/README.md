@@ -208,8 +208,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   properties and keys of more than two, which
   `crates/sparkles-reasoner/rules/owl-rl.gaps` lists beside the rules. The warnings
   appear in the run's report, the reasoning record and the output of `sparkles infer`.
-  The check reads the terminology of the inputs before the run, with the imports that
-  resolve to graphs of the dataset.
+  The check reads the terminology of the inputs in the state the run reads, once the run
+  holds the writer lock, with the imports that resolve to graphs of the dataset.
 * `sparkles_owl::profiles::partition` splits an ontology's axioms by one profile's
   grammar, without the OWL 2 DL global restrictions. It is the OWL 2 QL check that
   query-time OWL 2 QL rewriting is to use, and the RL warning uses it too.
@@ -388,6 +388,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 75.
 * An ontology read does not fetch an `owl:imports` target that is not a graph of the
   dataset. Roadmap item 559.
+* The MCP ontology tool and the CLI's ontology commands read the asserted axioms only,
+  without the materialized inferences that the library, the bindings and the HTTP routes
+  can include. Roadmap item NEW-ITEM-1.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
 * The Rust ontology handle has no entity accessors such as the superclasses of a class
@@ -416,7 +419,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md), [item 559](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md), [item 559](../ROADMAP.md), [item NEW-ITEM-1](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

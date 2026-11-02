@@ -628,7 +628,9 @@ take `Axiom` objects, strings or dicts. The wheel's `ontology` feature is on by 
 **Node.js.** `dataset.ontology` has `summary`, `axiomPage`, `axioms`, `check`, `edit`,
 `removeEntity` and `diff`, each returning a promise except `axioms`. `axioms` is an async
 iterable that reads pages of `batch` axioms (1,000 by default) from the commit of the
-first page, so that a commit made during the listing does not mix into it. Axioms are
+first page, whatever state `at` names, so that a commit made during the listing does not
+mix into it. Its `timeout` bounds the whole listing. Edits and diffs pass `at` and
+`inferences` on to the native call, which refuses them. Axioms are
 plain objects in the JSON form, with a `type` member, and the 64-bit counts are `bigint`,
 as in the other administration answers.
 
@@ -638,7 +640,9 @@ model reads an in-memory copy of the graph that one native call, `find_all`, fil
 the thread's transaction or the head, so the per-`find` cost that P04 §3.10 describes
 does not apply. A write to the model goes to the copy and to the Sparkles graph, in the
 thread's write transaction when there is one, so a transaction's edits make one commit.
-`SparklesOnt` also runs the native operations over one graph, and
+The copy keeps the changes of a transaction until it ends and undoes them when it does
+not commit, so an aborted transaction leaves the model as the dataset is. `SparklesOnt`
+also runs the native operations over one graph, and
 `DatasetGraphSparkles.ontology()` is the full handle with `summary`, `axioms`, `check`,
 `edit`, `removeEntity` and `diff`.
 
@@ -656,7 +660,10 @@ graph among its origins. Edits and diffs refuse the flag, since they change and 
 the asserted axioms.
 
 **The OWL 2 RL warning.** A materialization under `owl-rl` reads the terminology of its
-input graphs and their dataset imports before it runs. This holds for the library, the
+input graphs and their dataset imports in the state it reads, once it holds the writer
+lock and before it derives anything. The reasoner's `ReasonOptions::inspect` hook makes
+this check, so a commit that lands after the run starts and before it locks is checked
+too. The check holds the lock for the time it takes. This holds for the library, the
 server's `/$/reason/{ds}` and `sparkles infer`. The run adds a warning with the count of
 axioms outside the OWL 2 RL grammar and the first of them with its rule, since the rules
 are complete only for ontologies in the profile (OWL 2 Profiles §4.3, Theorem PR1). A
@@ -673,10 +680,12 @@ that F17 §7 plans in `qlrewrite.rs`, so the rewriting reads the axioms inside O
 reports those set aside. The RL warning uses the same partition.
 
 **Testing.** Library tests cover reads with and without inferences, a view that hides the
-inferred graph, the RL warning of A10, the gap table, and every JSON operation and its
+inferred graph, the RL warning of A10 with a commit that lands before the run locks, the
+gap table, and every JSON operation and its
 refusals. The CLI test runs A10 through `sparkles infer`. The binding tests cover each
 operation in Python, Node.js and the JVM, `Axiom` equality and hashing, the batched
-Node.js listing, and A9. In A9, `OntModel.classes()` lists the classes of A1, a superclass
+Node.js listing with its commit and its deadline, the refusals of inferred and historical
+edits, and A9 with an aborted transaction. In A9, `OntModel.classes()` lists the classes of A1, a superclass
 added inside a write transaction makes one commit, and a model over 10,000 classes and
 20,000 triples is filled by one native read. The OWL 2 tests cover the partition of A6's
 ontology.
