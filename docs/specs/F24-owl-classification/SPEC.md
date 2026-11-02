@@ -167,7 +167,7 @@ classifier gives is asserted. `scripts/el-oracle.py --asserted` makes these
 comparisons. All 298 ontologies of the ORE 2015 EL classification sample classify.
 ELK itself has not been run beside the classifier, so a comparison with ELK 0.4.3 on
 GO, ChEBI and the ORE sample, and the measurements against ELK, remain in roadmap item
-NEW-ITEM-6. SNOMED CT is not available to the project and was not used.
+591. SNOMED CT is not available to the project and was not used.
 
 **Measurements.** On forge, GO classifies in 410 ms and ChEBI lite in 2.97 s on four
 threads, at peak resident sets of 438 MiB and 1.66 GiB that include the axioms read.
@@ -187,10 +187,10 @@ tests cover the answer, the functional-style form, dry runs and the caller's gra
 CLI test classifies a file and a database, and each binding's tests classify and write a
 taxonomy.
 
-**Roadmap follow-ups.** An MCP tool is item NEW-ITEM-1. Complete reasoning with
-individuals and datatypes is item NEW-ITEM-2. Reads that answer from the classification
-and DL Query are item NEW-ITEM-3. Durable and automatic classification is item
-NEW-ITEM-4, after item 339. A kept classification with assertions is item NEW-ITEM-5,
-the comparison and measurements against ELK are item NEW-ITEM-6, and a classifier that
+**Roadmap follow-ups.** An MCP tool is item 586. Complete reasoning with
+individuals and datatypes is item 587. Reads that answer from the classification
+and DL Query are item 588. Durable and automatic classification is item
+589, after item 339. A kept classification with assertions is item 590,
+the comparison and measurements against ELK are item 591, and a classifier that
 shares the ontology's axioms and builds its index and taxonomy in parallel is item
-NEW-ITEM-7.
+592.

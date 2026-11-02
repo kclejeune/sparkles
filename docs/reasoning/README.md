@@ -450,21 +450,21 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The EL classifier treats individuals in class expressions, data ranges and data values
   as atoms, so axioms that use them may lose consequences, and keys, negative property
   assertions, functional data properties and data property ranges take no part.
-  Roadmap item NEW-ITEM-2.
-* No MCP tool classifies, roadmap item NEW-ITEM-1, and the entity accessors and the
+  Roadmap item 587.
+* No MCP tool classifies, roadmap item 586, and the entity accessors and the
   inferred reads do not answer from a classification, nor does any surface answer the
-  subclasses of a class expression, roadmap item NEW-ITEM-3.
+  subclasses of a class expression, roadmap item 588.
 * A classification runs within one request's deadline and is not kept up to date as
-  commits land. Roadmap item NEW-ITEM-4.
+  commits land. Roadmap item 589.
 * A classification with the assertions saturates everything on each run, since the
-  dataset keeps only classifications of the terminology. Roadmap item NEW-ITEM-5.
+  dataset keeps only classifications of the terminology. Roadmap item 590.
 * The classifier's hierarchy has been compared with the released hierarchies of GO,
   which ELK computes in GO's release pipeline, and of ChEBI, but not with ELK itself on
   those and the ORE test ontologies, and it has not been timed against ELK. Roadmap item
-  NEW-ITEM-6.
+  591.
 * The classifier keeps its own copy of the axioms, its peak resident memory is about 1.6
   times the estimate that its memory budget uses, and its indexing and taxonomy stages
-  run on one thread. Roadmap item NEW-ITEM-7.
+  run on one thread. Roadmap item 592.
 
 ## Configuration and usage
 

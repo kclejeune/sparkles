@@ -27,7 +27,7 @@ a loaded laptop, the largest having 981,151 classes, which is a completion check
 not a timing.
 
 The classifier has not been compared with ELK itself on these ontologies, and its time
-and memory have not been measured against ELK's. Roadmap item NEW-ITEM-6 covers both.
+and memory have not been measured against ELK's. Roadmap item 591 covers both.
 SNOMED CT is not available to the project and was not used.
 
 ## Classification time and memory
@@ -48,7 +48,7 @@ The build is commit 8e73284a.
 | | 8 | 2,840 | 858 | 739 | 868 | 1,803 | 269 |
 
 Saturation scales with the threads. Indexing and the taxonomy run on one thread and
-take most of the time on four threads or more, which roadmap item NEW-ITEM-7 follows.
+take most of the time on four threads or more, which roadmap item 592 follows.
 The classifier holds a copy of the axioms of its own, so its share of the peak is about
 350 MiB on GO and 1.3 to 1.5 GiB on ChEBI. That copy is what lets a kept classifier
 reclassify incrementally after a change, which trades memory for fast

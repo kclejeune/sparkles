@@ -62,7 +62,7 @@ partially complete and planned implementation scope.
 | Query, load and write comparisons | Measured with partial coverage | Published tables cover their named data, engines and timing contracts. Larger suites, sustained workloads and broader hardware remain open. |
 | Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
-| OWL 2 EL classification | Measured without peers | [Classification times and memory](benchmarks/el-classification/RESULTS.md) on GO and ChEBI are published, with agreement against their released hierarchies. A comparison with ELK remains in roadmap item NEW-ITEM-6. |
+| OWL 2 EL classification | Measured without peers | [Classification times and memory](benchmarks/el-classification/RESULTS.md) on GO and ChEBI are published, with agreement against their released hierarchies. A comparison with ELK remains in roadmap item 591. |
 | Evidence and maintained analysis | Unmeasured | C25 provides authenticated evidence proposals and resolution, and C27 supplies temporal profile resources and queries. Review-controlled projections and the managed analysis work in C26, F22 and C22b remain planned. |
 
 ## Reading the comparisons
