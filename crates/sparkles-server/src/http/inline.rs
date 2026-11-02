@@ -304,8 +304,8 @@ impl QuickQueries {
         self.record_run(key, ms, Run::Cursor);
     }
 
-    /// Record that an eager trial of the query outgrew its memory budget, so that later
-    /// runs keep automatic execution whatever eager runs took before.
+    /// Record that an eager run of the query outgrew its memory budget, so that later runs
+    /// keep automatic execution whatever eager runs took before.
     pub fn record_eager_failure(&self, key: u64) {
         self.record_run(key, f64::MAX, Run::EagerFailed);
     }
@@ -336,10 +336,18 @@ impl QuickQueries {
             }
             Run::Eager => {
                 eager_best = eager_best.min(ms);
-                if ms < QUICK_QUERY_MS {
+                if cursor_best < eager_best {
+                    // the cursor is the faster mode
+                    if cursor_best < QUICK_QUERY_MS {
+                        History::Quick(QuickExecution::PreserveAuto)
+                    } else {
+                        History::Slow
+                    }
+                } else if ms < QUICK_QUERY_MS {
                     History::Quick(QuickExecution::Eager)
-                } else if eager_best < cursor_best {
-                    // eager is the faster mode, though not a quick one: eager on the pool
+                } else if cursor_best.is_finite() {
+                    // eager measured faster than the cursor, though not quick: eager on
+                    // the pool
                     History::TryEager
                 } else {
                     History::Slow
@@ -446,7 +454,7 @@ mod tests {
         q.record_cursor(b, 6.0);
         assert_eq!(q.history(b), History::Quick(QuickExecution::Eager));
         q.record(b, 14.0);
-        assert_eq!(q.history(b), History::Slow);
+        assert_eq!(q.history(b), History::Quick(QuickExecution::PreserveAuto));
         q.record_cursor(b, 6.0);
         assert_eq!(q.history(b), History::Quick(QuickExecution::PreserveAuto));
         q.record_cursor(b, 9.0);
@@ -459,6 +467,19 @@ mod tests {
         assert_eq!(q.history(c), History::Slow);
         q.record_cursor(c, 20.0);
         assert_eq!(q.history(c), History::Slow);
+        // a slow eager run with no cursor measured leaves automatic execution
+        let h = 8;
+        q.record(h, 30.0);
+        assert_eq!(q.history(h), History::Slow);
+        // a quick eager run that a faster cursor beat keeps automatic execution
+        let i = 9;
+        q.record_cursor(i, 40.0);
+        q.record(i, 20.0);
+        assert_eq!(q.history(i), History::TryEager);
+        q.record_cursor(i, 4.0);
+        assert_eq!(q.history(i), History::Quick(QuickExecution::PreserveAuto));
+        q.record(i, 8.0);
+        assert_eq!(q.history(i), History::Quick(QuickExecution::PreserveAuto));
         // eager faster but not quick: the next runs stay eager, on the pool
         let f = 6;
         q.record_cursor(f, 40.0);
@@ -472,7 +493,7 @@ mod tests {
         assert_eq!(q.history(d), History::Slow);
         q.record_cursor(d, f64::INFINITY);
         assert_eq!(q.history(d), History::Slow);
-        // an eager trial that outgrew its budget keeps the cursor, whatever came before
+        // an eager run that outgrew its budget keeps the cursor, whatever came before
         let g = 7;
         q.record_cursor(g, 15.0);
         q.record(g, 3.0);

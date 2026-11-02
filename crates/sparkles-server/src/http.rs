@@ -1630,6 +1630,13 @@ pub(crate) fn one_request(opts: &sparkles::sparql::QueryOptions) -> sparkles::sp
     shared
 }
 
+/// Whether a run failed for want of query memory, the failure after which a cursor that
+/// keeps to the budget may still answer.
+fn outgrew_memory(e: &sparkles::Error) -> bool {
+    matches!(e, sparkles::Error::BudgetExceeded(b)
+        if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory))
+}
+
 /// Run a query as `/{ds}/sparql` does: the request's budgets, graph view, result format
 /// and history parameters, with `bindings` as initial bindings (stored queries).
 #[allow(clippy::too_many_arguments)]
@@ -1814,20 +1821,21 @@ pub(crate) async fn run_query(
                 // share one deadline, one count of rows produced and one outbound budget.
                 let shared = one_request(&opts);
                 match sparkles::sparql::query_with_plan(snap.clone(), &query, &shared) {
-                    Err(f)
-                        if matches!(
-                            &f.error,
-                            sparkles::Error::BudgetExceeded(b)
-                                if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory)
-                        ) =>
-                    {
+                    Err(f) if outgrew_memory(&f.error) => {
                         QUICK.record_eager_failure(quick_key);
                         automatic(snap, &shared)
                     }
                     ran => ran.map(Ran::Eager),
                 }
             } else {
-                sparkles::sparql::query_with_plan(snap, &query, &opts).map(Ran::Eager)
+                let ran = sparkles::sparql::query_with_plan(snap, &query, &opts);
+                if let Err(f) = &ran
+                    && outgrew_memory(&f.error)
+                {
+                    // a cursor that keeps to the budget stays the text's mode
+                    QUICK.record_eager_failure(quick_key);
+                }
+                ran.map(Ran::Eager)
             };
             let r = match ran {
                 Ok(Ran::Cursor(cursor)) => return Ok((Ran::Cursor(cursor), seq, resolved, t0, t)),
