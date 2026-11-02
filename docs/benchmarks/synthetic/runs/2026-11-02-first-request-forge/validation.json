@@ -48,7 +48,7 @@
   "a5": "A5 and the window sweep at 1.01B",
   "probes": "first-request probes of path-plus and four other queries"
  },
- "correctness": "Every A/B and A5 step has one answer hash per query across both sides (answer_hashes). bench.sh checks row agreement across the engines before timing.",
+ "correctness": "Every A/B and A5 step has one answer hash per query across both sides (answer_hashes), so base and lane return the same answers. The engine step ran bench.sh with MODE=cold, which records timings and does not compare answers, so the cross-engine agreement of these five queries was not checked in this run.",
  "results": {
   "cold_10m": {
    "class-predicate-list": {

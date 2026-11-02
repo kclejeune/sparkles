@@ -4,8 +4,8 @@
 >
 > **Phases:** I/O accounting, batched constant resolution, prefetch, scan-specific read
 > windows, segmented index-format-3 blocks and the optional prewarm of `serve --prewarm`
-> are available. The 1.01B gates and the cold targets that the
-> [Outcome](#not-done) lists remain open.
+> are available. The four cold targets are met and the 1.01B dense gate A5 holds. The
+> counter-cost gate A2 and the follow-ups that the [Outcome](#not-done) lists remain open.
 >
 > **User docs:** [I/O profile](../API.md#the-io-profile),
 > [cold reads](../internals/OPTIMIZATIONS.md#cold-reads) and
@@ -1242,13 +1242,14 @@ variant returned one answer hash per query. The default window is 4 MiB, and "of
 
 A5 holds. With hints on, `export-1m` takes 1,293 ms, far below the 22,118 ms of the same
 build with hints off, and `entity-facts-1` takes 8.7 ms against its gate of 15.2 ms.
-`label-regex` takes 39.4 ms against its gate of 68.5 ms. `export-1m` is 4% above the
-1,239 ms of §9, which was measured on a format 2 store with an earlier build, and no
-format 2 store of this size was available to repeat that measurement. The hints-off
-export of a format 3 store is now 17 times slower than with hints, where on format 2 the
-two were within 1%. Both are follow-ups under roadmap item NEW-ITEM-2. The windows of 1, 4
-and 16 MiB are within the noise of each other on every query except `label-regex`, where
-the 1 MiB window is 28% slower than the default, so the default of 4 MiB stays.
+`label-regex` takes 39.4 ms against its gate of 68.5 ms. `export-1m` is 4% above the 1,239
+ms of §9, which was measured on a format 2 store with an earlier build, and no format 2
+store of this size was available to repeat that measurement. The hints-off export of a
+format 3 store is now 17 times slower than with hints, where on format 2 it took 1,231 to
+1,239 ms and was faster than the 1,883 to 1,956 ms with hints. Both are follow-ups under
+roadmap item NEW-ITEM-2. The windows of 1, 4 and 16 MiB are within the noise of each other
+on every query except `label-regex`, where the 1 MiB window is 28% slower than the
+default, so the default of 4 MiB stays.
 
 ### Not done
 
