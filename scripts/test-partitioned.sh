@@ -63,7 +63,7 @@ main() {
   if [ -f "$config" ]; then
     while IFS='=' read -r k v; do
       case $k in
-        TEST_PARTITION_HOSTS | TEST_PARTITION_TRANSPORT | TEST_PARTITION_MIN_FREE_GB | TEST_PARTITION_NSC_DURATION | TEST_PARTITION_ENV_FILE)
+        TEST_PARTITION_HOSTS | TEST_PARTITION_TRANSPORT | TEST_PARTITION_MIN_FREE_GB | TEST_PARTITION_NSC_DURATION | TEST_PARTITION_ENV_FILE | TEST_PARTITION_TIMEOUT)
           [ -n "${!k+x}" ] || export "$k=$v"
           ;;
       esac
@@ -75,6 +75,7 @@ main() {
   min_free=${TEST_PARTITION_MIN_FREE_GB:-40}
   nsc_duration=${TEST_PARTITION_NSC_DURATION:-2h}
   env_file=${TEST_PARTITION_ENV_FILE:-}
+  share_timeout=${TEST_PARTITION_TIMEOUT:-7200}
   local_share=1
   kind=slice
   busy=skip
@@ -127,6 +128,7 @@ main() {
   case $transport in ssh | hc) ;; *) die "bad --transport $transport" ;; esac
   case $busy in skip | use) ;; *) die "bad --busy $busy" ;; esac
   case $min_free in '' | *[!0-9]*) die "bad TEST_PARTITION_MIN_FREE_GB $min_free" ;; esac
+  case $share_timeout in '' | *[!0-9]*) die "bad TEST_PARTITION_TIMEOUT $share_timeout" ;; esac
 
   case $root in *[!A-Za-z0-9._/-]*) die "the checkout path $root has characters the remote commands do not quote" ;; esac
   out=$(realpath -m "${out:-.artifacts/test-partitioned/$(date -u +%Y%m%dT%H%M%SZ)}")
@@ -142,8 +144,19 @@ main() {
   share_kind=()
   trap cleanup EXIT
   trap 'exit 130' INT TERM
+  # Each share runs in its own process group, so cleanup stops its children too.
+  set -m
 
+  declare -A seen_host=()
   for h in $hosts; do
+    case $h in
+      nsc | nsc:*) ;;
+      *)
+        # Two shares on one host would share its run directory.
+        [ -z "${seen_host[$h]:-}" ] || die "host $h is listed twice"
+        seen_host[$h]=1
+        ;;
+    esac
     case $h in
       nsc | nsc:*)
         share_host+=("$h")
@@ -178,6 +191,8 @@ main() {
     [ -f "$reuse/tests.tar.zst" ] && [ -f "$reuse/list.json" ] || die "$reuse has no tests.tar.zst and list.json"
     # The coverage check counts the earlier run's selection, so it must be this run's.
     [ -z "$local_share" ] || die "--reuse needs --no-local, since this checkout's build may differ from the archive"
+    # The binaries hold the building checkout's paths, so they run only at that path.
+    [ "$(cat "$reuse/root" 2> /dev/null)" = "$root" ] || die "$reuse was built in $(cat "$reuse/root" 2> /dev/null || echo "an unrecorded checkout"), not $root"
     if [ -f "$reuse/args" ]; then saved=$(cat "$reuse/args"); else saved=; fi
     [ "$saved" = "$(printf '%q ' "${args[@]}")" ] || die "--reuse needs the same nextest arguments as the earlier run (${saved:-none})"
     ln -f "$reuse/tests.tar.zst" "$archive" 2> /dev/null || cp "$reuse/tests.tar.zst" "$archive"
@@ -196,18 +211,12 @@ main() {
     note "phase build and archive: $((SECONDS - t0)) s, $(du -h "$archive" | cut -f1)"
   fi
   printf '%q ' "${args[@]}" > "$out/args"
-  expected=$(
-    python3 - "$out/list.json" << 'PY'
+  echo "$root" > "$out/root"
+  expected=$(python3 -c '
 import json, sys
 doc = json.load(open(sys.argv[1]))
-n = 0
-for suite in doc["rust-suites"].values():
-    for case in suite["testcases"].values():
-        if case["filter-match"]["status"] == "matches":
-            n += 1
-print(n)
-PY
-  )
+print(sum(c["filter-match"]["status"] == "matches" for s in doc["rust-suites"].values() for c in s["testcases"].values()))
+' "$out/list.json")
   note "tests selected: $expected in $n shares, partitioned by $kind"
 
   # ---------------------------------------------------------------- start the shares
@@ -247,11 +256,19 @@ PY
     [ "$code" = 0 ] || rc=1
   done
 
-  python3 - "$out" "$n" "$expected" << 'PY' | tee -a "$log" || rc=1
-import sys, xml.etree.ElementTree as ET
+  python3 - "$out" "$n" << 'PY' | tee -a "$log" || rc=1
+import json, sys, xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
-out, n, expected = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-total = failed = 0
+out, n = Path(sys.argv[1]), int(sys.argv[2])
+doc = json.load(open(out / "list.json"))
+expected = Counter()
+for binary, suite in doc["rust-suites"].items():
+    for name, case in suite["testcases"].items():
+        if case["filter-match"]["status"] == "matches":
+            expected[(binary, name)] += 1
+ran = Counter()
+failed = 0
 slow = []
 ok = True
 for k in range(1, n + 1):
@@ -263,18 +280,28 @@ for k in range(1, n + 1):
         ok = False
         continue
     root = ET.parse(j).getroot()
-    tests = int(root.get("tests", 0))
-    fails = int(root.get("failures", 0)) + int(root.get("errors", 0))
-    secs = float(root.get("time", 0))
-    total += tests
+    tests = fails = 0
+    for suite in root.iter("testsuite"):
+        for case in suite.iter("testcase"):
+            if case.find("skipped") is not None:
+                continue
+            tests += 1
+            ran[(suite.get("name"), case.get("name"))] += 1
+            if case.find("failure") is not None or case.find("error") is not None:
+                fails += 1
+            slow.append((float(case.get("time", 0)), host, suite.get("name"), case.get("name")))
     failed += fails
-    for case in root.iter("testcase"):
-        slow.append((float(case.get("time", 0)), host, case.get("classname"), case.get("name")))
-    print(f"share {k} ({host}): {tests} tests, {fails} failed, {secs:.0f} s")
-print(f"all shares: {total} tests run, {failed} failed, {expected} selected")
-if total != expected:
-    print(f"coverage check failed: the shares ran {total} tests and an unpartitioned run selects {expected}")
+    print(f"share {k} ({host}): {tests} tests, {fails} failed, {float(root.get('time', 0)):.0f} s")
+print(f"all shares: {sum(ran.values())} tests run, {failed} failed, {sum(expected.values())} selected")
+missing = expected - ran
+extra = ran - expected
+if missing or extra:
     ok = False
+    print(f"coverage check failed: {sum(missing.values())} selected tests did not run and {sum(extra.values())} ran that were not selected or ran twice")
+    for (b, t) in list(missing)[:10]:
+        print(f"  missing {b} {t}")
+    for (b, t) in list(extra)[:10]:
+        print(f"  unexpected {b} {t}")
 for t, host, cls, name in sorted(slow, reverse=True)[:10]:
     print(f"  {t:7.1f}s {host} {cls} {name}")
 sys.exit(0 if ok and failed == 0 else 1)
@@ -310,14 +337,20 @@ probe() {
     echo "idle: load $load on $cpus processors, $d GiB free"' 2> /dev/null || echo "unreachable"
 }
 
+# The variables that point the tests at conformance suites and corpora outside the checkout.
+suite_vars=(SPARKLES_W3C_DIR SPARKLES_RDF_TESTS_DIR SPARKLES_SHACL_TESTS SPARKLES_SHEX_TESTS
+  SPARKLES_OXIGRAPH_DIR SPARKLES_JSONLD_TESTS)
+
 # The suite directories the tests read, as absolute paths that exist here: those named by
 # the suite variables, then the default checkouts next to this one.
 suite_dirs() {
   local v d
-  for v in SPARKLES_W3C_DIR SPARKLES_RDF_TESTS_DIR SPARKLES_SHACL_TESTS SPARKLES_SHEX_TESTS SPARKLES_OXIGRAPH_DIR; do
+  for v in "${suite_vars[@]}"; do
     d=${!v:-}
     [ -n "$d" ] && [ -d "$d" ] && realpath "$d"
   done
+  # The RDF corpus test reads the rdf directory beside a SPARKLES_W3C_DIR.
+  if [ -n "${SPARKLES_W3C_DIR:-}" ] && [ -d "$SPARKLES_W3C_DIR/../rdf" ]; then realpath "$SPARKLES_W3C_DIR/../rdf"; fi
   for d in apache/jena/jena-arq/testing apache/jena/jena-shacl/src/test/files \
     apache/jena/jena-shex/src/test/files oxigraph/oxigraph/testsuite; do
     [ -d "$root/../../$d" ] && realpath "$root/../../$d"
@@ -328,7 +361,7 @@ suite_dirs() {
 # The suite variables set here, as KEY=VALUE words for the remote environment.
 suite_env() {
   local v
-  for v in SPARKLES_W3C_DIR SPARKLES_RDF_TESTS_DIR SPARKLES_SHACL_TESTS SPARKLES_SHEX_TESTS SPARKLES_OXIGRAPH_DIR; do
+  for v in "${suite_vars[@]}"; do
     [ -n "${!v:-}" ] && printf '%s=%q ' "$v" "${!v}"
   done
   return 0
@@ -367,12 +400,18 @@ run_remote() {
     rsh() { ssh "${ssh_opts[@]}" "$h" "$1"; }
   fi
 
-  # The run directory has the checkout's absolute path. Refuse one that is not ours.
+  # The run directory has the checkout's absolute path. Refuse one that is not ours, and one
+  # that another run holds: the lock directory beside it is created atomically and goes
+  # when the share's directory goes. A run that was killed leaves it, and the message names it.
+  # Whatever an earlier kept run left is removed, so no deleted source survives.
   if ! rsh "if [ -e $root ] && [ ! -e $root/.sparkles-test-share ]; then echo '$root exists and is not a test-share directory'; exit 1; fi
-    mkdir -p $s && touch $root/.sparkles-test-share && rm -rf $s/* $root/target/nextest" < /dev/null > "$d/prepare.log" 2>&1; then
+    mkdir -p \$(dirname $root) && mkdir $root.share-lock 2> /dev/null || { echo 'another run holds $root.share-lock; remove it if no run is active'; exit 1; }
+    mkdir -p $root && find $root -mindepth 1 -maxdepth 1 ! -name .sparkles-test-share -exec rm -rf {} + &&
+    mkdir -p $s && touch $root/.sparkles-test-share" < /dev/null > "$d/prepare.log" 2>&1; then
     echo 96 > "$d/exit"
     return
   fi
+  echo "$h" > "$d/remote-locked"
   # Tracked files and the built UI, then each suite directory the machine lacks.
   if ! {
     git -C "$root" ls-files -z
@@ -384,6 +423,12 @@ run_remote() {
   fi
   local sd
   while read -r sd; do
+    case $sd in *[!A-Za-z0-9._/-]*)
+      echo "the suite path $sd has characters the remote commands do not quote" >&2
+      echo 95 > "$d/exit"
+      return
+      ;;
+    esac
     if rsh "test -d $sd" < /dev/null 2> /dev/null; then
       echo "suite $sd: present" >> "$d/prepare.log"
     else
@@ -447,6 +492,7 @@ if [ "\$(stat -f -c %T /tmp 2> /dev/null)" = tmpfs ]; then
   export TMPDIR=$root/target/share-tmp
   mkdir -p "\$TMPDIR"
 fi
+echo \$\$ > $s/pid
 date +%s > $s/started
 env $(suite_env)"\${lock[@]}" "\${cap[@]}" $s/cargo-nextest nextest run \\
   --binaries-metadata $root/target/nextest/binaries-metadata.json \\
@@ -468,8 +514,36 @@ EOF
       rsh "nohup setsid bash $s/run.sh > /dev/null 2>&1 < /dev/null &" < /dev/null
     fi
   fi
-  # Poll for the exit file. A lost connection only delays the collection.
-  until rsh "test -e $s/exit" < /dev/null 2> /dev/null; do sleep 20; done
+  # Poll for the exit file. A lost connection only delays the collection, but a share that
+  # does not start within 30 minutes, a host unreachable for 10 minutes or a share that runs
+  # past TEST_PARTITION_TIMEOUT seconds (default 7200) fails.
+  local t0=$SECONDS lost=0 r
+  while :; do
+    if r=$(rsh "if [ -e $s/exit ]; then echo done; elif [ -e $s/started ]; then echo running; else echo waiting; fi" < /dev/null 2> /dev/null); then
+      lost=0
+      [ "$r" = "done" ] && break
+      if [ "$r" = waiting ] && [ $((SECONDS - t0)) -gt 1800 ]; then
+        echo "the share did not start within 30 minutes" >&2
+        echo 93 > "$d/exit"
+        remote_cleanup
+        return
+      fi
+    else
+      lost=$((lost + 1))
+      if [ "$lost" -ge 30 ]; then
+        echo "lost contact with $h for 10 minutes" >&2
+        echo 92 > "$d/exit"
+        return
+      fi
+    fi
+    if [ $((SECONDS - t0)) -gt "$share_timeout" ]; then
+      echo "the share ran past $share_timeout s" >&2
+      echo 91 > "$d/exit"
+      remote_cleanup
+      return
+    fi
+    sleep 20
+  done
   rsh "cd $root && tar -cf - .artifacts/test-share/exit .artifacts/test-share/share.log \$(ls target/nextest/*/junit.xml 2> /dev/null)" < /dev/null |
     tar -C "$d" -xf -
   mv "$d/.artifacts/test-share/exit" "$d/exit"
@@ -477,22 +551,48 @@ EOF
   for f in "$d"/target/nextest/*/junit.xml; do [ -f "$f" ] && mv "$f" "$d/junit.xml"; done
   rm -rf "$d/.artifacts" "$d/target"
   if [ -n "$addr" ]; then hc rm "$addr" > /dev/null 2>&1 || true; fi
-  if [ -z "$keep" ] && [ "$how" = ssh ]; then
-    rsh "test -e $root/.sparkles-test-share && rm -rf $root" < /dev/null || true
-  fi
+  remote_cleanup
 }
 
-# Stop local shares and destroy every Namespace instance this run created.
+# remote_cleanup (in run_remote's scope): stop the share's processes, remove its directory
+# unless --keep, release its lock, and destroy a Namespace instance at once.
+remote_cleanup() {
+  if [ "$how" = nsc ]; then
+    if nsc destroy --force "$id" > /dev/null 2>&1; then
+      sed -i "/^$id\$/d" "$out/nsc-ids"
+      mv "$d/instance.id" "$d/instance.destroyed"
+    fi
+    return 0
+  fi
+  rsh "if [ -s $s/pid ]; then kill -TERM -- -\$(ps -o pgid= -p \$(cat $s/pid) | tr -d ' ') 2> /dev/null; fi
+    if [ -z '$keep' ] && [ -e $root/.sparkles-test-share ]; then rm -rf $root; fi
+    rmdir $root.share-lock 2> /dev/null; true" < /dev/null || true
+  rm -f "$d/remote-locked"
+}
+
+# Stop every share's process group and wait for it, then stop the remote shares that were
+# still running and destroy every Namespace instance whose creation had begun.
 # shellcheck disable=SC2329
 cleanup() {
-  local pid id
-  for pid in $(jobs -p); do kill "$pid" 2> /dev/null || true; done
-  if [ -f "${out:-/nonexistent}/nsc-ids" ]; then
-    while read -r id; do
-      [ -n "$id" ] && nsc destroy --force "$id" > /dev/null 2>&1 || echo "test-partitioned.sh: destroying $id failed; run nsc destroy $id" >&2
-    done < "$out/nsc-ids"
-    rm -f "$out/nsc-ids"
-  fi
+  local pid id f h
+  for pid in $(jobs -p); do kill -TERM -- "-$pid" 2> /dev/null || kill "$pid" 2> /dev/null || true; done
+  wait 2> /dev/null || true
+  [ -n "${out:-}" ] || return 0
+  for f in "$out"/share-*/remote-locked; do
+    [ -f "$f" ] || continue
+    h=$(cat "$f")
+    # shellcheck disable=SC2029
+    ssh "${ssh_opts[@]}" "$h" "s=$root/.artifacts/test-share
+      if [ -s \$s/pid ]; then kill -TERM -- -\$(ps -o pgid= -p \$(cat \$s/pid) | tr -d ' ') 2> /dev/null; fi
+      if [ -z '$keep' ] && [ -e $root/.sparkles-test-share ]; then rm -rf $root; fi
+      rmdir $root.share-lock 2> /dev/null; true" < /dev/null > /dev/null 2>&1 || echo "test-partitioned.sh: could not stop the share on $h" >&2
+    rm -f "$f"
+  done
+  while read -r id; do
+    [ -n "$id" ] || continue
+    nsc destroy --force "$id" > /dev/null 2>&1 || echo "test-partitioned.sh: destroying $id failed; run nsc destroy $id" >&2
+  done < <(cat "$out"/nsc-ids "$out"/share-*/instance.id 2> /dev/null | sort -u)
+  rm -f "$out/nsc-ids"
 }
 
 main "$@"
