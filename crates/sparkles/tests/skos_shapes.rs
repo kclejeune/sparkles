@@ -109,8 +109,20 @@ fn s14_one_preferred_label_per_language() {
         r#"<Love> skos:prefLabel "love"@en ; skos:prefLabel "adoration"@en ."#,
         "S14",
     );
-    // two untagged preferred labels
+    // two untagged preferred labels, plain, mixed or SKOS-XL
     breaks(r#"<Love> skos:prefLabel "love" , "adoration" ."#, "S14");
+    breaks(
+        r#"<Love> skos:prefLabel "love" ; skosxl:prefLabel <A> . <A> skosxl:literalForm "adoration" ."#,
+        "S14",
+    );
+    breaks(
+        r#"<Love> skosxl:prefLabel <A> , <B> .
+        <A> skosxl:literalForm "love" . <B> skosxl:literalForm "adoration" ."#,
+        "S14",
+    );
+    consistent(
+        r#"<Love> skos:prefLabel "love" ; skosxl:prefLabel <A> . <A> skosxl:literalForm "love" ."#,
+    );
     // Examples 10 and 11 of the Reference are consistent
     consistent(r#"<Love> skos:prefLabel "love"@en ; skos:altLabel "adoration"@en ."#);
     consistent(r#"<Love> skos:prefLabel "love"@en ; skos:prefLabel "amour"@fr ."#);
@@ -130,6 +142,15 @@ fn s27_related_is_disjoint_with_broader_transitive() {
         "<A> skos:narrower <B> ; skos:related <C> . <B> skos:narrower <C> .",
         "S27",
     );
+    // the hierarchical mappings are sub-properties of broader and narrower, and
+    // relatedMatch of related
+    breaks("<A> skos:broadMatch <B> ; skos:related <B> .", "S27");
+    breaks("<A> skos:broader <B> ; skos:relatedMatch <B> .", "S27");
+    breaks(
+        "<B> skos:narrowMatch <A> . <A> skos:relatedMatch <B> .",
+        "S27",
+    );
+    consistent("<A> skos:broadMatch <B> ; skos:relatedMatch <C> .");
 }
 
 #[test]
@@ -153,6 +174,34 @@ fn s37_collections_are_not_concepts() {
     );
     breaks("<A> a skos:Concept , skos:Collection .", "S37");
     breaks("<A> a skos:ConceptScheme , skos:Collection .", "S37");
+    // an ordered collection is a collection, and the SKOS properties type their resources
+    breaks("<A> a skos:Concept , skos:OrderedCollection .", "S37");
+    breaks("<A> skos:related <B> . <B> skos:member <C> .", "S37");
+    breaks(
+        "<A> skos:broadMatch <B> . <B> a skos:OrderedCollection .",
+        "S37",
+    );
+    breaks("<S> skos:hasTopConcept <A> ; skos:member <C> .", "S37");
+    consistent(
+        "<R> a skos:OrderedCollection ; skos:memberList ( <A> <B> ) . <A> skos:related <B> .",
+    );
+}
+
+#[test]
+fn s9_holds_for_resources_the_skos_properties_type() {
+    breaks("<S> a skos:ConceptScheme ; skos:related <C> .", "S9");
+    breaks("<A> skos:inScheme <S> . <S> skos:broader <B> .", "S9");
+    breaks(
+        "<S> skos:hasTopConcept <A> . <A> a skos:ConceptScheme .",
+        "S9",
+    );
+    breaks(
+        "<A> skos:topConceptOf <S> . <B> skos:exactMatch <S> .",
+        "S9",
+    );
+    consistent(
+        "<S> a skos:ConceptScheme ; skos:hasTopConcept <A> . <A> skos:topConceptOf <S> ; skos:inScheme <S> ; skos:narrower <B> .",
+    );
 }
 
 #[test]
@@ -171,6 +220,16 @@ fn s46_exact_match_is_disjoint_with_broad_and_related_match() {
         "S46",
     );
     consistent("<A> skos:exactMatch <B> ; skos:closeMatch <B> .");
+    // exactMatch is transitive
+    breaks(
+        "<A> skos:exactMatch <B> . <B> skos:exactMatch <C> . <A> skos:broadMatch <C> .",
+        "S46",
+    );
+    breaks(
+        "<A> skos:exactMatch <B> . <C> skos:exactMatch <B> . <C> skos:relatedMatch <A> .",
+        "S46",
+    );
+    consistent("<A> skos:exactMatch <B> . <B> skos:exactMatch <C> . <A> skos:closeMatch <C> .");
 }
 
 #[test]
@@ -428,6 +487,20 @@ fn form_checks_admit_every_built_in_constraint() {
         .unwrap();
     assert_eq!(c.conforms, Some(false));
     assert!(messages(&c).contains("S27"), "{}", messages(&c));
+
+    // a second untagged preferred label through SKOS-XL: S14
+    let c = ds
+        .forms()
+        .check(
+            &change(
+                pref,
+                Term::Literal(oxrdf::Literal::new_simple_literal("Mammalia")),
+                vec![lit("Mammals", "en")],
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(c.conforms, Some(true), "{}", messages(&c));
 
     // the exact match made a broad match too: S46
     let c = ds

@@ -9392,10 +9392,16 @@ S14, S27, S37 and S46, with S51, S52 and S58 of the SKOS-XL appendix. The litera
 SKOS-XL labels count for S13 and S14, as S55 to S57 imply. Each result's message names
 its condition. A linked concept, scheme or collection member without its `rdf:type` is
 reported at `sh:Info` severity, which a guard with the default threshold lets through.
-Each SPARQL constraint reads one property path or basic graph pattern from the focus node,
-so a form check with `shapes=skos` validates only the resources an edit affects. The
-results of S27, S46 and the clash of two SKOS-XL labels name the focus node without a
-value.
+The shapes graph does not hold the SKOS vocabulary, so the checks name its consequences.
+`skos:OrderedCollection` counts as `skos:Collection`, the subjects and objects of the
+semantic and mapping relations count as concepts, and the properties of concept schemes
+and collections type their subjects and objects. S27 reads `skos:broadMatch`,
+`skos:narrowMatch` and `skos:relatedMatch` as the sub-properties of `skos:broader`,
+`skos:narrower` and `skos:related` they are, and S46 follows `skos:exactMatch` through
+its symmetry and transitivity. Each SPARQL constraint reads one property path or basic
+graph pattern from the focus node, so a form check with `shapes=skos` validates only the
+resources an edit affects. The results of S27, S46 and the clash of two SKOS-XL labels
+name the focus node without a value.
 
 Forms read the shapes with `shapes=skos`. `POST /{ds}/shacl` runs them over a graph, and
 `PUT /$/validation/{ds}` installs them as a write guard with `{"shapes": {"inline": …}}`.

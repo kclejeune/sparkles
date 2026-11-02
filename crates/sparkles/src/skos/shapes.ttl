@@ -45,13 +45,13 @@ sks:LabelledShape a sh:NodeShape ;
   sh:targetClass skos:Concept , skos:ConceptScheme , skos:Collection , skos:OrderedCollection ;
   sh:targetSubjectsOf skos:prefLabel , skos:altLabel , skos:hiddenLabel ,
     skosxl:prefLabel , skosxl:altLabel , skosxl:hiddenLabel ;
-  sh:property sks:prefLabel , sks:prefLabelPerLanguage , sks:prefLabelDisjoint ,
+  sh:property sks:prefLabel , sks:prefLabelPerLanguage , sks:untaggedPrefLabel , sks:prefLabelDisjoint ,
     sks:altLabel , sks:altLabelDisjoint , sks:hiddenLabel , sks:notation ,
     sks:xlPrefLabel , sks:xlPrefLabelDisjoint , sks:xlAltLabel , sks:xlAltLabelDisjoint ,
     sks:xlHiddenLabel , sks:xlPrefFormDisjoint , sks:xlAltFormDisjoint , sks:xlHiddenFormDisjoint ,
     sks:note , sks:definition , sks:scopeNote , sks:example ,
     sks:historyNote , sks:editorialNote , sks:changeNote ;
-  sh:sparql sks:UntaggedPrefLabels , sks:XLLabelClash .
+  sh:sparql sks:XLLabelClash .
 
 sks:prefLabel sh:path skos:prefLabel ;
   sh:name "Preferred label"@en ; sh:group sks:Labels ; sh:order 1 ;
@@ -128,15 +128,12 @@ sks:changeNote sh:path skos:changeNote ;
   sh:name "Change note"@en ; sh:group sks:Documentation ; sh:order 3 ; sh:nodeKind sh:Literal ;
   dash:editor dash:TextAreaEditor .
 
-# S14 for labels without a language tag, which sh:uniqueLang does not compare.
-sks:UntaggedPrefLabels a sh:SPARQLConstraint ;
-  sh:message "S14: a resource has no more than one preferred label without a language tag"@en ;
-  sh:prefixes sks: ;
-  sh:select """
-    SELECT $this ?value WHERE {
-      $this skos:prefLabel ?value , ?other .
-      FILTER (isLiteral(?value) && LANG(?value) = "" && LANG(?other) = "" && !sameTerm(?value, ?other))
-    }""" .
+# S14 for labels without a language tag, which sh:uniqueLang does not compare: one such
+# preferred label at most, plain or SKOS-XL.
+sks:untaggedPrefLabel sh:path [ sh:alternativePath ( skos:prefLabel ( skosxl:prefLabel skosxl:literalForm ) ) ] ;
+  sh:qualifiedValueShape [ sh:nodeKind sh:Literal ; sh:not [ sh:datatype rdf:langString ] ] ;
+  sh:qualifiedMaxCount 1 ;
+  sh:message "S14: a resource has no more than one preferred label without a language tag, SKOS-XL labels included"@en .
 
 # S13 with S55 to S57 for two SKOS-XL labels of different kinds with one literal form: a
 # path from the resource over one label's literal form back over the other label.
@@ -194,43 +191,36 @@ sks:topConceptOf sh:path skos:topConceptOf ;
   sh:severity sh:Info ;
   sh:message "The value is not typed skos:ConceptScheme"@en .
 
-# S27, with the hierarchy read through skos:broader, skos:narrower and their transitive
-# super-properties (Examples 26 to 29 of the SKOS Reference). skos:related is symmetric.
+# S27, with the hierarchy read through skos:broader, skos:narrower, their transitive
+# super-properties and the hierarchical mappings, which are sub-properties of broader and
+# narrower, and with skos:relatedMatch as a sub-property of skos:related (Examples 26
+# to 29 of the SKOS Reference). skos:related is symmetric.
 sks:RelatedNotBroaderTransitive a sh:SPARQLConstraint ;
   sh:message "S27: skos:related is disjoint with skos:broaderTransitive"@en ;
   sh:prefixes sks: ;
   sh:select """
     SELECT DISTINCT $this WHERE {
-      $this ((skos:related|^skos:related)/(skos:broader|^skos:narrower|skos:broaderTransitive|^skos:narrowerTransitive)+)
-        | ((skos:related|^skos:related)/(^skos:broader|skos:narrower|^skos:broaderTransitive|skos:narrowerTransitive)+) $this .
+      $this ((skos:related|^skos:related|skos:relatedMatch|^skos:relatedMatch)/(skos:broader|^skos:narrower|skos:broaderTransitive|^skos:narrowerTransitive|skos:broadMatch|^skos:narrowMatch)+)
+        | ((skos:related|^skos:related|skos:relatedMatch|^skos:relatedMatch)/(^skos:broader|skos:narrower|^skos:broaderTransitive|skos:narrowerTransitive|^skos:broadMatch|skos:narrowMatch)+) $this .
     }""" .
 
-# S46 (Examples 52 and 53). skos:exactMatch and skos:relatedMatch are symmetric, and
-# skos:narrowMatch is the inverse of skos:broadMatch.
+# S46 (Examples 52 and 53). skos:exactMatch is symmetric and transitive, skos:relatedMatch
+# is symmetric, and skos:narrowMatch is the inverse of skos:broadMatch.
 sks:ExactMatchClash a sh:SPARQLConstraint ;
   sh:message "S46: skos:exactMatch is disjoint with skos:broadMatch and skos:relatedMatch"@en ;
   sh:prefixes sks: ;
   sh:select """
     SELECT DISTINCT $this WHERE {
-      $this (skos:exactMatch/(skos:broadMatch|^skos:broadMatch|skos:narrowMatch|^skos:narrowMatch|skos:relatedMatch|^skos:relatedMatch))
-        | (^skos:exactMatch/(skos:broadMatch|^skos:broadMatch|skos:narrowMatch|^skos:narrowMatch|skos:relatedMatch|^skos:relatedMatch)) $this .
+      $this (skos:exactMatch/(skos:exactMatch|^skos:exactMatch)*/(skos:broadMatch|^skos:broadMatch|skos:narrowMatch|^skos:narrowMatch|skos:relatedMatch|^skos:relatedMatch))
+        | (^skos:exactMatch/(skos:exactMatch|^skos:exactMatch)*/(skos:broadMatch|^skos:broadMatch|skos:narrowMatch|^skos:narrowMatch|skos:relatedMatch|^skos:relatedMatch)) $this .
     }""" .
-
-# S37 for the values of the semantic relations, whose domain and range are skos:Concept
-# (Examples 45 to 47 of the SKOS Reference).
-sks:SemanticRelationShape a sh:NodeShape ;
-  rdfs:label "Concept in a semantic relation"@en ;
-  sh:targetSubjectsOf skos:broader , skos:narrower , skos:related ;
-  sh:targetObjectsOf skos:broader , skos:narrower , skos:related ;
-  sh:not [ sh:class skos:Collection ] ;
-  sh:message "S37: skos:Collection is disjoint with skos:Concept, and the semantic relations link concepts"@en .
 
 # S27 and S46 for every resource in a related link or an exact match, typed or not, as the
 # Reference's examples leave their resources untyped.
 sks:RelatedShape a sh:NodeShape ;
   rdfs:label "Resource in a related link"@en ;
-  sh:targetSubjectsOf skos:related ;
-  sh:targetObjectsOf skos:related ;
+  sh:targetSubjectsOf skos:related , skos:relatedMatch ;
+  sh:targetObjectsOf skos:related , skos:relatedMatch ;
   sh:sparql sks:RelatedNotBroaderTransitive .
 
 sks:ExactMatchShape a sh:NodeShape ;
@@ -244,9 +234,7 @@ sks:ExactMatchShape a sh:NodeShape ;
 sks:ConceptSchemeShape a sh:NodeShape ;
   rdfs:label "Concept scheme"@en ;
   sh:targetClass skos:ConceptScheme ;
-  sh:property sks:hasTopConcept ;
-  sh:not [ sh:class skos:Collection ] ;
-  sh:message "S37: skos:Collection is disjoint with skos:ConceptScheme"@en .
+  sh:property sks:hasTopConcept .
 
 sks:hasTopConcept sh:path skos:hasTopConcept ;
   sh:name "Top concepts"@en ; sh:group sks:Hierarchy ; sh:order 1 ; sh:nodeKind sh:IRI ;
@@ -254,19 +242,74 @@ sks:hasTopConcept sh:path skos:hasTopConcept ;
   sh:severity sh:Info ;
   sh:message "The value is not typed skos:Concept"@en .
 
-# S9 as a shape of its own, so that its message names S9.
+# The SKOS data model types resources through its properties, and the shapes graph does
+# not hold the SKOS vocabulary, so the disjointness checks name these consequences. The
+# subjects and objects of the semantic relations, and so of the mapping relations, are
+# concepts, as are the subjects of skos:topConceptOf and the objects of skos:hasTopConcept.
+# The objects of skos:inScheme and skos:topConceptOf and the subjects of skos:hasTopConcept
+# are concept schemes. The subjects of skos:member are collections, and those of
+# skos:memberList are ordered collections, which are collections.
+
+# S9 for every resource typed or used as a concept.
 sks:ConceptNotSchemeShape a sh:NodeShape ;
   rdfs:label "Concept that is not a concept scheme"@en ;
   sh:targetClass skos:Concept ;
+  sh:targetSubjectsOf skos:semanticRelation , skos:broader , skos:narrower , skos:related ,
+    skos:broaderTransitive , skos:narrowerTransitive , skos:mappingRelation , skos:closeMatch ,
+    skos:exactMatch , skos:broadMatch , skos:narrowMatch , skos:relatedMatch , skos:topConceptOf ;
+  sh:targetObjectsOf skos:semanticRelation , skos:broader , skos:narrower , skos:related ,
+    skos:broaderTransitive , skos:narrowerTransitive , skos:mappingRelation , skos:closeMatch ,
+    skos:exactMatch , skos:broadMatch , skos:narrowMatch , skos:relatedMatch , skos:hasTopConcept ;
   sh:not [ sh:class skos:ConceptScheme ] ;
   sh:message "S9: skos:ConceptScheme is disjoint with skos:Concept"@en .
 
-# S37 for collections and concepts.
+# S9 for every resource typed or used as a concept scheme: it is not typed a concept, and
+# it is used as no concept.
+sks:SchemeNotConceptShape a sh:NodeShape ;
+  rdfs:label "Concept scheme that is not a concept"@en ;
+  sh:targetClass skos:ConceptScheme ;
+  sh:targetObjectsOf skos:inScheme , skos:topConceptOf ;
+  sh:targetSubjectsOf skos:hasTopConcept ;
+  sh:not [ sh:class skos:Concept ] ;
+  sh:property [
+    sh:path [ sh:alternativePath (
+      skos:semanticRelation skos:broader skos:narrower skos:related
+    skos:broaderTransitive skos:narrowerTransitive skos:mappingRelation skos:closeMatch
+    skos:exactMatch skos:broadMatch skos:narrowMatch skos:relatedMatch
+      [ sh:inversePath skos:semanticRelation ] [ sh:inversePath skos:broader ]
+      [ sh:inversePath skos:narrower ] [ sh:inversePath skos:related ]
+      [ sh:inversePath skos:broaderTransitive ] [ sh:inversePath skos:narrowerTransitive ]
+      [ sh:inversePath skos:mappingRelation ] [ sh:inversePath skos:closeMatch ]
+      [ sh:inversePath skos:exactMatch ] [ sh:inversePath skos:broadMatch ]
+      [ sh:inversePath skos:narrowMatch ] [ sh:inversePath skos:relatedMatch ]
+      skos:topConceptOf [ sh:inversePath skos:hasTopConcept ] ) ] ;
+    sh:maxCount 0 ;
+    sh:message "S9: skos:ConceptScheme is disjoint with skos:Concept, and a concept scheme is in no semantic relation"@en ] ;
+  sh:message "S9: skos:ConceptScheme is disjoint with skos:Concept"@en .
+
+# S37 for every resource typed or used as a collection: it is neither typed nor used as a
+# concept or a concept scheme (Examples 45 to 47 of the SKOS Reference).
 sks:CollectionNotConceptShape a sh:NodeShape ;
   rdfs:label "Collection that is not a concept"@en ;
-  sh:targetClass skos:Concept ;
-  sh:not [ sh:class skos:Collection ] ;
-  sh:message "S37: skos:Collection is disjoint with skos:Concept"@en .
+  sh:targetClass skos:Collection , skos:OrderedCollection ;
+  sh:targetSubjectsOf skos:member , skos:memberList ;
+  sh:not [ sh:or ( [ sh:class skos:Concept ] [ sh:class skos:ConceptScheme ] ) ] ;
+  sh:property [
+    sh:path [ sh:alternativePath (
+      skos:semanticRelation skos:broader skos:narrower skos:related
+    skos:broaderTransitive skos:narrowerTransitive skos:mappingRelation skos:closeMatch
+    skos:exactMatch skos:broadMatch skos:narrowMatch skos:relatedMatch
+      [ sh:inversePath skos:semanticRelation ] [ sh:inversePath skos:broader ]
+      [ sh:inversePath skos:narrower ] [ sh:inversePath skos:related ]
+      [ sh:inversePath skos:broaderTransitive ] [ sh:inversePath skos:narrowerTransitive ]
+      [ sh:inversePath skos:mappingRelation ] [ sh:inversePath skos:closeMatch ]
+      [ sh:inversePath skos:exactMatch ] [ sh:inversePath skos:broadMatch ]
+      [ sh:inversePath skos:narrowMatch ] [ sh:inversePath skos:relatedMatch ]
+      skos:topConceptOf [ sh:inversePath skos:hasTopConcept ]
+      skos:hasTopConcept [ sh:inversePath skos:topConceptOf ] [ sh:inversePath skos:inScheme ] ) ] ;
+    sh:maxCount 0 ;
+    sh:message "S37: skos:Collection is disjoint with skos:Concept and skos:ConceptScheme, so a collection is in no semantic relation and has no concepts"@en ] ;
+  sh:message "S37: skos:Collection is disjoint with skos:Concept and skos:ConceptScheme"@en .
 
 # --- collections ----------------------------------------------------------------------------
 
@@ -278,7 +321,8 @@ sks:CollectionShape a sh:NodeShape ;
 sks:member sh:path skos:member ;
   sh:name "Members"@en ; sh:group sks:Members ; sh:order 1 ; sh:nodeKind sh:IRI ;
   sh:or ( [ sh:class skos:Concept ; sh:name "Concept"@en ]
-          [ sh:class skos:Collection ; sh:name "Collection"@en ] ) ;
+          [ sh:class skos:Collection ; sh:name "Collection"@en ]
+          [ sh:class skos:OrderedCollection ; sh:name "Ordered collection"@en ] ) ;
   sh:severity sh:Info ;
   sh:message "The member is typed neither skos:Concept nor skos:Collection"@en .
 
