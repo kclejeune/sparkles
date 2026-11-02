@@ -7,27 +7,33 @@ This report is a manual import of the retained run records. Read the
 
 <a id="agreement"></a>
 
-The classifier's direct hierarchy of the Gene Ontology release of 2026-07-26 is the
+The classifier's taxonomies equal ELK 0.6.0's on the Gene Ontology, ChEBI lite and all
+298 ontologies of the ORE 2015 EL classification sample. `scripts/el-oracle.py`
+compared each pair over the same classes and found no class whose node differs, no
+difference in the unsatisfiable classes and no missing or extra direct edge. The ORE
+ontologies hold 11,183,153 classes and 13,144,288 direct edges in all, and the largest
+has 981,153 classes. ELK and the classifier both find `ore_ont_6720` inconsistent, and
+both find the same 13, 1 and 18 unsatisfiable classes in `ore_ont_1325`, `ore_ont_2497`
+and `ore_ont_7868`.
+
+No difference needed an explanation, including on the ontologies that use axioms
+outside the calculus. The classifier reported axioms used in part in 18 ORE ontologies,
+and ELK reported possible incompleteness in 31, from object property ranges, nominals,
+`ObjectHasValue`, property assertions and data property axioms. Thirteen ontologies are
+in both groups. The taxonomies agree on these ontologies too, so the axioms that each
+reasoner leaves out or uses in part do not separate the two on this sample. GO and ChEBI
+lite each have one `InverseObjectProperties` axiom, which both reasoners leave out and
+report. The classifier's taxonomy is the same on one and eight threads.
+
+The classifier's direct hierarchy of the Gene Ontology release of 2026-07-26 is also the
 hierarchy that the release asserts, which GO's pipeline computes with ELK. Both sides
 have 57,456 direct subsumptions between named classes, and none is missing or extra.
 For the ChEBI lite release 256, every one of the 300,224 asserted subsumptions between
 named classes is entailed, and every one of the classifier's 296,173 direct
 subsumptions is asserted. ChEBI asserts some edges that other edges imply, so the
-classifier's direct hierarchy is the transitive reduction of the asserted one. Neither
-ontology has an unsatisfiable class. Each has one axiom outside OWL 2 EL, an
-`InverseObjectProperties` axiom, which the classifier leaves out and reports, as ELK
-also ignores inverse properties. The taxonomy is the same on one, four and eight
-threads. `scripts/el-oracle.py --asserted` made both comparisons.
+classifier's direct hierarchy is the transitive reduction of the asserted one.
+`scripts/el-oracle.py --asserted` made both of these comparisons.
 
-All 298 ontologies of the ORE 2015 EL classification sample classify, with taxonomies
-that do not change between the builds of the record below and the build with the
-review fixes. One of them is inconsistent, four have unsatisfiable classes and 18 have
-axioms the classifier uses only in part. Each classifies within 21 s on four threads of
-a loaded laptop, the largest having 981,151 classes, which is a completion check and
-not a timing.
-
-The classifier has not been compared with ELK itself on these ontologies, and its time
-and memory have not been measured against ELK's. Roadmap item 591 covers both.
 SNOMED CT is not available to the project and was not used.
 
 ## Classification time and memory

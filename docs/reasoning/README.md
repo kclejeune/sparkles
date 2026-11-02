@@ -458,10 +458,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   commits land. Roadmap item 589.
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
-* The classifier's hierarchy has been compared with the released hierarchies of GO,
-  which ELK computes in GO's release pipeline, and of ChEBI, but not with ELK itself on
-  those and the ORE test ontologies, and it has not been timed against ELK. Roadmap item
-  591.
 * The classifier keeps its own copy of the axioms, its peak resident memory is about 1.6
   times the estimate that its memory budget uses, and its indexing and taxonomy stages
   run on one thread. Roadmap item 592.

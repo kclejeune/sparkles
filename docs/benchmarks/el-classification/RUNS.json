@@ -57,6 +57,50 @@
     }
    },
    "metadata_note": "A manual measurement record of el_classify. Read the record for its method, results and checks."
+  },
+  {
+   "run_id": "sha256-16553a77cb499da2e310e0b15f3f4c11d24183bd88b9c6cbc0b6c73d2e6dad70",
+   "path": "runs/2026-11-02-ore-elk-agreement-aa0a41a6/record.json",
+   "sha256": "16553a77cb499da2e310e0b15f3f4c11d24183bd88b9c6cbc0b6c73d2e6dad70",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "ORE 2015 EL classification sample, 298 ontologies",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "0bba3629a057ea5077a9ac61a3d4dd711d239504aa1ff4008e292bd5f988458d",
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley",
+     "commit": "aa0a41a6",
+     "data": {
+      "ore2015_sample": {
+       "files": "pool_sample/el/classification/fileorder.txt",
+       "md5_published": "109f04cf8f124eb551d33c100e549730",
+       "url": "https://zenodo.org/records/18578/files/ore2015_sample.zip",
+       "zip_sha256": "775064eb6dfee404d8f0b0e8500974eb420006b656f5cf413e05a9b33c2252e7"
+      }
+     },
+     "harness_note": "297 ELK runs used the harness of commit 3b5131ed or 3d8fd876, whose taxonomy output is the same for a consistent ontology. ore_ont_6720, which is inconsistent, ran with 3d8fd876, since the earlier harness stopped on ELK's exception.",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare (pins in scripts/elk-compare/pins.tsv), Temurin 17.0.20"
+    },
+    "settings": {
+     "elk_heap": "16 MiB per MiB of input plus 1 GiB, at most 12 GiB",
+     "threads": 4,
+     "timeout_s": {
+      "elk": 900,
+      "sparkles": 600
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "stanley",
+      "role": "laptop, loaded by other work, so the times are not measurements"
+     },
+     "method": "Each ontology classified once by el_classify --threads 4 --taxonomy and once by scripts/elk-compare/elk.sh run --threads 4 --taxonomy, then scripts/el-oracle.py ELK.ofn OURS.txt. compare.jsonl holds the oracle's report for each ontology, ours.jsonl and elk.jsonl the two tools' JSON lines, elk-incompleteness.json the axiom types ELK reported as possible causes of incompleteness, and taxonomy.sha256 the hashes of both taxonomies.",
+     "kind": "agreement"
+    }
+   },
+   "metadata_note": "A manual agreement record of el_classify against ELK 0.6.0 on the ORE 2015 EL sample. Read the record for its method and checks."
   }
  ]
 }

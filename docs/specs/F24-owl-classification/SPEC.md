@@ -164,10 +164,13 @@ GO's pipeline computes with ELK and reduces, with 57,456 direct subsumptions on 
 side and no difference. On ChEBI lite (release 256, 238,150 classes) every asserted
 subsumption between named classes is entailed and every direct subsumption the
 classifier gives is asserted. `scripts/el-oracle.py --asserted` makes these
-comparisons. All 298 ontologies of the ORE 2015 EL classification sample classify.
-ELK itself has not been run beside the classifier, so a comparison with ELK 0.4.3 on
-GO, ChEBI and the ORE sample, and the measurements against ELK, remain in roadmap item
-591. SNOMED CT is not available to the project and was not used.
+comparisons. ELK 0.6.0, run through the OWL API by `scripts/elk-compare/elk.sh`, gives
+the same taxonomy as the classifier on GO, ChEBI lite and all 298 ontologies of the ORE
+2015 EL classification sample, with the same unsatisfiable classes and the same
+inconsistent ontology. `scripts/el-oracle.py` found no difference to explain, including
+on the 18 ORE ontologies with axioms the classifier uses in part and the 31 where ELK
+reports possible incompleteness. SNOMED CT is not available to the project and was not
+used, so the acceptance gate's SNOMED CT comparison remains open.
 
 **Measurements.** On forge, GO classifies in 410 ms and ChEBI lite in 2.97 s on four
 threads, at peak resident sets of 438 MiB and 1.66 GiB that include the axioms read.
@@ -191,6 +194,6 @@ taxonomy.
 individuals and datatypes is item 587. Reads that answer from the classification
 and DL Query are item 588. Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
-the comparison and measurements against ELK are item 591, and a classifier that
+the comparison and measurements against ELK were item 591, and a classifier that
 shares the ontology's axioms and builds its index and taxonomy in parallel is item
 592.
