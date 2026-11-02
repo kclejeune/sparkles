@@ -780,7 +780,7 @@ fn rl(
     // ontology inside OWL 2 RL
     let instances_complete = a
         .instances
-        .then(|| part.outside.is_empty() && as_sub.is_empty());
+        .then_some(part.outside.is_empty() && as_sub.is_empty());
     Ok(DlQueryAnswer {
         opened: o.clone(),
         expression: q.expression.clone(),
