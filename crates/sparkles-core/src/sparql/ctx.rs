@@ -3037,27 +3037,37 @@ mod charge_tests {
     }
 
     /// A shard that reaches its share of the cache is freed with its slots, so that the
-    /// slots of cleared shards never pile up outside the reservation.
+    /// slots of cleared shards never pile up outside the reservation. The test watches
+    /// one shard through its evictions: a map cleared in place would keep the capacity
+    /// it had before the eviction.
     #[test]
     fn a_cleared_value_shard_frees_its_slots() {
         let store = Store::in_memory(StoreOptions::default());
         let mut ctx = Ctx::new(store.snapshot());
         ctx.mem_limit = 8 * MIB;
-        let literals = local_literals(&ctx, 20_000);
+        let watched = ctx.values.shard(Id(0)) as *const _;
+        let literals: Vec<_> = local_literals(&ctx, 40_000)
+            .into_iter()
+            .filter(|(id, _)| std::ptr::eq(ctx.values.shard(*id), watched))
+            .collect();
+        let share = ValueCache::cap(ctx.mem_limit) / VALUE_SHARDS as u64;
+        let (mut before, mut evictions) = (0, 0);
         for (id, text) in &literals {
             assert_text(ctx.value(*id), text);
-        }
-        let share = ValueCache::cap(ctx.mem_limit) / VALUE_SHARDS as u64;
-        for shard in ctx.values.shards.iter() {
-            let shard = shard.read();
-            let slots =
-                shard.map.capacity() as u64 * (std::mem::size_of::<(Id, Value)>() as u64 + 1);
-            assert!(
-                slots <= 2 * share,
-                "{slots} bytes of slots for a share of {share}"
-            );
+            let shard = ctx.values.shard(*id).read();
+            if shard.bytes < before {
+                evictions += 1;
+                assert_eq!(shard.map.len(), 1);
+                assert!(
+                    shard.map.capacity() <= 4,
+                    "a cleared shard keeps {} slots",
+                    shard.map.capacity()
+                );
+            }
             assert!(shard.bytes <= share);
+            before = shard.bytes;
         }
+        assert!(evictions >= 2, "{evictions} evictions of the watched shard");
         assert!(ctx.values.reserved() <= ValueCache::cap(ctx.mem_limit));
     }
 
