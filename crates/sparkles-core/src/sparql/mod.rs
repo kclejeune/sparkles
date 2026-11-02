@@ -1029,7 +1029,7 @@ fn execute_prepared(
     // The operators' state is gone, so the pool keeps only what the result holds. A
     // graph result's triples are not measured, and it keeps its query's highest
     // estimate as before.
-    // Decoding the result reserves its envelope again when it needs one.
+    // Decoding the result reserves its envelope again when the budget allows.
     ctx.release_work();
     if matches!(kind, QueryKind::Select | QueryKind::Ask)
         && let Err(error) = ctx.shrink_retained(result.table.capacity_bytes())

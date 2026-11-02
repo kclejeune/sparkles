@@ -134,8 +134,8 @@ const VALUE_CACHE_BYTES: u64 = 64 << 20;
 /// [`EAGER_STEP`]s from the query's account as its entries grow, and a value whose
 /// reservation is refused is returned without being cached. The cache holds at most
 /// [`VALUE_CACHE_BYTES`] or an eighth of the memory budget, whichever is smaller, and a
-/// shard that reaches its share of that is cleared. The reservation is kept until the
-/// context drops, so it also covers the slots that a cleared shard keeps allocated.
+/// shard that reaches its share of that is cleared and freed. The reservation is kept
+/// until the context drops.
 pub(super) struct ValueCache {
     shards: Box<[RwLock<ValueShard>]>,
     /// the estimated bytes of the entries held now
@@ -1547,7 +1547,14 @@ impl Ctx {
                 let account = ledger.owner(self.grant.as_ref())?;
                 ledger.reserve(&account, self.mem_limit, need - *peak, true)?;
             } else {
-                let charge = self.charge(need - *peak)?;
+                // Eager callers of `term` and `value`, the planner's plan text and the
+                // readers of a finished result among them, cannot report a refusal. An
+                // eager envelope is therefore charged when the budget and the pool allow
+                // it, and otherwise the key is decoded without it, as eager decoding
+                // always was. The next growth tries the charge again.
+                let Ok(charge) = self.charge(need - *peak) else {
+                    return Ok(());
+                };
                 let id = charge.disarm();
                 debug_assert!(owner.is_none() || id.is_none() || *owner == id);
                 if owner.is_none() {
@@ -1717,12 +1724,14 @@ impl Ctx {
                 _ => return Ok(()),
             },
         };
-        let keep = result;
+        // The output columns hold no lease, so the result keeps them on top of the
+        // live charges.
+        let keep = result.saturating_add(self.live_bytes());
         // A contribution within the slack of what the result keeps is left alone.
         if fast.is_some_and(|admitted| admitted <= keep.saturating_add(RETAIN_SLACK)) {
             return Ok(());
         }
-        self.memory().shrink_eager(keep)
+        self.memory().shrink_eager(result)
     }
 
     pub fn mem_peak(&self) -> u64 {
@@ -2293,11 +2302,11 @@ impl Ctx {
             return;
         }
         if shard.bytes + entry > share || shard.map.len() > VALUE_SHARD_CAP {
-            // The slots stay allocated, and the reservation, which never shrinks
-            // before the context drops, keeps covering them.
+            // The map is freed with its slots, so that the entries' estimate, slots
+            // included, leaves the cache with them.
             cache.used.fetch_sub(shard.bytes, Ordering::AcqRel);
             shard.bytes = 0;
-            shard.map.clear();
+            shard.map = FxHashMap::default();
         }
         let used = cache.used.fetch_add(entry, Ordering::AcqRel) + entry;
         if !cache.charge.covers(used)
@@ -2964,9 +2973,11 @@ mod charge_tests {
         }
     }
 
-    /// Decoding a term reserves the decode envelope in both accounting modes. A refused
-    /// envelope gives no term and fails the next check, so a refused decode never
-    /// becomes an unbound value, and the end of the work releases the envelope.
+    /// Decoding a term reserves the decode envelope in both accounting modes, and the end
+    /// of the work releases it. A cursor refuses a decode that the budget cannot hold,
+    /// gives no term and fails the next check, so a refused decode never becomes an
+    /// unbound value. Eager callers cannot report a refusal, so an eager context decodes
+    /// without the envelope then.
     #[test]
     fn refused_decode_envelopes_fail_the_next_check() {
         let store = Store::in_memory(StoreOptions::default());
@@ -2986,13 +2997,68 @@ mod charge_tests {
             ctx.release_work();
             assert_eq!(ctx.live_bytes(), live, "cursor {cursor}: and released");
             let held = ctx.charge(MIB - live - 100).unwrap();
-            assert_eq!(ctx.term(literals[1].0), None, "cursor {cursor}");
-            assert!(
-                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
-                "cursor {cursor}"
-            );
+            if cursor {
+                assert_eq!(ctx.term(literals[1].0), None);
+                assert!(
+                    matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+                );
+            } else {
+                assert!(ctx.term(literals[1].0).is_some());
+                assert!(ctx.check().is_ok());
+            }
             drop(held);
         }
+    }
+
+    /// A finished result keeps its unleased output columns on top of the charged state
+    /// the context retains, such as its value cache.
+    #[test]
+    fn a_finished_result_keeps_its_output_and_its_charged_state() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(512 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        for (id, text) in &local_literals(&ctx, 2_000) {
+            assert_text(ctx.value(*id), text);
+        }
+        let state = ctx.live_bytes();
+        assert!(state > 0);
+        ctx.check_output((200 * MIB / 8) as usize, 1).unwrap();
+        ctx.shrink_retained(32 * MIB).unwrap();
+        assert!(
+            grant.used() >= state + 32 * MIB,
+            "{} of {}",
+            grant.used(),
+            state + 32 * MIB
+        );
+        assert!(grant.used() < 200 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// A shard that reaches its share of the cache is freed with its slots, so that the
+    /// slots of cleared shards never pile up outside the reservation.
+    #[test]
+    fn a_cleared_value_shard_frees_its_slots() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 8 * MIB;
+        let literals = local_literals(&ctx, 20_000);
+        for (id, text) in &literals {
+            assert_text(ctx.value(*id), text);
+        }
+        let share = ValueCache::cap(ctx.mem_limit) / VALUE_SHARDS as u64;
+        for shard in ctx.values.shards.iter() {
+            let shard = shard.read();
+            let slots =
+                shard.map.capacity() as u64 * (std::mem::size_of::<(Id, Value)>() as u64 + 1);
+            assert!(
+                slots <= 2 * share,
+                "{slots} bytes of slots for a share of {share}"
+            );
+            assert!(shard.bytes <= share);
+        }
+        assert!(ctx.values.reserved() <= ValueCache::cap(ctx.mem_limit));
     }
 
     #[test]

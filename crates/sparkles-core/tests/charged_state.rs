@@ -4,7 +4,7 @@
 
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
-use sparkles_core::sparql::{CursorOptions, QueryOptions, query, select_cursor};
+use sparkles_core::sparql::{CursorOptions, QueryOptions, query, select_cursor, update::update};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_core::{BudgetKind, Error};
 
@@ -66,5 +66,68 @@ fn computed_terms_beyond_the_budget_fail_the_query_in_both_modes() {
     match cursor {
         Err(error) => assert!(is_memory(&error), "{error:?}"),
         Ok(n) => panic!("the cursor answered {n} rows within the budget"),
+    }
+}
+
+fn turtle(data: &str) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        data.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+/// A finished eager result decodes without refusals: its readers cannot report one, so
+/// a value the budget cannot hold the decode envelope of must still come back bound.
+#[test]
+fn a_finished_result_decodes_its_values_within_a_small_budget() {
+    let long = "x".repeat(4096);
+    let s = turtle(&format!("<urn:s> <urn:p> \"{long}\" ."));
+    let r = query(
+        s.snapshot(),
+        "SELECT ?o WHERE { ?s <urn:p> ?o }",
+        &budget(8192),
+    )
+    .unwrap();
+    let rows = r.rows();
+    assert_eq!(rows.len(), 1);
+    match &rows[0][0] {
+        Some(oxrdf::Term::Literal(l)) => assert_eq!(l.value(), long),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An update whose template term cannot be decoded within its budget fails before it
+/// applies anything, instead of applying its deletions and skipping the insertion.
+#[test]
+fn a_refused_template_term_leaves_the_store_unchanged() {
+    let s = turtle("<urn:s> <urn:p> \"old\" .");
+    let long = "x".repeat(4096);
+    let text = format!(
+        "DELETE {{ <urn:s> <urn:p> ?old }} INSERT {{ <urn:s> <urn:p> ?new }} \
+         WHERE {{ <urn:s> <urn:p> ?old VALUES ?new {{ \"{long}\" }} }}"
+    );
+    match update(&s, &text, &budget(8192)) {
+        Err(error) => assert!(is_memory(&error), "{error:?}"),
+        Ok(stats) => {
+            // An update that fits must have applied both halves.
+            assert_eq!((stats.deleted, stats.inserted), (1, 1));
+            return;
+        }
+    }
+    let r = query(
+        s.snapshot(),
+        "SELECT ?o WHERE { <urn:s> <urn:p> ?o }",
+        &Default::default(),
+    )
+    .unwrap();
+    let rows = r.rows();
+    assert_eq!(rows.len(), 1, "the deletion was not applied");
+    match &rows[0][0] {
+        Some(oxrdf::Term::Literal(l)) => assert_eq!(l.value(), "old"),
+        other => panic!("{other:?}"),
     }
 }

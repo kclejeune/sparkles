@@ -425,8 +425,8 @@ impl QueryMemoryLedger {
         Ok(())
     }
     /// Lower the admitted eager contributions of a finished eager query to what its
-    /// result keeps: the primary account to its live bytes or `keep`, whichever is
-    /// higher, and every other account to its live bytes. The excess returns to each
+    /// result keeps: the primary account to its live bytes plus `keep`, the bytes of
+    /// output that no lease holds, and every other account to its live bytes. The excess returns to each
     /// account's grant. A cursor ledger keeps no eager contribution, and a running
     /// algorithm call may still need its own, so both are left as they are.
     pub(crate) fn shrink_eager(&self, keep: u64) -> Result<()> {
@@ -449,7 +449,7 @@ impl QueryMemoryLedger {
                     continue;
                 };
                 let floor = if account.owner.id == PRIMARY {
-                    account.live.max(keep)
+                    account.live.saturating_add(keep)
                 } else {
                     account.live
                 };
@@ -950,10 +950,10 @@ mod tests {
         drop(ctx.charge(4 * MB).unwrap());
         std::mem::forget(ctx.charge(MB / 2).unwrap());
         assert!(b.used() >= 4 * MB);
-        // the primary account keeps its live megabyte or the result's two, the other
-        // account its live half megabyte
+        // the primary account keeps its live megabyte and the result's two, which no
+        // lease holds, the other account its live half megabyte
         ctx.memory().shrink_eager(2 * MB).unwrap();
-        assert_eq!((a.used(), b.used()), (2 * MB, MB / 2));
+        assert_eq!((a.used(), b.used()), (3 * MB, MB / 2));
         ctx.memory().shrink_eager(0).unwrap();
         assert_eq!((a.used(), b.used()), (MB, MB / 2));
         // live charges grow the contribution again
