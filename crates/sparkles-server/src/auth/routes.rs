@@ -481,7 +481,6 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/diff"
         | "/$/ontology/{ds}"
         | "/$/ontology/{ds}/entities"
-        | "/$/ontology/{ds}/entity"
         | "/$/ontology/{ds}/check"
         // a run that writes its taxonomy checks write in the handler
         | "/$/ontology/{ds}/classify"
