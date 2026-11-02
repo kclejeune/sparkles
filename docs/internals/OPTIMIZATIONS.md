@@ -48,7 +48,10 @@ operator or its cost model changes.
   of QLever's `DeltaTriples`. Snapshots are versioned, and caches are keyed by snapshot
   version. A scan merges the delta into the blocks it changes. It finds the base rows
   between two delta keys by binary search, and only those blocks have every column
-  decoded.
+  decoded. The reads that visit index blocks in parallel, such as the runs of the count
+  and filter operators below, copy each changed block with its delta keys merged in, so
+  uncompacted commits keep those reads parallel. The copy holds only the columns that the
+  read asks for, and lives until the read's task for that block ends.
 * **Rebuilds in the background.** Like QLever's index rebuild, a compaction builds the
   new index from a snapshot while updates continue, then carries the updates made since
   the snapshot into the new index with their ids remapped. Sparkles carries each commit
@@ -111,10 +114,11 @@ implementation and always apply. EXPLAIN shows which ones ran.
   the pattern from the permutation sorted on `?v`. The filter is tested once per run of
   equal ids, and the count is the sum of the lengths of the runs that pass, or the number
   of such runs for `COUNT(DISTINCT ?v)` (`CountFilterFromRuns`). No rows are
-  materialized. When the snapshot's delta has no key in the pattern's range, the index
-  blocks are read in parallel and each block's vocabulary ids are tested on their keys as
-  the block is read, in pieces of 8192 rows so that a short scan still uses every thread.
-  Otherwise the runs are read in order with the delta merged in. At 10.5M triples,
+  materialized. The index blocks are read in parallel, with the delta merged into the
+  blocks it changes, and each block's vocabulary ids are tested on their keys as the
+  block is read, in pieces of 8192 rows so that a short scan still uses every thread.
+  Union-graph dedup, which compares neighbouring rows, reads the runs in order. At 10.5M
+  triples,
   counting the `foaf:name` values that contain "Ada" tests 1.02M names and takes about
   4 ms in the server, against 14 ms when the name column is materialized first.
 * **Filters on the runs of a scan** (`filter_scan_runs`). A FILTER directly over a scan
@@ -122,8 +126,9 @@ implementation and always apply. EXPLAIN shows which ones ran.
   per value, then copies out of the index blocks only the rows of the values that pass,
   in parallel. The other conjuncts are applied to those rows. EXPLAIN notes
   `[runs of ?v: N values tested on vocabulary keys, M passed]`. Union-graph dedup, which
-  compares neighbouring rows, and a delta with keys in the scan's range keep the generic
-  scan and filter.
+  compares neighbouring rows, keeps the generic scan and filter. Under streaming
+  execution the filter reads its scan in morsels of whole blocks only when the snapshot
+  has no delta at all.
 * **Filter selectivity from samples** (`sampled_filters`). Without other knowledge the
   planner assumes that a FILTER conjunct keeps 30% of its input. A conjunct whose
   variables are all bound by one triple pattern is instead tested on a sample of that

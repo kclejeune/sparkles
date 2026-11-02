@@ -64,6 +64,8 @@ mod mem_history;
 #[cfg(test)]
 mod memory_branch_tests;
 mod merge;
+#[cfg(test)]
+mod par_blocks_tests;
 mod partial;
 mod patch_apply;
 #[cfg(test)]
@@ -905,12 +907,14 @@ impl Snapshot {
         Ok(())
     }
 
-    /// The base blocks holding keys in the ranges `[lo, hi]` (sorted and disjoint),
-    /// visited in parallel: `f(block, s, e)` for the rows `[s, e)` of a block in a range,
-    /// at most `piece` rows at a time (the columns in `mask` are decoded), with the
-    /// results in key order. `None` when the delta inserts or deletes a key in a range,
-    /// whose merge with the blocks is sequential
-    /// ([`scan_between_cols`](Self::scan_between_cols) reads those).
+    /// The quads with keys in the ranges `[lo, hi]` (sorted and disjoint), base blocks
+    /// merged with the delta, visited in parallel: `f(block, s, e)` for rows `[s, e)` of a
+    /// block, at most `piece` rows at a time (the columns in `mask` are decoded), with the
+    /// results in key order. A base block that the delta changes is read with every
+    /// column and copied with the delta merged into it, into a block of its own that `f`
+    /// reads, so `f` sees exactly the quads that
+    /// [`scan_between_cols`](Self::scan_between_cols) visits, in the same order. Inserted
+    /// keys after the last block of a range form a block of their own.
     pub fn par_blocks_in_ranges<T: Send>(
         &self,
         perm: Perm,
@@ -918,48 +922,142 @@ impl Snapshot {
         mask: crate::index::ColMask,
         piece: usize,
         f: impl Fn(&Block, usize, usize) -> Result<T> + Sync + Send,
-    ) -> Result<Option<Vec<T>>> {
+    ) -> Result<Vec<T>> {
         use rayon::prelude::*;
         let pi = perm.index();
-        let touched = |&(lo, hi): &(Key, Key)| {
-            self.delta.ins[pi].intersects(lo..=hi) || self.delta.del[pi].intersects(lo..=hi)
-        };
-        if ranges.iter().any(touched) {
-            return Ok(None);
-        }
+        let (ins_set, del_set) = (&self.delta.ins[pi], &self.delta.del[pi]);
         let base = self.perm(perm);
-        let visits: Vec<(usize, usize)> = ranges
-            .iter()
-            .enumerate()
-            .flat_map(|(r, (lo, hi))| {
-                let (b0, b1) = base.key_block_range(lo, hi);
-                (b0..b1).map(move |b| (r, b))
-            })
-            .collect();
+        let piece = piece.max(1);
+        // one base block in one range, with the delta keys merged into its rows: those
+        // after the block before it and up to its last key, or after the last block
+        struct Visit {
+            r: usize,
+            b: usize,
+            /// whether block `b` has rows in the range, or only follows the inserted keys
+            base: bool,
+            ins: Vec<Key>,
+            del: Vec<Key>,
+        }
+        let visit = |r, b, base| Visit {
+            r,
+            b,
+            base,
+            ins: Vec::new(),
+            del: Vec::new(),
+        };
+        let mut visits: Vec<Visit> = Vec::new();
+        for (r, (lo, hi)) in ranges.iter().enumerate() {
+            let (b0, b1) = base.key_block_range(lo, hi);
+            let start = visits.len();
+            visits.extend((b0..b1).map(|b| visit(r, b, true)));
+            if !ins_set.intersects(lo..=hi) && !del_set.intersects(lo..=hi) {
+                continue;
+            }
+            // a key's block is the first whose last key is not less than it. A key in
+            // [lo, hi] lies in b0..=b1: block b1, when it exists, starts after hi.
+            let slot = |k: &Key| base.blocks.partition_point(|m| m.last < *k).clamp(b0, b1);
+            for k in Delta::key_range(ins_set, *lo, *hi) {
+                let b = slot(k);
+                if b == b1 && visits.len() == start + (b1 - b0) {
+                    visits.push(visit(r, b1, false));
+                }
+                visits[start + b - b0].ins.push(*k);
+            }
+            // the base holds every deleted key, so its block overlaps the range
+            for k in Delta::key_range(del_set, *lo, *hi) {
+                let b = slot(k);
+                if b < b1 {
+                    visits[start + b - b0].del.push(*k);
+                }
+            }
+        }
         visits
             .into_par_iter()
-            .map(|(r, b)| {
-                let (lo, hi) = &ranges[r];
-                let m = &base.blocks[b];
-                let whole = m.first >= *lo && m.last <= *hi;
-                let bounds = crate::index::bound_cols(lo, hi);
-                let blk = self
-                    .cache
-                    .get_cols(base, b, if whole { mask } else { mask | bounds })?;
-                let (s, e) = if whole {
-                    (0, blk.len())
-                } else {
-                    blk.key_range(lo, hi)
+            .map(|v| {
+                let (lo, hi) = &ranges[v.r];
+                if v.ins.is_empty() && v.del.is_empty() {
+                    let m = &base.blocks[v.b];
+                    let whole = m.first >= *lo && m.last <= *hi;
+                    let bounds = crate::index::bound_cols(lo, hi);
+                    let blk =
+                        self.cache
+                            .get_cols(base, v.b, if whole { mask } else { mask | bounds })?;
+                    let (s, e) = if whole {
+                        (0, blk.len())
+                    } else {
+                        blk.key_range(lo, hi)
+                    };
+                    let starts: Vec<usize> = (s..e.max(s + 1)).step_by(piece).collect();
+                    return starts
+                        .into_par_iter()
+                        .map(|a| f(&blk, a.min(e), (a + piece).min(e)))
+                        .collect::<Result<Vec<T>>>();
+                }
+                // The merge compares full keys, so a changed block has every column. The
+                // columns in `mask` of its rows in the range and of the inserted keys are
+                // copied into one block, which costs less than a task and an allocation for
+                // each run between two delta keys.
+                let blk = match v.base {
+                    true => Some(self.cache.get_cols(base, v.b, crate::index::ALL_COLS)?),
+                    false => None,
                 };
-                let piece = piece.max(1);
-                let starts: Vec<usize> = (s..e.max(s + 1)).step_by(piece).collect();
-                starts
+                let (s, e) = blk.as_ref().map_or((0, 0), |b| b.key_range(lo, hi));
+                let wanted = |c: usize| mask & (1 << c) != 0;
+                let mut cols: [Vec<u64>; 4] = std::array::from_fn(|c| match wanted(c) {
+                    true => Vec::with_capacity(e - s + v.ins.len()),
+                    false => Vec::new(),
+                });
+                let mut rows = 0;
+                let copy = |cols: &mut [Vec<u64>; 4], rows: &mut usize, i: usize, j: usize| {
+                    if let Some(b) = &blk {
+                        for (c, (to, from)) in cols.iter_mut().zip(&b.cols).enumerate() {
+                            if wanted(c) {
+                                to.extend_from_slice(&from[i..j]);
+                            }
+                        }
+                        *rows += j - i;
+                    }
+                };
+                let (mut ins, mut del) = (v.ins.iter().peekable(), v.del.iter().peekable());
+                let mut i = s;
+                loop {
+                    // the base holds no inserted key and every deleted one, so the two
+                    // never share a key
+                    let (k, is_ins) = match (ins.peek(), del.peek()) {
+                        (None, None) => break,
+                        (Some(a), Some(d)) if d < a => (**d, false),
+                        (Some(a), _) => (**a, true),
+                        (None, Some(d)) => (**d, false),
+                    };
+                    let j = blk.as_ref().map_or(i, |b| first_row_from(b, i, e, &k));
+                    copy(&mut cols, &mut rows, i, j);
+                    i = j;
+                    if is_ins {
+                        for (c, (to, x)) in cols.iter_mut().zip(k).enumerate() {
+                            if wanted(c) {
+                                to.push(x);
+                            }
+                        }
+                        rows += 1;
+                        ins.next();
+                    } else {
+                        if blk.as_ref().is_some_and(|b| i < e && b.key(i) == k) {
+                            i += 1;
+                        }
+                        del.next();
+                    }
+                }
+                copy(&mut cols, &mut rows, i, e);
+                let merged = Block::from_cols(cols, rows);
+                (0..merged.len())
+                    .step_by(piece)
+                    .collect::<Vec<usize>>()
                     .into_par_iter()
-                    .map(|a| f(&blk, a.min(e), (a + piece).min(e)))
+                    .map(|a| f(&merged, a, (a + piece).min(merged.len())))
                     .collect::<Result<Vec<T>>>()
             })
             .collect::<Result<Vec<Vec<T>>>>()
-            .map(|parts| Some(parts.into_iter().flatten().collect()))
+            .map(|parts| parts.into_iter().flatten().collect())
     }
 
     /// Collect full keys for a prefix (convenience; engine uses [`scan`](Self::scan)).

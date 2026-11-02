@@ -643,6 +643,15 @@ impl Block {
         }
         (start, lo)
     }
+    /// A block of `rows` keys from its columns, each of which holds `rows` values or is
+    /// empty, as a column a reader did not ask for is.
+    pub(crate) fn from_cols(cols: [Vec<u64>; 4], rows: usize) -> Block {
+        debug_assert!(cols.iter().all(|c| c.is_empty() || c.len() == rows));
+        Block {
+            cols: cols.map(Col::from),
+            rows,
+        }
+    }
     /// Bytes of the decoded columns held.
     pub fn bytes(&self) -> usize {
         self.cols.iter().map(|c| c.len() * 8).sum()

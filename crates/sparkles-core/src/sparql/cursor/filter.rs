@@ -358,7 +358,6 @@ impl Morsels {
                 &self.filters,
                 &ranges,
             )?
-            .ok_or_else(|| Error::invalid("a cursor morsel overlaps the delta"))?
         };
         let held = parts
             .iter()
