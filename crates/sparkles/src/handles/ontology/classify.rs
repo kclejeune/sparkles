@@ -48,7 +48,7 @@ use oxrdf::{Literal, NamedNode, Term};
 use rustc_hash::FxHashSet;
 use sparkles_core::algo::Control;
 use sparkles_core::algo::pool::Par;
-use sparkles_owl::classify::{Classification, Classifier, Excluded, Limits};
+use sparkles_owl::classify::{Changes, Classification, Excluded, Limits, Saturation, logical};
 use sparkles_owl::read::Mode;
 use sparkles_owl::{
     AnnotationProperty, AnnotationValue, Axiom, AxiomKind, ClassExpression, Entity, vocab,
@@ -107,33 +107,29 @@ impl Classified {
     }
 }
 
-/// The classification the dataset keeps.
+/// The classification the dataset keeps: the saturated contexts and the open ontology
+/// they were saturated from, whose axioms the saturation reads in place rather than
+/// copying them.
 pub struct CacheEntry {
     key: String,
     commit: u64,
-    kinds: FxHashSet<AxiomKind>,
-    classifier: Classifier,
+    ontology: Option<Arc<sparkles_owl::read::Ontology>>,
+    saturation: Saturation,
     result: Option<(Arc<Classification>, Arc<Vec<Excluded>>)>,
 }
 
-fn logical(k: &AxiomKind) -> bool {
-    !matches!(
-        k,
-        AxiomKind::AnnotationAssertion(..)
-            | AxiomKind::SubAnnotationPropertyOf(..)
-            | AxiomKind::AnnotationPropertyDomain(..)
-            | AxiomKind::AnnotationPropertyRange(..)
-    )
+/// The logical axioms of an ontology, in its order.
+fn logical_axioms(o: &sparkles_owl::read::Ontology) -> Vec<&AxiomKind> {
+    o.axioms
+        .keys()
+        .map(|a| &a.kind)
+        .filter(|k| logical(k))
+        .collect()
 }
 
 /// The logical content of an open ontology's terminology, without annotations.
-fn kinds_of(o: &Opened) -> FxHashSet<AxiomKind> {
-    o.ontology
-        .axioms
-        .keys()
-        .filter(|a| logical(&a.kind))
-        .map(|a| a.kind.clone())
-        .collect()
+fn kinds_of(o: &Opened) -> FxHashSet<&AxiomKind> {
+    logical_axioms(&o.ontology).into_iter().collect()
 }
 
 /// Whether an axiom is one a taxonomy writes: a subsumption or an equivalence between
@@ -178,17 +174,20 @@ impl Ontologies {
         let (classification, excluded, reused) = if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
-            let mut k = Classifier::of(o.ontology.axioms.keys());
+            let mut assertions: Vec<Axiom> = Vec::new();
             if c.assertions {
                 o.assertions(&opts, |ax, _, _| {
                     if let Some(ax) = ax {
-                        k.add([&ax]);
+                        assertions.push(ax);
                     }
                     Ok(true)
                 })?;
             }
-            let out = run(&mut k, c, &opts)?;
-            (Arc::new(out), Arc::new(k.excluded()), false)
+            let mut axioms = logical_axioms(&o.ontology);
+            axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
+            let mut s = Saturation::new();
+            let out = run(&mut s, &axioms, None, c, &opts)?;
+            (Arc::new(out), Arc::new(s.excluded().to_vec()), false)
         };
         if let Some(about) = &c.about
             && classification
@@ -239,8 +238,8 @@ impl Ontologies {
             _ => CacheEntry {
                 key,
                 commit: 0,
-                kinds: FxHashSet::default(),
-                classifier: Classifier::new(),
+                ontology: None,
+                saturation: Saturation::new(),
                 result: None,
             },
         };
@@ -252,25 +251,29 @@ impl Ontologies {
             *state.classify_cache.lock() = Some(e);
             return Ok(answer);
         }
-        let kinds = kinds_of(o);
-        let added: Vec<Axiom> = kinds
-            .iter()
-            .filter(|k| !e.kinds.contains(*k))
-            .map(|k| Axiom::new(k.clone()))
-            .collect();
-        let removed: Vec<Axiom> = e
-            .kinds
-            .iter()
-            .filter(|k| !kinds.contains(*k))
-            .map(|k| Axiom::new(k.clone()))
-            .collect();
-        e.classifier.add(&added);
-        e.classifier.remove(&removed);
-        // the classifier holds the new axioms whether the run ends or not
-        e.kinds = kinds;
+        // the axioms that changed since the ontology the saturation last read
+        let before = e.ontology.take();
+        let axioms = logical_axioms(&o.ontology);
+        let (added, removed) = match &before {
+            Some(b) => {
+                let now: FxHashSet<&AxiomKind> = axioms.iter().copied().collect();
+                let then: FxHashSet<&AxiomKind> = logical_axioms(b).into_iter().collect();
+                (
+                    now.iter().copied().filter(|k| !then.contains(k)).collect(),
+                    then.iter().copied().filter(|k| !now.contains(k)).collect(),
+                )
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        let changes = before.as_ref().map(|_| Changes {
+            added: &added,
+            removed: &removed,
+        });
         e.commit = commit;
         e.result = None;
-        let out = run(&mut e.classifier, c, opts);
+        let out = run(&mut e.saturation, &axioms, changes, c, opts);
+        // the saturation reflects the new axioms whether the run ends or not
+        e.ontology = Some(o.ontology.clone());
         let out = match out {
             Ok(out) => out,
             Err(err) => {
@@ -279,7 +282,7 @@ impl Ontologies {
             }
         };
         let cl = Arc::new(out);
-        let ex = Arc::new(e.classifier.excluded());
+        let ex = Arc::new(e.saturation.excluded().to_vec());
         if cl.stats.memory <= CACHE_MAX_BYTES {
             e.result = Some((cl.clone(), ex.clone()));
             *state.classify_cache.lock() = Some(e);
@@ -472,9 +475,15 @@ impl Ontologies {
     }
 }
 
-/// Runs a classifier under the options' deadline, cancellation and memory budget, with
-/// threads from the algorithm pool.
-fn run(k: &mut Classifier, c: &ClassifyRequest, opts: &QueryOptions) -> Result<Classification> {
+/// Runs a classification under the options' deadline, cancellation and memory budget,
+/// with threads from the algorithm pool.
+fn run(
+    k: &mut Saturation,
+    axioms: &[&AxiomKind],
+    changes: Option<Changes<'_>>,
+    c: &ClassifyRequest,
+    opts: &QueryOptions,
+) -> Result<Classification> {
     let flag = opts.cancel.clone().unwrap_or_default();
     let ctl = Control::new(flag, opts.deadline, u64::MAX);
     let par = Par::acquire(c.threads, &ctl)?;
@@ -494,7 +503,7 @@ fn run(k: &mut Classifier, c: &ClassifyRequest, opts: &QueryOptions) -> Result<C
                 as Arc<dyn Fn(usize) -> bool + Send + Sync>
         }),
     };
-    let out = k.classify(&limits);
+    let out = k.classify(axioms, changes, &limits);
     drop(par);
     out.map_err(|e| match e {
         sparkles_owl::classify::Error::Cancelled => Error::Cancelled,
