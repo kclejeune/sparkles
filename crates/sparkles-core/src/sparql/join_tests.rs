@@ -375,9 +375,11 @@ fn optional_and_join_queries_give_the_same_rows_with_each_switch() {
 
 /// Subjects in several blocks of every permutation, some with runs of values that span
 /// blocks, probed for random, clustered and absent keys: the galloping reader gives the
-/// rows of the reader with a scan per cluster, before and after updates.
-#[test]
-fn galloping_index_joins_match_scans_per_cluster_across_blocks() {
+/// rows of the reader with a scan per cluster, before and after updates. Every part draws
+/// the keys of every round from the same random stream, so the rounds are the same in
+/// any split, and checks the queries whose position leaves `part` modulo `parts`. The six
+/// tests, one per query, run in parallel.
+fn galloping_index_joins_part(part: usize, parts: usize) {
     let s = Store::in_memory(StoreOptions::default());
     let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
     for i in 0..30_000 {
@@ -423,14 +425,20 @@ fn galloping_index_joins_match_scans_per_cluster_across_blocks() {
                 })
                 .collect();
             let values = format!("VALUES ?s {{ {} }}", keys.join(" "));
-            for q in [
+            for (i, q) in [
                 format!("SELECT * WHERE {{ {values} ?s ex:p0 ?a }}"),
                 format!("SELECT * WHERE {{ {values} ?s ex:p2 ?a }}"),
                 format!("SELECT * WHERE {{ {values} ?s ex:p0 ?a ; ex:p1 ?b }}"),
                 format!("SELECT * WHERE {{ {values} ?s ex:p0 ?a ; ex:p2 ?c ; a ?t }}"),
                 format!("SELECT * WHERE {{ {values} ?s ex:p1 ?t . ?t ex:p0 ?a }}"),
                 format!("SELECT * WHERE {{ {values} ?s a ex:C1 ; ex:p0 ?a }}"),
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if i % parts != part {
+                    continue;
+                }
                 let want = answer(&run(&snap, &q, Optimizations::NONE));
                 for walk in [Some(true), Some(false)] {
                     for opt in [Optimizations::ALL, gallop_off] {
@@ -450,4 +458,34 @@ fn galloping_index_joins_match_scans_per_cluster_across_blocks() {
             }
         }
     }
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_1_of_6() {
+    galloping_index_joins_part(0, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_2_of_6() {
+    galloping_index_joins_part(1, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_3_of_6() {
+    galloping_index_joins_part(2, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_4_of_6() {
+    galloping_index_joins_part(3, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_5_of_6() {
+    galloping_index_joins_part(4, 6);
+}
+
+#[test]
+fn galloping_index_joins_match_scans_per_cluster_across_blocks_part_6_of_6() {
+    galloping_index_joins_part(5, 6);
 }

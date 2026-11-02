@@ -10,17 +10,31 @@
 #   gate.sh --hosts                    print each gate host's lock, queue and free disk
 #
 # Options:
-#   --host H     run the whole gate on H, with no conformance half elsewhere
-#   --helper H   run the conformance half on H while ci runs on the primary host, or "none"
-#   --auto       pick the hosts from their heavy locks and gate queues (see below)
-#   --jobs N     pass --jobs N to scripts/ci.sh (default 1)
-#   --tag T      name the run <short>-T, so a second run of the same commit can coexist
-#   --dry-run    print the chosen hosts and stop before pushing or starting anything
+#   --host H        run ci on H (default GATE_PRIMARY or the first gate host)
+#   --helper H      run the conformance half on H while ci runs on the primary host, or
+#                   "none" to run the whole gate on the primary host
+#   --auto          pick the hosts from their heavy locks and gate queues (see below)
+#   --base REV      compare the commit with its merge base with REV and run only the
+#                   checks the changed files call for (default GATE_BASE or origin/main)
+#   --full          run every check with --force and no selection, as the nightly gate does
+#   --jobs N        pass --jobs N to scripts/ci.sh (default 1)
+#   --cargo-jobs N  set CARGO_BUILD_JOBS on every host of the run (see below)
+#   --tag T         name the run <short>-T, so a second run of the same commit can coexist
+#   --dry-run       print the chosen hosts and checks and stop before pushing or starting
 #
-# By default scripts/ci.sh runs on wally while the conformance suites (test:w3c, test:shacl,
-# test:shex and the plain and encrypted spill matrices) run on atlas for the same commit.
-# If atlas cannot be reached, everything runs on wally in sequence and progress.log says
-# so. The gate hosts cannot reach each other, so --status, --fetch and the waiting mode
+# The gate host chooses the checks from the files that changed between the merge base and
+# the commit, with the commit's scripts/gate/select-checks.py, and records them in
+# selection.txt. The task cache of mise then skips a chosen check whose inputs already
+# passed on that host. Build configuration, the CI scripts and files that no rule covers
+# run everything. --full and the nightly gate (scripts/gate/nightly.sh) run every check.
+#
+# scripts/ci.sh runs on the primary host. When the batch changes code that the
+# conformance suites (test:w3c, test:shacl, test:shex and the plain and encrypted spill
+# matrices) check, they run on a second gate host for the same commit, the first one
+# that is free: its heavy lock is free, it runs no gate unit and it has the disk for a
+# conformance half. With no free host, or with --helper none, they run on the primary host
+# after ci. If the helper cannot be reached, everything runs on the primary host in
+# sequence and progress.log says so. The gate hosts cannot reach each other, so --status, --fetch and the waiting mode
 # merge the two halves into one directory with one steps.txt and one gate.exit, which is
 # 0 only when both halves pass. A fetch of a finished split gate also copies the merged
 # files back into the primary host's ~/gate/out/<name>/.
@@ -28,11 +42,17 @@
 # Host roles: SPARKLES_BENCH_HOST (default forge) names the benchmark host, which never
 # runs gate work, not even when named with --host. GATE_HOSTS (default "wally atlas
 # forge") lists the hosts that may run gates, and the benchmark host is dropped from it.
-# GATE_PRIMARY (or the older WALLY_HOST) sets the default primary host, and GATE_HELPER
-# the default helper, which is otherwise the first other gate host. GATE_HELPER=none
-# disables the split, and a GATE_HELPER that does not resolve exercises the
-# unreachable-helper fallback. These settings may also live in ~/.config/sparkles/gate.env
-# (or $SPARKLES_GATE_CONFIG) as KEY=VALUE lines, and the environment takes precedence.
+# GATE_PRIMARY (or the older WALLY_HOST) sets the default primary host. GATE_HELPER names
+# a helper to use whether or not it is free, GATE_HELPER=none disables the split, and a
+# GATE_HELPER that does not resolve exercises the unreachable-helper fallback.
+#
+# Compile jobs: --cargo-jobs applies to every host. Otherwise GATE_CARGO_JOBS_HOSTS, such
+# as "hostA=6 hostB=8", sets them per host, and GATE_CARGO_JOBS sets them for the other
+# hosts. Without any of these, each host derives them from its gate memory cap
+# (scripts/gate/remote/gate-start.sh).
+#
+# These settings may also live in ~/.config/sparkles/gate.env (or $SPARKLES_GATE_CONFIG)
+# as KEY=VALUE lines, and the environment takes precedence.
 # Swapping the benchmark role from forge to atlas is SPARKLES_BENCH_HOST=atlas there, after
 # scripts/gate/setup-host.sh forge has prepared forge.
 #
@@ -61,13 +81,15 @@ default_helper() {
   }; done
   echo none
 }
-helper=${GATE_HELPER-$(default_helper "$primary")}
+helper=${GATE_HELPER:-}
 mode="wait"
 auto=0
 dry=0
 jobs=1
+cargo_jobs=
+base_rev=${GATE_BASE:-origin/main}
+all_checks=0
 tag=
-host_set=0
 helper_set=0
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
 
@@ -87,7 +109,6 @@ while [ $# -gt 0 ]; do
     --dry-run) dry=1 ;;
     --host)
       primary=${2:?--host needs a host}
-      host_set=1
       shift
       ;;
     --helper)
@@ -99,6 +120,15 @@ while [ $# -gt 0 ]; do
       jobs=${2:?--jobs needs a number}
       shift
       ;;
+    --cargo-jobs)
+      cargo_jobs=${2:?--cargo-jobs needs a number}
+      shift
+      ;;
+    --base)
+      base_rev=${2:?--base needs a revision}
+      shift
+      ;;
+    --full) all_checks=1 ;;
     --tag)
       tag=${2:?--tag needs a name}
       shift
@@ -117,8 +147,12 @@ if [ $mode = hosts ]; then :; elif [ $# -ne 1 ]; then
   exit 0
 fi
 case $jobs in '' | *[!0-9]* | 0) die "bad --jobs $jobs" ;; esac
+case $cargo_jobs in *[!0-9]* | 0) die "bad --cargo-jobs $cargo_jobs" ;; esac
 case $tag in *[!A-Za-z0-9._-]*) die "bad --tag $tag" ;; esac
-if [ $host_set = 1 ] && [ $helper_set = 0 ]; then helper=none; fi
+# A helper named by --helper or GATE_HELPER is used as given. Otherwise the run picks a
+# free one below, once it knows whether the batch needs the conformance suites.
+pick_helper=0
+if [ $helper_set = 0 ] && [ -z "${GATE_HELPER+x}" ]; then pick_helper=1; fi
 [ "$helper" = "$primary" ] && helper=none
 
 root=$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)
@@ -205,11 +239,16 @@ install_remote() {
 
 # start_on HOST NAME PART [NOTE]
 start_on() {
-  local h=$1 n=$2 p=$3 note=${4:-} bin
+  local h=$1 n=$2 p=$3 note=${4:-} bin args cj
   git push -q "ssh://$h/home/$USER/gate/repo.git" "$full:refs/heads/gate-$short"
   bin=$(install_remote "$h")
+  args="--name $n --part $p --jobs $jobs"
+  cj=$(cargo_jobs_for "$h")
+  case $cj in '' | *[!0-9]* | 0) ;; *) args+=" --cargo-jobs $cj" ;; esac
+  [ -z "$mb" ] || args+=" --base $mb"
+  [ $all_checks = 0 ] || args+=" --full"
   # shellcheck disable=SC2029
-  ssh "${ssh_opts[@]}" "$h" "\$HOME/$bin/gate-start.sh $full --name $n --part $p --jobs $jobs --note $(printf '%q' "$note")"
+  ssh "${ssh_opts[@]}" "$h" "\$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
 }
 
 # 0 when the run NAME on HOST has finished: it wrote its exit file or its unit stopped.
@@ -298,9 +337,9 @@ fetch() {
   # and environment records keep a -conf suffix, and steps.txt lists both halves.
   for f in "$conf"/*.log "$conf"/*.exit; do
     [ -e "$f" ] || continue
-    case ${f##*/} in progress.log | mempeak.log | part.exit) ;; *) cp -a "$f" "$tmp/" ;; esac
+    case ${f##*/} in progress.log | mempeak.log | selection.log | part.exit) ;; *) cp -a "$f" "$tmp/" ;; esac
   done
-  for f in progress.log mempeak.log env.txt mempeak.final; do
+  for f in progress.log mempeak.log env.txt mempeak.final selection.txt selection.log; do
     [ -f "$conf/$f" ] && cp -a "$conf/$f" "$tmp/${f%.*}-conf.${f##*.}"
   done
   # After an earlier merge was partly copied back, steps.txt on the primary is that merge
@@ -369,6 +408,29 @@ case $mode in
     ;;
 esac
 
+# The merge base the gate host compares the commit with, and whether the batch needs the
+# conformance suites, from the same selection the host makes (scripts/gate/select-checks.py).
+mb=
+needs_conf=1
+if [ $all_checks = 0 ]; then
+  if mb=$(git merge-base "$base_rev" "$full" 2> /dev/null); then
+    sel=$(python3 "$here/select-checks.py" --base "$mb" --rev "$full" --paths-only 2> /dev/null) || sel=
+    if [ -n "$sel" ] && ! echo "$sel" | grep -Eq '^(conformance|spill) [a-z]'; then needs_conf=0; fi
+    echo "checks: selected from the changes since $(git rev-parse --short "$mb") ($base_rev); conformance $([ $needs_conf = 1 ] && echo needed || echo 'not needed')"
+  else
+    echo "gate.sh: $full has no merge base with $base_rev, so every check runs" >&2
+    mb=
+  fi
+else
+  echo "checks: every check with --force (--full)"
+fi
+if [ $needs_conf = 0 ]; then
+  helper=none
+  pick_helper=0
+fi
+# --auto starts from the first other gate host as the candidate helper.
+if [ $pick_helper = 1 ] && [ $auto = 1 ]; then helper=$(default_helper "$primary"); fi
+
 if [ $auto = 1 ]; then
   # idle[h]=1 when h is reachable with its lock free and no gate units; roomy[h]=1 when h has
   # the disk for a whole gate and half[h]=1 when it has the disk for a conformance half.
@@ -422,8 +484,39 @@ if [ $auto = 1 ]; then
   dest=$root/.artifacts/gates/main-gate-$name-$primary
 fi
 
+# The default helper is the first other gate host that is free now.
+if [ $pick_helper = 1 ] && [ $auto = 0 ]; then
+  helper=none
+  for h in "${gate_hosts[@]}"; do
+    [ "$h" != "$primary" ] || continue
+    read -r l u d <<< "$(probe "$h")" || true
+    if [ "$l" = free ] && [ "${u:-1}" = 0 ] && [ "${d:-0}" -ge "${GATE_MIN_FREE_HALF_GB:-20}" ]; then
+      helper=$h
+      break
+    fi
+  done
+  [ "$helper" != none ] || echo "no other gate host is free, so the conformance suites run on $primary after ci"
+  refuse_bench
+fi
+
+# cargo_jobs_for HOST: the CARGO_BUILD_JOBS to pass to HOST, or nothing for its default.
+cargo_jobs_for() {
+  local kv
+  if [ -n "$cargo_jobs" ]; then
+    echo "$cargo_jobs"
+    return
+  fi
+  for kv in ${GATE_CARGO_JOBS_HOSTS:-}; do
+    if [ "${kv%%=*}" = "$1" ]; then
+      echo "${kv#*=}"
+      return
+    fi
+  done
+  echo "${GATE_CARGO_JOBS:-}"
+}
+
 if [ $dry = 1 ]; then
-  echo "dry run: gate-$name primary $primary helper $helper jobs $jobs results $dest"
+  echo "dry run: gate-$name primary $primary helper $helper jobs $jobs cargo-jobs ${cargo_jobs:-per host} base ${mb:-none} full $all_checks results $dest"
   exit 0
 fi
 
@@ -481,7 +574,7 @@ else
   start_on "$primary" "$name" ci "split: conformance half runs on $helper as gate-$hname"
 fi
 mkdir -p "$statedir"
-printf 'primary=%s\nhelper=%s\nhname=%s\njobs=%s\n' "$primary" "$helper" "$hname" "$jobs" > "$statefile"
+printf 'primary=%s\nhelper=%s\nhname=%s\njobs=%s\nbase=%s\nfull_checks=%s\n' "$primary" "$helper" "$hname" "$jobs" "$mb" "$all_checks" > "$statefile"
 if [ "$helper" = none ]; then
   echo "gate-$name started on $primary; status: $0 ${tag:+--tag $tag }--status $short"
 else
@@ -496,6 +589,7 @@ while ! finished "$primary" "$name" || { [ "$helper" != none ] && ! finished "$h
   sleep 120
 done
 fetch
+cat "$dest/selection.txt" 2> /dev/null
 cat "$dest/steps.txt" 2> /dev/null
 cat "$dest/wall.txt" 2> /dev/null
 code=$(cat "$dest/gate.exit" 2> /dev/null || echo 99)

@@ -219,18 +219,26 @@ touched, such as `py:test`, `jvm:test`, `node:test`, `node:client:check` or `ui:
 since `--fast` runs none of them. The lane may run `scripts/ci.sh --fast --changed <base>`
 instead, which runs Clippy and the tests only for the workspace packages its change can
 affect and falls back to the whole workspace when a shared root changes. Lanes do not run
-full gates of their own, and the batch gate always runs the whole workspace.
+full gates of their own.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
-batch. One full gate runs on the batch: `scripts/ci.sh`, the conformance suites and a
-Namespace screen (`mise run bench:nsc origin/main HEAD`). `scripts/gate/gate.sh <rev>` runs
-the tests on the configured gate hosts, as the
-[batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Push when the tests pass and the
+batch. One gate runs on the batch, with a Namespace screen
+(`mise run bench:nsc origin/main HEAD`). `scripts/gate/gate.sh <rev>` runs it on the
+configured gate hosts and selects its checks from the batch's diff against `origin/main`.
+It runs the `scripts/ci.sh` tasks, conformance suites and spill matrices that the changed
+files call for, with Clippy and the Rust tests for the packages they can affect, as the
+[batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Build configuration, the CI
+scripts and files that no rule covers run everything. Push when the tests pass and the
 screen shows no query 10% or more slower after the rerun of the flagged queries with more
 rounds, which `bench:nsc` runs on the same instance and reports beside the first pass.
 `scripts/premerge.sh` checks the generated clients, the binding lock files, the Python
 parity list, the doc paths and the script tests in minutes, and runs on the merged batch
 before the gate starts.
+
+The nightly gate (`scripts/gate/nightly.sh`) runs every check with `--force` on
+`origin/main`. A nightly failure is bisected across the merges since the last nightly pass
+and fixed forward in a follow-up commit, and a check that the batch selection should have
+chosen gets a rule in `scripts/gate/select-checks.py`.
 
 Benchmark-host measurements do not hold up a feature lane or a push. A lane whose goal
 is performance measures on the benchmark host before it reports, and every other lane

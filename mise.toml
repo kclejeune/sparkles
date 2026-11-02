@@ -82,6 +82,67 @@ rust = [
   "crates/*/python/**",
   "vendor/**",
 ]
+# What the Python, JVM and Node bindings compile from the root workspace: the libraries
+# of the crates they depend on, directly or not, through normal and build dependencies.
+# A binding check whose own crate and these files are unchanged keeps its cached pass
+# when other crates, such as the server, change. scripts/bench-tests/test_binding_sources.py
+# checks the list against cargo metadata.
+binding-deps = [
+  # The crates inherit [workspace.package] and [workspace.dependencies] from it.
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+  ".mbx.toml",
+  "vendor/**",
+  "crates/sparkles/*.toml",
+  "crates/sparkles/src/**",
+  "crates/sparkles/resources/**",
+  "crates/sparkles-alloc/*.toml",
+  "crates/sparkles-alloc/src/**",
+  "crates/sparkles-backup/*.toml",
+  "crates/sparkles-backup/src/**",
+  "crates/sparkles-core/*.toml",
+  "crates/sparkles-core/src/**",
+  "crates/sparkles-fmt/*.toml",
+  "crates/sparkles-fmt/src/**",
+  "crates/sparkles-graphql/*.toml",
+  "crates/sparkles-graphql/src/**",
+  "crates/sparkles-owl/*.toml",
+  "crates/sparkles-owl/src/**",
+  "crates/sparkles-reasoner/*.toml",
+  "crates/sparkles-reasoner/src/**",
+  "crates/sparkles-reasoner/diagnostics/**",
+  "crates/sparkles-reasoner/rules/**",
+  "crates/sparkles-reasoner/vocab/**",
+  "crates/sparkles-shacl/*.toml",
+  "crates/sparkles-shacl/src/**",
+  "crates/sparkles-shaclc/*.toml",
+  "crates/sparkles-shaclc/src/**",
+  "crates/sparkles-shex/*.toml",
+  "crates/sparkles-shex/src/**",
+]
+# Each binding's own Cargo workspace.
+py = [
+  "crates/sparkles-py/*.toml",
+  "crates/sparkles-py/Cargo.lock",
+  "crates/sparkles-py/src/**",
+  "crates/sparkles-py/tests/**",
+  "crates/sparkles-py/python/**",
+  # tests/test_dataset.py reads Jena's patch fixtures
+  "crates/sparkles-core/tests/patch/**",
+]
+ffi = [
+  "crates/sparkles-ffi/*.toml",
+  "crates/sparkles-ffi/Cargo.lock",
+  "crates/sparkles-ffi/src/**",
+  "crates/sparkles-ffi/examples/**",
+]
+node-addon = [
+  "crates/sparkles-node/*.toml",
+  "crates/sparkles-node/Cargo.lock",
+  "crates/sparkles-node/build.rs",
+  "crates/sparkles-node/src/**",
+]
 # The UI's sources; the server embeds its build.
 ui = [
   "ui/package.json",
@@ -448,7 +509,9 @@ mbx test --workspace
 
 [tasks."test:w3c"]
 description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
-run = "mbx test -p sparkles-core --test w3c -- --nocapture --test-threads=1"
+# Each suite and cursor batch size is its own test with its own state, so the tests run
+# in parallel. Each summary is one line, so their output stays readable.
+run = "mbx test -p sparkles-core --test w3c -- --nocapture"
 
 [tasks."test:shacl"]
 description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and node expression tests and the SHACLC test pairs"
@@ -508,7 +571,7 @@ tools = { "github:PyO3/maturin" = "1.15.0" }
 run = "mbx sparkles-task -- python3 scripts/py-sdist.py target/wheels"
 
 [tasks."py:test"]
-sources = ["@group:rust", "scripts/py-test.sh"]
+sources = ["@group:binding-deps", "@group:py", "scripts/py-test.sh"]
 outputs = []
 description = "Build the Python extension and run its pytest suite (python3 from PATH, with pytest from the dev shell or a venv in target/py-venv); extra args go to pytest"
 run = "mbx sparkles-task -- scripts/py-test.sh"
@@ -518,7 +581,7 @@ description = "Install a built wheel or sdist into a fresh venv for each given p
 run = "mbx sparkles-task -- scripts/py-wheel-test.sh"
 
 [tasks."py:lint"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:py"]
 outputs = []
 description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
 run = [
@@ -556,7 +619,7 @@ dir = "jvm"
 run = "mbx sparkles-task -- ../scripts/jvm-gradle.sh :sparkles-jena:assemble"
 
 [tasks."jvm:test"]
-sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh", "scripts/jvm-gradle.sh", "scripts/with-lock.py"]
+sources = ["@group:binding-deps", "@group:ffi", "@group:jvm", "scripts/jvm-native.sh", "scripts/jvm-gradle.sh", "scripts/with-lock.py"]
 outputs = []
 description = "Jena's contract tests and the binding's own tests on the host's native library, once with the hand-written JNI calls and once without; extra args go to Gradle"
 dir = "jvm"
@@ -572,7 +635,7 @@ dir = "jvm"
 run = "mbx sparkles-task -- ../scripts/jvm-gradle.sh :sample-java:build :sample-java:run"
 
 [tasks."jvm:lint"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:ffi"]
 outputs = []
 description = "Clippy (warnings are errors) on the JVM bindings' native library, with its default features and with none"
 run = [
@@ -581,7 +644,7 @@ run = [
 ]
 
 [tasks."jvm:rust-test"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:ffi"]
 outputs = []
 description = "The native library's Rust tests (the batch encoding and the objects the Kotlin library uses)"
 run = "mbx sparkles-task -- mbx test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
@@ -621,6 +684,7 @@ depends = ["node:install", "node:native"]
 run = "pnpm --dir js build"
 
 [tasks."node:test"]
+# The remote client's tests run against a debug server, so every Rust input counts.
 sources = ["@group:rust", "@group:js", "scripts/node-native.sh"]
 outputs = []
 tools = { node = "24" }
@@ -635,7 +699,7 @@ mbx sparkles-task -- bash -ec 'mbx build --locked --manifest-path ../Cargo.toml 
 '''
 
 [tasks."node:lint"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:node-addon"]
 outputs = []
 description = "Clippy on the Node addon with default features and with none"
 run = [

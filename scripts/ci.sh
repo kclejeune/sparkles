@@ -22,7 +22,8 @@
 #                the merge base of BASE and HEAD can affect and the packages that depend on
 #                them (scripts/changed-crates.py). A change to a shared root, such as
 #                Cargo.lock or sparkles-core, keeps the whole workspace. The batch gate
-#                never uses it.
+#                passes it when its selection narrows the packages
+#                (scripts/gate/select-checks.py).
 #   --exhaustive-features
 #                also run optional-feature Clippy and the six stripped-server test sets
 #   --fail-fast  stop the remaining tasks after the first failure
@@ -77,14 +78,18 @@ main() {
     shift
   done
   [ ${#tasks[@]} -gt 0 ] || tasks=("${full[@]}")
+  # The packages go to the lint and test tasks alone, whose cache keys include the
+  # variable. Every other task runs without it, so it keeps the cache key of a full run and
+  # no test of the scripts sees it.
+  changed_packages=
   if [ -n "$changed_base" ]; then
-    # The packages go to the lint and test tasks, whose cache keys include the variable.
     changed=$(python3 scripts/changed-crates.py "$changed_base") || exit 1
+    unset SPARKLES_CHANGED_PACKAGES
     case $changed in
-      all) unset SPARKLES_CHANGED_PACKAGES ;;
-      *) export SPARKLES_CHANGED_PACKAGES="${changed//$'\n'/ }" ;;
+      all) ;;
+      *) changed_packages="${changed//$'\n'/ }" ;;
     esac
-    echo "changed packages since $changed_base: ${SPARKLES_CHANGED_PACKAGES:-the whole workspace}"
+    echo "changed packages since $changed_base: ${changed_packages:-the whole workspace}"
   fi
   if [ -n "$exhaustive_features" ]; then
     for feature_task in lint:features test:features; do
@@ -172,8 +177,10 @@ main() {
     log="$out/logs/$key.log"
     t0=$SECONDS
     echo "running since $(date '+%H:%M:%S')" > "$out/state/$key"
+    local narrow=()
+    case $t in lint | test) [ -z "$changed_packages" ] || narrow=(env "SPARKLES_CHANGED_PACKAGES=$changed_packages") ;; esac
     set +e
-    mise run --output interleave "$@" "$t" > "$log" 2>&1
+    "${narrow[@]}" mise run --output interleave "$@" "$t" > "$log" 2>&1
     rc=$?
     set -e
     local secs=$((SECONDS - t0))
