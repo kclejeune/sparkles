@@ -859,7 +859,8 @@ enum LogFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum RequestCpus {
     /// On a hybrid processor, request threads run on the performance cores and the
-    /// query pool leaves a thread for every two efficiency cores free. Elsewhere, as `all`.
+    /// query pool leaves a CPU free for every four efficiency cores. Elsewhere, as
+    /// `all`.
     Auto,
     /// Every thread may run on every CPU, and the query pool has a thread per logical CPU.
     All,

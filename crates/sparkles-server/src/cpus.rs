@@ -17,6 +17,9 @@
 //! the process may run on cores of one kind only, every thread may run on every CPU and
 //! the query pool has one thread per logical CPU, as before.
 
+// Elsewhere than on Linux no `Hybrid` is ever made, so its helpers go unused there.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 /// The CPUs this process may run on, split by kind of core, when it may run on both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hybrid {
@@ -68,12 +71,13 @@ impl Hybrid {
     }
 
     /// The default size of the query pool: one thread per logical CPU, less one for
-    /// every two efficiency cores. On forge's 20 logical CPUs, 16 threads measured as
-    /// fast as or faster than 12, 14, 18 and 20 on every BSBM BI template and on
-    /// DBpedia's `births-by-decade` (item 449).
+    /// every four efficiency cores or part of four, which Intel's hybrid processors
+    /// group into clusters of four. On forge's 20 logical CPUs, 18 threads measured as
+    /// fast as 16 on the BSBM BI templates and faster on DBpedia's `births-by-decade`,
+    /// and both were faster than 12, 14 and 20 (item 449).
     pub fn query_threads(&self) -> usize {
         let all = self.performance.len() + self.efficiency.len();
-        all.saturating_sub(self.efficiency.len() / 2).max(1)
+        all.saturating_sub(self.efficiency.len().div_ceil(4)).max(1)
     }
 }
 
@@ -168,16 +172,19 @@ mod tests {
         assert_eq!(h.performance, (0..12).collect::<Vec<_>>());
         assert_eq!(h.efficiency, (12..20).collect::<Vec<_>>());
         // forge: 20 logical CPUs, eight of them efficiency cores
-        assert_eq!(h.query_threads(), 16);
+        assert_eq!(h.query_threads(), 18);
         // a process confined to cores of one kind is not hybrid
         assert_eq!(Hybrid::from_lists("0-11", "12-19", &[0, 1, 2]), None);
         assert_eq!(Hybrid::from_lists("0-11", "12-19", &[12, 13]), None);
-        // a mixed affinity keeps both kinds, and one efficiency core costs no thread
+        // a mixed affinity keeps both kinds, and one efficiency core costs a thread
         let h = Hybrid::from_lists("0-11", "12-19", &[0, 1, 12]).unwrap();
         assert_eq!(
             (h.performance.len(), h.efficiency.len(), h.query_threads()),
-            (2, 1, 3)
+            (2, 1, 2)
         );
+        // sixteen efficiency cores leave four CPUs free
+        let h = Hybrid::from_lists("0-15", "16-31", &(0..32).collect::<Vec<_>>()).unwrap();
+        assert_eq!(h.query_threads(), 28);
         // an unreadable list is not hybrid
         assert_eq!(Hybrid::from_lists("", "12-19", &all), None);
     }
