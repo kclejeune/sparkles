@@ -13,6 +13,7 @@
 // tree. Functional-style axioms are parsed for the forms the editor sends.
 
 import ox from 'oxigraph';
+import { changesOf } from './branches.mjs';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 const RDFS = 'http://www.w3.org/2000/01/rdf-schema#';
@@ -1114,6 +1115,8 @@ function quadJson(op) {
 export async function handleOntology(req, res, url, seg, ctx) {
   if (seg.length >= 2 && seg[0] !== '$' && seg[1] === 'changes')
     return changes(req, res, url, seg, ctx);
+  if (seg[0] === '$' && seg[1] === 'revert' && seg[2] && req.method === 'POST')
+    return revert(req, res, url, seg, ctx);
   if (seg[0] !== '$' || seg[1] !== 'ontology' || !seg[2]) return false;
   const { datasets, send, fail, readBody, headCommit, quadSet, commitWrite } = ctx;
   const ds = datasets.get(seg[2]);
@@ -1492,6 +1495,99 @@ function changes(req, res, url, seg, ctx) {
   req.on('close', () => {
     clearInterval(tick);
     clearTimeout(end);
+  });
+  return true;
+}
+
+/**
+ * `POST /$/revert/{ds}?branch=&commit=`: the revert of a commit of the branch, from the
+ * changes the mock recorded for it (none for the seeded history). A quad the commit added
+ * goes and a quad it removed comes back, unless a later commit already did that. The mock
+ * reports no conflicts. `expect.target` is the head the caller saw, and a head that moved
+ * since answers `409` `head-moved`. With `dryRun` it answers the write preview.
+ */
+async function revert(req, res, url, seg, ctx) {
+  const { datasets, send, fail, readBody, headCommit, quadSet, commitWrite, allCommits } = ctx;
+  const ds = datasets.get(seg[2]);
+  if (!ds) return (fail(res, 404, `no such dataset: /${seg[2]}`), true);
+  if (ds.protected)
+    return (
+      fail(res, 403, `branch ${ds.branchName} is protected`, { code: 'branch-protected' }), true
+    );
+  let body = {};
+  try {
+    body = JSON.parse((await readBody(req)) || '{}');
+  } catch {
+    return (fail(res, 400, 'invalid JSON'), true);
+  }
+  const seq = Number(url.searchParams.get('commit'));
+  const commit = allCommits(ds).find((c) => c.seq === seq);
+  if (!commit || seq === 0)
+    return (fail(res, 400, `cannot revert commit ${seq}`, { code: 'invalid-merge' }), true);
+  const head = headCommit(ds).seq;
+  if (body.expect?.target != null && body.expect.target !== head)
+    return (
+      fail(res, 409, `the branch is at commit ${head}, not ${body.expect.target}`, {
+        code: 'head-moved',
+      }),
+      true
+    );
+  const has = (q) => ds.store.match(q.subject, q.predicate, q.object, q.graph).length > 0;
+  const before = quadSet(ds);
+  const beforeQuads = ds.store.match();
+  const removed = [];
+  const added = [];
+  for (const { op, quad } of changesOf.get(commit) ?? []) {
+    if (op === '+' && has(quad)) {
+      ds.store.delete(quad);
+      removed.push(quad);
+    } else if (op === '-' && !has(quad)) {
+      ds.store.add(quad);
+      added.push(quad);
+    }
+  }
+  const branch = ds.branchName ?? 'main';
+  const message = body.message || `revert commit ${seq}`;
+  if (body.dryRun) {
+    for (const q of ds.store.match()) ds.store.delete(q);
+    for (const q of beforeQuads) ds.store.add(q);
+    const changes = [...removed.map(quadJson('-')), ...added.map(quadJson('+'))];
+    const limit = Number(body.changes ?? 0);
+    send(res, 200, {
+      dryRun: true,
+      wouldCommit: changes.length > 0,
+      outcome: changes.length ? 'commit' : 'no-change',
+      head,
+      commit: {
+        seq: head + (changes.length ? 1 : 0),
+        inserted: added.length,
+        deleted: removed.length,
+      },
+      ...(limit
+        ? {
+            changes: {
+              total: changes.length,
+              limit,
+              truncated: changes.length > limit,
+              quads: changes.slice(0, limit),
+            },
+          }
+        : {}),
+    });
+    return true;
+  }
+  const receipt = commitWrite(ds, 'revert', before, { message });
+  send(res, 200, {
+    merged: receipt.committed,
+    upToDate: !receipt.committed,
+    fastForward: false,
+    source: { branch, seq: seq - 1 },
+    target: { branch, seq: receipt.commit.seq },
+    base: { branch, seq },
+    reverted: { branch, seq },
+    commit: receipt.committed ? receipt.commit : null,
+    changes: { inserted: added.length, deleted: removed.length },
+    conflicts: { found: 0, resolved: 0 },
   });
   return true;
 }

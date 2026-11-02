@@ -31,12 +31,13 @@ annotations of axioms, a header editor, an axiom-level usage view and the EL cla
 inferred class tree beside the asserted one. It creates entities with IRIs from a
 per-dataset IRI policy, renames and deletes them, and previews every edit as a dry run
 before committing it with `If-Match`. **Start session** edits on a branch of its own, an
-undo stack undoes and redoes commits exactly, and the change feed reloads the views after
-another writer's commit. For the editor, the `/$/ontology/{ds}` routes take `?branch=` and
+undo stack undoes and redoes commits by reverting them, and the change feed reloads the
+views after another writer's commit. For the editor, the `/$/ontology/{ds}` routes take `?branch=` and
 the `/{ds}@{branch}` form, `DELETE /$/ontology/{ds}/entity` removes an entity with its
 axioms, edits accept axioms in functional-style syntax over HTTP, and an edit's answer
 lists the axioms it added and removed as `addedAxioms` and `removedAxioms` in every
-surface that answers the edit body.
+surface that answers the edit body. The OpenAPI description of an edit's `add` and
+`remove` takes functional-style strings beside the JSON form.
 
 An OWL 2 EL classifier computes the inferred class hierarchy and the unsatisfiable
 classes of an ontology (spec F24, roadmap item 580). `sparkles_owl::classify` follows

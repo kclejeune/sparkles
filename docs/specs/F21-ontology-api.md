@@ -872,7 +872,9 @@ its declarations, axioms and assertions, with `dryRun`, `If-Match`, a commit mes
 take strings in functional-style syntax with the dataset's prefixes beside the JSON form,
 as the MCP tool and the bindings already did. An edit's answer, and so the answer of every
 binding, lists the axioms it added and removed as `addedAxioms` and `removedAxioms`, up to
-10,000 of each with `axiomsTruncated`, so a caller can build the edit's exact inverse.
+10,000 of each with `axiomsTruncated`. An added n-ary axiom of which part was present is
+listed whole, so the lists are not an exact inverse, and the editor undoes a commit by
+reverting it instead.
 
 ### Decisions and departures from the design
 

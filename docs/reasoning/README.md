@@ -308,9 +308,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   creates entities with IRIs from a per-dataset IRI policy, renames and deletes them,
   and runs every edit as a previewed dry run before it commits with `If-Match`, so a
   commit by another writer in between refuses the edit. **Start session** edits on a
-  branch of its own, an undo stack for the browser session undoes and redoes commits
-  exactly from the axioms each edit lists, and the change feed reloads the views after
-  another writer's commit.
+  branch of its own, an undo stack for the browser session undoes and redoes commits by
+  reverting them, which restores exactly the triples each commit changed, and the change
+  feed reloads the views after another writer's commit.
 
   ![The ontology editor with the class tree and the frame of Professor](../images/ontology-editor.png)
 

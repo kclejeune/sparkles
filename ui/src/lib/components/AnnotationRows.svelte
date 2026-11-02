@@ -1,12 +1,17 @@
 <script lang="ts">
   // The annotations of an entity or of an axiom in the ontology editor: each a property
   // and a value, which is a literal with a language tag or a datatype, or an IRI. A change
-  // hands the whole new list to the caller, which turns it into one previewed edit.
+  // hands the whole new list to the caller, which turns it into one previewed edit. A row
+  // being edited is found again by its value when it is saved, since a refresh after
+  // another writer's commit can add or remove rows before it.
   import {
     COMMON_ANNOTATION_PROPERTIES,
+    editableIri,
     isLit,
     literalOf,
     LITERAL_TYPES,
+    annotationKey,
+    replaceAnnotation,
     validIri,
     validLang,
     type Annotation,
@@ -36,22 +41,29 @@
     onchange: (next: Annotation[], what: string) => void;
   } = $props();
 
-  /** The row being edited (its index), or `annotations.length` for a new one. */
-  let editing = $state<number | null>(null);
+  /** The key of the row being edited, `'new'` for a new row, or null. */
+  let editing = $state<string | null>(null);
   let property = $state('');
   let value = $state('');
   let lang = $state('');
   let datatype = $state(LITERAL_TYPES[0]);
   let isIriValue = $state(false);
   let problem = $state<string | null>(null);
+  /** The row being edited as it was when editing began. */
+  let original: Annotation | null = null;
 
+  /** Where the row being edited is now, or -1 when it is new or gone. */
+  const editIndex = $derived(
+    editing && editing !== 'new' ? annotations.findIndex((a) => annotationKey(a) === editing) : -1,
+  );
   const offered = $derived([...new Set([...COMMON_ANNOTATION_PROPERTIES, ...properties])]);
   const uid = Math.random().toString(36).slice(2, 8);
 
-  function expand(t: string): string | null {
+  /** The IRI a field names: `<iri>`, a prefixed name, an IRI, or for a property its name. */
+  function expand(t: string, property: boolean): string | null {
     const s = t.trim();
     if (s.startsWith('<') && s.endsWith('>')) return s.slice(1, -1);
-    const byName = offered.find((p) => name(p) === s);
+    const byName = property ? offered.find((p) => name(p) === s) : undefined;
     if (byName) return byName;
     const c = s.indexOf(':');
     if (c > 0 && prefixes[s.slice(0, c)] !== undefined && !s.slice(c + 1).startsWith('//'))
@@ -59,18 +71,20 @@
     return validIri(s) ? s : null;
   }
 
-  function begin(i: number) {
-    editing = i;
+  function begin(i: number | null) {
     problem = null;
-    const a = annotations[i];
+    const a = i == null ? undefined : annotations[i];
+    editing = a ? annotationKey(a) : 'new';
+    original = a ? (JSON.parse(JSON.stringify(a)) as Annotation) : null;
     if (a) {
-      property = name(a.property);
+      // the fields hold IRIs without loss; labels are for display only
+      property = editableIri(a.property, prefixes);
       isIriValue = !isLit(a.value);
-      value = isLit(a.value) ? a.value['@value'] : name(String(a.value));
+      value = isLit(a.value) ? a.value['@value'] : editableIri(String(a.value), prefixes);
       lang = isLit(a.value) ? (a.value['@language'] ?? '') : '';
       datatype = isLit(a.value) ? (a.value['@type'] ?? LITERAL_TYPES[0]) : LITERAL_TYPES[0];
     } else {
-      property = name(COMMON_ANNOTATION_PROPERTIES[0]);
+      property = editableIri(COMMON_ANNOTATION_PROPERTIES[0], prefixes);
       value = '';
       lang = navigator.language?.split('-')[0] ?? 'en';
       datatype = LITERAL_TYPES[0];
@@ -79,11 +93,11 @@
   }
 
   function save() {
-    const p = expand(property);
+    const p = expand(property, true);
     if (!p) return void (problem = 'The property is not a known name, a prefixed name or an IRI.');
     let v: AnnValue;
     if (isIriValue) {
-      const iri = expand(value);
+      const iri = expand(value, false);
       if (!iri) return void (problem = 'The value is not an IRI or a prefixed name.');
       v = iri;
     } else {
@@ -91,17 +105,22 @@
         return void (problem = 'The language tag is not a BCP 47 tag, such as en or pt-BR.');
       v = literalOf(value, lang.trim(), datatype);
     }
-    const next = [...annotations];
     const row: Annotation = { property: p, value: v };
-    const i = editing ?? next.length;
-    const what =
-      i < annotations.length
-        ? `Change ${name(p)} of ${label}`
-        : `Annotate ${label} with ${name(p)}`;
-    if (i < next.length)
-      next[i] = { ...row, ...(next[i].annotations ? { annotations: next[i].annotations } : {}) };
-    else next.push(row);
+    let next: Annotation[];
+    let what: string;
+    if (original) {
+      const replaced = replaceAnnotation(annotations, original, row);
+      if (!replaced)
+        return void (problem =
+          'Another commit changed or removed this annotation. Cancel, then edit it again.');
+      next = replaced;
+      what = `Change ${name(p)} of ${label}`;
+    } else {
+      next = [...annotations, row];
+      what = `Annotate ${label} with ${name(p)}`;
+    }
     editing = null;
+    original = null;
     onchange(next, what);
   }
 
@@ -121,7 +140,7 @@
     <ul class="rows" aria-label="Annotations of {label}">
       {#each annotations as a, i (i)}
         <li class="row-item">
-          {#if editing === i}
+          {#if i === editIndex}
             {@render form()}
           {:else}
             <span class="prop">{name(a.property)}</span>
@@ -153,10 +172,10 @@
   {:else}
     <p class="faint none">No annotations.</p>
   {/if}
-  {#if editing === annotations.length}
+  {#if editing === 'new' || (editing && editIndex < 0)}
     {@render form()}
   {:else if !readonly && editing === null}
-    <button class="btn sm ghost add" onclick={() => begin(annotations.length)}
+    <button class="btn sm ghost add" onclick={() => begin(null)}
       ><Icon name="plus" size={13} /> Add annotation</button
     >
   {/if}
@@ -215,7 +234,14 @@
     {/if}
     {#if problem}<p class="problem" role="alert">{problem}</p>{/if}
     <div class="form-acts">
-      <button class="btn sm" type="button" onclick={() => (editing = null)}>Cancel</button>
+      <button
+        class="btn sm"
+        type="button"
+        onclick={() => {
+          editing = null;
+          original = null;
+        }}>Cancel</button
+      >
       <button class="btn sm primary" type="submit">Preview</button>
     </div>
   </form>

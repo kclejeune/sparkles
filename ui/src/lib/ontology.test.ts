@@ -1,28 +1,29 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ancestorsOf,
   buildFrame,
   buildTree,
   dataUpdate,
   defaultNamespace,
+  editableIri,
   filterTree,
   hierarchyEdges,
-  inverseOfEdit,
   labelsOf,
   localFromLabel,
   manchester,
   mintIri,
   pickLabel,
   renameUpdate,
+  replaceAnnotation,
   sectionAxiom,
   sessionBranchName,
   taxonomyTree,
   UndoStack,
   validLang,
   withAnnotations,
+  type Annotation,
   type AxiomItem,
   type Classification,
-  type EditAnswer,
   type IriPolicy,
 } from './ontology';
 
@@ -271,54 +272,54 @@ describe('frames', () => {
 });
 
 describe('undo', () => {
-  const answer = (over: Partial<EditAnswer>): EditAnswer => ({
-    added: 0,
-    present: 0,
-    removed: 0,
-    absent: [],
-    declared: [],
-    addedAxioms: [],
-    removedAxioms: [],
-    axiomsTruncated: false,
-    inserted: 0,
-    deleted: 0,
-    kept: 0,
-    committed: true,
-    ...over,
-  });
-
-  it('inverts what an edit wrote and removed', () => {
-    const sub = { type: 'SubClassOf', subClass: 'a', superClass: 'b' };
-    const decl = { type: 'Declaration', kind: 'Class', iri: 'a' };
-    const old = { type: 'SubClassOf', subClass: 'a', superClass: 'c' };
-    expect(
-      inverseOfEdit(answer({ addedAxioms: [item(sub), item(decl)], removedAxioms: [item(old)] })),
-    ).toEqual({
-      kind: 'axioms',
-      add: [old],
-      remove: [sub, decl],
-      declare: false,
-    });
-    expect(inverseOfEdit(answer({}))).toBeNull();
-    expect(inverseOfEdit(answer({ addedAxioms: [item(sub)], axiomsTruncated: true }))).toBeNull();
-  });
-
-  it('keeps the stacks in order and clears redo on a new edit', () => {
+  it('reverts the commits in order and clears redo on a new edit', () => {
     const s = new UndoStack();
-    const op = (n: string) => ({
-      label: n,
-      commit: 1,
-      inverse: { kind: 'update' as const, sparql: n, inverse: null },
+    s.push({ label: 'one', commit: 3 });
+    s.push({ label: 'two', commit: 4 });
+    // commit 5 reverts commit 4, so a redo reverts commit 5
+    s.undid(5);
+    expect(s.done).toEqual([{ label: 'one', commit: 3 }]);
+    expect(s.undone).toEqual([{ label: 'two', commit: 5 }]);
+    // commit 6 reverts the revert, so an undo reverts commit 6
+    s.redid(6);
+    expect(s.done).toEqual([
+      { label: 'one', commit: 3 },
+      { label: 'two', commit: 6 },
+    ]);
+    expect(s.undone).toEqual([]);
+    s.undid(7);
+    s.push({ label: 'three', commit: 8 });
+    expect(s.undone).toEqual([]);
+  });
+
+  it('drops an entry when its revert made no commit', () => {
+    const s = new UndoStack();
+    s.push({ label: 'one', commit: 3 });
+    s.undid(null);
+    expect(s.done).toEqual([]);
+    expect(s.undone).toEqual([]);
+  });
+
+  afterEach(() => void vi.unstubAllGlobals());
+
+  it('drops stored entries without a commit', () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal('sessionStorage', {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
     });
-    s.push(op('one'));
-    s.push(op('two'));
-    s.undid(op('redo two'));
-    expect(s.done.map((d) => d.label)).toEqual(['one']);
-    expect(s.undone.map((d) => d.label)).toEqual(['redo two']);
-    s.redid(op('undo two'));
-    expect(s.done.map((d) => d.label)).toEqual(['one', 'undo two']);
-    s.undid(op('redo again'));
-    s.push(op('three'));
+    sessionStorage.setItem(
+      'undo-test',
+      JSON.stringify({
+        done: [
+          { label: 'old', commit: 1, inverse: {} },
+          { label: 'older', inverse: {} },
+        ],
+        undone: [{ label: 'x', commit: null }],
+      }),
+    );
+    const s = new UndoStack('undo-test');
+    expect(s.done.map((d) => d.label)).toEqual(['old']);
     expect(s.undone).toEqual([]);
   });
 });
@@ -398,5 +399,40 @@ describe('SPARQL', () => {
         'DELETE DATA { <http://ex.org/o> <http://www.w3.org/2002/07/owl#versionIRI>',
       ),
     ).toBe(true);
+  });
+});
+
+describe('annotation drafts', () => {
+  const label = (v: string, lang = 'en'): Annotation => ({
+    property: RDFS + 'label',
+    value: { '@value': v, '@language': lang },
+  });
+
+  it('replaces the edited row by its value after rows were added before it', () => {
+    const original = label('Person');
+    const refreshed = [label('Personne', 'fr'), label('Human'), original];
+    expect(replaceAnnotation(refreshed, original, label('Person, a human'))).toEqual([
+      label('Personne', 'fr'),
+      label('Human'),
+      label('Person, a human'),
+    ]);
+  });
+
+  it('keeps the annotations of the replaced row', () => {
+    const note: Annotation = { property: RDFS + 'comment', value: { '@value': 'checked' } };
+    const original = { ...label('Person'), annotations: [note] };
+    expect(replaceAnnotation([original], label('Person'), label('Persons'))).toBeNull();
+    expect(replaceAnnotation([original], original, label('Persons'))).toEqual([
+      { ...label('Persons'), annotations: [note] },
+    ]);
+  });
+
+  it('refuses when the row is gone', () => {
+    expect(replaceAnnotation([label('Human')], label('Person'), label('Persons'))).toBeNull();
+  });
+
+  it('holds IRIs as prefixed names or in angle brackets, never as labels', () => {
+    expect(editableIri(EX + 'Person', { ex: EX })).toBe('ex:Person');
+    expect(editableIri('http://other.org/x', { ex: EX })).toBe('<http://other.org/x>');
   });
 });

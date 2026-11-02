@@ -4,7 +4,8 @@
   // its usage, the header, and the inferred class tree beside the asserted one. Every edit
   // is a dry run first and then one commit on the branch the page works on, with If-Match
   // naming the commit the page shows. The session's undo stack undoes the editor's commits
-  // with their exact inverses, and the change feed refreshes the views when a commit lands.
+  // by reverting them, which restores exactly the triples each commit changed, and the
+  // change feed refreshes the views when a commit lands.
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
@@ -27,7 +28,6 @@
     filterTree,
     hierarchyEdges,
     iriName,
-    inverseOf,
     KIND_LABEL,
     KIND_SINGULAR,
     labelsOf,
@@ -122,6 +122,15 @@
   let branchList = $state<api.Branch[]>([]);
   /** The commit the views show, which a change after it makes stale. */
   let shown = 0;
+  /** The target whose first read the views show, which the change feed waits for. */
+  let loadedTarget: string | null = null;
+  /**
+   * The latest request of each loader. An answer to an older one, such as a read of the
+   * graph or dataset the page showed before, is dropped.
+   */
+  let loadSeq = 0;
+  let frameSeq = 0;
+  let classifySeq = 0;
 
   const langs = typeof navigator === 'undefined' ? ['en'] : [...(navigator.languages ?? []), 'en'];
   const nameOf = (iri: string) => entityName(iri, labels, prefixes, langs);
@@ -131,6 +140,7 @@
     const t = target;
     const s = sel;
     if (!name) return;
+    const my = ++loadSeq;
     loading = true;
     try {
       const r = await ontologySummary(t, s);
@@ -147,7 +157,7 @@
         }),
         ontologyAxioms(t, s, { types: ['ClassAssertion'], assertions: true, cap: 10_000 }),
       ]);
-      if (t !== target) return;
+      if (my !== loadSeq) return;
       const byKind = new Map<EntityKind, string[]>();
       for (const e of ents.entities) {
         const l = byKind.get(e.kind) ?? [];
@@ -163,6 +173,7 @@
       summary = r.summary;
       etag = r.etag;
       shown = r.summary.commit;
+      loadedTarget = t;
       entities = byKind;
       hierarchy = ax.axioms;
       typeAxioms = types.axioms;
@@ -170,9 +181,9 @@
       truncated = ents.truncated || ax.truncated || types.truncated;
       loadError = null;
     } catch (e) {
-      if (t === target) loadError = e as Error;
+      if (my === loadSeq) loadError = e as Error;
     } finally {
-      if (t === target) loading = false;
+      if (my === loadSeq) loading = false;
     }
   }
 
@@ -197,6 +208,8 @@
     void graph;
     untrack(() => {
       summary = null;
+      shown = 0;
+      loadedTarget = null;
       classification = null;
       undo = new UndoStack(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
@@ -250,14 +263,16 @@
   let classifyError = $state<string | null>(null);
   let classifying = $state(false);
   async function classify() {
+    const my = ++classifySeq;
     classifying = true;
     classifyError = null;
     try {
-      classification = await classifyOntology(target, sel);
+      const c = await classifyOntology(target, sel);
+      if (my === classifySeq) classification = c;
     } catch (e) {
-      classifyError = api.errorMessage(e);
+      if (my === classifySeq) classifyError = api.errorMessage(e);
     } finally {
-      classifying = false;
+      if (my === classifySeq) classifying = false;
     }
   }
   $effect(() => {
@@ -304,6 +319,7 @@
   async function loadFrame() {
     const iri = selected;
     const t = target;
+    const my = ++frameSeq;
     if (!iri) {
       frameItems = [];
       frameKinds = [];
@@ -319,13 +335,13 @@
           throw e;
         }),
       ]);
-      if (iri !== selected || t !== target) return;
+      if (my !== frameSeq) return;
       frameKinds = report?.kinds ?? [];
       frameItems = ax.axioms;
       frameFor = iri;
       frameError = report ? null : 'The ontology neither declares nor uses this IRI.';
     } catch (e) {
-      frameError = api.errorMessage(e);
+      if (my === frameSeq) frameError = api.errorMessage(e);
     }
   }
   $effect(() => {
@@ -429,7 +445,7 @@
     const top = undo.done.at(-1);
     if (!top) return;
     pending = { mode: 'undo', label: top.label };
-    previewOp = top.inverse;
+    previewOp = { kind: 'revert', commit: top.commit };
     previewTitle = `Undo: ${top.label}`;
     previewOpen = true;
   }
@@ -438,7 +454,7 @@
     const top = undo.undone.at(-1);
     if (!top) return;
     pending = { mode: 'redo', label: top.label };
-    previewOp = top.inverse;
+    previewOp = { kind: 'revert', commit: top.commit };
     previewTitle = `Redo: ${top.label}`;
     previewOpen = true;
   }
@@ -447,19 +463,11 @@
     const seq = committedSeq(a);
     if (seq != null) ownCommits.add(seq);
     const p = pending;
+    if (p.mode === 'undo') undo.undid(seq);
+    else if (p.mode === 'redo') undo.redid(seq);
+    else if (seq != null) undo.push({ label: p.label, commit: seq });
+    stackTick++;
     if (changedAnything(a)) {
-      const inv = inverseOf(op, a);
-      const entry = inv ? { label: p.label, commit: seq, inverse: inv } : null;
-      if (p.mode === 'undo') undo.undid(entry);
-      else if (p.mode === 'redo') undo.redid(entry);
-      else if (entry) undo.push(entry);
-      else
-        toasts.push(
-          'info',
-          'This edit cannot be undone from the editor.',
-          'Its answer listed too many axioms.',
-        );
-      stackTick++;
       toasts.push(
         'success',
         p.mode === 'edit' ? p.label : `${p.mode === 'undo' ? 'Undid' : 'Redid'}: ${p.label}`,
@@ -605,7 +613,6 @@
       {
         kind: 'update',
         sparql: renameUpdate(from, to, sel.graph),
-        inverse: renameUpdate(to, from, sel.graph),
       },
       `Rename ${iriName(from, prefixes)} to ${iriName(to, prefixes)}`,
       () => {
@@ -642,16 +649,17 @@
     const t = target;
     if (!name) return;
     const ctl = new AbortController();
-    let after = untrack(() => shown);
+    const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const run = async () => {
-      // wait for the first read, so the stream starts at the commit the views show
-      while (!ctl.signal.aborted && untrack(() => shown) === 0)
-        await new Promise((r) => setTimeout(r, 200));
-      after = Math.max(
-        after,
-        untrack(() => shown),
-      );
+      // wait for this target's first read, so the stream starts at the commit it shows
+      while (!ctl.signal.aborted && loadedTarget !== t) await pause(200);
+      let after = shown;
+      let first = true;
       while (!ctl.signal.aborted) {
+        // a stream that ended, or that the server refused, is opened again after a pause
+        if (!first) await pause(1000);
+        first = false;
+        if (ctl.signal.aborted) return;
         live = 'on';
         try {
           after = await followCommits(
@@ -1096,6 +1104,7 @@
   {sel}
   op={previewOp}
   {etag}
+  head={summary?.commit ?? null}
   {describe}
   oncommitted={(op, a) => void committed(op, a)}
   onstale={() => void stale()}

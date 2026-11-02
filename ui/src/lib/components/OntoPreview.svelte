@@ -2,7 +2,8 @@
   // The preview of an ontology edit (docs/specs/U12-ontology-workbench/SPEC.md): the edit
   // runs as a dry run with `If-Match` naming the commit the editor shows, the dialog lists
   // the axioms it adds and removes and the triples that would change, and Commit writes it
-  // with the same precondition, so another writer's commit in between is refused.
+  // with the same precondition, so another writer's commit in between is refused. An undo or
+  // a redo is a revert of one commit, which expects the head the editor shows instead.
   import { ApiError, errorMessage } from '$lib/api';
   import { fmtInt } from '$lib/format';
   import {
@@ -26,6 +27,7 @@
     sel,
     op,
     etag,
+    head,
     describe,
     oncommitted,
     onstale,
@@ -36,6 +38,8 @@
     sel: Selection;
     op: Op | null;
     etag: string | null;
+    /** The head commit the editor shows, which a revert expects. */
+    head: number | null;
     /** An axiom as the editor shows it. */
     describe: (a: AxiomInput) => string;
     oncommitted: (op: Op, a: OpAnswer, message: string) => void;
@@ -47,14 +51,21 @@
   let error = $state<string | null>(null);
   let busy = $state(false);
   let message = $state('');
+  /** The dry run of a revert found that the head moved on. */
+  let movedOn = $state(false);
   let ran: Op | null = null;
-  /** The tag of the state the dry run read, which the commit names too. */
+  /** The tag and head of the state the dry run read, which the commit names too. */
   let tag: string | null = null;
+  let at: number | null = null;
+  /** A refusal because another commit landed: `412`, or a revert's `409` `head-moved`. */
+  const isStale = (e: unknown) =>
+    e instanceof ApiError && (e.status === 412 || (e.status === 409 && e.code === 'head-moved'));
 
   $effect(() => {
     if (!open || !op || ran === op) return;
     ran = op;
     tag = etag;
+    at = head;
     message = title;
     void dry(op);
   });
@@ -66,14 +77,17 @@
   async function dry(o: Op) {
     preview = null;
     error = null;
+    movedOn = false;
     busy = true;
     try {
-      const r = await runOp(target, sel, o, { dryRun: true, etag: tag });
+      const r = await runOp(target, sel, o, { dryRun: true, etag: tag, head: at });
       if (ran !== o) return;
       if (isPreview(r)) preview = r;
       else error = 'The server answered a dry run without its preview.';
     } catch (e) {
-      if (ran === o) error = errorMessage(e);
+      if (ran !== o) return;
+      if (isStale(e)) movedOn = true;
+      else error = errorMessage(e);
     } finally {
       if (ran === o) busy = false;
     }
@@ -84,12 +98,16 @@
     busy = true;
     error = null;
     try {
-      const r = await runOp(target, sel, op, { etag: tag, message: message.trim() || title });
+      const r = await runOp(target, sel, op, {
+        etag: tag,
+        head: at,
+        message: message.trim() || title,
+      });
       if (isPreview(r)) throw new Error('The server answered the write as a dry run.');
       open = false;
       oncommitted(op, r, message.trim() || title);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 412) {
+      if (isStale(e)) {
         open = false;
         onstale();
       } else error = errorMessage(e);
@@ -99,7 +117,7 @@
   }
 
   const lists = $derived(op ? opAxioms(op) : { add: [], remove: [] });
-  const stale = $derived(preview?.outcome === 'precondition-failed');
+  const stale = $derived(movedOn || preview?.outcome === 'precondition-failed');
   const canCommit = $derived(!!preview && preview.outcome === 'commit' && !busy);
 </script>
 
@@ -123,6 +141,11 @@
         Removes the entity with its declarations, the axioms that mention it and the assertions
         about it.
       </p>
+    {:else if op?.kind === 'revert'}
+      <p>
+        Reverts commit {op.commit}, which restores exactly the triples that commit changed. A later
+        commit that changed the same triples makes the revert conflict.
+      </p>
     {:else if op?.kind === 'update'}
       <details>
         <summary>SPARQL update</summary>
@@ -132,6 +155,12 @@
 
     {#if busy && !preview}
       <p class="faint"><span class="spinner"></span> Running the edit as a dry run…</p>
+    {/if}
+    {#if movedOn}
+      <p class="outcome warn-text" data-outcome="precondition-failed">
+        <strong>{OUTCOME['precondition-failed']}</strong>
+      </p>
+      <p class="warn-text">Reload the editor to see the new state, then undo again.</p>
     {/if}
     {#if preview}
       <p

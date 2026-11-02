@@ -124,11 +124,17 @@ with `412` and the page reloads. **Start session** creates a branch named
 branch's merge page. A protected branch, or a caller without write access, makes the page
 read-only.
 
-**Undo.** The page keeps an undo stack for the browser session. Each commit's inverse is
-built from the axioms the server says it added and removed, which
-`addedAxioms` and `removedAxioms` of the edit answer list, so an undo restores the graph
-exactly even when part of an edit was already present. Undo and redo are previewed
-commits too, and Ctrl+Z and Ctrl+Shift+Z run them.
+**Undo.** The page keeps an undo stack of its commits for the browser session. An undo
+reverts the commit through `POST /$/revert/{ds}`, a three-way merge that restores exactly
+the triples and blank nodes the commit changed, and a redo reverts that revert. Undo and
+redo are previewed with a dry run that expects the head the page shows, so another
+writer's commit in between refuses them, and a later commit that changed the same triples
+makes the revert conflict. Ctrl+Z and Ctrl+Shift+Z run them. A revert needs write access
+to the whole branch, so a caller whose grants cover only some graphs can edit but not
+undo. A first version built each commit's inverse from the axioms the edit answer lists.
+That inverse also removed the part of an n-ary axiom that was present before the edit and
+gave a restored restriction a new blank node when another axiom shared the old one, so
+undo uses reverts.
 
 **Live refresh.** The page follows `GET /{ds}/changes` for the branch it edits. A commit
 by another writer reloads the trees and the frame and shows a notice with the commit
@@ -138,8 +144,9 @@ The server gained what the editor needs. The ontology routes take `?branch=` and
 `/{ds}@{branch}` form, and `DELETE /$/ontology/{ds}/entity` removes an entity with
 preview, precondition and receipt. Edits accept axioms in functional-style syntax, and an
 edit's answer lists the axioms it added and removed, up to 10,000 of each. The server
-tests check that an edit's listed inverse restores the graph and leaves unrelated triples
-unchanged. The UI's unit tests cover the tree, frame, Manchester rendering, IRI minting,
+tests check that an edit and its inverse leave unrelated triples unchanged, and the
+real-server Playwright test checks that an undo on a branch leaves its triple count as it
+was. The UI's unit tests cover the tree, frame, Manchester rendering, IRI minting,
 rename and undo logic. Playwright covers each view, the edits on a session branch, undo
 and redo, the refusal of a stale edit and the refresh after another writer's commit
 against the mock backend, and the trees, the inferred tree, edits on a branch and the
@@ -150,7 +157,9 @@ annotation and axiom editors are its own components, so editing an entity's term
 through a form remains for later. Manchester syntax is rendered but not parsed, so class
 expressions are typed in functional-style syntax. Rename covers the one graph the page
 reads and does not reach IRIs inside triple terms. Real-time co-editing stays with the
-U05 §1 open question. Roadmap item NEW-ITEM-1 covers a lazy hierarchy route for large
+U05 §1 open question. The page decides whether the caller can write from its level on
+the dataset, so write grants on a branch alone leave the page read-only, roadmap item
+NEW-ITEM-5. Roadmap item NEW-ITEM-1 covers a lazy hierarchy route for large
 ontologies, NEW-ITEM-2 Manchester input of class expressions, NEW-ITEM-3 inferred
 property trees and NEW-ITEM-4 an IRI policy kept on the server with the resource catalog
 of [C30](../C30-resource-catalog/README.md).

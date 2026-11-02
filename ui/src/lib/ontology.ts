@@ -4,6 +4,7 @@
 // edit makes with their inverses for the session's undo stack, the IRI policy for new
 // entities and the SPARQL of a rename and of header edits.
 import { ApiError, receiptOf, request, type Receipt } from './api';
+import { splitTarget } from './branches';
 import { localName, shorten, sparqlIri, sparqlString, WELL_KNOWN, type PrefixMap } from './rdf';
 import type { WritePreview } from './validation-overlay';
 
@@ -280,7 +281,13 @@ export async function classifyOntology(
 }
 
 /** The options of a write: a dry run, the tag of the state the editor shows, a message. */
-export type WriteOpts = { dryRun?: boolean; etag?: string | null; message?: string };
+export type WriteOpts = {
+  dryRun?: boolean;
+  etag?: string | null;
+  message?: string;
+  /** The head commit the editor shows, which a revert expects the branch to be at. */
+  head?: number | null;
+};
 
 /** The preview of a dry run, which a `412`, `422` or `507` carries as its body. */
 async function previewOr<T>(go: () => Promise<Response>, dry: boolean): Promise<T | WritePreview> {
@@ -354,6 +361,43 @@ export async function removeEntity(
 }
 
 export type UpdateAnswer = { inserted: number; deleted: number; receipt?: Receipt };
+
+/**
+ * `POST /$/revert/{ds}?branch=&commit=`: the revert of one commit of the target's branch,
+ * or its preview. A revert is a three-way merge of the commit's parent into the head, so it
+ * restores exactly the quads, blank nodes included, that the commit changed. `o.head` is the
+ * head the editor shows, and a head that moved since answers `409` `head-moved`.
+ */
+export async function revertCommit(
+  target: string,
+  commit: number,
+  o: WriteOpts = {},
+): Promise<UpdateAnswer | WritePreview> {
+  const { name, branch } = splitTarget(target);
+  const p = new URLSearchParams({ branch, commit: String(commit) });
+  const body = {
+    ...(o.dryRun ? { dryRun: true, changes: 50 } : {}),
+    ...(o.head != null ? { expect: { target: o.head } } : {}),
+    ...(o.message ? { message: o.message } : {}),
+  };
+  const r = await previewOr<Record<string, unknown>>(
+    () =>
+      request(`/$/revert/${enc(name)}?${p}`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    !!o.dryRun,
+  );
+  if (isPreview(r)) return r;
+  const c = r.commit as Receipt['commit'] | null | undefined;
+  const changes = (r.changes ?? {}) as { inserted?: number; deleted?: number };
+  return {
+    inserted: Number(changes.inserted ?? 0),
+    deleted: Number(changes.deleted ?? 0),
+    receipt: c ? { dataset: name, datasetId: '', committed: true, commit: c } : undefined,
+  };
+}
 
 /** `POST /{ds}/update`: a SPARQL update, or its preview. */
 export async function runUpdate(
@@ -901,23 +945,24 @@ export function manchester(
 
 // --- operations and their inverses ---------------------------------------------------
 
-/** An edit the editor makes, which the preview dialog runs as a dry run and then commits. */
+/**
+ * An edit the editor makes, which the preview dialog runs as a dry run and then commits.
+ * Undo and redo are reverts of the commit they take back.
+ */
 export type Op =
   | { kind: 'axioms'; add: AxiomInput[]; remove: AxiomInput[]; declare?: boolean }
   | { kind: 'removeEntity'; iri: string }
-  | { kind: 'update'; sparql: string; inverse: string | null };
+  | { kind: 'update'; sparql: string }
+  | { kind: 'revert'; commit: number };
 
-/** The inverse of an edit's answer: add back what it removed, remove what it wrote. */
-export function inverseOfEdit(a: EditAnswer): Op | null {
-  if (a.axiomsTruncated) return null;
-  const add = a.removedAxioms.map((x) => x.axiom);
-  const remove = a.addedAxioms.map((x) => x.axiom);
-  if (!add.length && !remove.length) return null;
-  return { kind: 'axioms', add, remove, declare: false };
-}
+/** An entry of the session's undo stack: a commit and what it did. */
+export type Done = { label: string; commit: number };
 
-/** An entry of the session's undo stack: a committed edit and how to undo it. */
-export type Done = { label: string; commit: number | null; inverse: Op };
+const isDone = (d: unknown): d is Done =>
+  !!d &&
+  typeof d === 'object' &&
+  typeof (d as Done).label === 'string' &&
+  typeof (d as Done).commit === 'number';
 
 /**
  * The session's undo and redo stacks, kept per dataset and branch in session storage, so
@@ -936,8 +981,9 @@ export class UndoStack {
       const raw = sessionStorage.getItem(this.key);
       if (!raw) return;
       const j = JSON.parse(raw) as { done?: Done[]; undone?: Done[] };
-      this.done = Array.isArray(j.done) ? j.done : [];
-      this.undone = Array.isArray(j.undone) ? j.undone : [];
+      // entries of an older form, without a commit, cannot be reverted
+      this.done = Array.isArray(j.done) ? j.done.filter(isDone) : [];
+      this.undone = Array.isArray(j.undone) ? j.undone.filter(isDone) : [];
     } catch {
       /* storage unavailable: a stack for this page only */
     }
@@ -959,17 +1005,17 @@ export class UndoStack {
     this.save();
   }
 
-  /** After running the inverse of the top entry: `redo` undoes the undo. */
-  undid(redo: Done | null) {
-    this.done.pop();
-    if (redo) this.undone.push(redo);
+  /** After the top entry was reverted by commit `revert`, which a redo reverts in turn. */
+  undid(revert: number | null) {
+    const top = this.done.pop();
+    if (top && revert != null) this.undone.push({ label: top.label, commit: revert });
     this.save();
   }
 
-  /** After redoing the top of the redo stack: `again` undoes it once more. */
-  redid(again: Done | null) {
-    this.undone.pop();
-    if (again) this.done.push(again);
+  /** After the top of the redo stack was reverted by commit `revert`. */
+  redid(revert: number | null) {
+    const top = this.undone.pop();
+    if (top && revert != null) this.done.push({ label: top.label, commit: revert });
     this.save();
   }
 
@@ -1383,14 +1429,9 @@ export function runOp(
       return removeEntity(target, sel, op.iri, o);
     case 'update':
       return runUpdate(target, op.sparql, o);
+    case 'revert':
+      return revertCommit(target, op.commit, o);
   }
-}
-
-/** The inverse of an operation that `a` answered, or null when it cannot be undone. */
-export function inverseOf(op: Op, a: OpAnswer): Op | null {
-  if (op.kind === 'update')
-    return op.inverse ? { kind: 'update', sparql: op.inverse, inverse: op.sparql } : null;
-  return inverseOfEdit(a as EditAnswer);
 }
 
 /** The commit an answer made, or null when it made none. */
@@ -1418,6 +1459,34 @@ export const OUTCOME: Record<string, string> = {
   'storage-refused': 'The storage limit would refuse the edit.',
   'precondition-failed': 'Another commit landed since the editor read the ontology.',
 };
+
+/** An IRI as an editor field holds it without loss: a prefixed name, or `<iri>`. */
+export function editableIri(iri: string, prefixes: PrefixMap): string {
+  return shorten(iri, prefixes) ?? `<${iri}>`;
+}
+
+/**
+ * `list` with the annotation equal to `original` replaced by `row`, keeping its own
+ * annotations, or null when `list` no longer holds `original`. An editor finds the row it
+ * edits by its value, since a refresh can insert or remove rows before it.
+ */
+export function replaceAnnotation(
+  list: Annotation[],
+  original: Annotation,
+  row: Annotation,
+): Annotation[] | null {
+  const key = annotationKey(original);
+  const i = list.findIndex((a) => annotationKey(a) === key);
+  if (i < 0) return null;
+  const next = [...list];
+  next[i] = { ...row, ...(list[i].annotations ? { annotations: list[i].annotations } : {}) };
+  return next;
+}
+
+/** A structural key of an annotation, its own annotations included. */
+export function annotationKey(a: Annotation): string {
+  return axiomKey({ type: 'Annotation', ...a } as unknown as AxiomJson);
+}
 
 /** A key of an axiom that ignores the order of members and of set operands. */
 export function axiomKey(a: AxiomInput): string {

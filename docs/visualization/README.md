@@ -253,6 +253,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   dataset, NEW-ITEM-4. Rename covers the graph the page reads and not IRIs inside triple
   terms, under item 457's refactoring phase. The SKOS editor, the DL Query tab and the
   editable schema diagram are further U12 phases of item 457.
+* The ontology editor decides whether the caller can write from the caller's level on the
+  dataset, so a caller whose grants allow writes on a branch only sees the branch
+  read-only, NEW-ITEM-5. Undo and redo revert commits, which needs write access to the
+  whole branch, so a caller whose grants cover some graphs only can edit but not undo.
 
 ## Configuration and usage
 

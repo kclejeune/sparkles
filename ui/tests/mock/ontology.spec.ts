@@ -155,6 +155,17 @@ test('edits on a session branch are previewed, committed, undone and redone', as
   await commitPreview(page);
   await expect(frame).toContainText('assistant d’enseignement');
 
+  // an IRI value edits as the IRI's prefixed name, not as the label it shows
+  await frame.getByRole('button', { name: 'Add annotation' }).first().click();
+  await form.getByRole('combobox', { name: 'Property' }).fill('rdfs:seeAlso');
+  await form.getByRole('combobox', { name: 'Value is' }).selectOption('an IRI');
+  await form.getByRole('textbox', { name: 'Value' }).fill('uni:Professor');
+  await form.getByRole('button', { name: 'Preview' }).click();
+  await commitPreview(page);
+  await frame.getByRole('button', { name: 'Edit rdfs:seeAlso Professor' }).click();
+  await expect(form.getByRole('textbox', { name: 'Value' })).toHaveValue('uni:Professor');
+  await form.getByRole('button', { name: 'Cancel' }).click();
+
   // an annotation on the subclass axiom
   const sub = frame.locator('[data-section="sub"]');
   await sub.getByRole('button', { name: /Annotations of SubClassOf/ }).click();
@@ -197,7 +208,7 @@ test('edits on a session branch are previewed, committed, undone and redone', as
       .getByRole('button', { name: 'teaching assistant' }),
   ).toHaveCount(0);
   // the undo stack holds every edit of the session
-  await expect(page.getByRole('button', { name: /^Undo/ })).toHaveText('Undo (6)');
+  await expect(page.getByRole('button', { name: /^Undo/ })).toHaveText('Undo (7)');
 });
 
 test('a stale edit is refused and another writer’s commit refreshes the views', async ({
@@ -235,4 +246,18 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   ).toHaveCount(0);
   await page.getByRole('button', { name: 'Expand Course' }).click();
   await expect(page.getByRole('button', { name: 'uni:Seminar' })).toBeVisible();
+
+  // after a visit to another dataset, the feed follows uni again from the commit it shows
+  await page.getByRole('combobox', { name: 'Dataset' }).selectOption('foaf');
+  await expect(page).toHaveURL(/ds=foaf/);
+  await page.getByRole('combobox', { name: 'Dataset' }).selectOption('uni');
+  // Course stays open from before
+  await expect(page.getByRole('button', { name: 'Collapse Course' })).toBeVisible();
+  await expect(page.locator('.live')).toContainText('Live');
+  const again = await request.post('/$/ontology/uni/axioms', {
+    data: { add: [{ type: 'SubClassOf', subClass: `${UNI}Workshop`, superClass: `${UNI}Course` }] },
+  });
+  expect(again.ok()).toBe(true);
+  await expect(page.getByRole('status').filter({ hasText: 'by another writer' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'uni:Workshop' })).toBeVisible();
 });

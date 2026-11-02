@@ -108,8 +108,8 @@
     triple(a.property, isLit(a.value) ? a.value : { iri: String(a.value) });
 
   function update(remove: HeaderTriple[], add: HeaderTriple[], label: string) {
-    const { sparql, inverse } = dataUpdate(remove, add, sel.graph);
-    if (sparql) onedit({ kind: 'update', sparql, inverse }, label);
+    const { sparql } = dataUpdate(remove, add, sel.graph);
+    if (sparql) onedit({ kind: 'update', sparql }, label);
   }
 
   function changeAnnotations(next: Annotation[], what: string) {
@@ -146,12 +146,8 @@
   function addHeader() {
     const v = newIri.trim();
     if (!validIri(v)) return void (error = 'The ontology IRI is not an absolute IRI.');
-    const { sparql, inverse } = dataUpdate(
-      [],
-      [{ s: v, p: TYPE, o: { iri: OWL + 'Ontology' } }],
-      sel.graph,
-    );
-    onedit({ kind: 'update', sparql, inverse }, `Add the ontology header ${v}`);
+    const { sparql } = dataUpdate([], [{ s: v, p: TYPE, o: { iri: OWL + 'Ontology' } }], sel.graph);
+    onedit({ kind: 'update', sparql }, `Add the ontology header ${v}`);
   }
 
   const counts = $derived(Object.entries(summary.entities).sort((a, b) => b[1] - a[1]));

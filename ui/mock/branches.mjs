@@ -36,6 +36,8 @@ const BRANCH_ROUTES = new Set([
   'cache',
   'forms',
   'ontology',
+  // a revert names its branch with `branch` as the server's route does (mock/ontology.mjs)
+  'revert',
 ]);
 
 const validName = (n) =>
