@@ -731,11 +731,24 @@ impl Saturation {
         drop(ax);
         let stop = || poll(limits).is_err();
         // the taxonomy's bytes join those held, and the budget and the pool's grant cover
-        // what passes the saturation's peak
+        // what passes the saturation's peak. The build asks again as its estimate grows,
+        // and the pool is charged only for the growth.
+        let charged = std::cell::Cell::new(0usize);
         let budget = |bytes: usize| {
             let used = held + bytes;
-            !limits.max_memory.is_some_and(|m| used > m)
-                && charge_fn.is_none_or(|f| f(used.saturating_sub(totals.peak)))
+            if limits.max_memory.is_some_and(|m| used > m) {
+                return false;
+            }
+            let over = used.saturating_sub(totals.peak);
+            let more = over.saturating_sub(charged.get());
+            if more == 0 {
+                return true;
+            }
+            let ok = charge_fn.is_none_or(|f| f(more));
+            if ok {
+                charged.set(over);
+            }
+            ok
         };
         let (taxonomy, tax_bytes) = taxonomy::build(self, consistent, threads, &stop, &budget)
             .map_err(|h| match h {

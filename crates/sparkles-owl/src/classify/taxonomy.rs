@@ -165,6 +165,7 @@ fn sort_classes(cs: &mut [Class]) {
 }
 
 /// Why building the taxonomy stopped.
+#[derive(Debug)]
 pub(super) enum Halt {
     /// the deadline or a cancellation
     Stopped,
@@ -200,6 +201,16 @@ pub(super) fn build(
     let mut top = vec![Class::thing()];
     let mut bottom = vec![Class::nothing()];
     if !consistent {
+        // every class in the bottom node and the lookup
+        let bytes = classes.len()
+            * (2 * std::mem::size_of::<Class>() + std::mem::size_of::<(Class, usize)>() * 8 / 7)
+            + classes
+                .iter()
+                .map(|(c, _)| 2 * c.as_str().len())
+                .sum::<usize>();
+        if !budget(bytes) {
+            return Err(Halt::Memory(bytes));
+        }
         bottom.push(Class::thing());
         bottom.extend(classes.into_iter().map(|(c, _)| c.clone()));
         sort_classes(&mut bottom);
@@ -223,7 +234,7 @@ pub(super) fn build(
                 ],
                 of,
             },
-            0,
+            bytes,
         ));
     }
     let n = classes.len();
@@ -233,6 +244,7 @@ pub(super) fn build(
         pos[e as usize] = i as u32;
     }
     let stopped = AtomicBool::new(false);
+    // `i` counts the items of a chunk, so each chunk polls when it starts
     let halt = |i: usize| {
         if i % POLL_EVERY == 0 && (stopped.load(Ordering::Relaxed) || stop()) {
             stopped.store(true, Ordering::Relaxed);
@@ -245,8 +257,8 @@ pub(super) fn build(
     let mut subs: Vec<(bool, Vec<u32>)> = vec![(false, Vec::new()); n];
     let mut work: Vec<(usize, &mut (bool, Vec<u32>))> = subs.iter_mut().enumerate().collect();
     super::par_chunks(&mut work, threads, |chunk| {
-        for (i, slot) in chunk {
-            if halt(*i) {
+        for (j, (i, slot)) in chunk.iter_mut().enumerate() {
+            if halt(j) {
                 return;
             }
             let e = classes[*i].1;
@@ -285,8 +297,8 @@ pub(super) fn build(
     let mut key: Vec<u32> = vec![NONE; n];
     let mut work: Vec<(usize, &mut u32)> = key.iter_mut().enumerate().collect();
     super::par_chunks(&mut work, threads, |chunk| {
-        for (i, slot) in chunk {
-            if halt(*i) {
+        for (j, (i, slot)) in chunk.iter_mut().enumerate() {
+            if halt(j) {
                 return;
             }
             let i32 = *i as u32;
@@ -348,8 +360,8 @@ pub(super) fn build(
     let mut work: Vec<(u32, &mut Vec<usize>)> =
         reps.iter().copied().zip(parents.iter_mut()).collect();
     super::par_chunks(&mut work, threads, |chunk| {
-        for (r, slot) in chunk {
-            if halt(*r as usize) {
+        for (j, (r, slot)) in chunk.iter_mut().enumerate() {
+            if halt(j) {
                 return;
             }
             **slot = direct_parents(*r, &subs, &key, &node_of, &has);
@@ -359,13 +371,27 @@ pub(super) fn build(
     if stopped.load(Ordering::Relaxed) {
         return Err(Halt::Stopped);
     }
-    for (j, ps) in parents.into_iter().enumerate() {
-        nodes[j + 2].parents = ps;
+    // the links, each held as a parent and as a child, join the estimate before the
+    // children are built
+    let links: usize = parents.iter().map(|ps| ps.len()).sum();
+    let bytes = bytes + 2 * links * std::mem::size_of::<usize>();
+    if !budget(bytes) {
+        return Err(Halt::Memory(bytes));
     }
-    for i in 0..nodes.len() {
-        for p in nodes[i].parents.clone() {
-            nodes[p].children.push(i);
+    let mut fan_in = vec![0usize; nodes.len()];
+    for ps in &parents {
+        for &p in ps {
+            fan_in[p] += 1;
         }
+    }
+    for (node, k) in nodes.iter_mut().zip(fan_in) {
+        node.children.reserve_exact(k);
+    }
+    for (j, ps) in parents.into_iter().enumerate() {
+        for &p in &ps {
+            nodes[p].children.push(j + 2);
+        }
+        nodes[j + 2].parents = ps;
     }
     sort_classes(&mut top);
     sort_classes(&mut bottom);
@@ -380,9 +406,9 @@ pub(super) fn build(
     Ok((Taxonomy { nodes, of }, bytes))
 }
 
-/// The estimated bytes of a taxonomy and of what building it holds: the subsumers read,
-/// the tables by class and by expression, and for each class its two copies in the
-/// nodes and the lookup with a node's share of the links.
+/// The estimated bytes of a taxonomy and of what building it holds before its links: the
+/// subsumers read, the tables by class and by expression, and for each class its two
+/// copies in the nodes and the lookup. The build adds the links once it has them.
 fn bytes_of(classes: &[(&Class, Ex)], subs: &[(bool, Vec<u32>)], exprs: usize) -> usize {
     let per_class = std::mem::size_of::<(&Class, Ex)>()
         + std::mem::size_of::<(bool, Vec<u32>)>()
@@ -390,8 +416,7 @@ fn bytes_of(classes: &[(&Class, Ex)], subs: &[(bool, Vec<u32>)], exprs: usize) -
         + 1
         + std::mem::size_of::<Node>()
         + 2 * std::mem::size_of::<Class>()
-        + std::mem::size_of::<(Class, usize)>() * 8 / 7
-        + 4 * std::mem::size_of::<usize>();
+        + std::mem::size_of::<(Class, usize)>() * 8 / 7;
     let iris: usize = classes.iter().map(|(c, _)| 2 * c.as_str().len()).sum();
     let read: usize = subs.iter().map(|(_, v)| v.capacity() * 4).sum();
     classes.len() * per_class + iris + read + exprs * 4
@@ -458,4 +483,105 @@ fn direct_parents(
     };
     parents.sort_unstable();
     parents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classify::Limits;
+    use std::sync::atomic::AtomicUsize;
+
+    fn c(s: &str) -> Class {
+        Class::new(format!("http://ex.org/{s}"))
+    }
+
+    fn saturated(axioms: &[Axiom]) -> Saturation {
+        let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
+        let mut k = Saturation::new();
+        k.classify(&kinds, None, &Limits::default()).unwrap();
+        k
+    }
+
+    #[test]
+    fn the_estimate_counts_every_link_of_a_wide_hierarchy() {
+        // every lower class is below every upper class through an existential that no
+        // name stands for, so each has all the upper classes as direct parents
+        let n = 400;
+        let via = ClassExpression::some(ObjectProperty::new("http://ex.org/r"), c("Y"));
+        let mut axioms = Vec::new();
+        for i in 0..n {
+            axioms.push(Axiom::sub_class_of(c(&format!("L{i}")), via.clone()));
+            axioms.push(Axiom::sub_class_of(via.clone(), c(&format!("U{i}"))));
+        }
+        let k = saturated(&axioms);
+        let (t, bytes) = build(&k, true, 1, &|| false, &|_| true).unwrap();
+        let links: usize = t
+            .nodes()
+            .iter()
+            .map(|node| node.parents.capacity() + node.children.capacity())
+            .sum();
+        assert!(links >= 2 * n * n);
+        assert!(
+            bytes >= links * std::mem::size_of::<usize>(),
+            "{bytes} for {links} links"
+        );
+        // a budget that does not cover the links stops the build
+        let below = bytes - 1;
+        assert!(matches!(
+            build(&k, true, 1, &|| false, &|b| b <= below),
+            Err(Halt::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn an_inconsistent_taxonomy_asks_the_budget() {
+        let mut axioms = vec![Axiom::sub_class_of(Class::thing(), Class::nothing())];
+        for i in 0..1000 {
+            axioms.push(Axiom::sub_class_of(c(&format!("A{i}")), c("B")));
+        }
+        let k = saturated(&axioms);
+        let (t, bytes) = build(&k, false, 1, &|| false, &|_| true).unwrap();
+        assert!(t.bottom().classes.len() > 1000);
+        assert!(bytes >= 1000 * 2 * std::mem::size_of::<Class>(), "{bytes}");
+        assert!(matches!(
+            build(&k, false, 1, &|| false, &|b| b < bytes),
+            Err(Halt::Memory(_))
+        ));
+    }
+
+    #[test]
+    fn every_stage_polls_whatever_the_positions_of_its_nodes() {
+        // the first class is unsatisfiable and the others come in equivalent pairs, so
+        // every node's first class has an odd position
+        let mut axioms = vec![Axiom::sub_class_of(c("A00"), Class::nothing())];
+        for i in (1..21).step_by(2) {
+            axioms.push(Axiom::equivalent_classes([
+                c(&format!("A{i:02}")).into(),
+                c(&format!("A{:02}", i + 1)).into(),
+            ]));
+        }
+        let k = saturated(&axioms);
+        let polls = AtomicUsize::new(0);
+        let (t, _) = build(
+            &k,
+            true,
+            1,
+            &|| {
+                polls.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(t.equivalents(&c("A01")), &[c("A01"), c("A02")]);
+        let polls = polls.into_inner();
+        assert!(polls >= 3, "{polls} polls");
+        // a stop in the last stage is heard
+        let calls = AtomicUsize::new(0);
+        let stop = || calls.fetch_add(1, Ordering::Relaxed) + 1 >= 3;
+        assert!(matches!(
+            build(&k, true, 1, &stop, &|_| true),
+            Err(Halt::Stopped)
+        ));
+    }
 }
