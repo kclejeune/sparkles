@@ -653,11 +653,17 @@ impl Opened {
             .filter_map(|p| self.snapshot.lookup_iri(p))
             .collect();
         for &p in &preds {
+            // the other individual and graph of each assertion streamed by subject, so
+            // that its reverse in the same graph, the same axiom, is not streamed again
+            let mut streamed: FxHashSet<(Id, Id)> = FxHashSet::default();
             for (g, id) in self.inner.graph_ids.iter().enumerate() {
                 let Some(id) = id else { continue };
-                let more = stream.scan(Perm::Gspo, &[id.0, iid.0, p.0], |t, _| {
+                let more = stream.scan(Perm::Gspo, &[id.0, iid.0, p.0], |t, q| {
                     match self.ontology.map_assertion(&t) {
-                        Some(ax) => f(ax, g as u32),
+                        Some(ax) => {
+                            streamed.insert((q[2], q[3]));
+                            f(ax, g as u32)
+                        }
                         None => Ok(true),
                     }
                 })?;
@@ -666,8 +672,9 @@ impl Opened {
                 }
             }
             let more = stream.scan(Perm::Ops, &[iid.0, p.0], |t, q| {
-                // a reflexive assertion was streamed with the subjects
-                if q[0] == iid {
+                // a reflexive assertion, or the reverse of one streamed by subject in
+                // the same graph, was streamed already
+                if q[0] == iid || streamed.contains(&(q[0], q[3])) {
                     return Ok(true);
                 }
                 match (self.graph_index(q[3]), self.ontology.map_assertion(&t)) {

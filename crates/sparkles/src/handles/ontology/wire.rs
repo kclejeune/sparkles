@@ -574,25 +574,34 @@ pub fn entity_body(
                 let (same, different) = if q.assertions {
                     let mut same: BTreeSet<Individual> = BTreeSet::new();
                     let mut different: BTreeSet<Individual> = BTreeSet::new();
+                    // each list fills to the limit on its own, and the stream stops
+                    // once both are cut
+                    let (mut same_cut, mut different_cut) = (false, false);
                     o.equalities(&i, opts, |ax, _| {
+                        let (into, cut) = match &ax.kind {
+                            AxiomKind::SameIndividual(_) => (&mut same, &mut same_cut),
+                            AxiomKind::DifferentIndividuals(_) => {
+                                (&mut different, &mut different_cut)
+                            }
+                            _ => return Ok(true),
+                        };
                         let (AxiomKind::SameIndividual(set) | AxiomKind::DifferentIndividuals(set)) =
                             &ax.kind
                         else {
                             return Ok(true);
                         };
-                        let into = if matches!(ax.kind, AxiomKind::SameIndividual(_)) {
-                            &mut same
-                        } else {
-                            &mut different
-                        };
                         for x in set.iter().filter(|x| **x != i) {
-                            if into.len() >= q.limit && !into.contains(x) {
+                            if into.contains(x) {
+                                continue;
+                            }
+                            if into.len() >= q.limit {
+                                *cut = true;
                                 truncated = true;
-                                return Ok(false);
+                                break;
                             }
                             into.insert(x.clone());
                         }
-                        Ok(true)
+                        Ok(!(same_cut && different_cut))
                     })?;
                     (same.into_iter().collect(), different.into_iter().collect())
                 } else {

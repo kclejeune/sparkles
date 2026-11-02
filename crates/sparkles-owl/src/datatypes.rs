@@ -194,19 +194,8 @@ fn nonnegative_integer(datatype: &str, lex: &str) -> bool {
         let Some((n, d)) = lex.split_once('/') else {
             return false;
         };
-        let Ok(d) = d.trim_start_matches('+').parse::<u64>() else {
-            return false;
-        };
-        if d == 0 {
-            return false;
-        }
-        let rem = n
-            .trim_start_matches(['+', '-'])
-            .bytes()
-            .fold(0u128, |r, b| {
-                (r * 10 + u128::from(b - b'0')) % u128::from(d)
-            });
-        return rem == 0 && unsigned(n);
+        let digits = |s: &str| s.trim_start_matches(['+', '-']).as_bytes().to_vec();
+        return divides(&digits(d), &digits(n)) && unsigned(n);
     }
     match local(datatype) {
         Some("decimal") => {
@@ -235,56 +224,248 @@ fn string_value<'a>(datatype: &str, lex: &'a str) -> Option<&'a str> {
     .then_some(lex)
 }
 
-/// Whether `p` is an XML Schema regular expression. Only its syntax is judged, so the
-/// constructs that XML Schema adds to the syntax that `regex-syntax` parses are first
-/// replaced by atoms that parse alike: the name escapes `\i` and `\c` and their
-/// complements, the block escapes `\p{Is…}`, and character-class subtraction `-[…]`,
-/// which becomes `--[…]`.
-fn pattern(p: &str) -> bool {
-    let mut out = String::with_capacity(p.len() + 4);
-    let mut depth = 0usize;
-    let mut chars = p.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some('i' | 'I' | 'c' | 'C') => out.push('a'),
-                Some(e @ ('p' | 'P')) if chars.peek() == Some(&'{') => {
-                    let mut body = String::new();
-                    loop {
-                        match chars.next() {
-                            Some('}') => break,
-                            Some(c) => body.push(c),
-                            None => return false,
-                        }
-                    }
-                    if body.len() > 3 && body.starts_with("{Is") {
-                        out.push('a');
-                    } else {
-                        out.push('\\');
-                        out.push(e);
-                        out.push_str(&body);
-                        out.push('}');
-                    }
+/// Whether the decimal digits `d`, not all zero, divide the decimal digits `n`, of any
+/// length, by schoolbook long division.
+fn divides(d: &[u8], n: &[u8]) -> bool {
+    let trim = |x: &[u8]| -> Vec<u8> {
+        let start = x.iter().position(|&b| b != b'0').unwrap_or(x.len());
+        x[start..].to_vec()
+    };
+    let d = trim(d);
+    if d.is_empty() {
+        return false;
+    }
+    // `a >= b` for digit strings without leading zeros
+    let ge = |a: &[u8], b: &[u8]| a.len() > b.len() || a.len() == b.len() && a >= b;
+    let mut rem: Vec<u8> = Vec::with_capacity(d.len() + 1);
+    for &digit in n {
+        rem.push(digit);
+        rem = trim(&rem);
+        while ge(&rem, &d) {
+            // rem -= d
+            let mut borrow = 0i8;
+            let offset = rem.len() - d.len();
+            for i in (0..rem.len()).rev() {
+                let sub = if i >= offset {
+                    (d[i - offset] - b'0') as i8
+                } else {
+                    0
+                };
+                let mut v = (rem[i] - b'0') as i8 - sub - borrow;
+                borrow = i8::from(v < 0);
+                if v < 0 {
+                    v += 10;
                 }
-                Some(e) => {
-                    out.push('\\');
-                    out.push(e);
-                }
-                None => return false,
-            },
-            '[' => {
-                depth += 1;
-                out.push(c);
+                rem[i] = b'0' + v as u8;
             }
-            ']' if depth > 0 => {
-                depth -= 1;
-                out.push(c);
-            }
-            '-' if depth > 0 && chars.peek() == Some(&'[') => out.push_str("--"),
-            _ => out.push(c),
+            rem = trim(&rem);
         }
     }
-    regex_syntax::Parser::new().parse(&out).is_ok()
+    rem.is_empty()
+}
+
+/// Whether `p` is a regular expression of XML Schema 1.1 Part 2, Appendix G.
+fn pattern(p: &str) -> bool {
+    let mut r = Regex {
+        c: p.chars().collect(),
+        i: 0,
+    };
+    r.reg_exp() && r.i == r.c.len()
+}
+
+/// A recursive-descent recognizer of the XML Schema regular expression grammar.
+struct Regex {
+    c: Vec<char>,
+    i: usize,
+}
+
+impl Regex {
+    fn peek(&self) -> Option<char> {
+        self.c.get(self.i).copied()
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        let hit = self.peek() == Some(c);
+        self.i += usize::from(hit);
+        hit
+    }
+
+    /// `regExp ::= branch ( '|' branch )*`
+    fn reg_exp(&mut self) -> bool {
+        loop {
+            if !self.branch() {
+                return false;
+            }
+            if !self.eat('|') {
+                return true;
+            }
+        }
+    }
+
+    /// `branch ::= piece*`
+    fn branch(&mut self) -> bool {
+        while let Some(c) = self.peek() {
+            if c == '|' || c == ')' {
+                return true;
+            }
+            if !self.atom() || !self.quantifier() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `quantifier ::= [?*+] | '{' quantity '}'`, optional
+    fn quantifier(&mut self) -> bool {
+        if self.eat('?') || self.eat('*') || self.eat('+') {
+            return true;
+        }
+        if !self.eat('{') {
+            return true;
+        }
+        let Some(min) = self.number() else {
+            return false;
+        };
+        if self.eat(',') {
+            if let Some(max) = self.number()
+                && max < min
+            {
+                return false;
+            }
+        }
+        self.eat('}')
+    }
+
+    fn number(&mut self) -> Option<u128> {
+        let start = self.i;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        let digits: String = self.c[start..self.i].iter().collect();
+        // a quantity too large for any machine is still a quantity
+        (!digits.is_empty()).then(|| digits.parse().unwrap_or(u128::MAX))
+    }
+
+    /// `atom ::= NormalChar | charClass | '(' regExp ')'`
+    fn atom(&mut self) -> bool {
+        match self.peek() {
+            Some('(') => {
+                self.i += 1;
+                self.reg_exp() && self.eat(')')
+            }
+            Some('[') => self.char_class_expr(),
+            Some('\\') => self.escape().is_some(),
+            Some('.') => {
+                self.i += 1;
+                true
+            }
+            Some('?' | '*' | '+' | '{' | '}' | ')' | ']' | '|') | None => false,
+            Some(_) => {
+                self.i += 1;
+                true
+            }
+        }
+    }
+
+    /// An escape after its backslash's position: `Some(Some(c))` for a single-character
+    /// escape of `c`, `Some(None)` for a multi-character or category escape.
+    fn escape(&mut self) -> Option<Option<char>> {
+        self.i += 1;
+        let c = self.peek()?;
+        self.i += 1;
+        match c {
+            'n' => Some(Some('\n')),
+            'r' => Some(Some('\r')),
+            't' => Some(Some('\t')),
+            '\\' | '|' | '.' | '?' | '*' | '+' | '(' | ')' | '{' | '}' | '-' | '[' | ']' | '^' => {
+                Some(Some(c))
+            }
+            's' | 'S' | 'i' | 'I' | 'c' | 'C' | 'd' | 'D' | 'w' | 'W' => Some(None),
+            'p' | 'P' => {
+                if !self.eat('{') {
+                    return None;
+                }
+                let start = self.i;
+                while self.peek().is_some_and(|c| c != '}') {
+                    self.i += 1;
+                }
+                let prop: String = self.c[start..self.i].iter().collect();
+                if !self.eat('}') {
+                    return None;
+                }
+                char_prop(&prop).then_some(None)
+            }
+            _ => None,
+        }
+    }
+
+    /// `charClassExpr ::= '[' charGroup ']'`, with
+    /// `charGroup ::= ( posCharGroup | negCharGroup ) ( '-' charClassExpr )?`
+    fn char_class_expr(&mut self) -> bool {
+        if !self.eat('[') {
+            return false;
+        }
+        self.eat('^');
+        let mut parts = 0;
+        loop {
+            match self.peek() {
+                None => return false,
+                Some(']') => {
+                    self.i += 1;
+                    return parts > 0;
+                }
+                Some('-') if self.c.get(self.i + 1) == Some(&'[') => {
+                    self.i += 1;
+                    return parts > 0 && self.char_class_expr() && self.eat(']');
+                }
+                Some('[') => return false,
+                Some(_) => {
+                    let Some(start) = self.single_or_class() else {
+                        return false;
+                    };
+                    parts += 1;
+                    // a range, unless the hyphen ends the group or starts a subtraction
+                    if self.peek() == Some('-')
+                        && !matches!(self.c.get(self.i + 1), Some(']' | '[') | None)
+                    {
+                        self.i += 1;
+                        let (Some(lo), Some(Some(hi))) = (start, self.single_or_class()) else {
+                            return false;
+                        };
+                        if hi < lo {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One part of a group: `Some(Some(c))` for a single character, `Some(None)` for
+    /// an escape that stands for several.
+    fn single_or_class(&mut self) -> Option<Option<char>> {
+        match self.peek()? {
+            '\\' => self.escape(),
+            '[' | ']' => None,
+            c => {
+                self.i += 1;
+                Some(Some(c))
+            }
+        }
+    }
+}
+
+/// `charProp ::= IsCategory | IsBlock`
+fn char_prop(p: &str) -> bool {
+    const CATEGORIES: [&str; 37] = [
+        "L", "Lu", "Ll", "Lt", "Lm", "Lo", "M", "Mn", "Mc", "Me", "N", "Nd", "Nl", "No", "P", "Pc",
+        "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Z", "Zs", "Zl", "Zp", "S", "Sm", "Sc", "Sk", "So",
+        "C", "Cc", "Cf", "Co", "Cn", "Cs",
+    ];
+    CATEGORIES.contains(&p)
+        || p.strip_prefix("Is").is_some_and(|b| {
+            !b.is_empty() && b.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 /// Whether `r` is a language range of RFC 4647, in the extended form that contains the
@@ -933,6 +1114,11 @@ mod tests {
             lit("-0", "integer"),
             lit("3", "unsignedByte"),
             Literal::typed("6/2", vocab::OWL_RATIONAL),
+            Literal::typed(
+                "18446744073709551616/18446744073709551616",
+                vocab::OWL_RATIONAL,
+            ),
+            Literal::typed("100000000000000000000000000000/10", vocab::OWL_RATIONAL),
         ] {
             assert_eq!(facet_problem(&string, &len, &v), None, "{v:?}");
         }
@@ -940,6 +1126,10 @@ mod tests {
             lit("3.5", "decimal"),
             lit("-1.0", "decimal"),
             Literal::typed("7/2", vocab::OWL_RATIONAL),
+            Literal::typed(
+                "18446744073709551617/18446744073709551616",
+                vocab::OWL_RATIONAL,
+            ),
             lit("3", "double"),
             lit("x", "decimal"),
         ] {
@@ -972,12 +1162,31 @@ mod tests {
             "[a-z-[aeiou]]",
             r"\p{IsBasicLatin}+",
             r"\P{Lu}",
+            r"\P{Cs}",
             r"\d{3}-\d{4}",
+            "a{2,}b{0,1}",
+            "[^-a-z]",
+            "^a$",
+            "(a|b)*|",
             "",
         ] {
             assert!(pattern(p), "{p:?}");
         }
-        for p in ["[", "a{", "(a", r"\p{IsBasicLatin", "\\"] {
+        for p in [
+            "[",
+            "a{",
+            "(a",
+            r"\p{IsBasicLatin",
+            "\\",
+            "(?i)a",
+            "(?:a)",
+            r"\bword\b",
+            "a{3,2}",
+            "[z-a]",
+            r"\p{Xx}",
+            "a**",
+            "[]",
+        ] {
             assert!(!pattern(p), "{p:?}");
         }
         for r in ["en", "*", "de-*-DE", "en-US", "zh-Hant-1996"] {

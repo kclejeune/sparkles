@@ -1481,6 +1481,43 @@ fn entities_used_only_by_stored_assertions_are_found() {
 }
 
 #[test]
+fn equalities_stream_once_and_fill_each_list_on_its_own() {
+    let ds = dataset(
+        ":o a owl:Ontology . :a owl:sameAs :b , :c . :b owl:sameAs :a .
+         :a owl:differentFrom :d .",
+    );
+    let o = ds
+        .ontology()
+        .graph("default")
+        .mode(Mode::Lenient)
+        .open()
+        .unwrap();
+    let mut n = 0;
+    o.equalities(&Individual::named(ex("a")), &opts(), |_, _| {
+        n += 1;
+        Ok(true)
+    })
+    .unwrap();
+    // a sameAs b and its reverse are one axiom in one graph
+    assert_eq!(n, 3);
+    let body = wire::call(
+        &ds,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": true, "mode": "lenient", "limit": 1}),
+        &opts(),
+    )
+    .unwrap();
+    let a = &body["namedIndividual"];
+    assert_eq!(a["sameIndividuals"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(
+        a["differentIndividuals"].as_array().unwrap().len(),
+        1,
+        "{body}"
+    );
+    assert_eq!(body["truncated"], true);
+}
+
+#[test]
 fn streams_give_every_graph_of_an_assertion() {
     let held = ":o a owl:Ontology . :A a owl:Class . :p a owl:ObjectProperty .
         :a a owl:NamedIndividual , [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :A ] .
