@@ -128,29 +128,59 @@ impl Placement {
     }
 
     /// Run the calling thread where request work goes with `active` requests in flight.
-    /// A thread starts on every CPU, and changes its CPUs only when its placement differs.
+    /// A thread changes its CPUs only when its placement differs from the one it last
+    /// set, and a thread that has set none sets one.
     fn place(&self, active: usize) {
-        let want = self.on_performance(active);
-        ON_PERFORMANCE.with(|on| {
-            if on.get() != want {
-                pin_current_thread(if want { &self.performance } else { &self.every });
-                on.set(want);
+        self.set(if self.on_performance(active) {
+            Placed::Performance
+        } else {
+            Placed::Every
+        });
+    }
+
+    fn set(&self, want: Placed) {
+        PLACED.with(|placed| {
+            if placed.get() != want {
+                pin_current_thread(match want {
+                    Placed::Performance => &self.performance,
+                    _ => &self.every,
+                });
+                placed.set(want);
             }
         });
     }
 }
 
+/// Where a thread last placed itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placed {
+    /// Nowhere: the thread runs on the CPUs it inherited from the thread that created it,
+    /// which may be a request thread on the performance cores.
+    Unknown,
+    Performance,
+    Every,
+}
+
 static PLACEMENT: std::sync::OnceLock<Placement> = std::sync::OnceLock::new();
 
 thread_local! {
-    /// Whether this thread runs on the performance cores only.
-    static ON_PERFORMANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PLACED: std::cell::Cell<Placed> = const { std::cell::Cell::new(Placed::Unknown) };
 }
 
 /// Place request work by `placement` from now on. The server calls it once at start, on
 /// a hybrid processor with `--request-cpus auto`.
 pub fn start(placement: Placement) {
     let _ = PLACEMENT.set(placement);
+}
+
+/// Run a thread the runtime starts on every CPU. A new thread inherits the CPUs of the
+/// thread that creates it, and the runtime creates threads from request threads, such as
+/// the worker that replaces one running a request in place, so without this a thread
+/// could stay on the performance cores under any load.
+pub fn thread_started() {
+    if let Some(p) = PLACEMENT.get() {
+        p.set(Placed::Every);
+    }
 }
 
 /// Run the calling thread where a request's work goes now, by the requests in flight.
@@ -342,6 +372,50 @@ mod tests {
             got,
             vec![allowed.clone(), one.clone(), one.clone(), allowed, one]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_created_by_a_placed_thread_leaves_the_performance_cores() {
+        let allowed = linux::allowed().unwrap();
+        if allowed.len() < 2 {
+            return;
+        }
+        let p = std::sync::Arc::new(Placement {
+            performance: vec![allowed[0]],
+            every: allowed.clone(),
+            limit: 2,
+        });
+        let got = std::thread::spawn(move || {
+            // a request thread on the performance cores at low load
+            p.place(1);
+            let inherited = linux::allowed().unwrap();
+            // a thread it creates, as the runtime's replacement worker would be, places
+            // itself under load although it never set a placement
+            let q = p.clone();
+            let placed = std::thread::spawn(move || {
+                q.place(5);
+                linux::allowed().unwrap()
+            })
+            .join()
+            .unwrap();
+            // and a thread the runtime starts runs on every CPU from its start
+            let q = p.clone();
+            let started = std::thread::spawn(move || {
+                q.set(Placed::Every);
+                let at_start = linux::allowed().unwrap();
+                q.place(5);
+                (at_start, linux::allowed().unwrap())
+            })
+            .join()
+            .unwrap();
+            (inherited, placed, started)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got.0, vec![allowed[0]]);
+        assert_eq!(got.1, allowed);
+        assert_eq!(got.2, (allowed.clone(), allowed));
     }
 
     #[cfg(target_os = "linux")]

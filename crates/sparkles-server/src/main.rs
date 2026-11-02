@@ -3315,7 +3315,9 @@ fn run() -> Result<()> {
                 _ => bail!("--prewarm-interval expects a number of seconds from 1 to 1e9"),
             };
             let mut rt = tokio::runtime::Builder::new_multi_thread();
-            rt.thread_stack_size(THREAD_STACK).enable_all();
+            rt.thread_stack_size(THREAD_STACK)
+                .enable_all()
+                .on_thread_start(cpus::thread_started);
             let rt = rt.build()?;
             // Queries run on the runtime's blocking threads, which it also starts on first
             // use. One started here serves a first query that arrives soon after the
