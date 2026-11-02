@@ -697,7 +697,7 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                 super::plan::eval_exists(ctx, spec, &key, &row.table.vars)
             })
             .map_err(|error| {
-                ctx.fail_cursor(&error);
+                ctx.fail_memory(&error);
                 if ctx.calls_extensions {
                     ctx.fail_extension(super::extensions::ScalarError::from_engine(&error));
                 }
@@ -1203,19 +1203,19 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 let re = ctx
                     .cursor_regex(p.as_str().ok_or(TypeError)?, flags)
                     .map_err(|error| {
-                        ctx.fail_cursor(&error);
+                        ctx.fail_memory(&error);
                         TypeError
                     })?
                     .ok_or(TypeError)?;
                 if re.is_match(ctx, "").map_err(|error| {
-                    ctx.fail_cursor(&error);
+                    ctx.fail_memory(&error);
                     TypeError
                 })? {
                     return Err(TypeError);
                 }
                 let rep = xpath_replacement(r.as_str().ok_or(TypeError)?)?;
                 let output = re.replace(ctx, st, &rep).map_err(|error| {
-                    ctx.fail_cursor(&error);
+                    ctx.fail_memory(&error);
                     TypeError
                 })?;
                 return Ok(same_kind(l, output));
@@ -1398,12 +1398,12 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 let re = ctx
                     .cursor_regex(p.as_str().ok_or(TypeError)?, flags)
                     .map_err(|error| {
-                        ctx.fail_cursor(&error);
+                        ctx.fail_memory(&error);
                         TypeError
                     })?
                     .ok_or(TypeError)?;
                 b(re.is_match(ctx, st).map_err(|error| {
-                    ctx.fail_cursor(&error);
+                    ctx.fail_memory(&error);
                     TypeError
                 })?)
             } else {

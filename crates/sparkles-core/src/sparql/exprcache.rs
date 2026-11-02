@@ -1556,7 +1556,7 @@ mod tests {
             "refused column leaked trial ownership"
         );
         assert!(
-            ctx.check_cursor_memory().is_ok(),
+            ctx.check_memory_failure().is_ok(),
             "recoverable ORDER decoding poisoned the cursor before its smaller trial"
         );
         drop(trial_storage);
@@ -1572,7 +1572,7 @@ mod tests {
         }
         drop(values);
         drop(input);
-        assert!(ctx.check_cursor_memory().is_ok());
+        assert!(ctx.check_memory_failure().is_ok());
         assert!(ctx.mem_peak() <= 16 << 20);
     }
 
@@ -1583,12 +1583,12 @@ mod tests {
         let storage = ctx.charge(ctx.memory_room() - 8).unwrap();
         assert!(ctx.value(long).is_none());
         assert!(
-            matches!(ctx.check_cursor_memory(), Err(crate::Error::BudgetExceeded(b))
+            matches!(ctx.check_memory_failure(), Err(crate::Error::BudgetExceeded(b))
             if b.kind == crate::BudgetKind::Memory)
         );
         drop(storage);
         assert!(
-            matches!(ctx.check_cursor_memory(), Err(crate::Error::BudgetExceeded(b))
+            matches!(ctx.check_memory_failure(), Err(crate::Error::BudgetExceeded(b))
             if b.kind == crate::BudgetKind::Memory)
         );
     }

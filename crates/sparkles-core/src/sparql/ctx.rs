@@ -550,6 +550,9 @@ pub struct Ctx {
     pub(crate) extension_writers: Vec<(uuid::Uuid, super::extensions::Failure)>,
     callback_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     callback_terms: parking_lot::Mutex<FxHashMap<Id, u64>>,
+    /// A budget refusal in infallible code, which fails the next check (see
+    /// [`Ctx::fail_memory`]).
+    memory_failure: MemoryFailure,
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
     // Data and weak retained caches drop before final ledger ownership.
@@ -631,11 +634,38 @@ impl Drop for FastMemory {
     }
 }
 
-struct CursorMemory {
+/// How a context accounts its memory, the one place that reads the mode (see
+/// [`Ctx::accounting`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Accounting {
+    /// Eager execution, which collects whole tables. Its pool contribution stays at
+    /// the admitted high point until the result is dropped.
+    Collect,
+    /// Pull cursors, whose grant follows their live bytes.
+    Cursor,
+}
+
+/// The first budget refusal that infallible code met. Scalar evaluation cannot return
+/// a budget error, so it records the refusal here and the next check fails with it,
+/// which keeps a refused allocation from becoming an unbound value.
+#[derive(Default)]
+struct MemoryFailure {
     failure: parking_lot::Mutex<Option<Budget>>,
     failed: AtomicBool,
-    decode_peak: parking_lot::Mutex<u64>,
-    decoded_reserved: AtomicU64,
+}
+
+/// The high-water envelope that transient dictionary decoding reserves: a key of the
+/// largest size seen so far on every worker, charged once when it grows (see
+/// [`Ctx::cursor_decode_checked`]).
+#[derive(Default)]
+struct DecodeEnvelope {
+    peak: parking_lot::Mutex<u64>,
+    reserved: AtomicU64,
+}
+
+#[derive(Default)]
+struct CursorMemory {
+    decode: DecodeEnvelope,
     owner: parking_lot::Mutex<Weak<Ctx>>,
     regex: super::cursor_regex::RegexCache,
 }
@@ -831,6 +861,7 @@ impl Ctx {
             calls_extensions: false,
             callback_bnodes: Default::default(),
             callback_terms: Default::default(),
+            memory_failure: Default::default(),
             cursor_memory: None,
             fast: Default::default(),
             memory: Default::default(),
@@ -1114,7 +1145,7 @@ impl Ctx {
     pub fn check(&self) -> Result<()> {
         #[cfg(test)]
         CHECKS.with(|n| n.set(n.get() + 1));
-        self.check_cursor_memory()?;
+        self.check_memory_failure()?;
         if self.calls_extensions
             && let Some(state) = &self.extension_failure
             && let Some(failure) = state.lock().as_ref()
@@ -1166,14 +1197,7 @@ impl Ctx {
         let bytes = self.local.read().bytes() as u64;
         std::mem::forget(self.charge(bytes)?);
         self.memory().cursor_mode()?;
-        self.cursor_memory = Some(Box::new(CursorMemory {
-            failure: Default::default(),
-            failed: AtomicBool::new(false),
-            decode_peak: Default::default(),
-            decoded_reserved: AtomicU64::new(0),
-            owner: Default::default(),
-            regex: Default::default(),
-        }));
+        self.cursor_memory = Some(Box::default());
         self.use_cache = false;
         self.opt.sampled_filters = false;
         #[cfg(feature = "geo")]
@@ -1187,8 +1211,19 @@ impl Ctx {
         Ok(())
     }
 
+    /// How this context accounts its memory.
+    #[inline]
+    pub(super) fn accounting(&self) -> Accounting {
+        if self.cursor_memory.is_some() {
+            Accounting::Cursor
+        } else {
+            Accounting::Collect
+        }
+    }
+
+    #[inline]
     pub(super) fn is_cursor(&self) -> bool {
-        self.cursor_memory.is_some()
+        self.accounting() == Accounting::Cursor
     }
 
     pub(super) fn attach_cursor_owner(self: &Arc<Self>) {
@@ -1274,38 +1309,56 @@ impl Ctx {
     pub(super) fn release_cursor_work(&self) {
         if let Some(memory) = &self.cursor_memory {
             memory.regex.clear();
-            let _bytes = std::mem::take(&mut *memory.decode_peak.lock());
-            memory.decoded_reserved.store(0, Ordering::Release);
+            let _bytes = std::mem::take(&mut *memory.decode.peak.lock());
+            memory.decode.reserved.store(0, Ordering::Release);
             self.memory().release_decode();
         }
     }
 
-    pub(super) fn check_cursor_memory(&self) -> Result<()> {
-        if let Some(memory) = &self.cursor_memory
-            && memory.failed.load(Ordering::Acquire)
-            && let Some(budget) = *memory.failure.lock()
-        {
-            return Err(Error::BudgetExceeded(budget));
+    /// Fail with the budget refusal that infallible code recorded (see
+    /// [`Ctx::fail_memory`]).
+    #[inline]
+    pub(super) fn check_memory_failure(&self) -> Result<()> {
+        let failure = &self.memory_failure;
+        if failure.failed.load(Ordering::Acquire) {
+            return self.recorded_failure();
         }
         Ok(())
     }
 
-    pub(super) fn fail_cursor(&self, error: &Error) {
-        if let Some(memory) = &self.cursor_memory
+    #[cold]
+    #[inline(never)]
+    fn recorded_failure(&self) -> Result<()> {
+        match *self.memory_failure.failure.lock() {
+            Some(budget) => Err(Error::BudgetExceeded(budget)),
+            None => Ok(()),
+        }
+    }
+
+    /// Record a budget refusal that infallible code met, so that the next check fails
+    /// with it. Only cursor accounting records one so far, since eager scalar code
+    /// charges nothing it could be refused.
+    pub(super) fn fail_memory(&self, error: &Error) {
+        if self.is_cursor()
             && let Error::BudgetExceeded(budget) = error
         {
-            memory.failure.lock().get_or_insert(*budget);
-            memory.failed.store(true, Ordering::Release);
+            self.record_failure(*budget);
         }
+    }
+
+    fn record_failure(&self, budget: Budget) {
+        let failure = &self.memory_failure;
+        failure.failure.lock().get_or_insert(budget);
+        failure.failed.store(true, Ordering::Release);
     }
 
     // Infallible expression interning must not turn a resource failure into an
     // ordinary unbound BIND. Record it, refuse allocation, and fail the next check.
     pub(crate) fn retain_cursor_bytes(&self, bytes: u64) -> bool {
-        let Some(memory) = &self.cursor_memory else {
+        if !self.is_cursor() {
             return true;
-        };
-        if memory.failed.load(Ordering::Acquire) {
+        }
+        if self.memory_failure.failed.load(Ordering::Acquire) {
             return false;
         }
         match self.charge(bytes) {
@@ -1314,8 +1367,7 @@ impl Ctx {
                 true
             }
             Err(Error::BudgetExceeded(budget)) => {
-                memory.failure.lock().get_or_insert(budget);
-                memory.failed.store(true, Ordering::Release);
+                self.record_failure(budget);
                 false
             }
             Err(_) => unreachable!("memory charge returns a budget error"),
@@ -1329,7 +1381,8 @@ impl Ctx {
         let Some(memory) = &self.cursor_memory else {
             return Ok(());
         };
-        self.check_cursor_memory()?;
+        let envelope = &memory.decode;
+        self.check_memory_failure()?;
         let workers = if rayon::current_thread_index().is_some() {
             rayon::current_num_threads() as u64 + 1
         } else {
@@ -1339,18 +1392,18 @@ impl Ctx {
             .saturating_mul(8)
             .saturating_add(1024)
             .saturating_mul(workers);
-        if memory.decoded_reserved.load(Ordering::Acquire) >= need {
-            return self.check_cursor_memory();
+        if envelope.reserved.load(Ordering::Acquire) >= need {
+            return self.check_memory_failure();
         }
-        let mut peak = memory.decode_peak.lock();
+        let mut peak = envelope.peak.lock();
         if need > *peak {
             let owner = self.memory().owner(self.grant.as_ref())?;
             self.memory()
                 .reserve(&owner, self.mem_limit, need - *peak, true)?;
             *peak = need;
-            memory.decoded_reserved.store(need, Ordering::Release);
+            envelope.reserved.store(need, Ordering::Release);
         }
-        self.check_cursor_memory()
+        self.check_memory_failure()
     }
 
     /// Reserve the same high-water envelope for an infallible scalar caller.
@@ -1359,7 +1412,7 @@ impl Ctx {
         match self.cursor_decode_checked(bytes) {
             Ok(()) => true,
             Err(error) => {
-                self.fail_cursor(&error);
+                self.fail_memory(&error);
                 false
             }
         }
@@ -1866,7 +1919,7 @@ impl Ctx {
                     .with_cursor_vocab_key(id.payload(), |key| {
                         self.cursor_decode(key.len()).then(|| id::key_to_term(key))
                     })
-                    .inspect_err(|error| self.fail_cursor(error))
+                    .inspect_err(|error| self.fail_memory(error))
                     .ok()
                     .flatten()
                     .flatten(),
@@ -2065,7 +2118,7 @@ impl Ctx {
     /// reconstruction and admitted decoding retain the same owner and charges.
     pub(super) fn cursor_value_checked(&self, id: Id) -> Result<Option<Value>> {
         debug_assert!(self.is_cursor());
-        self.check_cursor_memory()?;
+        self.check_memory_failure()?;
         let decode = |key: &[u8]| -> Result<Value> {
             self.cursor_decode_checked(key.len())?;
             Ok(Value::from_key(key))
@@ -2115,7 +2168,7 @@ impl Ctx {
                         Tag::Vocab => match self.with_cursor_vocab_key(id.payload(), decode) {
                             Ok(value) => value.flatten(),
                             Err(error) => {
-                                self.fail_cursor(&error);
+                                self.fail_memory(&error);
                                 None
                             }
                         },
