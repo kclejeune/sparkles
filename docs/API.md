@@ -1987,10 +1987,11 @@ assertions. A classification of the same ontology at the same commit answers fro
 with `reused: true`. One at a later commit gives the kept classifier the axioms that
 changed, so that it saturates again only the classes those axioms can reach, and
 `stats.incremental` says so. A change to the property hierarchy, chains, reflexivity or
-ranges, or to an axiom with a data property or datatype, saturates everything again. The kept state costs memory for the time the dataset
-is open, about 55 MB estimated for GO, and it is dropped after a run whose estimate
-passes one gigabyte. A run is bounded by the request's deadline and memory budget and
-answers `507` with `budget: "memory"` past the budget.
+ranges, or to an axiom with a data property or datatype, saturates everything again.
+The kept state costs memory for the time the dataset is open, about 115 MB estimated
+and 190 MB resident for GO, and it is dropped after a run whose estimate passes one
+gigabyte. A run is bounded by the request's deadline and memory budget, from indexing
+to the taxonomy, and answers `507` with `budget: "memory"` past the budget.
 
 `target` names a graph to write the taxonomy to, in one commit, with `message`. The
 graph must be a named graph that the classification does not read. The commit adds the

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Measure el_classify on GO and ChEBI lite on the benchmark host, under the bench lock.
+# Usage: forge-measure.sh DIR   (DIR holds bin/el_classify and data/{go,chebi_lite}.ofn)
+set -euo pipefail
+D=$1
+BIN=${2:-bin/el_classify}
+cd "$D"
+OUT=out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  echo "binary_sha256=$(sha256sum "$BIN" | cut -d' ' -f1)"
+  for f in data/*.ofn; do echo "data_sha256 $f=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "load_before=$(cut -d' ' -f1-3 /proc/loadavg)"
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$OUT/env.txt"
+exec 9>"$HOME/lanes/.bench.lock"
+flock 9
+exec 8>"$HOME/lanes/.heavy.lock"
+flock 8
+echo "locked=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+for ont in go chebi_lite; do
+  for t in 1 4 8; do
+    "$BIN" --threads "$t" --repeat 5 --taxonomy "$OUT/$ont.t$t.txt" "data/$ont.ofn" \
+      >> "$OUT/metrics.jsonl" 2>> "$OUT/err.txt"
+  done
+done
+flock -u 8
+flock -u 9
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+echo "load_after=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+for ont in go chebi_lite; do
+  sha256sum "$OUT/$ont".t*.txt >> "$OUT/taxonomy.sha256"
+done
+echo "done $OUT"

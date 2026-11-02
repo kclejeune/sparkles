@@ -229,6 +229,41 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
 * `sparkles_owl::profiles::partition` splits an ontology's axioms by one profile's
   grammar, without the OWL 2 DL global restrictions. It is the OWL 2 QL check that
   query-time OWL 2 QL rewriting is to use, and the RL warning uses it too.
+* `sparkles_owl::classify` classifies an ontology by OWL 2 EL with a consequence-based
+  calculus in the manner of ELK. It reads the axiom model only, saturates its contexts
+  on several threads and computes the class taxonomy: the classes grouped into
+  equivalence classes, their direct superclasses and the unsatisfiable classes. It
+  covers intersections, existential restrictions, `owl:Thing` and `owl:Nothing`, the
+  property hierarchy, property chains, transitive and reflexive properties, domains,
+  ranges, disjointness and `ObjectHasSelf`. An axiom outside OWL 2 EL is left out and
+  reported with its rule. An axiom with an individual in a class expression, a data
+  range or a data value, or a key, a negative property assertion or a functional data
+  property, is used as far as the calculus goes and reported as partial, since the
+  classifier treats individuals and data ranges as atoms. Every answer is entailed, and
+  it is complete for named classes when nothing is reported. The classifier keeps its
+  contexts between runs, and a run after added or removed axioms saturates again only
+  the contexts that those axioms can reach. A change to the property hierarchy, chains,
+  reflexivity or ranges, or to an axiom with a data property or datatype, saturates
+  everything again. A run stops at its deadline, its memory budget or a cancellation,
+  which it checks while it indexes, saturates and builds the taxonomy. On the benchmark
+  host GO classifies in about 0.4 seconds and ChEBI lite in about 3 seconds on four
+  threads. The classifier's direct hierarchy equals the hierarchy that GO's release
+  publishes, and its taxonomy of ChEBI entails every subsumption ChEBI asserts and
+  gives no direct subsumption that ChEBI does not assert
+  ([results](../benchmarks/el-classification/RESULTS.md)).
+* `ds.ontology().classify()`, `POST /$/ontology/{ds}/classify`, `sparkles ontology
+  classify` and the bindings' `classify` run it on an open ontology. The answer says
+  whether the ontology is consistent and complete and lists the unsatisfiable classes,
+  the excluded axioms, one class's place in the hierarchy and the taxonomy's nodes. A
+  run with `target` writes the taxonomy to a named graph in one commit, replaces the
+  taxonomy that graph held, and records PROV-O provenance on the graph's ontology
+  header. The dataset keeps its last classification of an ontology for callers who read
+  every graph, so a classification at the same commit answers at once and one at a
+  later commit is incremental. That kept state holds the classifier's contexts in memory
+  while the dataset is open, about 115 MB estimated and 190 MB resident for GO, which
+  trades memory for fast reclassification. `sparkles ontology classify FILE` classifies a file without a
+  database and exits with status 1 when the ontology is inconsistent or has an
+  unsatisfiable class.
 * The Rust handle `ds.ontology()` opens a snapshot's ontology, checks it and edits it,
   and keeps the last four reads of up to two million triples each, keyed by commit, for
   callers who read every graph. `/$/ontology/{ds}` serves the summary, the axioms, the
@@ -411,6 +446,24 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   report. Roadmap item 578.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
+* The EL classifier treats individuals in class expressions, data ranges and data values
+  as atoms, so axioms that use them may lose consequences, and keys, negative property
+  assertions, functional data properties and data property ranges take no part.
+  Roadmap item NEW-ITEM-2.
+* No MCP tool classifies, roadmap item NEW-ITEM-1, and the entity accessors and the
+  inferred reads do not answer from a classification, nor does any surface answer the
+  subclasses of a class expression, roadmap item NEW-ITEM-3.
+* A classification runs within one request's deadline and is not kept up to date as
+  commits land. Roadmap item NEW-ITEM-4.
+* A classification with the assertions saturates everything on each run, since the
+  dataset keeps only classifications of the terminology. Roadmap item NEW-ITEM-5.
+* The classifier's hierarchy has been compared with the released hierarchies of GO,
+  which ELK computes in GO's release pipeline, and of ChEBI, but not with ELK itself on
+  those and the ORE test ontologies, and it has not been timed against ELK. Roadmap item
+  NEW-ITEM-6.
+* The classifier keeps its own copy of the axioms, its peak resident memory is about 1.6
+  times the estimate that its memory budget uses, and its indexing and taxonomy stages
+  run on one thread. Roadmap item NEW-ITEM-7.
 
 ## Configuration and usage
 
