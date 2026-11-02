@@ -1118,7 +1118,7 @@ export interface paths {
         put?: never;
         /**
          * Check a form's changes
-         * @description Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.
+         * @description Turns the changes, with those of nested children, into the quads one update deletes and inserts, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.
          */
         post: operations["checkForm"];
         delete?: never;
@@ -1138,7 +1138,7 @@ export interface paths {
         put?: never;
         /**
          * Save a form's changes
-         * @description Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.
+         * @description Commits the changes, with those of nested children, as one update with the message, when the stored values of every changed field are still those `expect` names and every stored child still hangs from its parent, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now` and nested `node`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.
          */
         post: operations["saveForm"];
         delete?: never;
@@ -14751,6 +14751,8 @@ export interface operations {
                 shapes?: "guard" | "graphs" | "drafted";
                 /** @description The language labels are picked in, then English, then untagged. */
                 lang?: string;
+                /** @description Also answer the blank-node children that fields declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children (`templates`). A nested model past its allowances answers the flat form with `nested.refused`. */
+                nested?: boolean;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
@@ -14788,11 +14790,17 @@ export interface operations {
                         groups: Record<string, never>[];
                         /** @description `{language, mode}` of the write guard. */
                         guard?: Record<string, never> | null;
+                        /** @description `{refused}`: why the nested model was refused, when it was. */
+                        nested?: Record<string, never>;
+                        /** @description With `nested=true`: `{id, term, anchors, …}` of each stored child, with the fields of a form model. Each anchor is `{parent, field, graph, inverse}`, where `parent` is `root` or another child's `id`. */
+                        nestedNodes?: Record<string, never>[];
                         other: Record<string, never>[];
                         /** @description `{to, branch, exists, mainProtected}`: `to` is `main` or `branch`. */
                         save: Record<string, never>;
                         /** @description `{source, nodeShapes, missing?, unknownHints}`. */
                         shapes: Record<string, never>;
+                        /** @description With `nested=true`: `{node, …}`, the empty form of a new child under a field whose `constraints.node` is `node`. */
+                        templates?: Record<string, never>[];
                         types: string[];
                     };
                 };
@@ -14823,14 +14831,18 @@ export interface operations {
                     /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
                     branch?: string;
                     changes: {
+                        /** @description Values to add. A blank node is a new child that `nested` describes. */
                         add?: Record<string, never>[];
                         /** @description The field's id, its path in SPARQL syntax. */
                         field: string;
+                        /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                        list?: Record<string, never>[];
+                        /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
                         remove?: Record<string, never>[];
                     }[];
                     /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
                     class?: string;
-                    /** @description The values the form loaded, by field id, for every changed field. */
+                    /** @description The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order. */
                     expect?: {
                         [key: string]: Record<string, never>[];
                     };
@@ -14838,6 +14850,29 @@ export interface operations {
                     focus?: string;
                     /** @description The commit message. */
                     message?: string;
+                    /** @description Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry. */
+                    nested?: {
+                        changes?: {
+                            /** @description Values to add. A blank node is a new child that `nested` describes. */
+                            add?: Record<string, never>[];
+                            /** @description The field's id, its path in SPARQL syntax. */
+                            field: string;
+                            /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                            list?: Record<string, never>[];
+                            /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
+                            remove?: Record<string, never>[];
+                        }[];
+                        /** @description For a stored child, the values the form loaded for every changed field. */
+                        expect?: {
+                            [key: string]: Record<string, never>[];
+                        };
+                        /** @description The parent's field id. */
+                        field: string;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        node: Record<string, never>;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        parent?: Record<string, never>;
+                    }[];
                     /**
                      * @description The shapes the form was built from, when not the setting's.
                      * @enum {string}
@@ -14855,7 +14890,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         branch: string;
-                        /** @description `{id, now}` of each changed field whose stored values differ from `expect`. */
+                        /** @description `{id, node?, now}` of each changed field whose stored values differ from `expect`, with the nested `node` it belongs to, and of each parent field a stored child no longer hangs from. */
                         conflicts: Record<string, never>[];
                         /** @description The dry run, as a write preview answers it. */
                         preview: Record<string, never>;
@@ -14890,14 +14925,18 @@ export interface operations {
                     /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
                     branch?: string;
                     changes: {
+                        /** @description Values to add. A blank node is a new child that `nested` describes. */
                         add?: Record<string, never>[];
                         /** @description The field's id, its path in SPARQL syntax. */
                         field: string;
+                        /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                        list?: Record<string, never>[];
+                        /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
                         remove?: Record<string, never>[];
                     }[];
                     /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
                     class?: string;
-                    /** @description The values the form loaded, by field id, for every changed field. */
+                    /** @description The values the form loaded, by field id, for every changed field, and for a list field the members of its list in order. */
                     expect?: {
                         [key: string]: Record<string, never>[];
                     };
@@ -14905,6 +14944,29 @@ export interface operations {
                     focus?: string;
                     /** @description The commit message. */
                     message?: string;
+                    /** @description Changes to nested blank-node children, committed atomically with `changes`. Each entry names its `node`, the `parent` it hangs from (absent for the root, else another entry's node) and the parent's `field`. A stored child must be a visible value of that field now, and every node between it and the root needs an entry. */
+                    nested?: {
+                        changes?: {
+                            /** @description Values to add. A blank node is a new child that `nested` describes. */
+                            add?: Record<string, never>[];
+                            /** @description The field's id, its path in SPARQL syntax. */
+                            field: string;
+                            /** @description For a list field, the members its `rdf:List` takes in order, replacing the stored list. `remove` and `add` stay empty. */
+                            list?: Record<string, never>[];
+                            /** @description Values to remove. A stored blank node of a field that declares `sh:node` also removes the child's visible quads when nothing else refers to it. */
+                            remove?: Record<string, never>[];
+                        }[];
+                        /** @description For a stored child, the values the form loaded for every changed field. */
+                        expect?: {
+                            [key: string]: Record<string, never>[];
+                        };
+                        /** @description The parent's field id. */
+                        field: string;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        node: Record<string, never>;
+                        /** @description A term in the SPARQL JSON results form: `{"type": "uri", "value": …}` or `{"type": "literal", "value": …, "datatype"?: …, "xml:lang"?: …}`. A blank node `{"type": "bnode", "value": label}` names a nested child: a stored one by the label the nested model gives it, or a new one that `nested` describes. */
+                        parent?: Record<string, never>;
+                    }[];
                     /**
                      * @description The shapes the form was built from, when not the setting's.
                      * @enum {string}

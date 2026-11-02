@@ -51,14 +51,7 @@ pub fn field_changes_from_json(v: Option<&J>, what: &str) -> Result<Vec<FieldCha
         let o = c
             .as_object()
             .ok_or_else(|| invalid(format!("{what}[{i}]: an object of field, remove and add")))?;
-        if let Some(k) = o
-            .keys()
-            .find(|k| !matches!(k.as_str(), "field" | "remove" | "add" | "list"))
-        {
-            return Err(invalid(format!(
-                "{what}[{i}]: unknown member '{k}': field, remove, add and list"
-            )));
-        }
+        // other members are ignored, as they were before list changes
         let field = o
             .get("field")
             .and_then(J::as_str)

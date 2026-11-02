@@ -829,6 +829,11 @@ async fn nested_children_lists_and_alternatives_over_http() {
     assert_eq!(nodes.len(), 1);
     let label = nodes[0]["term"]["value"].as_str().unwrap().to_string();
     assert_eq!(nodes[0]["anchors"][0]["parent"], "root");
+    // a template names its shapes in `node`, apart from the model's own `shapes`
+    let templates = m["templates"].as_array().unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0]["node"], json!([format!("<{EX}XLabel>")]));
+    assert!(templates[0]["shapes"]["nodeShapes"].is_array());
     let xl = "<http://www.w3.org/2008/05/skos-xl#prefLabel>";
     let form = "<http://www.w3.org/2008/05/skos-xl#literalForm>";
     let cats = |v: &str| json!({ "type": "literal", "value": v, "xml:lang": "en" });

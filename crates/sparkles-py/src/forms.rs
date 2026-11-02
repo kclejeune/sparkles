@@ -216,6 +216,7 @@ mod imp {
         at: Option<&Bound<'py, PyAny>>,
         lang: Option<String>,
         writable: bool,
+        nested: bool,
         timeout: Option<f64>,
         cancel: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -249,6 +250,10 @@ mod imp {
         req.lang = lang;
         req.writable = writable;
         let (opts, flag) = options(timeout, cancel, None)?;
+        if nested {
+            let model = interrupt::run(py, &flag, move || ds.forms().nested_model(&req, &opts))?;
+            return admin::to_py(py, &model);
+        }
         let model = interrupt::run(py, &flag, move || ds.forms().model(&req, &opts))?;
         admin::to_py(py, &model)
     }
@@ -464,8 +469,10 @@ impl PyForms {
     /// setting (`shapes`, `graphs`, `targetGraph`, `newIri` and the others), with
     /// `shapes` choosing between `guard`, `graphs` and `drafted`. `at` opens the form at
     /// a past state, which is never editable. `writable=False` makes every field
-    /// read-only. Returns the model as a dict.
-    #[pyo3(signature = (focus = None, *, class_ = None, settings = None, at = None, lang = None, writable = true, timeout = None, cancel = None))]
+    /// read-only. `nested=True` also returns the blank-node children that fields
+    /// declaring `sh:node` reach (`nestedNodes`) and the empty forms of new children
+    /// (`templates`). Returns the model as a dict.
+    #[pyo3(signature = (focus = None, *, class_ = None, settings = None, at = None, lang = None, writable = true, nested = false, timeout = None, cancel = None))]
     #[allow(clippy::too_many_arguments)]
     fn model<'py>(
         &self,
@@ -476,6 +483,7 @@ impl PyForms {
         at: Option<&Bound<'py, PyAny>>,
         lang: Option<String>,
         writable: bool,
+        nested: bool,
         timeout: Option<f64>,
         cancel: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -483,13 +491,13 @@ impl PyForms {
         #[cfg(feature = "shacl")]
         {
             imp::model(
-                py, ds, focus, class_, settings, at, lang, writable, timeout, cancel,
+                py, ds, focus, class_, settings, at, lang, writable, nested, timeout, cancel,
             )
         }
         #[cfg(not(feature = "shacl"))]
         {
             let _ = (
-                ds, focus, class_, settings, at, lang, writable, timeout, cancel,
+                ds, focus, class_, settings, at, lang, writable, nested, timeout, cancel,
             );
             Err(missing(py))
         }

@@ -373,3 +373,65 @@ def test_a_bad_timeout_and_cancel_are_refused(ds: Dataset) -> None:
     assert ds.forms.model(EX + "alice", settings=SETTINGS, timeout=60)["editable"] is True
     with pytest.raises(TypeError):
         ds.forms.model(EX + "alice", settings=SETTINGS, cancel=object())  # type: ignore[arg-type]
+
+
+XL_SHAPES = """
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://ex.org/> .
+ex:ConceptShape a sh:NodeShape ; sh:targetClass ex:Concept ;
+  sh:property [ sh:path ex:label ; sh:node ex:Label ; sh:nodeKind sh:BlankNode ] ;
+  sh:property [ sh:path ex:members ; sh:memberShape [ sh:class ex:Concept ] ] .
+ex:Label sh:property [ sh:path ex:form ; sh:minCount 1 ; sh:maxCount 1 ] .
+"""
+
+
+def test_nested_children_and_lists_are_edited_in_one_save() -> None:
+    d = Dataset()
+    d.update(
+        f'INSERT DATA {{ <{EX}c> a <{EX}Concept> ; <{EX}label> [ <{EX}form> "Cats" ] ; '
+        f"<{EX}members> ( <{EX}c> <{EX}d> ) . <{EX}d> a <{EX}Concept> . }}"
+    )
+    d.load(XL_SHAPES, "turtle", to_graph="urn:shapes")
+    m = d.forms.model(EX + "c", settings=SETTINGS, nested=True)
+    assert [t["node"] for t in m["templates"]] == [[f"<{EX}Label>"]]
+    (child,) = m["nestedNodes"]
+    assert child["anchors"][0]["parent"] == "root"
+    members = next(f for f in m["fields"] if f["id"] == f"<{EX}members>")
+    assert members["widget"] == "list"
+    items = [i["term"] for i in members["values"][0]["items"]]
+    assert [i["value"] for i in items] == [EX + "c", EX + "d"]
+    flat = d.forms.model(EX + "c", settings=SETTINGS)
+    assert "nestedNodes" not in flat
+
+    label = f"<{EX}label>"
+    form = f"<{EX}form>"
+    node = child["term"]
+    # a new child is a blank node that the parent field adds and a nested entry describes
+    saved = d.forms.save(
+        {
+            "focus": EX + "c",
+            "changes": [
+                {"field": f"<{EX}members>", "list": [items[1], items[0]]},
+                {"field": label, "add": [{"type": "bnode", "value": "n1"}]},
+            ],
+            "expect": {f"<{EX}members>": items, label: [node]},
+            "nested": [
+                {
+                    "node": node,
+                    "field": label,
+                    "changes": [{"field": form, "remove": [lit("Cats")], "add": [lit("Felines")]}],
+                    "expect": {form: [lit("Cats")]},
+                },
+                {
+                    "node": {"type": "bnode", "value": "n1"},
+                    "field": label,
+                    "changes": [{"field": form, "remove": [], "add": [lit("Chats")]}],
+                },
+            ],
+        },
+        settings=SETTINGS,
+    )
+    assert saved["committed"] is True
+    forms = d.query(f"SELECT ?f WHERE {{ <{EX}c> <{EX}label>/<{EX}form> ?f }} ORDER BY ?f")
+    assert [str(r["f"].value) for r in forms] == ["Chats", "Felines"]
+    assert d.query(f"ASK {{ <{EX}c> <{EX}members> (<{EX}d> <{EX}c>) }}")

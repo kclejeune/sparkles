@@ -116,7 +116,7 @@ fn a_concept_form_lists_skos_fields_and_saves_them_atomically() {
     assert_eq!(root.fields[0].label, "Preferred label");
     // a new SKOS-XL label takes the template of its field's sh:node shapes
     assert_eq!(m.templates.len(), 1);
-    assert_eq!(m.templates[0].shapes, vec![format!("<{EX}XLabel>")]);
+    assert_eq!(m.templates[0].node, vec![format!("<{EX}XLabel>")]);
     assert_eq!(
         m.templates[0].model.fields[0].id,
         id(&format!("{XL}literalForm"))

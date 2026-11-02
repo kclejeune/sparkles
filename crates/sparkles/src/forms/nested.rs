@@ -104,8 +104,9 @@ pub struct NestedFormModel {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NestedTemplate {
-    /// the shapes as the field's `constraints.node` names them
-    pub shapes: Vec<String>,
+    /// the shapes as the field's `constraints.node` names them; the member is `node`
+    /// because the flattened model already has a `shapes` member
+    pub node: Vec<String>,
     #[serde(flatten)]
     pub model: FormModel,
 }
@@ -440,7 +441,7 @@ impl Built {
             declared(&child.layout, &mut sets)?;
             let model = child.model(writable, branch)?;
             out.push(NestedTemplate {
-                shapes: sets[i]
+                node: sets[i]
                     .iter()
                     .map(|s| self.shapes.shapes()[*s].node.to_string())
                     .collect(),
