@@ -95,6 +95,16 @@ partially complete while adopted requirements remain. Building an application on
 usable subset does not waive those requirements. Correctness, recovery, bounded
 resources and source identity go ahead of unrelated feature expansion.
 
+### Release
+
+The first release needs its artifacts and the workflows that produce them. Item 479 sets
+the first-release format cutoff, item 59 publishes the server binaries and container
+images, item 58 publishes the packages to PyPI, Maven Central and npm, and item 61
+completes backup. These items take free capacity alongside the waves below. The later
+encryption phases of item 65, security and audit in item 466, the developer ecosystem of
+items 468 and 47, notifications in item 46, the per-crate Nix builds of item 92 and the
+replication refresh of item 280 follow the first release.
+
 ### Wave A: engine quality
 
 Wave A holds the work that most improves the engine against objective measures.
