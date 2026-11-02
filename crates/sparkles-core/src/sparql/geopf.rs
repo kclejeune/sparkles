@@ -1101,7 +1101,7 @@ mod on {
         }
         let Some(slot) = view.predicate_slot(shape.pred) else {
             let p = ctx
-                .term(shape.pred)
+                .plan_term(shape.pred)
                 .map_or_else(|| "?".into(), |t| short(&t));
             not_pushed(&format!("{p} is not an indexed predicate"));
             return (n, exprs);
@@ -1158,7 +1158,7 @@ mod on {
                 .iter()
                 .map(|v| format!("?{} ", ctx.var_name(*v)))
                 .collect::<String>(),
-            ctx.term(shape.pred)
+            ctx.plan_term(shape.pred)
                 .map_or_else(|| "?".into(), |t| short(&t)),
             atoms
                 .iter()
