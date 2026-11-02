@@ -174,7 +174,10 @@ private class ReadThroughGraph(
             emptyList()
         } else {
             synchronized(this) {
-                copy.find(ms, mp, mo).toList() + journal.filter { it.matches(ms, mp, mo) }
+                val found = copy.find(ms, mp, mo).toList()
+                // a predecessor's noted triples may be missing from the copy until settled;
+                // the caller's own stay noted
+                if (pending === dataset.txn()) found else found + journal.filter { it.matches(ms, mp, mo) }
             }
         }
         target.remove(s, p, o)
