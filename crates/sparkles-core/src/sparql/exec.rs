@@ -5518,11 +5518,26 @@ fn anti_join(
 
 // ------------------------------------------------------------ expressions ------
 
+/// Row-aligned decoded value columns with the charge that holds their slots and values.
+struct Decoded {
+    cols: super::expr::DecodedCols,
+    _charge: Option<super::ctx::RetainedCharge>,
+}
+
+impl Decoded {
+    fn cols(decoded: &Option<Decoded>) -> Option<&super::expr::DecodedCols> {
+        decoded.as_ref().map(|d| &d.cols)
+    }
+}
+
 /// Decode the base-vocabulary ids of the columns the expressions read into row-aligned
-/// value columns: rows are argsorted by id so every distinct term is decoded once and
-/// each front-coded block is touched once (in parallel); per-row lookups are then O(1)
-/// and lock-free.
-fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::DecodedCols> {
+/// value columns for a table of more than [`PAR_THRESHOLD`] rows: rows are argsorted by
+/// id so every distinct term is decoded once and each front-coded block is touched once
+/// (in parallel); per-row lookups are then O(1) and lock-free. A smaller table, such as
+/// a cursor's batch, reads its values through the value cache row by row. Each column's
+/// slots are charged before it is decoded and its values after, and a column whose
+/// charge does not fit is left to the rows, as are the columns after it.
+fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
     if t.len() < 2 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
         return None;
     }
@@ -5541,11 +5556,31 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
         }
         return None;
     }
-    if ctx.is_cursor() {
+    if t.len() <= PAR_THRESHOLD {
         return None;
     }
     let vocab = &ctx.snap.generation.vocab;
     let mut out: super::expr::DecodedCols = vec![None; t.width()];
+    let mut charge: Option<super::ctx::RetainedCharge> = None;
+    let mut charged = 0u64;
+    // `false` when the query cannot hold `bytes` more
+    let mut grow = |bytes: u64| -> bool {
+        let total = charged.saturating_add(bytes);
+        let fits = match &mut charge {
+            Some(charge) => charge.resize(total).is_ok(),
+            None => match ctx.retained_charge(total) {
+                Ok(c) => {
+                    charge = c;
+                    true
+                }
+                Err(_) => false,
+            },
+        };
+        if fits {
+            charged = total;
+        }
+        fits
+    };
     for v in vars {
         let Some(c) = t.col_of(v) else { continue };
         let col = &t.cols[c];
@@ -5554,6 +5589,11 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
             .collect();
         if idx.len() < 4096 {
             continue;
+        }
+        // the column's slots, and the sorted rows with their distinct ids while it is made
+        let slots = col.len() as u64 * std::mem::size_of::<Option<Value>>() as u64;
+        if !grow(slots.saturating_add(idx.len() as u64 * 12)) {
+            break;
         }
         idx.par_sort_unstable_by_key(|&i| col[i as usize]);
         let mut uniq: Vec<u64> = idx.iter().map(|&i| col[i as usize].payload()).collect();
@@ -5578,9 +5618,21 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
                 vals[i as usize] = Some(decoded[j].clone());
             }
         }
+        let payload: u64 = vals
+            .par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(key_payload)
+            .sum();
+        if !grow(payload.saturating_sub(idx.len() as u64 * 12)) {
+            break;
+        }
         out[c] = Some(vals);
     }
-    Some(out)
+    drop(grow);
+    Some(Decoded {
+        cols: out,
+        _charge: charge,
+    })
 }
 
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
@@ -5717,7 +5769,7 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
             table: t,
             i,
             map: &map,
-            dec: dec.as_ref(),
+            dec: Decoded::cols(&dec),
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
@@ -5759,9 +5811,7 @@ fn string_order_mask(
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
         return Ok(None);
     };
-    // A cursor's batch would rebuild the cache for each batch. Its rows compare their
-    // two keys directly instead (see `val_cmp`).
-    if n < STRING_ORDER_ROWS || ctx.is_cursor() {
+    if n < STRING_ORDER_ROWS {
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
@@ -5865,7 +5915,7 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
             table: t,
             i,
             map: &map,
-            dec: dec.as_ref(),
+            dec: Decoded::cols(&dec),
         },
         ctx,
     ) {
@@ -6440,7 +6490,7 @@ fn key_per_value(
         return Ok(None);
     }
     let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-        key_rows(ctx, v, e, decode_for(ctx, v, &[e]).as_ref())
+        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])))
     })?;
     // The distinct keys' payloads stay with them until the sort is done.
     if let Some(values) = &mut values {
@@ -6465,7 +6515,7 @@ fn key_column(
     Ok(match key_per_value(ctx, t, e, report)? {
         Some(p) => super::exprcache::Column::Values(p),
         None if t.len() <= PAR_THRESHOLD => key_column_charged(ctx, t, e, None)?,
-        None => key_column_charged(ctx, t, e, decode_for(ctx, t, &[e]).as_ref())?,
+        None => key_column_charged(ctx, t, e, Decoded::cols(&decode_for(ctx, t, &[e])))?,
     })
 }
 
@@ -6505,7 +6555,7 @@ fn order_by_rows(
         .map(|((e, _), c)| {
             Ok(match c {
                 Some(p) => super::exprcache::Column::Values(p),
-                None => key_column_charged(ctx, &t, e, dec.as_ref())?,
+                None => key_column_charged(ctx, &t, e, Decoded::cols(&dec))?,
             })
         })
         .collect::<Result<_>>()?;

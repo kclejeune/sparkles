@@ -566,10 +566,18 @@ than reading every row of the pieces first. `sorts_agree_on_both_sides_of_the_th
 compares full sorts and top k over 8,192 and 32,768 rows eagerly and in cursors with
 batches on both sides of the threshold.
 
+The sorted pre-decode of the columns that row-by-row FILTER, BIND and ORDER BY
+evaluation reads runs for inputs of more than 16,384 rows in both modes, and smaller
+inputs read their values through the value cache. Each decoded column's slots are
+charged before it is decoded and its values after, and a column whose charge does not
+fit is left to the rows. The comparison of two string columns through cached
+lexicographic floors needs only its 4,096-row minimum, so a cursor batch can use it.
+
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 calls of `is_cursor()` outside tests and fails above its bound, which each step lowers. It
-was 26 after the regular expressions, 17 after per-value reuse and is 7 after the sort
-keys. The rest of item
+was 26 after the regular expressions, 17 after per-value reuse, 7 after the sort keys and
+is 5 after the decoded columns. The five are the planning and routing choices that stage 6
+removes and the accumulation of an EXISTS key set across a cursor's batches. The rest of item
 NEW-ITEM-4 merges the remaining `cursor_*` twins.
 
 ### Measurements of stage 1
