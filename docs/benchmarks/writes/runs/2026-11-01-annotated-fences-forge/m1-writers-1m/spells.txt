@@ -1,0 +1,9 @@
+text b1 A samples=124 fast=0% mid=100% slow=0% q10..q90=0.70 0.72 0.75 0.78 0.82 fast runs=0 longest(s)=
+text b2 A samples=642 fast=10% mid=90% slow=0% q10..q90=0.41 0.52 0.71 0.77 0.81 fast runs=3 longest(s)=5.9@6 0.4@48 0.1@13
+text b2 B samples=276 fast=21% mid=2% slow=78% q10..q90=0.20 1.23 1.50 1.53 1.59 fast runs=1 longest(s)=5.7@6
+text b2 B samples=271 fast=21% mid=1% slow=78% q10..q90=0.20 1.23 1.50 1.52 1.61 fast runs=1 longest(s)=5.8@3
+text b2 A samples=579 fast=16% mid=84% slow=0% q10..q90=0.11 0.64 0.67 0.70 0.73 fast runs=2 longest(s)=7.3@2 1.8@42
+text b3 A samples=801 fast=4% mid=95% slow=0% q10..q90=0.55 0.67 0.70 0.74 0.80 fast runs=4 longest(s)=1.8@1 1.4@79 0.2@70 0.1@78
+text b3 B samples=347 fast=6% mid=32% slow=61% q10..q90=0.45 0.73 1.40 1.53 1.59 fast runs=4 longest(s)=1.8@9 0.2@3 0.1@2 0.1@1
+text b3 B samples=274 fast=20% mid=4% slow=75% q10..q90=0.20 1.03 1.49 1.52 1.60 fast runs=1 longest(s)=5.6@2
+text b3 A samples=684 fast=16% mid=80% slow=4% q10..q90=0.11 0.63 0.70 0.75 0.82 fast runs=5 longest(s)=7.7@1 3.2@40 0.1@28 0.1@9 0.1@1

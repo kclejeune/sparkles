@@ -337,10 +337,15 @@ the gain in the drive's slow state, where six flushing processes took 1.48 to 1.
 fence and committed 1,157 to 1,287 transactions/s, and every write-through process took
 0.58 to 0.64 ms and committed 2,458 to 2,681. In the fast state four flushing processes
 took 0.44 to 0.67 ms a fence and committed 2,566 to 3,754 transactions/s. Three of them
-outran every write-through process, and their pairs have ratios of 0.69 to 0.73. No
-write-through process ran with fences that short, because each fence's write-through
-writes took about 0.47 ms under this load. [Roadmap](../../ROADMAP.md) item 502
-measures write-through fences with the drive held in each state. In the full-text cell
+outran every write-through process, and their pairs have ratios of 0.69 to 0.73. These
+campaigns kept only each process's means, so they cannot show how long the drive stayed in
+each state. The reading that the data fit is that those flushing processes ran wholly in
+the drive's fast state, while the device time of 0.47 ms per write-through write is the
+mean of processes in which the drive spent part of the time in each state. The
+[fence probes](#fences-in-each-drive-state) measured both shapes with the drive in each
+state and found write-through fences faster in both. The fence histograms and device
+samples of the [annotation record runs](#written-through-annotation-records) show
+write-through processes that spend part of their time in each state. In the full-text cell
 the write-through fences of eight processes took 1.10 to 1.48 ms, with device writes of
 0.76 to 1.20 ms each, and the paired gain is 1.020. Serial commits take the ordinary path
 with both builds and kept their latency. Their p90 medians differ because one flushing
@@ -354,6 +359,73 @@ drive in its slow state, where an ordinary write-through commit synchronized in 
 dataset, a paired ratio of 2.135, and 1,433 against 726 on the full-text dataset, a paired
 ratio of 1.927, both above the required 1.5. The certified peak resident memory
 differences were 1.4 and 7.3 MiB, under the limit of 64 MiB.
+
+#### Fences in each drive state
+
+Probe runs on `forge` measured the two fence shapes outside the engine. A write-through
+fence wrote one 4 KiB block in each of two files through `O_DIRECT` and `O_DSYNC` handles
+in parallel, and a flushing fence wrote the same blocks with buffered writes and ran
+`fdatasync` of both files in parallel. Two runs alternated the shapes every second, so that
+neighbouring seconds shared the drive's state, and each pair counts in a state when both of
+its seconds were in it. The [run record](runs/2026-11-01-fence-probe-forge/README.md) holds
+the probe, its schedules, its output and the drive's power and thermal state.
+
+| State | Pairs | Write-through fence (ms) | Flushing fence (ms) | Paired ratio | Write-through faster |
+|---|---:|---:|---:|---:|---:|
+| Fast | 14 | 0.241 | 0.342 | 0.704 | 14 |
+| Slow | 332 | 1.612 | 1.701 | 0.944 | 308 |
+
+In the fast state a write-through write took 0.20 ms on the device, and the two writes of a
+fence overlapped, so the fence took no longer than one write. A flushing fence's writes
+took 0.13 ms and its flushes 0.24 ms. In the slow state every write-through write and every
+flush took about 1.5 ms. The drive spent most of each run in its slow state, and its fast
+spells lasted 5 to 14 seconds, often after an idle period but not always. Its thermal
+management counters stayed at zero. Write-through fences are faster in both states, so
+fences keep writing through.
+
+#### Written-through annotation records
+
+A fence's leader now writes its commits' messages and digests to `annotations.bin` through
+the `O_DIRECT` and `O_DSYNC` handle as well, instead of synchronizing the file with
+`fdatasync`. These campaigns ran on `forge` with release builds of commit `4bd70845`,
+whose fences synchronize the file, and of commit `4082759b`, whose fences write the records
+through. The later commits of the item add one mutex acquisition and one atomic addition to
+each fence for the quota's count of preallocated zeros. Every commit carried a commit
+message. Each campaign had blocks of four processes at 1.05M, in the order A, B, B, A, under the host's heavy-job lock with nothing else
+running. The [run record](runs/2026-11-01-annotated-fences-forge/README.md) holds the
+results, the per-process counters of `/proc/diskstats` and the process list at the start of
+each campaign.
+
+| Cell | Measurement | Synchronized records | Written-through records | Paired ratio |
+|---|---|---:|---:|---:|
+| Spatial, four grouped writers | tx/s | 833 (613–857) | 1,735 (1,499–1,861) | 2.102 |
+| Spatial, four grouped writers | Fence time (ms) | 2.31–3.24 | 0.95–1.23 | 0.427 |
+| Full-text, four grouped writers | tx/s | 787 (622–860) | 1,772 (1,237–1,833) | 2.214 |
+| Full-text, four grouped writers | Fence time (ms) | 2.28–3.16 | 0.95–1.53 | 0.407 |
+| Spatial, serial literal inserts | p50 and p90 (ms) | 1.855, 4.691 | 0.692, 0.737 | 0.618, 0.627 |
+
+A fence that synchronized the records issued 0.50 to 0.53 device cache flushes per commit,
+one for each fence, and a fence that writes them through 0.001 to 0.005. The paired p50 and
+p90 latency ratios of the grouped writers are 0.480 and 0.478 on the spatial dataset and
+0.483 and 0.482 on the full-text dataset. The peak resident memory medians were 186.3 and
+219.4 MiB with written-through records and 193.9 and 230.4 MiB with synchronized ones.
+Serial commits take the ordinary path, which now writes its record through before the
+commit's log records instead of synchronizing the file. They issued 0.005 to 0.007 cache
+flushes per commit instead of 1.105 to 1.109, and their paired transactions/s ratio is
+1.669. Their peak resident memory medians were 127.7 MiB with written-through records and
+131.5 MiB with synchronized ones.
+
+The fence times of a process fall in two groups. Every process with written-through
+records had 17 to 57 percent of its fences under 0.5 ms and 42 to 80 percent between 1 and
+2.5 ms, with at most 9.1 percent between the two. These are the fence times of the
+[fence probes](#fences-in-each-drive-state) in the drive's fast and slow states. Samples of
+`/proc/diskstats` every 100 ms through the third and fourth blocks of the full-text cell
+show when the drive changed state. In three of the four sampled processes with
+written-through records, a write took 0.20 ms on the device for one spell of 5.6 to 5.8
+seconds that began within 6 seconds of the process's first commit, and about 1.5 ms for the
+rest of the process. The fourth had a spell of 1.8 seconds and spent a third of its samples
+between the two states. A process's mean fence time and device time per write therefore
+lie between the two states and match neither.
 
 #### Limits of these runs
 

@@ -58,8 +58,8 @@ pub(super) struct Pending {
     pub validation: Option<Arc<crate::guard::ValidationSummary>>,
     /// the commit's message and change digest
     pub annotation: crate::annotations::Annotation,
-    /// the annotations file, when this commit's record in it is not synced yet
-    pub ann_file: Option<Arc<File>>,
+    /// the commit's record in the annotations file, which the leader of its fence writes
+    pub ann: Option<crate::annotations::Queued>,
     /// the commit's full-text changes, applied to the live index at publication
     #[cfg(feature = "text")]
     pub text: Option<crate::text::Staged>,
@@ -112,6 +112,10 @@ pub(super) struct Coordinator {
     /// fences whose records went through the log's write-through handle
     #[cfg(test)]
     direct_fences: AtomicUsize,
+    /// fences whose annotation records went through the annotations file's write-through
+    /// handle
+    #[cfg(test)]
+    ann_direct_fences: AtomicUsize,
     /// times a waiter parked with its commit still pending
     #[cfg(test)]
     parks: AtomicUsize,
@@ -373,30 +377,10 @@ impl Coordinator {
         let injected = self.fail_next_sync.swap(false, Ordering::AcqRel);
         #[cfg(not(any(test, feature = "failpoints")))]
         let injected = false;
-        let ann_file = batch.iter().rev().find_map(|p| p.ann_file.clone());
-        let write = || store.write_prefix(&batch, &mut self.vocab.lock());
         let synced = if injected {
             Err(std::io::Error::from_raw_os_error(5).into())
-        } else if let Some(ann) = ann_file {
-            // the annotations of the commits are synced with their records and terms
-            std::thread::scope(|sc| {
-                let annotations = std::thread::Builder::new()
-                    .name("annotations-sync".into())
-                    .spawn_scoped(sc, || {
-                        store.failpoint("group-annotations-syncing");
-                        ann.sync_data()
-                    });
-                let log = write();
-                let annotations = match annotations {
-                    Ok(h) => h.join().unwrap_or_else(|_| {
-                        Err(std::io::Error::other("the annotations sync panicked"))
-                    }),
-                    Err(_) => ann.sync_data(),
-                };
-                log.and_then(|direct| annotations.map(|()| direct).map_err(Error::from))
-            })
         } else {
-            write()
+            store.write_prefix(&batch, &mut self.vocab.lock())
         };
         store
             .commit_stats
@@ -540,6 +524,9 @@ impl Store {
     /// pages reach the disk in any order.
     fn write_prefix(&self, batch: &[Pending], worker: &mut crate::vocab::LazySync) -> Result<bool> {
         let (first, last) = (&batch[0], batch.last().expect("nonempty sealed prefix"));
+        // the annotation records of the prefix's commits, in commit order
+        let anns: Vec<&crate::annotations::Queued> =
+            batch.iter().filter_map(|p| p.ann.as_ref()).collect();
         let generation = &last.snapshot.generation;
         let dvocab = &generation.dvocab;
         let upto = last.snapshot.dvocab_len;
@@ -574,19 +561,34 @@ impl Store {
             .map(|d| d.join("wal.log"));
         // The preallocation was allowed when the last commit queued, before the commits
         // still queued around this prefix were counted. The log and the vocabulary each
-        // preallocate after the whole prefix, so the reserve must hold that as well as
-        // every queued commit's bytes (this prefix's among them), or neither preallocates.
-        // The fence promises the space before it checks, and a commit queued meanwhile
-        // counts the promise, until the write below is done.
-        let promise =
-            (last.prealloc > 0).then(|| self.quota.promise(2 * last.prealloc.saturating_add(4096)));
+        // preallocate after the whole prefix, and so does the annotations file when the
+        // prefix has records for it, so the reserve must hold that as well as every
+        // queued commit's bytes (this prefix's among them), or none preallocates. The
+        // fence promises the space before it checks, and a commit queued meanwhile counts
+        // the promise, until the write below is done.
+        let ann_prealloc = if anns.is_empty() {
+            0
+        } else {
+            crate::annotations::MAX_PREALLOC
+        };
+        let promise = (last.prealloc > 0).then(|| {
+            self.quota.promise(
+                2 * last.prealloc.saturating_add(4096)
+                    + if ann_prealloc > 0 {
+                        ann_prealloc + 4096
+                    } else {
+                        0
+                    },
+            )
+        });
         let promise = promise.filter(|_| self.check_disk(self.quota.unwritten()).is_ok());
         let prealloc = if promise.is_some() { last.prealloc } else { 0 };
+        let ann_prealloc = if promise.is_some() { ann_prealloc } else { 0 };
         dvocab.set_prealloc(prealloc);
         self.failpoint("group-preallocating");
         let measures = self.quota.measures();
         let (alloc_before, vocab_before) = (io.alloc, dvocab.allocated());
-        let written = (|| -> Result<bool> {
+        let mut log_write = || -> Result<bool> {
             if wal::DirectLog::fits(at, data.len(), io.alloc)
                 && let Some(direct) = io.direct.handle(path.as_deref(), &last.wal)
             {
@@ -603,16 +605,60 @@ impl Store {
             wal::write_commit(&last.wal, at, &mut io.alloc, data, prealloc)?;
             sync_commit_reused(&last.wal, dvocab, worker, upto)?;
             Ok(false)
-        })();
+        };
+        // The prefix's annotation records are written at the same time as its records and
+        // terms, through the annotations file's write-through handle when they fit in its
+        // preallocated zeros (X09 item 501). The commits are acknowledged only once all
+        // three writes are durable, and each commit record that expects an annotation
+        // says so, so a crash between the writes leaves a torn tail (see `annotations`).
+        let (written, ann_written) = if anns.is_empty() {
+            (log_write(), None)
+        } else {
+            let write_anns = || {
+                self.failpoint("group-annotations-writing");
+                crate::annotations::write_queued(&anns, ann_prealloc)
+            };
+            std::thread::scope(|sc| {
+                let ann = std::thread::Builder::new()
+                    .name("annotations-write".into())
+                    .spawn_scoped(sc, write_anns);
+                let log = log_write();
+                let ann = match ann {
+                    Ok(h) => h.join().unwrap_or_else(|_| {
+                        Err(std::io::Error::other("the annotations write panicked").into())
+                    }),
+                    Err(_) => write_anns(),
+                };
+                (log, Some(ann))
+            })
+        };
         tail.release(&io);
-        let direct = written?;
+        // every change of the annotations file reaches the quota, a failed write's too
+        let ann_prealloc = (!anns.is_empty()).then(|| anns[0].tail.take_prealloc());
+        let failed = |_: &Error| {
+            if let Some((was, now)) = ann_prealloc {
+                self.quota.move_ann_preallocated(was, now);
+                self.quota.invalidate();
+            }
+        };
+        let direct = written.inspect_err(failed)?;
+        let ann_written = ann_written.transpose().inspect_err(failed)?;
+        #[cfg(test)]
+        if ann_written.is_some_and(|w| w.direct)
+            && let Some(g) = &self.group
+        {
+            g.ann_direct_fences.fetch_add(1, Ordering::Relaxed);
+        }
         self.failpoint("group-written");
         io.end = last.wal_end;
         self.quota.written(
             batch.iter().map(|p| &p.reserved),
-            (io.alloc - alloc_before) + dvocab.allocated().saturating_sub(vocab_before),
+            (io.alloc - alloc_before)
+                + dvocab.allocated().saturating_sub(vocab_before)
+                + ann_written.map_or(0, |w| w.grew),
             io.alloc - io.end,
             dvocab.preallocated(),
+            ann_prealloc,
         );
         // the growth is on disk now
         drop(promise);
@@ -701,7 +747,9 @@ impl WriteTxn<'_> {
         // so that the check of a racing fence's preallocation sees them, or this check
         // sees its promise (see `Quota::unwritten`).
         let terms = generation.dvocab.key_bytes(self.mark.entries());
-        let reserved = store.quota.reserve(bytes + terms);
+        // So does the commit's annotation record, which its fence writes too.
+        let ann_bytes = crate::annotations::record_len(message.as_deref(), store.commit_digests());
+        let reserved = store.quota.reserve(bytes + terms + ann_bytes);
         self.check_storage_for(self.net_ins > 0, 0)?;
         let c = self.next_commit(validation.as_deref());
         let mut snapshot = Snapshot {
@@ -770,13 +818,12 @@ impl WriteTxn<'_> {
             .expect("persistent grouped transaction")
             .get_ref()
             .try_clone()?;
-        // The annotation record is written, not synced, before the fence writes the WAL
-        // records: the fence syncs both files, and the commit record says an annotation is
-        // expected. Nothing after this takes the commit back without poisoning the writer,
-        // and a failed fence poisons it too, so the record is never taken back: if the
-        // commit is recovered, its annotation is there.
-        let (annotation, ann_file) =
-            store.annotate_unsynced(&c, message, || Some(self.change_lines()))?;
+        // The annotation record is queued with the WAL records, and the fence writes both:
+        // the commit record says an annotation is expected. Nothing after this takes the
+        // commit back without poisoning the writer, and a failed fence poisons it too, so
+        // the record is never taken back: if the commit is recovered, its annotation is
+        // there.
+        let (annotation, ann) = store.annotate_queued(&c, message, || Some(self.change_lines()))?;
         let family = self.guard.family.clone();
         let w = &mut **self.guard;
         let mut data = Vec::with_capacity(bytes as usize);
@@ -799,7 +846,7 @@ impl WriteTxn<'_> {
                 commit::WAL_FLAG_UNVALIDATED
             } else {
                 0
-            }) | (if ann_file.is_some() {
+            }) | (if ann.is_some() {
                 commit::WAL_FLAG_ANNOTATED
             } else {
                 0
@@ -846,7 +893,7 @@ impl WriteTxn<'_> {
             ticket: ticket.clone(),
             validation: validation.clone(),
             annotation: annotation.clone(),
-            ann_file,
+            ann,
             #[cfg(feature = "text")]
             text,
             _family: family,
@@ -887,6 +934,14 @@ mod tests {
             group_commit: true,
             group_commit_idle_direct: false,
             ..Default::default()
+        }
+    }
+    /// [`options`] without the change log, whose background appends grow the directory
+    /// outside any fence, for tests that compare the quota's count with a walk.
+    fn quota_options() -> StoreOptions {
+        StoreOptions {
+            change_log: false,
+            ..options()
         }
     }
     /// A transaction of the kind that may begin from an unsynced group head.
@@ -2456,7 +2511,7 @@ mod tests {
     #[test]
     fn a_quota_walk_during_a_fence_is_not_counted_twice() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let s = Arc::new(Store::open(dir.path(), quota_options()).unwrap());
         s.set_quota(Some(1 << 40)).unwrap();
         s.set_failpoint(
             "group-written",
@@ -2730,7 +2785,7 @@ mod tests {
     #[test]
     fn a_quota_walk_running_across_a_fence_is_not_counted_twice() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let s = Arc::new(Store::open(dir.path(), quota_options()).unwrap());
         s.set_quota(Some(1 << 40)).unwrap();
         let (hit, go) = pause(&s, "group-sealed");
         let fenced = {
@@ -2773,16 +2828,16 @@ mod tests {
     }
 
     /// A fence releases its commits' quota reservations as it counts their growth, in one
-    /// step, even while its annotation synchronization still runs, so no writer's check
-    /// counts the prefix twice meanwhile.
+    /// step, with the growth and preallocation of the annotations file that it wrote too,
+    /// so no writer's check counts the prefix twice or not at all.
     #[test]
     fn a_fence_releases_its_reservation_with_its_growth() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let s = Arc::new(Store::open(dir.path(), quota_options()).unwrap());
         insert(&s, "seed").unwrap();
         let (seen_tx, seen) = mpsc::channel();
         s.set_failpoint(
-            "group-annotations-syncing",
+            "group-synced",
             Some(Arc::new(move |st: &Store| {
                 let until = Instant::now() + Duration::from_secs(2);
                 while st.quota.queued() > 0 && Instant::now() < until {
@@ -4290,9 +4345,130 @@ mod tests {
         assert_eq!(messages, ["message four", "message three", "message two"]);
     }
 
+    /// Branch stores share their dataset's quota, which sums the zeros after the records
+    /// of every store's annotations file, and a close takes them back.
+    #[test]
+    fn the_quota_sums_the_annotation_zeros_of_every_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ds");
+        let s = Store::open(&root, Default::default()).unwrap();
+        kind_insert(
+            &s,
+            CommitKind::Update,
+            message_options("main"),
+            in_graph("a", "urn:g"),
+        )
+        .unwrap();
+        s.create_branch("dev", &Default::default()).unwrap();
+        let dev = s.branch("dev").unwrap();
+        kind_insert(
+            &dev,
+            CommitKind::Update,
+            message_options("dev"),
+            in_graph("b", "urn:g"),
+        )
+        .unwrap();
+        fn files(p: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(p).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    files(&p, out);
+                } else if p.file_name() == Some(std::ffi::OsStr::new(crate::annotations::FILE)) {
+                    out.push(p);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        files(&root, &mut found);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let zeros: Vec<u64> = found
+            .iter()
+            .map(|p| {
+                let b = std::fs::read(p).unwrap();
+                (b.len() - crate::annotations::records_end(&b).unwrap()) as u64
+            })
+            .collect();
+        assert!(zeros.iter().all(|z| *z > 0), "{zeros:?}");
+        assert_eq!(s.quota.ann_preallocated(), zeros.iter().sum::<u64>());
+        drop(dev);
+        drop(s);
+        let s = Store::open(&root, Default::default()).unwrap();
+        assert_eq!(s.quota.ann_preallocated(), 0);
+    }
+
+    /// Once the annotations file has preallocated space, a fence writes its commits'
+    /// annotation records through the write-through handle, as it writes their log
+    /// records, and no longer synchronizes the file (X09 item 501). The records survive a
+    /// reopen, which cuts the preallocated zeros.
+    #[test]
+    fn fences_write_their_annotation_records_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(
+            Store::open(
+                dir.path(),
+                StoreOptions {
+                    commit_digests: true,
+                    ..options()
+                },
+            )
+            .unwrap(),
+        );
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let s = s.clone();
+                thread::spawn(move || {
+                    for k in 0..15 {
+                        let name = format!("w{t}-{k}");
+                        let o = message_options(&format!("message {name}"));
+                        kind_insert(&s, CommitKind::Update, o, in_graph(&name, "urn:g")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let g = s.group.as_ref().unwrap();
+        let (fences, direct, ann_direct) = (
+            g.fences.load(Ordering::Relaxed),
+            g.direct_fences.load(Ordering::Relaxed),
+            g.ann_direct_fences.load(Ordering::Relaxed),
+        );
+        assert!(fences > 0);
+        let path = dir.path().join(crate::annotations::FILE);
+        let bytes = std::fs::read(&path).unwrap();
+        let end = crate::annotations::records_end(&bytes).unwrap();
+        // the log's own write-through fences show that this file system takes direct I/O
+        if direct > 0 {
+            assert!(
+                ann_direct > 0 && ann_direct + 2 >= direct,
+                "{ann_direct} of {fences} fences wrote annotations through, {direct} the log"
+            );
+            assert!(end < bytes.len(), "no preallocated zeros after the records");
+            assert_eq!(s.quota.ann_preallocated(), (bytes.len() - end) as u64);
+        }
+        let messages: Vec<_> = (1..=60)
+            .map(|n| s.annotation(n).unwrap().message.unwrap())
+            .collect();
+        drop(s);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, 60);
+        for (n, m) in (1..=60).zip(&messages) {
+            assert_eq!(reopened.annotation(n).unwrap().message.as_ref(), Some(m));
+            assert!(reopened.annotation(n).unwrap().digest.is_some());
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            end as u64,
+            "the reopen cut the preallocated zeros"
+        );
+    }
+
     /// Commits 2 to 4 of a store with a message each. Commits 3 and 4 queue behind commit
-    /// 2's fence, and the files are copied while the fence is held: the records of all
-    /// three are in them, unsynced. Returns the directory of the copy and the store.
+    /// 2's fence, and the files are copied while the fence is held, when none of the three
+    /// has written anything yet. The log, the vocabulary and the annotations file are
+    /// copied again once the fences are done. Returns the directory of the store and of
+    /// the copy.
     fn annotated_suffix(dir: &Path) -> (PathBuf, PathBuf) {
         let root = dir.join("db");
         let s = Arc::new(Store::open(&root, options()).unwrap());
@@ -4382,14 +4558,20 @@ mod tests {
         if let Err(panic) = copied {
             std::panic::resume_unwind(panic);
         }
-        // Writers leave the log to the leader, so the records of m3 and m4 reach it only
-        // with their own fence. The image is the crash right after that fence's records
-        // and terms were written through and before its annotation sync returned: the log
-        // and vocabulary as they are now, with the annotations file copied mid-fence.
+        // Writers leave the log and the annotations file to the leader, so the records of
+        // m3 and m4 reach them only with their own fence. The image is the crash right
+        // after that fence's writes: the log, the vocabulary and the annotations file as
+        // they are now. The tests take records out of the annotations file to model a
+        // crash between its write and the log's.
         let log = wal_path(&root);
         std::fs::copy(&log, wal_path(&crashed)).unwrap();
         let vocab = log.with_file_name("delta.vocab");
         std::fs::copy(&vocab, wal_path(&crashed).with_file_name("delta.vocab")).unwrap();
+        std::fs::copy(
+            root.join(crate::annotations::FILE),
+            crashed.join(crate::annotations::FILE),
+        )
+        .unwrap();
         (root, crashed)
     }
 
@@ -4397,14 +4579,15 @@ mod tests {
     fn a_commit_that_reached_the_disk_without_its_annotation_is_a_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let (_root, crashed) = annotated_suffix(dir.path());
-        // the records of commits 3 and 4 never reached annotations.bin: 17 bytes each
+        // the records of commits 3 and 4 never reached annotations.bin: 17 bytes each,
+        // before the zeros the file preallocated
         let path = crashed.join(crate::annotations::FILE);
-        let len = std::fs::metadata(&path).unwrap().len();
+        let end = crate::annotations::records_end(&std::fs::read(&path).unwrap()).unwrap();
         OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len(len - 34)
+            .set_len(end as u64 - 34)
             .unwrap();
         // no later record shows commits 3 and 4 were durable: both are cut off, and the
         // check reports it as a torn tail rather than damage
@@ -4435,7 +4618,7 @@ mod tests {
         // the middle record is lost from the file afterwards (17 bytes for each message)
         let path = root.join(crate::annotations::FILE);
         let mut bytes = std::fs::read(&path).unwrap();
-        let first = bytes.len() - 4 * 17;
+        let first = crate::annotations::records_end(&bytes).unwrap() - 4 * 17;
         bytes.drain(first + 17..first + 34);
         std::fs::write(&path, bytes).unwrap();
         // the commit stays, without its message

@@ -1,0 +1,56 @@
+== run1.txt: 390 seconds
+  fl1   slow   seconds=  40 fence p50 median=1.630 mean median=1.651 writes/fence=2.01 wms=0.780 flushes/fence=1.00 fms=1.540
+  fl2   fast   seconds=   1 fence p50 median=0.333 mean median=0.361 writes/fence=4.00 wms=0.140 flushes/fence=2.00 fms=0.265
+  fl2   mixed  seconds=   2 fence p50 median=0.354 mean median=0.702 writes/fence=4.00 wms=0.300 flushes/fence=2.00 fms=0.583
+  fl2   slow   seconds= 147 fence p50 median=1.660 mean median=1.682 writes/fence=4.03 wms=0.782 flushes/fence=2.00 fms=1.539
+  wt1   fast   seconds=   9 fence p50 median=0.228 mean median=0.234 writes/fence=1.00 wms=0.199 flushes/fence=0.00 fms=0.500
+  wt1   mixed  seconds=   1 fence p50 median=0.221 mean median=0.503 writes/fence=1.01 wms=0.468 flushes/fence=0.00 fms=0.000
+  wt1   slow   seconds=  30 fence p50 median=1.528 mean median=1.539 writes/fence=1.01 wms=1.474 flushes/fence=0.00 fms=2.000
+  wt2   mixed  seconds=   8 fence p50 median=0.235 mean median=0.507 writes/fence=2.00 wms=0.452 flushes/fence=0.00 fms=2.000
+  wt2   slow   seconds= 132 fence p50 median=1.566 mean median=1.611 writes/fence=2.01 wms=1.518 flushes/fence=0.00 fms=2.000
+  wt2s  fast   seconds=   1 fence p50 median=0.458 mean median=0.489 writes/fence=2.00 wms=0.209 flushes/fence=0.00 fms=nan
+  wt2s  mixed  seconds=   1 fence p50 median=0.467 mean median=1.628 writes/fence=2.00 wms=0.764 flushes/fence=0.00 fms=nan
+  wt2s  slow   seconds=  18 fence p50 median=3.079 mean median=3.099 writes/fence=2.01 wms=1.471 flushes/fence=0.00 fms=1.500
+  pairs slow   n=   2 wt2 mean median=1.641 fl2 mean median=1.747 ratio wt2/fl2 median=0.940 wt2 faster in 2
+== run2.txt: 140 seconds
+  fl1   fast   seconds=  11 fence p50 median=0.301 mean median=0.298 writes/fence=2.00 wms=0.125 flushes/fence=1.00 fms=0.233
+  fl1   mixed  seconds=   2 fence p50 median=0.289 mean median=0.488 writes/fence=2.00 wms=0.222 flushes/fence=1.00 fms=0.426
+  fl1   slow   seconds=  17 fence p50 median=1.608 mean median=1.624 writes/fence=2.00 wms=0.769 flushes/fence=1.00 fms=1.524
+  fl2   fast   seconds=  14 fence p50 median=0.356 mean median=0.356 writes/fence=4.00 wms=0.127 flushes/fence=2.00 fms=0.238
+  fl2   mixed  seconds=   1 fence p50 median=0.357 mean median=0.499 writes/fence=4.00 wms=0.199 flushes/fence=2.00 fms=0.381
+  fl2   slow   seconds=  25 fence p50 median=1.665 mean median=1.694 writes/fence=4.00 wms=0.782 flushes/fence=2.00 fms=1.540
+  wt1   fast   seconds=   9 fence p50 median=0.236 mean median=0.239 writes/fence=1.00 wms=0.199 flushes/fence=0.00 fms=1.000
+  wt1   mixed  seconds=   2 fence p50 median=0.230 mean median=0.549 writes/fence=1.00 wms=0.506 flushes/fence=0.00 fms=1.000
+  wt1   slow   seconds=  19 fence p50 median=1.537 mean median=1.550 writes/fence=1.00 wms=1.475 flushes/fence=0.00 fms=2.000
+  wt2   fast   seconds=   6 fence p50 median=0.233 mean median=0.242 writes/fence=2.00 wms=0.200 flushes/fence=0.00 fms=0.000
+  wt2   slow   seconds=  34 fence p50 median=1.567 mean median=1.599 writes/fence=2.01 wms=1.497 flushes/fence=0.00 fms=1.875
+== run3.txt: 600 seconds
+  fl2   fast   seconds=   9 fence p50 median=0.335 mean median=0.340 writes/fence=4.00 wms=0.129 flushes/fence=2.00 fms=0.242
+  fl2   mixed  seconds=   3 fence p50 median=0.340 mean median=0.605 writes/fence=4.00 wms=0.261 flushes/fence=2.00 fms=0.505
+  fl2   slow   seconds= 288 fence p50 median=1.655 mean median=1.709 writes/fence=4.00 wms=0.793 flushes/fence=2.00 fms=1.566
+  wt2   fast   seconds=   8 fence p50 median=0.234 mean median=0.245 writes/fence=2.00 wms=0.203 flushes/fence=0.00 fms=1.000
+  wt2   mixed  seconds=   5 fence p50 median=0.234 mean median=0.454 writes/fence=2.00 wms=0.406 flushes/fence=0.00 fms=2.000
+  wt2   slow   seconds= 287 fence p50 median=1.567 mean median=1.613 writes/fence=2.01 wms=1.523 flushes/fence=0.00 fms=2.000
+  pairs fast   n=   5 wt2 mean median=0.243 fl2 mean median=0.339 ratio wt2/fl2 median=0.705 wt2 faster in 5
+  pairs slow   n= 286 wt2 mean median=1.614 fl2 mean median=1.709 ratio wt2/fl2 median=0.939 wt2 faster in 266
+  pairs split  n=   9 wt2 mean median=0.397 fl2 mean median=0.564 ratio wt2/fl2 median=1.192 wt2 faster in 4
+== run4.txt: 120 seconds
+  fl2   fast   seconds=  11 fence p50 median=0.334 mean median=0.342 writes/fence=4.00 wms=0.127 flushes/fence=2.00 fms=0.238
+  fl2   mixed  seconds=   3 fence p50 median=0.336 mean median=0.564 writes/fence=4.00 wms=0.236 flushes/fence=2.00 fms=0.453
+  fl2   slow   seconds=  46 fence p50 median=1.643 mean median=1.678 writes/fence=4.00 wms=0.779 flushes/fence=2.00 fms=1.542
+  wt2   fast   seconds=  12 fence p50 median=0.233 mean median=0.240 writes/fence=2.00 wms=0.200 flushes/fence=0.00 fms=0.000
+  wt2   mixed  seconds=   2 fence p50 median=0.238 mean median=0.594 writes/fence=2.00 wms=0.540 flushes/fence=0.00 fms=2.000
+  wt2   slow   seconds=  46 fence p50 median=1.563 mean median=1.590 writes/fence=2.00 wms=1.500 flushes/fence=0.00 fms=2.000
+  pairs fast   n=   9 wt2 mean median=0.241 fl2 mean median=0.342 ratio wt2/fl2 median=0.704 wt2 faster in 9
+  pairs slow   n=  46 wt2 mean median=1.590 fl2 mean median=1.678 ratio wt2/fl2 median=0.952 wt2 faster in 42
+  pairs split  n=   5 wt2 mean median=0.243 fl2 mean median=0.500 ratio wt2/fl2 median=0.486 wt2 faster in 3
+== run3.txt and run4.txt together: 720 seconds
+  fl2   fast   seconds=  20 fence p50 median=0.334 mean median=0.342 writes/fence=4.00 wms=0.127 flushes/fence=2.00 fms=0.238
+  fl2   mixed  seconds=   6 fence p50 median=0.337 mean median=0.579 writes/fence=4.00 wms=0.246 flushes/fence=2.00 fms=0.477
+  fl2   slow   seconds= 334 fence p50 median=1.653 mean median=1.700 writes/fence=4.00 wms=0.791 flushes/fence=2.00 fms=1.562
+  wt2   fast   seconds=  20 fence p50 median=0.233 mean median=0.242 writes/fence=2.00 wms=0.200 flushes/fence=0.00 fms=0.500
+  wt2   mixed  seconds=   7 fence p50 median=0.235 mean median=0.518 writes/fence=2.00 wms=0.468 flushes/fence=0.00 fms=2.000
+  wt2   slow   seconds= 333 fence p50 median=1.566 mean median=1.612 writes/fence=2.01 wms=1.522 flushes/fence=0.00 fms=2.000
+  pairs fast   n=  14 wt2 mean median=0.241 fl2 mean median=0.342 ratio wt2/fl2 median=0.704 wt2 faster in 14
+  pairs slow   n= 332 wt2 mean median=1.612 fl2 mean median=1.701 ratio wt2/fl2 median=0.944 wt2 faster in 308
+  pairs split  n=  14 wt2 mean median=0.391 fl2 mean median=0.532 ratio wt2/fl2 median=0.839 wt2 faster in 7

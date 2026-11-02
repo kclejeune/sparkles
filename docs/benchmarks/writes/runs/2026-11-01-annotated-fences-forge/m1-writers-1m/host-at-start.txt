@@ -1,0 +1,17 @@
+Sun Nov  1 05:58:37 PM EST 2026
+ 17:58:37  up 8 days  2:19,  0 users,  load average: 0.95, 1.02, 0.99
+    PID %CPU     ELAPSED COMMAND
+ 944000  0.8    02:36:56 /nix/store/wfi3zyi4p723ib7qvpzclr1lyxhysywg-tailscale-1.104.2/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641 --tun tailscale0
+ 713759  0.3  1-14:49:40 /nix/store/1l6pk0v0fwdd7irylacnjrsyvvfyhfyz-netbird-client-0.81.5/bin/netbird service run
+ 714923  0.2  1-14:49:35 /nix/store/jjqk5711npw54k21izspv0bx53c3ji9h-otelcol-contrib-0.155.0/bin/otelcol-contrib --config=file:/nix/store/x663rz5jnxayskqsym0dfrjr4yk0fh4g-config.yaml
+   1698  0.2  8-02:18:50 /nix/store/x0019gyv8baqma5kqwjld2bvwynmf1yc-herdr-0.9.3/bin/herdr server
+ 967167  0.2    01:29:11 sshd-session: kclejeune@notty
+ 975299  0.1    01:06:02 [kworker/u81:1-kcryptd-254:0-1]
+1026543  0.1       21:25 [kworker/u81:21-kcryptd-254:0-1]
+1032708  0.1       09:14 [kworker/u81:0-kcryptd-254:0-1]
+ 927891  0.1    03:25:15 /bin/sh -s
+1026537  0.1       21:25 [kworker/u81:13-events_unbound]
+1016475  0.1       41:23 [kworker/u81:17-kcryptd-254:0-1]
+ 714917  0.0  1-14:49:35 avahi-daemon: running [forge.local]
+1021082  0.0       30:40 [kworker/u81:10-kcryptd-254:0-1]
+ 927887  0.0    03:25:15 sshd-session: kclejeune@notty

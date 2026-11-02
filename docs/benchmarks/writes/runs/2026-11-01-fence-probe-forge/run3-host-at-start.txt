@@ -1,0 +1,10 @@
+Sun Nov  1 05:17:14 PM EST 2026
+ 17:17:14  up 8 days  1:37,  0 users,  load average: 0.23, 0.32, 0.63
+    PID %CPU     ELAPSED COMMAND
+1016315  141       00:10 /home/kclejeune/lanes/thread-placement-449/bin/sparkles-4bd70845 --result-cache-mb 0 serve --data exp1/side-r1-base-all20 --loc bench=/home/kclejeune/lanes/thread-placement-449/bsbm-10m/sparkles.db --loc dbp=/home/kclejeune/lanes/thread-placement-449/billion/50m/sparkles.db --port 28471 --timeout 600 --query-memory-mb 12288
+ 944000  0.7    01:55:33 /nix/store/wfi3zyi4p723ib7qvpzclr1lyxhysywg-tailscale-1.104.2/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641 --tun tailscale0
+ 713759  0.3  1-14:08:16 /nix/store/1l6pk0v0fwdd7irylacnjrsyvvfyhfyz-netbird-client-0.81.5/bin/netbird service run
+ 973417  0.2       30:24 [kworker/u81:3-kcryptd-254:0-1]
+ 714923  0.2  1-14:08:12 /nix/store/jjqk5711npw54k21izspv0bx53c3ji9h-otelcol-contrib-0.155.0/bin/otelcol-contrib --config=file:/nix/store/x663rz5jnxayskqsym0dfrjr4yk0fh4g-config.yaml
+   1698  0.2  8-01:37:26 /nix/store/x0019gyv8baqma5kqwjld2bvwynmf1yc-herdr-0.9.3/bin/herdr server
+ 967167  0.2       47:48 sshd-session: kclejeune@notty

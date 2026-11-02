@@ -1,0 +1,10 @@
+Sun Nov  1 04:46:49 PM EST 2026
+ 16:46:49  up 8 days  1:07,  0 users,  load average: 0.03, 0.10, 0.08
+    PID %CPU     ELAPSED COMMAND
+ 973397 33.3       00:00 flock /home/kclejeune/lanes/.heavy.lock bash -c { date; uptime; ps -eo pid,pcpu,etime,args --sort=-pcpu | head -8; } > run1.start; timeout 1200 ./fence-io-probe ~/lanes/fence-sync-501-502/probe nvme0n1 idle:20 wt1:20 wt2:20 wt2s:20 fl1:20 fl2:60 wt2:30 fl2:30 wt2:60 fl2:30 idle:30 fl2:30 wt2:30 wt1:20 fl1:20 > run1.txt 2>&1; echo exit $? >> run1.txt
+ 944000  0.4    01:25:08 /nix/store/wfi3zyi4p723ib7qvpzclr1lyxhysywg-tailscale-1.104.2/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641 --tun tailscale0
+ 713759  0.3  1-13:37:51 /nix/store/1l6pk0v0fwdd7irylacnjrsyvvfyhfyz-netbird-client-0.81.5/bin/netbird service run
+ 714923  0.2  1-13:37:46 /nix/store/jjqk5711npw54k21izspv0bx53c3ji9h-otelcol-contrib-0.155.0/bin/otelcol-contrib --config=file:/nix/store/x663rz5jnxayskqsym0dfrjr4yk0fh4g-config.yaml
+   1698  0.2  8-01:07:01 /nix/store/x0019gyv8baqma5kqwjld2bvwynmf1yc-herdr-0.9.3/bin/herdr server
+ 927891  0.1    02:13:26 /bin/sh -s
+ 714917  0.0  1-13:37:46 avahi-daemon: running [forge.local]

@@ -16,7 +16,11 @@
 //!    write at the next sequence number. The shim also records the creation, renaming and
 //!    unlinking of files. Such an operation is durable once a synchronization of its
 //!    directory has returned, and of those that are not, an image keeps a prefix, as a
-//!    file system that journals its metadata in order would.
+//!    file system that journals its metadata in order would. Every commit carries a
+//!    message, and besides evenly spaced crash points the images are taken after each
+//!    write to `annotations.bin` and after each log write that returns while an annotation
+//!    write is in flight, so that a crash between a fence's annotation write and its log
+//!    write is checked.
 //!    `crash_images_of_a_dataset_with_full_text_search` runs the same images on a dataset
 //!    with full-text search, whose index replaces its metadata file by a rename, and checks
 //!    that the index never names a commit above the recovered log and that its results
@@ -1459,6 +1463,27 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             println!("{name}: the file system refuses O_DIRECT, so fences wrote buffered");
         }
     }
+    // Every commit carries a message, so each fence and each ordinary commit writes an
+    // annotation record. With the write-through handles on, those records go through
+    // `annotations.bin`'s own handle once the file has preallocated space, and the file is
+    // synchronized only when it grows (X09 item 501).
+    if cfg.direct && direct_io_available(&run.root) {
+        let ann_dsync = log
+            .iter()
+            .filter(|r| matches!(r, Rec::Write { path, dsync: true, .. } if path.ends_with("/annotations.bin")))
+            .count();
+        let ann_syncs = log
+            .iter()
+            .filter(|r| matches!(r, Rec::Sync { path } if path.ends_with("/annotations.bin")))
+            .count();
+        println!(
+            "{name}: {ann_dsync} write-through annotation writes, {ann_syncs} synchronizations of annotations.bin"
+        );
+        assert!(
+            ann_dsync >= 10 && ann_dsync > 4 * ann_syncs,
+            "{name}: {ann_dsync} annotation records written through, annotations.bin synchronized {ann_syncs} times"
+        );
+    }
     let root = run.root.canonicalize().unwrap();
     // the paths in the log are canonical
     let mut model = Model::new();
@@ -1471,6 +1496,16 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     // the highest commit an image's full-text checkpoint named
     let mut named = 0;
     let base_db = run.root.join("base-db");
+    // A crash between a commit's annotation write and its log write: images are taken
+    // when each write to annotations.bin starts and returns, and when a log write returns
+    // before the annotation write of its commit or fence has, besides the evenly spaced
+    // points. Each commit, or each fence, writes one annotation record and its log
+    // records, and the next starts only after both returned, so the first of the two
+    // writes to return leaves a split point, where one is durable and the other is not,
+    // in either order and whether or not the writes overlap.
+    let (mut open, mut ann_done, mut wal_done) = (false, false, false);
+    let (mut forced, mut split) = (0usize, 0usize);
+    const FORCED: usize = 48;
     for (i, rec) in log.iter().enumerate() {
         if let Rec::Write { path, data, .. } = rec
             && path.ends_with("ack.log")
@@ -1485,7 +1520,32 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         // the evenly spaced crash points miss this short phase at the end of the run.
         let locked_cleared =
             matches!(rec, Rec::Write { path, .. } if path.ends_with("/locked-cleared"));
-        if i % stride != 0 && i + 1 != log.len() && !locked_cleared {
+        let ann = |path: &str| path.ends_with("/annotations.bin");
+        let wal = |path: &str| path.ends_with("/wal.log");
+        if let Rec::Write { path, .. } = rec
+            && (ann(path) || wal(path))
+            && !open
+        {
+            (open, ann_done, wal_done) = (true, false, false);
+        }
+        let (between, is_split) = match rec {
+            Rec::Write { path, .. } if ann(path) => (true, false),
+            Rec::WriteEnd { path, .. } if ann(path) && open => {
+                ann_done = true;
+                open = !wal_done;
+                (true, !wal_done)
+            }
+            Rec::WriteEnd { path, .. } if wal(path) && open => {
+                wal_done = true;
+                open = !ann_done;
+                (!ann_done, !ann_done)
+            }
+            _ => (false, false),
+        };
+        split += usize::from(between && is_split && forced < FORCED);
+        let between = between && forced < FORCED;
+        forced += usize::from(between);
+        if i % stride != 0 && i + 1 != log.len() && !locked_cleared && !between {
             continue;
         }
         let what = format!("{name}: crash after record {i} of {}", log.len());
@@ -1532,10 +1592,16 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         images += 4;
     }
     println!(
-        "{name}: checked {images} crash images from {} I/O records, {} acknowledgements, highest text checkpoint {named}",
+        "{name}: checked {images} crash images from {} I/O records, {} acknowledgements, highest text checkpoint {named}, {forced} points at annotation writes, {split} between an annotation write and a log write",
         log.len(),
         acked.len()
     );
+    if cfg.group && cfg.direct && !cfg.idle_direct && direct_io_available(&run.root) {
+        assert!(
+            split > 0,
+            "{name}: no crash point fell between a fence's annotation write and its log write"
+        );
+    }
     assert!(images > 0);
     assert!(!acked.is_empty(), "the writer acknowledged no commit");
     if background {

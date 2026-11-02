@@ -2316,8 +2316,13 @@ impl Store {
             index: family.holds.index.clone(),
             store: dataset_id,
         });
-        let annotations =
-            crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
+        let annotations = crate::annotations::Annotations::open(
+            root,
+            dataset_id,
+            head.seq,
+            opts.commit_digests,
+            opts.wal_direct_writes,
+        )?;
         #[cfg(test)]
         open_step("annotations-open");
         // A headerless log written by an older release: everything it holds now was
@@ -3485,9 +3490,13 @@ impl Store {
             cutoff
         };
         let n = self.catalog.lock().prune_before(cutoff)?;
-        self.annotations
-            .lock()
-            .prune_before(cutoff, self.dataset_id)?;
+        {
+            let mut a = self.annotations.lock();
+            let pruned = a.prune_before(cutoff, self.dataset_id);
+            let (was, now) = a.take_prealloc();
+            self.quota.move_ann_preallocated(was, now);
+            pruned?;
+        }
         drop(w);
         if n > 0 {
             self.quota.invalidate();
@@ -3610,25 +3619,64 @@ impl Store {
     ) -> Result<crate::annotations::Annotation> {
         let mut a = self.annotations.lock();
         let ann = self.annotation_of(&a, c, message, changes);
-        a.append(c.seq, ann.clone(), self.dataset_id)?;
+        let written = a.append(c.seq, ann.clone(), self.dataset_id, || {
+            self.annotation_prealloc()
+        });
+        // a failed append cut the file back, zeros included, which the cached size of
+        // the directory still holds
+        let (was, now) = a.take_prealloc();
+        self.quota.move_ann_preallocated(was, now);
+        if written.is_err() {
+            self.quota.invalidate();
+        }
+        if let Some(w) = written? {
+            self.quota.add(w.grew);
+        }
         Ok(ann)
     }
 
-    /// [`annotate`](Self::annotate) for a commit of a group: the record is written but not
-    /// synced, and the file to sync before the commit is acknowledged comes with it.
-    fn annotate_unsynced(
+    /// How far `annotations.bin` may grow ahead of its records: nothing when the log
+    /// preallocates nothing, or when the free-space reserve cannot hold the growth.
+    pub(crate) fn annotation_prealloc(&self) -> u64 {
+        let p = crate::annotations::MAX_PREALLOC;
+        if self.opts.wal_prealloc_bytes == 0
+            || self
+                .check_disk((p + 4096).saturating_add(self.quota.unwritten()))
+                .is_err()
+        {
+            return 0;
+        }
+        p
+    }
+
+    /// Take back the annotation of commit `seq`, which did not happen (see
+    /// [`Annotations::undo`](crate::annotations::Annotations::undo)).
+    fn undo_annotation(&self, seq: u64) -> Result<()> {
+        let mut a = self.annotations.lock();
+        let undone = a.undo(seq);
+        let (was, now) = a.take_prealloc();
+        self.quota.move_ann_preallocated(was, now);
+        // the cut is not in the cached size of the directory
+        self.quota.invalidate();
+        undone
+    }
+
+    /// [`annotate`](Self::annotate) for a commit of a group: the record is queued for
+    /// the commit's fence, which writes it before the commit is acknowledged.
+    fn annotate_queued(
         &self,
         c: &CommitInfo,
         message: Option<Arc<str>>,
         changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
-    ) -> Result<(crate::annotations::Annotation, Option<Arc<File>>)> {
+    ) -> Result<(
+        crate::annotations::Annotation,
+        Option<crate::annotations::Queued>,
+    )> {
         let mut a = self.annotations.lock();
         let ann = self.annotation_of(&a, c, message, changes);
-        // a grouped commit never takes its record back, so only the file is needed
-        let file = a
-            .append_unsynced(c.seq, ann.clone(), self.dataset_id)?
-            .map(|(f, _)| f);
-        Ok((ann, file))
+        // a grouped commit never takes its record back
+        let queued = a.append_queued(c.seq, ann.clone(), self.dataset_id)?;
+        Ok((ann, queued))
     }
 
     fn annotation_of(
@@ -5385,7 +5433,7 @@ impl Store {
                 // may bring the bulk commit back with its annotation, the annotation goes.
                 if !f.maybe_switched
                     && !annotation.is_empty()
-                    && self.annotations.lock().undo(head.seq).is_err()
+                    && self.undo_annotation(head.seq).is_err()
                 {
                     w.poisoned = true;
                 }
@@ -6794,7 +6842,7 @@ impl WriteTxn<'_> {
             m.seq = c.seq;
             let rec = *m;
             if let Err(e) = self.store.branching.merges.lock().append(rec) {
-                let _ = self.store.annotations.lock().undo(c.seq);
+                let _ = self.store.undo_annotation(c.seq);
                 return Err(e);
             }
             self.store.failpoint("merge-recorded");
@@ -7379,6 +7427,12 @@ impl Drop for Store {
             if !w.poisoned {
                 self.snapshot().generation.dvocab.trim();
             }
+            // Branch stores share the quota, so a closing store takes back its zeros,
+            // and a poisoned one too, since its directory may be deleted next.
+            let mut a = self.annotations.lock();
+            a.trim();
+            let (was, now) = a.take_prealloc();
+            self.quota.move_ann_preallocated(was, now);
         }
         if let Some(log) = &self.changelog
             && let Err(e) = log.flush(true)
