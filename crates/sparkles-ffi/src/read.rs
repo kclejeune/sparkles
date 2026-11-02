@@ -197,6 +197,21 @@ impl SnapReader<'_> {
         Ok(FindResult { batch, cursor })
     }
 
+    /// Every quad of a pattern in one batch, for a caller that copies a graph across the
+    /// boundary in one call, such as the JVM's ontology model (spec F21 §2.3).
+    pub fn find_all(&self, pattern: &[u8]) -> FfiResult<Vec<u8>> {
+        let Some(p) = self.pattern(pattern)? else {
+            return Ok(encode::empty_batch(4));
+        };
+        let mut st = CursorState {
+            iter: quads_in(self.snap.clone(), &p),
+            table: TermTable::new(self.term_cache),
+            peeked: None,
+            done: false,
+        };
+        st.batch(self.snap, self.labels, u32::MAX)
+    }
+
     pub fn count(&self, pattern: &[u8]) -> FfiResult<u64> {
         match self.pattern(pattern)? {
             Some(p) => Ok(count_in(self.snap, &p)?),

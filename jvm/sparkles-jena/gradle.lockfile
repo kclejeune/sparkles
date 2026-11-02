@@ -57,6 +57,7 @@ org.apache.jena:jena-fuseki-main:5.6.0=testCompileClasspath,testRuntimeClasspath
 org.apache.jena:jena-iri3986:5.6.0=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
 org.apache.jena:jena-iri:5.6.0=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
 org.apache.jena:jena-langtag:5.6.0=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
+org.apache.jena:jena-ontapi:5.6.0=compileClasspath,testCompileClasspath,testRuntimeClasspath
 org.apache.jena:jena-rdfconnection:5.6.0=testCompileClasspath,testRuntimeClasspath
 org.apache.jena:jena-rdfpatch:5.6.0=testCompileClasspath,testRuntimeClasspath
 org.apache.jena:jena-shacl:5.6.0=testCompileClasspath,testRuntimeClasspath

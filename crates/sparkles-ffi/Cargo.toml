@@ -50,10 +50,12 @@ nix = { version = "0.31.3", default-features = false, optional = true }
 tempfile = "3"
 
 [features]
-default = ["text", "geo", "reasoning", "shacl", "shex", "backup", "graphql", "fmt", "mimalloc"]
+default = ["text", "geo", "reasoning", "ontology", "shacl", "shex", "backup", "graphql", "fmt", "mimalloc"]
 fmt = ["sparkles/fmt", "dep:sparkles-fmt"]
 graphql = ["sparkles/graphql"]
 reasoning = ["sparkles/reasoning", "dep:sparkles-reasoner"]
+# the OWL 2 ontology handle and the jena-ontapi entry point (spec F21)
+ontology = ["reasoning", "sparkles/ontology"]
 shacl = ["sparkles/shacl", "dep:sparkles-shacl"]
 shex = ["sparkles/shex", "dep:sparkles-shex"]
 backup = ["sparkles/backup"]

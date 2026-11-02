@@ -483,6 +483,8 @@ public class DatasetGraphSparkles internal constructor(
     public fun queries(): SparklesQueries = SparklesQueries(this)
     public fun algorithms(): SparklesAlgorithms = SparklesAlgorithms(this)
     public fun schema(): SparklesSchema = SparklesSchema(this)
+    /** The OWL 2 ontology of the dataset's graphs (spec F21). */
+    public fun ontology(): SparklesOntology = SparklesOntology(this)
     public fun graphql(): SparklesGraphQl = SparklesGraphQl(this)
     public fun graph(): SparklesGraphOverview = SparklesGraphOverview(this)
 

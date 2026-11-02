@@ -501,6 +501,10 @@ export class Dataset extends Queryable {
   get mappings() {
     return this.administration.mappings;
   }
+  /** The OWL 2 ontology of the dataset's graphs (spec F21). */
+  get ontology() {
+    return this.administration.ontology;
+  }
   runMapping(
     text: string,
     options: import('./admin.js').MappingInputs &
