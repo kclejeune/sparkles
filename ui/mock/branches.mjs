@@ -35,6 +35,7 @@ const BRANCH_ROUTES = new Set([
   'rdfs',
   'cache',
   'forms',
+  'ontology',
 ]);
 
 const validName = (n) =>
