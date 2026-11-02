@@ -461,3 +461,35 @@ Ontology(<http://ex.org/g-onto>
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     assert!(r.text().contains("line 2"), "{}", r.text());
 }
+
+#[tokio::test]
+async fn inferred_views_say_what_they_read() {
+    let s = server();
+    // without a materialization the view reads the asserted axioms and says so
+    let r = get(&s.app, "/$/ontology/t?inferences=true").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["inferences"], json!({"included": false}));
+    assert!(
+        get(&s.app, "/$/ontology/t")
+            .await
+            .json()
+            .get("inferences")
+            .is_none()
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/check",
+        json!({"inferences": true, "profiles": ["rl"]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["inferences"]["included"], false);
+    // an edit changes the asserted axioms only
+    let r = post(
+        &s.app,
+        "/$/ontology/t/axioms?inferences=true",
+        json!({"add": [sub("http://ex.org/Course", json!("http://ex.org/Thing"))]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

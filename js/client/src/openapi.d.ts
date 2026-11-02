@@ -16746,6 +16746,8 @@ export interface operations {
                 mode?: "lenient" | "strict";
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
+                /** @description Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale. */
+                inferences?: boolean;
             };
             header?: {
                 /** @description Entity tags, or `*`. */
@@ -16794,6 +16796,8 @@ export interface operations {
                 mode?: "lenient" | "strict";
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
+                /** @description Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale. */
+                inferences?: boolean;
                 /** @description Axiom types, comma separated, such as `SubClassOf,EquivalentClasses`. */
                 type?: string;
                 /** @description An entity IRI the axioms mention. */
@@ -16955,6 +16959,8 @@ export interface operations {
                     /** @description A graph IRI or `default`, or a list of them. */
                     graph?: unknown;
                     imports?: boolean;
+                    /** @description Also read the materialized inferences while the dataset has them. */
+                    inferences?: boolean;
                     /** @description The most violations each report lists (1,000 by default). */
                     maxViolations?: number;
                     /** @enum {string} */

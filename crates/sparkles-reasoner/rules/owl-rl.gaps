@@ -1,0 +1,7 @@
+# The OWL 2 RL/RDF rules (OWL 2 Profiles §4.3) that owl-rl.rules covers only up to a size.
+# Each line names a rule, the largest size whose rules owl-rl.rules holds, and what the
+# size counts. A reasoning run under owl-rl warns about each axiom in OWL 2 RL that is
+# larger, since the materialization does not apply its rule. The rules are named
+# <rule>-<size> in owl-rl.rules, and a test checks that they match this table.
+prp-spo2 3 properties in the chain of a SubObjectPropertyOf axiom
+prp-key 2 properties of a HasKey axiom

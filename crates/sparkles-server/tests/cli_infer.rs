@@ -308,3 +308,36 @@ fn infer_check_justify_returns_first_minimal_support_under_one_bound() {
         head
     );
 }
+
+/// spec F21 A10: `sparkles infer --profile owl-rl` on a graph with a `DisjointUnion`
+/// axiom completes and warns that one axiom is outside OWL 2 RL.
+#[cfg(feature = "ontology")]
+#[test]
+fn infer_warns_about_axioms_outside_owl_rl() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.ttl");
+    std::fs::write(
+        &data,
+        "@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         ex:o a owl:Ontology . ex:A a owl:Class . ex:B a owl:Class . ex:C a owl:Class .
+         ex:A owl:disjointUnionOf ( ex:B ex:C ) . ex:x a ex:B .",
+    )
+    .unwrap();
+    let db = dir.path().join("db").to_str().unwrap().to_string();
+    expect(&["load", "--loc", &db, data.to_str().unwrap()], 0);
+    let o = expect(&["infer", "--loc", &db, "--profile", "owl-rl"], 0);
+    let e = stderr(&o);
+    assert!(
+        e.contains("warning: 1 axiom is outside OWL 2 RL") && e.contains("DisjointUnion("),
+        "{e}"
+    );
+    // the record keeps the warning, and an RDFS run has none
+    let o = expect(&["infer", "--loc", &db, "--status", "--format", "json"], 0);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(
+        s["warnings"].to_string().contains("outside OWL 2 RL"),
+        "{s}"
+    );
+    let o = expect(&["infer", "--loc", &db, "--profile", "rdfs"], 0);
+    assert!(!stderr(&o).contains("OWL 2 RL"), "{}", stderr(&o));
+}

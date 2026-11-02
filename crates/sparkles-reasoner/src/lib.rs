@@ -79,6 +79,10 @@ pub const RDFS_RULES: &str = include_str!("../rules/rdfs.rules");
 pub const RDFS_SIMPLE_RULES: &str = include_str!("../rules/rdfs-simple.rules");
 /// OWL 2 RL subset (comparable to Jena OWL Mini/Micro).
 pub const OWL_RL_RULES: &str = include_str!("../rules/owl-rl.rules");
+/// The rules of OWL 2 RL that [`OWL_RL_RULES`] covers only up to a size, one per line:
+/// the rule, the largest size covered and what the size counts. Lines that start with
+/// `#` are comments.
+pub const OWL_RL_GAPS: &str = include_str!("../rules/owl-rl.gaps");
 
 /// Which rules to run.
 #[derive(Clone, Debug, PartialEq, Eq)]

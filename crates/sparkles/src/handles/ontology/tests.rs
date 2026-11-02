@@ -1023,3 +1023,235 @@ fn diffs_annotations_of_reversed_equalities() {
     assert_eq!(rendered(&d.added), [noted.to_string()], "{d:?}");
     assert_eq!(rendered(&d.removed), [plain.to_string()], "{d:?}");
 }
+
+fn materialize(
+    ds: &Dataset,
+    profile: sparkles_reasoner::Profile,
+) -> crate::reasoning::ReasonOutcome {
+    ds.reasoning()
+        .run(&crate::reasoning::ReasonRequest {
+            profile,
+            ..Default::default()
+        })
+        .unwrap()
+}
+
+fn inferred() -> OntologyRequest {
+    OntologyRequest {
+        inferences: true,
+        ..Default::default()
+    }
+}
+
+/// spec F21 §7: an inferred view reads the materialized closure while it is fresh,
+/// says when it is stale, and reads the asserted axioms only without a materialization.
+#[test]
+fn inferred_views_read_the_materialized_closure() {
+    let ds = dataset(
+        ":o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class .
+        :A rdfs:subClassOf :B . :B rdfs:subClassOf :C .",
+    );
+    let a_c = Axiom::sub_class_of(class("A"), class("C"));
+    // no materialization: the asserted axioms, and no inferences read
+    let o = ds.ontology().open(&inferred(), &opts()).unwrap();
+    assert!(o.inferences.is_none());
+    assert!(!o.ontology.contains(&a_c));
+    materialize(&ds, sparkles_reasoner::Profile::Rdfs);
+    // asserted only unless asked
+    let o = ds
+        .ontology()
+        .open(&OntologyRequest::default(), &opts())
+        .unwrap();
+    assert!(!o.ontology.contains(&a_c));
+    assert!(o.inferences.is_none());
+    let o = ds.ontology().open(&inferred(), &opts()).unwrap();
+    assert!(o.ontology.contains(&a_c), "the closure is read");
+    let i = o.inferences.clone().expect("inferences read");
+    assert_eq!(i.profile, "rdfs");
+    assert_eq!(i.stale, Some(false));
+    assert_eq!(o.graph_name(i.graph), INFERRED_GRAPH);
+    let origins: Vec<&str> = o
+        .ontology
+        .axioms
+        .iter()
+        .find(|(a, _)| **a == a_c)
+        .map(|(_, g)| g.iter().map(|x| o.graph_name(x.graph)).collect())
+        .unwrap();
+    assert_eq!(origins, vec![INFERRED_GRAPH]);
+    // a later change to the default graph makes the view stale
+    ds.update(&format!("{PREFIXES} INSERT DATA {{ :D a owl:Class }}"))
+        .unwrap();
+    let o = ds.ontology().open(&inferred(), &opts()).unwrap();
+    let i = o.inferences.expect("inferences read");
+    assert_eq!(i.stale, Some(true));
+    assert_eq!(i.commits_since, Some(1));
+    // the JSON form says what was read
+    let j = wire::call(
+        &ds,
+        "summary",
+        &serde_json::json!({"inferences": true}),
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(j["inferences"]["included"], true, "{j}");
+    assert_eq!(j["inferences"]["stale"], true, "{j}");
+    // edits and diffs read the asserted axioms only
+    let edit = EditRequest {
+        add: vec![a_c.clone()],
+        ..Default::default()
+    };
+    assert!(matches!(
+        ds.ontology().edit(&inferred(), &edit, &opts()),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        ds.ontology()
+            .diff(&inferred(), &At::Commit(1), &At::Head, false, &opts()),
+        Err(Error::Invalid(_))
+    ));
+}
+
+/// An inferred view through a view that hides the inferred graph reads no inferences.
+#[test]
+fn inferred_views_follow_the_callers_view() {
+    let ds = dataset(
+        ":A a owl:Class . :B a owl:Class . :C a owl:Class .
+        :A rdfs:subClassOf :B . :B rdfs:subClassOf :C .",
+    );
+    materialize(&ds, sparkles_reasoner::Profile::Rdfs);
+    let hidden = QueryOptions {
+        graphs: Some(only(&["default"])),
+        ..Default::default()
+    };
+    let o = ds.ontology().open(&inferred(), &hidden).unwrap();
+    assert!(o.inferences.is_none());
+    assert!(
+        !o.ontology
+            .contains(&Axiom::sub_class_of(class("A"), class("C")))
+    );
+}
+
+/// spec F21 A10: an OWL 2 RL run over a `DisjointUnion` completes and warns that one
+/// axiom is outside OWL 2 RL; an RDFS run does not check.
+#[test]
+fn owl_rl_runs_warn_about_axioms_outside_rl() {
+    let ds = dataset(
+        ":o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class .
+        :A owl:disjointUnionOf ( :B :C ) . :x a :B .",
+    );
+    let out = materialize(&ds, sparkles_reasoner::Profile::OwlRl);
+    let w: Vec<&String> = out
+        .record
+        .warnings
+        .iter()
+        .filter(|w| w.contains("outside OWL 2 RL"))
+        .collect();
+    assert_eq!(w.len(), 1, "{:?}", out.record.warnings);
+    assert!(w[0].starts_with("1 axiom is outside OWL 2 RL"), "{}", w[0]);
+    assert!(w[0].contains("DisjointUnion("), "{}", w[0]);
+    assert!(out.report.warnings.contains(w[0]));
+    let rdfs = materialize(&ds, sparkles_reasoner::Profile::Rdfs);
+    assert!(
+        !rdfs.record.warnings.iter().any(|w| w.contains("OWL 2 RL")),
+        "{:?}",
+        rdfs.record.warnings
+    );
+}
+
+/// spec F21 §7: an axiom in OWL 2 RL whose rule the subset covers only up to a size is
+/// named, from the gap table beside the rules.
+#[test]
+fn owl_rl_runs_warn_about_rules_the_subset_lacks() {
+    let ds = dataset(
+        ":o a owl:Ontology . :p a owl:ObjectProperty . :q a owl:ObjectProperty .
+        :r a owl:ObjectProperty . :s a owl:ObjectProperty . :t a owl:ObjectProperty .
+        :t owl:propertyChainAxiom ( :p :q :r :s ) .
+        :u owl:propertyChainAxiom ( :p :q ) . :u a owl:ObjectProperty .",
+    );
+    let w = rl_warnings(ds.store(), &Default::default(), &opts()).unwrap();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].starts_with("1 axiom in OWL 2 RL needs rule prp-spo2 for more than 3"),
+        "{}",
+        w[0]
+    );
+    let clean =
+        dataset(":o a owl:Ontology . :A a owl:Class . :B a owl:Class . :A rdfs:subClassOf :B .");
+    assert!(
+        rl_warnings(clean.store(), &Default::default(), &opts())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The gap table names rules whose sizes up to its limit, and no larger one, are in the
+/// rules file.
+#[test]
+fn the_gap_table_matches_the_rules() {
+    let gaps = rl_gaps();
+    assert_eq!(
+        gaps.iter().map(|g| g.0).collect::<Vec<_>>(),
+        vec!["prp-spo2", "prp-key"]
+    );
+    for (rule, max, what) in gaps {
+        assert!(!what.is_empty());
+        let sizes: Vec<usize> = sparkles_reasoner::OWL_RL_RULES
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix(&format!("[{rule}-")))
+            .filter_map(|l| l.split(':').next()?.parse().ok())
+            .collect();
+        assert_eq!(sizes.iter().max(), Some(&max), "{rule}: {sizes:?}");
+    }
+}
+
+/// The JSON operations the bindings call answer as the HTTP routes do.
+#[test]
+fn json_operations_answer_in_the_route_forms() {
+    let (_dir, ds) = on_disk(BASE);
+    let call = |op: &str, a: serde_json::Value| wire::call(&ds, op, &a, &opts());
+    let s = call("summary", serde_json::json!({})).unwrap();
+    assert_eq!(s["axioms"]["SubClassOf"], 1, "{s}");
+    assert!(s.get("inferences").is_none());
+    let p = call("axioms", serde_json::json!({"type": "SubClassOf"})).unwrap();
+    assert_eq!(p["total"], 1);
+    assert_eq!(p["axioms"][0]["type"], "SubClassOf");
+    assert_eq!(
+        sparkles_owl::json::read_axiom(&p["axioms"][0]["axiom"]).unwrap(),
+        some_ab()
+    );
+    assert!(matches!(
+        call("axioms", serde_json::json!({"about": ex("nothing")})),
+        Err(Error::NotFound(_))
+    ));
+    let c = call("check", serde_json::json!({"profiles": ["el", "ql"]})).unwrap();
+    assert_eq!(c["reports"].as_array().unwrap().len(), 2);
+    // axioms as functional-style strings with the dataset's prefixes
+    ds.set_prefix("ex", "http://ex.org/").unwrap();
+    // the snapshot keeps the state before the edit for the diff
+    let (before, _keep) = head(&ds);
+    let e = call(
+        "edit",
+        serde_json::json!({"add": ["SubClassOf(ex:B ex:C)"], "remove": [sparkles_owl::json::axiom(&some_ab())]}),
+    )
+    .unwrap();
+    assert_eq!(e["removed"], 1, "{e}");
+    assert_eq!(e["added"], 1, "{e}");
+    let At::Commit(from) = before else {
+        unreachable!()
+    };
+    let d = call("diff", serde_json::json!({"from": from})).unwrap();
+    assert_eq!(d["addedCount"], 1, "{d}");
+    assert_eq!(d["removedCount"], 1, "{d}");
+    let r = call("removeEntity", serde_json::json!({"iri": ex("C")})).unwrap();
+    assert!(r["removed"].as_u64().unwrap() >= 2, "{r}");
+    for (op, a) in [
+        ("summary", serde_json::json!({"nope": 1})),
+        ("axioms", serde_json::json!({"limit": 0})),
+        ("edit", serde_json::json!({})),
+        ("edit", serde_json::json!({"add": ["SubClassOf(ex:A"]})),
+        ("diff", serde_json::json!({})),
+        ("nothing", serde_json::json!({})),
+    ] {
+        assert!(matches!(call(op, a), Err(Error::Invalid(_))), "{op}");
+    }
+}
