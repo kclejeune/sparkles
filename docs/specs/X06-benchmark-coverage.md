@@ -1908,7 +1908,7 @@ On forge, `two-hop-count` on the changed 1.05M store went from 8.16 to 6.21 ms t
 of 1.019 for server time and 0.978 for client time, and its rerun left only
 `predicate-counts`, at 11 against 12 µs, at a ratio of 1.10. That query does not read
 index blocks in parallel, and on `atlas` `star-join` and `predicate-counts` kept their
-times, which the access log there records to 10 µs. Item NEW-ITEM-2 checks the flag on
+times, which the access log there records to 10 µs. Item 585 checks the flag on
 the benchmark host. The [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md) has the server
 times, and the forge [run record](../benchmarks/writes/runs/2026-11-02-competitive-writes-forge/README.md)
 has every sample and answer fingerprint.
