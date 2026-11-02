@@ -173,10 +173,12 @@ pub fn start(placement: Placement) {
     let _ = PLACEMENT.set(placement);
 }
 
-/// Run a thread the runtime starts on every CPU. A new thread inherits the CPUs of the
-/// thread that creates it, and the runtime creates threads from request threads, such as
-/// the worker that replaces one running a request in place, so without this a thread
-/// could stay on the performance cores under any load.
+/// Run a thread the runtime or the engine starts on every CPU. A new thread inherits the
+/// CPUs of the thread that creates it. The runtime creates threads from request threads,
+/// such as the worker that replaces one running a request in place, and the engine starts
+/// its block decoders, change log writer and vocabulary sync worker from the first
+/// request that needs them, which on a fresh server runs alone on the performance cores.
+/// Without this such a thread would stay there under any load.
 pub fn thread_started() {
     if let Some(p) = PLACEMENT.get() {
         p.set(Placed::Every);

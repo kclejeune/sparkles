@@ -1942,6 +1942,7 @@ fn decode_pool() -> Option<&'static rayon::ThreadPool> {
         rayon::ThreadPoolBuilder::new()
             .num_threads((cpus / 2).clamp(2, 8))
             .thread_name(|i| format!("sparkles-decode-{i}"))
+            .start_handler(|_| crate::threads::started())
             .build()
             .ok()
     })

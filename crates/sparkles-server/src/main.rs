@@ -3306,6 +3306,8 @@ fn run() -> Result<()> {
                      most request_limit requests are in flight"
                 );
                 cpus::start(placement);
+                // the engine's long-lived threads start with the requests that need them
+                sparkles::threads::set_start_hook(cpus::thread_started);
             }
             alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
