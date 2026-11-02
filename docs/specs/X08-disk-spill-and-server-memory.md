@@ -2110,3 +2110,17 @@ between the servers of each build. The geometric mean was 1.023 for server time 
 1.010 for client time. The slowdown of `expr-order-key` is therefore reproducible
 between these two builds, which do not include the commits of item 93, and its cause is
 unknown.
+
+### Ordered aggregates and DESCRIBE under the budget (2026-11-01)
+
+A grouping with FOLD or a registered aggregate now streams, as the
+[X05 follow-ups](X05-streaming-query-execution.md#item-7-follow-ups-2026-11-01) describe.
+When its input does not arrive in group-key order, it reads the input through a stable
+sort on the keys, which writes sorted runs and merges them as the other cursor sorts do.
+The grouping itself holds the rows of the group it has not finished and at most a batch
+more, so its largest group must fit the budget, as it must in eager execution.
+`tests/group_runs.rs` checks a spilled sort under a 24 MiB budget against the eager
+answer, and without spill the same query fails on memory instead of exceeding its budget.
+A streamed DESCRIBE charges the traversal state it keeps for the rest of the query and
+releases the triples of each batch once the batch is handed on, so a description larger
+than the budget streams through it.

@@ -97,6 +97,12 @@ check them against the W3C suites and Jena's own answers.
   the resource, and `outgoing` keeps only the resource's own triples. Options add labels
   of linked IRIs and limit the size and depth. A dataset keeps its setting through
   `/$/describe/{ds}` and `sparkles describe-settings`, and a request can choose another.
+  A streamed DESCRIBE describes the new resources of each batch of solutions as the
+  batch arrives, so its first triples come before the WHERE clause has finished. The
+  resources, triples and nodes it has seen stay in memory under the query's budget, and
+  the labels of linked IRIs come last. When `maxTriples` cuts a streamed description
+  short, the triples kept can differ from the eager ones, because the resources are
+  described in the order the batches name them.
 
 ### Federated queries
 
@@ -130,6 +136,16 @@ check them against the W3C suites and Jena's own answers.
   a SERVICE, a LATERAL or a property function call. At most 10,000 rows move, and at most
   20,000 over all the copies made for the branches and for the named graphs of a
   `GRAPH ?g`.
+* A LIMIT without OFFSET passes through projections and BINDs into a SERVICE that reads
+  no input, whose remote query is then sent with that limit. It also reaches a full-text
+  search with a constant query string, which keeps only that many of its best hits, so
+  the LIMIT is answered even when the search matches more than `maxHits`.
+* An EXISTS or NOT EXISTS that is a FILTER conjunct, a BIND expression or an OPTIONAL
+  condition is answered from a key set of its pattern, built once per query, when the
+  pattern costs less than evaluating it for each distinct outer key. A row is evaluated
+  on its own when it binds a variable that a FILTER inside the pattern reads and the
+  pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
+  as IF or OR, is evaluated once per distinct outer key.
 * Eager ASK execution can visit a pure UNION branch with lower estimated work before
   its first answer. On an unchanged snapshot without a total produced-row cap, a
   bounded whitelist of the whole ASK lets pure input operators request only the rows
@@ -166,7 +182,10 @@ check them against the W3C suites and Jena's own answers.
   stop when the client disconnects.
 * Streaming joins run batch by batch with column kernels. ORDER BY with LIMIT keeps only
   its best rows in a bounded heap. A cursor filter over an index scan filters whole blocks
-  in parallel, and a range top-k ranks its range a part at a time. A full sort and the
+  in parallel, and a range top-k ranks its range a part at a time. FOLD and registered
+  aggregates read their input in group-key order, through a stable sort on the keys that
+  can spill when the input does not arrive that way. They hold the rows of the group
+  they have not finished and at most a batch more. A full sort and the
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
 * Property path closures run within the query's memory budget and timeout in both

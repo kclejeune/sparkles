@@ -1,8 +1,11 @@
 //! Bounded graph output over snapshot-owned WHERE batches. Exact CONSTRUCT
-//! deduplication is growing, budgeted state. DESCRIBE has an explicit barrier.
+//! deduplication is growing, budgeted state. DESCRIBE describes the resources of each
+//! WHERE batch that no earlier batch named, so its triples follow the batches. What it
+//! has described, returned and visited is growing, budgeted state, and the labels of
+//! the linked IRIs come after the last batch.
 use super::{
-    Buffer, CursorOptions, CursorPlan, CursorStats, CursorStatus, FallbackPolicy, QueryBatch,
-    QueryCursor, capacity_bytes, merge, open_pattern_cursor,
+    Buffer, CursorOptions, CursorPlan, CursorStats, CursorStatus, QueryBatch, QueryCursor,
+    open_pattern_cursor,
 };
 use crate::error::{Error, Result};
 use crate::sparql::ctx::OwnedCharge;
@@ -30,7 +33,6 @@ impl Spec {
     pub(super) fn from_parsed(
         parsed: &spargebra::Query,
         options: &QueryOptions,
-        policy: FallbackPolicy,
     ) -> Result<Option<Self>> {
         Ok(match parsed {
             spargebra::Query::Construct {
@@ -41,20 +43,13 @@ impl Spec {
                 template: template.clone(),
                 graphs: graph_templates.clone(),
             }),
-            spargebra::Query::Describe { dataset, .. } => {
-                if policy == FallbackPolicy::RejectMaterialization {
-                    return Err(Error::Unsupported(
-                        "DESCRIBE traversal is an explicit materialization barrier".into(),
-                    ));
-                }
-                Some(Self::Describe {
-                    options: options.describe.clone(),
-                    explicit: dataset.is_some()
-                        || !options.default_graph_uris.is_empty()
-                        || !options.named_graph_uris.is_empty()
-                        || !options.default_graph_extra.is_empty(),
-                })
-            }
+            spargebra::Query::Describe { dataset, .. } => Some(Self::Describe {
+                options: options.describe.clone(),
+                explicit: dataset.is_some()
+                    || !options.default_graph_uris.is_empty()
+                    || !options.named_graph_uris.is_empty()
+                    || !options.default_graph_extra.is_empty(),
+            }),
             _ => None,
         })
     }
@@ -116,6 +111,10 @@ pub struct GraphCursor {
     transform_ms: f64,
     ended: Option<Instant>,
     truncated: bool,
+    /// What a DESCRIBE keeps between WHERE batches.
+    described: crate::sparql::describe::Streamed,
+    /// Whether a DESCRIBE has described its last WHERE batch.
+    described_all: bool,
 }
 
 pub fn graph_cursor(
@@ -160,11 +159,11 @@ pub(super) fn from_pattern(
         plan.operator.columns = vec!["s".into(), "p".into(), "o".into(), "g".into()];
         plan.operator.actual_rows = 0;
         plan.growing_state = true;
-        plan.materializes = matches!(spec, Spec::Describe { .. });
-        plan.full_input_before_output = plan.materializes;
-        plan.reason = plan
-            .materializes
-            .then(|| "DESCRIBE traversal is an explicit materialization barrier".into());
+        plan.materializes = false;
+        plan.full_input_before_output = false;
+        plan.reason = matches!(spec, Spec::Describe { .. }).then(|| {
+            "DESCRIBE describes the new resources of each batch and keeps what it described under the memory budget".into()
+        });
         Ok(GraphCursor {
             where_cursor,
             spec,
@@ -185,6 +184,8 @@ pub(super) fn from_pattern(
             transform_ms: 0.0,
             ended: None,
             truncated: false,
+            described: Default::default(),
+            described_all: false,
         })
     })
 }
@@ -292,45 +293,42 @@ impl GraphCursor {
             }
             match &self.spec {
                 Spec::Describe { options, explicit } => {
-                    if self.input.is_some() {
+                    if self.described_all {
                         break;
                     }
-                    let mut table = Buffer::new(&ctx, &self.where_cursor.vars, 0)?;
-                    while let Some(buffer) = self
+                    let batch = self
                         .where_cursor
-                        .pull(self.where_cursor.options.batch_rows)?
-                    {
-                        merge::append(&ctx, &mut table, &buffer.table, 0..buffer.table.len)?;
-                    }
-                    let described =
-                        crate::sparql::describe::describe(&ctx, &table.table, options, *explicit)?;
-                    self.truncated = described.truncated;
+                        .pull(self.where_cursor.options.batch_rows)?;
+                    let last = batch.is_none();
+                    let table = match batch {
+                        Some(buffer) => buffer,
+                        None => Buffer::new(&ctx, &self.where_cursor.vars, 0)?,
+                    };
+                    let triples = crate::sparql::describe::describe_batch(
+                        &ctx,
+                        &table.table,
+                        options,
+                        *explicit,
+                        &mut self.described,
+                        last,
+                    )?;
+                    drop(table);
+                    self.truncated = self.described.truncated();
+                    self.described_all = last || self.truncated;
                     let mut pending_bytes = 128u64;
-                    let mut pending_charge = OwnedCharge::new(&ctx, capacity_bytes(&table.table))?;
-                    for triple in &described.triples {
+                    for triple in &triples {
                         pending_bytes = pending_bytes.saturating_add(
                             crate::sparql::graph_triple_bytes(triple).saturating_add(256),
                         );
                     }
-                    pending_charge.resize(pending_bytes.saturating_mul(2))?;
-                    let pending = described
-                        .triples
+                    let pending_charge = OwnedCharge::new(&ctx, pending_bytes.saturating_mul(2))?;
+                    let pending = triples
                         .into_iter()
                         .map(|triple| triple.in_graph(GraphName::DefaultGraph))
                         .collect::<Vec<_>>();
                     self.pending = Some(Pending {
                         quads: pending.into_iter(),
                         _charge: pending_charge,
-                    });
-                    // A zero-row captured batch marks the one-time traversal complete.
-                    self.input = Some(QueryBatch {
-                        buffer: super::BatchBuffer::Owned(Buffer::new(
-                            &ctx,
-                            &self.where_cursor.vars,
-                            0,
-                        )?),
-                        variables: self.where_cursor.variables.clone(),
-                        ctx: ctx.clone(),
                     });
                 }
                 Spec::Construct { template, graphs } => {
@@ -407,6 +405,9 @@ impl GraphCursor {
             self.pending = None;
             self.seen.clear();
             self.seen.shrink_to_fit();
+            // what a DESCRIBE kept, with its charge; `truncated` stays
+            self.described = Default::default();
+            self.described_all = true;
         });
         let _ = self.seen_charge.resize(self.base_bytes);
     }
@@ -465,8 +466,10 @@ pub fn write_cursor_graph(
             oxrdfio::RdfSerializer::from_format(format),
             prefixes.iter().cloned(),
         );
-        let mut writer = serializer.for_writer(output);
+        let shared = std::cell::RefCell::new(output);
+        let mut writer = serializer.for_writer(crate::sparql::results::Shared(&shared));
         let mut sent = 0usize;
+        let mut first = true;
         while send.is_none_or(|max| sent < max) {
             let Some(batch) =
                 cursor.next_at_most(send.map_or(usize::MAX, |max| max.saturating_sub(sent)))?
@@ -486,6 +489,11 @@ pub fn write_cursor_graph(
                         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
                 }
                 sent += 1;
+            }
+            // what the first batch wrote reaches a writer that commits on a flush; a
+            // serializer that groups triples by subject may still hold the last ones
+            if std::mem::take(&mut first) {
+                shared.borrow_mut().flush()?;
             }
         }
         if send.is_some_and(|max| sent >= max) {

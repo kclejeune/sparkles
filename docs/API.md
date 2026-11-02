@@ -2048,9 +2048,12 @@ Query parameters beyond the standard protocol:
   the client, so a slow reader does not run it out. A client that reads nothing for
   longer than the request's `timeout` ends the stream as a timeout. That limit applies to
   each wait and not to the whole transfer, and the snapshot and the query's memory grant
-  stay held until the body ends. An error before the response starts gets the normal
-  status and JSON error. An error after the first 1 MiB has been sent, such as a timeout
-  or an exhausted budget, aborts the body transfer. The client then sees a truncated
+  stay held until the body ends. A request with `execution=streaming` starts its
+  response after the cursor's first batch, or after 64 KiB when the batch is larger, so
+  its first rows arrive while later batches are computed. An answer that automatic
+  execution streams starts after 1 MiB, as an eager body does. An error before the
+  response starts gets the normal status and JSON error. An error after it has started,
+  such as a timeout or an exhausted budget, aborts the body transfer. The client then sees a truncated
   response with a `200` status, and in TSV, CSV or N-Triples the rows before
   the cut are well formed, so only a transfer that completes is a complete answer. Treat
   a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
@@ -9828,7 +9831,9 @@ query result whose smallest encoding already exceeds the budget is refused with 
 before anything is sent. A client that
 disconnects stops the serialization. A query that runs as a cursor, which by default
 includes a scan of a million rows or more, is computed while it is sent, so its timeout
-and its memory and row budgets can also end the transfer after it has started. The
+and its memory and row budgets can also end the transfer after it has started. With
+`execution=streaming` the response starts after the first batch of rows or after 64 KiB,
+whichever comes first, so even a small answer is streamed without `Content-Length`. The
 `execution` parameter of [the query endpoint](#per-dataset-sparql-protocol-fuseki-compatible)
 describes when that happens, and `execution=eager` avoids it.
 

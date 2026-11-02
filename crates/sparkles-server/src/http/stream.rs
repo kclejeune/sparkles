@@ -24,6 +24,9 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Bodies up to this size are returned whole.
 pub const STREAM_AFTER: usize = 1 << 20;
+/// An explicitly streamed body commits the response once it holds this many bytes, or
+/// once its writer flushes after the first batch, whichever comes first.
+pub const FIRST_BYTES_AFTER: usize = 64 << 10;
 /// Size of the chunks of a streamed body.
 pub const CHUNK: usize = 64 << 10;
 /// A controlled writer checks its deadline whenever its buffer crosses a multiple of
@@ -77,6 +80,9 @@ pub struct SwitchWriter {
     tx: Option<mpsc::Sender<Chunk>>,
     deferred: bool,
     control: Option<StreamControl>,
+    /// Whether a flush before the switch switches to streaming, so that the bytes of a
+    /// cursor's first batch reach the client before the next batch is computed.
+    commit_on_flush: bool,
     #[cfg(test)]
     producer_gate: Option<Arc<super::algo::probe::Gate>>,
 }
@@ -165,6 +171,20 @@ fn gone() -> io::Error {
 }
 
 impl SwitchWriter {
+    /// Switch to streaming: hand the receiver to the handler, then send what is
+    /// buffered.
+    fn switch(&mut self) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel(4);
+        let signal = self.signal.take().expect("signal before the switch");
+        signal.send(Outcome::Stream(rx)).map_err(|_| gone())?;
+        self.tx = Some(tx);
+        #[cfg(test)]
+        if let Some(gate) = self.producer_gate.take() {
+            gate.wait();
+        }
+        self.send_chunk()
+    }
+
     /// A capped synchronous trial reached its byte threshold and will be retried
     /// on the blocking pool. That trial must not report final serialization timing.
     pub(super) fn deferred(&self) -> bool {
@@ -269,23 +289,23 @@ impl Write for SwitchWriter {
         let n = b.len().min(room);
         self.buf.extend_from_slice(&b[..n]);
         if self.tx.is_none() && self.buf.len() > self.threshold {
-            // switch to streaming: hand the receiver to the handler first
-            let (tx, rx) = mpsc::channel(4);
-            let signal = self.signal.take().expect("signal before the switch");
-            signal.send(Outcome::Stream(rx)).map_err(|_| gone())?;
-            self.tx = Some(tx);
-            #[cfg(test)]
-            if let Some(gate) = self.producer_gate.take() {
-                gate.wait();
-            }
-            self.send_chunk()?;
+            self.switch()?;
         } else if self.tx.is_some() && self.buf.len() >= CHUNK {
             self.send_chunk()?;
         }
         Ok(n)
     }
 
+    /// A flush commits an explicitly streamed response that has not switched yet. Every
+    /// other flush leaves the buffer to fill its chunk.
     fn flush(&mut self) -> io::Result<()> {
+        if self.commit_on_flush
+            && self.tx.is_none()
+            && self.signal.is_some()
+            && !self.buf.is_empty()
+        {
+            self.switch()?;
+        }
         Ok(())
     }
 }
@@ -316,12 +336,18 @@ where
     F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
     D: FnOnce(StreamEnd) + Send + 'static,
 {
-    serialize_inner(threshold, limit, None, write, on_stream_end).await
+    serialize_inner(threshold, false, limit, None, write, on_stream_end).await
 }
 
+/// Serialize a cursor's body under `control`. With `early`, for a request that asked
+/// for streaming, the response commits after [`FIRST_BYTES_AFTER`] bytes or at the
+/// writer's first flush, which the cursor writers send after their first batch.
+/// Otherwise it commits after [`STREAM_AFTER`] bytes, as an eager body does. A failure
+/// after the commit aborts the transfer.
 pub(super) async fn serialize_controlled<F, D>(
     limit: Option<u64>,
     control: StreamControl,
+    early: bool,
     write: F,
     on_end: D,
 ) -> ApiResult<Serialized>
@@ -329,11 +355,17 @@ where
     F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
     D: FnOnce(StreamEnd) + Send + 'static,
 {
-    serialize_inner(STREAM_AFTER, limit, Some(control), write, on_end).await
+    let threshold = if early {
+        FIRST_BYTES_AFTER
+    } else {
+        STREAM_AFTER
+    };
+    serialize_inner(threshold, early, limit, Some(control), write, on_end).await
 }
 
 async fn serialize_inner<F, D>(
     threshold: usize,
+    commit_on_flush: bool,
     limit: Option<u64>,
     control: Option<StreamControl>,
     write: F,
@@ -377,6 +409,7 @@ where
             tx: None,
             deferred: false,
             control: control.clone(),
+            commit_on_flush,
             #[cfg(test)]
             producer_gate: probe.producer,
         };
@@ -561,6 +594,7 @@ where
         tx: None,
         deferred: false,
         control: None,
+        commit_on_flush: false,
         #[cfg(test)]
         producer_gate: None,
     };
@@ -735,6 +769,7 @@ mod tests {
                 tx: None,
                 deferred: false,
                 control: None,
+                commit_on_flush: false,
                 producer_gate: None,
             };
             w.write_all(&vec![b'x'; size])?;
@@ -844,8 +879,15 @@ mod tests {
             Some(Duration::from_millis(150)),
         );
         let waits = control.clone();
-        let Ok(Serialized::Streamed(body)) =
-            serialize_inner(100, None, Some(control), write_n(10_000_000, None), on_end).await
+        let Ok(Serialized::Streamed(body)) = serialize_inner(
+            100,
+            false,
+            None,
+            Some(control),
+            write_n(10_000_000, None),
+            on_end,
+        )
+        .await
         else {
             panic!("expected a stream");
         };
@@ -877,8 +919,15 @@ mod tests {
             Default::default(),
             Some(Duration::from_secs(1)),
         );
-        let Ok(Serialized::Streamed(body)) =
-            serialize_inner(100, None, Some(control), write_n(400_000, None), on_end).await
+        let Ok(Serialized::Streamed(body)) = serialize_inner(
+            100,
+            false,
+            None,
+            Some(control),
+            write_n(400_000, None),
+            on_end,
+        )
+        .await
         else {
             panic!("expected a stream");
         };
@@ -910,6 +959,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let Ok(Serialized::Streamed(body)) = serialize_inner(
             100,
+            false,
             None,
             Some(StreamControl::new(
                 cancel.clone(),
@@ -936,6 +986,7 @@ mod tests {
         let (seen, on_end) = ends();
         let r = serialize_inner(
             100,
+            false,
             Some(50),
             Some(StreamControl::new(
                 Default::default(),

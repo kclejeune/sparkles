@@ -1917,3 +1917,53 @@ async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
         "a stream past its deadline must not end successfully"
     );
 }
+
+/// A request that asks for streaming commits its response after the cursor's first
+/// batch, so even a small answer arrives as a stream. The same answer under automatic
+/// execution is buffered and sent whole (roadmap item 7).
+#[tokio::test]
+async fn explicit_streaming_commits_after_the_first_batch() {
+    let s = server();
+    for format in ["json", "xml", "csv", "tsv", "sparkles"] {
+        let streamed = get(
+            &s.app,
+            &format!("{ALL}&format={format}&execution=streaming"),
+        )
+        .await;
+        assert_eq!(streamed.status, StatusCode::OK, "{format}");
+        assert!(
+            streamed.header("content-length").is_empty(),
+            "{format}: an explicit stream was buffered"
+        );
+        let eager = get(&s.app, &format!("{ALL}&format={format}&execution=eager")).await;
+        assert_eq!(eager.header("content-length"), eager.body.len().to_string());
+        if format != "sparkles" {
+            assert_eq!(streamed.body, eager.body, "{format}");
+        }
+    }
+}
+
+/// An explicitly streamed CONSTRUCT commits after its first batch as well, in an RDF
+/// format, in a Jena format and in the native graph format. The core test
+/// `graph_writers_flush_after_their_first_batch` checks when the writers flush.
+#[tokio::test]
+async fn explicit_streaming_graphs_commit_after_the_first_batch() {
+    let s = server();
+    let q = "/ds/sparql?query=CONSTRUCT%20%7B%3Fs%20%3Fp%20%3Fo%7D%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D&execution=streaming";
+    for accept in [
+        "application/n-triples",
+        "application/rdf+thrift",
+        "sparkles",
+    ] {
+        let r = if accept == "sparkles" {
+            get(&s.app, &format!("{q}&format=sparkles")).await
+        } else {
+            get_with(&s.app, q, "accept", accept).await
+        };
+        assert_eq!(r.status, StatusCode::OK, "{accept}: {}", r.text());
+        assert!(
+            r.header("content-length").is_empty(),
+            "{accept}: an explicit stream was buffered"
+        );
+    }
+}

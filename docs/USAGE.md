@@ -5633,7 +5633,10 @@ let result = ds.query_with(
 A registered aggregate takes one argument and receives the values one at a time, in
 sequence. Without GROUP BY, empty input still creates one accumulator and finishes it.
 With GROUP BY, empty input creates none. An unbound argument or an expression error
-makes that group's result unbound.
+makes that group's result unbound. A group's values arrive in the order of its input
+rows in both execution modes. A streaming cursor reads the input in group-key order,
+sorting it on the keys when it does not come that way, and holds the rows of the group
+it has not finished and at most a batch more.
 
 Call `context.retain(bytes)` before an accumulator keeps more state. The engine
 releases those bytes when the accumulator is destroyed. Cancellation, execution errors,
@@ -5726,6 +5729,14 @@ produced are discarded. Execution errors, invalid outputs, panics, cancellation,
 exceeded budgets and failing destructors abort the query, and an update that contains
 it does not commit partially. Streams run synchronously, one after another, and the
 results are fully built before the query returns.
+
+A streaming cursor collects a function's whole input before its first call, because a
+LIMIT above it could otherwise skip input rows whose calls have effects the function
+relies on. Set `prefix_output` on the descriptor when the rows for a prefix of the input
+are a prefix of the rows for all of it and nothing depends on how much input the
+function saw. The cursor then calls the function a batch of input at a time, so a LIMIT
+stops its input early. Each batch has its own context, so a blank node that a call
+received in one batch cannot be returned by a call in another.
 
 `context.view().scan(subject, predicate, object)` gives a read-only SPO cursor over the
 query's active graph, limited to the graphs, triples and datasets the caller may read.

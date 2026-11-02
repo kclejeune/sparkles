@@ -216,14 +216,34 @@ by that of eager execution.
 | `not-exists`, the bench query | 0.96, eager at this size | **0.96** |
 | `exists-join`, the bench query | 1.01, eager at this size | **0.98** |
 | `exists-group`, a grouped COUNT over FILTER EXISTS, top 10 | 1.01 | 0.99 |
-| `exists-bind`, a COUNT grouped by BIND(EXISTS …) | 1.07 | 1.15 |
 
 *Measured on an 8-vCPU AMD EPYC Namespace instance on 2026-10-23.*
 
 At 1.05M `not-exists` and `exists-join` filter fewer than 20,000 estimated rows and stay
-eager, so their ratios compare a mode with itself. An EXISTS in BIND, in an OPTIONAL
-condition or inside a larger expression is evaluated once per distinct outer key, which
-was slower in the cursor, so plans with one stay eager.
+eager, so their ratios compare a mode with itself.
+
+Both executors also answer an EXISTS that is a BIND expression or an OPTIONAL condition
+from the key set of its pattern, and automatic execution streams the BIND. The next table
+gives median server times at 10.5M with one Rayon thread and three A, B, B, A rounds. The
+first two columns are automatic execution before and after that change, 4bd70845 and
+ec6cd326, and the last two are eager and streamed execution of ec6cd326. All runs
+returned the same answers.
+
+| 10.5M, ms | Automatic, before | Automatic, after | Eager | Streamed |
+|---|---:|---:|---:|---:|
+| `exists-bind`, researchers grouped by BIND(EXISTS { ?p ex:authorOf ?d }) | 860 | **8.4** | 8.8 | **7.7** |
+| `exists-bind-join`, students grouped by BIND(NOT EXISTS) on the city of their advisor's employer | 2,003 | **7.4** | 7.9 | **7.3** |
+| `exists-optional`, students with an OPTIONAL advisor who wrote a paper | 1,079 | **12.9** | **12.5** | 57.4 |
+| `optional-filter`, the same OPTIONAL with a plain FILTER condition | 41.3 | 40.8 | **12.3** | 45.9 |
+| `exists-if`, an EXISTS inside IF, evaluated per key | 4,354 | 4,364 | **4,245** | 4,982 |
+
+*Measured on 8-vCPU AMD EPYC Namespace instances on 2026-11-01.*
+
+An EXISTS inside a larger expression is still evaluated once per distinct outer key,
+which is slower in the cursor, so plans with one stay eager. An OPTIONAL whose condition
+is an EXISTS stays eager as well, because the cursor's conditional OPTIONAL takes several
+times as long as the eager one with any condition. Automatic execution already streams
+`optional-filter` at this size, which item NEW-ITEM-1 covers.
 
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M, with the spill directory on the instance's local disk.

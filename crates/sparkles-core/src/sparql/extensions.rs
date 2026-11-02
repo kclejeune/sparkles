@@ -654,6 +654,12 @@ pub struct PropertyDescriptor {
     pub volatility: Volatility,
     pub description: Option<String>,
     pub cardinality_factor: Option<f64>,
+    /// Whether the rows the function returns for a prefix of its input solutions are a
+    /// prefix of the rows it returns for all of them, with nothing else depending on how
+    /// much of the input it saw. A cursor then calls it on its input a batch at a time,
+    /// so that a LIMIT above stops the input early. It is false by default, and the
+    /// cursor then collects the whole input before the first call.
+    pub prefix_output: bool,
     pub(crate) implementation: Arc<dyn PropertyFunction>,
 }
 
@@ -689,6 +695,7 @@ impl PropertyDescriptor {
             volatility: Volatility::default(),
             description: None,
             cardinality_factor: None,
+            prefix_output: false,
         };
         descriptor.validate()?;
         Ok(descriptor)

@@ -19,8 +19,10 @@
 //! functions (`text:query`, `spk:vectorSearch`, `spatial:`) and everything else
 //! (OPTIONAL, UNION, MINUS, BIND, VALUES, sub-selects, SERVICE) are rejected, and the
 //! EXISTS is evaluated per row as before. The EXISTS must be a top-level conjunct of a
-//! FILTER (`EXISTS` or `NOT EXISTS`, possibly beside other conjuncts); one under OR, IF,
-//! BIND or an OPTIONAL's condition is evaluated per row. The active graph of the EXISTS
+//! FILTER (`EXISTS` or `NOT EXISTS`, possibly beside other conjuncts), the whole
+//! expression of a BIND, or the whole condition of an OPTIONAL, whose candidate rows the
+//! key set answers as it answers a filter's rows. One under OR, IF or another function
+//! is evaluated per row. The active graph of the EXISTS
 //! must be the default graph, the union graph or a constant graph; `GRAPH ?g { … FILTER
 //! EXISTS … }` qualifies because the planner evaluates such a group per named graph,
 //! each with its own constant active graph and its own key set.
@@ -274,18 +276,20 @@ fn exists_of(e: &Expr) -> Option<(&ExistsSpec, bool)> {
     }
 }
 
-/// The unsubstituted plan of the key set that would answer the filter conjunct `e`,
-/// when `e` is `EXISTS { P }` or `NOT EXISTS { P }` and `P` is in the admitted algebra.
-/// Automatic execution streams only an EXISTS that it can answer this way. Any other
-/// EXISTS is evaluated once per distinct outer key, which measured slower in the cursor
-/// than in eager execution.
+/// The unsubstituted plan of the key set that would answer `e`, when `e` is
+/// `EXISTS { P }` or `NOT EXISTS { P }` and `P` is in the admitted algebra. `e` is a
+/// FILTER conjunct, a BIND expression or an OPTIONAL condition. Automatic execution
+/// streams only an EXISTS that it can answer this way. Any other EXISTS is evaluated
+/// once per distinct outer key, which measured slower in the cursor than in eager
+/// execution.
 ///
-/// `input` is the FILTER's input. The key set cannot answer a row that binds a risky
-/// variable, one that a FILTER inside `P` reads, so a risky variable that a constant or
-/// every input row binds forces evaluation per key, as does an input that binds none of
-/// the key variables. Both are rejected here. A risky variable that only some input rows
-/// bind stays admitted, since the rows that leave it unbound use the key set.
-pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, input: &Node) -> Option<Node> {
+/// `vars` are the variables of the rows `e` tests and `certain` those that every such
+/// row binds. The key set cannot answer a row that binds a risky variable, one that a
+/// FILTER inside `P` reads, so a risky variable that a constant or every row binds
+/// forces evaluation per key, as do rows that bind none of the key variables. Both are
+/// rejected here. A risky variable that only some rows bind stays admitted, since the
+/// rows that leave it unbound use the key set.
+pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, vars: &[VarId], certain: &[VarId]) -> Option<Node> {
     if !ctx.opt.decorrelate_exists {
         return None;
     }
@@ -295,15 +299,11 @@ pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, input: &Node) -> Option<Node> {
     if plan
         .risky
         .iter()
-        .any(|v| constant(v) || input.certain.contains(v))
+        .any(|v| constant(v) || certain.contains(v))
     {
         return None;
     }
-    if !plan
-        .keys
-        .iter()
-        .any(|v| constant(v) || input.vars.contains(v))
-    {
+    if !plan.keys.iter().any(|v| constant(v) || vars.contains(v)) {
         return None;
     }
     Some(plan.node)
@@ -368,15 +368,55 @@ fn slots(spec: &ExistsSpec, t: &Table, vars: &[VarId]) -> Vec<Slot> {
 
 /// Filter `t` by the EXISTS conjunct `e` from its key set, if it has (or gets) one.
 fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -> Result<bool> {
-    let Some(build) = prepare(ctx, spec, t)? else {
+    let Some(keep) = answers(ctx, t, e, spec, negated)? else {
         return Ok(false);
+    };
+    let sorted = t.sorted.clone();
+    t.filter_rows(&keep);
+    t.sorted = sorted;
+    Ok(true)
+}
+
+/// The values of `EXISTS { P }` or `NOT EXISTS { P }` for the rows of `t`, as a BIND
+/// computes them, from the key set of `P` that a FILTER would use. The same admission
+/// and cost rule decides whether the key set is built, and a row that the key set cannot
+/// answer is evaluated by substitution, so the values are those of per-row evaluation.
+/// `None` leaves every row to per-row evaluation.
+pub(super) fn column(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Option<Vec<Id>>> {
+    Ok(mask(ctx, t, e)?.map(|values| values.into_iter().map(Id::from_bool).collect()))
+}
+
+/// Whether each row of `t` satisfies `e`, when `e` is `EXISTS { P }` or
+/// `NOT EXISTS { P }` that the key set of `P` answers, as [`column`] decides. An
+/// OPTIONAL condition tests its candidate rows this way.
+pub(super) fn mask(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Option<Vec<bool>>> {
+    if !ctx.opt.decorrelate_exists || t.is_empty() || PER_ROW.with(Cell::get) > 0 {
+        return Ok(None);
+    }
+    let Some((spec, negated)) = exists_of(e) else {
+        return Ok(None);
+    };
+    answers(ctx, t, e, spec, negated)
+}
+
+/// Whether each row of `t` satisfies the EXISTS conjunct `e`, from its key set, if it
+/// has (or gets) one.
+fn answers(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    spec: &ExistsSpec,
+    negated: bool,
+) -> Result<Option<Vec<bool>>> {
+    let Some(build) = prepare(ctx, spec, t)? else {
+        return Ok(None);
     };
     let decor = &spec.decor;
     let keys = slots(spec, t, &build.keys);
     let risky = slots(spec, t, &build.risky);
     if risky.iter().any(|s| s.constant.is_some()) {
         decor.note(RISKY_BOUND);
-        return Ok(false);
+        return Ok(None);
     }
     // the key sets are alive while the rows are probed
     let held = match ctx.charge(if ctx.is_cursor() {
@@ -388,7 +428,7 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
         Ok(h) => h,
         Err(Error::BudgetExceeded(_)) => {
             decor.note("its key set does not fit in the memory budget");
-            return Ok(false);
+            return Ok(None);
         }
         Err(e) => return Err(e),
     };
@@ -409,10 +449,7 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
             .collect();
         drop(held);
         decor.probed.fetch_add(keep.len() as u64, Ordering::Relaxed);
-        let sorted = t.sorted.clone();
-        t.filter_rows(&keep);
-        t.sorted = sorted;
-        return Ok(true);
+        return Ok(Some(keep));
     }
     let width = keys.len();
     let all = if width == 64 {
@@ -480,10 +517,7 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
     drop(held);
     decor.probed.fetch_add(probed, Ordering::Relaxed);
     decor.per_row.fetch_add(per_row, Ordering::Relaxed);
-    let sorted = t.sorted.clone();
-    t.filter_rows(&keep);
-    t.sorted = sorted;
-    Ok(true)
+    Ok(Some(keep))
 }
 
 const RISKY_BOUND: &str = "the outer solutions bind a variable that only a FILTER inside it uses";
