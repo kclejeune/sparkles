@@ -6619,7 +6619,10 @@ pub(super) fn group(
     vars.extend(aggs.iter().map(|(v, _)| *v));
     let mut out = Table::new(vars);
     let map = t.var_map(ctx.nvars());
-    // aggregate arguments that are pure over one variable, once per distinct value
+    // Aggregate arguments that are pure over one variable, once per distinct value, for
+    // an input of more than `PAR_THRESHOLD` rows. A smaller input, such as a cursor's
+    // batch, evaluates them row by row: finding its distinct values costs more than the
+    // evaluations it saves, about 13% of `expr-agg-arg` at 10.5M triples in cursors.
     let mut args = Vec::with_capacity(aggs.len());
     for (_, agg) in aggs {
         args.push(match &agg.expr {
@@ -6627,7 +6630,7 @@ pub(super) fn group(
             Some(e)
                 if agg.fold.is_none()
                     && agg.registered.is_none()
-                    && t.len() >= super::exprcache::MIN_ROWS
+                    && t.len() > PAR_THRESHOLD
                     && super::exprcache::eligible(&[e]).is_ok() =>
             {
                 super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
