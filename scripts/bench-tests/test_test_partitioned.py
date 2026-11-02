@@ -125,5 +125,51 @@ class StopShare(unittest.TestCase):
         self.assertFalse((out / "share-1/remote-locked").exists())
 
 
+class StartShare(unittest.TestCase):
+    """The start of run.sh, with a ps that lacks -p, as BusyBox's does."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        prologue = subprocess.run(["bash", "-c", functions("share_prologue") + f'\nshare_prologue "{self.dir}"'],
+                                  check=True, capture_output=True, text=True).stdout
+        self.run_sh = self.dir / "run.sh"
+        self.run_sh.write_text("#!/usr/bin/env bash\n" + prologue +
+                               f'echo "$$ $(sed \'s/.*) //\' /proc/$$/stat | cut -d\' \' -f3)" > {self.dir}/ran\n')
+        bin_dir = self.dir / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "ps").write_text("#!/bin/sh\necho 'ps: invalid option -- p' >&2\nexit 1\n")
+        (bin_dir / "ps").chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        self.env.pop("SPARKLES_SHARE_SETSID", None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def start(self, leader):
+        p = subprocess.run(["bash", str(self.run_sh)], env=self.env, start_new_session=leader,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def check_leads_its_group(self):
+        pid, pgid = (self.dir / "ran").read_text().split()
+        self.assertEqual(pid, pgid)
+        self.assertEqual((self.dir / "pid").read_text().strip(), pid)
+
+    def test_a_share_that_is_not_a_group_leader_becomes_one_with_its_pid_recorded(self):
+        self.start(leader=False)
+        self.check_leads_its_group()
+
+    def test_a_share_that_leads_its_group_runs_without_a_new_session(self):
+        self.start(leader=True)
+        self.check_leads_its_group()
+
+    def test_a_cancelled_share_stops_before_its_setup(self):
+        (self.dir / "cancel").touch()
+        self.start(leader=True)
+        self.assertTrue((self.dir / "pid").exists())
+        self.assertFalse((self.dir / "ran").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

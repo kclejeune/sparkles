@@ -456,17 +456,7 @@ run_remote() {
   rsh "cat > $s/run.sh" << EOF
 #!/usr/bin/env bash
 set -uo pipefail
-# The share leads its own process group, so its pid names the group even after it exits
-# and a child lives on. setsid without a fork keeps the pid when the shell is not a group
-# leader already, as under a terminal service.
-if [ "\$(ps -o pgid= -p \$\$ | tr -d ' ')" != "\$\$" ] && command -v setsid > /dev/null; then
-  exec setsid bash "\$0"
-fi
-# The group is recorded before any setup, so a cleanup can stop it at any point. A cleanup
-# writes cancel before it reads pid, and this checks cancel after writing pid, so either
-# the cleanup sees the pid or the share sees the request.
-echo \$\$ > $s/pid
-[ -e $s/cancel ] && exit 0
+$(share_prologue "$s")
 cd $root
 env_file=$(printf '%q' "$env_file")
 if [ -n "\$env_file" ] && [ -f "\$env_file" ]; then set -a; . "\$env_file"; set +a; fi
@@ -580,6 +570,24 @@ remote_cleanup() {
   else
     echo "test-partitioned.sh: could not confirm that the share on $h stopped; its directory and $root.share-lock stay" >&2
   fi
+}
+
+# share_prologue DIR: the start of a share's run.sh. The share leads its own process group,
+# so its pid names the group even after it exits and a child lives on. The group comes from
+# /proc, which every Linux machine has, where ps may lack -p, as BusyBox's does. When the
+# shell is not a group leader, as under a terminal service, setsid makes it one, once.
+# The group is recorded before any setup, so a cleanup can stop it at any point. A cleanup
+# writes cancel before it reads pid, and this checks cancel after writing pid, so either
+# the cleanup sees the pid or the share sees the request.
+share_prologue() {
+  cat << EOF
+if [ -z "\${SPARKLES_SHARE_SETSID:-}" ] && command -v setsid > /dev/null; then
+  pg=\$(sed 's/.*) //' /proc/\$\$/stat 2> /dev/null | cut -d' ' -f3)
+  [ "\$pg" = "\$\$" ] || SPARKLES_SHARE_SETSID=1 exec setsid bash "\$0"
+fi
+echo \$\$ > $1/pid
+[ -e $1/cancel ] && exit 0
+EOF
 }
 
 # The bash program that stops a share and releases its directory, which the remote side
