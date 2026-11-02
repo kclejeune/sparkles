@@ -178,7 +178,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_test_binary_maps_its_own_code() {
-        let bytes = prefault_code().expect("Linux 5.14 or later maps the code");
+        // whether this kernel knows MADV_POPULATE_READ, asked of one page of this
+        // function's own code
+        // SAFETY: sysconf only reads a system setting
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let here = the_test_binary_maps_its_own_code as fn() as usize & !(page - 1);
+        // SAFETY: the page holds this function's code, and populating it changes no memory
+        let supported = unsafe {
+            libc::madvise(here as *mut libc::c_void, page, libc::MADV_POPULATE_READ) == 0
+        };
+        if !supported {
+            assert_eq!(prefault_code(), None, "a kernel before 5.14 maps nothing");
+            return;
+        }
+        let bytes = prefault_code().expect("a kernel that populates pages maps the code");
         assert!(bytes > 0);
         // a second call finds the pages mapped and succeeds again
         assert_eq!(prefault_code(), Some(bytes));
