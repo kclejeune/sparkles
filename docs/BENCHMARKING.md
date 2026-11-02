@@ -56,6 +56,11 @@ queries look slower on the other side. Build both revisions in `nix develop`.
 refuses a pair whose compilers differ, and `readelf -p .comment` shows them for any other
 comparison.
 
+Build timed binaries with `MBX_LEARNED_INCREMENTAL=false`. Boxington's learned incremental
+reuse once compiled one side of an A/B pair with a `.text` section about 2% smaller, and
+that binary ran up to 12% to 19% slower on the same source. `scripts/nsc-build.sh` sets it
+for every binary the Namespace screen builds.
+
 Server ports belong below the kernel's range of ephemeral client ports, which is 32768 to
 60999 by default (`/proc/sys/net/ipv4/ip_local_port_range`). A client connection that
 happened to use a server's port as its own local port stays in TIME-WAIT for 60 s after it
