@@ -19,6 +19,17 @@ struct State {
 }
 /// The owner id of an eager context's fast account, the first owner of its ledger.
 pub(crate) const PRIMARY: u64 = 1;
+/// The step in which a live account's reservation from its grant grows, so that a
+/// cursor's charges take a pool operation only once per step.
+const LIVE_STEP: u64 = 64 << 10;
+/// How far a live account's reservation may stay above its live bytes before a release
+/// gives the excess back to the grant.
+const LIVE_SLACK: u64 = 1 << 20;
+#[cfg(test)]
+thread_local! {
+    /// growths of a live account's reservation on this thread
+    pub(crate) static LIVE_GROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub(crate) struct MemoryOwner {
     pub(crate) id: u64,
     grant: Option<Arc<PoolGrant>>,
@@ -26,8 +37,45 @@ pub(crate) struct MemoryOwner {
 struct Account {
     owner: Arc<MemoryOwner>,
     live: u64,
+    /// The account's reservation from its grant. Under eager accounting it is the
+    /// admitted high point, kept until the result drops. Under cursor accounting it
+    /// follows `live` in steps of [`LIVE_STEP`] and never falls below it.
     eager: u64,
     decode: u64,
+}
+
+impl Account {
+    /// Grow a live account's reservation to cover `own_live`, a step ahead when the
+    /// grant can give the step and exactly otherwise. A refused grant changes nothing.
+    fn reserve_live(&mut self, grant: &PoolGrant, own_live: u64) -> Result<()> {
+        if own_live <= self.eager {
+            return Ok(());
+        }
+        #[cfg(test)]
+        LIVE_GROWS.with(|n| n.set(n.get() + 1));
+        let ahead = own_live.next_multiple_of(LIVE_STEP).max(own_live);
+        match grant.charge(ahead - self.eager) {
+            Ok(()) => self.eager = ahead,
+            Err(_) if ahead > own_live => {
+                grant.charge(own_live - self.eager)?;
+                self.eager = own_live;
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// The part of a live account's reservation to give back now that its live bytes
+    /// fell: everything above the next step once the excess passes [`LIVE_SLACK`].
+    fn shrink_live(&mut self) -> u64 {
+        if self.eager - self.live <= LIVE_SLACK {
+            return 0;
+        }
+        let keep = self.live.next_multiple_of(LIVE_STEP).min(self.eager);
+        let bytes = self.eager - keep;
+        self.eager = keep;
+        bytes
+    }
 }
 struct Release {
     grant: Option<Arc<PoolGrant>>,
@@ -105,14 +153,19 @@ impl QueryMemoryLedger {
         let mut storage = Vec::new();
         loop {
             let mut state = self.lock();
+            let cursor = state.cursor;
             if let Some(i) = state.owners.iter().position(|a| {
                 a.live == 0
-                    && a.eager == 0
+                    && (a.eager == 0 || cursor)
                     && Arc::strong_count(&a.owner) == 1
                     && !same(a.owner.grant.as_ref(), grant)
             }) {
                 let retired = state.owners.swap_remove(i);
                 drop(state);
+                // A retired live account gives back the step it still reserved.
+                if let Some(g) = &retired.owner.grant {
+                    g.release(retired.eager);
+                }
                 drop(retired);
                 continue;
             }
@@ -204,7 +257,7 @@ impl QueryMemoryLedger {
             .ok_or_else(|| memory(limit, u64::MAX))?;
         if let Some(grant) = &owner.grant {
             if cursor {
-                grant.charge(bytes)?;
+                account.reserve_live(grant, own_live)?;
             } else if own_live > account.eager {
                 grant.charge(own_live - account.eager)?;
                 account.eager = own_live;
@@ -253,10 +306,12 @@ impl QueryMemoryLedger {
             .checked_sub(bytes)
             .expect("query live bytes");
         self.live.store(live, Ordering::Release);
-        Release {
-            grant: cursor.then(|| account.owner.grant.clone()).flatten(),
-            bytes,
-        }
+        let grant = cursor.then(|| account.owner.grant.clone()).flatten();
+        let bytes = match &grant {
+            Some(_) => account.shrink_live(),
+            None => 0,
+        };
+        Release { grant, bytes }
     }
     pub(crate) fn release(&self, id: u64, bytes: u64) {
         let release = {
@@ -265,6 +320,8 @@ impl QueryMemoryLedger {
         };
         release.finish();
     }
+    /// Let a cursor's grant give back granules it no longer needs. The accounts keep
+    /// their reservations, which their releases shrink.
     pub(crate) fn trim_zero(&self, grant: Option<&Arc<PoolGrant>>) {
         let cursor = self.lock().cursor;
         if cursor && let Some(grant) = grant {
@@ -355,7 +412,8 @@ impl QueryMemoryLedger {
                         bytes,
                     });
                 }
-                account.eager = 0;
+                // A live account's reservation starts at its live bytes.
+                account.eager = account.live;
             }
             state.cursor = true;
             drop(state);
@@ -579,11 +637,8 @@ impl Drop for QueryMemoryLedger {
         let state = self.state.get_mut();
         for account in &state.owners {
             if let Some(grant) = &account.owner.grant {
-                grant.release(if state.cursor {
-                    account.live
-                } else {
-                    account.eager
-                });
+                // Both policies keep the reservation at or above the live bytes.
+                grant.release(account.eager);
             }
         }
     }
@@ -938,11 +993,84 @@ mod tests {
         assert!(a.used() > 0);
         let keep = ctx.charge(300).unwrap();
         ctx.release_cursor_work();
-        assert_eq!((a.used(), b.used()), (300, 2 * MB));
+        // Each live account keeps the step that covers what it holds, within its slack.
+        assert_eq!((a.used(), b.used()), (LIVE_STEP, 2 * MB + LIVE_STEP));
         drop(keep);
         drop(ctx);
         assert_eq!((a.used(), b.used()), (0, 0));
     }
+    /// A cursor account reserves its grant in steps: small charges take a pool operation
+    /// once per step, the reservation never falls below the live bytes and never stays
+    /// more than the slack above them, and the context gives it all back when it drops.
+    #[test]
+    fn live_reservations_grow_in_steps_and_shrink_with_hysteresis() {
+        let pool = QueryPool::new(256 * MB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = context();
+        ctx.set_grant(Some(grant.clone()));
+        ctx.enable_cursor_accounting().unwrap();
+        let before = LIVE_GROWS.with(|n| n.get());
+        let held: Vec<_> = (0..4096).map(|_| ctx.charge(1000).unwrap()).collect();
+        let live = 4096 * 1000;
+        let grows = LIVE_GROWS.with(|n| n.get()) - before;
+        assert!(grows as u64 <= live / LIVE_STEP + 1, "{grows} growths");
+        assert!(grant.used() >= live && grant.used() < live + LIVE_STEP);
+        let mut held = held;
+        // Releases within the slack keep the reservation.
+        held.truncate(4096 - 512);
+        assert!(grant.used() >= live && grant.used() < live + LIVE_STEP);
+        // Past the slack the reservation falls back to the step over the live bytes.
+        held.truncate(1024);
+        let live = 1024 * 1000;
+        assert!(grant.used() >= live && grant.used() <= live + LIVE_SLACK + LIVE_STEP);
+        drop(held);
+        assert!(grant.used() <= LIVE_SLACK + LIVE_STEP);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// Seventeen cursors that charge a 256 MiB pool concurrently in small pieces never
+    /// hold more than the pool, each keeps at most one step and the slack above its live
+    /// bytes, and all of it comes back.
+    #[test]
+    fn concurrent_cursors_share_a_small_pool_within_their_steps() {
+        let pool = QueryPool::new(256 * MB);
+        let grants: Vec<_> = (0..17).map(|_| Arc::new(pool.empty_grant())).collect();
+        std::thread::scope(|scope| {
+            for grant in &grants {
+                let pool = &pool;
+                scope.spawn(move || {
+                    let mut ctx = context();
+                    ctx.set_grant(Some(grant.clone()));
+                    ctx.enable_cursor_accounting().unwrap();
+                    let mut held = Vec::new();
+                    for round in 0..4 {
+                        for _ in 0..2000 {
+                            match ctx.charge(4096) {
+                                Ok(charge) => held.push(charge),
+                                Err(Error::BudgetExceeded(_)) => break,
+                                Err(error) => panic!("{error:?}"),
+                            }
+                            assert!(pool.granted() <= pool.capacity());
+                        }
+                        let live = ctx.memory().live.load(Ordering::Acquire);
+                        assert!(grant.used() >= live);
+                        assert!(
+                            grant.used() <= live + LIVE_SLACK + LIVE_STEP,
+                            "round {round}"
+                        );
+                        held.truncate(held.len() / 4);
+                    }
+                    drop(held);
+                    drop(ctx);
+                    assert_eq!(grant.used(), 0);
+                });
+            }
+        });
+        drop(grants);
+        assert_eq!(pool.granted(), 0);
+    }
+
     #[test]
     fn native_call_captures_owner_limit_and_output_outlives_context() {
         let pool = QueryPool::new(64 * MB);
