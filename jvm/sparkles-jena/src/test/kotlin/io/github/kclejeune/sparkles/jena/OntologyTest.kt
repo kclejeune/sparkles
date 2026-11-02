@@ -133,8 +133,8 @@ class OntologyTest {
                     if (adding) g.add(t) else g.delete(t)
                     other.start()
                     awaitWriterWait(other)
-                    ds.abort()
                 } finally {
+                    ds.abort()
                     ds.end()
                 }
                 other.join()
@@ -145,11 +145,17 @@ class OntologyTest {
         }
     }
 
-    /** Wait until `thread` is in the native call that waits for the writer lock. */
+    /**
+     * Wait until `thread` is in the native start of its own write transaction, which waits
+     * for the writer lock that this thread's transaction holds.
+     */
     private fun awaitWriterWait(thread: Thread) {
         val until = System.nanoTime() + 10_000_000_000L
-        while (thread.stackTrace.none { it.methodName == "beginWrite" }) {
-            assertTrue(System.nanoTime() < until, "the other thread never waited for the writer lock")
+        while (thread.stackTrace.none { it.methodName.startsWith("uniffi_sparkles_ffi_fn_method_ffidataset_begin_write") }) {
+            assertTrue(System.nanoTime() < until) {
+                "the other thread never waited for the writer lock: " +
+                    thread.stackTrace.joinToString { "${it.className}.${it.methodName}" }
+            }
             Thread.sleep(5)
         }
     }
