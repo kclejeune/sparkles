@@ -1,0 +1,14 @@
+{
+ "sparkles": {
+  "seconds": 6.5569,
+  "max_rss_kib": 3892976,
+  "index_bytes": 652967936,
+  "index_apparent_bytes": 652883770
+ },
+ "qlever": {
+  "seconds": 10.9876,
+  "max_rss_kib": 2064800,
+  "index_bytes": 402210816,
+  "index_apparent_bytes": 402140602
+ }
+}

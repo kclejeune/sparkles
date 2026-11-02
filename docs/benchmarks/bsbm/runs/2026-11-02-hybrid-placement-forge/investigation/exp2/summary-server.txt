@@ -1,0 +1,57 @@
+metric=server  host=forge  governor=powersave/balance_performance
+template                base/all12      base/all16      base/all20         base/e7        base/p12     base/p12x20       base/pe19
+bi-q3                        20.15           20.03           24.55           25.71           19.84           22.52           24.82
+bi-q5                        18.84           19.34           18.78           23.69           18.95           18.96           18.41
+bi-q8                        24.13           24.71           24.63           30.05           23.73           24.05           23.88
+
+per-process medians (instance 1 and births):
+bi-q3-1
+   base/all12           12.55   10.45   15.01   16.07
+   base/all16           10.99   16.68    8.77   11.07
+   base/all20           16.46   17.10   17.59   18.94
+   base/e7              14.32   12.50   21.20   13.19
+   base/p12             14.08   15.83   16.00   14.09
+   base/p12x20           8.97   14.89   14.65   14.65
+   base/pe19            18.05   17.88   16.70   18.34
+bi-q5-1
+   base/all12            4.74    4.69    4.68    4.64
+   base/all16            4.06    4.89    4.79    4.62
+   base/all20            4.76    4.62    4.69    3.18
+   base/e7               5.34    4.55    2.47    5.37
+   base/p12              4.47    4.55    3.86    3.73
+   base/p12x20           3.59    4.48    4.08    4.39
+   base/pe19             4.08    4.42    4.41    3.94
+bi-q8-1
+   base/all12          244.71  244.22  248.14  252.67
+   base/all16          245.51  247.94  251.14  252.60
+   base/all20          248.62  248.00  248.75  248.87
+   base/e7             312.10  313.40  315.82  312.62
+   base/p12            245.32  245.27  246.79  245.73
+   base/p12x20         246.31  247.44  249.27  245.95
+   base/pe19           250.48  247.85  243.00  245.20
+
+CPU ms per timed request by thread kind and core type (instance 1 and births):
+bi-q3-1
+   base/all12         rayon-E=  3.93  rayon-P=  5.49  tokio-E=  2.57  tokio-P=  9.99
+   base/all16         rayon-E=  4.72  rayon-P=  7.49  tokio-E=  3.14  tokio-P=  8.78
+   base/all20         rayon-E=  7.71  rayon-P= 11.09  tokio-E=  4.29  tokio-P= 11.04
+   base/e7            rayon-E=  8.16  tokio-E= 14.70
+   base/p12           rayon-P= 11.23  tokio-P= 13.00
+   base/p12x20        rayon-P= 16.84  tokio-P= 11.83
+   base/pe19          rayon-E=  6.25  rayon-P= 12.03  tokio-E=  1.34  tokio-P= 14.27
+bi-q5-1
+   base/all12         tokio-E=  2.05  tokio-P=  2.91
+   base/all16         tokio-E=  1.44  tokio-P=  3.33
+   base/all20         other-E=  0.00  tokio-E=  2.50  tokio-P=  1.94
+   base/e7            other-E=  0.00  tokio-E=  4.67
+   base/p12           other-P=  0.00  tokio-P=  4.37
+   base/p12x20        tokio-P=  4.25
+   base/pe19          tokio-P=  4.34
+bi-q8-1
+   base/all12         other-E=  0.02  other-P=  0.00  rayon-E= 45.87  rayon-P= 54.49  tokio-E=  0.45  tokio-P=237.39
+   base/all16         other-E=  0.02  other-P=  0.01  rayon-E= 56.20  rayon-P= 68.45  tokio-E=  0.51  tokio-P=238.00
+   base/all20         other-E=  0.02  other-P=  0.01  rayon-E= 60.13  rayon-P= 87.15  tokio-E=  0.35  tokio-P=237.72
+   base/e7            other-E=  0.02  rayon-E= 94.42  tokio-E=298.37
+   base/p12           other-P=  0.03  rayon-P=105.38  tokio-P=234.86
+   base/p12x20        other-P=  0.02  rayon-P=112.40  tokio-P=235.89
+   base/pe19          other-E=  0.01  other-P=  0.01  rayon-E= 51.26  rayon-P= 87.74  tokio-E=  0.08  tokio-P=236.49

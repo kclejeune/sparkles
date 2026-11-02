@@ -70,6 +70,22 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+On Linux, a server on a processor with performance and efficiency cores runs the threads
+that serve requests on the performance cores, and its query pool leaves one logical CPU
+free for every four efficiency cores. Before, the pool held every logical CPU, and a
+request that waited for it often finished its sequential work on an efficiency core.
+`serve --request-cpus all` keeps the earlier placement, and `RAYON_NUM_THREADS` still
+sets the pool's size. The default pool on such a processor is smaller, 18 threads instead
+of 20 on an Intel Core i5-13500, which a query bound by its parallel work can feel.
+
+A cursor batch of BIND or FILTER rows whose expressions are expensive, such as date
+functions and decimal arithmetic, is mapped over the query pool instead of on the
+request thread, and the rows it holds while it does count against the query's memory
+budget. A query text whose automatic cursor answers whole in 10 to 50 ms has its next
+run tried eagerly, once, and settles in the faster mode. Before, DBpedia's
+`births-by-decade` could stay a cursor of about 15 ms for a server's whole life where an
+eager run takes 2 ms.
+
 An OWL 2 ontology API reads the axioms of a dataset's graphs through the OWL 2 Mapping to
 RDF Graphs, checks them against OWL 2 DL, EL, QL and RL, and edits them in one commit.
 The new `sparkles-owl` crate holds the axiom model, both mappings with lenient and strict

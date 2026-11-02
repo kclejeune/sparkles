@@ -1,0 +1,368 @@
+{
+ "bi-q1-1": {
+  "sparkles": {
+   "rows": 10,
+   "order": "ecf7f34cb9ae1182",
+   "boundary_rows": 0,
+   "exact": "921df77389f01594",
+   "value": "72d557ca9c94e0c7",
+   "query_sha256": "8239f25ea708717824344eb4c8cf7f868f14e230e5784b944d846a04f0ee2d2a"
+  },
+  "qlever": {
+   "rows": 10,
+   "order": "ecf7f34cb9ae1182",
+   "boundary_rows": 0,
+   "exact": "db591a27751c8b94",
+   "value": "72d557ca9c94e0c7",
+   "query_sha256": "8239f25ea708717824344eb4c8cf7f868f14e230e5784b944d846a04f0ee2d2a"
+  }
+ },
+ "bi-q1-2": {
+  "sparkles": {
+   "rows": 10,
+   "order": "ae603d4ecc746af6",
+   "boundary_rows": 0,
+   "exact": "30745bbd70160c4c",
+   "value": "5f909160a4b7cd4e",
+   "query_sha256": "65a56fc4f3107ea86c484f38f2bc7d470c9324ac721cf6903ba44cdc4c18f206"
+  },
+  "qlever": {
+   "rows": 10,
+   "order": "ae603d4ecc746af6",
+   "boundary_rows": 0,
+   "exact": "05a1ba66e1a912db",
+   "value": "5f909160a4b7cd4e",
+   "query_sha256": "65a56fc4f3107ea86c484f38f2bc7d470c9324ac721cf6903ba44cdc4c18f206"
+  }
+ },
+ "bi-q1-3": {
+  "sparkles": {
+   "rows": 10,
+   "order": "7acf49548e5810e2",
+   "boundary_rows": 0,
+   "exact": "0894df87e33b3c12",
+   "value": "8383281576f2ee23",
+   "query_sha256": "95e08aa1eb58dbed5deefe601bdcfb5fa3b9453602c6c243577d91fa9f779e02"
+  },
+  "qlever": {
+   "rows": 10,
+   "order": "7acf49548e5810e2",
+   "boundary_rows": 0,
+   "exact": "8d6a98425f54145b",
+   "value": "8383281576f2ee23",
+   "query_sha256": "95e08aa1eb58dbed5deefe601bdcfb5fa3b9453602c6c243577d91fa9f779e02"
+  }
+ },
+ "bi-q2-1": {
+  "sparkles": {
+   "rows": 10,
+   "order": "dd544c38099e1912",
+   "boundary_rows": 0,
+   "exact": "fb256a09ca887316",
+   "value": "0d2aaf6a66a6dd49",
+   "query_sha256": "de64e60ea2989d361e14ee78ef62a22129d9bfaf832f0ee1c7922dcb0e08d6f0"
+  },
+  "qlever": {
+   "rows": 10,
+   "order": "dd544c38099e1912",
+   "boundary_rows": 0,
+   "exact": "8278f5381eabe7fa",
+   "value": "0d2aaf6a66a6dd49",
+   "query_sha256": "de64e60ea2989d361e14ee78ef62a22129d9bfaf832f0ee1c7922dcb0e08d6f0"
+  }
+ },
+ "bi-q2-2": {
+  "sparkles": {
+   "rows": 10,
+   "order": "f8324fc389a9841d",
+   "boundary_rows": 0,
+   "exact": "cdf19467f2699c88",
+   "value": "f593e1a20e136373",
+   "query_sha256": "d0a1c13bb3bef07d33da60b815668fca18cd83f95fdee61be8f9cc947cdbbe22"
+  },
+  "qlever": {
+   "rows": 10,
+   "order": "f8324fc389a9841d",
+   "boundary_rows": 0,
+   "exact": "be2016a03c939143",
+   "value": "f593e1a20e136373",
+   "query_sha256": "d0a1c13bb3bef07d33da60b815668fca18cd83f95fdee61be8f9cc947cdbbe22"
+  }
+ },
+ "bi-q2-3": {
+  "sparkles": {
+   "rows": 10,
+   "order": "1144c1d4e19b95f7",
+   "boundary_rows": 0,
+   "exact": "f06d2f8e6666f897",
+   "value": "3b62bd58603e8853",
+   "query_sha256": "867bc45ecd65b5a2b5c399ef0d861160252c71e2c159aff6ebb15f58f34e63a7"
+  },
+  "qlever": {
+   "rows": 10,
+   "order": "1144c1d4e19b95f7",
+   "boundary_rows": 0,
+   "exact": "9d8f6fb8c1829ce5",
+   "value": "3b62bd58603e8853",
+   "query_sha256": "867bc45ecd65b5a2b5c399ef0d861160252c71e2c159aff6ebb15f58f34e63a7"
+  }
+ },
+ "bi-q3-1": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "ed55a5f1ff5c9080",
+   "value": "ebef2c0b9b0f600e",
+   "query_sha256": "ededf742b9927ac2fbb8aafb0d8bcabb437bab0a24f81b8143899f18db9a5a86"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "004c631e7d21eab4",
+   "value": "ebef2c0b9b0f600e",
+   "query_sha256": "ededf742b9927ac2fbb8aafb0d8bcabb437bab0a24f81b8143899f18db9a5a86"
+  }
+ },
+ "bi-q3-2": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "90723a01fb3eea50",
+   "value": "3234dadc9b402930",
+   "query_sha256": "7d2623be431a0cfa493017e8ffb26dbe034e834e497cb0d61e1fda030ead26da"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "d4f18a5bcbefbee9",
+   "value": "3234dadc9b402930",
+   "query_sha256": "7d2623be431a0cfa493017e8ffb26dbe034e834e497cb0d61e1fda030ead26da"
+  }
+ },
+ "bi-q3-3": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "5242c94515c9c216",
+   "value": "fa9410db8242c10a",
+   "query_sha256": "3a283b1fef638f10f0a4fb18a7f47ff2baebf20ae236dfa9d0d74b55a8b1f997"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "0c7b4daee5765c8e",
+   "value": "fa9410db8242c10a",
+   "query_sha256": "3a283b1fef638f10f0a4fb18a7f47ff2baebf20ae236dfa9d0d74b55a8b1f997"
+  }
+ },
+ "bi-q4-1": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "6c4e3677fa0f87cd",
+   "value": "14296af8992e3796",
+   "query_sha256": "3368c3d0602471762911b3be364ca33ff73b962375e95055b1045cbb5a8a5607"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "3810fa19d8238355",
+   "value": "0694cf733b4c72d2",
+   "query_sha256": "3368c3d0602471762911b3be364ca33ff73b962375e95055b1045cbb5a8a5607"
+  }
+ },
+ "bi-q4-2": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "a8eba398eeae4bf4",
+   "value": "853e1ea3442106e2",
+   "query_sha256": "c2657f10890ad629534008314d024dfcc21c9e5415abc7e082141452c91b6c4a"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "86f984a93a6a582e",
+   "value": "c21a3a2a1345c153",
+   "query_sha256": "c2657f10890ad629534008314d024dfcc21c9e5415abc7e082141452c91b6c4a"
+  }
+ },
+ "bi-q4-3": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "72cb9145e888b52d",
+   "value": "cb1c51be83f2374f",
+   "query_sha256": "d29b64caff906ba561aec4d9cbe48e0fe2964dd2abf0b0f2c32569ec39f6aaa9"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "292fc6f231d8b3c1",
+   "value": "9df0cd31b41bc060",
+   "query_sha256": "d29b64caff906ba561aec4d9cbe48e0fe2964dd2abf0b0f2c32569ec39f6aaa9"
+  }
+ },
+ "bi-q5-1": {
+  "sparkles": {
+   "rows": 13,
+   "order": "f6f91364680dd7fb",
+   "exact": "efcf11b07a8a4610",
+   "value": "aa93594384faac35",
+   "query_sha256": "35a2fc791f57aca1cbf7d84ddcd136a57849c619f73d1d3bfb3912734e6d33b0"
+  },
+  "qlever": {
+   "rows": 13,
+   "order": "f6f91364680dd7fb",
+   "exact": "21003eccd2ffb2bb",
+   "value": "637b640aa6216821",
+   "query_sha256": "35a2fc791f57aca1cbf7d84ddcd136a57849c619f73d1d3bfb3912734e6d33b0"
+  }
+ },
+ "bi-q5-2": {
+  "sparkles": {
+   "rows": 30,
+   "order": "2ee6e97de773ec64",
+   "exact": "23a5057d822be1ad",
+   "value": "0b12cf032e68c71a",
+   "query_sha256": "2fe6d78319b02c90acf9aae4093315db8da62f3db0d5f13bf37e6de40311a596"
+  },
+  "qlever": {
+   "rows": 30,
+   "order": "2ee6e97de773ec64",
+   "exact": "8e85b73d0c007efe",
+   "value": "590eac8e707478ec",
+   "query_sha256": "2fe6d78319b02c90acf9aae4093315db8da62f3db0d5f13bf37e6de40311a596"
+  }
+ },
+ "bi-q5-3": {
+  "sparkles": {
+   "rows": 30,
+   "order": "8b6ccd00d0106123",
+   "exact": "fecf40f8e4867318",
+   "value": "a37ddff1684df620",
+   "query_sha256": "e60060dc4bd1ec2b53ce5c6ca17317839909ce52ac09eedd13995dcaea21c7ef"
+  },
+  "qlever": {
+   "rows": 30,
+   "order": "8b6ccd00d0106123",
+   "exact": "f22c9d62acb1df2d",
+   "value": "a508279768c3b035",
+   "query_sha256": "e60060dc4bd1ec2b53ce5c6ca17317839909ce52ac09eedd13995dcaea21c7ef"
+  }
+ },
+ "bi-q6-1": {
+  "sparkles": {
+   "rows": 14,
+   "exact": "a35cb3ef3ce21e12",
+   "value": "27e888027c43328f",
+   "query_sha256": "c6e24251db7918bb8283ddbd72feb7a9a4385d1772405f193131a5ae1ca6ccc0"
+  },
+  "qlever": {
+   "rows": 14,
+   "exact": "fbc5fde8c61df4f8",
+   "value": "62ce5cf45aba0c51",
+   "query_sha256": "c6e24251db7918bb8283ddbd72feb7a9a4385d1772405f193131a5ae1ca6ccc0"
+  }
+ },
+ "bi-q6-2": {
+  "sparkles": {
+   "rows": 56,
+   "exact": "3299d19491683dcd",
+   "value": "fe4aa1e4518e79c7",
+   "query_sha256": "b47a5ffa51c4f3d17c4d560e37d8f3e439a4e9274b14f85f57c52c7309254db3"
+  },
+  "qlever": {
+   "rows": 56,
+   "exact": "6162f7a0f965d86b",
+   "value": "fc4eb8bf5ac27deb",
+   "query_sha256": "b47a5ffa51c4f3d17c4d560e37d8f3e439a4e9274b14f85f57c52c7309254db3"
+  }
+ },
+ "bi-q6-3": {
+  "sparkles": {
+   "rows": 29,
+   "exact": "c4bd0576119e8184",
+   "value": "34976b247134639a",
+   "query_sha256": "fcb1b2012c2d28a985af0436079ea7e8babe3026805dd34627fe73ffe408082f"
+  },
+  "qlever": {
+   "rows": 29,
+   "exact": "6e874babc441a1b2",
+   "value": "5a6bc4b6fe02febd",
+   "query_sha256": "fcb1b2012c2d28a985af0436079ea7e8babe3026805dd34627fe73ffe408082f"
+  }
+ },
+ "bi-q7-1": {
+  "sparkles": {
+   "rows": 0,
+   "exact": "e3b0c44298fc1c14",
+   "value": "e3b0c44298fc1c14",
+   "query_sha256": "bfaf68fec772f499d17bdfb36264152d0ea4d29ff3073bb15dbdd75810b4e00e"
+  },
+  "qlever": {
+   "rows": 0,
+   "exact": "e3b0c44298fc1c14",
+   "value": "e3b0c44298fc1c14",
+   "query_sha256": "bfaf68fec772f499d17bdfb36264152d0ea4d29ff3073bb15dbdd75810b4e00e"
+  }
+ },
+ "bi-q7-2": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "ad5f18a622defae3",
+   "value": "ad5f18a622defae3",
+   "query_sha256": "b9d293c8c6d37a0c9692d6a72097f492155573abd31715ee48828ceafa8aa473"
+  },
+  "qlever": {
+   "rows": 1,
+   "exact": "ad5f18a622defae3",
+   "value": "ad5f18a622defae3",
+   "query_sha256": "b9d293c8c6d37a0c9692d6a72097f492155573abd31715ee48828ceafa8aa473"
+  }
+ },
+ "bi-q7-3": {
+  "sparkles": {
+   "rows": 81,
+   "exact": "12822b13761dab22",
+   "value": "12822b13761dab22",
+   "query_sha256": "4eeaeae4e1c73b1d3cfc243db22ee7cce73217c02b19a343013fea8092a0a1ab"
+  },
+  "qlever": {
+   "rows": 81,
+   "exact": "12822b13761dab22",
+   "value": "12822b13761dab22",
+   "query_sha256": "4eeaeae4e1c73b1d3cfc243db22ee7cce73217c02b19a343013fea8092a0a1ab"
+  }
+ },
+ "bi-q8-1": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "ecd1aa9222f51591",
+   "value": "6ebfe57afcf6e093",
+   "query_sha256": "39d4c46556458b004accaaf45fd600f80b9f964f2c81fbe2e3e3129fd13c9288"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "14a7f194c3be91bd",
+   "value": "361df61518bae8f6",
+   "query_sha256": "39d4c46556458b004accaaf45fd600f80b9f964f2c81fbe2e3e3129fd13c9288"
+  }
+ },
+ "bi-q8-2": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "0f6a506d8b6d24a5",
+   "value": "18af67072946c367",
+   "query_sha256": "dcaba615a754c61a14ec214b999468dced1ace7636e11861580ec03f17ace705"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "661a505297fc7fa2",
+   "value": "3aabb1769106268e",
+   "query_sha256": "dcaba615a754c61a14ec214b999468dced1ace7636e11861580ec03f17ace705"
+  }
+ },
+ "bi-q8-3": {
+  "sparkles": {
+   "rows": 10,
+   "exact": "3879975a4dd75545",
+   "value": "fe3f642e73850a82",
+   "query_sha256": "d5c41fbcae85dd4c10bb8704d5bbc58cf4882f8c0d654fc9bc31f8cd80b35992"
+  },
+  "qlever": {
+   "rows": 10,
+   "exact": "14407e54cb29116f",
+   "value": "fe3f642e73850a82",
+   "query_sha256": "d5c41fbcae85dd4c10bb8704d5bbc58cf4882f8c0d654fc9bc31f8cd80b35992"
+  }
+ }
+}

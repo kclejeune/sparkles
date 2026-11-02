@@ -1,0 +1,12 @@
+r1-sparkles-4bd70845-streaming 12.72 12.82 
+r1-sparkles-4bd70845-eager 2.12 2.13 
+r1-sparkles-bf2b473c-streaming 3.16 3.17 
+r1-sparkles-bf2b473c-eager 1.81 1.84 
+r2-sparkles-4bd70845-streaming 8.55 8.56 
+r2-sparkles-4bd70845-eager 2.23 2.24 
+r2-sparkles-bf2b473c-streaming 3.25 3.27 
+r2-sparkles-bf2b473c-eager 1.8 1.8 
+r3-sparkles-4bd70845-streaming 12.85 13.09 
+r3-sparkles-4bd70845-eager 2.16 2.16 
+r3-sparkles-bf2b473c-streaming 3.2 3.2 
+r3-sparkles-bf2b473c-eager 1.78 1.78 

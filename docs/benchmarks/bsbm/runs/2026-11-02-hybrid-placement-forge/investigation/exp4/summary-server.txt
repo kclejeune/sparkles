@@ -1,0 +1,123 @@
+metric=server  host=forge  governor=powersave/balance_performance
+template                base/all20    base/split12    base/split14    base/split16    base/split18
+bi-q1                        12.38            8.04           11.85           14.16            9.11
+bi-q2                        12.91           15.78           16.26           15.06           12.79
+bi-q3                        29.20           19.86           19.79           18.58           18.30
+bi-q4                       159.09          159.26          159.06          158.19          157.58
+bi-q5                        18.89           19.29           19.29           19.03           18.16
+bi-q6                        17.60           15.80           14.52           11.41           10.78
+bi-q7                        45.00           45.38           45.34           45.31           45.36
+bi-q8                        23.98           24.98           24.23           24.33           23.96
+births-by-decade              5.04            8.69           13.16            7.08            3.70
+
+per-process medians (instance 1 and births):
+bi-q1-1
+   base/all20            7.76    8.87    8.90    9.01
+   base/split12          8.37    6.65    6.64    4.20
+   base/split14          6.01    4.18    4.37    4.27
+   base/split16          4.20    7.14    8.41    4.42
+   base/split18          8.48    3.97    8.41    8.69
+bi-q2-1
+   base/all20           12.76   16.68   14.69   12.91
+   base/split12         16.74   13.18   16.37   13.01
+   base/split14         13.22   15.14   16.59   13.05
+   base/split16         16.28   15.21   12.70   16.11
+   base/split18         12.43   12.73   12.77   16.43
+bi-q3-1
+   base/all20           15.86   16.23   16.31   16.64
+   base/split12         10.01   14.57   13.62   12.61
+   base/split14         13.94   12.85   10.40    9.72
+   base/split16          8.84    7.41    7.85    8.06
+   base/split18          7.62    7.20    7.28    7.38
+bi-q4-1
+   base/all20          239.45  242.78  241.33  241.13
+   base/split12        241.89  240.80  241.01  240.55
+   base/split14        241.35  240.08  239.09  241.62
+   base/split16        240.66  240.50  237.76  240.54
+   base/split18        237.73  239.02  238.61  240.08
+bi-q5-1
+   base/all20            5.37    2.65    4.78    4.87
+   base/split12          4.07    4.10    1.99    4.01
+   base/split14          4.18    3.68    4.04    4.09
+   base/split16          2.10    4.07    2.53    3.95
+   base/split18          2.57    3.92    2.40    4.31
+bi-q6-1
+   base/all20           12.14   22.89   16.28   14.42
+   base/split12         21.88   14.77   10.99   17.83
+   base/split14         12.70   21.86   10.86   11.94
+   base/split16         11.43   12.13   10.51   12.63
+   base/split18         10.60   10.81   11.07   11.61
+bi-q7-1
+   base/all20           75.80   76.64   76.99   76.46
+   base/split12         77.00   76.36   77.62   77.01
+   base/split14         77.14   76.74   77.03   76.58
+   base/split16         77.68   77.31   76.23   76.56
+   base/split18         76.53   75.82   77.29   77.30
+bi-q8-1
+   base/all20          247.67  249.57  250.39  247.33
+   base/split12        247.60  246.96  247.45  250.72
+   base/split14        247.54  249.59  247.18  248.73
+   base/split16        249.75  248.38  244.48  246.65
+   base/split18        244.67  244.36  245.19  246.92
+births-by-decade
+   base/all20            4.85   15.81    4.54    4.92
+   base/split12         15.56    4.68    3.77   15.73
+   base/split14         15.74    2.98   14.63    3.40
+   base/split16         14.94   14.35    3.85    3.81
+   base/split18          3.51    3.53    3.46   15.74
+
+CPU ms per timed request by thread kind and core type (instance 1 and births):
+bi-q1-1
+   base/all20         tokio-E=  1.32  tokio-P=  7.50
+   base/split12       tokio-P=  6.44
+   base/split14       tokio-P=  4.91
+   base/split16       tokio-P=  5.85
+   base/split18       tokio-P=  7.36
+bi-q2-1
+   base/all20         other-E=  0.00  other-P=  0.00  rayon-E=  0.06  rayon-P=  0.83  tokio-E=  0.40  tokio-P= 13.56
+   base/split12       other-P=  0.00  rayon-E=  0.04  rayon-P=  0.82  tokio-P= 14.46
+   base/split14       other-P=  0.00  rayon-E=  0.15  rayon-P=  0.73  tokio-P= 14.13
+   base/split16       other-P=  0.00  rayon-E=  0.17  rayon-P=  0.71  tokio-P= 14.59
+   base/split18       other-P=  0.00  rayon-E=  0.10  rayon-P=  0.79  tokio-P= 13.20
+bi-q3-1
+   base/all20         other-E=  0.00  other-P=  0.00  rayon-E=  7.54  rayon-P= 10.54  tokio-E=  1.62  tokio-P= 13.10
+   base/split12       other-P=  0.00  rayon-E=  4.53  rayon-P=  4.80  tokio-P= 11.25
+   base/split14       other-P=  0.00  rayon-E=  4.16  rayon-P=  5.94  tokio-P= 10.32
+   base/split16       other-P=  0.00  rayon-E=  4.03  rayon-P=  5.88  tokio-P=  8.36
+   base/split18       rayon-E=  3.76  rayon-P=  6.37  tokio-P=  6.97
+bi-q4-1
+   base/all20         other-E=  0.01  other-P=  0.02  rayon-E= 21.17  rayon-P= 29.47  tokio-E=  0.40  tokio-P=238.33
+   base/split12       other-P=  0.02  rayon-E=  9.73  rayon-P= 16.90  tokio-P=237.44
+   base/split14       other-P=  0.02  rayon-E= 16.27  rayon-P= 17.34  tokio-P=237.53
+   base/split16       other-P=  0.02  rayon-E= 17.71  rayon-P= 20.31  tokio-P=236.69
+   base/split18       other-P=  0.02  rayon-E= 18.22  rayon-P= 23.93  tokio-P=235.64
+bi-q5-1
+   base/all20         other-E=  0.00  other-P=  0.00  tokio-E=  3.16  tokio-P=  1.59
+   base/split12       tokio-P=  3.59
+   base/split14       tokio-P=  3.92
+   base/split16       tokio-P=  3.20
+   base/split18       tokio-P=  3.30
+bi-q6-1
+   base/all20         other-E=  0.00  other-P=  0.00  rayon-E= 19.32  rayon-P= 29.54  tokio-E=  5.30  tokio-P=  8.34
+   base/split12       rayon-E= 18.38  rayon-P= 21.46  tokio-P= 12.19
+   base/split14       other-P=  0.00  rayon-E= 18.04  rayon-P= 16.87  tokio-P= 10.98
+   base/split16       rayon-E= 12.57  rayon-P= 17.67  tokio-P=  9.54
+   base/split18       rayon-E= 11.56  rayon-P= 17.43  tokio-P=  9.08
+bi-q7-1
+   base/all20         other-E=  0.00  other-P=  0.00  tokio-E=  0.59  tokio-P= 75.89
+   base/split12       other-P=  0.00  tokio-P= 77.14
+   base/split14       other-P=  0.01  tokio-P= 77.94
+   base/split16       other-P=  0.01  tokio-P= 77.12
+   base/split18       other-P=  0.01  tokio-P= 76.78
+bi-q8-1
+   base/all20         other-E=  0.01  other-P=  0.01  rayon-E= 55.49  rayon-P= 97.64  tokio-E=  0.53  tokio-P=240.06
+   base/split12       other-P=  0.02  rayon-E= 44.83  rayon-P= 51.12  tokio-P=237.84
+   base/split14       other-P=  0.02  rayon-E= 58.94  rayon-P= 49.18  tokio-P=238.42
+   base/split16       other-P=  0.02  rayon-E= 59.11  rayon-P= 62.79  tokio-P=238.12
+   base/split18       other-P=  0.02  rayon-E= 57.36  rayon-P= 76.79  tokio-P=235.70
+births-by-decade
+   base/all20         rayon-E=  4.53  rayon-P=  8.67  tokio-E=  1.34  tokio-P=  6.37
+   base/split12       rayon-E=  4.25  rayon-P=  4.35  tokio-P=  9.24
+   base/split14       other-P=  0.00  rayon-E=  2.97  rayon-P=  2.86  tokio-P=  9.26
+   base/split16       other-P=  0.00  rayon-E=  4.45  rayon-P=  4.70  tokio-P=  8.62
+   base/split18       other-P=  0.00  rayon-E=  5.99  rayon-P=  7.86  tokio-P=  5.95

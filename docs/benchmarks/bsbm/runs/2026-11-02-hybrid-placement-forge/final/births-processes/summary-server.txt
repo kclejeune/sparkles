@@ -1,0 +1,13 @@
+metric=server  host=forge  governor=powersave/balance_performance
+template                base/all20      final/auto
+births-by-decade              4.67            3.62
+
+per-process medians (instance 1 and births):
+births-by-decade
+   base/all20            4.89   15.39    4.54   15.52    3.37    4.62    4.58    3.90    4.49    3.62    4.71    4.49
+   final/auto            3.32    3.98    3.74    4.13    4.11    4.06    3.32    4.14    4.01    2.94    3.77    3.47
+
+CPU ms per timed request by thread kind and core type (instance 1 and births):
+births-by-decade
+   base/all20         rayon-E=  5.84  rayon-P=  7.96  tokio-E=  0.75  tokio-P=  5.15
+   final/auto         rayon-E=  7.83  rayon-P= 10.74  tokio-P=  2.70

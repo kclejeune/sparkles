@@ -1,0 +1,26 @@
+{
+ "results": [
+  {
+   "command": "sparkles",
+   "mean": 6.5569,
+   "stddev": 0.0,
+   "times": [
+    6.5569
+   ],
+   "exit_codes": [
+    0
+   ]
+  },
+  {
+   "command": "qlever",
+   "mean": 10.9876,
+   "stddev": 0.0,
+   "times": [
+    10.9876
+   ],
+   "exit_codes": [
+    0
+   ]
+  }
+ ]
+}
