@@ -107,8 +107,12 @@ fn nested_loop(l: &Table, r: &Table, vars: &[VarId], left: bool) -> Vec<Vec<Id>>
     rows
 }
 
-#[test]
-fn flat_hash_joins_give_the_rows_of_a_nested_loop_join() {
+/// One part of the rounds of the flat hash join check. Every part draws the tables of all
+/// 400 rounds from the same random stream, so the rounds are the same in any split, and
+/// checks the rounds that `(round + round / 10) % parts` assigns to `part`. That spreads the
+/// large tables of every tenth round evenly over the parts, so the four tests, which run in
+/// parallel, take about as long as each other.
+fn flat_hash_joins_part(part: usize, parts: usize) {
     let s = Store::in_memory(StoreOptions::default());
     let on = ctx_with(&s, Optimizations::ALL);
     let mut next = xorshift(0x2545_f491_4f6c_dd1d);
@@ -128,6 +132,9 @@ fn flat_hash_joins_give_the_rows_of_a_nested_loop_join() {
             if round % 4 == 2 {
                 r.sort_by_vars(&rv[..1]);
             }
+            if (round + round / 10) % parts != part {
+                continue;
+            }
             let mut vars = lv.clone();
             vars.extend(rv.iter().filter(|v| !lv.contains(v)));
             let want = nested_loop(&l, &r, &vars, false);
@@ -143,6 +150,26 @@ fn flat_hash_joins_give_the_rows_of_a_nested_loop_join() {
             );
         }
     }
+}
+
+#[test]
+fn flat_hash_joins_give_the_rows_of_a_nested_loop_join_part_1_of_4() {
+    flat_hash_joins_part(0, 4);
+}
+
+#[test]
+fn flat_hash_joins_give_the_rows_of_a_nested_loop_join_part_2_of_4() {
+    flat_hash_joins_part(1, 4);
+}
+
+#[test]
+fn flat_hash_joins_give_the_rows_of_a_nested_loop_join_part_3_of_4() {
+    flat_hash_joins_part(2, 4);
+}
+
+#[test]
+fn flat_hash_joins_give_the_rows_of_a_nested_loop_join_part_4_of_4() {
+    flat_hash_joins_part(3, 4);
 }
 
 #[test]

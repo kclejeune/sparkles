@@ -99,6 +99,7 @@ morsel_filters_and_ordered_top_k_agree_with_eager_on_mixed_terms|\
 memory_stays_bounded|\
 ordered_top_k_dedups_union_graph_rows_across_morsels|\
 sparql::join_tests::flat_hash_joins_give_the_rows_of_per_key_lists_in_the_same_order|\
+sparql::join_tests::flat_hash_joins_give_the_rows_of_a_nested_loop_join_part_[1-4]_of_4|\
 every_syntax_and_codec_agree_in_all_parse_modes|\
 exists_evaluated_per_key_stays_eager_and_matches|\
 f16_keeping_after_commit_stays_within_limit|\
