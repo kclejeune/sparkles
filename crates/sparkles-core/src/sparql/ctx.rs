@@ -111,6 +111,7 @@ impl StepReservation {
     }
 
     /// The bytes charged.
+    #[cfg(test)]
     pub(crate) fn reserved(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
     }
@@ -960,7 +961,7 @@ impl Ctx {
     }
 
     /// [`Ctx::live_bytes`] for the tests of other modules.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "geo"))]
     pub(crate) fn live_bytes_for_tests(&self) -> u64 {
         self.live_bytes()
     }
