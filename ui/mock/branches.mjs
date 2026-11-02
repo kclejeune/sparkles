@@ -903,8 +903,16 @@ function commitGraph(ds, url) {
 /** The changes each commit made (`[{op, quad}]`), by commit object. */
 export const changesOf = new WeakMap();
 
+/**
+ * The N-Quads lines (without " .") each commit added and removed, by commit object. Unlike
+ * the quads of `changesOf`, which are parsed again and so get new blank nodes, the lines
+ * keep the store's blank-node labels, which a revert needs (mock/ontology.mjs).
+ */
+export const linesOf = new WeakMap();
+
 /** Remember what `commit` changed: the N-Quads lines (without " .") it added and removed. */
 export function recordChanges(commit, added, removed) {
+  linesOf.set(commit, { added, removed });
   const parse = (lines) => {
     if (!lines.length) return [];
     const st = new ox.Store();

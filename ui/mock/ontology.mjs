@@ -13,6 +13,7 @@
 // tree. Functional-style axioms are parsed for the forms the editor sends.
 
 import ox from 'oxigraph';
+import { linesOf } from './branches.mjs';
 import { stateLines } from './history.mjs';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
@@ -1499,6 +1500,30 @@ function changes(req, res, url, seg, ctx) {
   return true;
 }
 
+/** The terms of an N-Quads line as written: IRIs, blank nodes and literals with their tags. */
+function nquadTerms(line) {
+  const out = [];
+  let i = 0;
+  while (i < line.length) {
+    const c = line[i];
+    if (c === ' ' || c === '\t') {
+      i++;
+      continue;
+    }
+    const start = i;
+    if (c === '<') i = line.indexOf('>', i) + 1;
+    else if (c === '"') {
+      i++;
+      while (i < line.length && line[i] !== '"') i += line[i] === '\\' ? 2 : 1;
+      i++;
+      if (line[i] === '@') while (i < line.length && !/\s/.test(line[i])) i++;
+      else if (line.startsWith('^^<', i)) i = line.indexOf('>', i) + 1;
+    } else while (i < line.length && !/\s/.test(line[i])) i++;
+    out.push(line.slice(start, i));
+  }
+  return out;
+}
+
 /**
  * The quad of an N-Quads line (without the final " .") with its blank nodes as labelled,
  * since loading a line into a store renames them.
@@ -1507,10 +1532,10 @@ function quadOfLine(line) {
   const st = new ox.Store();
   st.load(`${line} .`, { format: 'application/n-quads' });
   const q = st.match()[0];
-  const labels = [...line.matchAll(/(?:^|\s)_:([^\s]+)/g)].map((m) => m[1]);
-  const fix = (t) =>
-    t.termType === 'BlankNode' && labels.length ? ox.blankNode(labels.shift()) : t;
-  return ox.quad(fix(q.subject), q.predicate, fix(q.object), fix(q.graph));
+  const terms = nquadTerms(line);
+  const fix = (t, i) =>
+    t.termType === 'BlankNode' && terms[i]?.startsWith('_:') ? ox.blankNode(terms[i].slice(2)) : t;
+  return ox.quad(fix(q.subject, 0), q.predicate, fix(q.object, 2), fix(q.graph, 3));
 }
 
 /** The cell of a quad, which a revert compares as the server's default `cell` scope does. */
@@ -1544,12 +1569,13 @@ async function revert(req, res, url, seg, ctx) {
   const seq = Number(url.searchParams.get('commit'));
   const list = allCommits(ds);
   const commit = list.find((c) => c.seq === seq);
-  const parent = list.find((c) => c.seq === seq - 1);
-  if (!commit || !parent)
+  if (!commit || seq === 0)
     return (fail(res, 400, `cannot revert commit ${seq}`, { code: 'invalid-merge' }), true);
+  // the state after the commit and the lines it changed, which the mock keeps for the
+  // commits it makes after start-up
   const after = stateLines(commit);
-  const before = stateLines(parent);
-  if (!after || !before)
+  const lines = linesOf.get(commit);
+  if (!after || !lines)
     return (
       fail(res, 410, `commit ${seq} is outside the kept history`, { code: 'history-gone' }), true
     );
@@ -1562,23 +1588,27 @@ async function revert(req, res, url, seg, ctx) {
       true
     );
   const branch = ds.branchName ?? 'main';
-  const afterSet = new Set(after);
-  const beforeSet = new Set(before);
   const now = quadSet(ds);
   // the commit's changes, reversed: what it added goes, what it removed comes back
-  const drop = after.filter((l) => !beforeSet.has(l)).map(quadOfLine);
-  const restore = before.filter((l) => !afterSet.has(l)).map(quadOfLine);
+  const drop = lines.added.map(quadOfLine);
+  const restore = lines.removed.map(quadOfLine);
+  // the state before the commit, which the revert would leave in the cells it changed
+  const gone = new Set(lines.added);
+  const before = [...after.filter((l) => !gone.has(l)), ...lines.removed];
   // a cell the commit changed conflicts when the head holds other objects there than both
   // the commit left and the revert would leave
   const cells = new Set([...drop, ...restore].map(cellKey));
-  const objects = (lines) => {
+  // each cell's objects in a state, as a sorted list of lines
+  const objects = (state) => {
     const m = new Map();
-    for (const l of lines) {
-      const q = quadOfLine(l);
-      const k = cellKey(q);
-      if (cells.has(k)) m.set(k, [...(m.get(k) ?? []), l].sort().join('\n'));
+    for (const l of state) {
+      const k = cellKey(quadOfLine(l));
+      if (!cells.has(k)) continue;
+      const v = m.get(k) ?? [];
+      v.push(l);
+      m.set(k, v);
     }
-    return m;
+    return new Map([...m].map(([k, v]) => [k, v.sort().join('\n')]));
   };
   const left = objects(after);
   const reverted = objects(before);

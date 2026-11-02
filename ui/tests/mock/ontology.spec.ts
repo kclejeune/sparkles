@@ -347,4 +347,24 @@ test('the mock revert keeps blank nodes and refuses a cell a later commit change
   expect(refused.status()).toBe(409);
   expect((await refused.json()).code).toBe('merge-conflict');
   expect(await headOf()).toBe(head);
+
+  // a literal that looks like a blank node, and a commit of two values in one cell, which
+  // reverts whole
+  expect((await update(`INSERT DATA { <urn:s> <urn:p> "reference _:example" }`)).ok()).toBe(true);
+  const two = await json(await update(`INSERT DATA { ${comment('one')} . ${comment('two')} }`));
+  const both = await json(
+    await request.post(`/$/revert/uni?commit=${two.commit!.seq}`, { data: {} }),
+  );
+  expect(both.changes.deleted).toBe(2);
+
+  // the first commit after a seeded history, whose parent the mock kept no state for
+  const foaf = await request.post('/foaf/update?receipt=true', {
+    headers: { 'Content-Type': 'application/sparql-update', Accept: 'application/json' },
+    data: 'INSERT DATA { <urn:revert:s> <urn:revert:p> 1 }',
+  });
+  const first = await json(foaf);
+  const back = await json(
+    await request.post(`/$/revert/foaf?commit=${first.commit!.seq}`, { data: {} }),
+  );
+  expect(back.changes.deleted).toBe(1);
 });
