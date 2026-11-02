@@ -1029,10 +1029,12 @@ fn execute_prepared(
         let plan = Some(std::mem::take(&mut result.plan));
         return Err(Box::new(Failed { error, plan }));
     }
-    // The operators' state is gone, so the pool keeps only what the result holds. A
-    // graph result's triples are not measured, and it keeps its query's highest
-    // estimate as before.
+    // The operators' state goes with the plan, so the pool keeps only what the result
+    // holds. The plan's retained charges, such as an EXISTS memo or key set, are
+    // released before the shrink, which they would otherwise keep. A graph result's
+    // triples are not measured, and it keeps its query's highest estimate as before.
     // Decoding the result reserves its envelope again when the budget allows.
+    drop(node);
     ctx.release_work();
     if matches!(kind, QueryKind::Select | QueryKind::Ask)
         && let Err(error) = ctx.shrink_retained(result.table.capacity_bytes())

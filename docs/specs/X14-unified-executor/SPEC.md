@@ -424,7 +424,8 @@ of the fusion's sums, weights and ties.
 ### Charged query state and chunked live reservations
 
 The accounting steps of stage 4 that leave item 7's operators alone shipped, apart from
-the regular-expression step of item NEW-ITEM-2 and the EXISTS memo. Every context now
+the regular-expression step of item NEW-ITEM-2, and so did the first step of item
+NEW-ITEM-4, which charges retained scratch and the EXISTS memo in both modes. Every context now
 carries its accounting regime as `Accounting::Collect` or `Accounting::Cursor`, one
 record of a memory failure and one checked counter of produced rows, so the state that
 only cursors had is query state in both modes.
@@ -485,9 +486,28 @@ and `query_memory.rs` covers the stepped live reservations and 17 concurrent cur
 256 MiB pool. `plain_queries_take_no_ledger_operations` checks that plain eager queries
 still take no ledger operation.
 
-The EXISTS memo stays uncharged in eager execution, since its charge needs an owner of
-retained charges that eager contexts do not have, and item NEW-ITEM-4 charges it with the
-mode-neutral kernels. Item NEW-ITEM-2 holds the regular expressions.
+Retained charges, which belong to state that outlives the call that builds it, such as
+a cache of the plan, now work in both modes. Every context that query preparation shares
+holds a weak reference to itself, attached once the automatic choice between eager and
+cursor execution is made, and a retained charge releases through it. A retained charge
+grows on its own owner, which an eager context's lock-free account takes without the
+ledger. A context that is never shared, such as one of an incremental view, has no owner,
+so an eager one keeps such state uncharged as before. With that owner the EXISTS memo is
+one path, which holds at most 100,000 entries and an eighth of the budget and charges each
+entry in both modes. The key sets of a decorrelated EXISTS take one charge shape, in which
+the probe vectors are transient and a key set is a retained charge, or part of the
+probe's charge in a context without an owner. The admission of the planned pattern is
+charged in both modes. `map_rows` takes its collector charge and runs one partitioned job
+in both modes, and the key count over front-coded blocks sizes its pieces by the budget
+and charges its scratch and decoding in both modes. A finished query drops its plan before
+its pool contribution shrinks, so the plan's retained
+charges leave the pool with them. `an_eager_exists_memo_is_charged` checks that 20,000
+distinct EXISTS keys raise an eager query's peak by their entries, and
+`a_finished_result_gives_back_its_exists_state` checks that a one-row COUNT over 100,000
+EXISTS keys keeps at most 2 MiB of the pool.
+
+Item NEW-ITEM-2 holds the regular expressions, and the rest of item NEW-ITEM-4 merges the
+remaining `cursor_*` twins.
 
 ### Measurements of stage 1
 

@@ -100,8 +100,8 @@ callers and records the selected numeric user in its receipt.
   or as a cursor. A query close to its limit can therefore fail where an estimate without
   that state would let it pass. Eager evaluation counts its decoding space when the
   budget has room and never fails on it, so a finished result always reads back whole.
-  The EXISTS memo and the regular-expression cache of eager evaluation are not counted,
-  and [item 453](../ROADMAP.md) tracks charging them.
+  The EXISTS memo and key sets count as well. The regular-expression cache of eager
+  evaluation is not counted, and [item 453](../ROADMAP.md) tracks charging it.
 * Persistent datasets have storage quotas, a default with `--max-dataset-mb` and per
   dataset through `/$/quota/{ds}` and `sparkles quota` ([API.md](../API.md#storage-quotas)).
   A write that would exceed the quota is refused with `507` before it commits, while
