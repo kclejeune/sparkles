@@ -206,8 +206,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4 is under way, and [item 453](../../ROADMAP.md) tracks the rest of
-the work.
+479 of stage 2. Stage 4 is under way. Its charged query state and chunked live
+reservations have shipped, and [item 453](../../ROADMAP.md) tracks the rest of the work.
 
 ### Dead compaction arm and one generation switch
 
@@ -420,6 +420,74 @@ of the library and `GET /{ds}/text` used to remove the private-use characters th
 match from it even when no match was marked. Results and their order are otherwise
 unchanged, and the hybrid search, MCP search and memory tests cover them, with unit tests
 of the fusion's sums, weights and ties.
+
+### Charged query state and chunked live reservations
+
+The accounting steps of stage 4 that leave item 7's operators alone shipped, apart from
+the regular-expression step of item NEW-ITEM-2 and the EXISTS memo. Every context now
+carries its accounting regime as `Accounting::Collect` or `Accounting::Cursor`, one
+record of a memory failure and one checked counter of produced rows, so the state that
+only cursors had is query state in both modes.
+
+The decoded value cache is query-scoped and charged in both modes. It holds at most
+64 MiB or an eighth of the query's memory budget, whichever is smaller, split evenly over
+its 64 shards. Each entry counts twice its key and value slots and the heap bytes of its
+value, a shard that reaches its share is cleared and gives its slots back, and a value
+whose charge the budget or the pool refuses is returned without being cached. The cache
+survives the transition from eager to cursor accounting, which used to clear it.
+
+Dictionary decoding reserves one envelope in both modes, a key of the largest size seen
+so far on every worker, charged once when it grows and released when the work ends.
+`Ctx::term`, `Ctx::value` and the comparison of simple literals have one path each, and
+templates decode through `batch_term`. A cursor's envelope is decode bytes on the
+ledger, as before, and its refusal fails the query. An eager envelope is a charge of its
+own that is taken when the budget has room and is never refused. A finished eager result
+is decoded through infallible readers after its last check, and an update applies its
+template after its WHERE clause, so a refusal there would read as an unbound value. The
+same holds for the plan text that the planner decodes. An update checks its context
+before it applies deletions and insertions.
+
+The terms that expressions compute, the blank nodes and callback terms they memoize and
+the parsed geometries of the geometry memo are charged in both modes through one step
+reservation each. A reservation grows a step ahead of its bytes, a step of 64 KiB or a
+64th of the budget when that is smaller and at least 256 bytes, and falls back to the
+exact bytes for the terms, which a query cannot drop. A refusal of the terms records a
+failure, so an expression never turns a budget refusal into an unbound BIND. The value
+cache and the geometry memo are optional, so their refusal only skips the entry. A context
+that copies another's local vocabulary charges its copy. The transition no
+longer charges the local vocabulary again and keeps the geometry memo, which it used to
+drop. `retained_state_bytes` is gone, since what it estimated is charged. When an eager
+SELECT or ASK finishes, its primary account keeps its live bytes plus its columns.
+
+A live account of the ledger now reserves from its grant in steps of 64 KiB ahead of its
+live bytes, with an exact fallback when the step does not fit, and gives back everything
+above the next step once its reservation is more than 1 MiB above its live bytes. Most
+cursor charges therefore take the ledger's lock without a pool operation. Owners that
+retire release their reservations, and the drop of the ledger releases what remains.
+
+These steps make eager budgets stricter, as the maintainer decided. A query close to its
+limit can fail where it passed, since its value cache, terms, memos, geometries and
+decoding now count. Two tests changed their limits for that reason.
+`a_batch_too_large_to_buffer_spills_as_its_own_run` gives its spill sort a quarter more
+memory, since the value cache now takes part of the budget the run sized itself to, and
+the CONSTRUCT budget test of `sparql/tests.rs` uses 8 KiB where it used 1 KiB, since its
+template terms are charged. The tradeoffs are memory for speed. A cursor account can
+hold up to about 1.06 MiB of the pool above its live bytes, the step plus the slack, and a
+charged state reservation keeps up to one step above its bytes until the query ends.
+
+`charged_state.rs` runs 50,000 rows of `STRUUID()` under a 3 MiB budget, which fails with
+the memory budget in both modes where eager execution used to answer, and checks that a
+finished result of a 4 KiB literal reads back under an 8 KiB budget and that an update
+whose template is refused leaves the store as it was. Unit tests in `ctx.rs` cover the
+stepped cache charges, a refused cache reservation, a refused decode envelope, a cleared
+shard and the shrink of a finished result, `geo/memo.rs` covers a refused geometry charge,
+and `query_memory.rs` covers the stepped live reservations and 17 concurrent cursors in a
+256 MiB pool. `plain_queries_take_no_ledger_operations` checks that plain eager queries
+still take no ledger operation.
+
+The EXISTS memo stays uncharged in eager execution, since its charge needs an owner of
+retained charges that eager contexts do not have, and item NEW-ITEM-4 charges it with the
+mode-neutral kernels. Item NEW-ITEM-2 holds the regular expressions.
 
 ### Measurements of stage 1
 

@@ -1398,12 +1398,12 @@ of answer kept about 40 MB of the pool while its result was alive.
 
 When an eager SELECT or ASK finishes, `Ctx::shrink_retained` now lowers the contribution
 to what the result keeps. That is the capacity its columns have allocated, which a
-filter that compacted them in place leaves above their length, the terms computed into
-the query's local vocabulary, its cached decoded values with their strings, its parsed
-geometries, the memos of its blank nodes and callback terms, and every live charge. A
-map counts every slot it has allocated, since a value cache shard that overflows is
-cleared without giving its slots back, and the heap strings of its live entries. `QueryMemoryLedger::shrink_eager` lowers the primary account to the
-higher of its live bytes and that estimate, lowers every other account to its live bytes,
+filter that compacted them in place leaves above their length, and every live charge.
+The terms computed into the query's local vocabulary, its cached decoded values, its
+parsed geometries and the memos of its blank nodes and callback terms are live charges
+of their own, which item 453 added in both accounting modes, as the
+[X14 Outcome](X14-unified-executor/SPEC.md#outcome) describes. `QueryMemoryLedger::shrink_eager` lowers the primary account to its live
+bytes plus the capacity of the columns, lowers every other account to its live bytes,
 and returns the excess to each account's own grant outside the ledger's lock. A cursor
 ledger keeps no eager contribution and a ledger with a running algorithm call keeps its
 contribution, so both are left alone. A later charge on the context grows its
@@ -1414,10 +1414,9 @@ whose contribution is within 1 MiB of its columns, takes none of the caches' loc
 concurrent charge take the same lock. A context that already has a ledger, such as one
 that called a graph algorithm, always shrinks.
 
-The computed terms, cached values and blank-node memos were never charged in eager
-execution, and the peak estimate covered them only by accident. Counting them keeps the
-contribution from falling below them after the shrink, but a contribution that was
-already below them stays where it was, as before. A CONSTRUCT or DESCRIBE result keeps its peak estimate, because its decoded
+The computed terms, cached values and blank-node memos were not charged in eager
+execution when this phase shipped, and the shrink counted them from their sizes instead.
+They are charged as they grow now, so the contribution never falls below them. A CONSTRUCT or DESCRIBE result keeps its peak estimate, because its decoded
 triples and quads are not measured when the query finishes.
 
 `a_finished_eager_result_retains_only_what_it_holds` holds the thousand-row DISTINCT under
@@ -1432,8 +1431,10 @@ whose filtered columns keep 2.4 MB of capacity, which the first version shrank t
 112 bytes, and `a_result_keeps_its_blank_node_memo_covered` holds a COUNT over 100,000
 `BNODE("x")` memo entries, which it shrank to 123 bytes. A second review found that it
 counted the entries of a cleared value shard rather than its slots and left out the
-geometry memo. `retained_state_counts_the_slots_a_cleared_value_shard_keeps` covers the
-first.
+geometry memo. A cleared shard now gives its slots back, which
+`a_cleared_value_shard_frees_its_slots` covers, and
+`a_finished_result_keeps_its_output_and_its_charged_state` checks that the shrink keeps
+the columns on top of the charged state.
 
 ### Phase 2a: batch kernels (2026-10-17)
 
