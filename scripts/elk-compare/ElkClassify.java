@@ -19,9 +19,12 @@
 // node of its own and SubClassOf from each node's first class to the first class of each of
 // its direct superclass nodes. An inconsistent ontology gets one node of every class,
 // owl:Thing and owl:Nothing, as the classifier of sparkles-owl writes it.
+//
+// el_classify reads the axioms of its input file only, so an input that declares imports is
+// refused here rather than classified with a different import closure. Missing imports do
+// not stop the load before that check.
 
 import java.io.File;
-import java.io.PrintWriter;
 import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -41,10 +44,12 @@ import org.semanticweb.owlapi.apibinding.OWLManager;
 import org.semanticweb.owlapi.formats.FunctionalSyntaxDocumentFormat;
 import org.semanticweb.owlapi.io.FileDocumentSource;
 import org.semanticweb.owlapi.io.OWLOntologyDocumentSource;
+import org.semanticweb.owlapi.model.MissingImportHandlingStrategy;
 import org.semanticweb.owlapi.model.OWLClass;
 import org.semanticweb.owlapi.model.OWLOntology;
 import org.semanticweb.owlapi.model.OWLOntologyManager;
 import org.semanticweb.owlapi.model.parameters.Imports;
+import org.semanticweb.owlapi.reasoner.InconsistentOntologyException;
 import org.semanticweb.owlapi.reasoner.InferenceType;
 import org.semanticweb.owlapi.reasoner.Node;
 import org.semanticweb.owlapi.reasoner.OWLReasoner;
@@ -84,12 +89,18 @@ public class ElkClassify {
             (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
         for (int run = 0; run < repeat; run++) {
             OWLOntologyManager manager = OWLManager.createOWLOntologyManager();
+            manager.getOntologyConfigurator()
+                .setMissingImportHandlingStrategy(MissingImportHandlingStrategy.SILENT);
             OWLOntologyDocumentSource source = functional
                 ? new FileDocumentSource(file, new FunctionalSyntaxDocumentFormat())
                 : new FileDocumentSource(file);
             long t0 = System.nanoTime();
             OWLOntology ontology = manager.loadOntologyFromOntologyDocument(source);
             long t1 = System.nanoTime();
+            if (ontology.importsDeclarations().findAny().isPresent()) {
+                System.err.println(input + " declares imports, which el_classify does not read");
+                System.exit(3);
+            }
             ReasonerConfiguration elk = ReasonerConfiguration.getConfiguration();
             elk.setParameter(ReasonerConfiguration.NUM_OF_WORKING_THREADS, Integer.toString(threads));
             ElkReasonerConfiguration config = new ElkReasonerConfiguration(
@@ -97,7 +108,14 @@ public class ElkClassify {
             long c0 = os.getProcessCpuTime();
             long t2 = System.nanoTime();
             OWLReasoner reasoner = new ElkReasonerFactory().createReasoner(ontology, config);
-            reasoner.precomputeInferences(InferenceType.CLASS_HIERARCHY);
+            // ELK answers an inconsistent ontology with an exception once it has found the
+            // inconsistency, which ends that classification.
+            try {
+                reasoner.precomputeInferences(InferenceType.CLASS_HIERARCHY);
+                consistent = true;
+            } catch (InconsistentOntologyException e) {
+                consistent = false;
+            }
             long t3 = System.nanoTime();
             long c1 = os.getProcessCpuTime();
             loadMs.add((t1 - t0) / 1e6);
@@ -108,10 +126,12 @@ public class ElkClassify {
             retainedMib.add((rt.totalMemory() - rt.freeMemory()) / 1048576.0);
             classes = (int) ontology.classesInSignature(Imports.INCLUDED).count();
             logicalAxioms = ontology.getLogicalAxiomCount(Imports.INCLUDED);
-            consistent = reasoner.isConsistent();
-            if (consistent) {
-                unsatisfiable = reasoner.getUnsatisfiableClasses().getEntitiesMinusBottom().size();
-            }
+            // An inconsistent ontology makes every class unsatisfiable, owl:Thing included,
+            // as the taxonomy below writes it.
+            unsatisfiable = consistent
+                ? reasoner.getUnsatisfiableClasses().getEntitiesMinusBottom().size()
+                : (int) ontology.classesInSignature(Imports.INCLUDED)
+                    .filter(c -> !c.isOWLNothing() && !c.isOWLThing()).count() + 1;
             if (run == repeat - 1 && taxonomy != null) {
                 writeTaxonomy(ontology, reasoner, consistent, new File(taxonomy));
             }
@@ -200,9 +220,11 @@ public class ElkClassify {
                 }
             }
         }
-        try (PrintWriter w = new PrintWriter(path, StandardCharsets.UTF_8)) {
+        // A buffered writer, unlike PrintWriter, reports a failed write.
+        try (java.io.BufferedWriter w = Files.newBufferedWriter(path.toPath(), StandardCharsets.UTF_8)) {
             for (String l : lines) {
-                w.println(l);
+                w.write(l);
+                w.newLine();
             }
         }
     }
@@ -212,11 +234,16 @@ public class ElkClassify {
             .collect(Collectors.joining(" ")) + ")";
     }
 
-    static long peakRssKib() throws Exception {
-        for (String l : Files.readAllLines(new File("/proc/self/status").toPath())) {
-            if (l.startsWith("VmHWM:")) {
-                return Long.parseLong(l.replaceAll("[^0-9]", ""));
+    // The peak resident set from Linux's procfs, or -1 where it is not available.
+    static long peakRssKib() {
+        try {
+            for (String l : Files.readAllLines(new File("/proc/self/status").toPath())) {
+                if (l.startsWith("VmHWM:")) {
+                    return Long.parseLong(l.replaceAll("[^0-9]", ""));
+                }
             }
+        } catch (java.io.IOException | RuntimeException e) {
+            // Fall through to the unavailable value.
         }
         return -1;
     }

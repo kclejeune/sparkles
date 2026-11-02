@@ -28,6 +28,16 @@ JAVA=${JAVA:-java}
 JAVAC=${JAVAC:-$(dirname "$(command -v "$JAVA")")/javac}
 CENTRAL=https://repo1.maven.org/maven2
 
+# The pinned jars only, so that a stray jar in ELK_WORK/lib is never read.
+jars() {
+  local path out=
+  while IFS=$'\t' read -r path _; do
+    case $path in '#'* | '') continue ;; esac
+    out=$out${out:+:}$WORK/lib/$(basename "$path")
+  done < "$HERE/pins.tsv"
+  echo "$out"
+}
+
 fetch() {
   mkdir -p "$WORK/lib" "$WORK/classes"
   local path sha jar central
@@ -48,7 +58,7 @@ fetch() {
   done < "$HERE/pins.tsv"
   if [ ! -f "$WORK/classes/ElkClassify.class" ] ||
     [ "$HERE/ElkClassify.java" -nt "$WORK/classes/ElkClassify.class" ]; then
-    "$JAVAC" -proc:none -nowarn -cp "$WORK/lib/*" -d "$WORK/classes" "$HERE/ElkClassify.java"
+    "$JAVAC" -proc:none -nowarn -cp "$(jars)" -d "$WORK/classes" "$HERE/ElkClassify.java"
   fi
 }
 
@@ -64,8 +74,12 @@ case ${1:-} in
     cmd=("$JAVA" "-Xms$HEAP" "-Xmx$HEAP" -XX:+UseG1GC ${ELK_JAVA_OPTS:-}
       -Dorg.slf4j.simpleLogger.defaultLogLevel=warn
       -Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info
-      -cp "$WORK/classes:$WORK/lib/*" ElkClassify "$@")
+      -cp "$WORK/classes:$(jars)" ElkClassify "$@")
     if [ "${ELK_SCOPE:-1}" != 0 ] && command -v systemd-run > /dev/null; then
+      if ! systemd-run --user --scope --quiet true 2> /dev/null; then
+        echo "systemd-run cannot create a user scope here; set ELK_SCOPE=0 to run without one" >&2
+        exit 1
+      fi
       cmd=(systemd-run --user --scope --quiet -p "MemoryMax=${ELK_MEM_MAX:-12G}"
         -p MemorySwapMax=0 -p OOMPolicy=continue "${cmd[@]}")
     fi
