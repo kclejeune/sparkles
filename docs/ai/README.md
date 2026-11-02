@@ -80,7 +80,10 @@ build community reports.
   own part for its repairs, and ingestion marks the vocabulary of a document's chunks
   ([API.md](../API.md#model-providers)). `promptCaching` turns it off or sets the 1-hour
   TTL. Records report cache writes and reads apart, and token budgets and cost estimates
-  price each class.
+  price each class. OpenAI caches long prompts on its own, but only where the latest
+  user message ends, so an `openai` provider with `promptCaching.enabled` set to true
+  receives each Ask repair as the first draft's message followed by a second user
+  message, and the repair reads the cached question.
 * Ask keeps half of its schema budget for common vocabulary and retrieves the rest by
   matching the question against every visible class and predicate. Recognized candidate
   evidence preserves full choice identities and can order explicitly named kinds using

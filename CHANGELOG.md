@@ -662,6 +662,13 @@ under `repairs`, `POST /{ds}/ask` takes `explore`, `shapeCheck`, `drafts` and
 exploration's sample values and a shape repair's rows reach the model only when the
 dataset's `send` policy lets the draft and repair providers receive rows.
 
+An `openai` provider takes `promptCaching` with `enabled` only, false by default. When it
+is true, an Ask repair goes as the first draft's user message, unchanged, followed by a
+second user message with the repair and the format. OpenAI writes a cached prefix only
+where the latest user message ends, so the repair then reads the prefix that the first
+draft wrote, where before every OpenAI repair missed the cache and paid the write price
+again. The settings form still offers prompt caching for the `anthropic` kind only.
+
 `scripts/eval-ask-paid`, which `scripts/eval-ask-anthropic` still runs, takes a run
 file's `provider`, so a paid run can ask OpenAI's GPT-6 Luna, GPT-6.1 Terra and GPT-6.1
 Sol through the Chat Completions API under a wallet of its own, capped at USD 50 per
