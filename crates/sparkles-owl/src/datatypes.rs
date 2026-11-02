@@ -264,11 +264,18 @@ fn divides(d: &[u8], n: &[u8]) -> bool {
     rem.is_empty()
 }
 
-/// Whether `p` is a regular expression of XML Schema 1.1 Part 2, Appendix G.
+/// How deeply groups and subtracted character classes may nest in a pattern the check
+/// accepts, which bounds the recognizer's recursion. A deeper pattern is refused, as
+/// common regular expression engines refuse it.
+const PATTERN_NESTING: usize = 250;
+
+/// Whether `p` is a regular expression of XML Schema 1.1 Part 2, Appendix G, nested at
+/// most [`PATTERN_NESTING`] deep.
 fn pattern(p: &str) -> bool {
     let mut r = Regex {
         c: p.chars().collect(),
         i: 0,
+        depth: 0,
     };
     r.reg_exp() && r.i == r.c.len()
 }
@@ -277,6 +284,7 @@ fn pattern(p: &str) -> bool {
 struct Regex {
     c: Vec<char>,
     i: usize,
+    depth: usize,
 }
 
 impl Regex {
@@ -326,24 +334,39 @@ impl Regex {
         let Some(min) = self.number() else {
             return false;
         };
-        if self.eat(',') {
-            if let Some(max) = self.number()
-                && max < min
-            {
-                return false;
-            }
+        if self.eat(',')
+            && let Some(max) = self.number()
+            && max < min
+        {
+            return false;
         }
         self.eat('}')
     }
 
-    fn number(&mut self) -> Option<u128> {
+    /// The digits of a quantity without leading zeros, which compare as numbers of any
+    /// size by their length and then their text.
+    fn number(&mut self) -> Option<(usize, String)> {
         let start = self.i;
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.i += 1;
         }
         let digits: String = self.c[start..self.i].iter().collect();
-        // a quantity too large for any machine is still a quantity
-        (!digits.is_empty()).then(|| digits.parse().unwrap_or(u128::MAX))
+        if digits.is_empty() {
+            return None;
+        }
+        let trimmed = digits.trim_start_matches('0').to_string();
+        Some((trimmed.len(), trimmed))
+    }
+
+    /// Run `f` one level deeper, refusing a pattern nested past [`PATTERN_NESTING`].
+    fn nested(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
+        if self.depth >= PATTERN_NESTING {
+            return false;
+        }
+        self.depth += 1;
+        let ok = f(self);
+        self.depth -= 1;
+        ok
     }
 
     /// `atom ::= NormalChar | charClass | '(' regExp ')'`
@@ -351,7 +374,7 @@ impl Regex {
         match self.peek() {
             Some('(') => {
                 self.i += 1;
-                self.reg_exp() && self.eat(')')
+                self.nested(|r| r.reg_exp() && r.eat(')'))
             }
             Some('[') => self.char_class_expr(),
             Some('\\') => self.escape().is_some(),
@@ -416,7 +439,7 @@ impl Regex {
                 }
                 Some('-') if self.c.get(self.i + 1) == Some(&'[') => {
                     self.i += 1;
-                    return parts > 0 && self.char_class_expr() && self.eat(']');
+                    return parts > 0 && self.nested(|r| r.char_class_expr()) && self.eat(']');
                 }
                 Some('[') => return false,
                 Some(_) => {
@@ -424,9 +447,13 @@ impl Regex {
                         return false;
                     };
                     parts += 1;
-                    // a range, unless the hyphen ends the group or starts a subtraction
+                    // a range, unless the hyphen ends the group or starts a subtraction,
+                    // or is a literal hyphen before a subtraction (G.4.1)
+                    let next = |n: usize| self.c.get(self.i + n).copied();
+                    let before_subtraction = next(1) == Some('-') && next(2) == Some('[');
                     if self.peek() == Some('-')
-                        && !matches!(self.c.get(self.i + 1), Some(']' | '[') | None)
+                        && !matches!(next(1), Some(']' | '[') | None)
+                        && !before_subtraction
                     {
                         self.i += 1;
                         let (Some(lo), Some(Some(hi))) = (start, self.single_or_class()) else {
@@ -457,10 +484,10 @@ impl Regex {
 
 /// `charProp ::= IsCategory | IsBlock`
 fn char_prop(p: &str) -> bool {
-    const CATEGORIES: [&str; 37] = [
+    const CATEGORIES: [&str; 36] = [
         "L", "Lu", "Ll", "Lt", "Lm", "Lo", "M", "Mn", "Mc", "Me", "N", "Nd", "Nl", "No", "P", "Pc",
         "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Z", "Zs", "Zl", "Zp", "S", "Sm", "Sc", "Sk", "So",
-        "C", "Cc", "Cf", "Co", "Cn", "Cs",
+        "C", "Cc", "Cf", "Co", "Cn",
     ];
     CATEGORIES.contains(&p)
         || p.strip_prefix("Is").is_some_and(|b| {
@@ -1162,8 +1189,9 @@ mod tests {
             "[a-z-[aeiou]]",
             r"\p{IsBasicLatin}+",
             r"\P{Lu}",
-            r"\P{Cs}",
             r"\d{3}-\d{4}",
+            "[a--[b]]",
+            "a{0001,10}",
             "a{2,}b{0,1}",
             "[^-a-z]",
             "^a$",
@@ -1186,9 +1214,17 @@ mod tests {
             r"\p{Xx}",
             "a**",
             "[]",
+            r"\P{Cs}",
+            r"\p{Cs}",
+            "a{340282366920938463463374607431768211456,340282366920938463463374607431768211455}",
+            "a{10,9}",
         ] {
             assert!(!pattern(p), "{p:?}");
         }
+        let deep = format!("{}a{}", "(".repeat(30_000), ")".repeat(30_000));
+        assert!(!pattern(&deep));
+        let fine = format!("{}a{}", "(".repeat(100), ")".repeat(100));
+        assert!(pattern(&fine));
         for r in ["en", "*", "de-*-DE", "en-US", "zh-Hant-1996"] {
             assert!(language_range(r), "{r:?}");
         }

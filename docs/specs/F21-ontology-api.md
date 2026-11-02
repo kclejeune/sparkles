@@ -824,7 +824,8 @@ datatype (§7.5), so the facet must be one of the datatype's normative facets an
 value must be in the value space the facet ranges over. The value is judged by its data
 value, so `"3.0"^^xsd:decimal` is a valid length and an `xsd:token` is a valid pattern.
 A pattern must parse as an XML Schema regular expression and a language range must
-follow the grammar of RFC 4647. A datatype that a datatype definition introduces
+follow the grammar of RFC 4647. A pattern whose groups or subtracted classes nest more
+than 250 deep is refused too, which bounds the check's recursion. A datatype that a datatype definition introduces
 occurs in no literal and no restriction (§9.4). The check covers the literals of
 annotations and of the headers of the ontology and its imports too, since §5.7 applies to every literal of the
 ontology, and it covers streamed assertions, as the other rules of one axiom do.
