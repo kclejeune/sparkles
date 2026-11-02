@@ -10,7 +10,7 @@
 > reads that include materialized inferences, the OWL 2 RL warning of reasoning runs and
 > the profile partition that F17's OWL 2 QL rewriting is to use. Phase 3 provides the
 > functional-style syntax reader, an MCP tool and ontology diffs between commits. Roadmap
-> items 539, 540, 541 and 559 extend the delivered phases.
+> item 541 added literal checks, and items 539, 540 and 559 extend the delivered phases.
 >
 > **User docs:** [OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies) and
 > [API: Ontology](../API.md#ontology).
@@ -755,6 +755,30 @@ have no RDF/XML form meet the DL species their cases state. Four profile members
 differ where the cases disagree with the Profiles grammars, also listed. Property tests
 write random axioms with the writer and read them back.
 
+### Literal checks
+
+Roadmap item 541 adds the literal rules of the structural specification to the OWL 2 DL
+check. The lexical form of each literal whose datatype is in the OWL 2 datatype map must
+be in that datatype's lexical space (§5.7). The lexical spaces follow XML Schema 1.1
+Part 2 for the `xsd:` datatypes, without trimming white space, with the ranges of the
+integer datatypes and the `xsd:language` pattern. `owl:rational` takes the forms of §4.1,
+`owl:real` has none, `rdf:PlainLiteral` is a string, `@` and an empty or well-formed
+language tag, and `rdf:XMLLiteral` is well-balanced XML content without namespace
+resolution. Each pair of a datatype restriction must be in the facet space of its
+datatype (§7.5), so the facet must be one of the datatype's normative facets and its
+value of the type the facet ranges over. A datatype that a datatype definition introduces
+occurs in no literal and no restriction (§9.4). The check covers the literals of
+annotations and of the ontology header too, since §5.7 applies to every literal of the
+ontology, and it covers streamed assertions, as the other rules of one axiom do.
+
+The rules are part of OWL 2 DL, so every EL, QL and RL report lists their violations with
+the other DL violations. The profiles' own datatype lists are subsets of the OWL 2
+datatype map with the same lexical spaces, and their checks of which datatypes a profile
+allows are unchanged. A literal of a datatype outside the map has no known lexical space,
+and the datatype check reports the datatype instead. Edits still write ill-typed
+literals, since the forward mapping can write them, and a check reports them. The W3C
+OWL 2 test cases agree as before, and profile tests cover each datatype and facet rule.
+
 ### Decisions and departures from the design
 
 **Shared expressions in strict mode.** The first design made a blank node structure used
@@ -822,9 +846,7 @@ answers open question 3 for punned IRIs by removing both uses.
 **Commits.** The routes accept `at=` to read an earlier commit, which answers open
 question 5. An edit reads the ontology from the head it writes on, under the writer lock.
 
-**Unchecked.** The profile checks do not check literals' lexical forms against their
-datatypes, roadmap item 541. A8 is tested with graph views, not with C12b
-triple protections.
+**Unchecked.** A8 is tested with graph views, not with C12b triple protections.
 
 The parity test of the library administration API (P06) maps each route to its library
 call and to its Python, Node.js and JVM names.

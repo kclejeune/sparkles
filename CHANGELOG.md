@@ -45,6 +45,13 @@ carry when asked. The MCP tool `ontology_axioms` lists axioms, and on a server t
 allows updates adds and removes them with previews, `ifHead` and PROV-O provenance
 written as axiom annotations (spec F21 Phase 3).
 
+The OWL 2 DL check, and so every profile report, checks literals. A literal of a
+datatype in the OWL 2 datatype map needs a lexical form of that datatype, a datatype
+restriction needs facets and values that its datatype supports, and a datatype that a
+datatype definition introduces types no literal and takes no restriction. An ontology
+with an ill-typed literal, such as `"300"^^xsd:byte`, that conformed before now fails
+the check (roadmap item 541).
+
 The reasoner can keep witnesses for each fact of a materialization, the sets of input
 quads from which the rules derive it, with the provenance algebra of incremental views.
 `ReasonOptions::witnesses` sets the bound per fact, and `Cache::witnesses` and

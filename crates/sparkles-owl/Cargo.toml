@@ -9,6 +9,7 @@ license.workspace = true
 oxrdf.workspace = true
 serde_json.workspace = true
 rustc-hash.workspace = true
+oxsdatatypes.workspace = true
 
 [dev-dependencies]
 oxrdfio.workspace = true

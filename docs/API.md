@@ -1878,7 +1878,11 @@ one report per profile. A report says whether the ontology conforms and lists at
 it breaks, such as `OWL 2 Profiles §2.2.3`, a message, and the axiom and graph when the
 violation is one axiom's. The EL, QL and RL reports also list the OWL 2 DL violations,
 since each profile is a subset of OWL 2 DL. With `assertions: false` the check covers
-the terminology alone, which is faster on a large data graph.
+the terminology alone, which is faster on a large data graph. The DL rules include the
+literal rules of the structural specification. A literal of a datatype in the OWL 2
+datatype map needs a lexical form of that datatype (§5.7), a datatype restriction needs
+facets and values from its datatype's facet space (§7.5), and a datatype that a datatype
+definition introduces cannot type a literal or be restricted (§9.4).
 
 `POST /$/ontology/{ds}/axioms` adds the axioms of `add` and removes those of `remove` in
 one commit. A removed axiom takes its triples with it, including the blank nodes of its
