@@ -2331,7 +2331,7 @@ pub(super) type MorselPart = Vec<Vec<Id>>;
 /// tested and copied in one pass. Values outside the base vocabulary are tested as
 /// [`super::exprcache::filter_values`] tests them. Output column `i` is read from key
 /// column `cols[i]`. Returns the parts in key order and the rows read, or `None` when
-/// the delta has keys in a range.
+/// the delta has more keys in the ranges than a parallel read merges.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn filter_scan_morsel(
     ctx: &Ctx,
@@ -2455,9 +2455,10 @@ pub(super) fn filter_scan_morsel(
     }))
 }
 
-/// [`key_runs`] with the index blocks read in parallel, when the snapshot's delta has no
-/// key in the scan's range and rows need no comparison with their neighbours (no
-/// union-graph dedup); `None` otherwise.
+/// [`key_runs`] with the index blocks read in parallel and the snapshot's delta merged in,
+/// when rows need no comparison with their neighbours (no union-graph dedup) and
+/// [`Snapshot::par_blocks_in_ranges`](crate::store::Snapshot::par_blocks_in_ranges) takes
+/// the delta in the scan's range; `None` otherwise.
 fn par_key_runs(
     ctx: &Ctx,
     spec: &ScanSpec,

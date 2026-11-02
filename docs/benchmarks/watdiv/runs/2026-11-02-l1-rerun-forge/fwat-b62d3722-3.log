@@ -1,0 +1,299 @@
+[07:26:56] dataset: 10973381 triples
+Using saved setting for 'extra-substituters = https://cache.kclj.io' from ~/.local/share/nix/trusted-settings.json.
+warning: ignoring untrusted flake configuration setting 'extra-trusted-public-keys'.
+Pass '--accept-flake-config' to trust it
+
+rows         sparkles       fluree
+L1-1                0            0
+L1-2                1            1
+L1-3                1            1
+L1-4                8            8
+L1-5                4            4
+L3-1               20           20
+L3-2               60           60
+L3-3               60           60
+L3-4               13           13
+L3-5               28           28
+S7-1                0            0
+S7-2                0            0
+S7-3                0            0
+S7-4                0            0
+S7-5                0            0
+
+== L1-1
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.6 ms  ±     0.1 ms       3.5 ms  …     3.8 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.8 ms  ±     0.2 ms       3.6 ms  …     4.2 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.6 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L1-2
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.7 ms  ±     0.2 ms       3.5 ms  …     4.0 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.1 ms       3.4 ms  …     3.7 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L1-3
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.7 ms  ±     0.2 ms       3.5 ms  …     4.2 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.8 ms  ±     0.2 ms       3.6 ms  …     4.3 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L1-4
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.6 ms  ±     0.2 ms       3.4 ms  …     3.8 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.7 ms  ±     0.2 ms       3.6 ms  …     4.1 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.4 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L1-5
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.7 ms  ±     0.1 ms       3.6 ms  …     3.9 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.1 ms       3.4 ms  …     3.7 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L3-1
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.1 ms       3.5 ms  …     3.8 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.8 ms  ±     0.1 ms       3.7 ms  …     4.1 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.6 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L3-2
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.6 ms  ±     0.1 ms       3.5 ms  …     3.9 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.4 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.8 ms  ±     0.1 ms       3.6 ms  …     4.1 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L3-3
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.7 ms  ±     0.3 ms       3.5 ms  …     4.2 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.6 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.9 ms  ±     0.2 ms       3.7 ms  …     4.3 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L3-4
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      4.1 ms  ±     0.4 ms       3.5 ms  …     4.7 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.6 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      4.0 ms  ±     0.1 ms       3.8 ms  …     4.3 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== L3-5
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.6 ms  ±     0.1 ms       3.5 ms  …     3.8 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.7 ms  ±     0.1 ms       3.5 ms  …     4.0 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.1 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== S7-1
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.1 ms       3.4 ms  …     3.7 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.2 ms       3.4 ms  …     3.9 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.6 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== S7-2
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.4 ms  ±     0.1 ms       3.3 ms  …     3.7 ms
+  Memory        11.4 MiB ±     0.0 MiB     11.3 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.6 ms  ±     0.1 ms       3.5 ms  …     3.8 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== S7-3
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.1 ms       3.3 ms  …     3.7 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.1 ms       3.3 ms  …     3.7 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== S7-4
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.5 ms  ±     0.1 ms       3.4 ms  …     3.6 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.2 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.6 ms  ±     0.1 ms       3.5 ms  …     3.8 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.2 MiB …    11.6 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+
+== S7-5
+Benchmark 1: sparkles (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.6 ms  ±     0.1 ms       3.5 ms  …     3.7 ms
+  Memory        11.3 MiB ±     0.1 MiB     11.3 MiB …    11.5 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+Benchmark 1: fluree (10 runs)
+                mean     ±       σ          min     …     max
+  Wall Time      3.8 ms  ±     0.1 ms       3.6 ms  …     4.0 ms
+  Memory        11.4 MiB ±     0.1 MiB     11.3 MiB …    11.6 MiB
+ 
+  Warning: Command took less than 5 ms to complete. Note that the wall-clock measurements might be inaccurate because hyperfine can not calibrate the shell startup time much more precise than this limit. You can try to use the `-N`/`--shell=none` option to disable the shell completely.
+ 
+WatDiv basic testing, scale=100 seed=1, 10,973,381 generated triples. Times are in ms: the geometric mean over each template's instances of the mean of the timed runs.
+
+| load (s) | sparkles | fluree |
+|---|---:|---:|
+| load | **4.42** | 9.13 |
+
+| template | instances | sparkles (ms) | fluree (ms) |
+|---|---:|---:|---:|
+| L1 | 5 | **3.66** | 3.67 |
+| L2 | 5 | — | — |
+| L3 | 5 | **3.71** | 3.82 |
+| L4 | 5 | — | — |
+| L5 | 5 | — | — |
+| S1 | 5 | — | — |
+| S2 | 5 | — | — |
+| S3 | 5 | — | — |
+| S4 | 5 | — | — |
+| S5 | 5 | — | — |
+| S6 | 5 | — | — |
+| S7 | 5 | **3.49** | 3.60 |
+| F1 | 5 | — | — |
+| F2 | 5 | — | — |
+| F3 | 5 | — | — |
+| F4 | 5 | — | — |
+| F5 | 5 | — | — |
+| C1 | 1 | — | — |
+| C2 | 1 | — | — |
+| C3 | 1 | — | — |
+
+| category | templates | sparkles (ms) | fluree (ms) |
+|---|---:|---:|---:|
+| **linear (L)** | 2 of 5 | **3.68** | 3.74 |
+| **star (S)** | 1 of 7 | **3.49** | 3.60 |
+| snowflake (F) | 0 of 5 | — | — |
+| complex (C) | 0 of 3 | — | — |
+| **all templates** | 3 of 20 | **3.62** | 3.70 |
+
+The category rows leave out `L2`, `L4`, `L5`, `S1`, `S2`, `S3`, `S4`, `S5`, `S6`, `F1`, `F2`, `F3`, `F4`, `F5`, `C1`, `C2`, `C3`, where an engine failed or disagreed with the majority.

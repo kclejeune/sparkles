@@ -1,0 +1,31 @@
+{
+ "idle": {
+  "sparkles": 141,
+  "oxigraph": 22
+ },
+ "queries": {
+  "star-join": {
+   "sparkles": {
+    "before": 141,
+    "peak": 187,
+    "delta": 46
+   },
+   "oxigraph": {
+    "before": 22,
+    "peak": 67,
+    "delta": 45
+   }
+  }
+ },
+ "warm": {
+  "sparkles": 186,
+  "oxigraph": 67
+ },
+ "throughput_peak": {
+  "sparkles": 417,
+  "oxigraph": 421
+ },
+ "block_cache": {
+  "sparkles": 23
+ }
+}

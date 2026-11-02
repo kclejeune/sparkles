@@ -1,0 +1,34 @@
+{
+ "star-join": {
+  "sparkles": {
+   "rows": 29700,
+   "exact": "50cc8045f29f54f5",
+   "value": "e52ce107717da6e0",
+   "query_sha256": "c0e213f99c77d7177c973f0010ccf3c4caf15387279ac98237297ad3d4e248be"
+  }
+ },
+ "two-hop-count": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "89dfa429897b081f",
+   "value": "b40075eb804a7478",
+   "query_sha256": "08688547ff57d52458e30357b5550443eaa4e241346e47e67418bbd94fb62ff2"
+  }
+ },
+ "contains": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "ed2f4c9d88faddbb",
+   "value": "1a6565f20284bc82",
+   "query_sha256": "fc2b300132e013ea07fb1f399f5110f7a02dd6de7b9d6b2d2ec3ec4cad17afb2"
+  }
+ },
+ "regex-iri": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "773beeeeeb6ffa1d",
+   "value": "32d90ccd07425fd1",
+   "query_sha256": "ae4ab66cc61e0a9204671bde5d789b161e800e6fa05c308a390095e62b9e02b8"
+  }
+ }
+}

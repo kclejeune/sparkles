@@ -1,0 +1,72 @@
+== t1y
+3.31 5.04 5.50 1/642 3384179
+== base-b62d3722
+base {'plan_ms': 0.115, 'exec_ms': 1.7, 'total_ms': 1.97}
+changed {'plan_ms': 0.09, 'exec_ms': 7.135, 'total_ms': 7.525}
+== cand-0af790e5
+base {'plan_ms': 0.21, 'exec_ms': 3.075, 'total_ms': 3.6}
+changed {'plan_ms': 0.16, 'exec_ms': 5.53, 'total_ms': 6.01}
+== base-b62d3722
+base {'plan_ms': 0.215, 'exec_ms': 3.045, 'total_ms': 3.54}
+changed {'plan_ms': 0.16, 'exec_ms': 10.655, 'total_ms': 11.24}
+== cand-0af790e5
+base {'plan_ms': 0.22, 'exec_ms': 3.065, 'total_ms': 3.62}
+changed {'plan_ms': 0.18, 'exec_ms': 5.825, 'total_ms': 6.3}
+AB2DONE
+== t22
+3.64 5.09 4.11 1/645 3416010
+== base-b62d3722
+base {'plan_ms': 0.22, 'exec_ms': 3.0, 'total_ms': 3.54}
+changed {'plan_ms': 0.135, 'exec_ms': 9.745, 'total_ms': 10.305}
+== cand-0af790e5
+base {'plan_ms': 0.23, 'exec_ms': 3.05, 'total_ms': 3.585}
+changed {'plan_ms': 0.21, 'exec_ms': 6.145, 'total_ms': 6.72}
+== cand2
+base {'plan_ms': 0.21, 'exec_ms': 2.95, 'total_ms': 3.475}
+changed {'plan_ms': 0.145, 'exec_ms': 4.215, 'total_ms': 4.625}
+== cand2
+base {'plan_ms': 0.22, 'exec_ms': 3.025, 'total_ms': 3.58}
+changed {'plan_ms': 0.19, 'exec_ms': 4.475, 'total_ms': 5.07}
+== cand-0af790e5
+base {'plan_ms': 0.205, 'exec_ms': 2.865, 'total_ms': 3.39}
+changed {'plan_ms': 0.15, 'exec_ms': 5.395, 'total_ms': 5.855}
+== base-b62d3722
+base {'plan_ms': 0.22, 'exec_ms': 3.16, 'total_ms': 3.73}
+changed {'plan_ms': 0.145, 'exec_ms': 9.165, 'total_ms': 9.75}
+AB2DONE
+== t25
+3.34 5.54 4.89 2/642 3434888
+== base-b62d3722
+base {'plan_ms': 0.2, 'exec_ms': 2.98, 'total_ms': 3.5}
+changed {'plan_ms': 0.175, 'exec_ms': 10.495, 'total_ms': 11.2}
+== cand2
+base {'plan_ms': 0.2, 'exec_ms': 2.95, 'total_ms': 3.47}
+changed {'plan_ms': 0.17, 'exec_ms': 4.275, 'total_ms': 4.805}
+== cand3
+base {'plan_ms': 0.23, 'exec_ms': 3.12, 'total_ms': 3.69}
+changed {'plan_ms': 0.17, 'exec_ms': 3.99, 'total_ms': 4.47}
+== cand3
+base {'plan_ms': 0.1, 'exec_ms': 1.635, 'total_ms': 1.885}
+changed {'plan_ms': 0.185, 'exec_ms': 4.23, 'total_ms': 4.8}
+== cand2
+base {'plan_ms': 0.19, 'exec_ms': 3.03, 'total_ms': 3.465}
+changed {'plan_ms': 0.18, 'exec_ms': 4.435, 'total_ms': 4.86}
+== base-b62d3722
+base {'plan_ms': 0.195, 'exec_ms': 2.925, 'total_ms': 3.495}
+changed {'plan_ms': 0.11, 'exec_ms': 9.855, 'total_ms': 10.395}
+AB2DONE
+== t2h
+6.41 13.82 13.23 1/645 1014829
+base-b62d3722 1.4450 0.0000
+cand3 1.4400 0.0000
+cand3 1.4200 0.0000
+base-b62d3722 1.4900 0.0100
+base-b62d3722 1.5500 0.0000
+cand3 1.4300 0.0100
+cand3 1.3800 0.0100
+base-b62d3722 1.4600 0.0000
+base-b62d3722 1.5000 0.0000
+cand3 1.4400 0.0000
+cand3 1.3800 0.0000
+base-b62d3722 1.4500 0.0000
+AB3DONE

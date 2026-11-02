@@ -1887,6 +1887,50 @@ for the cause. The history's fastest runs do not age, so a text whose costs chan
 writes keeps its earlier mode until the history forgets it, which item 577 covers.
 Item 576 measures concurrent clients, other hybrid processors and macOS.
 
+### Changed-store reads and the write rows
+
+The changed-store `two-hop-count` loss came from the parallel block reads. Before this
+change, `Snapshot::par_blocks_in_ranges` gave up whenever the delta had a key in a range,
+and its callers then read the whole range in order with the delta merged in. On a store
+with 5,000 uncompacted commits, the runs of `foaf:knows` in both sorted orders were
+therefore read one block after another. On `atlas`, with other work on the host, this took
+the query's server time from about 3 ms on the loaded store to 7.1 to 10.7 ms. The reads
+now merge the delta keys of each changed block into a copy of the columns they need and keep their parallel pieces. A first
+version that called the reader once for each run between two delta keys spent most of its
+time allocating and scheduling those pieces and took 5.4 to 6.1 ms. The copy takes 4.0 to
+4.2 ms. A read whose ranges hold more than 65,536 delta keys keeps the ordered merge,
+because the copies are not charged to the query's memory budget.
+
+On forge, `two-hop-count` on the changed 1.05M store went from 8.16 to 6.21 ms through
+`curl`, against Fluree's recorded 7.8 ms, and on the changed 10.5M store from 35.8 to
+21.6 ms. `contains` and `regex-iri` on the changed stores became 14% to 15% faster at 1.05M and
+44% to 46% faster at 10.5M. A Namespace screen of the loaded store had a geometric mean
+of 1.019 for server time and 0.978 for client time, and its rerun left only
+`predicate-counts`, at 11 against 12 µs, at a ratio of 1.10. That query does not read
+index blocks in parallel, and on `atlas` `star-join` and `predicate-counts` kept their
+times, which the access log there records to 10 µs. Item NEW-ITEM-2 checks the flag on
+the benchmark host. The [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md) has the server
+times, and the forge [run record](../benchmarks/writes/runs/2026-11-02-competitive-writes-forge/README.md)
+has every sample and answer fingerprint.
+
+The same runs refreshed the write rows against Oxigraph after items 501 and 502. The churn
+of 5,000 commits ran at 778 and 935 commits/s against Oxigraph's 809 and 744 at 1.05M, and
+at 681 and 684 at 10.5M against Oxigraph's recorded 715. The single-commit latency through
+`curl` was within 10% of Oxigraph in three of four runs at 1.05M and 1.41× in one, whose
+Sparkles samples all took 5.0 to 5.3 ms. Under 16 unpaced readers, Sparkles committed 246
+and 252 writes/s at 1.05M and 211 at 10.5M, against Oxigraph's 1,264 and 1,277 and its
+recorded 565, while serving 2,101 and 2,198 reads/s against 12 and 16. The default
+placement of request threads on the performance cores of a hybrid processor costs part
+of that write rate. On `atlas`, five alternating pairs of runs gave 195 to 253 writes/s
+with it and 279 to 367 without it, as the [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md)
+shows, and item 583 follows this up.
+
+A [WatDiv rerun](../benchmarks/watdiv/runs/2026-11-02-l1-rerun-forge/README.md) of L1, L3
+and S7 in three rounds gave Sparkles the lower mean on L1-1 in every round, by 0.005 to 0.146
+ms, which is within the 0.2 ms that an instance's mean varies between rounds, and on all
+three templates in every round. The 11% `L1-1` loss of the full run did not recur. A Sparkles server
+spends about 0.29 ms on that instance.
+
 ### Rewrite gates
 
 Roadmap items 469 to 473 add the performance gates that the engine rewrites of items 453
@@ -1967,7 +2011,7 @@ These phases belong to [ROADMAP](../ROADMAP.md) item 452, the benchmark gates an
 
 **Reasoning benchmark suite against RDFox, Nemo, VLog, GraphDB, ELK and Konclude.** Add LUBM-1000 and 8000 under OWL RL with UBA data, UOBM, Claros and Claros-LE, Reactome, ChEMBL, UniProt, DBpedia with its ontology, OWL2Bench at 5 to 200, ORE, SNOMED, GO, the RDFox incremental methodology including sameAs deletes, ChaseBench and a query-time reasoning comparison. None of UOBM, Claros, Reactome, ChEMBL, SNOMED or ORE appears in the docs or X06. Query-time reasoning has no peer comparison. It depends on item 1.
 
-**Remaining recorded competitive losses.** Profile and close WatDiv `L1-1` (Fluree 1.11×), the cold small scans at 1.05M where Fluree leads by 1.17–3.0× and DBpedia cold `outlink-classes-2` (QLever 1.25×). It depends on item 4.
+**Remaining recorded competitive losses.** Profile and close the cold small scans at 1.05M where Fluree leads by 1.17–3.0× and DBpedia cold `outlink-classes-2` (QLever 1.25×). It depends on item 4.
 
 **BSBM Explore multi-client throughput gap.** Find why Fluree's driver throughput is two to three times Sparkles' at 1, 4 and 16 clients, separating its answer differences from real per-mix cost. The cell is unranked because Fluree's q8, q11 and q12 answers differ, so the losses table omits a large concurrency signal. It depends on item 1.
 

@@ -8,7 +8,8 @@ qualifications are preserved, and are not regenerated from the JSON records. Rea
 
 At 10.97M triples, Sparkles is fastest on 19 of the 20 templates and ties
   Fluree on S7, with a geometric mean of 4.63 ms against 6.97 ms for Fluree, 13.6 ms for
-  Fuseki, 16.2 ms for Oxigraph and 17.9 ms for QLever.
+  Fuseki, 16.2 ms for Oxigraph and 17.9 ms for QLever. A [rerun](#l1-l3-and-s7-rerun) of
+  L1, L3 and S7 found Sparkles ahead of Fluree on all three.
 
 ## WatDiv
 
@@ -57,8 +58,19 @@ instance timings, answer fingerprints and load measurements.*
 Sparkles has the lowest mean on 19 of the 20 templates and on 81 of 88 instances.
 Fluree's S7 mean is 0.04% lower, a tie. Fluree has the lower mean on L1-1, L1-5, F2-1,
 F5-1, S6-5, S7-1 and S7-2, and Oxigraph on S7-1 and S7-2. The L1-1 difference puts
-Sparkles 11% slower, while the others are within 5%. C3 returns 419,866 rows and includes
-the complete response.
+Sparkles 11% slower in this run, while the others are within 5%. C3 returns 419,866 rows
+and includes the complete response.
+
+### L1, L3 and S7 rerun
+
+A [rerun on forge](runs/2026-11-02-l1-rerun-forge/README.md) timed the L1, L3 and S7
+instances of Sparkles and Fluree again in three rounds, each with fresh servers. Sparkles
+had the lower mean on L1-1 in every round, 3.57 to 3.71 ms against 3.57 to 3.80 ms, and the
+lower geometric mean on all three templates in every round. A Sparkles server spends about
+0.29 ms on L1-1, the least of the L1 instances, and the rest of each request is the cost of
+the `curl` process. The 11% difference of the full run did not recur.
+
+*Measured on forge on 2026-11-02 with Sparkles at commit b62d3722 and Fluree 4.2.2.*
 
 WatDiv was created by G. Aluç, O. Hartig, M. T. Özsu and K. Daudjee, “Diversified Stress
 Testing of RDF Data Management Systems,” ISWC 2014.
