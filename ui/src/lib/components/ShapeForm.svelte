@@ -394,7 +394,7 @@
         )
         .map((t) => t.value as string);
       if (lost.length) {
-        const detached = detachLost(nodes, current, lost);
+        const detached = detachLost(nodes, current, lost, key);
         if (!detached) {
           toasts.push(
             'error',

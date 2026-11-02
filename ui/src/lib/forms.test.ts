@@ -531,7 +531,7 @@ describe('nested children', () => {
         isNew: false,
       },
     };
-    const detached = detachLost(stored, current, ['b7'])!;
+    const detached = detachLost(stored, current, ['b7'], '<addr>')!;
     expect(detached.b7.isNew && detached.g1.isNew).toBe(true);
     // the parent field now loads no child, as the conflict said
     const m = { fields: [{ ...address, values: [] }] } as unknown as FormModel;
@@ -563,7 +563,7 @@ describe('nested children', () => {
         fields: [{ ...street([{ term: lit('Old'), graph: null }]), editable: false }],
       },
     };
-    expect(detachLost(locked, current, ['b7'])).toBeNull();
+    expect(detachLost(locked, current, ['b7'], '<addr>')).toBeNull();
     // a child that refers to itself cannot be described as a new node
     const cyclic: Record<string, FormNode> = { b7: { ...nodes.b7, fields: [geo] } };
     expect(
@@ -571,8 +571,33 @@ describe('nested children', () => {
         cyclic,
         { '<addr>': [address.values[0].term], 'b7 <geo>': [address.values[0].term] },
         ['b7'],
+        '<addr>',
       ),
     ).toBeNull();
+  });
+  it('keeps a grandchild that another commit removed from its stored parent', () => {
+    // the conflict is on b7's geo field, which still holds g1 in the form
+    const current = {
+      '<addr>': [address.values[0].term],
+      'b7 <street>': [lit('Old')],
+      'b7 <geo>': [{ type: 'bnode', value: 'g1' } as Term],
+      'g1 <lat>': [lit('52')],
+    };
+    const stored: Record<string, FormNode> = {
+      ...nodes,
+      g1: {
+        key: 'g1',
+        term: { type: 'bnode', value: 'g1' },
+        fields: [field({ id: '<lat>', values: [{ term: lit('52'), graph: null }] })],
+        isNew: false,
+      },
+    };
+    const detached = detachLost(stored, current, ['g1'], 'b7 <geo>');
+    expect(detached?.g1.isNew).toBe(true);
+    expect(detached?.b7.isNew).toBe(false);
+    // another field that holds it still refuses
+    const shared = { ...current, 'b7 <street>': [{ type: 'bnode', value: 'g1' } as Term] };
+    expect(detachLost(stored, shared, ['g1'], 'b7 <geo>')).toBeNull();
   });
   it('drops the entries of a removed child', () => {
     const s = changeSet(model, { '<addr>': [], 'b7 <street>': [lit('New')] }, nodes);

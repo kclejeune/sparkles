@@ -729,12 +729,13 @@ export function reachable(
  * only the fields they changed. `null` when the form cannot rebuild the children whole:
  * a value it cannot write (a read-only field or a value in another graph), a node
  * reached twice (a cycle or a shared node), or a node that a node outside them also
- * holds.
+ * holds through another field than `edge`, the field whose conflict is resolved.
  */
 export function detachLost(
   nodes: Record<string, FormNode>,
   current: Record<string, (Term | null)[]>,
   lost: string[],
+  edge: string,
 ): Record<string, FormNode> | null {
   const closure = new Set<string>();
   const queue = [...lost];
@@ -756,7 +757,7 @@ export function detachLost(
   for (const [k, es] of Object.entries(current)) {
     const owner = k.includes(' ') ? k.slice(0, k.indexOf(' ')) : null;
     if (owner !== null && closure.has(owner)) continue;
-    if (owner === null) continue;
+    if (owner === null || k === edge) continue;
     if (es.some((t) => t?.type === 'bnode' && closure.has(t.value))) return null;
   }
   const out = { ...nodes };
