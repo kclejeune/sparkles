@@ -149,6 +149,7 @@ mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
 mise run office:fuzz  # fuzz the Office converter of ingestion the same way
 mise run test         # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain mbx test)
+mise run test:partitioned # the nextest tests built once and run in shares on several machines
 mise run ui:wasm      # the formatter's WebAssembly module for the UI (optional)
 mise run ui:dev       # UI dev server, proxying the API to $SPARKLES_API (default http://localhost:3030)
 mise run ui:mock      # mock API server for UI work without the Rust backend
@@ -282,6 +283,76 @@ build that runs both at once needs about 20 GB. `mise run test` therefore first 
 and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
 time, because the two server compiles do not overlap.
 
+No single test should dominate a run, since nextest ends only when its slowest test does.
+A test that loops over independent configurations, such as the crash images of each
+commit mode in `power_loss.rs` or the cursor batch sizes in `w3c.rs`, is therefore split
+into one test per configuration with the same assertions, so that the configurations run
+in parallel. `.config/nextest.toml` starts the slowest tests first.
+
+### Checks of a change
+
+`scripts/ci.sh --fast --changed <base>` narrows the `lint` and `test` tasks to the
+workspace packages that the change since the merge base of `<base>` and `HEAD` can
+affect. `scripts/changed-crates.py` maps each changed, uncommitted or untracked file to
+the packages that read it. A file in a package's directory belongs to that package, and a
+few files outside the crates, such as `docs/openapi.json` and `ui/`, belong to the
+packages whose builds or tests read them. The selection then grows by every package that
+depends on a chosen one through normal, build or dev-dependencies. Documentation and
+scripts select no package. A change to a shared root, such as `Cargo.toml`, `Cargo.lock`,
+`mise.toml`, `.config/`, `testsuite/` or `crates/sparkles-core`, or to a file that the
+rules do not cover, keeps the whole workspace.
+
+Clippy runs with `-p` for each chosen package. nextest still builds the whole workspace,
+so its test binaries are the ones a full run builds and the shared cache already holds,
+and a `package()` filter runs only the chosen packages' tests. The doctests run for the
+chosen packages that have a library. The chosen packages are part of the task cache key,
+so a narrowed pass never stands in for a full one. The batch gate uses the same
+selection for the packages of a batch, as [Batch gate](#batch-gate) describes.
+
+### Known flaky tests
+
+nextest retries a test only when `.config/nextest.toml` lists it by name as flaky, and
+each listed test has a roadmap item to make it deterministic. A retry prints a `TRY` line
+when it happens, and the final summary lists the test as `FLAKY`. `mise run test` writes
+the tests that passed only on a retry to `.artifacts/ci/flaky-tests.txt`, and
+`scripts/ci.sh` repeats them at the end of its summary. A test that fails every attempt
+still fails the run.
+
+### Partitioned test runs
+
+`mise run test:partitioned` builds every test binary once with `mbx nextest archive`,
+runs one share of the tests on this machine and sends the archive to the other machines,
+where nextest runs the other shares with `--partition slice:K/N`. The machines come from
+`--hosts`, `TEST_PARTITION_HOSTS` or a `TEST_PARTITION_HOSTS=` line in
+`~/.config/sparkles/test-partition.env`. An entry is an ssh host, or `nsc` or
+`nsc:MACHINE` for an ephemeral Namespace instance that the run creates and destroys. An
+ssh host that is busy is left out, which means that another process holds its
+`~/lanes/.heavy.lock`, a gate unit runs there, its load exceeds half its processors or it
+has less than `TEST_PARTITION_MIN_FREE_GB` (default 40) GiB free. `--transport hc` starts
+each ssh host's share as a named terminal of the maintainer's terminal service, and the
+default starts it detached over plain ssh. Either way the share survives a dropped
+connection.
+
+The test binaries hold the absolute paths of the checkout that built them, from
+`CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*` and `CARGO_TARGET_TMPDIR`. Each share therefore
+runs at the same absolute path as the building checkout. The run creates that directory
+on each machine, marks it as a share directory and refuses a machine where the path exists
+without the mark. It copies the tracked files, `ui/build` and the conformance suite
+directories the local tests read, and it extracts the archive there as it arrives. A
+Namespace instance also gets a C compiler, Python, Node.js, patchelf and the pinned
+rustfmt, and its share runs as an unprivileged user, since tests of permission checks
+fail as root. A binary whose loader the machine lacks, such as one built against a Nix
+store, gets the machine's own loader.
+Each share's JUnit report, log and exit code land in
+`.artifacts/test-partitioned/<time>/share-K/`, and the run fails unless every share passed
+and the shares together ran exactly the tests that an unpartitioned run selects.
+A run that ends, times out or is interrupted stops each remote share's process group,
+with KILL after 30 seconds, and removes the share's directory and lock only once the group
+is gone. When the group survives, the directory and its lock stay and the run names them.
+Arguments after `--` are nextest filters for both the listing and the shares, and
+`--reuse DIR` sends an earlier run's archive again without a build. Doctests do not
+archive, so `mise run test` still runs them.
+
 ### Conformance suites
 
 `crates/sparkles-core/tests/w3c.rs` runs the W3C SPARQL suites vendored in an Apache
@@ -291,6 +362,10 @@ repository, or at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checko
 `scripts/fetch-test-suites.sh DIR` fetches every suite the tests read, at the commits CI
 pins, as shallow sparse checkouts of about 35 MB, and prints the variables that point the
 tests at them (`export $(scripts/fetch-test-suites.sh target/test-suites)`).
+`mise run test:w3c` runs each suite and each cursor batch size as its own test, and the
+tests run in parallel, since each keeps its own state and prints its summary as one line.
+On a 20-core gate host that took the suite from 433 to 82 seconds, and the plain spill
+matrix from 156 to 66.
 
 All of these suites pass: 482/482, 328/328, 157/157 and 269/269 for SPARQL, and 98/98
 and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs of the
@@ -687,10 +762,20 @@ separate lines.
 
 ## Batch gate
 
-The batch gate before a push runs `scripts/ci.sh --force --jobs 1`, `test:w3c`,
-`test:shacl`, `test:shex` and the plain and encrypted spill matrices on the build hosts
-rather than the laptop. `scripts/gate/gate.sh <rev>` pushes the commit to the host's bare
-repository `~/gate/repo.git`, starts the run and waits for it. On the host each run is a
+`scripts/premerge.sh` runs on the merged batch before the gate starts and takes a few
+minutes. It checks that the TypeScript and Rust clients match `docs/openapi.json`, that
+the Cargo.lock files of the Python, Node.js and JVM binding workspaces resolve as they are,
+that every planned Python binding in `crates/sparkles/bindings.toml` is on the parity
+test's deferred list and no deferred key is stale, and it runs the doc-path check and the
+script tests, which include the CI task-profile test. Each failure names its fix, and
+`--fix` regenerates the clients and lock files and lists the files to commit.
+
+The batch gate before a push runs `scripts/ci.sh --jobs 1`, `test:w3c`, `test:shacl`,
+`test:shex` and the plain and encrypted spill matrices on the build hosts rather than the
+laptop, each only when the batch's changes call for it, as
+[Checks a batch selects](#checks-a-batch-selects) describes. The nightly gate runs all of
+them with `--force` on `origin/main`. `scripts/gate/gate.sh <rev>` pushes the commit to the
+host's bare repository `~/gate/repo.git`, starts the run and waits for it. On the host each run is a
 systemd user unit `gate-<name>` in the detached worktree `~/gate/wt-<name>`, where the name
 is the first eight hex digits of the commit. The unit holds `~/gate/.lock`, which is the
 same file as `~/lanes/.heavy.lock`, so gates and the heavy work of lanes on that host take
@@ -698,15 +783,19 @@ turns. Its memory cap is the smaller of 24 GiB and the host's RAM less 2 GiB, wi
 swap. A passing run removes its worktree, and a failing one keeps the sources and drops the
 build directories.
 
-By default `scripts/ci.sh` runs on wally while the conformance steps run on atlas for the
-same commit. The conformance half takes about 18 minutes and the ci half about 45, so the
-gate's critical path is the ci half alone. Each host keeps its own lock, mbx cache and
-queue. The two hosts cannot reach each other over ssh, so the laptop merges the halves
-when it waits, fetches or prints the status. The merged directory has one `steps.txt` that
-names the host of each step and one `gate.exit` that is 0 only when both halves pass. A
-fetch after both halves finish also copies the merged files back into the primary host's
-`~/gate/out/<name>/`. When atlas cannot be reached at the start, wally runs every step in
-sequence and its `progress.log` records the fallback.
+`scripts/ci.sh` runs on the primary host, which is `GATE_PRIMARY` or the first gate host.
+When the batch needs a conformance step, the steps run on a second gate host for the same
+commit, the first one that is free: its heavy lock is free, it runs no gate unit and it has
+the disk for a conformance half. The conformance half takes about 18 minutes and the ci
+half about 45, so the gate's critical path is the ci half alone. With no free host the
+conformance steps run on the primary host after ci, and `--helper H` names a helper to
+queue on whether or not it is free. Each host keeps its own lock, mbx cache and queue. The
+gate hosts cannot reach each other over ssh, so the laptop merges the halves when it
+waits, fetches or prints the status. The merged directory has one `steps.txt` that names
+the host of each step and one `gate.exit` that is 0 only when both halves pass. A fetch
+after both halves finish also copies the merged files back into the primary host's
+`~/gate/out/<name>/`. When the helper cannot be reached at the start, the primary host runs
+every step in sequence and its `progress.log` records the fallback.
 
 | Invocation | Effect |
 |---|---|
@@ -715,12 +804,17 @@ sequence and its `progress.log` records the fallback.
 | `gate.sh --status <rev>` | Prints each half's progress, steps and last memory sample. The last line is `active` while either half runs. |
 | `gate.sh --fetch <rev>` | Copies and merges the results into `.artifacts/gates/main-gate-<name>-<host>/` of the main checkout. |
 | `gate.sh --hosts` | Prints each host's lock state, number of gate units and free disk. |
-| `gate.sh --host atlas <rev>` | Runs the whole gate on one host. |
+| `gate.sh --host atlas <rev>` | Runs ci on atlas, with the conformance half on a free helper. |
+| `gate.sh --host atlas --helper none <rev>` | Runs the whole gate on one host. |
+| `gate.sh --base origin/main~3 <rev>` | Selects the checks from the changes since the merge base of `origin/main~3` and the commit. The default base is `GATE_BASE` or `origin/main`. |
+| `gate.sh --full <rev>` | Runs every check with `--force` and no selection, as the nightly gate does. |
+| `gate.sh --cargo-jobs 6 <rev>` | Sets `CARGO_BUILD_JOBS` to 6 on every host of the run. |
 | `gate.sh --auto <rev>` | Splits when both hosts are idle and otherwise runs the whole gate on the idle host that has the disk for it. With no idle host it puts ci on the shortest queue and splits only onto a helper whose queue is no longer. |
 | `gate.sh --jobs 2 --tag j2 <rev>` | Passes `--jobs 2` to `scripts/ci.sh` and names the run `<short>-j2`, so it can run beside a default run of the same commit. |
 
 The tag also applies to `--status` and `--fetch`. `GATE_HELPER=none` turns the split off,
-and a `GATE_HELPER` that does not resolve exercises the unreachable-host fallback.
+`GATE_HELPER=<host>` always splits onto that host, and a `GATE_HELPER` that does not
+resolve exercises the unreachable-host fallback.
 `GATE_PRIMARY` changes the default primary host. The results directory names the host that
 ran the ci half. A gate that the older driver started has no record on the laptop, so the
 status and fetch look for its out directory on each gate host and use the newest.
@@ -743,6 +837,83 @@ never rewrites a script that a queued or running gate is reading. The host also 
 `~/gate/py-venv`. `scripts/gate/setup-host.sh <host>` creates them, copies the suites from
 wally through the laptop and checks linger, mbx and free disk. A ci half needs about
 30 GiB of free disk for its target and a conformance half about 15 GiB.
+
+The driver checks the free disk under the home directory of each chosen host before it
+starts anything there. A whole gate needs what a ci half needs. When a host has less, the
+driver runs `mbx gc` on it, which collects idle managed targets and evicts cache objects to
+the cache's budgets, and checks again. A host that is still short makes the driver stop
+with a message that names the host, the free space and the space needed. The check runs
+before the start because a running build holds its target's lease, so the cache cannot
+give back that space until the gate ends. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change
+the two amounts, in the environment or in `~/.config/sparkles/gate.env`.
+
+Each run sets `CARGO_BUILD_JOBS` from its host's gate memory cap, the cap in GiB less one,
+halved, between 2 and 8. That gives 6 jobs on a host with 15 GiB of RAM and a 13 GiB cap,
+and 8 jobs on a host with a 24 GiB cap. A Rust test build at 4 jobs peaked at about 9 GiB of
+process memory, and one at 8 jobs ran the ci half about 18% faster than at 4 on a host with
+a 24 GiB cap. `--cargo-jobs N` sets the jobs for every host of a run.
+`GATE_CARGO_JOBS_HOSTS`, a space-separated list such as `hostA=6 hostB=8` in the
+environment or the configuration file, sets them per host, and `GATE_CARGO_JOBS` sets them
+for the hosts that list leaves out. The value is recorded in `progress.log`.
+
+### Checks a batch selects
+
+`scripts/gate/gate.sh` passes the gate host the merge base of the commit and `--base`
+(default `GATE_BASE` or `origin/main`). The host runs the commit's
+`scripts/gate/select-checks.py`, which maps every file that changed between the merge base
+and the commit to the checks it calls for, and writes the choice and its reasons to
+`selection.txt` and `selection.log` in the run's out directory. The rules are these.
+
+| Changed files | Checks |
+|---|---|
+| Documentation, scripts other than the CI scripts, `.github/`, deployment and Nix files | The cheap checks: `fmt:check`, `lint:shell`, `lint:doc-paths`, `api:check`, `test:bench-scripts` and `client:types:check`. These run in every gate. |
+| A workspace crate, `testsuite/`, `ui/`, `docs/openapi.json` and the other files that `scripts/changed-crates.py` maps to packages | `lint` and `test` for the packages that read the files and every package that depends on them, through `scripts/ci.sh --changed`. `test:quickstart` runs when the server is among them, `fmt:wasm` when the browser formatter is, and `licenses:check` with any of them. |
+| `ui/` | The UI checks. |
+| A binding's crate or its own directory and scripts | That binding's checks. `crates/sparkles-py` and `scripts/py-test.sh` run `py:lint` and `py:test`, `crates/sparkles-ffi` and `jvm/` the JVM checks, and `crates/sparkles-node` and `js/` the Node checks. |
+| The public surface: `crates/sparkles`, the OpenAPI description and the baselines that `api:check` compares | Every binding's checks. |
+| SPARQL parsing, algebra and evaluation in `crates/sparkles-core/src/sparql`, the RDF parsers, the XSD functions, GeoSPARQL, the SHACL, SHACLC and ShEx crates and the suites' own files | `test:w3c`, `test:shacl` and `test:shex`. Unit-test files inside `src` do not count. |
+| The streaming executor, the spill files and the W3C harness | The plain and encrypted spill matrices. |
+| `Cargo.toml`, `Cargo.lock`, the toolchain, `mise.toml`, `.config/`, `vendor/`, `scripts/ci.sh`, `scripts/gate/` and the other CI scripts | Everything. |
+| A file that no rule covers, or no changed file | Everything. |
+
+The run then calls `scripts/ci.sh` without `--force`, with the chosen tasks and with
+`--changed` when the packages are not the whole workspace, so mise's task cache on that
+host skips a chosen check whose inputs already passed there. The conformance steps that
+the selection leaves out appear in `steps.txt` as skipped. A commit without
+`select-checks.py`, or a run without a base, runs every check without `--force`. The Rust
+tests of the ci half also run the W3C, SHACL and ShEx suites whenever their packages are
+chosen, since the gate sets the suites' directories, so the conformance steps add the
+per-suite summaries and the spill matrices. The laptop runs the same selection on the
+changed paths to decide whether to start a conformance half at all. The selection covers
+a batch's direct effects. The nightly gate covers what it leaves out, such as a server
+change that a binding's tests would notice.
+
+`python3 scripts/gate/select-checks.py --base origin/main` prints the selection for the
+checkout's `HEAD`, and `gate.sh --dry-run <rev>` prints whether the batch needs the
+conformance half and the hosts it would use.
+
+### Nightly gate
+
+`scripts/gate/nightly.sh` runs the gate on `origin/main` with `--full`, which runs every
+check with `--force` and no selection, on the hosts that `gate.sh --auto` finds idle. It
+fetches `origin` first and does nothing when the commit is the last one that passed.
+`scripts/gate/nightly.sh --install` installs a systemd user timer on the laptop that runs it
+every night at `GATE_NIGHTLY_AT` (default `*-*-* 02:30:00`, a systemd `OnCalendar` value),
+and catches up after the laptop wakes. `--uninstall` removes the timer and
+`--dry-run` prints the commit and the hosts. The timer's service needs the ssh agent that
+the ssh configuration names, so an agent socket at a fixed path, as with an
+`IdentityAgent` setting, works where a per-login agent does not.
+
+Each run writes a log to `.artifacts/gates/nightly/` in the main checkout, and the gate's
+results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. A pass records the
+commit in `last-pass`. A failure writes `FAILED`, with the range from the last passing
+commit to the failing one, the failed steps and the merges in that range. A failure is
+fixed forward. Bisect the range's merges with the failing step, for example with
+`scripts/ci.sh --force <task>` in a worktree of each merge, or with
+`gate.sh --full --tag bisect-<n> <merge>` for a conformance step. Then fix the merge that
+broke it in a follow-up commit and gate that commit as usual. A batch whose selection
+skipped the failing check gets a rule in `scripts/gate/select-checks.py` when the miss is
+one the rules should have caught.
 
 ## Continuous integration
 

@@ -15,8 +15,15 @@
 # Checks whose inputs are unchanged since they last passed are skipped through mise's task
 # cache (see the task caching section of mise.toml).
 #
-# Usage: scripts/ci.sh [--fast] [--exhaustive-features] [--fail-fast] [--force] [--jobs N] [task...]
+# Usage: scripts/ci.sh [--fast] [--changed BASE] [--exhaustive-features] [--fail-fast] [--force] [--jobs N] [task...]
 #   --fast       formatting, shell checks, doc paths, workspace Clippy and Rust tests
+#   --changed BASE
+#                run `lint` and `test` only for the workspace packages that the change since
+#                the merge base of BASE and HEAD can affect and the packages that depend on
+#                them (scripts/changed-crates.py). A change to a shared root, such as
+#                Cargo.lock or sparkles-core, keeps the whole workspace. The batch gate
+#                passes it when its selection narrows the packages
+#                (scripts/gate/select-checks.py).
 #   --exhaustive-features
 #                also run optional-feature Clippy and the six stripped-server test sets
 #   --fail-fast  stop the remaining tasks after the first failure
@@ -43,6 +50,7 @@ main() {
   fast=(fmt:check lint:shell lint:doc-paths api:check client:types:check lint test)
 
   jobs=2
+  changed_base=
   fail_fast=
   force=()
   exhaustive_features=
@@ -50,6 +58,10 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --fast) tasks=("${fast[@]}") ;;
+      --changed)
+        changed_base=${2:?--changed needs a base revision}
+        shift
+        ;;
       --exhaustive-features) exhaustive_features=1 ;;
       --fail-fast) fail_fast=1 ;;
       --force) force=(--force) ;;
@@ -66,6 +78,19 @@ main() {
     shift
   done
   [ ${#tasks[@]} -gt 0 ] || tasks=("${full[@]}")
+  # The packages go to the lint and test tasks alone, whose cache keys include the
+  # variable. Every other task runs without it, so it keeps the cache key of a full run and
+  # no test of the scripts sees it.
+  changed_packages=
+  if [ -n "$changed_base" ]; then
+    changed=$(python3 scripts/changed-crates.py "$changed_base") || exit 1
+    unset SPARKLES_CHANGED_PACKAGES
+    case $changed in
+      all) ;;
+      *) changed_packages="${changed//$'\n'/ }" ;;
+    esac
+    echo "changed packages since $changed_base: ${changed_packages:-the whole workspace}"
+  fi
   if [ -n "$exhaustive_features" ]; then
     for feature_task in lint:features test:features; do
       if [[ " ${tasks[*]} " != *" $feature_task "* ]]; then
@@ -152,8 +177,10 @@ main() {
     log="$out/logs/$key.log"
     t0=$SECONDS
     echo "running since $(date '+%H:%M:%S')" > "$out/state/$key"
+    local narrow=()
+    case $t in lint | test) [ -z "$changed_packages" ] || narrow=(env "SPARKLES_CHANGED_PACKAGES=$changed_packages") ;; esac
     set +e
-    mise run --output interleave "$@" "$t" > "$log" 2>&1
+    "${narrow[@]}" mise run --output interleave "$@" "$t" > "$log" 2>&1
     rc=$?
     set -e
     local secs=$((SECONDS - t0))
@@ -306,6 +333,10 @@ main() {
 
   echo
   cat "$summary"
+  if [ -s "$out/flaky-tests.txt" ]; then
+    printf '\nwarning: known flaky tests that passed only on a retry (.config/nextest.toml):\n'
+    cat "$out/flaky-tests.txt"
+  fi
   if [ -s "$out/slow-tests.txt" ]; then
     printf '\nwarning: tests that may time out on GitHub runners (scripts/nextest-slow.py):\n'
     cat "$out/slow-tests.txt"

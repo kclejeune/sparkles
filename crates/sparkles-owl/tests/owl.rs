@@ -1333,3 +1333,40 @@ fn ofn_reads_one_axiom_with_prefixes() {
     assert!(parse_axiom("SubClassOf(ex:A ex:B) SubClassOf(ex:B ex:C)", &p).is_err());
     assert!(parse_axiom("SubClassOf(ex:A)", &p).is_err());
 }
+
+/// spec F21 A6 and F17 §7: a partition by the QL grammar keeps the axioms F17's
+/// rewriting reads and sets the transitive property aside with its violation.
+#[test]
+fn ql_partition_sets_aside_the_axioms_outside_ql() {
+    let body =
+        ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+         :B rdfs:subClassOf :C .";
+    let inside = profiles::partition(&strict(&decl(body)), Profile::Ql);
+    assert!(inside.outside.is_empty(), "{:?}", inside.outside);
+    let o = strict(&decl(&format!("{body}\n:p a owl:TransitiveProperty .")));
+    let part = profiles::partition(&o, Profile::Ql);
+    let transitive = Axiom::new(AxiomKind::TransitiveObjectProperty(op("p").into()));
+    assert_eq!(
+        part.outside_axioms().into_iter().collect::<Vec<_>>(),
+        vec![&transitive]
+    );
+    assert_eq!(part.inside.len(), inside.inside.len());
+    assert!(!part.inside.contains(&transitive));
+    assert!(
+        part.outside[0].rule.starts_with("OWL 2 Profiles"),
+        "{:?}",
+        part.outside
+    );
+}
+
+/// A partition applies the profile's own grammar, not the DL global restrictions that a
+/// check adds to every report.
+#[test]
+fn partitions_leave_out_the_dl_restrictions() {
+    let o = lenient(&decl(":x a owl:ObjectProperty , owl:DatatypeProperty ."));
+    assert!(!report(&o, Profile::Rl).conforms);
+    assert!(profiles::partition(&o, Profile::Rl).outside.is_empty());
+    let union = strict(&decl(":A owl:disjointUnionOf ( :B :C ) ."));
+    let part = profiles::partition(&union, Profile::Rl);
+    assert_eq!(part.outside_axioms().len(), 1, "{:?}", part.outside);
+}

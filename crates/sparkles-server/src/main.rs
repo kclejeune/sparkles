@@ -4580,6 +4580,14 @@ fn run() -> Result<()> {
                     }
                     fetched.extend(f.fetched);
                 }
+                // the input graphs' axioms outside OWL 2 RL, in the state the run reads
+                // (spec F21 §7)
+                #[cfg(not(feature = "ontology"))]
+                let inspect: Option<sparkles_reasoner::InspectFn> = None;
+                #[cfg(feature = "ontology")]
+                let inspect = (profile == sparkles_reasoner::Profile::OwlRl).then(|| {
+                    sparkles::handles::ontology::rl_inspector(&store, &inputs, Default::default())
+                });
                 let r = sparkles_reasoner::materialize_incremental(
                     &store,
                     &profile,
@@ -4589,6 +4597,7 @@ fn run() -> Result<()> {
                         inputs: inputs.clone(),
                         threads,
                         max_inferred: no_limit_if_zero(max_inferred),
+                        inspect,
                         ..Default::default()
                     },
                 )?;

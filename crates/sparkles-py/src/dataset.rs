@@ -1472,6 +1472,13 @@ impl PyDataset {
         crate::mappings::PyStoredMappings { owner: slf }
     }
 
+    /// The OWL 2 ontology of the dataset's graphs (spec F21).
+    #[cfg(feature = "ontology")]
+    #[getter]
+    fn ontology(slf: Py<Self>) -> crate::ontology::PyOntologies {
+        crate::ontology::PyOntologies { owner: slf }
+    }
+
     /// Run an R2RML, RML or YARRRML mapping and load its quads in one commit.
     #[pyo3(signature=(text,*,kind=None,sources=None,connections=None,directory=None,base=None,graph=None))]
     #[allow(clippy::too_many_arguments)]

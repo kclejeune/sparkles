@@ -1816,6 +1816,15 @@ and the default `mode=lenient` types undeclared entities from their use and says
 the diagnostics. The routes read with the caller's grants. An import of a graph the
 caller cannot read is not followed.
 
+`inferences=true` on the summary and the axioms, and `inferences` in the body of a check,
+also read the materialized inferences in `urn:x-sparkles:inferred` while the dataset has
+a materialization. The axioms then include the materialized closure, so the axioms about
+a class list its inferred superclasses. The answer's `inferences` member says whether
+they were read and, when they were, gives the graph, the materialization's profile,
+`stale`, `commitsSince` and `reason`, as the `Sparkles-Inferences` header does for a
+query. Without a materialization it is `{"included": false}` and the read covers the
+asserted axioms. An edit or a diff with `inferences` is `400`.
+
 `GET /$/ontology/{ds}` answers the ontology header, the counts of declared entities by
 kind and of axioms by type, the graphs read, the imports and whether each resolved, the
 number of triples read and unmapped, and the first 100 diagnostics. The counts cover the
@@ -1904,6 +1913,18 @@ the `diff` endpoint. A commit that the dataset's history no longer keeps is `410
   "added": [{ "type": "SubClassOf", "ofn": "SubClassOf(:Lecture :Event)", "axiom": { "type": "SubClassOf", "subClass": "http://ex.org/Lecture", "superClass": "http://ex.org/Event" }, "graph": "default" }],
   "removed": [], "changedQuads": 2, "method": "log" }
 ```
+
+The library's `sparkles::handles::ontology::wire::call` answers the same operations
+in the same JSON forms, and the bindings call it. Python's `Dataset.ontology` has
+`summary`, `axioms`, `check`, `edit`, `remove_entity` and `diff`, with the members as
+keyword arguments, and `Axiom` reads and writes one axiom with structural equality.
+Node.js's `dataset.ontology` has `summary`, `axiomPage`, `axioms` (an async iterable in
+batches), `check`, `edit`, `removeEntity` and `diff`. On the JVM,
+`DatasetGraphSparkles.ontology()` has the same operations, and `SparklesOnt.model`
+returns a `jena-ontapi` `OntModel` over a Sparkles graph
+([integrations](integrations/README.md#libraries-and-bindings)). An axiom given to an
+edit is its JSON form or a string in functional-style syntax with the dataset's
+prefixes.
 
 Graph Store writes and `/{ds}/upload` read an OWL 2 functional-style document sent as
 `text/owl-functional` or in a `.ofn` file. It is loaded as the triples its axioms map

@@ -12,18 +12,14 @@
 
 use super::*;
 use crate::auth::Endpoint;
-use sparkles::handles::ontology::{
-    self as onto, CheckRequest, EditRequest, OntologyRequest, Opened,
-};
+use sparkles::handles::ontology::{self as onto, CheckRequest, EditRequest, OntologyRequest};
 use sparkles::owl::{self, Axiom, ofn::Renderer, profiles::Profile};
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
 
-/// The most axioms one page lists.
-const MAX_LIMIT: usize = 10_000;
-/// The axioms a page lists by default.
-const DEFAULT_LIMIT: usize = 100;
-/// The diagnostics a summary lists.
-const SUMMARY_DIAGNOSTICS: usize = 100;
+pub(crate) use onto::wire::{
+    AxiomQuery, DEFAULT_LIMIT, MAX_LIMIT, axiom_page, check_body, diff_body, diff_lines, edit_body,
+    mentioned, page_body, summary_body,
+};
 
 fn bad(m: impl Into<String>) -> ApiError {
     err_code(StatusCode::BAD_REQUEST, "invalid-request", m)
@@ -62,6 +58,9 @@ fn request_of(params: &Params) -> ApiResult<OntologyRequest> {
         req.mode = mode_of(v)?;
     }
     req.at = history::at_param(params)?;
+    if let Some(v) = params.get("inferences") {
+        req.inferences = truthy(v);
+    }
     Ok(req)
 }
 
@@ -103,6 +102,11 @@ fn request_body(
         Some(J::String(s)) => req.mode = mode_of(s)?,
         Some(_) => return Err(bad("mode: lenient or strict")),
     }
+    match o.get("inferences") {
+        None | Some(J::Null) => {}
+        Some(J::Bool(b)) => req.inferences = *b,
+        Some(_) => return Err(bad("inferences: true or false")),
+    }
     Ok(req)
 }
 
@@ -134,59 +138,6 @@ fn ontology_error(e: Error) -> ApiError {
         }
         e => e.into(),
     }
-}
-
-fn header_json(h: &owl::Header, r: &Renderer) -> J {
-    json!({
-        "iri": h.iri.as_ref().map(|i| i.as_str()),
-        "versionIri": h.version_iri.as_ref().map(|i| i.as_str()),
-        "imports": h.imports.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
-        "annotations": h.annotations.iter().map(|a| r.annotation(a)).collect::<Vec<_>>(),
-    })
-}
-
-fn opened_json(name: &str, o: &Opened, req: &OntologyRequest) -> J {
-    json!({
-        "dataset": name,
-        "commit": o.snapshot.commit,
-        "mode": req.mode.as_str(),
-        "graphs": o.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
-        "imports": o.imports.iter().map(|i| json!({"iri": i.iri, "graph": i.graph})).collect::<Vec<_>>(),
-        "warnings": o.warnings,
-    })
-}
-
-/// The JSON of the summary of an open ontology, as `GET /$/ontology/{ds}` answers it.
-pub(crate) fn summary_body(name: &str, o: &Opened, req: &OntologyRequest, r: &Renderer) -> J {
-    let s = o.summary();
-    let mut j = opened_json(name, o, req);
-    j["header"] = header_json(&s.header, r);
-    j["axioms"] = json!(
-        s.axioms
-            .iter()
-            .map(|(t, n)| (t.name().to_string(), json!(*n)))
-            .collect::<serde_json::Map<String, J>>()
-    );
-    j["axiomCount"] = json!(s.axioms.values().sum::<usize>());
-    j["entities"] = json!(
-        s.entities
-            .iter()
-            .map(|(k, n)| (k.name().to_string(), json!(*n)))
-            .collect::<serde_json::Map<String, J>>()
-    );
-    j["triples"] = json!(s.triples);
-    j["unmapped"] = json!(s.unmapped);
-    j["diagnostics"] = json!({
-        "warnings": s.warnings,
-        "errors": s.errors,
-        "list": o.ontology.diagnostics.iter().take(SUMMARY_DIAGNOSTICS).map(|d| json!({
-            "severity": d.severity.as_str(),
-            "code": d.code,
-            "message": d.message,
-        })).collect::<Vec<_>>(),
-    });
-    j["cached"] = json!(o.cached);
-    j
 }
 
 /// `GET /$/ontology/{ds}`: the header, the counts of entities and axioms, the graphs
@@ -316,141 +267,6 @@ pub(super) async fn axioms(
     .await
 }
 
-/// What a listing of axioms keeps.
-pub(crate) struct AxiomQuery {
-    pub types: Option<std::collections::BTreeSet<owl::AxiomType>>,
-    pub about: Option<String>,
-    pub assertions: bool,
-    pub limit: usize,
-    pub offset: usize,
-}
-
-/// One page of axioms, with the graph each was read from, and the total.
-pub(crate) struct Page {
-    pub items: Vec<(Axiom, Option<u32>)>,
-    pub total: usize,
-    pub offset: usize,
-}
-
-/// The page `q` asks for: the terminology's axioms in order, then the assertions the
-/// store holds when `q.assertions` is set.
-pub(crate) fn axiom_page(
-    o: &Opened,
-    q: &AxiomQuery,
-    opts: &sparkles::sparql::QueryOptions,
-) -> sparkles::Result<Page> {
-    let keep = |ax: &Axiom| {
-        q.types
-            .as_ref()
-            .is_none_or(|t| t.contains(&ax.axiom_type()))
-            && q.about.as_deref().is_none_or(|a| ax.mentions(a))
-    };
-    let mut items: Vec<(Axiom, Option<u32>)> = Vec::new();
-    let mut total = 0usize;
-    for (ax, origins) in &o.ontology.axioms {
-        if keep(ax) {
-            if total >= q.offset && items.len() < q.limit {
-                items.push((ax.clone(), origins.first().map(|x| x.graph)));
-            }
-            total += 1;
-        }
-    }
-    let wants_assertions = q
-        .types
-        .as_ref()
-        .is_none_or(|t| t.iter().any(|t| t.is_assertion()));
-    if q.assertions && wants_assertions {
-        o.assertions(opts, |ax, _, g| {
-            if let Some(ax) = ax
-                && keep(&ax)
-            {
-                if total >= q.offset && items.len() < q.limit {
-                    items.push((ax, Some(g)));
-                }
-                total += 1;
-            }
-            Ok(true)
-        })?;
-    }
-    Ok(Page {
-        items,
-        total,
-        offset: q.offset,
-    })
-}
-
-/// The JSON of a page of axioms.
-pub(crate) fn page_body(
-    name: &str,
-    o: &Opened,
-    req: &OntologyRequest,
-    r: &Renderer,
-    page: &Page,
-) -> J {
-    let next = page.offset + page.items.len();
-    let list: Vec<J> = page
-        .items
-        .iter()
-        .map(|(ax, g)| {
-            let mut j = json!({
-                "type": ax.axiom_type().name(),
-                "ofn": r.axiom(ax),
-                "axiom": owl::json::axiom(ax),
-            });
-            if let Some(g) = g {
-                j["graph"] = o.graph_name(*g).into();
-            }
-            j
-        })
-        .collect();
-    let mut j = opened_json(name, o, req);
-    j["axioms"] = J::Array(list);
-    j["total"] = json!(page.total);
-    j["offset"] = json!(page.offset);
-    j["next"] = if next < page.total {
-        json!(next)
-    } else {
-        J::Null
-    };
-    j
-}
-
-/// The JSON of the reports of a check.
-pub(crate) fn check_body(
-    name: &str,
-    o: &Opened,
-    req: &OntologyRequest,
-    r: &Renderer,
-    reports: &[owl::profiles::Report],
-    assertions: bool,
-) -> J {
-    let mut j = opened_json(name, o, req);
-    j["conforms"] = json!(reports.iter().all(|r| r.conforms));
-    j["assertions"] = json!(assertions);
-    j["reports"] = J::Array(reports.iter().map(|x| onto::report_json(o, x, r)).collect());
-    j
-}
-
-/// The JSON of what an edit did.
-pub(crate) fn edit_body(e: &onto::EditOutcome, r: &Renderer) -> J {
-    json!({
-        "added": e.added,
-        "present": e.present,
-        "removed": e.removed,
-        "absent": e.absent.iter().map(|a| r.axiom(a)).collect::<Vec<_>>(),
-        "declared": e.declared.iter().map(|d| r.entity(d)).collect::<Vec<_>>(),
-        "inserted": e.inserted,
-        "deleted": e.deleted,
-        "kept": e.kept,
-        "committed": e.receipt.committed,
-    })
-}
-
-/// Whether the ontology's terminology declares or uses `iri`.
-pub(crate) fn mentioned(o: &Opened, iri: &str) -> bool {
-    o.ontology.axiom_set().any(|a| a.mentions(iri))
-}
-
 /// `POST /$/ontology/{ds}/check`: one report per profile in `profiles` (`dl` when
 /// none), over the terminology and, unless `assertions` is false, the assertions.
 pub(super) async fn check(
@@ -468,6 +284,7 @@ pub(super) async fn check(
             "graph",
             "imports",
             "mode",
+            "inferences",
             "profiles",
             "assertions",
             "maxViolations",
@@ -658,70 +475,6 @@ pub(super) async fn edit(
     })
     .await
     .map_err(|e| with_timeout(e, timeout))
-}
-
-/// The JSON of one axiom of a listing or a diff.
-fn axiom_json(ax: &Axiom, graph: Option<&str>, r: &Renderer) -> J {
-    let mut j = json!({
-        "type": ax.axiom_type().name(),
-        "ofn": r.axiom(ax),
-        "axiom": owl::json::axiom(ax),
-    });
-    if let Some(g) = graph {
-        j["graph"] = g.into();
-    }
-    j
-}
-
-/// The JSON of an ontology diff, with at most `limit` axioms on each side.
-pub(crate) fn diff_body(
-    name: &str,
-    d: &onto::OntologyDiff,
-    req: &OntologyRequest,
-    assertions: bool,
-    limit: usize,
-    r: &Renderer,
-) -> J {
-    let side = |v: &[onto::AxiomChange]| -> J {
-        J::Array(
-            v.iter()
-                .take(limit)
-                .map(|c| axiom_json(&c.axiom, Some(&c.graph), r))
-                .collect(),
-        )
-    };
-    json!({
-        "dataset": name,
-        "from": d.from,
-        "to": d.to,
-        "graphs": req.graphs.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
-        "mode": req.mode.as_str(),
-        "assertions": assertions,
-        "added": side(&d.added),
-        "removed": side(&d.removed),
-        "addedCount": d.added.len(),
-        "removedCount": d.removed.len(),
-        "truncated": d.added.len() > limit || d.removed.len() > limit,
-        "changedQuads": d.changed_quads,
-        "method": d.method.as_str(),
-    })
-}
-
-/// The diff as lines: `+ axiom` for each added axiom, then `- axiom` for each removed
-/// one, in functional-style syntax with the dataset's prefixes.
-pub(crate) fn diff_lines(d: &onto::OntologyDiff, limit: usize, r: &Renderer) -> String {
-    let mut s = String::new();
-    for c in d.added.iter().take(limit) {
-        s.push_str("+ ");
-        s.push_str(&r.axiom(&c.axiom));
-        s.push('\n');
-    }
-    for c in d.removed.iter().take(limit) {
-        s.push_str("- ");
-        s.push_str(&r.axiom(&c.axiom));
-        s.push('\n');
-    }
-    s
 }
 
 /// `GET /$/ontology/{ds}/diff?from=&to=`: the axioms that differ between two commits

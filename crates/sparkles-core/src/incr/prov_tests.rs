@@ -722,9 +722,11 @@ fn modes() -> [Provenance; 5] {
 }
 
 /// Random histories against the brute-force annotations, for every mode. The run's
-/// size and seed come from `SPARKLES_PROV_CASES` and `SPARKLES_PROV_SEED`.
-#[test]
-fn annotations_match_a_brute_force_recomputation() {
+/// size and seed come from `SPARKLES_PROV_CASES` and `SPARKLES_PROV_SEED`. The cases are
+/// split over four tests, which run in parallel: part `part` of `parts` takes the cases
+/// whose index leaves `part` modulo `parts`, so every case runs once, and asserts the
+/// share of incremental runs over its own cases.
+fn annotations_part(part: u64, parts: u64) {
     let cases: u64 = std::env::var("SPARKLES_PROV_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -734,7 +736,9 @@ fn annotations_match_a_brute_force_recomputation() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(415);
     let mut ran = 0;
-    for i in 0..cases {
+    let mut mine = 0;
+    for i in (0..cases).filter(|i| i % parts == part) {
+        mine += 1;
         let seed = base + i;
         for mode in modes() {
             match run(seed, mode) {
@@ -745,9 +749,29 @@ fn annotations_match_a_brute_force_recomputation() {
         }
     }
     assert!(
-        ran >= cases * 3,
-        "only {ran} runs were incremental out of {cases} cases"
+        ran >= mine * 3,
+        "only {ran} runs were incremental out of {mine} cases"
     );
+}
+
+#[test]
+fn annotations_match_a_brute_force_recomputation_part_1_of_4() {
+    annotations_part(0, 4);
+}
+
+#[test]
+fn annotations_match_a_brute_force_recomputation_part_2_of_4() {
+    annotations_part(1, 4);
+}
+
+#[test]
+fn annotations_match_a_brute_force_recomputation_part_3_of_4() {
+    annotations_part(2, 4);
+}
+
+#[test]
+fn annotations_match_a_brute_force_recomputation_part_4_of_4() {
+    annotations_part(3, 4);
 }
 
 /// A bound of one witness overflows on a row with two derivations, keeps the smaller

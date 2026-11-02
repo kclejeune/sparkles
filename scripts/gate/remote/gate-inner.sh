@@ -8,6 +8,12 @@
 # A whole gate (part all) writes gate.exit. A half (part ci or conformance) writes
 # part.exit instead, and scripts/gate/gate.sh on the laptop merges both halves and writes
 # gate.exit, since the gate hosts cannot reach each other.
+#
+# GATE_BASE, when set, names the commit the batch is compared with. The run then chooses
+# its checks with the commit's scripts/gate/select-checks.py and writes the choice to
+# selection.txt, and the task cache of mise skips a check whose inputs already passed.
+# GATE_FULL=1 runs every check with --force, as the nightly gate does. A commit without
+# the selection script, or a run without a base, runs every check without --force.
 set -uo pipefail
 full=$1
 name=$2
@@ -97,8 +103,49 @@ export PATH="$G/py-venv/bin:$PATH"
   python3 --version
 } > "$out/env.txt" 2>&1
 
+# skip NAME REASON: record a step that the selection left out.
+skip() {
+  log "skip $1 ($2)"
+  printf '%-20s skipped        %s\n' "$1" "$2" >> "$out/steps.txt"
+}
+
+# The checks to run. Every check by default; a selection narrows them.
+force=()
+ci_args=()
+conf="w3c shacl shex"
+spill="plain encrypted"
+if [ "${GATE_FULL:-0}" = 1 ]; then
+  force=(--force)
+  echo "every check with --force (full gate)" > "$out/selection.txt"
+elif [ -z "${GATE_BASE:-}" ]; then
+  echo "every check: no base commit was given" > "$out/selection.txt"
+elif [ ! -f scripts/gate/select-checks.py ]; then
+  echo "every check: this commit has no scripts/gate/select-checks.py" > "$out/selection.txt"
+else
+  # The conformance half needs no package selection, which reads cargo metadata.
+  only=()
+  [ "$part" != conformance ] || only=(--paths-only)
+  if python3 scripts/gate/select-checks.py --base "$GATE_BASE" "${only[@]}" > "$out/selection.txt" 2> "$out/selection.log"; then
+    tasks=$(sed -n 's/^ci //p' "$out/selection.txt")
+    conf=$(sed -n 's/^conformance *//p' "$out/selection.txt")
+    spill=$(sed -n 's/^spill *//p' "$out/selection.txt")
+    pkgs=$(sed -n 's/^packages //p' "$out/selection.txt")
+    if [ "$tasks" != all ]; then
+      read -ra ci_args <<< "$tasks"
+    fi
+    # ci.sh --changed recomputes the same packages from the clean worktree.
+    if [ -n "$pkgs" ] && [ "$pkgs" != all ]; then
+      ci_args=(--changed "$GATE_BASE" "${ci_args[@]}")
+    fi
+  else
+    log "select-checks.py failed, so every check runs; see selection.log"
+    echo "every check: select-checks.py failed" > "$out/selection.txt"
+  fi
+fi
+log "selection: $(tr '\n' ';' < "$out/selection.txt")"
+
 if [ "$part" != conformance ]; then
-  step ci scripts/ci.sh --force --jobs "$jobs"
+  step ci scripts/ci.sh "${force[@]}" --jobs "$jobs" "${ci_args[@]}"
   # scripts/ci.sh keeps its summary and task logs in .artifacts/ci, and older revisions in
   # target/ci. Copy them before the cleanup below removes the worktree.
   if [ -d .artifacts/ci ]; then
@@ -108,9 +155,21 @@ if [ "$part" != conformance ]; then
   fi
 fi
 if [ "$part" != ci ]; then
-  for t in w3c shacl shex; do step "$t" mise run --force "test:$t"; done
+  for t in w3c shacl shex; do
+    if [[ " $conf " == *" $t "* ]]; then
+      step "$t" mise run "${force[@]}" "test:$t"
+    else
+      skip "$t" "no change to the code its suite checks"
+    fi
+  done
+  # The cursor batch sizes are separate tests, which run in parallel. Each query has its
+  # own spill directory and budget.
   for m in plain encrypted; do
-    step "w3c-spill-$m" env SPARKLES_W3C_SPILL=$m mbx test -p sparkles-core --test w3c sparql_query_cursors -- --nocapture --test-threads=1
+    if [[ " $spill " == *" $m "* ]]; then
+      step "w3c-spill-$m" env SPARKLES_W3C_SPILL=$m mbx test -p sparkles-core --test w3c sparql_query_cursors -- --nocapture
+    else
+      skip "w3c-spill-$m" "no change to the streaming executor or spill"
+    fi
   done
 fi
 

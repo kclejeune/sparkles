@@ -840,3 +840,76 @@ mappings:
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('the ontology handle reads, checks, edits and diffs axioms', async (t) => {
+  // on disk, so that the diff can read the earlier commit
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class .
+      :p a owl:ObjectProperty .
+      :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+      :a a :A . }`);
+  const onto = ds.ontology;
+  const summary = await onto.summary();
+  assert.equal(summary.header.iri, 'http://ex.org/o');
+  assert.equal(Number(summary.axioms.SubClassOf), 1);
+  const page = await onto.axiomPage({ type: ['SubClassOf'] });
+  assert.equal(Number(page.total), 1);
+  const [entry] = page.axioms;
+  assert.equal(entry.type, 'SubClassOf');
+  assert.equal(entry.axiom.type, 'SubClassOf');
+  assert.equal(entry.axiom.superClass.type, 'ObjectSomeValuesFrom');
+  // the listing is an async iterable in batches
+  const listed = [];
+  for await (const a of onto.axioms({ assertions: true, batch: 2 })) listed.push(a.type);
+  assert.ok(listed.includes('ClassAssertion'), listed.join());
+  assert.equal(listed.length, Number((await onto.axiomPage({ assertions: true })).total));
+  const check = await onto.check({ profiles: ['el', 'rl'] });
+  assert.deepEqual(
+    check.reports.map((r) => r.profile),
+    ['el', 'rl'],
+  );
+  const before = summary.commit;
+  const done = await onto.edit({
+    remove: [entry.axiom],
+    add: ['SubClassOf(<http://ex.org/B> <http://ex.org/C>)'],
+  });
+  assert.equal(Number(done.removed), 1);
+  assert.equal(Number(done.added), 1);
+  const diff = await onto.diff(before);
+  assert.equal(Number(diff.addedCount), 1);
+  assert.equal(diff.removed[0].type, 'SubClassOf');
+  const gone = await onto.removeEntity('http://ex.org/C');
+  assert.ok(Number(gone.removed) >= 1);
+  await assert.rejects(onto.edit({}), InvalidInputError);
+  await assert.rejects(onto.axiomPage({ about: 'http://ex.org/nobody' }));
+  // an inferred read says whether it found materialized inferences
+  const inferred = await onto.summary({ inferences: true });
+  assert.equal(inferred.inferences.included, false);
+  // edits and diffs refuse an inferred or historical read, and commit nothing
+  const head = (await onto.summary()).commit;
+  const add = { add: ['Declaration(Class(<http://ex.org/Y>))'] };
+  await assert.rejects(onto.edit(add, { inferences: true }), InvalidInputError);
+  await assert.rejects(onto.edit(add, { at: 'commit:1' }), InvalidInputError);
+  await assert.rejects(
+    onto.removeEntity('http://ex.org/A', { inferences: true }),
+    InvalidInputError,
+  );
+  await assert.rejects(onto.diff(before, { inferences: true }), InvalidInputError);
+  assert.equal((await onto.summary()).commit, head);
+  // a listing at the head reads the commit of its first batch, whatever commits meanwhile
+  const total = Number((await onto.axiomPage({ at: 'head' })).total);
+  let seen = 0;
+  for await (const _ of onto.axioms({ at: 'head', batch: 1 })) {
+    if (seen++ === 0) await onto.edit({ add: ['Declaration(Class(<http://ex.org/Z>))'] });
+  }
+  assert.equal(seen, total);
+  // the timeout bounds the whole listing, not each batch
+  await assert.rejects(async () => {
+    for await (const _ of onto.axioms({ batch: 1, timeout: 50 })) {
+      await new Promise((r) => setTimeout(r, 60));
+    }
+  }, QueryTimeoutError);
+});

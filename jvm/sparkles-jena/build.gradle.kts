@@ -144,6 +144,8 @@ dependencies {
     implementation(libs.slf4j.api)
     // the TDB2 import; checked for at the call
     compileOnly(libs.jena.tdb2)
+    // SparklesOnt.model builds a jena-ontapi model; programs that call it add the module
+    compileOnly(libs.jena.ontapi)
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
@@ -154,6 +156,7 @@ dependencies {
     testImplementation(variantOf(libs.jena.core) { classifier("tests") })
     testImplementation(variantOf(libs.jena.base) { classifier("tests") })
     testImplementation(libs.jena.tdb2)
+    testImplementation(libs.jena.ontapi)
     testImplementation(libs.jena.rdfconnection)
     testImplementation(libs.jena.fuseki.main)
     testRuntimeOnly(libs.slf4j.simple)

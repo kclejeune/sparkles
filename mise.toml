@@ -55,6 +55,7 @@ global_env = [
   "MBX_INCREMENTAL", "MBX_LEARNED_INCREMENTAL", "MBX_EAGER_INCREMENTAL", "MBX_LINKER",
   "MBX_SEED_INCREMENTAL", "MBX_VERIFY", "MBX_VERIFY_SAMPLE_RATE",
   "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS",
+  "SPARKLES_CHANGED_PACKAGES",
 ]
 
 [task_config.input_groups]
@@ -80,6 +81,67 @@ rust = [
   "crates/*/fuzz/**",
   "crates/*/python/**",
   "vendor/**",
+]
+# What the Python, JVM and Node bindings compile from the root workspace: the libraries
+# of the crates they depend on, directly or not, through normal and build dependencies.
+# A binding check whose own crate and these files are unchanged keeps its cached pass
+# when other crates, such as the server, change. scripts/bench-tests/test_binding_sources.py
+# checks the list against cargo metadata.
+binding-deps = [
+  # The crates inherit [workspace.package] and [workspace.dependencies] from it.
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+  ".mbx.toml",
+  "vendor/**",
+  "crates/sparkles/*.toml",
+  "crates/sparkles/src/**",
+  "crates/sparkles/resources/**",
+  "crates/sparkles-alloc/*.toml",
+  "crates/sparkles-alloc/src/**",
+  "crates/sparkles-backup/*.toml",
+  "crates/sparkles-backup/src/**",
+  "crates/sparkles-core/*.toml",
+  "crates/sparkles-core/src/**",
+  "crates/sparkles-fmt/*.toml",
+  "crates/sparkles-fmt/src/**",
+  "crates/sparkles-graphql/*.toml",
+  "crates/sparkles-graphql/src/**",
+  "crates/sparkles-owl/*.toml",
+  "crates/sparkles-owl/src/**",
+  "crates/sparkles-reasoner/*.toml",
+  "crates/sparkles-reasoner/src/**",
+  "crates/sparkles-reasoner/diagnostics/**",
+  "crates/sparkles-reasoner/rules/**",
+  "crates/sparkles-reasoner/vocab/**",
+  "crates/sparkles-shacl/*.toml",
+  "crates/sparkles-shacl/src/**",
+  "crates/sparkles-shaclc/*.toml",
+  "crates/sparkles-shaclc/src/**",
+  "crates/sparkles-shex/*.toml",
+  "crates/sparkles-shex/src/**",
+]
+# Each binding's own Cargo workspace.
+py = [
+  "crates/sparkles-py/*.toml",
+  "crates/sparkles-py/Cargo.lock",
+  "crates/sparkles-py/src/**",
+  "crates/sparkles-py/tests/**",
+  "crates/sparkles-py/python/**",
+  # tests/test_dataset.py reads Jena's patch fixtures
+  "crates/sparkles-core/tests/patch/**",
+]
+ffi = [
+  "crates/sparkles-ffi/*.toml",
+  "crates/sparkles-ffi/Cargo.lock",
+  "crates/sparkles-ffi/src/**",
+  "crates/sparkles-ffi/examples/**",
+]
+node-addon = [
+  "crates/sparkles-node/*.toml",
+  "crates/sparkles-node/Cargo.lock",
+  "crates/sparkles-node/build.rs",
+  "crates/sparkles-node/src/**",
 ]
 # The UI's sources; the server embeds its build.
 ui = [
@@ -325,12 +387,19 @@ run = [
 ]
 
 [tasks.lint]
-sources = ["@group:rust", "@group:ui"]
+sources = ["@group:rust", "@group:ui", "scripts/changed-crates.py"]
 outputs = []
 description = "Clippy (warnings are errors) + svelte-check"
 # ui:build first: the server embeds ui/build, which a concurrent UI build rewrites
 depends = ["ui:check", "ui:build"]
-run = "mbx clippy --workspace --all-targets -- -D warnings"
+# SPARKLES_CHANGED_PACKAGES, which `scripts/ci.sh --changed BASE` sets, narrows it to the
+# packages a lane's change can affect (scripts/changed-crates.py).
+run = '''
+set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args)
+if [ "$pkgs" = none ]; then echo "no workspace package reads a changed file"; exit 0; fi
+mbx clippy $pkgs --all-targets -- -D warnings
+'''
 
 [tasks."lint:features"]
 sources = ["@group:rust", "@group:ui", "scripts/lint-features.sh"]
@@ -370,7 +439,7 @@ depends = ["ui:check", "ui:build"]
 run = "mbx check --workspace --all-targets"
 
 [tasks.test]
-sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**"]
+sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**", "scripts/changed-crates.py", "scripts/nextest-slow.py"]
 outputs = []
 # The W3C, SHACL, ShEx and JSON-LD suites read checkouts of Apache Jena and Oxigraph
 # next to this repository when they exist, so their commits are part of the key.
@@ -388,25 +457,43 @@ depends = ["ui:build"]
 # 9 GB of rustc memory, and nextest would build them at the same time. Building them one
 # after the other halves the peak at the cost of a few minutes. nextest does not run
 # doctests, so `mbx test --doc` runs them afterwards.
+# SPARKLES_CHANGED_PACKAGES, which `scripts/ci.sh --changed BASE` sets, narrows the run to
+# the packages a lane's change can affect (scripts/changed-crates.py). nextest still builds
+# the whole workspace, so its binaries match a full run's and come from the shared cache,
+# and runs only those packages' tests. The doctests build only those packages.
 run = [
-  "mbx test --workspace --no-run --bin sparkles",
   '''
 set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args)
+if [ "$pkgs" = none ]; then echo "no workspace package reads a changed file"; exit 0; fi
+mbx test --workspace --no-run --bin sparkles
+''',
+  '''
+set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args --nextest)
+[ "$pkgs" != none ] || exit 0
 if [ "$(uname -s)" = Darwin ]; then
   mbx test --locked -p sparkles-backup --features encryption --lib seal::memory::macos_tests::keys_require_explicit_process_preparation -- --exact
   ulimit -c 0
 fi
 rc=0
-mbx nextest run --workspace --no-fail-fast || rc=$?
+mbx nextest run $pkgs --no-fail-fast || rc=$?
 python3 scripts/nextest-slow.py target/nextest/default/junit.xml .artifacts/ci/slow-tests.txt
 exit $rc
 ''',
   '''
 set -e
+pkgs=$(python3 scripts/changed-crates.py --cargo-args --doc)
+[ "$pkgs" != none ] || exit 0
 if [ "$(uname -s)" = Darwin ]; then ulimit -c 0; fi
-mbx test --workspace --doc
+mbx test $pkgs --doc
 ''',
 ]
+
+[tasks."test:partitioned"]
+description = "The workspace's nextest tests, built once and run in shares here and on the configured hosts or Namespace instances, with a coverage check (scripts/test-partitioned.sh)"
+depends = ["ui:build"]
+run = "scripts/test-partitioned.sh"
 
 [tasks."test:cargo"]
 description = "All Rust tests with `mbx test`, one test binary after another"
@@ -422,7 +509,9 @@ mbx test --workspace
 
 [tasks."test:w3c"]
 description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
-run = "mbx test -p sparkles-core --test w3c -- --nocapture --test-threads=1"
+# Each suite and cursor batch size is its own test with its own state, so the tests run
+# in parallel. Each summary is one line, so their output stays readable.
+run = "mbx test -p sparkles-core --test w3c -- --nocapture"
 
 [tasks."test:shacl"]
 description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and node expression tests and the SHACLC test pairs"
@@ -482,7 +571,7 @@ tools = { "github:PyO3/maturin" = "1.15.0" }
 run = "mbx sparkles-task -- python3 scripts/py-sdist.py target/wheels"
 
 [tasks."py:test"]
-sources = ["@group:rust", "scripts/py-test.sh"]
+sources = ["@group:binding-deps", "@group:py", "scripts/py-test.sh"]
 outputs = []
 description = "Build the Python extension and run its pytest suite (python3 from PATH, with pytest from the dev shell or a venv in target/py-venv); extra args go to pytest"
 run = "mbx sparkles-task -- scripts/py-test.sh"
@@ -492,7 +581,7 @@ description = "Install a built wheel or sdist into a fresh venv for each given p
 run = "mbx sparkles-task -- scripts/py-wheel-test.sh"
 
 [tasks."py:lint"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:py"]
 outputs = []
 description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
 run = [
@@ -530,7 +619,7 @@ dir = "jvm"
 run = "mbx sparkles-task -- ../scripts/jvm-gradle.sh :sparkles-jena:assemble"
 
 [tasks."jvm:test"]
-sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh", "scripts/jvm-gradle.sh", "scripts/with-lock.py"]
+sources = ["@group:binding-deps", "@group:ffi", "@group:jvm", "scripts/jvm-native.sh", "scripts/jvm-gradle.sh", "scripts/with-lock.py"]
 outputs = []
 description = "Jena's contract tests and the binding's own tests on the host's native library, once with the hand-written JNI calls and once without; extra args go to Gradle"
 dir = "jvm"
@@ -546,7 +635,7 @@ dir = "jvm"
 run = "mbx sparkles-task -- ../scripts/jvm-gradle.sh :sample-java:build :sample-java:run"
 
 [tasks."jvm:lint"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:ffi"]
 outputs = []
 description = "Clippy (warnings are errors) on the JVM bindings' native library, with its default features and with none"
 run = [
@@ -555,7 +644,7 @@ run = [
 ]
 
 [tasks."jvm:rust-test"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:ffi"]
 outputs = []
 description = "The native library's Rust tests (the batch encoding and the objects the Kotlin library uses)"
 run = "mbx sparkles-task -- mbx test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
@@ -595,6 +684,7 @@ depends = ["node:install", "node:native"]
 run = "pnpm --dir js build"
 
 [tasks."node:test"]
+# The remote client's tests run against a debug server, so every Rust input counts.
 sources = ["@group:rust", "@group:js", "scripts/node-native.sh"]
 outputs = []
 tools = { node = "24" }
@@ -609,7 +699,7 @@ mbx sparkles-task -- bash -ec 'mbx build --locked --manifest-path ../Cargo.toml 
 '''
 
 [tasks."node:lint"]
-sources = ["@group:rust"]
+sources = ["@group:binding-deps", "@group:node-addon"]
 outputs = []
 description = "Clippy on the Node addon with default features and with none"
 run = [
@@ -1266,6 +1356,10 @@ flag "--execution <mode>" help="execution=MODE with every query, or A_MODE,B_MOD
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default .artifacts/nsc-bench/<UTC time>)"
+flag "--flag-ratio <r>" default="1.10" help="flag a query whose execution-time ratio B/A is at least this"
+flag "--rerun-rounds <n>" default="8" help="rounds of the rerun of the flagged queries on the same instance"
+flag "--rerun-reps <n>" default="40" help="timed requests per query and server process in the rerun"
+flag "--no-rerun" help="report the first pass alone"
 '''
 run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
@@ -1274,7 +1368,8 @@ scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$
   ${usage_queries:+--queries "$usage_queries"} ${usage_query_dir:+--query-dir "$usage_query_dir"} \
   ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_execution:+--execution "$usage_execution"} \
   ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
-  ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
+  --flag-ratio "$usage_flag_ratio" --rerun-rounds "$usage_rerun_rounds" --rerun-reps "$usage_rerun_reps" \
+  ${usage_no_rerun:+--no-rerun} ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
 SPARKLES_TASK
 '''
 

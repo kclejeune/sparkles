@@ -193,6 +193,26 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   anonymous structures it alone uses, and keeps any structure that another axiom or
   triple still refers to. A removal deletes only the declarations it names, and
   `remove_entity` names an entity's declarations, its axioms and the assertions about it.
+* A read with `inferences` also reads the materialized inferences while the dataset
+  records a materialization, so that an axiom listing about an entity includes the
+  materialized closure, such as the transitive superclasses of a class. The answer names
+  the materialization's profile and says whether it is stale, as the
+  `Sparkles-Inferences` header does for a query. Without a materialization the read
+  covers the asserted axioms and says so, and it never runs the reasoner. The inferred
+  graph holds the inferences of every input of the run, so such a read also includes
+  what the run derived from other graphs. Edits and diffs read the asserted axioms only.
+* A materialization under `owl-rl` warns when its input graphs hold axioms outside the
+  OWL 2 RL grammar, with their count and the first of them, since the OWL 2 RL rules are
+  complete only for ontologies in the profile. It also warns about axioms in OWL 2 RL
+  whose rule the rule set covers only up to a size, property chains of more than three
+  properties and keys of more than two, which
+  `crates/sparkles-reasoner/rules/owl-rl.gaps` lists beside the rules. The warnings
+  appear in the run's report, the reasoning record and the output of `sparkles infer`.
+  The check reads the terminology of the inputs in the state the run reads, once the run
+  holds the writer lock, with the imports that resolve to graphs of the dataset.
+* `sparkles_owl::profiles::partition` splits an ontology's axioms by one profile's
+  grammar, without the OWL 2 DL global restrictions. It is the OWL 2 QL check that
+  query-time OWL 2 QL rewriting is to use, and the RL warning uses it too.
 * The Rust handle `ds.ontology()` opens a snapshot's ontology, checks it and edits it,
   and keeps the last four reads of up to two million triples each, keyed by commit, for
   callers who read every graph. `/$/ontology/{ds}` serves the summary, the axioms, the
@@ -201,6 +221,14 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   same for a database directory or a server, and `sparkles ontology check FILE` checks
   an ontology file without a database. The check exits with status 1 when the ontology
   is outside a profile it names.
+* Python's `Dataset.ontology`, Node.js's `dataset.ontology` and the JVM's
+  `DatasetGraphSparkles.ontology()` and `SparklesOnt` run the summary, listing, check,
+  edit, entity removal and diff in the JSON forms of the routes
+  ([integrations](../integrations/README.md#libraries-and-bindings)). Python's `Axiom`
+  is a frozen axiom with structural equality, and Node.js lists axioms as an async
+  iterable in batches. `SparklesOnt.model` runs Jena's `jena-ontapi` over a Sparkles
+  graph that one native read copies into memory, with writes sent to the graph in the
+  caller's transaction.
 * `GET /$/ontology/{ds}/diff?from=&to=` lists the axioms that differ between two
   commits, with the graph of each, as JSON or as `+` and `-` lines. The terminology of
   each state is read as the summary reads it and the two axiom sets are compared. With
@@ -358,16 +386,17 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   validate in full. Roadmap item 54.
 * Validation endpoints refuse callers whose grants cover only some graphs or triples.
   Roadmap item 75.
-* The ontology API has no Python, Node.js or JVM surface, no views that include
-  materialized inferences and no warning when a reasoning run reads axioms outside RL.
-  Roadmap item 537.
 * An ontology read does not fetch an `owl:imports` target that is not a graph of the
   dataset. Roadmap item 559.
+* The MCP ontology tool and the CLI's ontology commands read the asserted axioms only,
+  without the materialized inferences that the library, the bindings and the HTTP routes
+  can include. Roadmap item 565.
 * An ontology read has no size budget of its own beyond the query deadline, and its cost
   on large ontologies is not measured. Roadmap item 539.
 * The Rust ontology handle has no entity accessors such as the superclasses of a class
-  and no edit builder. Callers filter axioms by type and entity instead. Roadmap item
-  540.
+  and no edit builder, and the Python and Node.js bindings have no typed axiom
+  constructors. Callers filter axioms by type and entity and write axioms in
+  functional-style syntax or the JSON form instead. Roadmap item 540.
 * The profile checks do not check the lexical forms of literals against their datatypes.
   Roadmap item 541.
 
@@ -390,7 +419,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 537](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md), [item 559](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 540](../ROADMAP.md), [item 541](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

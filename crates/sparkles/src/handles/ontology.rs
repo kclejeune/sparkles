@@ -89,6 +89,11 @@ pub struct OntologyRequest {
     pub mode: Mode,
     /// the state read (`None`: the head); edits always start from the head
     pub at: Option<At>,
+    /// also read the materialized inferences ([`INFERRED_GRAPH`]) when the dataset has
+    /// them, so that the axioms include the materialized closure (spec F21 §7). The
+    /// answer says whether they were read and whether they are fresh
+    /// ([`Opened::inferences`]). Edits and diffs refuse it.
+    pub inferences: bool,
 }
 
 impl Default for OntologyRequest {
@@ -98,6 +103,7 @@ impl Default for OntologyRequest {
             imports: ImportMode::Dataset,
             mode: Mode::Lenient,
             at: None,
+            inferences: false,
         }
     }
 }
@@ -126,9 +132,9 @@ impl OntologyRequest {
         out
     }
 
-    fn key(&self, commit: u64) -> String {
+    fn key(&self, commit: u64, inferred: bool) -> String {
         format!(
-            "{commit}|{:?}|{:?}|{}",
+            "{commit}|{:?}|{:?}|{}|{inferred}",
             self.graphs(),
             self.imports,
             self.mode.as_str()
@@ -151,8 +157,30 @@ pub struct Opened {
     pub warnings: Vec<String>,
     /// whether the dataset's kept copy answered
     pub cached: bool,
+    /// the materialized inferences read with the ontology, when the request asked for
+    /// them and the dataset has them; `None` reads the asserted axioms only
+    pub inferences: Option<Inferences>,
     inner: Arc<Inner>,
 }
+
+/// The materialized inferences an open ontology read (spec F21 §7): the profile of the
+/// run and their freshness at the state read, as a query that reads them reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inferences {
+    /// the profile of the materialization, such as `owl-rl`
+    pub profile: String,
+    /// the index of [`INFERRED_GRAPH`] in [`Opened::graphs`]
+    pub graph: u32,
+    /// `Some(true)` when a commit since the materialization changed a graph it read,
+    /// `None` when that is unknown
+    pub stale: Option<bool>,
+    pub commits_since: Option<u64>,
+    /// why the inferences are stale, or why their freshness is unknown
+    pub reason: Option<String>,
+}
+
+/// The named graph of the materialized inferences, which an inferred view reads.
+pub use crate::reasoning::INFERRED_GRAPH;
 
 /// What the dataset keeps of an open ontology besides the axioms.
 struct Inner {
@@ -430,12 +458,19 @@ impl Ontologies {
             None => snap.clone(),
         };
         let keep = access.is_none() && snap.cacheable;
-        let key = req.key(snap.commit);
+        // an inferred view reads the inferred graph while the dataset records a
+        // materialization; without one it reads the asserted axioms only (§7)
+        let record = if req.inferences {
+            self.ds.reasoning_record()
+        } else {
+            None
+        };
+        let key = req.key(snap.commit, record.is_some());
         if keep {
             let mut cache = self.ds.state().ontology_cache.lock();
             if let Some(i) = cache.iter().position(|e| e.key == key) {
                 let e = cache.remove(i);
-                let opened = Opened {
+                let mut opened = Opened {
                     ontology: e.ontology.clone(),
                     snapshot: view,
                     graphs: e.graphs.clone(),
@@ -443,9 +478,12 @@ impl Ontologies {
                     imports: e.imports.clone(),
                     warnings: e.warnings.clone(),
                     cached: true,
+                    inferences: None,
                     inner: e.inner.clone(),
                 };
                 cache.push(e);
+                drop(cache);
+                opened.inferences = self.inferences(&opened, record.as_ref());
                 return Ok(opened);
             }
         }
@@ -457,7 +495,11 @@ impl Ontologies {
             location_mapping: Default::default(),
         };
         let resolved = sparkles_reasoner::inputs::resolve_readable(&view, &inputs, &readable);
-        let graphs = resolved.graphs.clone();
+        let mut graphs = resolved.graphs.clone();
+        let inferred = GraphRef::Named(INFERRED_GRAPH.to_string());
+        if record.is_some() && !graphs.contains(&inferred) {
+            graphs.push(inferred);
+        }
         let requested = req.graphs().len();
         let graph_ids: Vec<Option<Id>> = graphs
             .iter()
@@ -483,7 +525,7 @@ impl Ontologies {
                 inner: inner.clone(),
             });
         }
-        Ok(Opened {
+        let mut opened = Opened {
             ontology,
             snapshot: view,
             graphs,
@@ -491,7 +533,31 @@ impl Ontologies {
             imports: resolved.imports,
             warnings: resolved.warnings,
             cached: false,
+            inferences: None,
             inner,
+        };
+        opened.inferences = self.inferences(&opened, record.as_ref());
+        Ok(opened)
+    }
+
+    /// The inferences `o` read, when `record` made it read the inferred graph and the
+    /// caller may read that graph, with their freshness at the state read.
+    fn inferences(
+        &self,
+        o: &Opened,
+        record: Option<&crate::reasoning::ReasoningRecord>,
+    ) -> Option<Inferences> {
+        let record = record?;
+        let inferred = GraphRef::Named(INFERRED_GRAPH.to_string());
+        let n = o.graphs.iter().position(|g| *g == inferred)?;
+        o.inner.graph_ids.get(n).copied().flatten()?;
+        let f = crate::reasoning::freshness(record, self.ds.store(), o.snapshot.commit);
+        Some(Inferences {
+            profile: record.profile.clone(),
+            graph: n as u32,
+            stale: f.stale,
+            commits_since: f.commits_since,
+            reason: f.reason,
         })
     }
 
@@ -550,6 +616,11 @@ impl Ontologies {
         if req.at.is_some() {
             return Err(Error::invalid(
                 "an edit starts from the head: leave out 'at'",
+            ));
+        }
+        if req.inferences {
+            return Err(Error::invalid(
+                "an edit changes the asserted axioms: leave out 'inferences'",
             ));
         }
         for ax in edit.add.iter().chain(&edit.remove) {
@@ -1268,6 +1339,11 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<OntologyDiff> {
         req.validate()?;
+        if req.inferences {
+            return Err(Error::invalid(
+                "a diff compares the asserted axioms: leave out 'inferences'",
+            ));
+        }
         let opts = self.anchored(opts)?;
         let store = self.ds.store();
         let hist = HistoryOptions {
@@ -1526,6 +1602,118 @@ pub fn parse_axiom_types(s: &str) -> Result<BTreeSet<AxiomType>> {
         })
         .collect()
 }
+
+// --------------------------------------------------- reasoning runs (§7) ------
+
+/// The size of an axiom that a gap of [`sparkles_reasoner::OWL_RL_GAPS`] limits: the
+/// properties of a chain (`prp-spo2`) or of a key (`prp-key`).
+fn gap_size(rule: &str, ax: &Axiom) -> Option<usize> {
+    use sparkles_owl::{AxiomKind as K, SubObjectPropertyExpression as S};
+    match (rule, &ax.kind) {
+        ("prp-spo2", K::SubObjectPropertyOf(S::Chain(c), _)) => Some(c.len()),
+        ("prp-key", K::HasKey(_, ops, dps)) => Some(ops.len() + dps.len()),
+        _ => None,
+    }
+}
+
+/// The gaps of the OWL 2 RL rule subset: each rule, the largest size it covers and
+/// what the size counts.
+pub fn rl_gaps() -> Vec<(&'static str, usize, &'static str)> {
+    sparkles_reasoner::OWL_RL_GAPS
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, ' ');
+            let rule = parts.next()?;
+            let size = parts.next()?.parse().ok()?;
+            Some((rule, size, parts.next().unwrap_or("").trim()))
+        })
+        .collect()
+}
+
+/// The warnings of an `owl-rl` materialization over `inputs` in the state `snap`
+/// (spec F21 §7):
+/// how many axioms of the input graphs and the imports they resolve to lie outside
+/// OWL 2 RL, for which the rules may miss entailments (OWL 2 Profiles §4.3, Theorem
+/// PR1), and how many axioms in OWL 2 RL need a rule that the rule subset covers only
+/// up to a size ([`sparkles_reasoner::OWL_RL_GAPS`]). The terminology is read as
+/// [`Ontologies::open`] reads it, leniently, and split by the OWL 2 RL grammar alone
+/// ([`sparkles_owl::profiles::partition`]). Assertions are not streamed, since a class
+/// assertion with a class expression is read with the terminology and the other
+/// assertions are always in OWL 2 RL. Fetching imports is the run's work, so an import
+/// is followed only to a graph of the dataset. The answer is empty when everything is
+/// in OWL 2 RL and covered. `prefixes` abbreviate the IRIs of the axioms the warnings
+/// quote.
+pub fn rl_warnings(
+    snap: &Arc<Snapshot>,
+    prefixes: &BTreeMap<String, String>,
+    inputs: &Inputs,
+    opts: &QueryOptions,
+) -> Result<Vec<String>> {
+    let inputs = Inputs {
+        data_graphs: inputs.configured(),
+        ontology_graphs: Vec::new(),
+        imports: match inputs.imports {
+            ImportMode::None => ImportMode::None,
+            _ => ImportMode::Dataset,
+        },
+        location_mapping: inputs.location_mapping.clone(),
+    };
+    let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &|_| true);
+    let graph_ids: Vec<Option<Id>> = resolved.graphs.iter().map(|g| g.id(snap)).collect();
+    let requested = inputs.data_graphs.len();
+    let (ontology, _) = read_store(snap, &graph_ids, requested, Mode::Lenient, opts)?;
+    let part = sparkles_owl::profiles::partition(&ontology, Profile::Rl);
+    let render = sparkles_owl::ofn::Renderer::new(prefixes.clone());
+    let mut out = Vec::new();
+    let outside = part.outside_axioms();
+    if let Some(first) = part.outside.first() {
+        let n = outside.len();
+        out.push(format!(
+            "{n} axiom{} outside OWL 2 RL, for which the OWL 2 RL rules may not derive every \
+             entailment (OWL 2 Profiles §4.3); the first is {} ({}: {})",
+            if n == 1 { " is" } else { "s are" },
+            render.axiom(first.axiom.as_ref().expect("a partition names its axioms")),
+            first.rule,
+            first.message,
+        ));
+    }
+    for (rule, max, what) in rl_gaps() {
+        let over: Vec<&Axiom> = part
+            .inside
+            .iter()
+            .filter(|ax| gap_size(rule, ax).is_some_and(|n| n > max))
+            .collect();
+        if let Some(first) = over.first() {
+            let n = over.len();
+            out.push(format!(
+                "{n} axiom{} in OWL 2 RL need{} rule {rule} for more than {max} {what}, which \
+                 the rule set does not have, so its entailments are not derived; the first \
+                 is {}",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "s" } else { "" },
+                render.axiom(first),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The [`rl_warnings`] of an `owl-rl` run over `inputs` in `store`, as a check the run
+/// makes of the state it reads under the writer lock
+/// ([`sparkles_reasoner::ReasonOptions::inspect`]).
+pub fn rl_inspector(
+    store: &crate::store::Store,
+    inputs: &Inputs,
+    opts: QueryOptions,
+) -> sparkles_reasoner::InspectFn {
+    let prefixes = store.prefixes();
+    let inputs = inputs.clone();
+    Arc::new(move |snap| Ok(rl_warnings(snap, &prefixes, &inputs, &opts)?))
+}
+
+pub mod wire;
 
 #[cfg(test)]
 mod tests;

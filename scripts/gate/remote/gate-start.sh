@@ -6,20 +6,29 @@
 # prints the unit name and returns at once.
 #
 # Usage: gate-start.sh <full-sha> [--name NAME] [--part all|ci|conformance] [--jobs N]
-#                      [--note TEXT]
-#   --name   unit, worktree and out-directory name (default: the first 8 hex digits)
-#   --part   all runs every step, ci only scripts/ci.sh, conformance only the suites
-#   --jobs   passed to scripts/ci.sh --jobs (default 1)
-#   --note   a line to record in progress.log before the run is queued
+#                      [--cargo-jobs N] [--base SHA] [--full] [--note TEXT]
+#   --name        unit, worktree and out-directory name (default: the first 8 hex digits)
+#   --part        all runs every step, ci only scripts/ci.sh, conformance only the suites
+#   --jobs        passed to scripts/ci.sh --jobs (default 1)
+#   --cargo-jobs  CARGO_BUILD_JOBS for the run (default: from the memory cap, see below)
+#   --base        the commit the batch is compared with, so that the run selects its checks
+#                 from the changed files (scripts/gate/select-checks.py)
+#   --full        every check with --force, with no selection, as the nightly gate runs
+#   --note        a line to record in progress.log before the run is queued
 #
 # The memory cap is the smaller of 24G and the host's RAM less 2G, with 2G of swap.
-# GATE_MEMORY_MAX overrides it.
+# GATE_MEMORY_MAX overrides it. The default number of compile jobs is the cap in GiB less
+# one, halved, from 2 to 8, which gives 6 at a 13G cap and 8 at a 24G cap. A Rust test build
+# at 4 jobs peaked at about 9 GiB of process memory.
 set -euo pipefail
 full=$1
 shift
 name=${full:0:8}
 part=all
 jobs=1
+cargo_jobs=
+base=
+all_checks=0
 note=
 while [ $# -gt 0 ]; do
   case $1 in
@@ -34,6 +43,18 @@ while [ $# -gt 0 ]; do
     --jobs)
       jobs=$2
       shift 2
+      ;;
+    --cargo-jobs)
+      cargo_jobs=$2
+      shift 2
+      ;;
+    --base)
+      base=$2
+      shift 2
+      ;;
+    --full)
+      all_checks=1
+      shift
       ;;
     --note)
       note=$2
@@ -60,6 +81,16 @@ case $name in '' | *[!A-Za-z0-9._-]*)
   exit 2
   ;;
 esac
+case $cargo_jobs in *[!0-9]* | 0)
+  echo "gate-start.sh: bad --cargo-jobs $cargo_jobs" >&2
+  exit 2
+  ;;
+esac
+case $base in *[!0-9a-f]*)
+  echo "gate-start.sh: bad --base $base" >&2
+  exit 2
+  ;;
+esac
 
 bin=$(cd "$(dirname "$0")" && pwd)
 G=$HOME/gate
@@ -75,6 +106,7 @@ systemctl --user reset-failed "$unit" 2> /dev/null || true
 if [ -d "$out" ]; then mv "$out" "$out.old-$(date +%s)"; fi
 mkdir -p "$out"
 git -C "$G/repo.git" cat-file -e "$full^{commit}"
+[ -z "$base" ] || git -C "$G/repo.git" cat-file -e "$base^{commit}"
 git -C "$G/repo.git" worktree prune
 # A failed run keeps its worktree for inspection. Recreate it, so that nothing left there
 # can change a rerun.
@@ -83,20 +115,28 @@ git -C "$G/repo.git" worktree prune
 git -C "$G/repo.git" worktree add -q --detach "$wt" "$full"
 date +%s > "$out/queued_at"
 if [ -n "$note" ]; then echo "$(date -u +%FT%TZ) $note" >> "$out/progress.log"; fi
-echo "$(date -u +%FT%TZ) queued $full part=$part jobs=$jobs host=$(hostname)" >> "$out/progress.log"
 
+total_g=$(awk '$1 == "MemTotal:" { print int($2 / 1048576) }' /proc/meminfo)
+mem_g=$((total_g - 2))
+[ "$mem_g" -gt 24 ] && mem_g=24
+mem=${mem_g}G
 if [ -n "${GATE_MEMORY_MAX:-}" ]; then
   mem=$GATE_MEMORY_MAX
-else
-  total_g=$(awk '$1 == "MemTotal:" { print int($2 / 1048576) }' /proc/meminfo)
-  mem_g=$((total_g - 2))
-  [ "$mem_g" -gt 24 ] && mem_g=24
-  mem=${mem_g}G
+  case $mem in *G) mem_g=${mem%G} ;; esac
 fi
+if [ -z "$cargo_jobs" ]; then
+  cargo_jobs=$(((mem_g - 1) / 2))
+  [ "$cargo_jobs" -lt 2 ] && cargo_jobs=2
+  [ "$cargo_jobs" -gt 8 ] && cargo_jobs=8
+fi
+mode=selected
+[ -n "$base" ] || mode="every check, no base"
+[ "$all_checks" = 0 ] || mode="every check with --force"
+echo "$(date -u +%FT%TZ) queued $full part=$part jobs=$jobs cargo_jobs=$cargo_jobs memory=$mem base=${base:-none} checks=$mode host=$(hostname)" >> "$out/progress.log"
 
 systemd-run --user --unit "$unit" --collect -q \
   -p MemoryMax="$mem" -p MemorySwapMax=2G \
   --setenv=HOME="$HOME" --setenv=USER="$USER" \
-  --setenv=GATE_CARGO_JOBS="${GATE_CARGO_JOBS:-4}" \
+  --setenv=GATE_CARGO_JOBS="$cargo_jobs" --setenv=GATE_BASE="$base" --setenv=GATE_FULL="$all_checks" \
   /run/current-system/sw/bin/timeout 9h "$bin/gate-inner.sh" "$full" "$name" "$part" "$jobs"
 echo "$unit"

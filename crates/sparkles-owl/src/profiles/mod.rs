@@ -242,6 +242,74 @@ impl Checker {
     }
 }
 
+/// The axioms of an ontology split by one profile's own grammar (§2 to §4 of OWL 2
+/// Profiles), or for OWL 2 DL by the restrictions that apply to one axiom at a time:
+/// those inside it and the violations of those outside, one per broken rule. The DL
+/// restrictions over the whole ontology, such as the typing of entities, are left to a
+/// check.
+#[derive(Clone, Debug, Default)]
+pub struct Partition {
+    /// the axioms of the terminology the profile's grammar allows, in order
+    pub inside: Vec<Axiom>,
+    /// the violations of the other axioms, each naming its axiom
+    pub outside: Vec<Violation>,
+}
+
+impl Partition {
+    /// The axioms outside the profile, each once.
+    pub fn outside_axioms(&self) -> std::collections::BTreeSet<&Axiom> {
+        self.outside
+            .iter()
+            .filter_map(|v| v.axiom.as_ref())
+            .collect()
+    }
+}
+
+/// Split the axioms of `ontology` by the grammar of `profile`. Unlike [`check`], an
+/// EL, QL or RL partition applies the profile's own rules only, without the OWL 2 DL
+/// global restrictions or the unmapped triples, since it serves a consumer that uses
+/// the axioms a profile allows and sets the others aside: query rewriting under OWL 2
+/// QL (spec F17 §7) reads `inside`, and a materialization under OWL 2 RL warns about
+/// `outside` (spec F21 §7).
+pub fn partition(ontology: &Ontology, profile: Profile) -> Partition {
+    let el = (profile == Profile::El).then(|| el::El::new(ontology.axiom_set()));
+    let mut dl = (profile == Profile::Dl).then(|| dl::Dl::new(ontology));
+    let title = profile.title();
+    let mut out = Partition::default();
+    for (ax, origins) in &ontology.axioms {
+        let broken = match (profile, &el, &mut dl) {
+            (Profile::El, Some(el), _) => {
+                let mut b = el::axiom(ax);
+                b.extend(el.chain_ranges(ax));
+                b
+            }
+            (Profile::Ql, _, _) => ql::axiom(ax),
+            (Profile::Rl, _, _) => rl::axiom(ax),
+            (Profile::Dl, _, Some(dl)) => dl.axiom(ax),
+            _ => Vec::new(),
+        };
+        if broken.is_empty() {
+            out.inside.push(ax.clone());
+            continue;
+        }
+        let graph = origins.first().map(|o| o.graph);
+        for b in broken {
+            let message = if b.rule.starts_with("OWL 2 Profiles") {
+                format!("{} in {title}", b.message)
+            } else {
+                b.message
+            };
+            out.outside.push(Violation {
+                axiom: Some(ax.clone()),
+                graph,
+                rule: b.rule.to_string(),
+                message,
+            });
+        }
+    }
+    out
+}
+
 /// Check every axiom of an ontology against `profiles`.
 pub fn check(ontology: &Ontology, profiles: &[Profile], opts: CheckOptions) -> Vec<Report> {
     let mut c = Checker::new(ontology, profiles, opts);

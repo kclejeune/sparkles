@@ -22,6 +22,8 @@ mod indexes;
 mod interrupt;
 mod io;
 mod mappings;
+#[cfg(feature = "ontology")]
+mod ontology;
 mod overview;
 mod queries;
 mod query_cursor;
@@ -43,6 +45,7 @@ use pyo3::types::PyFrozenSet;
 /// The cargo features of this build.
 const FEATURES: &[(&str, bool)] = &[
     ("reasoning", cfg!(feature = "reasoning")),
+    ("ontology", cfg!(feature = "ontology")),
     ("shacl", cfg!(feature = "shacl")),
     ("shex", cfg!(feature = "shex")),
     ("text", cfg!(feature = "text")),
@@ -74,6 +77,8 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     reasoning::register(m)?;
     querybuilder::register(m)?;
     mappings::register(m)?;
+    #[cfg(feature = "ontology")]
+    ontology::register(m)?;
     queries::register(m)?;
     views::register(m)?;
     algorithms::register(m)?;

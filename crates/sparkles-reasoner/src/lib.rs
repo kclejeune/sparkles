@@ -79,6 +79,10 @@ pub const RDFS_RULES: &str = include_str!("../rules/rdfs.rules");
 pub const RDFS_SIMPLE_RULES: &str = include_str!("../rules/rdfs-simple.rules");
 /// OWL 2 RL subset (comparable to Jena OWL Mini/Micro).
 pub const OWL_RL_RULES: &str = include_str!("../rules/owl-rl.rules");
+/// The rules of OWL 2 RL that [`OWL_RL_RULES`] covers only up to a size, one per line:
+/// the rule, the largest size covered and what the size counts. Lines that start with
+/// `#` are comments.
+pub const OWL_RL_GAPS: &str = include_str!("../rules/owl-rl.gaps");
 
 /// Which rules to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,7 +207,17 @@ pub struct ReasonOptions {
     /// none, and a run then does no work for them. A protection that shows inferences
     /// by their support turns them on.
     pub witnesses: Option<usize>,
+    /// Called once with the state the run reads, while the run holds the writer lock and
+    /// before it derives anything, after a progress report. The warnings it returns join
+    /// the report's, so that a check of the input graphs sees exactly what the rules
+    /// read. An error fails the run, and a long check observes [`cancel`](Self::cancel)
+    /// itself.
+    pub inspect: Option<InspectFn>,
 }
+
+/// A check of the state a run reads ([`ReasonOptions::inspect`]).
+pub type InspectFn =
+    Arc<dyn Fn(&Arc<sparkles_core::store::Snapshot>) -> anyhow::Result<Vec<String>> + Send + Sync>;
 
 impl Default for ReasonOptions {
     fn default() -> Self {
@@ -219,6 +233,7 @@ impl Default for ReasonOptions {
             pool: None,
             closure_operators: true,
             witnesses: None,
+            inspect: None,
         }
     }
 }
@@ -236,6 +251,7 @@ impl fmt::Debug for ReasonOptions {
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
             .field("closure_operators", &self.closure_operators)
             .field("witnesses", &self.witnesses)
+            .field("inspect", &self.inspect.as_ref().map(|_| "…"))
             .finish()
     }
 }
@@ -916,13 +932,23 @@ fn materialize_admitted(
 ) -> anyhow::Result<ReasonReport> {
     let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
     let snap = txn.base().clone();
+    let inspected = match &opts.inspect {
+        Some(f) => {
+            // the first progress report says the run holds the lock, so that a waiting
+            // write can supersede it during the check
+            progress(opts, 0.05, "checking the input axioms");
+            f(&snap)?
+        }
+        None => Vec::new(),
+    };
     let digest = rules_digest(profile, extras);
     let mut fallback = None;
     if let (Some(since), Some(raw)) = (inc.since, raw) {
         match update_closure(
             exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw, opts,
         ) {
-            Ok(done) => {
+            Ok(mut done) => {
+                done.warnings.extend(inspected);
                 return finish(
                     store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
                 );
@@ -944,6 +970,7 @@ fn materialize_admitted(
     )?;
     progress(opts, 0.8, "writing inferred graph");
     let mut warnings = d.warnings.clone();
+    warnings.extend(inspected);
     let w = write_full(&mut txn, &snap, &d, opts)?;
     if w.generalized > 0 {
         warnings.push(format!(

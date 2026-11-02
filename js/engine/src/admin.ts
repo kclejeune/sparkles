@@ -6,7 +6,7 @@ import type {
   UpdateOptions,
   CommitReceipt,
 } from '@sparkles-rdf/common';
-import { decodeTerm, unsigned } from '@sparkles-rdf/common';
+import { QueryTimeoutError, decodeTerm, unsigned } from '@sparkles-rdf/common';
 export type Configuration = Record<string, unknown>;
 export interface CommitInfo {
   seq: bigint;
@@ -207,6 +207,119 @@ export interface MappingRun {
   receipt: CommitReceipt;
   stats: { rows: bigint; quads: bigint; warnings: string[]; joins: string[] };
 }
+/** A graph an ontology reads: `"default"` or an IRI. */
+export type OntologyGraph = string;
+/** What ontology to read (see "Ontology" in API.md). */
+export interface OntologySelection {
+  /** the graphs read, the default graph when absent; the first takes edits */
+  graph?: OntologyGraph | OntologyGraph[];
+  /** follow `owl:imports` to graphs of the dataset (true by default) */
+  imports?: boolean;
+  mode?: 'lenient' | 'strict';
+}
+/** A read of an ontology at a state, with or without its materialized inferences. */
+export interface OntologyRead extends OntologySelection {
+  /** the state read, as queries take it: `commit:N`, a snapshot or a time */
+  at?: string | number | bigint;
+  /** also read the materialized inferences, when the dataset has them */
+  inferences?: boolean;
+}
+/** An OWL 2 axiom in its JSON form: `type` is its functional-style name. */
+export interface OwlAxiom {
+  type: string;
+  annotations?: Configuration[];
+  [member: string]: unknown;
+}
+/** An axiom given to an edit: its JSON form, or a string in functional-style syntax. */
+export type AxiomInput = OwlAxiom | string;
+/** One axiom of a listing or a diff. */
+export interface OntologyAxiom {
+  type: string;
+  /** the axiom in functional-style syntax with the dataset's prefixes */
+  ofn: string;
+  axiom: OwlAxiom;
+  /** the graph the axiom was read from */
+  graph?: string;
+}
+/** The inferences an inferred read included, and their freshness. */
+export interface OntologyInferences {
+  included: boolean;
+  graph?: string;
+  profile?: string;
+  stale?: boolean | null;
+  commitsSince?: bigint | null;
+  reason?: string | null;
+}
+/** What every ontology answer says about the read. */
+export interface OntologyState {
+  dataset: string;
+  commit: bigint;
+  mode: string;
+  graphs: string[];
+  imports: { iri: string; graph: string | null }[];
+  warnings: string[];
+  inferences?: OntologyInferences;
+}
+export interface OntologySummary extends OntologyState {
+  header: {
+    iri: string | null;
+    versionIri: string | null;
+    imports: string[];
+    annotations: string[];
+  };
+  axioms: Record<string, number>;
+  axiomCount: number;
+  entities: Record<string, number>;
+  triples: number;
+  unmapped: number;
+  diagnostics: Configuration;
+  cached: boolean;
+}
+export interface OntologyAxiomQuery extends OntologyRead {
+  /** axiom types such as `SubClassOf`, or a list such as `SubClassOf,ClassAssertion` */
+  type?: string | string[];
+  /** keep the axioms that mention this IRI */
+  about?: string;
+  /** also list the assertions the store holds */
+  assertions?: boolean;
+}
+export interface OntologyAxiomPage extends OntologyState {
+  axioms: OntologyAxiom[];
+  total: number;
+  offset: number;
+  next: bigint | null;
+}
+export interface OntologyCheck extends OntologyState {
+  conforms: boolean;
+  assertions: boolean;
+  reports: Configuration[];
+}
+export interface OntologyEdit {
+  added: bigint;
+  present: number;
+  removed: bigint;
+  absent: string[];
+  declared: string[];
+  inserted: bigint;
+  deleted: bigint;
+  kept: number;
+  committed: boolean;
+}
+export interface OntologyDiff {
+  dataset: string;
+  from: number;
+  to: number;
+  graphs: string[];
+  mode: string;
+  assertions: boolean;
+  added: OntologyAxiom[];
+  removed: OntologyAxiom[];
+  addedCount: number;
+  removedCount: number;
+  truncated: boolean;
+  changedQuads: number;
+  method: string;
+}
 export class Administration {
   readonly snapshots;
   readonly history;
@@ -214,6 +327,7 @@ export class Administration {
   readonly prefixes;
   readonly queries;
   readonly mappings;
+  readonly ontology;
   readonly algorithms;
   readonly graph;
   readonly branches;
@@ -340,6 +454,138 @@ export class Administration {
       },
       retention: setting(call, 'retention'),
       changeLog: setting(call, 'changeLog'),
+    };
+    // the members of a read the native call takes; options such as `signal` stay out
+    const ontologyArgs = (
+      o: OntologyAxiomQuery & {
+        limit?: number;
+        offset?: number;
+        profiles?: string[];
+        maxViolations?: number;
+      },
+    ) => ({
+      graph: o.graph,
+      imports: o.imports,
+      mode: o.mode,
+      at: o.at === undefined || typeof o.at === 'string' ? o.at : unsigned(o.at),
+      inferences: o.inferences,
+      type: Array.isArray(o.type) ? o.type.join(',') : o.type,
+      about: o.about,
+      assertions: o.assertions,
+      limit: o.limit,
+      offset: o.offset,
+      profiles: o.profiles,
+      maxViolations: o.maxViolations,
+    });
+    // what an edit or a diff reads; `at` and `inferences` go on, for the native call to refuse
+    const writeSelection = (o: OntologySelection) => {
+      const { at, inferences } = o as OntologyRead;
+      return {
+        graph: o.graph,
+        imports: o.imports,
+        mode: o.mode,
+        at: at === undefined || typeof at === 'string' ? at : unsigned(at),
+        inferences,
+      };
+    };
+    this.ontology = {
+      /** The header, the counts of entities and axioms, the graphs read and the diagnostics. */
+      summary: (o: OntologyRead & OperationOptions = {}) =>
+        call<OntologySummary>('ontology.summary', ontologyArgs(o), o, false),
+      /** One page of the axioms (`limit` and `offset`), as `GET /$/ontology/{ds}/axioms` lists them. */
+      axiomPage: (
+        o: OntologyAxiomQuery & OperationOptions & { limit?: number; offset?: number } = {},
+      ) => call<OntologyAxiomPage>('ontology.axioms', ontologyArgs(o), o, false),
+      /**
+       * The axioms, read in batches of `batch` (1,000 by default) from the commit of the first
+       * batch, so that a commit made meanwhile does not mix into the listing. `timeout`
+       * bounds the whole listing, from the first batch on.
+       */
+      axioms: (
+        o: OntologyAxiomQuery & OperationOptions & { batch?: number } = {},
+      ): AsyncIterable<OntologyAxiom> => {
+        const { batch = 1000, timeout, ...rest } = o;
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            let offset = 0;
+            let at = rest.at;
+            const end = timeout === undefined ? undefined : Date.now() + timeout;
+            for (;;) {
+              const left = end === undefined ? undefined : end - Date.now();
+              if (left !== undefined && left <= 0) throw new QueryTimeoutError();
+              const page = await call<OntologyAxiomPage>(
+                'ontology.axioms',
+                ontologyArgs({ ...rest, at, limit: batch, offset }),
+                { ...rest, timeout: left },
+                false,
+              );
+              // the later batches read the commit the first one read, whatever `at` named
+              at = 'commit:' + page.commit.toString();
+              yield* page.axioms;
+              if (page.next === null || page.next === undefined) return;
+              offset = Number(page.next);
+            }
+          },
+        };
+      },
+      /** One report per profile (`el`, `ql`, `rl`, `dl`; `dl` by default). */
+      check: (
+        o: OntologyRead &
+          OperationOptions & {
+            profiles?: string[];
+            assertions?: boolean;
+            maxViolations?: number;
+          } = {},
+      ) => call<OntologyCheck>('ontology.check', ontologyArgs(o), o, false),
+      /** Add and remove axioms in one commit. */
+      edit: (
+        change: {
+          add?: AxiomInput[];
+          remove?: AxiomInput[];
+          declare?: boolean;
+          target?: OntologyGraph;
+          message?: string;
+        },
+        o: OntologySelection & UpdateOptions = {},
+      ) => {
+        return call<OntologyEdit>('ontology.edit', { ...writeSelection(o), ...change }, o, true);
+      },
+      /** Remove an entity: its declarations, the axioms that mention it and the assertions about it. */
+      removeEntity: (
+        iri: string,
+        o: OntologySelection & UpdateOptions & { message?: string } = {},
+      ) => {
+        return call<OntologyEdit>(
+          'ontology.removeEntity',
+          { ...writeSelection(o), iri, message: o.message },
+          o,
+          true,
+        );
+      },
+      /** The axioms that differ between two states (`to` is the head by default). */
+      diff: (
+        from: string | number | bigint,
+        o: OntologySelection &
+          OperationOptions & {
+            to?: string | number | bigint;
+            assertions?: boolean;
+            limit?: number;
+          } = {},
+      ) => {
+        const { to, assertions, limit } = o;
+        return call<OntologyDiff>(
+          'ontology.diff',
+          {
+            ...writeSelection(o),
+            from: typeof from === 'string' ? from : unsigned(from),
+            to: to === undefined || typeof to === 'string' ? to : unsigned(to),
+            assertions,
+            limit,
+          },
+          o,
+          false,
+        );
+      },
     };
     this.mappings = {
       list: (o?: OperationOptions) => call<Configuration[]>('mappings.list', {}, o, false),

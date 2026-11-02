@@ -24,6 +24,18 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
+`dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
+axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms
+of the `/$/ontology` routes. Python adds `Axiom`, a frozen axiom with structural
+equality, and Node.js lists axioms as an async iterable in batches.
+`SparklesOnt.model` runs Jena's `jena-ontapi` over a Sparkles graph that one native read
+copies into memory, with writes sent to the graph in the caller's transaction, and
+programs that call it add `jena-ontapi`. A read with `inferences` includes the
+materialized inferences and says whether they are stale. A materialization under
+`owl-rl` warns about input axioms outside OWL 2 RL and about axioms whose rules the rule
+set covers only up to a size (spec F21 Phase 2).
+
 Sparkles reads the OWL 2 functional-style syntax. A `.ofn` file, or a body sent as
 `text/owl-functional`, loads as the triples its axioms map to, through `sparkles load`,
 `sparkles ontology check FILE`, the file loaders of the library and the bindings,
@@ -581,6 +593,29 @@ fewer instructions.
 
 `scripts/nsc-bench.sh` now records the compilers of each binary and refuses to compare
 two binaries built with different ones unless `--allow-mixed-compilers` is given.
+
+`scripts/nsc-bench.sh` reruns the queries it flags, at an execution-time ratio of 1.10 or
+more, on the same instance in 8 rounds of 40 timed requests, and reports both passes.
+`mise run test:partitioned` runs the nextest tests in shares on several machines from one
+archive and checks that the shares ran every selected test. `scripts/ci.sh --changed
+BASE` narrows a lane's Clippy and tests to the packages its change can affect.
+`scripts/premerge.sh` checks the generated clients, binding lock files and Python parity
+list of a merged batch. `scripts/gate/gate.sh` refuses to start on a host that lacks the
+free disk after `mbx gc`. nextest retries the tests that `.config/nextest.toml` lists as
+flaky and reports each retry. The four longest tests run as one test per configuration.
+
+The batch gate selects its checks from the batch's diff. `scripts/gate/select-checks.py`
+maps the files that changed since the merge base with `origin/main` to the
+`scripts/ci.sh` tasks, the conformance suites and the spill matrices that they call for,
+and the gate runs those without `--force`, so mise's task cache skips a check whose inputs
+already passed on the gate host. Build configuration, the CI scripts and files that no
+rule covers run everything, and `scripts/gate/nightly.sh` runs every check with `--force`
+on `origin/main` each night. The conformance half goes to a second gate host only when
+one is free. `gate.sh --cargo-jobs`, `GATE_CARGO_JOBS_HOSTS` and a default from each
+host's memory cap set the compile jobs. `mise run test:w3c` and the spill matrices run
+their tests in parallel, which took the W3C suite from 433 to 82 seconds on a 20-core gate
+host. The binding checks key their task cache on the crates the bindings compile, and
+seven more slow tests run as parallel parts with the same cases.
 
 The first run of a query text that the server does not remember now runs on the thread
 that received it under the request's timeout when the server has been idle for 10 ms,

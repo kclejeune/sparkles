@@ -702,6 +702,7 @@ fn ontology(p: &mut Paths) {
             .doc("The ontology header, the counts of declared entities by kind and of axioms by type in the terminology, the graphs read with the imports that resolved, the triples read, the unmapped triples and the diagnostics of the read. The entity tag names the commit read, and an edit's `If-Match` can name it.")
             .see("ontology")
             .param("at")
+            .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.")
             .param("ifNoneMatch")
             .resp("200", "The summary.", Some(object.clone()))
             .resp("304", "The summary is still at the tagged commit.", None)
@@ -712,6 +713,7 @@ fn ontology(p: &mut Paths) {
             .doc("The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.")
             .see("ontology")
             .param("at")
+            .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.")
             .query("type", s(), "Axiom types, comma separated, such as `SubClassOf,EquivalentClasses`.")
             .query("about", s(), "An entity IRI the axioms mention.")
             .query("assertions", boolean(), "Also list the assertions the store holds.")
@@ -743,6 +745,7 @@ fn ontology(p: &mut Paths) {
                         "graph": selection["graph"],
                         "imports": selection["imports"],
                         "mode": selection["mode"],
+                        "inferences": { "type": "boolean", "description": "Also read the materialized inferences while the dataset has them." },
                         "profiles": { "type": "array", "items": { "type": "string", "enum": ["el", "ql", "rl", "dl", "all"] } },
                         "assertions": { "type": "boolean", "description": "Check the assertions the store holds (the default)." },
                         "maxViolations": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most violations each report lists (1,000 by default)." }
