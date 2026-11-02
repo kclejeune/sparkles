@@ -20,7 +20,7 @@ fn settings(st: &AppState, main: &Dataset, shapes: Option<&str>) -> ApiResult<Fo
         s.shapes = ShapesSource::parse(v).ok_or_else(|| {
             err(
                 StatusCode::BAD_REQUEST,
-                format!("shapes must be guard, graphs or drafted, not '{v}'"),
+                format!("shapes must be guard, graphs, drafted or skos, not '{v}'"),
             )
         })?;
         if s.shapes == ShapesSource::Graphs && s.graphs.is_empty() {

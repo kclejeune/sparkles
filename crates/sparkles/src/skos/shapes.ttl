@@ -1,0 +1,308 @@
+# The built-in SKOS shapes (docs/specs/U12-ontology-workbench/SPEC.md, "SKOS and SKOS-XL
+# thesaurus editor"). They lay out the editing forms of concept schemes, concepts,
+# collections, ordered collections and SKOS-XL labels, and they check the integrity
+# conditions of the W3C SKOS Reference (https://www.w3.org/TR/skos-reference/): S9, S13,
+# S14, S27, S37 and S46, with S52 and S58 of the SKOS-XL appendix and the consequences of
+# S55 to S57 for S13 and S14. Each message names its condition. The shapes are written from
+# the SKOS Reference and SHACL 1.2 alone.
+#
+# Each SPARQL constraint is one property path or one basic graph pattern read from $this,
+# with a filter at most, so that the checks of a form can find the resources an edit
+# affects without validating the whole graph. A path that leads from $this back to $this
+# finds a clash between two values without a join. Each such path is an alternative at its
+# top level, since a SPARQL parser turns a top-level sequence into a join over a blank node.
+
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix skosxl: <http://www.w3.org/2008/05/skos-xl#> .
+@prefix dash: <http://datashapes.org/dash#> .
+@prefix sks: <urn:x-sparkles:skos:> .
+
+sks: a owl:Ontology ;
+  rdfs:label "Sparkles SKOS shapes"@en ;
+  sh:declare [ sh:prefix "skos" ; sh:namespace "http://www.w3.org/2004/02/skos/core#"^^xsd:anyURI ] ,
+             [ sh:prefix "skosxl" ; sh:namespace "http://www.w3.org/2008/05/skos-xl#"^^xsd:anyURI ] .
+
+# --- groups of the forms ---------------------------------------------------------------
+
+sks:Labels a sh:PropertyGroup ; rdfs:label "Labels"@en ; sh:order 1 .
+sks:XLLabels a sh:PropertyGroup ; rdfs:label "SKOS-XL labels"@en ; sh:order 2 .
+sks:Hierarchy a sh:PropertyGroup ; rdfs:label "Hierarchy"@en ; sh:order 3 .
+sks:Mappings a sh:PropertyGroup ; rdfs:label "Mappings"@en ; sh:order 4 .
+sks:Schemes a sh:PropertyGroup ; rdfs:label "Schemes"@en ; sh:order 5 .
+sks:Members a sh:PropertyGroup ; rdfs:label "Members"@en ; sh:order 6 .
+sks:Notes a sh:PropertyGroup ; rdfs:label "Notes"@en ; sh:order 7 .
+sks:Documentation a sh:PropertyGroup ; rdfs:label "Documentation"@en ; sh:order 8 .
+
+# --- every labelled SKOS resource --------------------------------------------------------
+
+sks:LabelledShape a sh:NodeShape ;
+  rdfs:label "Labelled SKOS resource"@en ;
+  sh:targetClass skos:Concept , skos:ConceptScheme , skos:Collection , skos:OrderedCollection ;
+  sh:targetSubjectsOf skos:prefLabel , skos:altLabel , skos:hiddenLabel ,
+    skosxl:prefLabel , skosxl:altLabel , skosxl:hiddenLabel ;
+  sh:property sks:prefLabel , sks:prefLabelPerLanguage , sks:prefLabelDisjoint ,
+    sks:altLabel , sks:altLabelDisjoint , sks:hiddenLabel , sks:notation ,
+    sks:xlPrefLabel , sks:xlPrefLabelDisjoint , sks:xlAltLabel , sks:xlAltLabelDisjoint ,
+    sks:xlHiddenLabel , sks:xlPrefFormDisjoint , sks:xlAltFormDisjoint , sks:xlHiddenFormDisjoint ,
+    sks:note , sks:definition , sks:scopeNote , sks:example ,
+    sks:historyNote , sks:editorialNote , sks:changeNote ;
+  sh:sparql sks:UntaggedPrefLabels , sks:XLLabelClash .
+
+sks:prefLabel sh:path skos:prefLabel ;
+  sh:name "Preferred label"@en ; sh:group sks:Labels ; sh:order 1 ;
+  sh:nodeKind sh:Literal ; dash:editor dash:TextFieldWithLangEditor .
+# S14 with S55: the literal forms of SKOS-XL preferred labels count as preferred labels, so
+# the plain and SKOS-XL preferred labels share one language tag at most.
+sks:prefLabelPerLanguage sh:path [ sh:alternativePath ( skos:prefLabel ( skosxl:prefLabel skosxl:literalForm ) ) ] ;
+  sh:uniqueLang true ;
+  sh:message "S14: a resource has no more than one preferred label per language tag, SKOS-XL labels included"@en .
+sks:prefLabelDisjoint sh:path skos:prefLabel ;
+  sh:disjoint skos:altLabel , skos:hiddenLabel ;
+  sh:message "S13: preferred, alternative and hidden labels are pairwise disjoint"@en .
+
+sks:altLabel sh:path skos:altLabel ;
+  sh:name "Alternative label"@en ; sh:group sks:Labels ; sh:order 2 ;
+  sh:nodeKind sh:Literal ; dash:editor dash:TextFieldWithLangEditor .
+sks:altLabelDisjoint sh:path skos:altLabel ;
+  sh:disjoint skos:hiddenLabel ;
+  sh:message "S13: preferred, alternative and hidden labels are pairwise disjoint"@en .
+
+sks:hiddenLabel sh:path skos:hiddenLabel ;
+  sh:name "Hidden label"@en ; sh:group sks:Labels ; sh:order 3 ;
+  sh:nodeKind sh:Literal ; dash:editor dash:TextFieldWithLangEditor .
+
+sks:notation sh:path skos:notation ;
+  sh:name "Notation"@en ; sh:group sks:Labels ; sh:order 4 ; sh:nodeKind sh:Literal .
+
+sks:xlPrefLabel sh:path skosxl:prefLabel ;
+  sh:name "Preferred label (SKOS-XL)"@en ; sh:group sks:XLLabels ; sh:order 1 ;
+  sh:nodeKind sh:BlankNodeOrIRI .
+sks:xlPrefLabelDisjoint sh:path skosxl:prefLabel ;
+  sh:disjoint skosxl:altLabel , skosxl:hiddenLabel ;
+  sh:message "S58: SKOS-XL preferred, alternative and hidden labels are pairwise disjoint"@en .
+sks:xlAltLabel sh:path skosxl:altLabel ;
+  sh:name "Alternative label (SKOS-XL)"@en ; sh:group sks:XLLabels ; sh:order 2 ;
+  sh:nodeKind sh:BlankNodeOrIRI .
+sks:xlAltLabelDisjoint sh:path skosxl:altLabel ;
+  sh:disjoint skosxl:hiddenLabel ;
+  sh:message "S58: SKOS-XL preferred, alternative and hidden labels are pairwise disjoint"@en .
+sks:xlHiddenLabel sh:path skosxl:hiddenLabel ;
+  sh:name "Hidden label (SKOS-XL)"@en ; sh:group sks:XLLabels ; sh:order 3 ;
+  sh:nodeKind sh:BlankNodeOrIRI .
+
+# S13 with S55 to S57: the literal form of a SKOS-XL label is a plain label of its kind, so
+# it is disjoint with the plain labels of the other kinds.
+sks:xlPrefFormDisjoint sh:path ( skosxl:prefLabel skosxl:literalForm ) ;
+  sh:disjoint skos:altLabel , skos:hiddenLabel ;
+  sh:message "S13 with S55 to S57: preferred, alternative and hidden labels are pairwise disjoint, SKOS-XL labels included"@en .
+sks:xlAltFormDisjoint sh:path ( skosxl:altLabel skosxl:literalForm ) ;
+  sh:disjoint skos:prefLabel , skos:hiddenLabel ;
+  sh:message "S13 with S55 to S57: preferred, alternative and hidden labels are pairwise disjoint, SKOS-XL labels included"@en .
+sks:xlHiddenFormDisjoint sh:path ( skosxl:hiddenLabel skosxl:literalForm ) ;
+  sh:disjoint skos:prefLabel , skos:altLabel ;
+  sh:message "S13 with S55 to S57: preferred, alternative and hidden labels are pairwise disjoint, SKOS-XL labels included"@en .
+
+sks:note sh:path skos:note ;
+  sh:name "Note"@en ; sh:group sks:Notes ; sh:order 1 ; sh:nodeKind sh:Literal ;
+  dash:editor dash:TextAreaEditor .
+sks:definition sh:path skos:definition ;
+  sh:name "Definition"@en ; sh:group sks:Notes ; sh:order 2 ; sh:nodeKind sh:Literal ;
+  dash:editor dash:TextAreaEditor .
+sks:scopeNote sh:path skos:scopeNote ;
+  sh:name "Scope note"@en ; sh:group sks:Notes ; sh:order 3 ; sh:nodeKind sh:Literal ;
+  dash:editor dash:TextAreaEditor .
+sks:example sh:path skos:example ;
+  sh:name "Example"@en ; sh:group sks:Notes ; sh:order 4 ; sh:nodeKind sh:Literal .
+sks:historyNote sh:path skos:historyNote ;
+  sh:name "History note"@en ; sh:group sks:Documentation ; sh:order 1 ; sh:nodeKind sh:Literal ;
+  dash:editor dash:TextAreaEditor .
+sks:editorialNote sh:path skos:editorialNote ;
+  sh:name "Editorial note"@en ; sh:group sks:Documentation ; sh:order 2 ; sh:nodeKind sh:Literal ;
+  dash:editor dash:TextAreaEditor .
+sks:changeNote sh:path skos:changeNote ;
+  sh:name "Change note"@en ; sh:group sks:Documentation ; sh:order 3 ; sh:nodeKind sh:Literal ;
+  dash:editor dash:TextAreaEditor .
+
+# S14 for labels without a language tag, which sh:uniqueLang does not compare.
+sks:UntaggedPrefLabels a sh:SPARQLConstraint ;
+  sh:message "S14: a resource has no more than one preferred label without a language tag"@en ;
+  sh:prefixes sks: ;
+  sh:select """
+    SELECT $this ?value WHERE {
+      $this skos:prefLabel ?value , ?other .
+      FILTER (isLiteral(?value) && LANG(?value) = "" && LANG(?other) = "" && !sameTerm(?value, ?other))
+    }""" .
+
+# S13 with S55 to S57 for two SKOS-XL labels of different kinds with one literal form: a
+# path from the resource over one label's literal form back over the other label.
+sks:XLLabelClash a sh:SPARQLConstraint ;
+  sh:message "S13 with S55 to S57: preferred, alternative and hidden labels are pairwise disjoint, SKOS-XL labels included"@en ;
+  sh:prefixes sks: ;
+  sh:select """
+    SELECT DISTINCT $this WHERE {
+      $this (skosxl:prefLabel/skosxl:literalForm/^skosxl:literalForm/(^skosxl:altLabel|^skosxl:hiddenLabel))
+        | (skosxl:altLabel/skosxl:literalForm/^skosxl:literalForm/^skosxl:hiddenLabel) $this .
+    }""" .
+
+# --- concepts -------------------------------------------------------------------------------
+
+sks:ConceptShape a sh:NodeShape ;
+  rdfs:label "Concept"@en ;
+  sh:targetClass skos:Concept ;
+  sh:property sks:broader , sks:narrower , sks:related ,
+    sks:exactMatch , sks:closeMatch , sks:broadMatch , sks:narrowMatch , sks:relatedMatch ,
+    sks:inScheme , sks:topConceptOf .
+
+sks:broader sh:path skos:broader ;
+  sh:name "Broader"@en ; sh:group sks:Hierarchy ; sh:order 1 ; sh:nodeKind sh:IRI ;
+  sh:class skos:Concept ;
+  sh:severity sh:Info ;
+  sh:message "The value is not typed skos:Concept"@en .
+sks:narrower sh:path skos:narrower ;
+  sh:name "Narrower"@en ; sh:group sks:Hierarchy ; sh:order 2 ; sh:nodeKind sh:IRI ;
+  sh:class skos:Concept ;
+  sh:severity sh:Info ;
+  sh:message "The value is not typed skos:Concept"@en .
+sks:related sh:path skos:related ;
+  sh:name "Related"@en ; sh:group sks:Hierarchy ; sh:order 3 ; sh:nodeKind sh:IRI ;
+  sh:class skos:Concept ;
+  sh:severity sh:Info ;
+  sh:message "The value is not typed skos:Concept"@en .
+sks:exactMatch sh:path skos:exactMatch ;
+  sh:name "Exact match"@en ; sh:group sks:Mappings ; sh:order 1 ; sh:nodeKind sh:IRI .
+sks:closeMatch sh:path skos:closeMatch ;
+  sh:name "Close match"@en ; sh:group sks:Mappings ; sh:order 2 ; sh:nodeKind sh:IRI .
+sks:broadMatch sh:path skos:broadMatch ;
+  sh:name "Broad match"@en ; sh:group sks:Mappings ; sh:order 3 ; sh:nodeKind sh:IRI .
+sks:narrowMatch sh:path skos:narrowMatch ;
+  sh:name "Narrow match"@en ; sh:group sks:Mappings ; sh:order 4 ; sh:nodeKind sh:IRI .
+sks:relatedMatch sh:path skos:relatedMatch ;
+  sh:name "Related match"@en ; sh:group sks:Mappings ; sh:order 5 ; sh:nodeKind sh:IRI .
+sks:inScheme sh:path skos:inScheme ;
+  sh:name "In scheme"@en ; sh:group sks:Schemes ; sh:order 1 ; sh:nodeKind sh:IRI ;
+  sh:class skos:ConceptScheme ;
+  sh:severity sh:Info ;
+  sh:message "The value is not typed skos:ConceptScheme"@en .
+sks:topConceptOf sh:path skos:topConceptOf ;
+  sh:name "Top concept of"@en ; sh:group sks:Schemes ; sh:order 2 ; sh:nodeKind sh:IRI ;
+  sh:class skos:ConceptScheme ;
+  sh:severity sh:Info ;
+  sh:message "The value is not typed skos:ConceptScheme"@en .
+
+# S27, with the hierarchy read through skos:broader, skos:narrower and their transitive
+# super-properties (Examples 26 to 29 of the SKOS Reference). skos:related is symmetric.
+sks:RelatedNotBroaderTransitive a sh:SPARQLConstraint ;
+  sh:message "S27: skos:related is disjoint with skos:broaderTransitive"@en ;
+  sh:prefixes sks: ;
+  sh:select """
+    SELECT DISTINCT $this WHERE {
+      $this ((skos:related|^skos:related)/(skos:broader|^skos:narrower|skos:broaderTransitive|^skos:narrowerTransitive)+)
+        | ((skos:related|^skos:related)/(^skos:broader|skos:narrower|^skos:broaderTransitive|skos:narrowerTransitive)+) $this .
+    }""" .
+
+# S46 (Examples 52 and 53). skos:exactMatch and skos:relatedMatch are symmetric, and
+# skos:narrowMatch is the inverse of skos:broadMatch.
+sks:ExactMatchClash a sh:SPARQLConstraint ;
+  sh:message "S46: skos:exactMatch is disjoint with skos:broadMatch and skos:relatedMatch"@en ;
+  sh:prefixes sks: ;
+  sh:select """
+    SELECT DISTINCT $this WHERE {
+      $this (skos:exactMatch/(skos:broadMatch|^skos:broadMatch|skos:narrowMatch|^skos:narrowMatch|skos:relatedMatch|^skos:relatedMatch))
+        | (^skos:exactMatch/(skos:broadMatch|^skos:broadMatch|skos:narrowMatch|^skos:narrowMatch|skos:relatedMatch|^skos:relatedMatch)) $this .
+    }""" .
+
+# S37 for the values of the semantic relations, whose domain and range are skos:Concept
+# (Examples 45 to 47 of the SKOS Reference).
+sks:SemanticRelationShape a sh:NodeShape ;
+  rdfs:label "Concept in a semantic relation"@en ;
+  sh:targetSubjectsOf skos:broader , skos:narrower , skos:related ;
+  sh:targetObjectsOf skos:broader , skos:narrower , skos:related ;
+  sh:not [ sh:class skos:Collection ] ;
+  sh:message "S37: skos:Collection is disjoint with skos:Concept, and the semantic relations link concepts"@en .
+
+# S27 and S46 for every resource in a related link or an exact match, typed or not, as the
+# Reference's examples leave their resources untyped.
+sks:RelatedShape a sh:NodeShape ;
+  rdfs:label "Resource in a related link"@en ;
+  sh:targetSubjectsOf skos:related ;
+  sh:targetObjectsOf skos:related ;
+  sh:sparql sks:RelatedNotBroaderTransitive .
+
+sks:ExactMatchShape a sh:NodeShape ;
+  rdfs:label "Resource in an exact match"@en ;
+  sh:targetSubjectsOf skos:exactMatch ;
+  sh:targetObjectsOf skos:exactMatch ;
+  sh:sparql sks:ExactMatchClash .
+
+# --- concept schemes ----------------------------------------------------------------------
+
+sks:ConceptSchemeShape a sh:NodeShape ;
+  rdfs:label "Concept scheme"@en ;
+  sh:targetClass skos:ConceptScheme ;
+  sh:property sks:hasTopConcept ;
+  sh:not [ sh:class skos:Collection ] ;
+  sh:message "S37: skos:Collection is disjoint with skos:ConceptScheme"@en .
+
+sks:hasTopConcept sh:path skos:hasTopConcept ;
+  sh:name "Top concepts"@en ; sh:group sks:Hierarchy ; sh:order 1 ; sh:nodeKind sh:IRI ;
+  sh:class skos:Concept ;
+  sh:severity sh:Info ;
+  sh:message "The value is not typed skos:Concept"@en .
+
+# S9 as a shape of its own, so that its message names S9.
+sks:ConceptNotSchemeShape a sh:NodeShape ;
+  rdfs:label "Concept that is not a concept scheme"@en ;
+  sh:targetClass skos:Concept ;
+  sh:not [ sh:class skos:ConceptScheme ] ;
+  sh:message "S9: skos:ConceptScheme is disjoint with skos:Concept"@en .
+
+# S37 for collections and concepts.
+sks:CollectionNotConceptShape a sh:NodeShape ;
+  rdfs:label "Collection that is not a concept"@en ;
+  sh:targetClass skos:Concept ;
+  sh:not [ sh:class skos:Collection ] ;
+  sh:message "S37: skos:Collection is disjoint with skos:Concept"@en .
+
+# --- collections ----------------------------------------------------------------------------
+
+sks:CollectionShape a sh:NodeShape ;
+  rdfs:label "Collection"@en ;
+  sh:targetClass skos:Collection ;
+  sh:property sks:member .
+
+sks:member sh:path skos:member ;
+  sh:name "Members"@en ; sh:group sks:Members ; sh:order 1 ; sh:nodeKind sh:IRI ;
+  sh:or ( [ sh:class skos:Concept ; sh:name "Concept"@en ]
+          [ sh:class skos:Collection ; sh:name "Collection"@en ] ) ;
+  sh:severity sh:Info ;
+  sh:message "The member is typed neither skos:Concept nor skos:Collection"@en .
+
+sks:OrderedCollectionShape a sh:NodeShape ;
+  rdfs:label "Ordered collection"@en ;
+  sh:targetClass skos:OrderedCollection ;
+  sh:property sks:memberList .
+
+sks:memberList sh:path skos:memberList ;
+  sh:name "Ordered members"@en ; sh:group sks:Members ; sh:order 2 ; sh:maxCount 1 ;
+  sh:memberShape [ sh:nodeKind sh:IRI ] .
+
+# --- SKOS-XL labels -------------------------------------------------------------------------
+
+sks:LabelShape a sh:NodeShape ;
+  rdfs:label "SKOS-XL label"@en ;
+  sh:targetClass skosxl:Label ;
+  sh:targetObjectsOf skosxl:prefLabel , skosxl:altLabel , skosxl:hiddenLabel ;
+  sh:property sks:literalForm , sks:literalFormPlain .
+
+sks:literalForm sh:path skosxl:literalForm ;
+  sh:name "Literal form"@en ; sh:order 1 ; sh:minCount 1 ; sh:maxCount 1 ;
+  dash:editor dash:TextFieldWithLangEditor ;
+  sh:message "S52: a SKOS-XL label has exactly one literal form"@en .
+sks:literalFormPlain sh:path skosxl:literalForm ;
+  sh:or ( [ sh:datatype rdf:langString ] [ sh:datatype xsd:string ] ) ;
+  sh:message "S51: the literal form of a SKOS-XL label is a plain literal"@en .
