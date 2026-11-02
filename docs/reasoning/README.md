@@ -299,6 +299,25 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   that types them as object or data properties refuses the provenance. Removals are
   recorded by the activity and the commit, since an annotation cannot describe an axiom
   that is gone.
+* The web UI's **Ontology** page, `/ui/ontology`, edits an ontology graph over these
+  routes ([U12](../specs/U12-ontology-workbench/SPEC.md#outcome)). It has trees of
+  classes, object, data and annotation properties and individuals, an entity frame with
+  the entity's axioms in Manchester syntax, an annotation editor with language tags and
+  annotations of axioms, a header editor and an axiom-level usage view. The **Inferred**
+  switch shows the EL classifier's class taxonomy beside the asserted tree. The page
+  creates entities with IRIs from a per-dataset IRI policy, renames and deletes them,
+  and runs every edit as a previewed dry run before it commits with `If-Match`, so a
+  commit by another writer in between refuses the edit. **Start session** edits on a
+  branch of its own, an undo stack for the browser session undoes and redoes commits by
+  reverting them, which restores exactly the triples each commit changed, and the change
+  feed reloads the views after another writer's commit.
+
+  ![The ontology editor with the class tree and the frame of Professor](../images/ontology-editor.png)
+
+  ![The asserted and inferred class trees side by side](../images/ontology-inferred.png)
+
+  ![The preview of a new subclass, with the axioms it adds and the triples it changes](../images/ontology-preview.png)
+
 * The W3C OWL 2 test cases run as `mise run test:owl`, with the known differences and
   their reasons in `crates/sparkles-owl/tests/w3c_owl_known.txt`. The 78
   functional-style ontologies of the cases all parse, read back from the writer's

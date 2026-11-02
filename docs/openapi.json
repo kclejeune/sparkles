@@ -35618,6 +35618,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
             "in": "query",
             "name": "graph",
@@ -35710,6 +35713,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
@@ -35845,7 +35851,7 @@
         "x-sparkles-permission": "read"
       },
       "post": {
-        "description": "Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.",
+        "description": "Adds and removes axioms, each in its JSON form or in functional-style syntax with the dataset's prefixes, as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
         },
@@ -35970,7 +35976,16 @@
                 "properties": {
                   "add": {
                     "items": {
-                      "type": "object"
+                      "oneOf": [
+                        {
+                          "description": "The axiom's JSON form.",
+                          "type": "object"
+                        },
+                        {
+                          "description": "The axiom in functional-style syntax with the dataset's prefixes.",
+                          "type": "string"
+                        }
+                      ]
                     },
                     "type": "array"
                   },
@@ -35995,7 +36010,16 @@
                   },
                   "remove": {
                     "items": {
-                      "type": "object"
+                      "oneOf": [
+                        {
+                          "description": "The axiom's JSON form.",
+                          "type": "object"
+                        },
+                        {
+                          "description": "The axiom in functional-style syntax with the dataset's prefixes.",
+                          "type": "string"
+                        }
+                      ]
                     },
                     "type": "array"
                   },
@@ -36026,6 +36050,28 @@
                     "added": {
                       "type": "integer"
                     },
+                    "addedAxioms": {
+                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                      "items": {
+                        "properties": {
+                          "axiom": {
+                            "type": "object"
+                          },
+                          "ofn": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "axiomsTruncated": {
+                      "description": "Whether `addedAxioms` or `removedAxioms` was cut at 10,000.",
+                      "type": "boolean"
+                    },
                     "committed": {
                       "type": "boolean"
                     },
@@ -36049,6 +36095,24 @@
                     },
                     "removed": {
                       "type": "integer"
+                    },
+                    "removedAxioms": {
+                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                      "items": {
+                        "properties": {
+                          "axiom": {
+                            "type": "object"
+                          },
+                          "ofn": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
                     }
                   },
                   "type": "object"
@@ -36120,6 +36184,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -36504,6 +36571,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
             "in": "query",
             "name": "graph",
@@ -36633,6 +36703,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
             "in": "query",
             "name": "graph",
@@ -36734,6 +36807,266 @@
       }
     },
     "/$/ontology/{ds}/entity": {
+      "delete": {
+        "description": "Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "removeOntologyEntity",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Follow `owl:imports` to graphs of the dataset (the default).",
+            "in": "query",
+            "name": "imports",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "lenient",
+                "strict"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true.",
+            "in": "query",
+            "name": "entailments",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The shared reasoning profile. Omit it to use the recorded program.",
+            "in": "query",
+            "name": "profile",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Jena rule text for the rules profile.",
+            "in": "query",
+            "name": "rules",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping.",
+            "in": "query",
+            "name": "inputs",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JSON array of built-in vocabulary names.",
+            "in": "query",
+            "name": "vocabularies",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include GeoSPARQL default geometry inference.",
+            "in": "query",
+            "name": "geoDefaultGeometry",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The analysis memory allowance in bytes, capped at the server budget.",
+            "in": "query",
+            "name": "maxMemory",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The most inferred triples, capped at the server reasoning limit.",
+            "in": "query",
+            "name": "maxInferred",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "HTTP uses the server reasoning pool.",
+            "in": "query",
+            "name": "threads",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "description": "The entity's IRI.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The commit message, as the `Sparkles-Commit-Message` header gives it.",
+            "in": "query",
+            "name": "message",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "axiomsTruncated": {
+                      "type": "boolean"
+                    },
+                    "committed": {
+                      "type": "boolean"
+                    },
+                    "deleted": {
+                      "type": "integer"
+                    },
+                    "kept": {
+                      "type": "integer"
+                    },
+                    "removed": {
+                      "type": "integer"
+                    },
+                    "removedAxioms": {
+                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                      "items": {
+                        "properties": {
+                          "axiom": {
+                            "type": "object"
+                          },
+                          "ofn": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "What the removal did, with the receipt when asked for."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove an entity",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "write"
+      },
       "get": {
         "description": "What the ontology says about one entity: its kinds, labels and annotations, and for each kind the superclasses, subclasses, equivalent and disjoint classes, keys and instances of a class, the domains, ranges, hierarchy, inverses and characteristics of a property, the definitions of a datatype, and the types, equalities and property assertions of an individual. Each expression comes in functional-style syntax and in its JSON form. With `assertions=true`, the instances of a class and the types and property assertions of an individual also come from the assertions the store holds, at most `limit` of each. An IRI that the ontology neither declares nor uses as an entity, or as the `kind` asked for, is `404`.",
         "externalDocs": {
@@ -36743,6 +37076,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "description": "A graph read: an IRI or `default` (repeatable). The default graph when none is named.",

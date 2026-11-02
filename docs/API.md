@@ -1814,7 +1814,9 @@ defaults to the default graph, with the imports that resolve to graphs of the da
 unless `imports=false`. `mode=strict` keeps every triple outside the mapping unmapped,
 and the default `mode=lenient` types undeclared entities from their use and says so in
 the diagnostics. The routes read with the caller's grants. An import of a graph the
-caller cannot read is not followed.
+caller cannot read is not followed. Every route takes `branch` and reads or edits that
+branch, as [Choosing a branch](#choosing-a-branch) describes, and the grants are checked on
+it.
 
 `inferences=true` on the summary and the axioms, and `inferences` in the body of a check,
 also read the materialized inferences in `urn:x-sparkles:inferred` while the dataset has
@@ -1921,7 +1923,8 @@ facets and values from its datatype's facet space (§7.5), and a datatype that a
 definition introduces cannot type a literal or be restricted (§9.4).
 
 `POST /$/ontology/{ds}/axioms` adds the axioms of `add` and removes those of `remove` in
-one commit. A removed axiom takes its triples with it, including the blank nodes of its
+one commit. Each axiom is its JSON form or a string in functional-style syntax with the
+dataset's prefixes. A removed axiom takes its triples with it, including the blank nodes of its
 class expressions and lists, except those another axiom or triple still uses. Removing an
 axiom that the ontology does not hold is not an error, and the answer lists it under
 `absent`. A removal edits the graphs `graph` names and the graph `target` names. An
@@ -1929,11 +1932,26 @@ axiom read only from an imported graph is `400` until `target` names that graph.
 added axiom goes to the graph `target` names, the first graph read by default. The edit also declares the entities the added axioms use that the ontology does
 not declare, unless `declare` is false. Named individuals are not declared. The answer
 counts the axioms added, already present and removed, and the triples inserted, deleted
-and kept. The route takes the parameters of the other writes, such as `dryRun` and
+and kept. `addedAxioms` lists the axioms the edit wrote, declarations included, and
+`removedAxioms` those it removed, at most 10,000 of each with `axiomsTruncated` when a
+list is cut. Each entry has the `type`, `ofn` and `axiom` of a listing. An added axiom of
+several classes or individuals, such as an `EquivalentClasses`, is listed whole when part
+of it was already present, so the lists do not always undo the edit. A revert of the
+edit's commit through `POST /$/revert/{ds}` undoes it exactly. The route takes the parameters of the other writes, such as `dryRun` and
 `receipt`, and an `If-Match` with the summary's tag. An axiom the forward mapping cannot
 write, such as a `DisjointClasses` of one class, is `400` with code `invalid-axiom`.
 Writing needs write access to the target graph, and a removal needs it on the graphs the
 removed triples are in.
+
+`DELETE /$/ontology/{ds}/entity?iri=IRI` removes an entity in one commit. It removes the
+entity's declarations, the axioms of the graphs read that mention it and the assertions
+about it that the store holds there, with the blank nodes of their expressions as an
+edit's removals do. The graphs, imports and mode are chosen as for the other routes, and
+`message` gives the commit message. The answer is an edit's, and its `removedAxioms`
+lists what the removal took, so adding them back with `declare: false` undoes it. An IRI
+the ontology does not mention removes nothing and makes no commit. The route takes the
+parameters of the other writes, such as `dryRun` and `receipt`, and an `If-Match` with
+the summary's tag, and it needs write access to the graphs the removed triples are in.
 
 `GET /$/ontology/{ds}/diff` lists the axioms that differ between the commits `from` and
 `to`, which take the forms of `at` and default to the head for `to`. The graphs, imports
@@ -4173,7 +4191,7 @@ they must agree, and a request that names two different branches gets `400` with
 
 The admin routes `/$/commits`, `/$/snapshots`, `/$/history`, `/$/compaction`,
 `/$/compact`, `/$/stats`, `/$/schema`, `/$/reason`, `/$/validation`, `/$/prefixes`,
-`/$/describe`, `/$/text`, `/$/geo`, `/$/vector`, `/$/rdfs`, `/$/cache` and
+`/$/describe`, `/$/text`, `/$/geo`, `/$/vector`, `/$/rdfs`, `/$/cache`, `/$/ontology` and
 `/$/datasets/{ds}/clone` take `branch` as a query parameter. Other admin routes refuse
 a branch other than `main`.
 

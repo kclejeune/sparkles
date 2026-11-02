@@ -168,3 +168,30 @@ test('the server, tokens, sign-in and CLI pages', async ({ page }) => {
   for (const url of ['/ui/', '/ui/server', '/ui/tokens', '/ui/login', '/ui/cli/device'])
     await visit(page, url);
 });
+
+test('the ontology editor: the trees, a frame, the header and the new-class dialog', async ({
+  page,
+}) => {
+  // the page keeps the change feed open, so it waits for the tree instead of an idle network
+  const ready = async (url: string) => {
+    await page.goto(url);
+    await expect(page.getByRole('tree').first()).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('main .spinner')).toHaveCount(0, { timeout: 15_000 });
+    await expectNoSidewaysScroll(page, url);
+  };
+  await ready('/ui/ontology?ds=uni');
+  await ready(
+    `/ui/ontology?ds=uni&tab=Class&inferred=1&iri=${encodeURIComponent('http://example.org/uni#Professor')}`,
+  );
+  await expect(page.locator('.frame [data-section="sub"]')).toContainText('Employee');
+  await expectNoSidewaysScroll(page, 'the frame of Professor');
+  await page.getByRole('tab', { name: /Usage/ }).click();
+  await expectNoSidewaysScroll(page, 'the usage view');
+  await page.getByRole('button', { name: 'New', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'New class' })).toBeVisible();
+  await expectNoSidewaysScroll(page, 'the new-class dialog');
+  await page.keyboard.press('Escape');
+  await page.getByRole('tab', { name: 'Header' }).click();
+  await expect(page.getByRole('heading', { name: 'Ontology header' })).toBeVisible();
+  await expectNoSidewaysScroll(page, 'the header');
+});

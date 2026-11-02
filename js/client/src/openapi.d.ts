@@ -2117,7 +2117,7 @@ export interface paths {
         put?: never;
         /**
          * Add and remove axioms
-         * @description Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.
+         * @description Adds and removes axioms, each in its JSON form or in functional-style syntax with the dataset's prefixes, as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.
          */
         post: operations["editOntology"];
         delete?: never;
@@ -2220,7 +2220,11 @@ export interface paths {
         get: operations["getOntologyEntity"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Remove an entity
+         * @description Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.
+         */
+        delete: operations["removeOntologyEntity"];
         options?: never;
         head?: never;
         patch?: never;
@@ -17015,6 +17019,8 @@ export interface operations {
     getOntology: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17065,6 +17071,8 @@ export interface operations {
     getOntologyAxioms: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17169,7 +17177,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    add?: Record<string, never>[];
+                    add?: (Record<string, never> | string)[];
                     declare?: boolean;
                     /** @description A graph IRI or `default`, or a list of them. */
                     graph?: unknown;
@@ -17177,7 +17185,7 @@ export interface operations {
                     message?: string;
                     /** @enum {string} */
                     mode?: "lenient" | "strict";
-                    remove?: Record<string, never>[];
+                    remove?: (Record<string, never> | string)[];
                     /** @description The graph that takes the added axioms. */
                     target?: string;
                 };
@@ -17193,6 +17201,14 @@ export interface operations {
                     "application/json": {
                         absent?: string[];
                         added?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        addedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                        /** @description Whether `addedAxioms` or `removedAxioms` was cut at 10,000. */
+                        axiomsTruncated?: boolean;
                         committed?: boolean;
                         declared?: string[];
                         deleted?: number;
@@ -17200,6 +17216,12 @@ export interface operations {
                         kept?: number;
                         present?: number;
                         removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
                     };
                 };
             };
@@ -17217,6 +17239,8 @@ export interface operations {
     checkOntology: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
             };
@@ -17366,6 +17390,8 @@ export interface operations {
     diffOntology: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17414,6 +17440,8 @@ export interface operations {
     listOntologyEntities: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17460,6 +17488,8 @@ export interface operations {
     getOntologyEntity: {
         parameters: {
             query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
                 /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
                 graph?: string;
                 /** @description Follow `owl:imports` to graphs of the dataset (the default). */
@@ -17502,6 +17532,100 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    removeOntologyEntity: {
+        parameters: {
+            query?: {
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+                /** @description The entity's IRI. */
+                iri?: string;
+                /** @description The commit message, as the `Sparkles-Commit-Message` header gives it. */
+                message?: string;
+            };
+            header?: {
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the removal did, with the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        axiomsTruncated?: boolean;
+                        committed?: boolean;
+                        deleted?: number;
+                        kept?: number;
+                        removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            422: components["responses"]["Unprocessable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

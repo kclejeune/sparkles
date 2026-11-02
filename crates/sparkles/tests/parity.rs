@@ -515,6 +515,14 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("ontology", "editOntology", "ontology.edit", |ds| {
             ds.ontology().edit(&any(), &any(), &any());
         }),
+        op_if!(
+            "ontology",
+            "removeOntologyEntity",
+            "ontology.remove_entity",
+            |ds| {
+                ds.ontology().remove_entity(&any(), "i", &any());
+            }
+        ),
         op_if!("ontology", "classifyOntology", "ontology.classify", |ds| {
             ds.ontology().classify(&any(), &any(), &any());
         }),
@@ -1114,7 +1122,6 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.branch",
     "dataset.run_mapping",
     "history.wait_for_commit",
-    "ontology.remove_entity",
     "history.prune",
     "history.tick",
     "indexes.vector.embed_until_idle",
@@ -1165,7 +1172,6 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
         .embed_until_idle(std::time::Duration::ZERO);
     #[cfg(feature = "ontology")]
     {
-        ds.ontology().remove_entity(&any(), "i", &any());
         let scope = ds.ontology().graph("default");
         scope.open();
         scope.edit(|e| e.add(any()).map(|_| ()));

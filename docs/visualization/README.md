@@ -183,6 +183,24 @@ explains the unit calculation.
 The HTTP forms and browser still use the existing flat model. Atomic nested changes,
 fresh children and nested check/save and browser consumers remain under item 21.
 
+### Ontology editor
+
+The **Ontology** page, `/ui/ontology`, browses and edits the OWL ontology of one graph
+and its imports
+([U12](../specs/U12-ontology-workbench/SPEC.md#outcome),
+[reasoning guide](../reasoning/README.md#owl-2-ontologies),
+[screenshot](../images/ontology-editor.png)). Trees of classes, object, data and
+annotation properties and individuals sit beside the selected entity's frame, which
+lists its annotations, characteristics and axioms and adds and removes them. The
+header tab edits the ontology IRI, version IRI, imports and header annotations, and the
+usage tab lists every axiom that mentions the entity. **Inferred** shows the EL
+classifier's taxonomy beside the asserted class tree
+([screenshot](../images/ontology-inferred.png)). Every edit is previewed as a dry run and
+committed with the commit it was previewed against
+([screenshot](../images/ontology-preview.png)), on the current branch or on a session
+branch that **Start session** creates. Undo and redo are previewed commits too, and
+another writer's commit reloads the page through the change feed.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
@@ -228,6 +246,17 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   roadmap item 120. Under an incremental guard with other results in the dataset, a
   preview cannot say whether a fix resolves its result, item 121. Callers whose grants
   cover only some graphs get no overlay, item 75.
+* The ontology editor reads every entity and hierarchy axiom of a graph to draw its
+  trees, up to 50,000 of each, 607. Class expressions are typed in functional-style
+  syntax, since Manchester syntax is rendered but not parsed, 608. Only the class
+  tree has an inferred view, 609, and the IRI policy is kept in the browser per
+  dataset, 610. Rename covers the graph the page reads and not IRIs inside triple
+  terms, under item 457's refactoring phase. The SKOS editor, the DL Query tab and the
+  editable schema diagram are further U12 phases of item 457.
+* The ontology editor decides whether the caller can write from the caller's level on the
+  dataset, so a caller whose grants allow writes on a branch only sees the branch
+  read-only, 611. Undo and redo revert commits, which needs write access to the
+  whole branch, so a caller whose grants cover some graphs only can edit but not undo.
 
 ## Configuration and usage
 

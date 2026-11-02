@@ -861,6 +861,21 @@ message goes to the commit. A target that
 declares a PROV-O property as an object or data property refuses the write with a
 conflict, as the MCP tool refuses provenance, so the header stays in OWL 2 DL.
 
+### Routes for the ontology editor
+
+The ontology editor of [U12](U12-ontology-workbench/SPEC.md#outcome) added four things to
+the HTTP surface. The `/$/ontology/{ds}` routes take `?branch=` and the `/{ds}@{branch}`
+form, as the other admin routes on the branch list do, so reads and edits work on a
+branch with its own `ETag`. `DELETE /$/ontology/{ds}/entity?iri=` removes an entity with
+its declarations, axioms and assertions, with `dryRun`, `If-Match`, a commit message and
+`receipt`, and needs write access to the graphs it reads. An edit's `add` and `remove`
+take strings in functional-style syntax with the dataset's prefixes beside the JSON form,
+as the MCP tool and the bindings already did. An edit's answer, and so the answer of every
+binding, lists the axioms it added and removed as `addedAxioms` and `removedAxioms`, up to
+10,000 of each with `axiomsTruncated`. An added n-ary axiom of which part was present is
+listed whole, so the lists are not an exact inverse, and the editor undoes a commit by
+reverting it instead.
+
 ### Decisions and departures from the design
 
 **Shared expressions in strict mode.** The first design made a blank node structure used

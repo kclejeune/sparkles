@@ -7,7 +7,8 @@
 // `share_query`. The maps of relations, the communities, the Pattern pane, the diff graph
 // and the path finder on a query's graph use the `world` showcase dataset of
 // mock/world.mjs. The model configuration form uses the declared configuration of
-// mock/models.mjs. Run with `mise run docs:screenshots`.
+// mock/models.mjs. The ontology editor uses the `uni` dataset of mock/ontology.mjs. Run
+// with `mise run docs:screenshots`.
 
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { encodeHandoff } from '../../src/lib/handoff';
@@ -1212,4 +1213,50 @@ test('reasoning-support-preview', async ({ page }) => {
   await expect(modal).toContainText('1 changed quad');
   await expect(modal).toContainText('1 removed');
   await shoot(page, 'reasoning-support-preview');
+});
+
+// The ontology editor on the mock's `uni` dataset (mock/ontology.mjs): the class tree with
+// the frame of Professor, the asserted and inferred class trees side by side, and the
+// preview of a new subclass, which is cancelled so the mock keeps its ontology.
+const UNI = 'http://example.org/uni#';
+
+test('ontology-editor', async ({ page }) => {
+  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Professor`)}`);
+  const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
+  await expect(classes.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  // the selection opens Professor's ancestors, and the shot opens two more branches
+  await expect(classes.getByRole('treeitem', { name: 'Professor' })).toBeVisible();
+  for (const n of ['Organization', 'Student'])
+    await classes.getByRole('button', { name: `Expand ${n}` }).click();
+  await expect(page.locator('.frame [data-section="sub"]')).toContainText('teaches some Course');
+  await shoot(page, 'ontology-editor');
+});
+
+test('ontology-inferred', async ({ page }) => {
+  await page.goto(
+    `/ui/ontology?ds=uni&tab=Class&inferred=1&iri=${encodeURIComponent(`${UNI}Teacher`)}`,
+  );
+  const asserted = page.getByRole('tree', { name: 'Classes (asserted)' });
+  const inferred = page.getByRole('tree', { name: 'Classes (inferred)' });
+  await expect(inferred).toBeVisible({ timeout: 30_000 });
+  for (const n of ['Agent', 'Person', 'Employee'])
+    await asserted.getByRole('button', { name: `Expand ${n}` }).click();
+  await inferred.getByRole('button', { name: 'Expand Teacher' }).click();
+  await expect(inferred.getByRole('button', { name: 'Professor', exact: true })).toBeVisible();
+  await shoot(page, 'ontology-inferred');
+});
+
+test('ontology-preview', async ({ page }) => {
+  await page.goto(`/ui/ontology?ds=uni&tab=Class&iri=${encodeURIComponent(`${UNI}Employee`)}`);
+  await expect(page.locator('.frame')).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'New', exact: true }).click();
+  const create = page.getByRole('dialog', { name: 'New class' });
+  await create.getByRole('textbox', { name: 'Label', exact: true }).fill('teaching assistant');
+  await create.getByRole('button', { name: 'Preview' }).click();
+  const preview = page.getByRole('dialog');
+  await expect(preview.locator('[data-outcome]')).toHaveAttribute('data-outcome', 'commit');
+  await shoot(page, 'ontology-preview');
+  await preview.getByRole('button', { name: 'Cancel' }).click();
 });
