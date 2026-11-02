@@ -391,7 +391,6 @@ where
     };
     let t0 = Instant::now();
     tokio::task::spawn_blocking(move || {
-        crate::cpus::place_request();
         #[cfg(test)]
         let _completion = probe.producer.clone().map(super::algo::probe::Completion);
         // A local binding drops the permit before the test completion observer,

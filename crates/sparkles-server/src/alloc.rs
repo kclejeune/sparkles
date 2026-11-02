@@ -37,11 +37,6 @@ pub fn start_clock() {
     epoch();
 }
 
-/// Requests in flight, each until its response body has ended.
-pub fn active() -> usize {
-    ACTIVE.load(Ordering::Relaxed)
-}
-
 /// Whether the request calling this is the only one in flight and no other request has
 /// ended for `quiet`: the server's threads have been idle, so a wake-up of another
 /// thread would be slow. A request counts until its response body has ended.

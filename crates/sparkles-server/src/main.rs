@@ -3302,7 +3302,6 @@ fn run() -> Result<()> {
                     "hybrid processor: request threads run on the performance cores"
                 );
             }
-            let request_cpus_auto = hybrid.is_some();
             let request_cpus = hybrid.map(|h| h.performance);
             alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
@@ -3313,37 +3312,9 @@ fn run() -> Result<()> {
             };
             let mut rt = tokio::runtime::Builder::new_multi_thread();
             rt.thread_stack_size(THREAD_STACK).enable_all();
-            // EXPERIMENT (item 583): SPARKLES_PLACEMENT_EXP=adaptive:N places request work
-            // by the requests in flight, `updates` runs updates on every CPU
-            let exp = std::env::var("SPARKLES_PLACEMENT_EXP").unwrap_or_default();
-            if let (Some(cpus), Some(h)) = (request_cpus, cpus::Hybrid::detect())
-                && request_cpus_auto
-            {
-                let mut every: Vec<usize> =
-                    h.performance.iter().chain(&h.efficiency).copied().collect();
-                every.sort_unstable();
-                if let Some(n) = exp.strip_prefix("adaptive:") {
-                    let limit = n.parse().expect("adaptive:N");
-                    tracing::info!(limit, "EXPERIMENT adaptive placement");
-                    cpus::set_placement(cpus::Placement {
-                        performance: cpus,
-                        every,
-                        limit,
-                        updates_everywhere: false,
-                    });
-                } else {
-                    if exp == "updates" {
-                        tracing::info!("EXPERIMENT updates everywhere");
-                        cpus::set_placement(cpus::Placement {
-                            performance: cpus.clone(),
-                            every,
-                            limit: usize::MAX,
-                            updates_everywhere: true,
-                        });
-                    }
-                    // runtime workers and blocking threads alike
-                    rt.on_thread_start(move || cpus::pin_current_thread(&cpus));
-                }
+            if let Some(cpus) = request_cpus {
+                // runtime workers and blocking threads alike
+                rt.on_thread_start(move || cpus::pin_current_thread(&cpus));
             }
             let rt = rt.build()?;
             // Queries run on the runtime's blocking threads, which it also starts on first
