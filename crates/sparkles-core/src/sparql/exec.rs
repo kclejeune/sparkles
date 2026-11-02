@@ -87,8 +87,8 @@ const BATCH_PAR_NANOS: u128 = 200_000;
 /// Rows per parallel piece of a cursor batch.
 const BATCH_PAR_PIECE: usize = 256;
 
-/// [`map_rows`] for one batch of a cursor, whose rows are too few for the row count
-/// alone to say whether the pool pays. The first [`BATCH_SAMPLE_ROWS`] rows are mapped
+/// [`map_rows`] for a batch of at most [`PAR_THRESHOLD`] rows, such as one of a cursor,
+/// whose rows are too few for the row count alone to say whether the pool pays. The first [`BATCH_SAMPLE_ROWS`] rows are mapped
 /// on this thread and timed, and the rest are mapped in parallel when `par` allows it
 /// and their projected time reaches [`BATCH_PAR_NANOS`]. A cheap expression, such as
 /// arithmetic on inline numbers, stays on this thread, and an expensive one, such as
@@ -5736,7 +5736,7 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
     let parallel = exprs.iter().all(Expr::parallel);
-    let keep = if ctx.is_cursor() && t.len() <= PAR_THRESHOLD {
+    let keep = if t.len() <= PAR_THRESHOLD {
         map_batch(ctx, t.len(), parallel, test)?
     } else {
         map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && parallel, test)?
@@ -5886,7 +5886,7 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
-    if ctx.is_cursor() && t.len() <= PAR_THRESHOLD {
+    if t.len() <= PAR_THRESHOLD {
         return map_batch(ctx, t.len(), e.parallel(), f);
     }
     map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
