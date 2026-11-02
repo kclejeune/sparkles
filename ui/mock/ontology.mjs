@@ -1500,7 +1500,10 @@ function changes(req, res, url, seg, ctx) {
   return true;
 }
 
-/** The terms of an N-Quads line as written: IRIs, blank nodes and literals with their tags. */
+/**
+ * The terms of an N-Quads line as written: IRIs, blank nodes, literals with their tags,
+ * and triple terms, each one term however it nests.
+ */
 function nquadTerms(line) {
   const out = [];
   let i = 0;
@@ -1511,7 +1514,25 @@ function nquadTerms(line) {
       continue;
     }
     const start = i;
-    if (c === '<') i = line.indexOf('>', i) + 1;
+    if (line.startsWith('<<', i)) {
+      // a triple term: up to its matching `>>`, past the IRIs and literals inside it
+      let depth = 0;
+      while (i < line.length) {
+        if (line.startsWith('<<', i)) {
+          depth++;
+          i += 2;
+        } else if (line.startsWith('>>', i)) {
+          depth--;
+          i += 2;
+          if (depth === 0) break;
+        } else if (line[i] === '<') i = line.indexOf('>', i) + 1;
+        else if (line[i] === '"') {
+          i++;
+          while (i < line.length && line[i] !== '"') i += line[i] === '\\' ? 2 : 1;
+          i++;
+        } else i++;
+      }
+    } else if (c === '<') i = line.indexOf('>', i) + 1;
     else if (c === '"') {
       i++;
       while (i < line.length && line[i] !== '"') i += line[i] === '\\' ? 2 : 1;
@@ -1574,7 +1595,17 @@ async function revert(req, res, url, seg, ctx) {
   // the state after the commit and the lines it changed, which the mock keeps for the
   // commits it makes after start-up
   const after = stateLines(commit);
-  const lines = linesOf.get(commit);
+  const parent = list.find((c) => c.seq === seq - 1);
+  const parentState = parent && stateLines(parent);
+  // a commit made without recorded lines, such as a seeded upload, diffs the two states
+  const lines =
+    linesOf.get(commit) ??
+    (after && parentState
+      ? {
+          added: after.filter((l) => !new Set(parentState).has(l)),
+          removed: parentState.filter((l) => !new Set(after).has(l)),
+        }
+      : null);
   if (!after || !lines)
     return (
       fail(res, 410, `commit ${seq} is outside the kept history`, { code: 'history-gone' }), true

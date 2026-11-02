@@ -348,14 +348,52 @@ test('the mock revert keeps blank nodes and refuses a cell a later commit change
   expect((await refused.json()).code).toBe('merge-conflict');
   expect(await headOf()).toBe(head);
 
-  // a literal that looks like a blank node, and a commit of two values in one cell, which
-  // reverts whole
-  expect((await update(`INSERT DATA { <urn:s> <urn:p> "reference _:example" }`)).ok()).toBe(true);
-  const two = await json(await update(`INSERT DATA { ${comment('one')} . ${comment('two')} }`));
-  const both = await json(
-    await request.post(`/$/revert/uni?commit=${two.commit!.seq}`, { data: {} }),
+  // quads in a blank-node graph beside a literal that looks like a blank node and a triple
+  // term: undo removes them and redo puts them back in the same graph
+  const nq = [
+    '<urn:s> <urn:p> "reference _:example" _:g .',
+    '<urn:s> <urn:q> <<( <urn:a> <urn:b> <urn:c> )>> _:g .',
+  ].join('\n');
+  const upload = await json(
+    await request.post('/uni/upload?receipt=true', {
+      headers: { Accept: 'application/x-sparkles+json' },
+      multipart: {
+        file: { name: 'odd.nq', mimeType: 'application/n-quads', buffer: Buffer.from(nq) },
+      },
+    }),
   );
-  expect(both.changes.deleted).toBe(2);
+  const up = upload.commit!.seq;
+  const off = await json(await request.post(`/$/revert/uni?commit=${up}`, { data: {} }));
+  expect(off.changes.deleted).toBe(2);
+  const on = await json(await request.post(`/$/revert/uni?commit=${up + 1}`, { data: {} }));
+  expect(on.changes.inserted).toBe(2);
+  const offAgain = await json(await request.post(`/$/revert/uni?commit=${up + 2}`, { data: {} }));
+  expect(offAgain.changes.deleted).toBe(2);
+
+  // keep and cd, then cd to ab, then ab to ba by another writer: reverting cd to ab
+  // conflicts on the cell that holds two values
+  expect((await update(`INSERT DATA { ${comment('keep')} . ${comment('cd')} }`)).ok()).toBe(true);
+  const cdab = await json(
+    await update(`DELETE DATA { ${comment('cd')} } ; INSERT DATA { ${comment('ab')} }`),
+  );
+  expect(
+    (await update(`DELETE DATA { ${comment('ab')} } ; INSERT DATA { ${comment('ba')} }`)).ok(),
+  ).toBe(true);
+  const before = await headOf();
+  const clash = await request.post(`/$/revert/uni?commit=${cdab.commit!.seq}`, { data: {} });
+  expect(clash.status()).toBe(409);
+  expect(await headOf()).toBe(before);
+
+  // a seeded commit has no recorded lines, and the mock diffs its kept states instead
+  const seeded = (await (await request.get('/$/commits/uni?limit=100')).json()) as {
+    commits: { seq: number; kind: string }[];
+  };
+  // the oldest upload, the seeded load of the ontology (the list is newest first)
+  const load = seeded.commits.filter((c) => c.kind === 'upload').at(-1)!;
+  const dry = await request.post(`/$/revert/uni?commit=${load.seq}`, { data: { dryRun: true } });
+  // earlier edits changed cells of that load, so the revert may conflict, but it is
+  // computed rather than refused as outside the kept history
+  expect([200, 409], await dry.text()).toContain(dry.status());
 
   // the first commit after a seeded history, whose parent the mock kept no state for
   const foaf = await request.post('/foaf/update?receipt=true', {
