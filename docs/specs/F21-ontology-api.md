@@ -840,9 +840,11 @@ the objects the HTTP client sends and receives. Typed axiom constructors in Pyth
 Node.js come with the Rust edit builder of roadmap item 540.
 
 **The JVM model's copy.** The copy that `SparklesOnt.model` reads is filled once, so a
-commit made through another handle after the model is built is not seen by it. A program
-builds a new model to read later commits. Writes through the model reach the Sparkles
-graph at once, and they are not read back from it.
+commit made through another handle after the model is built is not seen by it, except
+for the triples a transaction of the model wrote. Those are read back from the dataset
+once that transaction ends, so that an abort leaves the model as the dataset is, and the
+read then shows later commits to them too. A program builds a new model to read later
+commits.
 
 **Inferences of other graphs.** The inferred graph holds the inferences of every input of
 the materialization, so a read with inferences of one graph also reads what the run

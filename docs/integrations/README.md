@@ -149,7 +149,8 @@ programs use `jena-ontapi`'s own interfaces. One native call copies the graph in
 Jena in-memory graph, from the thread's transaction or the head. Writes through the
 model go to the copy and to the Sparkles graph in the thread's write transaction, so a
 transaction's edits make one commit. A transaction that aborts undoes its writes in the
-copy too, and a commit made through another handle later is not seen by the model. Like
+copy too. A commit made through another handle later is not seen by the model, except
+for the triples a transaction of the model wrote, which are read back once it ends. Like
 Jena's in-memory models, the model needs the caller's locking when threads use it at
 once. `jena-ontapi` is not bundled, and a program that calls `model`
 adds `org.apache.jena:jena-ontapi` of its Jena version. `SparklesOnt.check` and the

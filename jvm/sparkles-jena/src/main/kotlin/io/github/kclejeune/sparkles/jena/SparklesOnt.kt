@@ -34,8 +34,9 @@ public object SparklesOnt {
      * the copy and to the Sparkles graph, in the thread's write transaction when there is
      * one, so the additions of a transaction make one commit. Without a transaction each
      * write commits on its own when the dataset allows autocommit. A transaction that
-     * aborts undoes its writes in the copy too. A commit made through another handle after
-     * the model is built is not seen by it.
+     * aborts undoes its writes in the copy too, since the triples a transaction writes are
+     * read back from the dataset once it ends. Another commit made through another handle
+     * after the model is built is not seen by it, unless it writes those triples.
      */
     @JvmStatic
     @JvmOverloads
