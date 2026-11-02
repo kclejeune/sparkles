@@ -1703,20 +1703,63 @@ mod tests {
         );
     }
 
-    /// A refused payload charge of query-local terms declines the decoding, which is
-    /// optional, instead of failing the query.
+    /// The least memory room in which `cursor_variable_values` decodes the column, which is
+    /// the peak of its construction, since the built column shrinks its charge.
+    fn least_room(ctx: &Ctx, table: &Table) -> u64 {
+        let decodes_in = |room: u64| {
+            let storage = ctx.charge(ctx.memory_room() - room).unwrap();
+            let column = cursor_variable_values(ctx, table, &Expr::Var(table.vars[0]));
+            drop(storage);
+            matches!(column, Ok(Some(_)))
+        };
+        let (mut low, mut high) = (0, ctx.memory_room());
+        assert!(decodes_in(high));
+        while low + 1 < high {
+            let mid = low + (high - low) / 2;
+            if decodes_in(mid) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        high
+    }
+
+    /// A refused payload charge of query-local terms in a large input declines the
+    /// decoding, which is optional, instead of failing the query.
     #[test]
     fn a_refused_local_payload_declines_the_decoding() {
         let store = crate::store::Store::in_memory(Default::default());
         let n = 2 * super::super::exec::PAR_THRESHOLD;
-        // the reservation for building the values fits, and nothing more
-        let base = n as u64 * 128 + n as u64 * 8 + 4096;
-        let (ctx, terms) = owned(&store, base + 64, &["local"]);
-        let (t, v) = column(&ctx, vec![terms[0]; n]);
+        let fixture = || {
+            let (ctx, terms) = owned(&store, 1 << 30, &["local"]);
+            // the cursor's value cache holds the term, so the payload is the last charge
+            assert!(ctx.value(terms[0]).is_some());
+            let (t, _) = column(&ctx, vec![terms[0]; n]);
+            (ctx, t)
+        };
+        let (measure, measured) = fixture();
+        let peak = least_room(&measure, &measured);
+        drop(measure);
+
+        let (ctx, t) = fixture();
+        let payload = ctx.decoded_bytes(t.cols[0][0]).unwrap();
+        assert!(payload > 0);
+        // the reservation for building the values fits, and the payload does not
+        let storage = ctx.charge(ctx.memory_room() - (peak - 1)).unwrap();
+        let before = ctx.live_bytes();
         assert!(
-            cursor_variable_values(&ctx, &t, &Expr::Var(v))
+            cursor_variable_values(&ctx, &t, &Expr::Var(t.vars[0]))
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(ctx.live_bytes(), before, "the refusal kept its charge");
+        assert!(ctx.check_memory_failure().is_ok());
+        drop(storage);
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(t.vars[0]))
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -1810,29 +1853,7 @@ mod tests {
         assert!(measure.value(long).is_some());
         let increment = measure.live_bytes() - before_long;
         assert_eq!(increment, 24);
-        // The column shrinks its charge to what it keeps once built, so find the room its
-        // construction needs at its peak, the least in which it succeeds.
-        let decodes_in = |room: u64| {
-            let storage = measure.charge(measure.memory_room() - room).unwrap();
-            let column = cursor_variable_values(
-                &measure,
-                &measured_table,
-                &Expr::Var(measured_table.vars[0]),
-            );
-            drop(storage);
-            matches!(column, Ok(Some(_)))
-        };
-        let (mut low, mut high) = (0, measure.memory_room());
-        assert!(decodes_in(high));
-        while low + 1 < high {
-            let mid = low + (high - low) / 2;
-            if decodes_in(mid) {
-                high = mid;
-            } else {
-                low = mid;
-            }
-        }
-        let column_bytes = high;
+        let column_bytes = least_room(&measure, &measured_table);
         drop(measure);
 
         let (ctx, table, [short, _]) = cursor_with_late_longer_local_key();
