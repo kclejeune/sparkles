@@ -5864,21 +5864,10 @@ pub(super) fn compute_column(
     if let Some(col) = super::exists::column(ctx, t, e)? {
         return Ok(col);
     }
-    if ctx.is_cursor() {
-        return match super::exprcache::cursor_column(ctx, t, e, report, |v| column_rows(ctx, v, e))?
-        {
-            Some(ids) => Ok(ids),
-            None => column_rows(ctx, t, e),
-        };
+    match super::exprcache::column(ctx, t, e, report, |v| column_rows(ctx, v, e))? {
+        Some(ids) => Ok(ids),
+        None => column_rows(ctx, t, e),
     }
-    if t.len() >= super::exprcache::MIN_ROWS
-        && super::exprcache::eligible(&[e]).is_ok()
-        && let Some(p) =
-            super::exprcache::per_value(ctx, t, &[e], false, report, |v| column_rows(ctx, v, e))?
-    {
-        return Ok(p.rows(t.len()));
-    }
-    column_rows(ctx, t, e)
 }
 
 fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {

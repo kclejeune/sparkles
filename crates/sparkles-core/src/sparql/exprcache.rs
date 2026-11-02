@@ -326,7 +326,7 @@ pub fn per_value<T: Send>(
     report: &mut Report,
     eval: impl FnOnce(&Table) -> Result<Vec<T>>,
 ) -> Result<Option<PerValue<T>>> {
-    let Some(d) = distinct(ctx, t, exprs, always, report, false)? else {
+    let Some(d) = distinct(ctx, t, exprs, always, report)? else {
         return Ok(None);
     };
     let vals = eval(&d.values)?;
@@ -411,11 +411,17 @@ pub(super) fn cursor_numeric_values(
     }))
 }
 
-/// Cursor BIND reuse keeps only IDs and slots, with a conservative reservation
-/// covering the temporary distinct set/map, table, slots and expanded output.
-/// The reservation lives until the output is expanded; no entries cross batches.
-/// Unlike general value-key caching, this does not retain decoded heap values.
-pub(super) fn cursor_column(
+/// BIND reuse in both accounting modes: the value of `e` on every row, evaluated once per
+/// distinct input value, or `None` when reuse is not admitted.
+///
+/// The input's size chooses the algorithm. A batch of at most
+/// [`super::exec::PAR_THRESHOLD`] rows, which holds a cursor's batches, keeps only ids and
+/// slots under a conservative reservation that covers the distinct set, the table, the
+/// slots and the expanded output until the output is expanded, finds its distinct inputs
+/// from a dense integer range or one sort, and expands on the calling thread. A larger
+/// table estimates its distinct inputs before it collects them and expands in parallel.
+/// Neither retains decoded heap values.
+pub(super) fn column(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
@@ -428,6 +434,9 @@ pub(super) fn cursor_column(
     if !ctx.opt.expr_cache || t.len() < MIN_ROWS {
         return Ok(None);
     }
+    if t.len() > super::exec::PAR_THRESHOLD {
+        return Ok(per_value(ctx, t, &[e], false, report, eval)?.map(|p| p.rows(t.len())));
+    }
     let bytes = (t.len() as u64).saturating_mul(128).saturating_add(1024);
     let Ok(_held) = ctx.charge(bytes) else {
         // Optional reuse may decline without consuming the remaining allowance.
@@ -438,7 +447,7 @@ pub(super) fn cursor_column(
             Some(d) => Some(d),
             None => cursor_key_distinct(ctx, t, &[e], v, false, report)?,
         },
-        None => distinct(ctx, t, &[e], false, report, true)?,
+        None => distinct(ctx, t, &[e], false, report)?,
     };
     let Some(d) = d else {
         return Ok(None);
@@ -446,8 +455,8 @@ pub(super) fn cursor_column(
     let vals = eval(&d.values)?;
     debug_assert_eq!(vals.len(), d.values.len());
     ctx.check()?;
-    // A cursor batch is small enough that scheduling the expansion on Rayon
-    // costs more than the ID copies. Keep the eager large-table path separate.
+    // A batch is small enough that scheduling the expansion on Rayon costs more than
+    // the id copies.
     let rows = match d.slot {
         Some(slot) => slot.iter().map(|&i| vals[i as usize]).collect(),
         None => vec![vals[0]; t.len()],
@@ -476,10 +485,9 @@ fn distinct(
     exprs: &[&Expr],
     always: bool,
     report: &mut Report,
-    cursor_reserved: bool,
 ) -> Result<Option<Distinct>> {
     let n = t.len();
-    if !ctx.opt.expr_cache || (ctx.is_cursor() && !cursor_reserved) || n < MIN_ROWS {
+    if !ctx.opt.expr_cache || n < MIN_ROWS {
         return Ok(None);
     }
     let v = match input(exprs) {
@@ -622,6 +630,10 @@ fn estimate_distinct(col: &[Id]) -> usize {
 /// The FILTER conjuncts that run per distinct value: pure conjuncts over one variable,
 /// grouped by it. Returns the mask of those groups and the conjuncts left for
 /// row-by-row evaluation (on the rows that pass), or `None` when no group ran per value.
+///
+/// A batch of at most [`super::exec::PAR_THRESHOLD`] rows, which holds a cursor's
+/// batches, whose conjuncts all read one variable runs them together under one
+/// reservation (see [`batch_filter`]). Other inputs group their conjuncts by variable.
 pub fn filter(
     ctx: &Ctx,
     t: &Table,
@@ -631,8 +643,9 @@ pub fn filter(
     if !ctx.opt.expr_cache || t.len() < MIN_ROWS {
         return Ok(None);
     }
-    if ctx.is_cursor() {
-        return cursor_filter(ctx, t, exprs, report);
+    if t.len() <= super::exec::PAR_THRESHOLD && eligible(&exprs.iter().collect::<Vec<_>>()).is_ok()
+    {
+        return batch_filter(ctx, t, exprs, report);
     }
     let mut groups: Vec<(Option<VarId>, Vec<&Expr>)> = Vec::new();
     let mut rest: Vec<&Expr> = Vec::new();
@@ -674,11 +687,11 @@ pub fn filter(
     Ok(keep.map(|k| (k, rest.into_iter().cloned().collect())))
 }
 
-/// Batch-local FILTER reuse stores only IDs, slots and booleans. A conservative
-/// reservation covers distinct construction and key-test scratch until expansion.
-/// Mixed/impure conjuncts stay row-by-row; no decoded-value cache survives a batch.
+/// Batch-local FILTER reuse stores only ids, slots and booleans. A conservative
+/// reservation covers distinct construction and key-test scratch until expansion, and no
+/// decoded value outlives the batch.
 #[inline(never)]
-fn cursor_filter(
+fn batch_filter(
     ctx: &Ctx,
     t: &Table,
     exprs: &[Expr],
@@ -702,12 +715,12 @@ fn cursor_filter(
     };
     let d = match (key_bytes, v) {
         (Some(_), Some(v)) => cursor_key_distinct(ctx, t, &refs, v, true, report)?,
-        _ => distinct(ctx, t, &refs, false, report, true)?,
+        _ => distinct(ctx, t, &refs, false, report)?,
     };
     let Some(d) = d else {
         drop(_held);
         return if key_bytes.is_none() {
-            cursor_numeric_filter(ctx, t, exprs).map(|keep| keep.map(|keep| (keep, Vec::new())))
+            numeric_filter(ctx, t, exprs).map(|keep| keep.map(|keep| (keep, Vec::new())))
         } else {
             Ok(None)
         };
@@ -715,7 +728,7 @@ fn cursor_filter(
     let vals = match (key_bytes, v) {
         (Some(_), Some(v)) => {
             let kf = super::keyfilter::KeyFilter::new_for(ctx, exprs, v)
-                .expect("cursor key-test admission matches compilation");
+                .expect("key-test admission matches compilation");
             key_filter_mask(ctx, &kf, &d.values.cols[0], v, exprs)?
         }
         _ => super::exec::filter_mask(ctx, &d.values, exprs)?,
@@ -733,10 +746,10 @@ fn cursor_filter(
 }
 
 /// Batch-local numeric dictionary evaluation after ordinary distinct reuse was
-/// declined. Shared eager row evaluation stays unchanged; optional memory failure
-/// returns to scalar filtering and no decoded dictionary crosses a batch.
+/// declined. An optional memory failure returns to scalar filtering, and no decoded
+/// dictionary outlives the batch.
 #[inline(never)]
-fn cursor_numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<bool>>> {
+fn numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<bool>>> {
     fn numeric(e: &Expr) -> bool {
         match e {
             Expr::Var(_) => true,
@@ -769,7 +782,7 @@ fn cursor_numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<
             _ => false,
         }
     }
-    if !ctx.is_cursor() || !ctx.opt.expr_cache || t.len() < 4096 || !exprs.iter().all(numeric) {
+    if !ctx.opt.expr_cache || t.len() < 4096 || !exprs.iter().all(numeric) {
         return Ok(None);
     }
     let bytes = t.len() as u64 * (std::mem::size_of::<Option<super::value::Value>>() as u64 + 2)
@@ -912,10 +925,10 @@ fn cursor_key_distinct(
     report: &mut Report,
 ) -> Result<Option<Distinct>> {
     let Some(c) = t.col_of(v) else {
-        return distinct(ctx, t, exprs, always, report, true);
+        return distinct(ctx, t, exprs, always, report);
     };
     if t.sorted.first() == Some(&v) {
-        return distinct(ctx, t, exprs, always, report, true);
+        return distinct(ctx, t, exprs, always, report);
     }
     let n = t.len();
     if n > u32::MAX as usize {
@@ -1032,9 +1045,9 @@ pub(super) fn key_filter_mask(
         rest_hit = tail;
         at = e;
     }
-    if ctx.is_cursor() && uniq.len() <= 4096 {
-        // Ordinary cursor batches do not amortize task scheduling or a fresh
-        // regex worker cache. Search with the already admitted query cache.
+    if uniq.len() <= 4096 {
+        // A few thousand values, such as those of a cursor's batch, do not amortize
+        // scheduling tasks on Rayon.
         for (h, ids) in read {
             let _payload_charge = ctx.charge(ids.len() as u64 * 8 + 64)?;
             let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
@@ -1075,30 +1088,27 @@ pub(super) fn key_filter_mask(
                         }
                         h[j] = kf.test(k);
                     };
-                    if ctx.is_cursor() {
-                        let scratch = ctx.charge(0)?;
-                        let mut reserved = 0;
-                        let mut examined = 0usize;
-                        vocab.get_sorted_checked(
-                            &payloads,
-                            |need| {
-                                let bytes = (need as u64).saturating_mul(2);
-                                scratch.add(bytes.saturating_sub(reserved))?;
-                                reserved = bytes;
-                                Ok::<_, crate::error::Error>(())
-                            },
-                            |p, k| {
-                                if examined.is_multiple_of(1024) {
-                                    ctx.check()?;
-                                }
-                                examined += 1;
-                                test(p, k);
-                                Ok::<_, crate::error::Error>(())
-                            },
-                        )?;
-                    } else {
-                        vocab.get_sorted(&payloads, test);
-                    }
+                    // Decoding a block reserves its keys in both accounting modes.
+                    let scratch = ctx.charge(0)?;
+                    let mut reserved = 0;
+                    let mut examined = 0usize;
+                    vocab.get_sorted_checked(
+                        &payloads,
+                        |need| {
+                            let bytes = (need as u64).saturating_mul(2);
+                            scratch.add(bytes.saturating_sub(reserved))?;
+                            reserved = bytes;
+                            Ok::<_, crate::error::Error>(())
+                        },
+                        |p, k| {
+                            if examined.is_multiple_of(1024) {
+                                ctx.check()?;
+                            }
+                            examined += 1;
+                            test(p, k);
+                            Ok::<_, crate::error::Error>(())
+                        },
+                    )?;
                     Ok::<_, crate::error::Error>(())
                 },
             )?;
@@ -1106,26 +1116,19 @@ pub(super) fn key_filter_mask(
     let mut rest = Table::new(vec![v]);
     let mut rest_at = Vec::new();
     for (i, id) in uniq.iter().enumerate().filter(|(i, _)| *i < lo || *i >= hi) {
-        if ctx.is_cursor() {
-            let test = match id.tag() {
-                Tag::Delta => ctx
-                    .snap
-                    .generation
-                    .dvocab
-                    .with(|vocab| vocab.get(id.payload()).map(|key| kf.test(key))),
-                Tag::Local => ctx.with_local_key(id.payload(), |key| kf.test(key)),
-                _ => None,
-            };
-            if let Some(test) = test {
-                hit[i] = test;
-                continue;
-            }
-            rest.push_row(&[*id]);
-            rest_at.push(i);
-            continue;
-        }
-        match ctx.snap.key(*id) {
-            Some(k) => hit[i] = kf.test(&k),
+        // Terms added by updates and query-local terms are tested on their keys without
+        // copying them, and the rest by the general evaluator.
+        let test = match id.tag() {
+            Tag::Delta => ctx
+                .snap
+                .generation
+                .dvocab
+                .with(|vocab| vocab.get(id.payload()).map(|key| kf.test(key))),
+            Tag::Local => ctx.with_local_key(id.payload(), |key| kf.test(key)),
+            _ => None,
+        };
+        match test {
+            Some(test) => hit[i] = test,
             None => {
                 rest.push_row(&[*id]);
                 rest_at.push(i);

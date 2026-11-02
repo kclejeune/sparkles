@@ -242,6 +242,24 @@ fn random_queries_agree_with_and_without_the_cache() {
     }
 }
 
+/// Inputs above `exec::PAR_THRESHOLD` rows take the table algorithms (an estimate of
+/// the distinct inputs and a parallel expansion) and inputs below it the batch
+/// algorithms, in both accounting modes, and both agree with evaluation row by row.
+#[test]
+fn the_table_and_batch_algorithms_agree_with_rows_on_both_sides_of_the_threshold() {
+    let mut next = xorshift(0x51_7cc1_b727_220a);
+    let s = store(next(), 2 * super::exec::PAR_THRESHOLD, false);
+    let snap = s.snapshot();
+    let mut cached = 0;
+    for i in 0..24 {
+        let shape = SHAPES[i % SHAPES.len()];
+        let e = EXPRS[(next() % EXPRS.len() as u64) as usize];
+        let p = PATTERNS[(next() % PATTERNS.len() as u64) as usize];
+        cached += check(&snap, &shape.replace("{E}", e).replace("{P}", p)) as usize;
+    }
+    assert!(cached > 0);
+}
+
 /// The cache runs on repeated values, says how often it reused a result, and steps
 /// aside for nearly distinct inputs and impure expressions.
 #[test]

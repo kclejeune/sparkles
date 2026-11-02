@@ -2766,7 +2766,7 @@ mod charge_tests {
     /// The executors read the accounting mode in at most this many places outside tests.
     /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, to the planning and
     /// routing sites that stage 6 removes, so that new twins do not come back.
-    const MODE_CHECKS: usize = 26;
+    const MODE_CHECKS: usize = 19;
 
     /// Counts the calls of `is_cursor()` in the non-test sources of the SPARQL engine,
     /// and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453).
