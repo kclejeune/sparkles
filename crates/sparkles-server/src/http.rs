@@ -1731,8 +1731,9 @@ pub(crate) async fn run_query(
     // automatic admission even when scheduled in place. A first run has no history, so
     // it keeps automatic execution as on the blocking pool.
     // A text whose automatic cursor answered whole but slowly runs eagerly once, on the
-    // blocking pool, so that it settles in the faster mode (see `inline`).
-    let trial = auto && history == inline::History::TryEager;
+    // blocking pool, so that it settles in the faster mode (see `inline`). One request
+    // claims the trial, and requests that overlap it keep automatic execution.
+    let trial = auto && history == inline::History::TryEager && QUICK.claim_trial(quick_key);
     let auto = auto
         && !trial
         && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
@@ -1745,11 +1746,11 @@ pub(crate) async fn run_query(
             let t0 = crate::otel::start();
             let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
             let seq = snap.commit;
-            let automatic = |snap| {
+            let automatic = |snap, opts: &sparkles::sparql::QueryOptions| {
                 sparkles::sparql::query_execution_with_plan(
                     snap,
                     &query,
-                    &opts,
+                    opts,
                     &Default::default(),
                     sparkles::sparql::ExecutionMode::Auto,
                 )
@@ -1759,14 +1760,32 @@ pub(crate) async fn run_query(
                 })
             };
             let ran = if auto {
-                automatic(snap)
+                automatic(snap, &opts)
             } else if trial {
-                // An eager trial that outgrows a budget the cursor kept to runs as the
-                // cursor again, and its text is not tried eagerly again.
-                match sparkles::sparql::query_with_plan(snap.clone(), &query, &opts) {
-                    Err(f) if matches!(f.error, sparkles::Error::BudgetExceeded(_)) => {
+                // An eager trial that outgrows its memory budget runs again with automatic
+                // execution, as an eager run that automatic execution chose would, and its
+                // text is not tried eagerly again. The two runs count as one request: they
+                // share one deadline, one count of rows produced and one outbound budget.
+                let mut shared = opts.clone();
+                if let Some(timeout) = shared.timeout.take() {
+                    let deadline = std::time::Instant::now() + timeout;
+                    shared.deadline = Some(shared.deadline.map_or(deadline, |d| d.min(deadline)));
+                }
+                shared.work.get_or_insert_with(Default::default);
+                if shared.outbound_budget.is_none() {
+                    shared.outbound_budget =
+                        Some(sparkles::outbound::RequestBudget::new(&shared.outbound));
+                }
+                match sparkles::sparql::query_with_plan(snap.clone(), &query, &shared) {
+                    Err(f)
+                        if matches!(
+                            &f.error,
+                            sparkles::Error::BudgetExceeded(b)
+                                if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory)
+                        ) =>
+                    {
                         QUICK.record(quick_key, inline::EAGER_FAILED_MS);
-                        automatic(snap)
+                        automatic(snap, &shared)
                     }
                     ran => ran.map(Ran::Eager),
                 }

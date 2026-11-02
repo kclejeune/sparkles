@@ -251,6 +251,20 @@ impl QuickQueries {
         self.timeless.lock().insert(key);
     }
 
+    /// Claim the eager trial of a text whose history is [`History::TryEager`]. It is true
+    /// for one caller, and the text counts as slow until the trial records its run, so
+    /// that requests that overlap the trial keep automatic execution.
+    pub fn claim_trial(&self, key: u64) -> bool {
+        let mut set = self.quick.lock();
+        match set.get_mut(&key) {
+            Some(seen) if seen.history == History::TryEager => {
+                seen.history = History::Slow;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Record how long an eager run of the query took, in milliseconds of work, or
     /// infinity for a run of either kind that failed or streamed past one body.
     pub fn record(&self, key: u64, ms: f64) {
@@ -397,6 +411,14 @@ mod tests {
             History::TryEager,
             "a failure says nothing of eager time"
         );
+        // one request claims the trial, and the text is slow until the trial records
+        assert!(q.claim_trial(e));
+        assert!(!q.claim_trial(e));
+        assert_eq!(q.history(e), History::Slow);
+        q.record(e, 3.0);
+        assert_eq!(q.history(e), History::Quick(QuickExecution::Eager));
+        assert!(!q.claim_trial(e));
+        assert!(!q.claim_trial(99), "an unseen text has no trial");
     }
 
     #[test]

@@ -2543,6 +2543,37 @@ fn cursor_batches_spread_expensive_rows_over_the_pool() {
         .install(|| exec::map_batch(&ctx, 300, true, slow))
         .unwrap();
     assert_eq!(short.len(), 300);
+    // a budget without room for the parallel pieces keeps the batch on the calling
+    // thread, and with room the pieces are charged
+    let mut tight = Ctx::new(s.snapshot());
+    tight.enable_cursor_accounting().unwrap();
+    tight.mem_limit = 1024;
+    assert!(caller_in(&pool, &tight, &slow));
+    let before = tight.mem_peak();
+    tight.mem_limit = u64::MAX;
+    assert!(!caller_in(&pool, &tight, &slow));
+    assert!(
+        tight.mem_peak() >= before + 3840 * 16,
+        "the pieces were charged"
+    );
+}
+
+/// Whether every row of a 4096-row batch of `f` ran on the thread that called
+/// [`exec::map_batch`] under `ctx`.
+fn caller_in(
+    pool: &rayon::ThreadPool,
+    ctx: &Ctx,
+    f: &(dyn Fn(usize) -> (usize, std::thread::ThreadId) + Sync),
+) -> bool {
+    pool.install(|| {
+        let me = std::thread::current().id();
+        let rows = exec::map_batch(ctx, 4096, true, f).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (0..4096).collect::<Vec<_>>()
+        );
+        rows.iter().all(|r| r.1 == me)
+    })
 }
 
 /// Cursor BIND and FILTER over date functions and decimal arithmetic, which the cursor

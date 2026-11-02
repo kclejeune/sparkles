@@ -113,22 +113,27 @@ pub(super) fn map_batch<T: Send>(
         && rayon::current_num_threads() > 1
         && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
-        // the pieces' own vectors before they are appended, as `map_rows` reserves them
+        // Each piece of the rest is its own vector until it is appended to `out`, which
+        // already holds room for every row, so the pieces are the memory this adds.
+        let starts: Vec<usize> = (sample..n).step_by(BATCH_PAR_PIECE).collect();
         let bytes = (rest as u64)
             .saturating_mul(std::mem::size_of::<T>() as u64)
-            .saturating_add(rayon::current_num_threads() as u64 * 1024);
+            .saturating_add(
+                (starts.len() as u64)
+                    .saturating_mul(std::mem::size_of::<Result<Vec<T>>>() as u64 + 16),
+            );
         if let Ok(_scratch) = ctx.charge(bytes) {
-            let mapped: Vec<T> = (sample..n)
+            // an indexed collect writes each piece's slot in place
+            let pieces: Vec<Result<Vec<T>>> = starts
                 .into_par_iter()
-                .with_min_len(BATCH_PAR_PIECE)
-                .map(|i| {
-                    if i.is_multiple_of(1024) {
-                        ctx.check()?;
-                    }
-                    Ok(f(i))
+                .map(|start| {
+                    ctx.check()?;
+                    Ok((start..(start + BATCH_PAR_PIECE).min(n)).map(&f).collect())
                 })
-                .collect::<Result<_>>()?;
-            out.extend(mapped);
+                .collect();
+            for piece in pieces {
+                out.extend(piece?);
+            }
             return Ok(out);
         }
     }
