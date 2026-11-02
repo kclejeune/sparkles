@@ -1573,9 +1573,15 @@ impl Asking<'_, '_> {
             } else {
                 prompts::draft()
             };
+            // a repair also offers its follow-up form, which an OpenAI provider with
+            // prompt caching receives so that it reads the first draft's cached prefix
+            let follow = repair.as_deref().filter(|_| !scoped).map(|r| {
+                prompts::draft_follow(&self.o.question, &ground.stable, &ground.context, notes, r)
+            });
             let prompt = Prompt {
                 system: vec![Part::cached(prompts::SYSTEM)],
                 user,
+                follow,
             };
             let (value, level, pair) = match self.call(role, &prompt, &schema) {
                 Ok(x) => x,

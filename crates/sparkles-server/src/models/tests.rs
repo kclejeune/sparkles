@@ -86,6 +86,81 @@ fn each_kind_gets_the_schema_in_its_member() {
     }
 }
 
+/// A prompt's follow-up form reaches an `openai` provider with `promptCaching.enabled` as
+/// two user messages, the earlier call's message first and unchanged. Without it, and for
+/// the anthropic kind, the provider gets the prompt's one user message.
+#[test]
+fn the_follow_up_form_reaches_only_an_openai_provider_that_asks_for_it() {
+    let prompt = Prompt {
+        system: vec![Part::cached("system text")],
+        user: vec![Part::cached("grounding"), Part::text("repair and format")],
+        follow: Some((
+            vec![Part::cached("grounding"), Part::text("format")],
+            vec![Part::text("repair and format")],
+        )),
+    };
+    for (kind, caching, want) in [
+        (
+            "openai",
+            json!({ "enabled": true }),
+            vec![
+                "grounding".to_string() + "format",
+                "repair and format".into(),
+            ],
+        ),
+        (
+            "openai",
+            json!({ "enabled": false }),
+            vec!["groundingrepair and format".to_string()],
+        ),
+        (
+            "anthropic",
+            json!({ "enabled": true }),
+            vec!["groundingrepair and format".to_string()],
+        ),
+    ] {
+        let k = if kind == "openai" {
+            Kind::Openai
+        } else {
+            Kind::Anthropic
+        };
+        let mock = MockModel::start(move |_, _| (200, mock::answer(k, r#"{"query":"ASK {}"}"#)));
+        let m = models(
+            json!({ "p": { "kind": kind, "endpoint": mock.url(), "promptCaching": caching } }),
+            &[],
+        );
+        m.call_prompt(
+            Some(Role::Repair),
+            &Pair::new("p", "m1"),
+            &prompt,
+            &draft_schema(),
+            Instant::now() + Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        let body = &mock.requests()[0].body;
+        let users: Vec<String> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| match &m["content"] {
+                Value::String(s) => s.clone(),
+                Value::Array(b) => b.iter().map(|x| x["text"].as_str().unwrap()).collect(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(users, want, "{kind} {caching}");
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["role"] != "developer")
+        );
+    }
+}
+
 /// An `openai` endpoint that refuses `response_format` and answers plain text: the test
 /// call reports the plain-text level, and the draft is taken from its fenced block (A26).
 #[test]

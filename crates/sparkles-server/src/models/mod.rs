@@ -251,6 +251,11 @@ pub fn usage_total<'a>(steps: impl IntoIterator<Item = &'a StepRecord>) -> admis
 pub struct Prompt {
     pub system: Vec<Part>,
     pub user: Vec<Part>,
+    /// The same request as two user messages, for a provider that caches a prefix only
+    /// where the latest user message ends ([`ProviderConfig::follows_up`]): an earlier
+    /// call's message unchanged, then what this call adds. Every other provider gets
+    /// `user`.
+    pub follow: Option<(Vec<Part>, Vec<Part>)>,
 }
 
 impl Prompt {
@@ -259,6 +264,7 @@ impl Prompt {
         Prompt {
             system: vec![Part::cached(system)],
             user: vec![Part::text(user)],
+            follow: None,
         }
     }
 }
@@ -774,7 +780,14 @@ impl Models {
         let mut last: Option<StepError> = None;
         for (i, &level) in levels.iter().enumerate() {
             let has_next = detecting && i + 1 < levels.len();
-            let mut messages = structured::messages(&prompt.user, out, level);
+            let mut messages = match &prompt.follow {
+                Some((first, then)) if p.follows_up() => {
+                    let mut m = structured::messages(first, out, level);
+                    m.extend(structured::messages(then, out, level));
+                    m
+                }
+                _ => structured::messages(&prompt.user, out, level),
+            };
             for attempt in 0..2 {
                 if let Some(cap) = p.budget.and_then(|b| b.tokens_per_day) {
                     let mut t = rt.tokens.lock();

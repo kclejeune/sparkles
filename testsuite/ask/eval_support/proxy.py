@@ -1001,8 +1001,8 @@ class OpenAIAPI:
         return self.cost(model, reply, limit)[0]
 
     def provider(self, port, proxy):
-        # promptCaching ends each user message at its cached part, so a repair reads
-        # the prefix that the first draft wrote
+        # promptCaching sends a repair as the first draft's message and a second user
+        # message, so the repair reads the prefix that the first draft wrote
         out = {
             "kind": "openai",
             "endpoint": f"http://127.0.0.1:{port}/v1",

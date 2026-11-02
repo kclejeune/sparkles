@@ -255,6 +255,22 @@ pub fn draft_user(
     ]
 }
 
+/// The follow-up form of a repair: the first draft's user message unchanged, then a
+/// second user message with the repair and the format. A provider that caches only where
+/// the latest user message ends reads the first message from the first draft's cache.
+pub fn draft_follow(
+    question: &str,
+    stable: &str,
+    context: &str,
+    notes: &[String],
+    repair: &str,
+) -> (Vec<Part>, Vec<Part>) {
+    (
+        draft_user(question, stable, context, notes, None),
+        vec![Part::text(format!("{}\n\n{DRAFT_FORMAT}", repair.trim()))],
+    )
+}
+
 /// The user message of a summary.
 pub fn summary_user(question: &str, query: &str, rows: &str, total: &str) -> String {
     format!(
@@ -268,6 +284,26 @@ pub fn summary_user(question: &str, query: &str, rows: &str, total: &str) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repair's follow-up form starts with the first draft's user message byte for byte,
+    /// and its second message holds the repair and the format.
+    #[test]
+    fn the_follow_up_form_repeats_the_first_draft() {
+        let notes = vec!["A note.".to_string()];
+        let first = draft_user("Who?", "stable\n", "ctx", &notes, None);
+        let (head, then) = draft_follow(
+            "Who?",
+            "stable\n",
+            "ctx",
+            &notes,
+            "Your previous query failed.",
+        );
+        assert_eq!(head, first);
+        assert_eq!(then.len(), 1);
+        assert!(!then[0].cache);
+        assert!(then[0].text.starts_with("Your previous query failed.\n\n"));
+        assert!(then[0].text.ends_with(DRAFT_FORMAT));
+    }
 
     #[test]
     fn text_level_and_markers() {

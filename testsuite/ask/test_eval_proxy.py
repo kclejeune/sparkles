@@ -1391,5 +1391,5 @@ class OpenAI(Base):
         p = proxy.config(200000)["models"]["providers"]["evaluation"]
         self.assertEqual((p["kind"], p["endpoint"], p["reasoningEffort"]),
                          ("openai", "http://127.0.0.1:5/v1", "medium"))
-        # a repair's tail goes in a developer message, so it reads the cached question
+        # a repair repeats the first draft's message, so it reads the cached question
         self.assertEqual(p["promptCaching"], {"enabled": True})

@@ -1373,7 +1373,7 @@ fn models(put: &mut dyn FnMut(&str, J)) {
             "allowedModels": strings(),
             "requestsPerMinute": int(),
             "budget": with_desc(obj(&["tokensPerDay", "usedToday"], json!({ "tokensPerDay": int(), "usedToday": int() })), "`usedToday` counts input written to the prompt cache at 1.25 tokens, or 2 tokens with the 1-hour TTL, and input read from it at 0.1 token."),
-            "promptCaching": with_desc(obj(&["enabled"], json!({ "enabled": boolean(), "ttl": string_enum(&["5m", "1h"]) })), "For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. For the openai kind, enabled true sends the text after each user message's last cached part as a developer message."),
+            "promptCaching": with_desc(obj(&["enabled"], json!({ "enabled": boolean(), "ttl": string_enum(&["5m", "1h"]) })), "For the anthropic kind: whether stable prompt prefixes are marked for the provider's cache, and their TTL. For the openai kind, enabled true sends an Ask repair as the first draft's user message followed by a second user message."),
             "unverified": with_desc(boolean(), "True when `tls.insecureSkipVerify` turns certificate verification off for the provider."),
             "tls": with_desc(obj(&["verification"], json!({
                 "verification": with_desc(string_enum(&["system", "custom-ca", "off"]), "How the provider's certificate is checked: against the system roots, against them and `tls.caCert`, or not at all."),

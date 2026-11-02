@@ -151,6 +151,7 @@ describe('the form of the models kind', () => {
       'temperature',
       'structuredOutput',
       'requestTimeoutSecs',
+      'reasoningEffort',
       'pricing.inputPerMTok',
       'pricing.outputPerMTok',
       'pricing.cacheWritePerMTok',

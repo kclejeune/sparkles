@@ -11951,11 +11951,10 @@ caches long prompts on its own.
 OpenAI writes a cached prefix only where the latest user message ends, so a repair that
 changes the text after the question cannot read the prefix that the first draft wrote
 when the whole prompt is one message. An `openai` provider whose `promptCaching` sets
-`enabled` to `true` therefore ends each user message at its last marked part and sends
-the rest, such as a repair's diagnosis and the answer format, as a developer message
-with the same text. It is off by default, since a server that only follows the OpenAI
-protocol may refuse the developer role, and `promptCaching.ttl` applies to the
-`anthropic` kind only.
+`enabled` to `true` therefore receives an Ask repair as the first draft's user message,
+unchanged, followed by a second user message with the repair and the answer format.
+Every message keeps the user role. It is off by default because it changes the shape of
+the prompt, and `promptCaching.ttl` applies to the `anthropic` kind only.
 
 ```json
 "claude": {
