@@ -2,6 +2,7 @@
   // One field of an editing form (docs/specs/U02-shape-driven-forms.md §2.2, §2.3): its
   // label and help, an input per value in the widget its constraints choose, and the
   // problems of the browser's checks and the server's check under it.
+  import type { Snippet } from 'svelte';
   import type { Term } from '$lib/api';
   import {
     choiceGroup,
@@ -9,6 +10,7 @@
     entryTerm,
     fieldDomId,
     multiValued,
+    optionFields,
     REASONS,
     required,
     resultText,
@@ -26,6 +28,7 @@
   import { numberStep, typeBounds, XSD } from '$lib/xsd';
   import { searchInstances } from '$lib/explore';
   import EntityPicker from './EntityPicker.svelte';
+  import MemberList from './MemberList.svelte';
   import TermView from './TermView.svelte';
 
   let {
@@ -39,6 +42,9 @@
     prefixes,
     lang = 'en',
     fullText = false,
+    child,
+    onaddchild,
+    key,
   }: {
     field: FormField;
     widget: Widget;
@@ -55,18 +61,39 @@
     lang?: string;
     /** The dataset's full-text index is ready, so the entity picker searches with it. */
     fullText?: boolean;
+    /** Renders the nested form of a blank-node value (U02 §2.3.1). */
+    child?: Snippet<[Term]>;
+    /** Adds a new nested child to this field; absent when the field cannot take one. */
+    onaddchild?: () => void;
+    /** The field's state key, which names its DOM ids (the field id on the root). */
+    key?: string;
   } = $props();
 
-  /** The entity picker's search: instances of the field's classes, by label. */
-  const searchHits = (text: string, signal: AbortSignal) =>
-    searchInstances(ds, text, { classes: c.class ?? [], fullText, signal });
+  /** The options of an `sh:or` or `sh:xone` field, as pseudo-fields of one value each. */
+  const options_ = $derived(optionFields(field));
+  /** The field an entry is edited and checked as: its option's, or the field itself. */
+  const fieldOf = (e: Entry | undefined) =>
+    options_.length ? (options_[e?.option ?? 0] ?? options_[0]) : field;
+  /** The widget of an entry: its option's, or the field's. */
+  const widgetFor = (e: Entry | undefined): Widget =>
+    options_.length ? fieldOf(e).widget : widget;
 
-  const base = $derived(fieldDomId(field.id));
+  /** The entity picker's search: instances of the classes of the entry's field, by label. */
+  const searchFor = (e: Entry) => (text: string, signal: AbortSignal) =>
+    searchInstances(ds, text, { classes: fieldOf(e).constraints.class ?? [], fullText, signal });
+
+  const base = $derived(fieldDomId(key ?? field.id));
   const c = $derived(field.constraints);
   const viewer = $derived(viewerOf(field));
   const many = $derived(multiValued(field));
   const req = $derived(required(field));
   const options = $derived(c.in ?? []);
+  /** The allowed values of an entry: its option's, or the field's. */
+  const optionsOf = (e: Entry | undefined) =>
+    options_.length ? (fieldOf(e).constraints.in ?? []) : options;
+  /** The languages of an entry: its option's, or the field's. */
+  const langsOf = (e: Entry | undefined) =>
+    (options_.length ? fieldOf(e).constraints.languageIn : c.languageIn) ?? [];
   /** Checkboxes or a radio group for a list of allowed values (`choiceGroup`). */
   const group = $derived(choiceGroup(field, widget));
   const errId = $derived(`${base}-problems`);
@@ -95,15 +122,14 @@
     c.maxCount !== undefined && entries.filter((e) => e.term).length >= c.maxCount,
   );
   const noted = $derived(serverPatterns(field));
-  const inputType = $derived(
-    widget === 'date'
+  const inputTypeOf = (w: Widget) =>
+    w === 'date'
       ? 'date'
-      : widget === 'datetime'
+      : w === 'datetime'
         ? 'datetime-local'
-        : widget === 'number'
+        : w === 'number'
           ? 'number'
-          : 'text',
-  );
+          : 'text';
   const bounds = $derived.by(() => {
     const b = typeBounds(c.datatype);
     const lit = (t: Term | undefined) => (t?.type === 'literal' ? t.value : undefined);
@@ -112,7 +138,6 @@
       max: lit(c.maxInclusive) ?? b.max,
     };
   });
-  const langs = $derived(c.languageIn ?? []);
 
   /** The id of an entry's input: the field's own id for the first. */
   const inputId = (i: number) => (i === 0 ? base : `${base}-${i}`);
@@ -121,7 +146,8 @@
     many && entries.length > 1 ? `${field.label} ${i + 1}` : field.label;
 
   function setText(i: number, text: string, langTag = entries[i].lang) {
-    const r = entryTerm(field, widget, text, langTag, prefixes, entries[i].zone);
+    const e = entries[i];
+    const r = entryTerm(fieldOf(e), widgetFor(e), text, langTag, prefixes, e.zone);
     entries[i] = { ...entries[i], text, lang: langTag, term: r.term, error: r.error };
   }
 
@@ -135,9 +161,18 @@
     };
   }
 
+  /** Choose the option of an entry: its value starts again in that option's widget. */
+  function setOption(i: number, option: number) {
+    const e = entryOf(null, options_[option]?.widget ?? widget);
+    if (e.lang === '' && options_[option]?.widget === 'text-lang')
+      e.lang = options_[option].constraints.languageIn?.[0] ?? lang;
+    entries[i] = { ...e, key: entries[i].key, option };
+  }
+
   function add() {
-    const e = entryOf(null, widget);
-    if (widget === 'text-lang') e.lang = langs[0] ?? lang;
+    if (onaddchild) return onaddchild();
+    const e = entryOf(null, widgetFor(undefined));
+    if (widgetFor(undefined) === 'text-lang') e.lang = langsOf(undefined)[0] ?? lang;
     entries = [...entries, e];
     queueMicrotask(() => document.getElementById(inputId(entries.length - 1))?.focus());
   }
@@ -249,6 +284,23 @@
         {/if}
       </div>
     </fieldset>
+  {:else if widget === 'list'}
+    <div class="ff-head">
+      <span class="ff-label" id="{base}-label">{field.label}</span>
+      {#if req}<span class="req">required</span>{/if}
+    </div>
+    {#if field.description}<p class="help" id={helpId}>{field.description}</p>{/if}
+    <MemberList
+      {field}
+      bind:entries
+      {editable}
+      {base}
+      problems={problems.filter((p) => p.index !== null)}
+      {ds}
+      {prefixes}
+      {fullText}
+      {lang}
+    />
   {:else}
     <div class="ff-head">
       {#if many}
@@ -265,13 +317,30 @@
       aria-labelledby={many ? `${base}-label` : undefined}
     >
       {#each entries as e, i (e.key)}
-        <div class="value-row">
-          {#if e.readOnly && e.term}
+        {@const ew = widgetFor(e)}
+        {@const el = langsOf(e)}
+        <div class="value-row" class:nested-row={!!child && e.term?.type === 'bnode'}>
+          {#if options_.length && !e.readOnly && !(child && e.term?.type === 'bnode')}
+            <select
+              class="select option"
+              aria-label="Kind of {nameOf(i)}"
+              value={e.option ?? 0}
+              onchange={(ev) => setOption(i, Number(ev.currentTarget.value))}
+            >
+              {#each c.or?.options ?? [] as o, k (o.shape)}<option value={k}>{o.label}</option
+                >{/each}
+            </select>
+          {/if}
+          {#if child && e.term?.type === 'bnode'}
+            <div class="child" id={inputId(i)} tabindex="-1" aria-label={nameOf(i)} role="group">
+              {@render child(e.term)}
+            </div>
+          {:else if e.readOnly && e.term}
             <div class="ro-value" id={inputId(i)} tabindex="-1" aria-describedby="{inputId(i)}-ro">
               <TermView term={e.term} {prefixes} />
               <span class="faint small" id="{inputId(i)}-ro">in a graph you cannot write to</span>
             </div>
-          {:else if widget === 'select' && options.length}
+          {:else if (ew === 'select' || ew === 'radio') && optionsOf(e).length}
             <select
               class="select"
               id={inputId(i)}
@@ -285,11 +354,11 @@
               }}
             >
               <option value="">{req ? 'Choose a value' : 'None'}</option>
-              {#each options as o (optionKey(o))}
+              {#each optionsOf(e) as o (optionKey(o))}
                 <option value={optionKey(o)}>{optionText(o)}</option>
               {/each}
             </select>
-          {:else if widget === 'checkbox'}
+          {:else if ew === 'checkbox'}
             <input
               type="checkbox"
               id={inputId(i)}
@@ -298,7 +367,7 @@
                 (e.term.value === 'true' || e.term.value === '1')}
               onchange={(ev) => setTerm(i, boolTerm(ev.currentTarget.checked))}
             />
-          {:else if widget === 'boolean-select'}
+          {:else if ew === 'boolean-select'}
             <select
               class="select"
               id={inputId(i)}
@@ -320,7 +389,7 @@
               <option value="true">true</option>
               <option value="false">false</option>
             </select>
-          {:else if widget === 'entity'}
+          {:else if ew === 'entity'}
             <EntityPicker
               id={inputId(i)}
               label={nameOf(i)}
@@ -329,14 +398,14 @@
               {prefixes}
               describedby={entryDescribedby(i)}
               invalid={hasProblems}
-              search={searchHits}
+              search={searchFor(e)}
               bind:value={
                 () =>
                   e.term ? { term: e.term, label: e.label ?? displayTerm(e.term, prefixes) } : null,
                 (v) => setTerm(i, v?.term ?? null, v?.label)
               }
             />
-          {:else if widget === 'textarea'}
+          {:else if ew === 'textarea'}
             <textarea
               class="textarea"
               id={inputId(i)}
@@ -349,38 +418,37 @@
           {:else}
             <input
               class="input"
-              class:mono={widget === 'term' || widget === 'iri'}
-              type={inputType}
+              class:mono={ew === 'term' || ew === 'iri'}
+              type={inputTypeOf(ew)}
               id={inputId(i)}
               aria-label={many ? nameOf(i) : undefined}
               aria-describedby={entryDescribedby(i)}
               aria-invalid={hasProblems || e.error ? true : undefined}
-              step={widget === 'number'
-                ? numberStep(c.datatype)
-                : widget === 'datetime'
+              step={ew === 'number'
+                ? numberStep(fieldOf(e).constraints.datatype)
+                : ew === 'datetime'
                   ? '1'
                   : undefined}
-              min={widget === 'number' ? bounds.min : undefined}
-              max={widget === 'number' ? bounds.max : undefined}
-              placeholder={widget === 'term'
+              min={ew === 'number' ? bounds.min : undefined}
+              max={ew === 'number' ? bounds.max : undefined}
+              placeholder={ew === 'term'
                 ? 'IRI, prefixed name or "literal"'
-                : widget === 'iri'
+                : ew === 'iri'
                   ? 'IRI or prefixed name'
                   : undefined}
               value={e.text}
               oninput={(ev) => setText(i, ev.currentTarget.value)}
             />
-            {#if widget === 'text-lang'}
-              {#if langs.length}
+            {#if ew === 'text-lang'}
+              {#if el.length}
                 <select
                   class="select lang"
                   aria-label="Language of {nameOf(i)}"
                   value={e.lang}
                   onchange={(ev) => setText(i, e.text, ev.currentTarget.value)}
                 >
-                  {#if !langs.includes(e.lang)}<option value={e.lang}>{e.lang || 'none'}</option
-                    >{/if}
-                  {#each langs as l (l)}<option value={l}>{l}</option>{/each}
+                  {#if !el.includes(e.lang)}<option value={e.lang}>{e.lang || 'none'}</option>{/if}
+                  {#each el as l (l)}<option value={l}>{l}</option>{/each}
                 </select>
               {:else}
                 <input
@@ -393,7 +461,7 @@
               {/if}
             {/if}
           {/if}
-          {#if !e.readOnly && (many || (!req && widget === 'entity' && e.term))}
+          {#if !e.readOnly && (many || (!req && (ew === 'entity' || (!!child && e.term?.type === 'bnode')) && e.term))}
             <button
               type="button"
               class="btn sm ghost icon"
@@ -416,7 +484,7 @@
           </div>
         {/if}
       {/each}
-      {#if many}
+      {#if many || (onaddchild && !entries.some((e) => e.term))}
         <button
           type="button"
           class="btn sm add"
@@ -540,6 +608,19 @@
   .problem {
     margin: 0;
     color: var(--danger);
+  }
+  .option {
+    flex: 0 0 auto;
+    max-width: 10rem;
+  }
+  .nested-row {
+    align-items: flex-start;
+  }
+  .child {
+    flex: 1 1 100%;
+    min-width: 0;
+    border-left: 2px solid var(--border, #ccc);
+    padding: 2px 0 2px 10px;
   }
   .problem.server {
     color: var(--warn);

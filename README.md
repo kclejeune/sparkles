@@ -257,6 +257,14 @@ editor. The collapsed panel below it has more workflows and detail views.
     <td>The ontology editor: class trees and an entity's frame</td>
     <td>Asserted and inferred class hierarchies side by side</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/forms-nested.png" alt="The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes"></td>
+    <td><img src="docs/images/forms-list.png" alt="The editing form of a SKOS collection, with its member chosen as a Concept among the alternatives of sh:or and its ordered member list after fish moved up, each member with buttons that move or remove it"></td>
+  </tr>
+  <tr>
+    <td>Nested blank-node children edited in one form and one commit</td>
+    <td>An ordered list editor and a choice among sh:or alternatives</td>
+  </tr>
 </table>
 
 <details>

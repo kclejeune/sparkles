@@ -760,3 +760,215 @@ async fn a_new_instance_gets_a_minted_iri() {
         String::from_utf8_lossy(&r.body)
     );
 }
+
+const SKOS_SHAPES: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> . @prefix skosxl: <http://www.w3.org/2008/05/skos-xl#> .
+ex:ConceptShape a sh:NodeShape ; sh:targetClass skos:Concept ;
+  sh:property [ sh:path skos:prefLabel ; sh:datatype rdf:langString ; sh:uniqueLang true ] ;
+  sh:property [ sh:path skosxl:prefLabel ; sh:node ex:XLabel ; sh:nodeKind sh:BlankNode ] .
+ex:XLabel sh:property [ sh:path skosxl:literalForm ; sh:datatype rdf:langString ; sh:minCount 1 ] .
+ex:OrderedShape a sh:NodeShape ; sh:targetClass skos:OrderedCollection ;
+  sh:property [ sh:path skos:memberList ; sh:memberShape [ sh:class skos:Concept ] ] ;
+  sh:property [ sh:path skos:member ; sh:or ( [ sh:class skos:Concept ] [ sh:class skos:Collection ] ) ] .
+"#;
+
+/// Nested children, lists and value alternatives over HTTP: the nested model, an atomic
+/// save of a child's field, its conflict with the child's node, a list change and the
+/// body checks of nested entries.
+#[tokio::test]
+async fn nested_children_lists_and_alternatives_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    let st = Arc::new(st);
+    st.create("skos", DbType::Persistent).unwrap();
+    let app = router(st.clone());
+    let data = r#"PREFIX ex: <http://example.org/> PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+      PREFIX skosxl: <http://www.w3.org/2008/05/skos-xl#>
+      INSERT DATA { ex:cats a skos:Concept ; skos:prefLabel "Cats"@en ;
+        skosxl:prefLabel [ skosxl:literalForm "Cats"@en ] .
+        ex:dogs a skos:Concept . ex:ranked a skos:OrderedCollection ; skos:memberList ( ex:cats ) . }"#;
+    let r = send(
+        &app,
+        "POST",
+        "/skos/update",
+        "application/sparql-update",
+        data,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let cfg = json!({ "mode": "reject", "shapes": { "inline": SKOS_SHAPES } });
+    let r = send(
+        &app,
+        "PUT",
+        "/$/validation/skos",
+        "application/json",
+        &cfg.to_string(),
+    )
+    .await;
+    assert!(
+        r.status.is_success(),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    let uri = format!(
+        "/$/forms/skos?focus={}&nested=true",
+        enc(&format!("{EX}cats"))
+    );
+    let r = send(&app, "GET", &uri, "", "").await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let m = r.json();
+    let nodes = m["nestedNodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    let label = nodes[0]["term"]["value"].as_str().unwrap().to_string();
+    assert_eq!(nodes[0]["anchors"][0]["parent"], "root");
+    // a template names its shapes in `node`, apart from the model's own `shapes`
+    let templates = m["templates"].as_array().unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0]["node"], json!([format!("<{EX}XLabel>")]));
+    assert!(templates[0]["shapes"]["nodeShapes"].is_array());
+    let xl = "<http://www.w3.org/2008/05/skos-xl#prefLabel>";
+    let form = "<http://www.w3.org/2008/05/skos-xl#literalForm>";
+    let cats = |v: &str| json!({ "type": "literal", "value": v, "xml:lang": "en" });
+    let body = json!({
+        "focus": format!("{EX}cats"),
+        "changes": [],
+        "nested": [{
+            "node": { "type": "bnode", "value": label },
+            "field": xl,
+            "changes": [{ "field": form, "remove": [cats("Cats")], "add": [cats("House cats")] }],
+            "expect": { form: [cats("Cats")] },
+        }],
+        "message": "rename the XL label",
+    });
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/skos/check",
+        "application/json",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let j = r.json();
+    assert_eq!(j["validation"]["conforms"], true, "{j}");
+    assert!(
+        j["update"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("_:{label}"))
+    );
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/skos/save",
+        "application/json",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/skos/save",
+        "application/json",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    let j = r.json();
+    assert_eq!(j["code"], "form-conflict");
+    assert_eq!(j["fields"][0]["id"], form);
+    assert_eq!(j["fields"][0]["node"]["value"], label.as_str());
+
+    // the ordered collection's members: a list and alternatives
+    let uri = format!("/$/forms/skos?focus={}", enc(&format!("{EX}ranked")));
+    let m = send(&app, "GET", &uri, "", "").await.json();
+    let fields = m["fields"].as_array().unwrap();
+    let list = fields
+        .iter()
+        .find(|f| f["path"] == "http://www.w3.org/2004/02/skos/core#memberList")
+        .unwrap();
+    assert_eq!(list["widget"], "list");
+    assert_eq!(
+        list["values"][0]["items"][0]["term"]["value"],
+        format!("{EX}cats")
+    );
+    let member = fields
+        .iter()
+        .find(|f| f["path"] == "http://www.w3.org/2004/02/skos/core#member")
+        .unwrap();
+    assert_eq!(
+        member["constraints"]["or"]["options"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let iri = |l: &str| json!({ "type": "uri", "value": format!("{EX}{l}") });
+    let body = json!({
+        "focus": format!("{EX}ranked"),
+        "changes": [{ "field": "<http://www.w3.org/2004/02/skos/core#memberList>",
+                      "list": [iri("dogs"), iri("cats")] }],
+        "expect": { "<http://www.w3.org/2004/02/skos/core#memberList>": [iri("cats")] },
+    });
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/skos/save",
+        "application/json",
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let m = send(&app, "GET", &uri, "", "").await.json();
+    let list = m["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "http://www.w3.org/2004/02/skos/core#memberList")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        list["values"][0]["items"][0]["term"]["value"],
+        format!("{EX}dogs")
+    );
+
+    // body checks of nested entries
+    let bad = json!({ "focus": format!("{EX}cats"), "changes": [],
+                      "nested": [{ "node": "x", "field": xl, "colour": 1 }] });
+    let r = send(
+        &app,
+        "POST",
+        "/$/forms/skos/check",
+        "application/json",
+        &bad.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&r.body).contains("unknown member 'colour'"));
+    let r = send(&app, "GET", &format!("{uri}&nested=maybe"), "", "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}

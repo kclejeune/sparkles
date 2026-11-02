@@ -451,3 +451,103 @@ fn fields_merge_by_path_and_keep_the_stricter_constraints() {
     ));
     assert!(!layout.closed);
 }
+
+#[test]
+fn value_alternatives_and_list_constraints_reach_the_layout_in_both_builders() {
+    let text = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+  sh:property [ sh:path ex:v ; sh:xone ( [ sh:datatype xsd:string ; sh:name "Text" ]
+                                         [ sh:class ex:Org ] ) ] ;
+  sh:property [ sh:path ex:w ; sh:or ( [ sh:property [ sh:path ex:x ] ] [ sh:class ex:Org ] ) ] ;
+  sh:property [ sh:path ex:l ; sh:memberShape [ sh:datatype xsd:integer ] ;
+                sh:minListLength 1 ; sh:maxListLength 4 ; sh:uniqueMembers true ] .
+"#;
+    let shapes = Shapes::parse(text, RdfFormat::Turtle, None).unwrap();
+    let s = shapes
+        .shape_id(&Term::NamedNode(ex("S")))
+        .expect("the node shape");
+    let mut units = 0usize;
+    for layout in [
+        form_layout(&shapes, &[s]),
+        form_layout_with(&shapes, &[s], &mut || {
+            units += 1;
+            Ok(())
+        })
+        .unwrap(),
+    ] {
+        let field = |p: &str| {
+            layout
+                .fields
+                .iter()
+                .find(|f| f.path == FieldPath::Predicate(ex(p)))
+                .unwrap()
+        };
+        let v = field("v");
+        let alt = v.constraints.alternatives.as_ref().expect("value options");
+        assert_eq!(alt.kind.name(), "xone");
+        assert_eq!(alt.options.len(), 2);
+        assert_eq!(alt.options[0].names[0].value(), "Text");
+        assert_eq!(alt.options[1].constraints.classes, vec![ex("Org")]);
+        assert!(
+            v.constraints.server.is_empty(),
+            "{:?}",
+            v.constraints.server
+        );
+        // an option with property shapes is the server's
+        let w = field("w");
+        assert!(w.constraints.alternatives.is_none());
+        assert!(
+            w.constraints
+                .server
+                .iter()
+                .any(|c| c.ends_with("OrConstraintComponent"))
+        );
+        let l = field("l");
+        assert_eq!(l.widget(), "list");
+        let list = l.constraints.list.as_ref().unwrap();
+        assert_eq!(
+            (list.min_length, list.max_length, list.unique),
+            (Some(1), Some(4), true)
+        );
+        assert_eq!(
+            list.member.datatype.as_ref().map(|d| d.as_str()),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+    }
+    assert!(units > 0);
+}
+
+#[test]
+fn a_member_shape_that_names_itself_ends_at_one_level() {
+    let text = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+  sh:property [ sh:path ex:l ; sh:memberShape ex:M ] .
+ex:M sh:memberShape ex:M ; sh:minListLength 1 ; sh:datatype xsd:integer .
+"#;
+    let shapes = Shapes::parse(text, RdfFormat::Turtle, None).unwrap();
+    let s = shapes
+        .shape_id(&Term::NamedNode(ex("S")))
+        .expect("the node shape");
+    for layout in [
+        form_layout(&shapes, &[s]),
+        form_layout_with(&shapes, &[s], &mut || Ok(())).unwrap(),
+    ] {
+        let l = &layout.fields[0];
+        let list = l.constraints.list.as_ref().expect("a list field");
+        assert!(list.member.list.is_none());
+        assert_eq!(
+            list.member.datatype.as_ref().map(|d| d.as_str()),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+        assert!(
+            list.member
+                .server
+                .iter()
+                .any(|c| c.ends_with("MemberShapeConstraintComponent"))
+        );
+    }
+}

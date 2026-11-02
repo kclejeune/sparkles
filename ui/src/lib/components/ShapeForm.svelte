@@ -20,16 +20,25 @@
     changeSet,
     checkField,
     choiceGroup,
+    detachLost,
     entryOf,
     fieldDomId,
+    fieldKey,
     grouped,
+    listItems,
+    nestedField,
+    optionOf,
+    reachable,
     resultText,
+    sameTerm,
     savePlan,
+    templateFits,
     widgetOf,
     type Entry,
     type FieldResult,
     type FormField as Field,
     type FormModel,
+    type FormNode,
     type Problem,
   } from '$lib/forms';
   import {
@@ -44,6 +53,7 @@
   import DiffLines from './DiffLines.svelte';
   import FormField from './FormField.svelte';
   import Icon from './Icon.svelte';
+  import NodeFields from './NodeFields.svelte';
   import TermView from './TermView.svelte';
 
   let {
@@ -79,7 +89,11 @@
   let model = $state<FormModel | null>(null);
   let loadError = $state<string | null>(null);
   let loading = $state(false);
+  /** The entries of every field by its key: the field id on the root, `{node} {id}` below. */
   let entries = $state<Record<string, Entry[]>>({});
+  /** The nested children the form shows: stored ones and new ones, by blank label. */
+  let nodes = $state<Record<string, FormNode>>({});
+  let newNodes = 0;
   let message = $state('');
   let check = $state<{ answer: FormCheckAnswer; key: string } | null>(null);
   let checking = $state(false);
@@ -102,11 +116,22 @@
     Object.fromEntries((model?.fields ?? []).map((f) => [f.id, widgetOf(f)])),
   );
 
-  function entriesOf(f: Field, m: FormModel): Entry[] {
+  function entriesOf(f: Field, m: Pick<FormModel, 'editable'>): Entry[] {
     const w = widgetOf(f);
-    const out = f.values.map((v) => entryOf(v.term, w, v.label, v.readOnly));
-    // radio groups and checkbox lists render from the options, not from the entries
-    if (!out.length && f.editable && m.editable && !choiceGroup(f, w)) {
+    // a list field edits the members of its list
+    if (f.constraints.list) {
+      const mw = f.constraints.list.memberWidget;
+      return listItems(f).map((v) => entryOf(v.term, mw, v.label, v.readOnly));
+    }
+    const or = f.constraints.or;
+    const out = f.values.map((v) => {
+      if (!or) return entryOf(v.term, w, v.label, v.readOnly);
+      const o = optionOf(f, v.term);
+      return { ...entryOf(v.term, or.options[o].widget, v.label, v.readOnly), option: o };
+    });
+    // a nested field adds children with its button; radio groups and checkbox lists render
+    // from the options, not from the entries
+    if (!out.length && f.editable && m.editable && !choiceGroup(f, w) && !nestedField(f)) {
       const e = entryOf(null, w);
       if (w === 'text-lang') e.lang = f.constraints.languageIn?.[0] ?? lang;
       out.push(e);
@@ -123,12 +148,23 @@
       const m = await getForm(ds, iri, {
         branch,
         lang,
+        nested: true,
         signal: c.signal,
         ...(cls ? { class: cls } : {}),
       });
       if (c !== ctl) return;
       model = m;
-      entries = Object.fromEntries(m.fields.map((f) => [f.id, entriesOf(f, m)]));
+      const es: Record<string, Entry[]> = Object.fromEntries(
+        m.fields.map((f) => [f.id, entriesOf(f, m)]),
+      );
+      const ns: Record<string, FormNode> = {};
+      for (const n of m.nestedNodes ?? []) {
+        if (n.term.type !== 'bnode') continue;
+        ns[n.term.value] = { key: n.term.value, term: n.term, fields: n.fields, isNew: false };
+        for (const f of n.fields) es[fieldKey(n.term.value, f.id)] = entriesOf(f, m);
+      }
+      nodes = ns;
+      entries = es;
       check = null;
       conflicts = null;
       summaryShown = false;
@@ -178,20 +214,28 @@
     Object.fromEntries(Object.entries(entries).map(([id, es]) => [id, es.map((e) => e.term)])),
   );
   /** The browser's problems, by field (editable fields only: the others do not change). */
+  /** The fields the form shows by key: the root's, and those of reachable children. */
+  const liveFields = $derived.by(() => {
+    const out: [string, Field][] = (model?.fields ?? []).map((f) => [f.id, f]);
+    if (model)
+      for (const r of reachable(model, current, nodes))
+        for (const f of r.node.fields) out.push([fieldKey(r.node.key, f.id), f]);
+    return out;
+  });
   const problems = $derived.by(() => {
     const out: Record<string, Problem[]> = {};
-    for (const f of model?.fields ?? []) {
+    for (const [key, f] of liveFields) {
       if (!f.editable || !editable) continue;
-      const ps = checkField(f, current[f.id] ?? []);
-      (entries[f.id] ?? []).forEach((e, i) => {
+      const ps = checkField(f, current[key] ?? []);
+      (entries[key] ?? []).forEach((e, i) => {
         if (e.error) ps.push({ index: i, message: e.error });
       });
-      if (ps.length) out[f.id] = ps;
+      if (ps.length) out[key] = ps;
     }
     return out;
   });
   const problemCount = $derived(Object.values(problems).reduce((n, p) => n + p.length, 0));
-  const changes = $derived(model ? changeSet(model, current) : { changes: [], expect: {} });
+  const changes = $derived(model ? changeSet(model, current, nodes) : { changes: [], expect: {} });
   /** A new instance's save writes its type even when no field has a value. */
   const nChanges = $derived(changeCount(changes) + (cls ? 1 : 0));
   const changeKey = $derived(JSON.stringify(changes));
@@ -199,7 +243,7 @@
   const results = $derived(checkCurrent ? (check?.answer.validation.results ?? []) : []);
   const resultsByField = $derived.by(() => {
     const out: Record<string, FieldResult[]> = {};
-    for (const r of results) if (r.field) (out[r.field] ??= []).push(r);
+    for (const r of results) if (r.field) (out[resultKey(r)] ??= []).push(r);
     return out;
   });
   const otherResults = $derived(results.filter((r) => !r.field));
@@ -237,6 +281,7 @@
       ...(openBranch !== MAIN ? { branch: openBranch } : {}),
       changes: changes.changes,
       expect: changes.expect,
+      ...(changes.nested ? { nested: changes.nested } : {}),
       ...(message.trim() ? { message: message.trim() } : {}),
     };
   }
@@ -328,14 +373,78 @@
     }
   }
 
+  /** The state key of a conflict's field. */
+  function conflictKey(c: FieldConflict) {
+    return fieldKey(c.node?.type === 'bnode' ? c.node.value : null, c.id);
+  }
+
   /** Resolve a conflict: the stored values become the loaded ones, and `take` copies them. */
   function resolveConflict(c: FieldConflict, take: boolean) {
-    const f = model?.fields.find((x) => x.id === c.id);
+    const key = conflictKey(c);
+    const f = fieldOf(key);
     if (!f || !model) return;
-    f.values = c.now.map((term) => ({ term, graph: model!.graph }));
-    if (take) entries[f.id] = entriesOf(f, model);
-    conflicts = (conflicts ?? []).filter((x) => x.id !== c.id);
+    if (!take && f.constraints.node?.length) {
+      // the person keeps a child that another commit removed: it is saved as a new child
+      // with all its values, and so are the stored children under it
+      const lost = (entries[key] ?? [])
+        .map((e) => e.term)
+        .filter(
+          (t): t is Term =>
+            t?.type === 'bnode' && !!nodes[t.value] && !c.now.some((n) => sameTerm(n, t)),
+        )
+        .map((t) => t.value as string);
+      if (lost.length) {
+        const detached = detachLost(nodes, current, lost, key);
+        if (!detached) {
+          toasts.push(
+            'error',
+            'This child cannot be kept',
+            'Another commit removed it, and the form cannot write it again whole. Take the stored values or reload the form.',
+          );
+          return;
+        }
+        nodes = detached;
+      }
+    }
+    const graph = model.graph;
+    // a list field's conflict names the members of its list
+    f.values = f.constraints.list
+      ? [
+          {
+            term: f.values[0]?.term ?? { type: 'bnode', value: 'list' },
+            graph,
+            items: c.now.map((term) => ({ term, graph })),
+          },
+        ]
+      : c.now.map((term) => ({ term, graph }));
+    if (take) entries[key] = entriesOf(f, model);
+    conflicts = (conflicts ?? []).filter((x) => conflictKey(x) !== key);
     if (!conflicts.length) conflicts = null;
+  }
+
+  /** Whether a field can take a new nested child: a template fits its `sh:node` shapes. */
+  function canAdd(f: Field) {
+    return (
+      editable &&
+      f.editable &&
+      nestedField(f) &&
+      !!model?.templates?.some((t) => templateFits(t, f))
+    );
+  }
+
+  /** Add a new nested child to the field `f` of `owner` (the root when null). */
+  function addChild(owner: string | null, f: Field) {
+    const t = model?.templates?.find((x) => templateFits(x, f));
+    if (!t || !model) return;
+    newNodes += 1;
+    const key = `new${newNodes}`;
+    const term: Term = { type: 'bnode', value: key };
+    // a new child's fields copy the template's, so that each child has its own
+    const fields: Field[] = JSON.parse(JSON.stringify(t.fields));
+    nodes[key] = { key, term, fields, isNew: true };
+    for (const tf of fields) entries[fieldKey(key, tf.id)] = entriesOf(tf, model);
+    const k = fieldKey(owner, f.id);
+    entries[k] = [...(entries[k] ?? []).filter((e) => e.term), entryOf(term, 'nested')];
   }
 
   function changeBranch(b: string) {
@@ -350,7 +459,14 @@
     el?.focus();
   }
 
-  const fieldOf = (id: string) => model?.fields.find((f) => f.id === id);
+  /** The field of a state key. */
+  function fieldOf(key: string) {
+    return liveFields.find(([k]) => k === key)?.[1];
+  }
+  /** The state key of a result's field. */
+  function resultKey(r: FieldResult) {
+    return fieldKey(r.node?.type === 'bnode' ? r.node.value : null, r.field ?? '');
+  }
   const valuesText = (ts: Term[]) =>
     ts.length ? ts.map((t) => displayTerm(t, prefixes)).join(', ') : 'no value';
   const mine = (id: string) => valuesText((current[id] ?? []).filter((t): t is Term => t !== null));
@@ -369,6 +485,29 @@
       (blockedWhy ? 1 : 0),
   );
 </script>
+
+{#snippet child(term: Term)}
+  {@const k = term.type === 'bnode' ? term.value : ''}
+  {#if nodes[k]}
+    <NodeFields
+      node={nodes[k]}
+      path={[k]}
+      {nodes}
+      bind:entries
+      {editable}
+      {problems}
+      results={resultsByField}
+      {ds}
+      {prefixes}
+      {lang}
+      {fullText}
+      {canAdd}
+      addchild={addChild}
+    />
+  {:else}
+    <TermView {term} {prefixes} />
+  {/if}
+{/snippet}
 
 <section class="sf" aria-label={heading}>
   <header class="sf-head">
@@ -501,19 +640,20 @@
             {/each}
           {/each}
           {#each results.filter((r) => r.field) as r, i (i)}
+            {@const rk = resultKey(r)}
             <li>
-              <a href="#{fieldDomId(r.field ?? '')}" onclick={(e) => focusField(r.field ?? '', e)}
-                >{fieldOf(r.field ?? '')?.label}: {resultText(r)}</a
+              <a href="#{fieldDomId(rk)}" onclick={(e) => focusField(rk, e)}
+                >{fieldOf(rk)?.label}: {resultText(r)}</a
               >
             </li>
           {/each}
           {#each otherResults as r, i (i)}
             <li>{displayTerm(r.focusNode, prefixes)}: {resultText(r)}</li>
           {/each}
-          {#each conflicts ?? [] as c (c.id)}
+          {#each conflicts ?? [] as c (conflictKey(c))}
             <li>
-              <a href="#conflict-{fieldDomId(c.id)}"
-                >{fieldOf(c.id)?.label}: changed since you opened the form</a
+              <a href="#conflict-{fieldDomId(conflictKey(c))}"
+                >{fieldOf(conflictKey(c))?.label}: changed since you opened the form</a
               >
             </li>
           {/each}
@@ -524,17 +664,23 @@
     {#if conflicts?.length}
       <section class="conflicts" aria-label="Conflicting changes">
         <h3>Changed since you opened the form</h3>
-        {#each conflicts as c (c.id)}
-          {@const f = fieldOf(c.id)}
-          <div class="conflict" id="conflict-{fieldDomId(c.id)}" tabindex="-1">
+        {#each conflicts as c (conflictKey(c))}
+          {@const f = fieldOf(conflictKey(c))}
+          <div class="conflict" id="conflict-{fieldDomId(conflictKey(c))}" tabindex="-1">
             <strong>{f?.label ?? c.id}</strong>
             <dl>
               <dt>You loaded</dt>
-              <dd>{valuesText(f?.values.map((v) => v.term) ?? [])}</dd>
+              <dd>
+                {valuesText(
+                  f?.constraints.list
+                    ? listItems(f).map((v) => v.term)
+                    : (f?.values.map((v) => v.term) ?? []),
+                )}
+              </dd>
               <dt>Stored now</dt>
               <dd>{valuesText(c.now)}</dd>
               <dt>Yours</dt>
-              <dd>{mine(c.id)}</dd>
+              <dd>{mine(conflictKey(c))}</dd>
             </dl>
             <div class="row">
               <button type="button" class="btn sm" onclick={() => resolveConflict(c, false)}
@@ -573,6 +719,8 @@
               {prefixes}
               {lang}
               {fullText}
+              child={nestedField(f) ? child : undefined}
+              onaddchild={canAdd(f) ? () => addChild(null, f) : undefined}
             />
           {/each}
         </fieldset>

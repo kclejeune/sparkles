@@ -21,7 +21,27 @@ export type Widget =
   | 'entity'
   | 'iri'
   | 'nested'
+  | 'list'
   | 'term';
+
+/** One option of a field's `sh:or` or `sh:xone` over value shapes. */
+export type Alternative = {
+  shape: string;
+  label: string;
+  widget: Widget;
+  constraints: Constraints;
+};
+
+/** SHACL 1.2 list constraints: each value of the field is an `rdf:List`. */
+export type ListConstraints = {
+  minLength?: number;
+  maxLength?: number;
+  unique?: boolean;
+  memberShapes: string[];
+  /** The value constraints every member meets. */
+  member: Constraints;
+  memberWidget: Widget;
+};
 
 export type Constraints = {
   minCount?: number;
@@ -45,9 +65,19 @@ export type Constraints = {
   node?: string[];
   /** Components only the server checks. */
   server?: string[];
+  /** The options of `sh:or` (one must hold) or `sh:xone` (exactly one must hold). */
+  or?: { kind: 'or' | 'xone'; options: Alternative[] };
+  list?: ListConstraints;
 };
 
-export type FormValue = { term: Term; graph: string | null; label?: string; readOnly?: boolean };
+export type FormValue = {
+  term: Term;
+  graph: string | null;
+  label?: string;
+  readOnly?: boolean;
+  /** The members of an `rdf:List` value of a list field, in order. */
+  items?: FormValue[];
+};
 
 export type ReadOnlyReason =
   | 'readOnly'
@@ -55,6 +85,7 @@ export type ReadOnlyReason =
   | 'graph'
   | 'complex-path'
   | 'too-many'
+  | 'list'
   | 'state';
 
 export type FormField = {
@@ -76,6 +107,20 @@ export type FormField = {
   truncated?: boolean;
 };
 
+/** The fields of a nested node: a pooled child, or the template of a new one. */
+export type NodeModel = Pick<FormModel, 'fields' | 'groups' | 'types' | 'graph' | 'other'>;
+
+/** A stored blank-node child of the form, with the visible edges it hangs from. */
+export type NestedNode = NodeModel & {
+  id: string;
+  term: Term;
+  anchors: { parent: string; field: string; graph: string | null; inverse: boolean }[];
+};
+
+/** The empty form of a new child under a field whose `sh:node` shapes are `shapes`. */
+/** The empty form of a new child under a field whose `constraints.node` is `node`. */
+export type NestedTemplate = NodeModel & { node: string[] };
+
 export type FormModel = {
   formFormat: 1;
   focus: string | null;
@@ -96,11 +141,18 @@ export type FormModel = {
   closed: boolean;
   save: { to: 'main' | 'branch'; branch: string; exists: boolean; mainProtected: boolean };
   guard: { language: 'shacl' | 'shex'; mode: 'reject' | 'warn' | 'off' } | null;
+  /** With `nested=true`: the stored blank-node children and the templates of new ones. */
+  nestedNodes?: NestedNode[];
+  templates?: NestedTemplate[];
+  /** The nested model refused past its allowances, so nested values are read-only. */
+  nested?: { refused: string };
 };
 
 /** A validation result of the server check, with the field it belongs to. */
 export type FieldResult = {
   field: string | null;
+  /** The nested node whose field the result is on. */
+  node?: Term;
   focusNode: Term;
   resultPath: Term | { type: 'path'; value: string } | null;
   value: Term | null;
@@ -117,6 +169,7 @@ export const REASONS: Record<ReadOnlyReason, string> = {
   graph: 'New values would go to a graph you cannot write to.',
   'complex-path': "This field's path is too complex to edit in a form.",
   'too-many': 'This field has more values than a form can list.',
+  list: 'This field does not hold exactly one well-formed list.',
   state: 'This form shows a past state, or you do not have permission to save.',
 };
 
@@ -151,6 +204,7 @@ const KNOWN: Set<string> = new Set([
   'entity',
   'iri',
   'nested',
+  'list',
   'term',
 ]);
 
@@ -251,8 +305,59 @@ function boundText(t: Term): string {
   return t.type === 'literal' ? t.value : str(t);
 }
 
+/** A field with only the value constraints `c`: one option, or a list's members. */
+export function valueField(f: FormField, c: Constraints, widget: Widget): FormField {
+  return { ...f, widget, constraints: { ...c, minCount: undefined, maxCount: undefined } };
+}
+
+/** The pseudo-fields of a field's options, which check and edit one value each. */
+export const optionFields = (f: FormField): FormField[] =>
+  (f.constraints.or?.options ?? []).map((o) => valueField(f, o.constraints, o.widget));
+
+/** The option a value takes: the first whose checks it passes, else the first. */
+export function optionOf(f: FormField, t: Term | null): number {
+  if (!t) return 0;
+  const i = optionFields(f).findIndex((o) => checkField(o, [t]).length === 0);
+  return Math.max(i, 0);
+}
+
+/** The pseudo-field of a list field's members. */
+export const memberField = (f: FormField): FormField | null =>
+  f.constraints.list
+    ? valueField(f, f.constraints.list.member, f.constraints.list.memberWidget)
+    : null;
+
+/** The members of a list field's stored list, in order. */
+export const listItems = (f: FormField): FormValue[] => f.values[0]?.items ?? [];
+
+/**
+ * The problems of a list field's members (`values`) that need no data: the members'
+ * constraints, the list lengths and repeated members.
+ */
+function checkList(f: FormField, values: (Term | null)[]): Problem[] {
+  const l = f.constraints.list!;
+  const m = memberField(f)!;
+  const out: Problem[] = [];
+  values.forEach((v, i) => {
+    if (v) for (const p of checkField(m, [v])) out.push({ index: i, message: p.message });
+  });
+  const present = values.filter((v): v is Term => v !== null);
+  const n = present.length;
+  if (l.minLength !== undefined && n < l.minLength)
+    out.push({ index: null, message: `needs at least ${l.minLength} members` });
+  if (l.maxLength !== undefined && n > l.maxLength)
+    out.push({ index: null, message: `takes at most ${l.maxLength} members` });
+  if (l.unique && present.some((v, i) => present.findIndex((x) => sameTerm(x, v)) !== i))
+    out.push({ index: null, message: 'has a member twice' });
+  const had = f.values.length > 0;
+  if ((f.constraints.minCount ?? 0) >= 1 && !had && n === 0)
+    out.push({ index: null, message: 'is required' });
+  return out;
+}
+
 /** The problems of a field's values that need no data (§2.4). */
 export function checkField(f: FormField, values: (Term | null)[]): Problem[] {
+  if (f.constraints.list) return checkList(f, values);
   const c = f.constraints;
   const out: Problem[] = [];
   const present = values
@@ -272,7 +377,7 @@ export function checkField(f: FormField, values: (Term | null)[]): Problem[] {
     const isLit = v.type === 'literal';
     if (kind === 'IRI' && v.type !== 'uri') problem('must be an IRI');
     else if (kind === 'Literal' && !isLit) problem('must be a literal');
-    else if (kind === 'BlankNode') problem('must be a blank node');
+    else if (kind === 'BlankNode' && v.type !== 'bnode') problem('must be a blank node');
     if ((c.class?.length ?? 0) > 0 && v.type !== 'uri')
       problem('must be a resource, not a literal');
     if (c.datatype) {
@@ -332,6 +437,20 @@ export function checkField(f: FormField, values: (Term | null)[]): Problem[] {
   for (const hv of c.hasValue ?? [])
     if (!present.some(({ v }) => sameTerm(v, hv)))
       out.push({ index: null, message: `must include ${boundText(hv)}` });
+  if (c.or?.options.length) {
+    const opts = optionFields(f);
+    const names = c.or.options.map((o) => o.label).join(', ');
+    // an option with constraints only the server checks may match or not: the browser
+    // proves a match only for an option it checks entirely
+    const decided = (o: FormField) =>
+      !o.constraints.class?.length && !o.constraints.node?.length && !o.constraints.server?.length;
+    for (const { v, i } of present) {
+      const pass = opts.filter((o) => checkField(o, [v]).length === 0);
+      if (pass.length === 0) out.push({ index: i, message: `must be one of: ${names}` });
+      else if (c.or.kind === 'xone' && pass.filter(decided).length > 1)
+        out.push({ index: i, message: `must be exactly one of: ${names}` });
+    }
+  }
   return out;
 }
 
@@ -353,6 +472,8 @@ export type Entry = {
   zone?: string;
   /** the value sits in a graph the person cannot write, so it is shown and kept */
   readOnly?: boolean;
+  /** the option of an `sh:or` or `sh:xone` field the value takes */
+  option?: number;
 };
 
 let entryKey = 0;
@@ -508,33 +629,201 @@ export function diffValues(loaded: Term[], current: Term[]): { remove: Term[]; a
   };
 }
 
-export type FieldChange = { field: string; remove: Term[]; add: Term[] };
+/**
+ * A change to one field: values to remove and to add, or for a list field the members
+ * its list takes (`list`).
+ */
+export type FieldChange = { field: string; remove: Term[]; add: Term[]; list?: Term[] };
+
+/** A change to a nested child (`node`), which hangs from `parent`'s `field`. */
+export type NodeChange = {
+  node: Term;
+  /** absent for the root */
+  parent?: Term;
+  field: string;
+  changes: FieldChange[];
+  expect?: Record<string, Term[]>;
+};
 
 export type ChangeSet = {
   changes: FieldChange[];
   /** the values the form loaded, by changed field */
   expect: Record<string, Term[]>;
+  /** changes to nested children, which commit with the root's */
+  nested?: NodeChange[];
 };
 
-/** The change set of a form: the changed editable fields and their loaded values. */
-export function changeSet(model: FormModel, current: Record<string, (Term | null)[]>): ChangeSet {
+/** The state key of a field: its id on the root, `{node} {id}` on a nested node. */
+export const fieldKey = (node: string | null, id: string) => (node ? `${node} ${id}` : id);
+
+/** The changes of one node's fields, read from `current` by their keys. */
+function fieldChanges(
+  fields: FormField[],
+  node: string | null,
+  current: Record<string, (Term | null)[]>,
+  loadedToo: boolean,
+): { changes: FieldChange[]; expect: Record<string, Term[]> } {
   const changes: FieldChange[] = [];
   const expect: Record<string, Term[]> = {};
-  for (const f of model.fields) {
+  for (const f of fields) {
     if (!f.editable) continue;
-    const now = (current[f.id] ?? []).filter((t): t is Term => t !== null);
+    const now = (current[fieldKey(node, f.id)] ?? []).filter((t): t is Term => t !== null);
+    if (f.constraints.list) {
+      const loaded = listItems(f).map((v) => v.term);
+      const same = loaded.length === now.length && loaded.every((t, i) => sameTerm(t, now[i]));
+      if (same && (f.values.length > 0 || !now.length)) continue;
+      changes.push({ field: f.id, remove: [], add: [], list: now });
+      if (loadedToo) expect[f.id] = loaded;
+      continue;
+    }
     const loaded = f.values.map((v) => v.term);
     const d = diffValues(loaded, now);
     if (!d.remove.length && !d.add.length) continue;
     changes.push({ field: f.id, ...d });
-    expect[f.id] = distinct(loaded);
+    if (loadedToo) expect[f.id] = distinct(loaded);
   }
   return { changes, expect };
 }
 
+/** A nested node the form shows: a stored child, or a new one from a template. */
+export type FormNode = {
+  /** the blank label: stored, or `new…` for a new child */
+  key: string;
+  term: Term;
+  fields: FormField[];
+  isNew: boolean;
+};
+
+/** The nested nodes reachable from the root through the current values, breadth first. */
+export function reachable(
+  model: Pick<FormModel, 'fields'>,
+  current: Record<string, (Term | null)[]>,
+  nodes: Record<string, FormNode>,
+): { node: FormNode; parent: string | null; field: string }[] {
+  const out: { node: FormNode; parent: string | null; field: string }[] = [];
+  const seen = new Set<string>();
+  const queue: { owner: string | null; fields: FormField[] }[] = [
+    { owner: null, fields: model.fields },
+  ];
+  while (queue.length) {
+    const { owner, fields } = queue.shift()!;
+    for (const f of fields) {
+      if (!f.constraints.node?.length) continue;
+      for (const t of current[fieldKey(owner, f.id)] ?? []) {
+        if (t?.type !== 'bnode' || seen.has(t.value) || !nodes[t.value]) continue;
+        seen.add(t.value);
+        const node = nodes[t.value];
+        out.push({ node, parent: owner, field: f.id });
+        queue.push({ owner: node.key, fields: node.fields });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Turn stored nested nodes that no longer hang from their parent into new ones, with
+ * the stored nodes reachable from them: their fields lose their loaded values, so a save
+ * writes every value the form shows again under new nodes. A person who keeps their own
+ * values of a field whose child another commit removed gets the whole child back, not
+ * only the fields they changed. `null` when the form cannot rebuild the children whole:
+ * a value it cannot write (a read-only field or a value in another graph), a node
+ * reached twice (a cycle or a shared node), or a node that a node outside them also
+ * holds through another field than `edge`, the field whose conflict is resolved.
+ */
+export function detachLost(
+  nodes: Record<string, FormNode>,
+  current: Record<string, (Term | null)[]>,
+  lost: string[],
+  edge: string,
+): Record<string, FormNode> | null {
+  const closure = new Set<string>();
+  const queue = [...lost];
+  while (queue.length) {
+    const key = queue.shift()!;
+    const n = nodes[key];
+    if (!n || n.isNew) continue;
+    if (closure.has(key)) return null;
+    closure.add(key);
+    for (const f of n.fields) {
+      const now = current[fieldKey(key, f.id)] ?? [];
+      if ((!f.editable && f.values.length) || f.values.some((v) => v.readOnly)) return null;
+      if (!f.constraints.node?.length) continue;
+      for (const t of now)
+        if (t?.type === 'bnode' && nodes[t.value] && !nodes[t.value].isNew) queue.push(t.value);
+    }
+  }
+  // a node of the closure that a node outside it holds stays stored for that one
+  for (const [k, es] of Object.entries(current)) {
+    const owner = k.includes(' ') ? k.slice(0, k.indexOf(' ')) : null;
+    if (owner !== null && closure.has(owner)) continue;
+    if (owner === null || k === edge) continue;
+    if (es.some((t) => t?.type === 'bnode' && closure.has(t.value))) return null;
+  }
+  const out = { ...nodes };
+  for (const key of closure) {
+    const n = nodes[key];
+    out[key] = { ...n, fields: n.fields.map((f) => ({ ...f, values: [] })), isNew: true };
+  }
+  return out;
+}
+
+/** Whether a template's shapes are a field's `sh:node` shapes. */
+export const templateFits = (t: NestedTemplate, f: FormField) =>
+  t.node.length === (f.constraints.node?.length ?? 0) &&
+  t.node.every((s) => f.constraints.node?.includes(s));
+
+/** Whether a field shows its blank-node values as nested forms. */
+export const nestedField = (f: FormField) =>
+  !!f.constraints.node?.length &&
+  !f.inverse &&
+  (widgetOf(f) === 'nested' || f.values.some((v) => v.term.type === 'bnode'));
+
+/**
+ * The change set of a form: the changed editable fields and their loaded values, and the
+ * changes of the nested children still reachable from the root through the current
+ * values, with the entries of the nodes on the way to a changed or new one.
+ */
+export function changeSet(
+  model: FormModel,
+  current: Record<string, (Term | null)[]>,
+  nodes: Record<string, FormNode> = {},
+): ChangeSet {
+  const root = fieldChanges(model.fields, null, current, true);
+  const nested: NodeChange[] = [];
+  // the reachable nodes, with the edge each was reached through
+  const reached = reachable(model, current, nodes);
+  const entries = new Map<string, NodeChange>();
+  const needed = new Set<string>();
+  for (const r of reached) {
+    const c = fieldChanges(r.node.fields, r.node.key, current, !r.node.isNew);
+    const e: NodeChange = {
+      node: r.node.term,
+      ...(r.parent ? { parent: nodes[r.parent].term } : {}),
+      field: r.field,
+      changes: c.changes,
+      ...(r.node.isNew ? {} : { expect: c.expect }),
+    };
+    entries.set(r.node.key, e);
+    if (r.node.isNew || c.changes.length) {
+      // the node and every node on its way from the root
+      let k: string | null = r.node.key;
+      while (k && !needed.has(k)) {
+        needed.add(k);
+        k = reached.find((x) => x.node.key === k)?.parent ?? null;
+      }
+    }
+  }
+  for (const r of reached) if (needed.has(r.node.key)) nested.push(entries.get(r.node.key)!);
+  return { changes: root.changes, expect: root.expect, ...(nested.length ? { nested } : {}) };
+}
+
 /** The number of changed values: a replaced value counts once, as do an added and a removed one. */
-export const changeCount = (s: ChangeSet) =>
-  s.changes.reduce((n, c) => n + Math.max(c.remove.length, c.add.length), 0);
+export const changeCount = (s: ChangeSet) => {
+  const of = (cs: FieldChange[]) =>
+    cs.reduce((n, c) => n + (c.list ? 1 : Math.max(c.remove.length, c.add.length)), 0);
+  return of(s.changes) + (s.nested ?? []).reduce((n, e) => n + of(e.changes), 0);
+};
 
 /** What pressing Save does (§2.4). */
 export type SavePlan = 'save' | 'check' | 'confirm' | 'blocked';

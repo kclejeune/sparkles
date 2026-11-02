@@ -122,6 +122,57 @@ pub struct FieldConstraints {
     pub node: Vec<Term>,
     /// the components only the server checks (`sh:sparql`, `sh:qualifiedValueShape`, …)
     pub server: BTreeSet<String>,
+    /// SHACL 1.2 list constraints: each value is an `rdf:List`
+    pub list: Option<ListConstraints>,
+    /// `sh:or` or `sh:xone` over value shapes: each value takes one of the options
+    pub alternatives: Option<Alternatives>,
+}
+
+/// The SHACL 1.2 list constraints of a field (`sh:memberShape`, `sh:minListLength`,
+/// `sh:maxListLength`, `sh:uniqueMembers`), whose values are `rdf:List`s.
+#[derive(Clone, Debug, Default)]
+pub struct ListConstraints {
+    /// the member shapes' nodes
+    pub member_shapes: Vec<Term>,
+    /// the value constraints of the member shapes, which a browser checks on each member
+    pub member: Box<FieldConstraints>,
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    pub unique: bool,
+}
+
+/// Whether one option (`sh:or`) or exactly one (`sh:xone`) must hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlternativeKind {
+    Or,
+    Xone,
+}
+
+impl AlternativeKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            AlternativeKind::Or => "or",
+            AlternativeKind::Xone => "xone",
+        }
+    }
+}
+
+/// The options of a field's `sh:or` or `sh:xone` whose members constrain values only,
+/// with no path and no property shapes of their own.
+#[derive(Clone, Debug)]
+pub struct Alternatives {
+    pub kind: AlternativeKind,
+    pub options: Vec<Alternative>,
+}
+
+/// One option of [`Alternatives`].
+#[derive(Clone, Debug)]
+pub struct Alternative {
+    /// the member shape's node
+    pub shape: Term,
+    /// its `sh:name`s
+    pub names: Vec<Literal>,
+    pub constraints: FieldConstraints,
 }
 
 /// One field: the property shapes of one path.
@@ -150,54 +201,62 @@ impl FormField {
 
     /// The widget the constraints choose (§2.3), before a `dash:editor` overrides it.
     pub fn widget(&self) -> &'static str {
-        let c = &self.constraints;
-        if let Some(values) = &c.allowed {
-            return if values.len() <= 6 { "radio" } else { "select" };
+        if self.constraints.list.is_some() {
+            return "list";
         }
-        let dt = c.datatype.as_ref().map(|d| d.as_str());
-        let xsd = |local: &str| dt == Some(&*format!("{XSD}{local}"));
-        if xsd("boolean") {
-            return if c.min_count.unwrap_or(0) >= 1 {
-                "checkbox"
-            } else {
-                "boolean-select"
-            };
-        }
-        if xsd("date") {
-            return "date";
-        }
-        if xsd("dateTime") || xsd("dateTimeStamp") {
-            return "datetime";
-        }
-        if dt.is_some_and(is_numeric) {
-            return "number";
-        }
-        if dt == Some(RDF_LANG_STRING) || c.language_in.is_some() {
-            return "text-lang";
-        }
-        let string = dt.is_none_or(|d| d == format!("{XSD}string"));
-        if string
-            && (self.single_line == Some(false) || c.max_length.is_some_and(|m| m > 200))
-            && (dt.is_some() || c.node_kind == Some(NodeKind::Literal))
-        {
-            return "textarea";
-        }
-        if dt.is_some() {
-            return "text";
-        }
-        if !c.classes.is_empty() || matches!(c.node_kind, Some(NodeKind::Iri)) {
-            return "entity";
-        }
-        if !c.node.is_empty() && matches!(c.node_kind, Some(NodeKind::BlankNode)) {
-            return "nested";
-        }
-        // string constraints on values of no stated kind: plain text, a simple literal
-        let texty = !c.patterns.is_empty() || c.min_length.is_some() || c.max_length.is_some();
-        if matches!(c.node_kind, Some(NodeKind::Literal)) || (c.node_kind.is_none() && texty) {
-            return "text";
-        }
-        "term"
+        widget_of(&self.constraints, self.single_line)
     }
+}
+
+/// The widget value constraints choose (§2.3): that of a field, of a list member or of
+/// one option of an alternative.
+pub fn widget_of(c: &FieldConstraints, single_line: Option<bool>) -> &'static str {
+    if let Some(values) = &c.allowed {
+        return if values.len() <= 6 { "radio" } else { "select" };
+    }
+    let dt = c.datatype.as_ref().map(|d| d.as_str());
+    let xsd = |local: &str| dt == Some(&*format!("{XSD}{local}"));
+    if xsd("boolean") {
+        return if c.min_count.unwrap_or(0) >= 1 {
+            "checkbox"
+        } else {
+            "boolean-select"
+        };
+    }
+    if xsd("date") {
+        return "date";
+    }
+    if xsd("dateTime") || xsd("dateTimeStamp") {
+        return "datetime";
+    }
+    if dt.is_some_and(is_numeric) {
+        return "number";
+    }
+    if dt == Some(RDF_LANG_STRING) || c.language_in.is_some() {
+        return "text-lang";
+    }
+    let string = dt.is_none_or(|d| d == format!("{XSD}string"));
+    if string
+        && (single_line == Some(false) || c.max_length.is_some_and(|m| m > 200))
+        && (dt.is_some() || c.node_kind == Some(NodeKind::Literal))
+    {
+        return "textarea";
+    }
+    if dt.is_some() {
+        return "text";
+    }
+    if !c.classes.is_empty() || matches!(c.node_kind, Some(NodeKind::Iri)) {
+        return "entity";
+    }
+    if !c.node.is_empty() && matches!(c.node_kind, Some(NodeKind::BlankNode)) {
+        return "nested";
+    }
+    // string constraints on values of no stated kind: plain text, a simple literal
+    let texty = !c.patterns.is_empty() || c.min_length.is_some() || c.max_length.is_some();
+    if matches!(c.node_kind, Some(NodeKind::Literal)) || (c.node_kind.is_none() && texty) {
+        return "text";
+    }
+    "term"
 }
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -424,11 +483,97 @@ fn merge(c: &mut FieldConstraints, shapes: &Shapes, list: &[Constraint]) {
                 }
                 c.server.insert(k.component().into_string());
             }
+            Constraint::MemberShape(n) => {
+                let l = c.list.get_or_insert_with(Default::default);
+                let t = shapes.shapes()[*n].node.clone();
+                if !l.member_shapes.contains(&t) {
+                    l.member_shapes.push(t);
+                    // a member's own list constraints stay with the server, so a list of
+                    // lists, or a member shape that names itself, ends at one level
+                    for mc in &shapes.shapes()[*n].constraints {
+                        if matches!(
+                            mc,
+                            Constraint::MemberShape(_)
+                                | Constraint::MinListLength(_)
+                                | Constraint::MaxListLength(_)
+                                | Constraint::UniqueMembers(_)
+                        ) {
+                            l.member.server.insert(mc.component().into_string());
+                        } else {
+                            merge(&mut l.member, shapes, std::slice::from_ref(mc));
+                        }
+                    }
+                }
+                c.server.insert(k.component().into_string());
+            }
+            Constraint::MinListLength(n) => {
+                let l = c.list.get_or_insert_with(Default::default);
+                l.min_length = max(l.min_length, *n);
+            }
+            Constraint::MaxListLength(n) => {
+                let l = c.list.get_or_insert_with(Default::default);
+                l.max_length = min(l.max_length, *n);
+            }
+            Constraint::UniqueMembers(u) => {
+                let l = c.list.get_or_insert_with(Default::default);
+                l.unique |= *u;
+            }
+            Constraint::Or(list) | Constraint::Xone(list)
+                if c.alternatives.is_none() && value_shapes(shapes, list) =>
+            {
+                let kind = if matches!(k, Constraint::Or(_)) {
+                    AlternativeKind::Or
+                } else {
+                    AlternativeKind::Xone
+                };
+                let mut options = Vec::new();
+                for &n in list {
+                    let shape = &shapes.shapes()[n];
+                    let mut oc = FieldConstraints::default();
+                    merge(&mut oc, shapes, &shape.constraints);
+                    // what an option leaves to the server, the field leaves to it too
+                    c.server.extend(oc.server.iter().cloned());
+                    options.push(Alternative {
+                        shape: shape.node.clone(),
+                        names: shape.info().names.clone(),
+                        constraints: oc,
+                    });
+                }
+                c.alternatives = Some(Alternatives { kind, options });
+            }
             _ => {
                 c.server.insert(k.component().into_string());
             }
         }
     }
+}
+
+/// Whether every member of an `sh:or` or `sh:xone` constrains values only: no path, no
+/// property shapes, no nested logical constraints and no node shapes, so that a browser
+/// can offer them as options of one value.
+fn value_shapes(shapes: &Shapes, list: &[ShapeId]) -> bool {
+    !list.is_empty()
+        && list.iter().all(|&n| {
+            let s = &shapes.shapes()[n];
+            !s.deactivated
+                && s.path.is_none()
+                && s.constraints.iter().all(|c| {
+                    !matches!(
+                        c,
+                        Constraint::Property(_)
+                            | Constraint::Or(_)
+                            | Constraint::Xone(_)
+                            | Constraint::And(_)
+                            | Constraint::Not(_)
+                            | Constraint::Node(_)
+                            | Constraint::Closed { .. }
+                            | Constraint::MemberShape(_)
+                            | Constraint::MinListLength(_)
+                            | Constraint::MaxListLength(_)
+                            | Constraint::UniqueMembers(_)
+                    )
+                })
+        })
 }
 
 /// Keep the stricter of two bounds: the one `want` of the other (a greater lower bound,

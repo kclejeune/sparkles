@@ -9050,8 +9050,10 @@ The design and its rationale are in
 The form routes turn a dataset's SHACL shapes into an editing form for one resource. The
 server reads the shapes, chooses the node shapes that target the resource, merges their
 property shapes into fields and reads the resource's values under the caller's grants. A
-form's changes go back as terms, and the server writes them as one update of
-`DELETE DATA` and `INSERT DATA`, so a client never writes SPARQL text for a save. The routes
+form's changes go back as terms, and the server writes the quads they delete and insert
+as one update, so a client never writes SPARQL text for a save. A change can also edit
+the blank-node children of fields that declare `sh:node`, replace the `rdf:List` of a
+list field, and pick among the options of `sh:or` and `sh:xone`. The routes
 need the `shacl` cargo feature, which is on by default, and return `501` without it.
 
 | Route | Permission | Use |
@@ -9091,6 +9093,8 @@ cover its target selection and work, not all SHACL heap use or cold index decodi
 * **`lang`** is the language whose `sh:name` and `sh:description` the labels prefer. The
   server falls back to English, then to untagged text, then to the predicate's
   `rdfs:label` and similar labels in the data, and then to its prefixed name.
+* **`nested=true`** also answers the blank-node children of the resource, as
+  [Nested children](#nested-children) describes.
 
 The answer is the model. Its `ETag` and `Sparkles-Commit` headers name the commit read.
 
@@ -9121,13 +9125,14 @@ type FormField = {
   path: string;                     // the predicate IRI, or the SPARQL path of a complex path
   inverse: boolean;
   editable: boolean;
-  reason?: "readOnly" | "protected" | "graph" | "complex-path" | "too-many" | "state";
+  reason?: "readOnly" | "protected" | "graph" | "complex-path" | "too-many" | "list" | "state";
   label: string;
   description?: string;
   group: string | null;             // the sh:PropertyGroup IRI
   order: number | null;
   widget: string;                   // radio, select, checkbox, boolean-select, date, datetime,
-                                    // number, text-lang, textarea, text, entity, nested, term
+                                    // number, text-lang, textarea, text, entity, nested, list,
+                                    // term
   editor?: string;                  // dash:editor
   viewer?: string;                  // dash:viewer
   constraints: Constraints;         // the merged constraints of every shape on this path
@@ -9135,7 +9140,13 @@ type FormField = {
   values: FormValue[];
   truncated?: boolean;              // more than 200 values, so the field is read-only
 };
-type FormValue = { term: Term; graph: string | null; label?: string; readOnly?: boolean };
+type FormValue = {
+  term: Term;
+  graph: string | null;
+  label?: string;
+  readOnly?: boolean;
+  items?: FormValue[];              // the members of a list field's rdf:List, in order
+};
 ```
 
 A field's `id` is its path written in SPARQL syntax, so two node shapes that constrain the
@@ -9145,6 +9156,20 @@ constraints the browser can check, which are `minCount`, `maxCount`, `datatype`,
 `pattern` with its `flags`, `languageIn`, `uniqueLang`, `singleLine` and `defaultValue`.
 `node` lists the shapes of `sh:node`, and `server` names the other components the check
 evaluates, such as `sh:qualifiedValueShape` or a SHACL-SPARQL constraint.
+
+A field whose shapes have SHACL 1.2 list constraints (`sh:memberShape`, `sh:minListLength`,
+`sh:maxListLength` or `sh:uniqueMembers`) is a list field with the widget `list`.
+`constraints.list` holds `minLength`, `maxLength`, `unique`, the `memberShapes`, the value
+constraints of the members in `member` and their widget in `memberWidget`. Its value lists
+its members in `items`. A list field that holds more than one list, or a list that is not
+well formed, is read-only with `reason: "list"`. A well-formed list has a blank node with
+one `rdf:first` and one `rdf:rest` for each cell, no cycle and at most 200 members.
+
+An `sh:or` or `sh:xone` whose members constrain values only, with no path and no property
+shapes of their own, gives the field `constraints.or`, which is `{kind, options}`. `kind`
+is `or` or `xone`, and each option is `{shape, label, widget, constraints}`. The label is
+the member's `sh:name`, else the local name of its class, datatype or node kind. Other
+`sh:or` and `sh:xone` constraints stay in `server`.
 
 A predicate path and an inverse path are editable. Sequence, alternative and repetition
 paths are read-only with `reason: "complex-path"` and show no values. A field is also
@@ -9160,6 +9185,36 @@ graphs alone make a field `protected`, and a protection scoped by classes or a p
 enforced by the save itself. Shapes read from shapes graphs leave out the triples that the
 caller's protections hide. A focus that no shape targets answers `200` with no fields.
 
+### Nested children
+
+With `nested=true` the model also lists the stored blank-node children that fields
+declaring `sh:node` reach, and the empty forms that new children take.
+
+```ts
+type NestedFormModel = FormModel & {
+  nestedNodes: (NodeModel & {
+    id: string;                     // n0, n1, … in this answer only
+    term: Term;                     // the child's stored blank node
+    anchors: { parent: string; field: string; graph: string | null; inverse: boolean }[];
+  })[];
+  templates: (NodeModel & { node: string[] })[];  // node: the shapes as constraints.node names them
+};
+```
+
+Each child keeps its stored blank node, every visible edge it hangs from and a layout built
+from every `sh:node` declaration that reaches it. An anchor's `parent` is `root` or another
+child's `id`. Shared children appear once, and a cycle refers to a child already listed.
+The model admits at most 64 children, 512 field views, 512 anchors and a first-discovery
+depth of 16, and its preparation shares 65,536 units, as
+[the design](specs/U02-shape-driven-forms/SPEC.md#231-nested-read-models-in-the-rust-library)
+describes. Past one of them, and for complex nested paths or blank-named graph contexts,
+the answer is the flat model with `nested: {refused}` set to the reason. A template is the
+empty form of a new child under a field whose `constraints.node` is its `node`, one
+for each distinct set that the root, the children and the templates declare.
+
+A child's term grants no write authority. A change that edits a stored child names it with
+the parent it hangs from, and the save checks that edge again under the writer lock.
+
 ### Checks and saves
 
 `check` and `save` take the same JSON body.
@@ -9170,18 +9225,54 @@ type FormChangeBody = {
   class?: string;                   // or the class of a new instance, instead of focus
   branch?: string;                  // the branch the form was opened on, main by default
   shapes?: "guard" | "graphs" | "drafted";
-  changes: { field: string; remove?: Term[]; add?: Term[] }[];
+  changes: FieldChange[];
   expect: { [field: string]: Term[] };  // the values the form loaded, for every changed field
+  nested?: NodeChange[];            // changes to nested children, committed with changes
   message?: string;                 // the commit message
+};
+type FieldChange = {
+  field: string;
+  remove?: Term[];
+  add?: Term[];
+  list?: Term[];                    // a list field's members, which replace its list
+};
+type NodeChange = {
+  node: Term;                       // a blank node: a stored child, or a new one
+  parent?: Term;                    // the node it hangs from, absent for the root
+  field: string;                    // the parent's field
+  changes?: FieldChange[];
+  expect?: { [field: string]: Term[] };  // a stored child's loaded values
 };
 ```
 
 The server checks each change before it writes anything. A field that is not in the form,
-a blank node, or a literal on an inverse path is a `400`, because the change could not
-name its triple. A change to a
+or a literal on an inverse path, is a `400`, because the change could not name its triple.
+A blank node may be removed only from a field that declares `sh:node`, and added only as a
+new child that a `nested` entry describes under that field. A label that a field's `add`
+names is always a new child, even when it spells a stored blank node, and the server gives
+it a new node.
+
+A `nested` entry for a stored child must name a current visible value of its parent's
+field, and every node between it and the root needs an entry, which may have no changes.
+A stored child that no longer hangs from its parent answers a conflict on the parent's
+field. Its fields are those of its nested model, and its `expect` names every changed
+field as the root's does. A new child takes the fields of its parent field's `sh:node`
+shapes, and its values and its edge go to its parent's target graph. A stored child takes
+new values into its own target graph, and with `targetGraph: "type"` a child without a
+type uses the graph of its edge. Removing a stored child deletes its edges and, when no
+other quad refers to it once they are gone, its visible quads, and so on through their
+blank objects, which removes the cells of its lists too. Hidden quads stay. A seen quad in
+a graph the caller cannot write refuses the change with `403`. A change cannot both remove
+and edit a child.
+
+A list change replaces the field's stored lists with a new list of `list`'s members, which
+are IRIs or literals, at most 200. An empty `list` writes `rdf:nil`. For a list field,
+`expect` holds the loaded members in order, so an edit of one cell in place conflicts. A change to a
 read-only field is a `403`. A change of more than 1,000 terms is a `400`. A removed value is
 deleted from every graph that holds it, and an added value goes to the model's `graph`.
 `expect` must name every changed field. It may be empty for a field that had no values.
+A change of nested children counts their terms and the quads it removes with them toward
+the same limits.
 A change with `class` makes a new instance. The server mints its IRI from the setting's
 `newIri`, refuses an IRI that already describes a resource, and adds its `rdf:type`.
 The middleware admits a check or a save on any branch the caller can see, and the handler
@@ -9202,8 +9293,8 @@ session branch that does not exist yet previews its first commit on `main`'s hea
 type FormCheckAnswer = {
   branch: string;
   preview: WritePreview;            // as POST /{ds}/update?dryRun=true answers
-  update: string;                   // the SPARQL Update the save would run
-  conflicts: { id: string; now: Term[] }[];  // fields another commit changed, as save's 409 lists them
+  update: string;                   // the update the save would run, as SPARQL text
+  conflicts: { id: string; node?: Term; now: Term[] }[];  // as save's 409 lists them
   validation: {
     checked: boolean;
     withheld: boolean;              // the caller's grants hide part of the dataset
@@ -9216,18 +9307,23 @@ type FormCheckAnswer = {
 
 Each result carries the `field` it belongs to, which is the field whose path is the
 result's `sh:resultPath` on the focus node, or `null` for a result on another node. A
+result on a nested child of the change carries that child's field and the child as
+`node`. The `update` text names stored blank nodes by their labels and new ones by plan
+labels, so a change with blank nodes is shown but cannot be run as SPARQL. A
 caller whose grants limit the graphs or triples it reads gets `withheld: true` and no
 results, as the validation routes withhold reports from such callers.
 
 The Rust library gives the same answers through `ds.forms().model`, `check` and `save`.
-Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…)`,
+Python binds them as `ds.forms.model(focus, class_=…, settings=…, at=…, nested=…)`,
 `ds.forms.check(change, settings=…)` and `ds.forms.save(change, settings=…)`, which
 return dicts with the members above. A conflicting save raises `ConflictError` with the
 code `form-conflict` and the fields in `fields`. The Node.js and JVM bindings do not expose forms.
 
 `save` compares `expect` with the stored values of the changed fields while it holds the
-writer lock. When one differs, it answers `409` with code `form-conflict` and the current
-values, and writes nothing. When the values are the same but another commit moved one of
+writer lock, and checks that every stored child still hangs from its parent. When one
+differs, it answers `409` with code `form-conflict` and the current values, with the
+nested `node` of a child's field, and writes nothing. When the quads under a removed child
+changed meanwhile, the save plans again on the new head. When the values are the same but another commit moved one of
 them to another graph while the save waited, the save plans its update again on the new
 head, up to three times.
 

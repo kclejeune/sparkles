@@ -410,6 +410,12 @@ fn admit_property(
                     }
                 }
             }
+            Constraint::MemberShape(member) => admit_value_shape(shapes, *member, check)?,
+            Constraint::Or(members) | Constraint::Xone(members) => {
+                for &member in members {
+                    admit_value_shape(shapes, member, check)?;
+                }
+            }
             Constraint::Component(component) => {
                 let iri = component.component.iri.as_str();
                 lexical(iri, check)?;
@@ -427,6 +433,64 @@ fn admit_property(
                         lexical(other.component.iri.as_str(), check)?;
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Admit the owned copies a list member shape or an option of an alternative makes: its
+/// node, names and value constraints. Matching composite bounds refuse as they do on a
+/// field, before the uncontrolled comparison.
+fn admit_value_shape(shapes: &Shapes, index: ShapeId, check: &mut Control<'_>) -> Result<()> {
+    let shape = &shapes.shapes()[index];
+    check()?;
+    term(&shape.node, check, 0)?;
+    for literal in &shape.info().names {
+        lexical(literal.value(), check)?;
+        if let Some(language) = literal.language() {
+            lexical(language, check)?;
+        }
+    }
+    let mut ranges = [None; 4];
+    for constraint in &shape.constraints {
+        check()?;
+        match constraint {
+            Constraint::Datatype(n) => lexical(n.as_str(), check)?,
+            Constraint::Class(t) | Constraint::HasValue(t) => term(shapes.term(*t), check, 0)?,
+            Constraint::In(values) => {
+                for &value in values {
+                    term(shapes.term(value), check, 0)?;
+                }
+            }
+            Constraint::MinInclusive(t, value)
+            | Constraint::MinExclusive(t, value)
+            | Constraint::MaxInclusive(t, value)
+            | Constraint::MaxExclusive(t, value) => {
+                let slot = match constraint {
+                    Constraint::MinInclusive(..) => 0,
+                    Constraint::MinExclusive(..) => 1,
+                    Constraint::MaxInclusive(..) => 2,
+                    _ => 3,
+                };
+                admit_range(value, &mut ranges[slot])?;
+                term(t, check, 0)?;
+                term(t, check, 0)?;
+            }
+            Constraint::Pattern(p) => {
+                lexical(&p.pattern, check)?;
+                if let Some(flags) = &p.flags {
+                    lexical(flags, check)?;
+                }
+            }
+            Constraint::LanguageIn(tags) => {
+                for tag in tags {
+                    lexical(tag, check)?;
+                }
+            }
+            Constraint::Component(component) => {
+                lexical(component.component.iri.as_str(), check)?;
             }
             _ => {}
         }
