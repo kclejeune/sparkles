@@ -267,13 +267,13 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
         "version": kinds(default(titled(string(), "API version", "The anthropic-version header."), json!("2023-06-01")), &["anthropic"]),
         "promptCaching": kinds({
             let mut v = ordered(&["enabled", "ttl"], json!({
-                "enabled": default(titled(boolean(), "Prompt caching", "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. For the openai kind it is off by default, and true sends an Ask repair as the first draft's user message unchanged followed by a second user message, so that OpenAI's own caching serves the repair."), json!(true)),
+                "enabled": default(titled(boolean(), "Prompt caching", "Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. An openai provider also takes `enabled`, false by default, in its JSON configuration: true sends an Ask repair as the first draft's user message unchanged followed by a second user message, so that OpenAI's own caching serves the repair."), json!(true)),
                 "ttl": kinds(default(titled(string_enum(&["5m", "1h"]), "Cache lifetime", "How long the provider keeps a cached prefix after its last use. The 1-hour TTL doubles the write price and pays when calls sharing a prefix come more than 5 minutes apart."), json!("5m")), &["anthropic"]),
             }));
             v["title"] = "Prompt caching".into();
-            v["description"] = "Prompt caching of the Anthropic API, and for the openai kind the follow-up form of Ask repairs that lets OpenAI's own caching serve them. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.".into();
+            v["description"] = "Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.".into();
             v
-        }, &["anthropic", "openai"]),
+        }, &["anthropic"]),
         "tls": tls,
         "models": {
             "type": "object",

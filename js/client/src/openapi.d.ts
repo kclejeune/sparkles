@@ -7463,12 +7463,12 @@ export interface components {
             };
             /**
              * Prompt caching
-             * @description Prompt caching of the Anthropic API, and for the openai kind the follow-up form of Ask repairs that lets OpenAI's own caching serve them. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.
+             * @description Prompt caching of the Anthropic API. Each call's stable prefix (its system text, and a dataset's shared grounding) is marked for the provider's cache. The TTL applies to the anthropic kind only.
              */
             promptCaching?: {
                 /**
                  * Prompt caching
-                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. For the openai kind it is off by default, and true sends an Ask repair as the first draft's user message unchanged followed by a second user message, so that OpenAI's own caching serves the repair.
+                 * @description Mark the stable start of each prompt so that the provider caches it. A cached prefix is read at a tenth of the input price and written at 1.25 times it, or 2 times with the 1-hour TTL. An openai provider also takes `enabled`, false by default, in its JSON configuration: true sends an Ask repair as the first draft's user message unchanged followed by a second user message, so that OpenAI's own caching serves the repair.
                  * @default true
                  */
                 enabled: boolean;

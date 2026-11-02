@@ -11954,7 +11954,9 @@ when the whole prompt is one message. An `openai` provider whose `promptCaching`
 `enabled` to `true` therefore receives an Ask repair as the first draft's user message,
 unchanged, followed by a second user message with the repair and the answer format.
 Every message keeps the user role. It is off by default because it changes the shape of
-the prompt, and `promptCaching.ttl` applies to the `anthropic` kind only.
+the prompt, and `promptCaching.ttl` applies to the `anthropic` kind only. The settings
+form offers prompt caching for the `anthropic` kind only, so an `openai` provider sets
+it in its JSON configuration.
 
 ```json
 "claude": {
