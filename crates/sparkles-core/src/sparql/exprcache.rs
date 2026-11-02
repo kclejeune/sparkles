@@ -1326,6 +1326,11 @@ fn cursor_values(
             )
         })
     {
+        // A large inline column keeps a value per row here, where per-value reuse keeps one
+        // per distinct value.
+        if table.len > super::exec::PAR_THRESHOLD {
+            return Ok(None);
+        }
         let bytes = table.len as u64
             * (std::mem::size_of::<Option<super::value::Value>>() as u64 * 2 + 8)
             + 4096;
@@ -1542,8 +1547,16 @@ fn cursor_values(
             Tag::Undef | Tag::Special | Tag::Int | Tag::Double | Tag::Decimal | Tag::Bool
         ) {
             bytes = bytes.saturating_add(ctx.decoded_bytes(unique[row])?);
-            if let Some(charge) = &mut charge {
-                charge.resize(bytes)?;
+            if let Some(charge) = &mut charge
+                && let Err(error) = charge.resize(bytes)
+            {
+                // A large input's caller falls back to per-value reuse, which keeps one value
+                // per distinct term, so the refusal declines this optional decoding there. A
+                // smaller input's caller retries with a smaller trial and needs the refusal.
+                if table.len > super::exec::PAR_THRESHOLD {
+                    return Ok(None);
+                }
+                return Err(error);
             }
         }
         vals[row] = ctx.cursor_value_checked(unique[row])?;
@@ -1553,6 +1566,17 @@ fn cursor_values(
     drop(unique);
     drop(payloads);
     drop(scratch);
+    // The sort keeps the slots, one value per distinct term and the values' payload, and
+    // the construction's pairs and distinct ids are gone.
+    if let Some(charge) = &mut charge {
+        let kept = slots.capacity() as u64 * 4
+            + vals.capacity() as u64 * std::mem::size_of::<Option<super::value::Value>>() as u64
+            + bytes.saturating_sub(base)
+            + 4096;
+        if kept < bytes {
+            charge.resize(kept)?;
+        }
+    }
     Ok(Some(PerValue {
         vals,
         slot: Some(slots),
@@ -1605,6 +1629,92 @@ mod tests {
         t.cols[0][n - 1] = Id::UNDEF;
         assert!(
             cursor_integer_distinct(&ctx, &t, &[&e], v, &mut report)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn owned(
+        store: &crate::store::Store,
+        limit: u64,
+        values: &[&str],
+    ) -> (std::sync::Arc<Ctx>, Vec<Id>) {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = limit;
+        let ids = values
+            .iter()
+            .map(|v| ctx.intern_value(&super::super::value::Value::Str((*v).into())))
+            .collect();
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+        (ctx, ids)
+    }
+
+    fn column(ctx: &Ctx, ids: Vec<Id>) -> (Table, VarId) {
+        let v = ctx.var("k");
+        let mut t = Table::new(vec![v]);
+        t.len = ids.len();
+        t.cols[0] = ids;
+        (t, v)
+    }
+
+    /// The decoded values of a large column keep a charge for their slots, one value per
+    /// distinct term and its payload, not the reservation that building them took.
+    #[test]
+    fn decoded_keys_keep_only_what_the_sort_holds() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let (ctx, terms) = owned(&store, 1 << 30, &["a", "b"]);
+        let n = 4 * super::super::exec::PAR_THRESHOLD;
+        let (t, v) = column(&ctx, (0..n).map(|i| terms[i % 2]).collect());
+        let before = ctx.memory_remaining();
+        let values = cursor_variable_values(&ctx, &t, &Expr::Var(v))
+            .unwrap()
+            .expect("a column of local terms decodes per term");
+        assert_eq!(values.vals.len(), 2);
+        let held = before - ctx.memory_remaining();
+        assert!(
+            held <= n as u64 * 4 + (64 << 10),
+            "{held} bytes kept for {n} rows"
+        );
+    }
+
+    /// A large column of inline values is left to per-value reuse, which keeps one value
+    /// per distinct value rather than one per row.
+    #[test]
+    fn a_large_inline_column_is_left_to_per_value_reuse() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let (ctx, _) = owned(&store, 1 << 30, &[]);
+        let n = 2 * super::super::exec::PAR_THRESHOLD;
+        let (t, v) = column(
+            &ctx,
+            ids(&(0..n).map(|i| [-1, 1][i % 2]).collect::<Vec<_>>()),
+        );
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(v))
+                .unwrap()
+                .is_none()
+        );
+        let small = super::super::exec::PAR_THRESHOLD / 2;
+        let (t, v) = column(&ctx, t.cols[0][..small].to_vec());
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(v))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A refused payload charge of query-local terms declines the decoding, which is
+    /// optional, instead of failing the query.
+    #[test]
+    fn a_refused_local_payload_declines_the_decoding() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let n = 2 * super::super::exec::PAR_THRESHOLD;
+        // the reservation for building the values fits, and nothing more
+        let base = n as u64 * 128 + n as u64 * 8 + 4096;
+        let (ctx, terms) = owned(&store, base + 64, &["local"]);
+        let (t, v) = column(&ctx, vec![terms[0]; n]);
+        assert!(
+            cursor_variable_values(&ctx, &t, &Expr::Var(v))
                 .unwrap()
                 .is_none()
         );
@@ -1700,15 +1810,29 @@ mod tests {
         assert!(measure.value(long).is_some());
         let increment = measure.live_bytes() - before_long;
         assert_eq!(increment, 24);
-        let column = cursor_variable_values(
-            &measure,
-            &measured_table,
-            &Expr::Var(measured_table.vars[0]),
-        )
-        .unwrap()
-        .unwrap();
-        let column_bytes = column._charge.as_ref().unwrap().bytes();
-        drop(column);
+        // The column shrinks its charge to what it keeps once built, so find the room its
+        // construction needs at its peak, the least in which it succeeds.
+        let decodes_in = |room: u64| {
+            let storage = measure.charge(measure.memory_room() - room).unwrap();
+            let column = cursor_variable_values(
+                &measure,
+                &measured_table,
+                &Expr::Var(measured_table.vars[0]),
+            );
+            drop(storage);
+            matches!(column, Ok(Some(_)))
+        };
+        let (mut low, mut high) = (0, measure.memory_room());
+        assert!(decodes_in(high));
+        while low + 1 < high {
+            let mid = low + (high - low) / 2;
+            if decodes_in(mid) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        let column_bytes = high;
         drop(measure);
 
         let (ctx, table, [short, _]) = cursor_with_late_longer_local_key();
