@@ -761,6 +761,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("shacl", "saveForm", "forms.save", |ds| {
             ds.forms().save(&any(), &any());
         }),
+        op!("getSkosShapes", "skos.shapes", |_| {
+            let _ = sparkles::skos::SHAPES;
+        }),
         // ------------------------------------------------------------------ backups
         op!("backupNquads", "dataset.backup", |ds| {
             ds.backup("backups");

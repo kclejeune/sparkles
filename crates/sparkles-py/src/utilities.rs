@@ -133,9 +133,17 @@ fn preview_schedule(
         ))
     }
 }
+/// The built-in SKOS shapes as Turtle (spec U12): the SKOS Reference's integrity
+/// conditions and the layout of the SKOS editing forms.
+#[pyfunction]
+fn skos_shapes() -> &'static str {
+    sparkles::skos::SHAPES
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_iri, m)?)?;
     m.add_function(wrap_pyfunction!(check_langtag, m)?)?;
+    m.add_function(wrap_pyfunction!(skos_shapes, m)?)?;
     m.add_function(wrap_pyfunction!(check_data, m)?)?;
     m.add_function(wrap_pyfunction!(parse_query, m)?)?;
     m.add_function(wrap_pyfunction!(parse_update, m)?)?;
