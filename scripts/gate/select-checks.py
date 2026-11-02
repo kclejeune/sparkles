@@ -138,7 +138,7 @@ RULES = [
     ([
         "*.md", "LICENSE", "docs/*", "scripts/*", ".github/*", ".githooks/*", "deploy/*", "nix/*",
         "flake.nix", "flake.lock", "Dockerfile", "compose.yaml", ".gitignore", ".dockerignore",
-        ".pre-commit-config.yaml",
+        ".pre-commit-config.yaml", ".shellcheckrc", ".gitattributes",
     ], ["base"]),
     # Workspace crates and the test suites: the Rust tasks come from changed-crates.py.
     (["crates/*", "testsuite/*"], ["base"]),
@@ -146,7 +146,8 @@ RULES = [
     (["README.md", "scripts/test-quickstart.py"], ["quickstart"]),
     (["scripts/build-fmt-wasm.sh"], ["wasm"]),
     (["ui/*"], ["base", "ui"]),
-    (["crates/sparkles-py/*", "scripts/py-test.sh"], ["base", "py"]),
+    # The Python tests also read Jena's patch fixtures from sparkles-core.
+    (["crates/sparkles-py/*", "scripts/py-test.sh", "crates/sparkles-core/tests/patch/*"], ["base", "py"]),
     (["crates/sparkles-ffi/*", "jvm/*", "scripts/jvm-native.sh", "scripts/jvm-gradle.sh", "scripts/with-lock.py"],
      ["base", "jvm"]),
     (["crates/sparkles-node/*", "js/*", "scripts/node-native.sh"], ["base", "node"]),
