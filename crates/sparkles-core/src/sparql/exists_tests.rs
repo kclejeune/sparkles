@@ -80,6 +80,33 @@ fn check(snap: &Arc<Snapshot>, text: &str) -> (Vec<String>, bool) {
 
 /// Shapes, and whether the rewrite applies to them (when the outer rows bind a key).
 const SHAPES: &[(&str, bool)] = &[
+    // BIND computes EXISTS from the key set as well, partial bindings included
+    (
+        "SELECT * WHERE { ?x ex:p ?y BIND(EXISTS { ?y ex:q ?z } AS ?e) }",
+        true,
+    ),
+    (
+        "SELECT * WHERE { ?x ex:p ?y OPTIONAL { ?y ex:q ?z } BIND(NOT EXISTS { ?z ex:r ?w } AS ?e) }",
+        true,
+    ),
+    (
+        "SELECT ?e (COUNT(*) AS ?n) WHERE { ?x ex:p ?y BIND(EXISTS { ?x ?pp ?y } AS ?e) } GROUP BY ?e",
+        true,
+    ),
+    // an OPTIONAL condition tests its candidate rows from the key set
+    (
+        "SELECT * WHERE { ?x ex:p ?y OPTIONAL { ?y ex:q ?z FILTER EXISTS { ?z ex:r ?w } } }",
+        true,
+    ),
+    (
+        "SELECT * WHERE { ?x ex:p ?y OPTIONAL { ?y ex:q ?z FILTER NOT EXISTS { ?x ex:r ?z } } }",
+        true,
+    ),
+    // a filter inside over an outer variable is evaluated per row, as for FILTER
+    (
+        "SELECT * WHERE { ?x ex:p ?y BIND(EXISTS { ?y ex:q ?z FILTER(?x != ?z) } AS ?e) }",
+        false,
+    ),
     // plain correlation, one and two keys, the key in either position
     (
         "SELECT * WHERE { ?x ex:p ?y FILTER EXISTS { ?y ex:q ?z } }",
@@ -286,7 +313,7 @@ const SHAPES: &[(&str, bool)] = &[
         "SELECT * WHERE { ?x ex:p ?y FILTER(?y = ex:b) FILTER EXISTS { ?z ex:q ?y } }",
         true,
     ),
-    // two EXISTS conjuncts, one beside an ordinary filter, EXISTS under OR / BIND
+    // two EXISTS conjuncts, one beside an ordinary filter, EXISTS under OR
     (
         "SELECT * WHERE { ?x ex:p ?y FILTER(EXISTS { ?y ex:q ?z } && NOT EXISTS { ?x ex:r ?y }) }",
         true,
@@ -297,10 +324,6 @@ const SHAPES: &[(&str, bool)] = &[
     ),
     (
         "SELECT * WHERE { ?x ex:p ?y FILTER(EXISTS { ?y ex:q ?z } || ?x = ex:a) }",
-        false,
-    ),
-    (
-        "SELECT * WHERE { ?x ex:p ?y BIND(EXISTS { ?y ex:q ?z } AS ?e) }",
         false,
     ),
     // patterns the rewrite does not admit

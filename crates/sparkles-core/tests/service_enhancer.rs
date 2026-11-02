@@ -555,3 +555,56 @@ fn measure_bulk_and_cache() {
         false,
     );
 }
+
+/// A LIMIT without OFFSET over a SERVICE that reads no input is sent with the remote
+/// query, through a projection and a BIND, in both execution modes, so the endpoint
+/// returns only the rows the LIMIT keeps (roadmap item 7). An OFFSET, a FILTER between
+/// them or a loop sends the query without it.
+#[test]
+fn a_limit_reaches_the_remote_query() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let count = |q: &str, mode: ExecutionMode| -> usize {
+        match query_execution(data.snapshot(), q, &opts(), &CursorOptions::default(), mode)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        {
+            QueryExecution::Select(mut c) => {
+                let mut n = 0;
+                while let Some(b) = c.next_batch().unwrap() {
+                    n += b.len();
+                }
+                n
+            }
+            QueryExecution::Eager(r) => r.into_result().rows().len(),
+            _ => unreachable!("a SELECT"),
+        }
+    };
+    for mode in [ExecutionMode::Eager, ExecutionMode::Streaming] {
+        let q = format!(
+            "SELECT ?p ?n {{ SERVICE <{url}> {{ ?d <urn:hasEmployee> ?p }} BIND(STR(?p) AS ?n) }} LIMIT 4"
+        );
+        assert_eq!(count(&q, mode), 4, "{mode:?}");
+        let sent = ep.take();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].trim_end().ends_with("LIMIT 4"),
+            "{mode:?}: {}",
+            sent[0]
+        );
+        // the remote solutions, not the rows a later operator drops, are limited
+        for q in [
+            format!(
+                "SELECT ?p {{ SERVICE <{url}> {{ ?d <urn:hasEmployee> ?p }} }} OFFSET 2 LIMIT 4"
+            ),
+            format!(
+                "SELECT ?p {{ SERVICE <{url}> {{ ?d <urn:hasEmployee> ?p }} FILTER(?d = <urn:dept1>) }} LIMIT 4"
+            ),
+        ] {
+            assert_eq!(count(&q, mode), 4, "{q}");
+            let sent = ep.take();
+            assert!(sent.iter().all(|s| !s.contains("LIMIT")), "{q}: {sent:?}");
+        }
+    }
+}

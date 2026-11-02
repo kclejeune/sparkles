@@ -1,0 +1,10 @@
+DESCRIBE first bytes, laptop stanley (busy with other lanes), release binary 015fdd80 from the nsc cache,
+10.5M quads (gen-data.py 1000000 people), RAYON_NUM_THREADS=1, --result-cache-mb 0, N-Triples.
+Query: PREFIX ex: <http://example.org/> DESCRIBE ?p WHERE { ?p a ex:Student } LIMIT 50000
+eager first 1.100603 total 1.207606 bytes 44215435
+streaming first 0.146356 total 1.020870 bytes 44215435
+eager first 0.686689 total 0.807949 bytes 44215435
+streaming first 0.065186 total 0.845317 bytes 44215435
+eager first 0.578554 total 0.702702 bytes 44215435
+streaming first 0.048199 total 0.699501 bytes 44215435
+410324 triples in both outputs.

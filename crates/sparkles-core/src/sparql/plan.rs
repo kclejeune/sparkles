@@ -4981,6 +4981,10 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
         }
         (n, _) => n,
     };
+    let mut child = child;
+    if let (0, Some(k)) = (start, length) {
+        limit_into(&mut child, k);
+    }
     let desc = format!(
         "offset {start} limit {}",
         length.map_or("∞".to_string(), |l| l.to_string())
@@ -4998,6 +5002,37 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
         n.est = n.est.min(l as f64);
     }
     n
+}
+
+/// Pass a LIMIT of `k` rows without OFFSET into an operator below it whose first `k`
+/// rows are as good an answer as any `k` of its rows, through the operators that keep
+/// every input row as one output row. A SERVICE that reads no input sends its remote
+/// query with the limit, and a full-text search keeps its `k` best hits, so neither
+/// fetches every solution for a few. A LIMIT without ORDER BY may take any `k`
+/// solutions, so both answers are correct. A SERVICE that loops over its input, in
+/// bulk or not, and a search with a variable query string read their input and stay
+/// as they are. OFFSET would let the remote endpoint skip solutions that a later
+/// request returns, so a LIMIT with an OFFSET passes nothing.
+fn limit_into(n: &mut Node, k: usize) {
+    match &mut n.kind {
+        Kind::Project(_) | Kind::Extend(..) if n.children.len() == 1 => {
+            limit_into(&mut n.children[0], k)
+        }
+        Kind::Service {
+            endpoint: PathEnd::Const(_),
+            query,
+            ..
+        } if n.children.is_empty() => {
+            query.push_str(&format!(" LIMIT {k}"));
+            n.desc.clone_from(query);
+            n.est = n.est.min(k as f64);
+        }
+        Kind::TextSearch(spec) if n.children.is_empty() && spec.query_var.is_none() => {
+            spec.limit = Some(spec.limit.map_or(k, |l| l.min(k)));
+            n.est = n.est.min(k as f64);
+        }
+        _ => {}
+    }
 }
 
 fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> Node {

@@ -1595,3 +1595,65 @@ fn original_callback_blank_labels_are_retained_once_under_finite_budgets() {
     .unwrap();
     assert!(error.to_string().contains("memory"), "{error}");
 }
+
+/// A registration that declares a prefix output runs a batch of input at a time in a
+/// cursor, so a LIMIT stops its input early with the answers of eager execution. One
+/// that does not declares nothing and is called for every input row first (roadmap
+/// item 7).
+#[test]
+fn a_declared_prefix_output_streams_its_input() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let s = store();
+    let values: String = (0..5000).map(|i| format!("{i} ")).collect();
+    let all = format!("SELECT ?x ?y {{ VALUES ?x {{ {values} }} ?x <{IRI}> ?y }}");
+    let limited = format!("{all} LIMIT 3");
+    let read = |o: &QueryOptions,
+                q: &str,
+                policy: FallbackPolicy|
+     -> sparkles_core::Result<Vec<Vec<Option<Term>>>> {
+        let cursor = CursorOptions {
+            batch_rows: 64,
+            fallback: policy,
+            ..Default::default()
+        };
+        let mut c = select_cursor(s.snapshot(), q, o, &cursor)?;
+        let mut rows = Vec::new();
+        while let Some(b) = c.next_batch()? {
+            for i in 0..b.len() {
+                rows.push(b.row(i)?);
+            }
+        }
+        Ok(rows)
+    };
+    let (mut d, opens, _) = descriptor(1, true);
+    d.prefix_output = true;
+    let o = options(d);
+    let eager = run(&s, &all, &o);
+    opens.store(0, Ordering::SeqCst);
+    let mut streamed = read(&o, &all, FallbackPolicy::RejectMaterialization).unwrap();
+    let mut expected = eager.clone();
+    streamed.sort_by_key(|r| format!("{r:?}"));
+    expected.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(streamed, expected);
+    assert_eq!(opens.load(Ordering::SeqCst), 5000);
+    opens.store(0, Ordering::SeqCst);
+    assert_eq!(
+        read(&o, &limited, FallbackPolicy::RejectMaterialization)
+            .unwrap()
+            .len(),
+        3
+    );
+    let calls = opens.load(Ordering::SeqCst);
+    assert!(calls < 1000, "{calls} calls for three rows");
+    // without the declaration the strict policy refuses it, and the fallback reads every row
+    let (d, opens, _) = descriptor(1, true);
+    let o = options(d);
+    assert!(read(&o, &limited, FallbackPolicy::RejectMaterialization).is_err());
+    assert_eq!(
+        read(&o, &limited, FallbackPolicy::AllowMaterialization)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 5000);
+}

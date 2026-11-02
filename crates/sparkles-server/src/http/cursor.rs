@@ -181,9 +181,12 @@ pub(super) async fn serve(
     let waits = control.clone();
     let began = Instant::now();
     let dataset_id = ds.store.dataset_id().to_string();
+    // A request that asked for streaming gets its first bytes after the first batch.
+    let early = quick.is_none();
     let serialized = stream::serialize_controlled(
         limit,
         control,
+        early,
         move |writer| {
             let metadata = Some(results::NativeJsonMetadata {
                 commit: seq,

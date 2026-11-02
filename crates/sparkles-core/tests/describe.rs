@@ -449,3 +449,230 @@ fn the_dataset_setting_is_kept_in_describe_json() {
         Ok(_) => panic!("a malformed describe.json opens"),
     }
 }
+
+/// A cursor describes the resources of each batch of solutions in turn, under the strict
+/// fallback policy, and returns the eager description: every mode, reifiers, labels,
+/// depth limits, a dataset, and resources that several batches name.
+#[test]
+fn the_cursor_describes_batch_by_batch() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, graph_cursor};
+    let s = store();
+    let labels = DescribeOptions {
+        labels: true,
+        ..Default::default()
+    };
+    let deep = DescribeOptions {
+        max_depth: Some(2),
+        ..Default::default()
+    };
+    let cases: Vec<(&str, DescribeOptions)> = vec![
+        ("DESCRIBE ex:a", DescribeOptions::default()),
+        ("DESCRIBE ?x WHERE { ?x ?p ?o }", DescribeOptions::default()),
+        ("DESCRIBE ?x WHERE { ?x ?p ?o }", mode(DescribeMode::Scbd)),
+        (
+            "DESCRIBE ?x WHERE { ?x ?p ?o }",
+            mode(DescribeMode::Outgoing),
+        ),
+        ("DESCRIBE ?x ?o WHERE { ?x ex:link ?o }", labels.clone()),
+        ("DESCRIBE ?x WHERE { GRAPH ?g { ?x ?p ?o } }", jena()),
+        ("DESCRIBE ?x WHERE { ?x ?p ?o }", deep),
+        ("DESCRIBE ex:a ?x FROM ex:g1 WHERE { ?x ?p ?o }", labels),
+        (
+            "DESCRIBE ?x WHERE { ?x ex:absent ?o }",
+            DescribeOptions::default(),
+        ),
+    ];
+    for (q, d) in cases {
+        let want = describe(&s, q, &d);
+        for batch_rows in [1, 3, 1000] {
+            let opts = QueryOptions {
+                describe: d.clone(),
+                ..Default::default()
+            };
+            let cursor = CursorOptions {
+                batch_rows,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            let mut c = graph_cursor(s.snapshot(), &format!("{PREFIXES}{q}"), &opts, &cursor)
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(!c.plan().materializes, "{q}");
+            assert!(!c.plan().full_input_before_output, "{q}");
+            let mut triples = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                triples.extend(batch.quads().iter().cloned().map(Triple::from));
+            }
+            let count = triples.len();
+            let got = canon(triples);
+            assert_eq!(count, got.len(), "{q}; {batch_rows}: a triple came twice");
+            assert!(
+                got == want,
+                "{q} with {d:?}; {batch_rows}\ngot:\n{got}\nwant:\n{want}"
+            );
+        }
+    }
+    // a streamed description stops at its limit and reports it
+    let small = DescribeOptions {
+        max_triples: Some(4),
+        ..Default::default()
+    };
+    let opts = QueryOptions {
+        describe: small,
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1,
+        ..Default::default()
+    };
+    let mut c = graph_cursor(
+        s.snapshot(),
+        &format!("{PREFIXES}DESCRIBE ?x WHERE {{ ?x ?p ?o }}"),
+        &opts,
+        &cursor,
+    )
+    .unwrap();
+    let mut count = 0;
+    while let Some(batch) = c.next_batch().unwrap() {
+        count += batch.len();
+    }
+    assert_eq!(count, 4);
+    assert!(c.describe_truncated());
+}
+
+/// A streamed description under a small memory budget either matches the eager one or
+/// fails on memory.
+#[test]
+fn a_streamed_description_stays_within_its_budget() {
+    use sparkles_core::sparql::{CursorOptions, graph_cursor};
+    use sparkles_core::{BudgetKind, Error};
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..3000 {
+        data.push_str(&format!(
+            "<urn:s:{i}> <urn:p> _:b{i} . _:b{i} <urn:q> \"{}\" . <urn:s:{i}> <urn:r> <urn:s:{}> .\n",
+            "x".repeat(40),
+            (i + 1) % 3000
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "DESCRIBE ?s WHERE { ?s <urn:r> ?o }";
+    let want = canon(query(s.snapshot(), q, &Default::default()).unwrap().triples);
+    assert_eq!(want.len(), 9000);
+    for memory in [1u64 << 20, 4 << 20, 64 << 20] {
+        let opts = QueryOptions {
+            max_memory_bytes: Some(memory),
+            ..Default::default()
+        };
+        let cursor = CursorOptions {
+            batch_rows: 100,
+            ..Default::default()
+        };
+        let mut c = graph_cursor(s.snapshot(), q, &opts, &cursor).unwrap();
+        let mut triples = Vec::new();
+        let outcome = loop {
+            match c.next_batch() {
+                Ok(Some(batch)) => triples.extend(batch.quads().iter().cloned().map(Triple::from)),
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        match outcome {
+            Ok(()) => assert!(canon(triples) == want, "{memory}"),
+            Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory, "{memory}"),
+            Err(e) => panic!("{memory}: {e}"),
+        }
+    }
+}
+
+/// The triples of a streamed description stay charged only until the batch that holds
+/// them is dropped, so a description larger than the budget streams through it.
+#[test]
+fn a_streamed_description_releases_what_it_returned() {
+    use sparkles_core::sparql::{CursorOptions, graph_cursor};
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..4000 {
+        data.push_str(&format!(
+            "<urn:s:{i}> <urn:text> \"{i}{}\" .\n",
+            "y".repeat(2000)
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let opts = QueryOptions {
+        max_memory_bytes: Some(16 << 20),
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 50,
+        ..Default::default()
+    };
+    let mut c = graph_cursor(
+        s.snapshot(),
+        "DESCRIBE ?s WHERE { ?s <urn:text> ?o }",
+        &opts,
+        &cursor,
+    )
+    .unwrap();
+    let mut count = 0;
+    while let Some(batch) = c.next_batch().unwrap() {
+        count += batch.len();
+    }
+    assert_eq!(count, 4000);
+}
+
+/// Closing a streamed description returns what it held to the query pool, even while
+/// the closed cursor stays alive.
+#[test]
+fn a_closed_description_returns_its_memory() {
+    use sparkles_core::sparql::pool::QueryPool;
+    use sparkles_core::sparql::{CursorOptions, graph_cursor};
+    use std::sync::Arc;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..20_000 {
+        data.push_str(&format!("<urn:s:{i}> <urn:p> <urn:o:{}> .\n", i % 97));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let pool = QueryPool::new(1 << 30);
+    let grant = Arc::new(pool.try_grant(0).unwrap());
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1000,
+        ..Default::default()
+    };
+    let mut c = graph_cursor(
+        s.snapshot(),
+        "DESCRIBE ?s WHERE { ?s <urn:p> ?o }",
+        &opts,
+        &cursor,
+    )
+    .unwrap();
+    for _ in 0..10 {
+        assert!(c.next_batch().unwrap().is_some());
+    }
+    let open = grant.used();
+    c.close();
+    let closed = grant.used();
+    assert!(closed < open / 2, "open {open}, closed {closed}");
+    assert!(c.next_batch().unwrap().is_none());
+    drop(c);
+}

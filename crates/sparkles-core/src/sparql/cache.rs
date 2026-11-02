@@ -585,7 +585,12 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
                 "owner:{};",
                 ctx.snap.text.as_ref().map_or(0, |v| v.owner)
             );
-            let _ = write!(s, "{:?}{:?}{:?}{}", t.graph, t.graph_var, t.subject, epoch);
+            // a query's LIMIT can set the search's limit without changing its text
+            let _ = write!(
+                s,
+                "{:?}{:?}{:?}l{:?}{}",
+                t.graph, t.graph_var, t.subject, t.limit, epoch
+            );
             true
         }
         Kind::IndexJoin(j) => {

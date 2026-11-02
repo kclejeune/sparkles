@@ -372,6 +372,14 @@ pub struct Spec {
     graph: Arc<GraphFilter>,
 }
 
+impl Spec {
+    /// Whether the registration declares that a prefix of the input gives a prefix of
+    /// the output.
+    pub(super) fn prefix_output(&self) -> bool {
+        self.descriptor.prefix_output
+    }
+}
+
 pub(super) fn has_calls(ctx: &Ctx, patterns: &[TriplePattern]) -> bool {
     ctx.extensions.as_ref().is_some_and(|r| {
         patterns.iter().any(|t|

@@ -91,6 +91,17 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+Streaming cursors run FOLD and registered aggregates over the key runs of their input,
+sorting it on the group keys when it does not arrive that way, and DESCRIBE describes
+each batch of solutions as it arrives, so the strict policy admits both. A LIMIT without
+OFFSET reaches a SERVICE that reads no input and a full-text search with a constant query,
+and a registered property function that declares `prefix_output` runs a batch of input
+at a time. A request with `execution=streaming` commits its response after the cursor's
+first batch instead of after 1 MiB. Both executors answer an EXISTS in BIND or an
+OPTIONAL condition from the key set of its pattern, and automatic execution streams such
+a BIND. On an 8-vCPU Namespace instance at 10.5M quads, automatic execution of a COUNT
+grouped by BIND(EXISTS) went from 860 ms to 8.4 ms.
+
 An OWL 2 ontology API reads the axioms of a dataset's graphs through the OWL 2 Mapping to
 RDF Graphs, checks them against OWL 2 DL, EL, QL and RL, and edits them in one commit.
 The new `sparkles-owl` crate holds the axiom model, both mappings with lenient and strict

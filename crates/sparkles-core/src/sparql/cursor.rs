@@ -30,6 +30,7 @@ mod joinspill;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
 mod ripple;
+mod runs;
 mod topk;
 mod walk;
 
@@ -691,7 +692,7 @@ fn from_prepared(
     let variables = Arc::new(order.iter().map(|&i| names[i].clone()).collect());
     let bytes = plan_bytes(&prepared.node).saturating_add(query.len() as u64 * 16);
     let charge = OwnedCharge::new(&ctx, bytes)?;
-    let spec = graph::Spec::from_parsed(parsed, options, cursor.fallback)?;
+    let spec = graph::Spec::from_parsed(parsed, options)?;
     let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
     let plan = root.describe(&ctx);
     ctx.check()?;
@@ -1284,27 +1285,69 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         Kind::Sort(_) => rows(node, node.est),
         Kind::OrderBy { limit: Some(k), .. } => rows(node, (*k as f64).min(node.est)),
         Kind::OrderBy { limit: None, .. } => rows(node, node.est),
-        Kind::Filter(exprs) if node.children.len() == 1 => exprs
-            .iter()
-            .filter(|e| e.has_exists())
-            .map(|e| {
-                super::exists::keyed_plan(ctx, e, &node.children[0])
-                    .map_or(f64::INFINITY, |planned| {
-                        hashed(&planned, planned.est) + cursor_state_bytes(ctx, &planned)
-                    })
-            })
-            .sum(),
+        Kind::Filter(_) if node.children.len() == 1 => keyed_exists_bytes(ctx, node),
         // a variable or a constant generates no term
         Kind::Extend(_, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..)) => 0.0,
         Kind::Extend(..) => node.est.max(0.0) * GENERATED_TERM_BYTES,
         _ if supported(&node.kind) => 0.0,
         _ => rows(node, node.est),
     };
-    own + node
-        .children
-        .iter()
-        .map(|c| cursor_state_bytes(ctx, c))
-        .sum::<f64>()
+    // the key sets of a BIND's or an OPTIONAL condition's EXISTS, beside the
+    // operator's own state
+    let keyed = match &node.kind {
+        Kind::Extend(_, e) | Kind::LeftJoin { expr: Some(e) } if e.has_exists() => {
+            keyed_exists_bytes(ctx, node)
+        }
+        _ => 0.0,
+    };
+    own + keyed
+        + node
+            .children
+            .iter()
+            .map(|c| cursor_state_bytes(ctx, c))
+            .sum::<f64>()
+}
+
+/// The estimated bytes of the key sets that answer the EXISTS expressions of `node`,
+/// with the cursor state of their plans, or infinity when one has no key set.
+fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
+    let hashed = |n: &Node| {
+        let est = n.est.max(0.0);
+        let entries = est.min(usize::MAX as f64) as usize;
+        est * (n.vars.len().max(1) * 8) as f64 * 2.0
+            + binary::map_bytes(entries, 16) as f64 * 1.5
+            + est * 12.0
+            + 1024.0
+    };
+    own_exprs(&node.kind)
+        .into_iter()
+        .filter(|e| e.has_exists())
+        .map(|e| {
+            keyed_exists(ctx, node, e).map_or(f64::INFINITY, |planned| {
+                hashed(&planned) + cursor_state_bytes(ctx, &planned)
+            })
+        })
+        .sum()
+}
+
+/// The plan of the key set that answers the EXISTS expression `e` of `node`: a FILTER
+/// conjunct, a BIND expression or an OPTIONAL condition. The rows a FILTER or a BIND
+/// tests are its input's, and those an OPTIONAL condition tests are the pairs of its
+/// two sides, which bind every variable that either side always binds.
+fn keyed_exists(ctx: &Ctx, node: &Node, e: &Expr) -> Option<Node> {
+    match (&node.kind, node.children.as_slice()) {
+        (Kind::Filter(_) | Kind::Extend(..), [input]) => {
+            super::exists::keyed_plan(ctx, e, &input.vars, &input.certain)
+        }
+        (Kind::LeftJoin { .. }, [left, right]) => {
+            let mut vars = left.vars.clone();
+            vars.extend(right.vars.iter().filter(|v| !left.vars.contains(v)));
+            let mut certain = left.certain.clone();
+            certain.extend(right.certain.iter().filter(|v| !left.certain.contains(v)));
+            super::exists::keyed_plan(ctx, e, &vars, &certain)
+        }
+        _ => None,
+    }
 }
 
 /// The estimated bytes of the largest operator output in `node`, as eager execution
@@ -1337,23 +1380,23 @@ pub(super) fn native(node: &Node) -> bool {
 const AUTO_EXISTS_DEPTH: usize = 4;
 
 /// Whether every operator of `node` has a cursor implementation, as [`native`] asks,
-/// where a FILTER whose conjuncts include `EXISTS { P }` or `NOT EXISTS { P }` also
-/// counts when the cursor can answer each of them from a key set and the plan of each
-/// `P` counts in turn. The key set is filled by a child cursor under the query's
-/// charges. An EXISTS anywhere else, such as in BIND, in an OPTIONAL condition or
-/// inside a larger expression, is evaluated once per distinct outer key. On Namespace
-/// at 10.5M quads that took 1.15 times as long in the cursor as in eager execution,
-/// while the key-set filters took 0.68 to 0.99 times as long, so such plans stay eager.
+/// where a FILTER conjunct or a BIND expression that is `EXISTS { P }` or
+/// `NOT EXISTS { P }` also counts when the cursor can answer it from a key set and the
+/// plan of `P` counts in turn. The key set is filled by a child cursor under the query's
+/// charges. An EXISTS inside a larger expression, such as IF or OR, is evaluated once
+/// per distinct outer key, which measured slower in the cursor than in eager execution,
+/// so such plans stay eager. So does an OPTIONAL whose condition is an EXISTS. The cursor
+/// answers it from the key set as well, but its conditional OPTIONAL took 3.7 to 4.6
+/// times as long as eager execution on Namespace at 10.5M quads, whatever the condition.
 /// The patterns are planned here only to read their operators. Planning interns their
 /// variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
     fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
         let exists = match &node.kind {
-            Kind::Filter(exprs) => exprs.iter().all(|e| {
+            Kind::Filter(_) | Kind::Extend(..) => own_exprs(&node.kind).into_iter().all(|e| {
                 !e.has_exists()
                     || (depth < AUTO_EXISTS_DEPTH
-                        && node.children.len() == 1
-                        && super::exists::keyed_plan(ctx, e, &node.children[0])
+                        && keyed_exists(ctx, node, e)
                             .is_some_and(|planned| at(ctx, &planned, depth + 1)))
             }),
             kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
@@ -2153,6 +2196,8 @@ enum State {
     Binary(Box<binary::Binary>),
     Ripple(Box<ripple::Ripple>),
     Group(Box<group::Group>),
+    /// A grouping over its input's key runs, for aggregates that need a group's rows.
+    RunGroup(Box<runs::RunGroup>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
     Walk(Box<walk::Walk>),
@@ -2532,6 +2577,8 @@ impl Operator {
         let exists_streams = !exists || exists_streams(ctx, &node.kind)?;
         let joins = exists_streams && binary::eligible(&node);
         let incremental_group = exists_streams && group::eligible(&node);
+        // FOLD and registered aggregates read each group's rows from key runs.
+        let run_group = exists_streams && runs::eligible(&node);
         let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
         // A pattern count over an input reads all of it, as a sort does, and then has one
@@ -2550,6 +2597,7 @@ impl Operator {
         let materializes = !(exists_streams && supported(&node.kind))
             && !joins
             && !incremental_group
+            && !run_group
             && !expanding
             && !walking
             && !index_topk
@@ -2667,6 +2715,24 @@ impl Operator {
             }
             children
         };
+        // A grouping over key runs needs its input ordered on the keys. When the input
+        // does not keep that order, a stable sort on the keys, which may spill, gives it.
+        let mut children = children;
+        if run_group {
+            let keys = runs::sort_keys(&node, &node.children[0].vars);
+            if !runs::grouped_by(&children[0].order, &keys) {
+                let child = children.pop().expect("a grouping's input");
+                let input = node.children.pop().expect("a grouping's input shape");
+                let mut shell =
+                    Node::leaf(Kind::Empty, input.vars.clone(), input.est, String::new());
+                shell.certain.clone_from(&input.certain);
+                shell.cost = input.cost;
+                let sorted = Self::sorted_on(ctx, child, input, keys)?;
+                shell.sorted.clone_from(&sorted.order);
+                node.children.push(shell);
+                children.push(sorted);
+            }
+        }
         // A merge join needs both inputs ordered on its key. When an input cannot
         // promise that order, the hash join takes its place.
         let incremental_merge = !materializes && merge::eligible(&node);
@@ -2685,6 +2751,7 @@ impl Operator {
             || incremental_merge
             || incremental_binary
             || incremental_group
+            || run_group
             || expanding
             || walking
             || exists;
@@ -2695,7 +2762,7 @@ impl Operator {
                 Role::Merge
             } else if incremental_binary {
                 Role::Binary
-            } else if incremental_group {
+            } else if incremental_group || run_group {
                 Role::Group
             } else if native_blocking {
                 Role::Blocking
@@ -2734,7 +2801,7 @@ impl Operator {
             );
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk).then(|| {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group).then(|| {
             if let Kind::OrderedTopK(spec) = &node.kind {
                 format!(
                     "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
@@ -2749,6 +2816,11 @@ impl Operator {
             } else if native_blocking {
                 format!(
                     "{} consumes all input under the memory budget before output",
+                    node.operator()
+                )
+            } else if run_group && !exists {
+                format!(
+                    "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
                     node.operator()
                 )
             } else if !materializes {
@@ -2771,6 +2843,8 @@ impl Operator {
             State::Ripple(Box::new(ripple))
         } else if let Some(group) = group {
             State::Group(Box::new(group))
+        } else if run_group {
+            State::RunGroup(Box::new(runs::RunGroup::new(&node, &children[0].vars)))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if index_topk {
@@ -2847,6 +2921,54 @@ impl Operator {
             growing,
             reason,
             bind_reuse,
+            released: false,
+            order,
+            #[cfg(debug_assertions)]
+            last: None,
+        })
+    }
+
+    /// A stable sort of `child`'s output on `keys`, for a parent that needs the rows of
+    /// each key together and in input order. `shape` is the child's plan shell. The
+    /// sort spills as other sorts do.
+    fn sorted_on(ctx: &Arc<Ctx>, child: Operator, shape: Node, keys: Vec<VarId>) -> Result<Self> {
+        let mut node = Node::leaf(
+            Kind::Sort(keys.clone()),
+            shape.vars.clone(),
+            shape.est,
+            "on the group keys, keeping input order within each group".into(),
+        );
+        node.certain.clone_from(&shape.certain);
+        node.cost = shape.cost + shape.est * shape.est.max(2.0).log2() * 0.5;
+        node.sorted.clone_from(&keys);
+        let mut shape = shape;
+        shape.sorted.clone_from(&child.order);
+        node.children = vec![shape];
+        let mut info = exec::describe_node(ctx, &node);
+        if ctx.graphs.is_some() {
+            info.redact();
+        }
+        info.actual_rows = 0;
+        let order = output_order(&node, std::slice::from_ref(&child), Role::Blocking);
+        Ok(Self {
+            vars: node.vars.clone(),
+            reason: Some(format!(
+                "{} consumes all input under the memory budget before output",
+                node.operator()
+            )),
+            state: State::Blocking {
+                node,
+                loaded: None,
+                at: 0,
+                external: None,
+            },
+            children: vec![child],
+            info,
+            rows: 0,
+            done: false,
+            materializes: false,
+            growing: true,
+            bind_reuse: None,
             released: false,
             order,
             #[cfg(debug_assertions)]
@@ -3273,6 +3395,11 @@ impl Operator {
                         counters.insert("spillPasses".into(), (group.passes + 1).into());
                         self.info.counters = Some(counters);
                     }
+                    batch
+                }
+                State::RunGroup(group) => {
+                    let batch = group.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
+                    self.done = group.done();
                     batch
                 }
                 State::Filter(filter) => {
@@ -4364,13 +4491,19 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
                 true,
             ),
-            // an EXISTS evaluated per distinct key, in an OPTIONAL condition or BIND
+            // an EXISTS answered from a key set in BIND, and in an OPTIONAL condition,
+            // whose conditional OPTIONAL is slower in the cursor
+            (
+                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
+                true,
+            ),
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
                 false,
             ),
+            // and one evaluated per distinct key inside a larger expression
             (
-                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
+                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(IF(EXISTS {?s <urn:q> ?b}, 1, 0) AS ?e)} GROUP BY ?e",
                 false,
             ),
             (
