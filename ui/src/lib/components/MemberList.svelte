@@ -27,6 +27,7 @@
     ds,
     prefixes,
     fullText = false,
+    lang = 'en',
   }: {
     field: FormField;
     /** The members, in order. */
@@ -39,20 +40,24 @@
     ds: string;
     prefixes: PrefixMap;
     fullText?: boolean;
+    /** The language a new member with a language takes. */
+    lang?: string;
   } = $props();
 
   const member = $derived(memberField(field));
   const widget = $derived(field.constraints.list?.memberWidget ?? 'term');
   const max = $derived(field.constraints.list?.maxLength);
+  const langs = $derived(member?.constraints.languageIn ?? []);
   const inputId = (i: number) => (i === 0 ? base : `${base}-m${i}`);
   const nameOf = (i: number) => `${field.label} member ${i + 1}`;
   const searchHits = (text: string, signal: AbortSignal) =>
     searchInstances(ds, text, { classes: member?.constraints.class ?? [], fullText, signal });
 
-  function setText(i: number, text: string) {
+  function setText(i: number, text: string, langTag = entries[i].lang) {
     if (!member) return;
-    const r = entryTerm(member, widget, text, entries[i].lang, prefixes);
-    entries[i] = { ...entries[i], text, term: r.term, error: r.error };
+    // a date-time member keeps the offset it was loaded with
+    const r = entryTerm(member, widget, text, langTag, prefixes, entries[i].zone);
+    entries[i] = { ...entries[i], text, lang: langTag, term: r.term, error: r.error };
   }
 
   function setTerm(i: number, term: Term | null, label?: string) {
@@ -75,7 +80,9 @@
   }
 
   function add() {
-    entries = [...entries, entryOf(null, widget)];
+    const e = entryOf(null, widget);
+    if (widget === 'text-lang') e.lang = langs[0] ?? lang;
+    entries = [...entries, e];
     queueMicrotask(() => document.getElementById(inputId(entries.length - 1))?.focus());
   }
 
@@ -117,6 +124,27 @@
           value={e.text}
           oninput={(ev) => setText(i, ev.currentTarget.value)}
         />
+        {#if widget === 'text-lang'}
+          {#if langs.length}
+            <select
+              class="select lang"
+              aria-label="Language of {nameOf(i)}"
+              value={e.lang}
+              onchange={(ev) => setText(i, e.text, ev.currentTarget.value)}
+            >
+              {#if !langs.includes(e.lang)}<option value={e.lang}>{e.lang || 'none'}</option>{/if}
+              {#each langs as l (l)}<option value={l}>{l}</option>{/each}
+            </select>
+          {:else}
+            <input
+              class="input lang"
+              aria-label="Language of {nameOf(i)}"
+              placeholder="lang"
+              value={e.lang}
+              oninput={(ev) => setText(i, e.text, ev.currentTarget.value.trim())}
+            />
+          {/if}
+        {/if}
       {/if}
       {#if editable}
         <span class="moves">
@@ -186,6 +214,9 @@
   .member :global(.input) {
     flex: 1 1 12rem;
     min-width: 0;
+  }
+  .member .lang {
+    flex: 0 0 5rem;
   }
   .pos {
     width: 1.5em;

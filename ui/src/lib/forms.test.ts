@@ -6,6 +6,7 @@ import {
   checkField,
   choiceGroup,
   compilePattern,
+  detachLost,
   diffValues,
   entryOf,
   entryTerm,
@@ -373,8 +374,25 @@ describe('value alternatives (sh:or and sh:xone)', () => {
       { index: 0, message: 'must be one of: Concept, Text' },
     ]);
   });
+  it('leaves sh:xone to the server when an option has checks only the server runs', () => {
+    // either class may hold, and the browser cannot tell which
+    const f = members('xone', { class: [`${EX}Collection`] } as never);
+    expect(checkField(f, [iri('x')])).toEqual([]);
+  });
   it('refuses a value that two options of sh:xone allow', () => {
-    const f = members('xone', { nodeKind: 'http://www.w3.org/ns/shacl#IRI' } as never);
+    const iriOnly = { nodeKind: 'http://www.w3.org/ns/shacl#IRI' };
+    const f = field({
+      widget: 'term',
+      constraints: {
+        or: {
+          kind: 'xone',
+          options: [
+            { shape: '_:a', label: 'Concept', widget: 'iri', constraints: iriOnly },
+            { shape: '_:b', label: 'Text', widget: 'iri', constraints: iriOnly },
+          ],
+        },
+      },
+    });
     expect(checkField(f, [iri('x')])).toEqual([
       { index: 0, message: 'must be exactly one of: Concept, Text' },
     ]);
@@ -491,6 +509,45 @@ describe('nested children', () => {
       },
       {
         node: { type: 'bnode', value: 'new1' },
+        parent: { type: 'bnode', value: 'b7' },
+        field: '<geo>',
+        changes: [{ field: '<lat>', remove: [], add: [lit('52')] }],
+      },
+    ]);
+  });
+  it('saves a kept child that another commit removed as a whole new child', () => {
+    const current = {
+      '<addr>': [address.values[0].term],
+      'b7 <street>': [lit('Old')],
+      'b7 <geo>': [{ type: 'bnode', value: 'g1' } as Term],
+      'g1 <lat>': [lit('52')],
+    };
+    const stored: Record<string, FormNode> = {
+      ...nodes,
+      g1: {
+        key: 'g1',
+        term: { type: 'bnode', value: 'g1' },
+        fields: [field({ id: '<lat>', values: [{ term: lit('52'), graph: null }] })],
+        isNew: false,
+      },
+    };
+    const detached = detachLost(stored, current, ['b7']);
+    expect(detached.b7.isNew && detached.g1.isNew).toBe(true);
+    // the parent field now loads no child, as the conflict said
+    const m = { fields: [{ ...address, values: [] }] } as unknown as FormModel;
+    const s = changeSet(m, current, detached);
+    expect(s.changes).toEqual([{ field: '<addr>', remove: [], add: [address.values[0].term] }]);
+    expect(s.nested).toEqual([
+      {
+        node: { type: 'bnode', value: 'b7' },
+        field: '<addr>',
+        changes: [
+          { field: '<street>', remove: [], add: [lit('Old')] },
+          { field: '<geo>', remove: [], add: [{ type: 'bnode', value: 'g1' }] },
+        ],
+      },
+      {
+        node: { type: 'bnode', value: 'g1' },
         parent: { type: 'bnode', value: 'b7' },
         field: '<geo>',
         changes: [{ field: '<lat>', remove: [], add: [lit('52')] }],

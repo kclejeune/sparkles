@@ -88,6 +88,12 @@
   const many = $derived(multiValued(field));
   const req = $derived(required(field));
   const options = $derived(c.in ?? []);
+  /** The allowed values of an entry: its option's, or the field's. */
+  const optionsOf = (e: Entry | undefined) =>
+    options_.length ? (fieldOf(e).constraints.in ?? []) : options;
+  /** The languages of an entry: its option's, or the field's. */
+  const langsOf = (e: Entry | undefined) =>
+    (options_.length ? fieldOf(e).constraints.languageIn : c.languageIn) ?? [];
   /** Checkboxes or a radio group for a list of allowed values (`choiceGroup`). */
   const group = $derived(choiceGroup(field, widget));
   const errId = $derived(`${base}-problems`);
@@ -132,7 +138,6 @@
       max: lit(c.maxInclusive) ?? b.max,
     };
   });
-  const langs = $derived(c.languageIn ?? []);
 
   /** The id of an entry's input: the field's own id for the first. */
   const inputId = (i: number) => (i === 0 ? base : `${base}-${i}`);
@@ -159,13 +164,15 @@
   /** Choose the option of an entry: its value starts again in that option's widget. */
   function setOption(i: number, option: number) {
     const e = entryOf(null, options_[option]?.widget ?? widget);
+    if (e.lang === '' && options_[option]?.widget === 'text-lang')
+      e.lang = options_[option].constraints.languageIn?.[0] ?? lang;
     entries[i] = { ...e, key: entries[i].key, option };
   }
 
   function add() {
     if (onaddchild) return onaddchild();
     const e = entryOf(null, widgetFor(undefined));
-    if (widget === 'text-lang') e.lang = langs[0] ?? lang;
+    if (widgetFor(undefined) === 'text-lang') e.lang = langsOf(undefined)[0] ?? lang;
     entries = [...entries, e];
     queueMicrotask(() => document.getElementById(inputId(entries.length - 1))?.focus());
   }
@@ -292,6 +299,7 @@
       {ds}
       {prefixes}
       {fullText}
+      {lang}
     />
   {:else}
     <div class="ff-head">
@@ -310,6 +318,7 @@
     >
       {#each entries as e, i (e.key)}
         {@const ew = widgetFor(e)}
+        {@const el = langsOf(e)}
         <div class="value-row" class:nested-row={!!child && e.term?.type === 'bnode'}>
           {#if options_.length && !e.readOnly && !(child && e.term?.type === 'bnode')}
             <select
@@ -331,7 +340,7 @@
               <TermView term={e.term} {prefixes} />
               <span class="faint small" id="{inputId(i)}-ro">in a graph you cannot write to</span>
             </div>
-          {:else if ew === 'select' && options.length}
+          {:else if (ew === 'select' || ew === 'radio') && optionsOf(e).length}
             <select
               class="select"
               id={inputId(i)}
@@ -345,7 +354,7 @@
               }}
             >
               <option value="">{req ? 'Choose a value' : 'None'}</option>
-              {#each options as o (optionKey(o))}
+              {#each optionsOf(e) as o (optionKey(o))}
                 <option value={optionKey(o)}>{optionText(o)}</option>
               {/each}
             </select>
@@ -431,16 +440,15 @@
               oninput={(ev) => setText(i, ev.currentTarget.value)}
             />
             {#if ew === 'text-lang'}
-              {#if langs.length}
+              {#if el.length}
                 <select
                   class="select lang"
                   aria-label="Language of {nameOf(i)}"
                   value={e.lang}
                   onchange={(ev) => setText(i, e.text, ev.currentTarget.value)}
                 >
-                  {#if !langs.includes(e.lang)}<option value={e.lang}>{e.lang || 'none'}</option
-                    >{/if}
-                  {#each langs as l (l)}<option value={l}>{l}</option>{/each}
+                  {#if !el.includes(e.lang)}<option value={e.lang}>{e.lang || 'none'}</option>{/if}
+                  {#each el as l (l)}<option value={l}>{l}</option>{/each}
                 </select>
               {:else}
                 <input

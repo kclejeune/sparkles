@@ -440,10 +440,14 @@ export function checkField(f: FormField, values: (Term | null)[]): Problem[] {
   if (c.or?.options.length) {
     const opts = optionFields(f);
     const names = c.or.options.map((o) => o.label).join(', ');
+    // an option with constraints only the server checks may match or not: the browser
+    // proves a match only for an option it checks entirely
+    const decided = (o: FormField) =>
+      !o.constraints.class?.length && !o.constraints.node?.length && !o.constraints.server?.length;
     for (const { v, i } of present) {
-      const pass = opts.filter((o) => checkField(o, [v]).length === 0).length;
-      if (pass === 0) out.push({ index: i, message: `must be one of: ${names}` });
-      else if (c.or.kind === 'xone' && pass > 1)
+      const pass = opts.filter((o) => checkField(o, [v]).length === 0);
+      if (pass.length === 0) out.push({ index: i, message: `must be one of: ${names}` });
+      else if (c.or.kind === 'xone' && pass.filter(decided).length > 1)
         out.push({ index: i, message: `must be exactly one of: ${names}` });
     }
   }
@@ -712,6 +716,35 @@ export function reachable(
         out.push({ node, parent: owner, field: f.id });
         queue.push({ owner: node.key, fields: node.fields });
       }
+    }
+  }
+  return out;
+}
+
+/**
+ * Turn stored nested nodes that no longer hang from their parent into new ones, with
+ * the stored nodes reachable from them: their fields lose their loaded values, so a save
+ * writes every value the form shows again under new nodes. A person who keeps their own
+ * values of a field whose child another commit removed gets the whole child back, not
+ * only the fields they changed.
+ */
+export function detachLost(
+  nodes: Record<string, FormNode>,
+  current: Record<string, (Term | null)[]>,
+  lost: string[],
+): Record<string, FormNode> {
+  const out = { ...nodes };
+  const queue = [...lost];
+  while (queue.length) {
+    const key = queue.shift()!;
+    const n = out[key];
+    if (!n || n.isNew) continue;
+    const fields = n.fields.map((f) => ({ ...f, values: [] }));
+    out[key] = { ...n, fields, isNew: true };
+    for (const f of n.fields) {
+      if (!f.constraints.node?.length) continue;
+      for (const t of current[fieldKey(key, f.id)] ?? [])
+        if (t?.type === 'bnode' && out[t.value] && !out[t.value].isNew) queue.push(t.value);
     }
   }
   return out;

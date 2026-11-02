@@ -3645,8 +3645,9 @@ or a hidden triple still refers to keeps its triples and loses only the edge. Va
 appear again through a cycle are shown once, with a note that the node is the same as
 one above. A field with SHACL 1.2 list constraints such as `sh:memberShape` edits its
 `rdf:List` as an ordered list, where each member can move up or down or be removed, and a
-save replaces the stored list with the members in their new order. A malformed list is
-read-only. A field whose `sh:or` or `sh:xone` names alternative value shapes offers a
+save replaces the stored list with the members in their new order. A field without a
+list gets one when it gains its first member, so the form does not write an empty list.
+A malformed list is read-only. A field whose `sh:or` or `sh:xone` names alternative value shapes offers a
 **Kind of** select for each value, which chooses the alternative whose constraints the
 browser checks and whose widget edits the value. Node-level alternatives with their own
 properties are not offered as a choice, and nested values reached through complex paths
