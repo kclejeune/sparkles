@@ -223,18 +223,20 @@ impl Dl {
                 });
             }
         }
-        // the literals of the ontology's own annotations
-        let mut header = Vec::new();
-        dl.literals(
-            &Literals::of_annotations(&o.header.annotations),
-            &mut header,
-        );
-        dl.global.extend(header.into_iter().map(|b| Violation {
-            axiom: None,
-            graph: o.header_graph,
-            rule: b.rule.into(),
-            message: b.message,
-        }));
+        // the literals of the annotations of the ontology's header and of the headers of
+        // the graphs it imports
+        let headers = std::iter::once((o.header_graph, &o.header))
+            .chain(o.other_headers.iter().map(|(g, h)| (Some(*g), h)));
+        for (graph, h) in headers {
+            let mut found = Vec::new();
+            dl.literals(&Literals::of_annotations(&h.annotations), &mut found);
+            dl.global.extend(found.into_iter().map(|b| Violation {
+                axiom: None,
+                graph,
+                rule: b.rule.into(),
+                message: b.message,
+            }));
+        }
         dl
     }
 

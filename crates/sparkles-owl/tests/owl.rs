@@ -762,6 +762,36 @@ fn annotation_literals_are_checked() {
 }
 
 #[test]
+fn imported_header_literals_are_checked() {
+    let main = ttl(&decl(
+        "<http://example.org/onto> owl:imports <http://example.org/lib> .",
+    ));
+    let lib = ttl("<http://example.org/lib> a owl:Ontology ; rdfs:comment \"x\"^^xsd:integer .");
+    let graph_of: Vec<u32> = std::iter::repeat_n(0, main.len())
+        .chain(std::iter::repeat_n(1, lib.len()))
+        .collect();
+    let triples = main.into_iter().chain(lib).collect();
+    let o = read::read(
+        triples,
+        graph_of,
+        &[0],
+        ReadOptions {
+            mode: Mode::Strict,
+            ..Default::default()
+        },
+    );
+    assert_eq!(o.other_headers.len(), 1);
+    let r = report(&o, Profile::Dl);
+    assert!(
+        r.violations
+            .iter()
+            .any(|v| v.rule.ends_with("§5.7") && v.graph == Some(1)),
+        "{:?}",
+        r.violations
+    );
+}
+
+#[test]
 fn defined_datatypes_have_no_literals_or_facets() {
     let body = ":SSN a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ;
          owl:onDatatype xsd:string ; owl:withRestrictions ( [ xsd:pattern \"[0-9]+\" ] ) ] .";

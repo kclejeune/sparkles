@@ -192,9 +192,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   datatype in the OWL 2 datatype map needs a lexical form of that datatype, such as an
   `xsd:byte` from -128 to 127 or an `owl:rational` such as `1/3`, and no literal can be
   of type `owl:real` or of a datatype that a datatype definition introduces. A datatype
-  restriction can use only the facets its datatype supports, with values of the type
-  each facet takes. Annotation literals and the ontology header's annotations are
-  checked as well. An edit can still write an ill-typed literal, and a check reports it.
+  restriction can use only the facets its datatype supports, with values in the value
+  space each facet takes, a pattern that parses as an XML Schema regular expression and
+  a language range of RFC 4647. Annotation literals and the annotations of the headers
+  of the ontology and its imports are checked as well. An edit can still write an ill-typed literal, and a check reports it.
 * Entity accessors answer what an ontology says about an entity: its kinds, labels and
   annotations, the superclasses, subclasses, equivalent and disjoint classes and keys of
   a class, the domains, ranges, hierarchy, inverses and characteristics of a property,

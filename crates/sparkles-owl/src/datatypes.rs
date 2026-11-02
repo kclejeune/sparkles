@@ -164,12 +164,9 @@ pub fn facet_problem(datatype: &str, facet: &str, value: &Literal) -> Option<Str
                 vt == datatype
             }
         }
-        "length" | "minLength" | "maxLength" => {
-            let v = value.value();
-            let negative = v.starts_with('-') && v[1..].bytes().any(|b| b != b'0');
-            local(vt).is_some_and(|l| integer_in(l, v)) && !negative
-        }
-        "pattern" | "langRange" => vt == vocab::XSD_STRING,
+        "length" | "minLength" | "maxLength" => nonnegative_integer(vt, value.value()),
+        "pattern" => string_value(vt, value.value()).is_some_and(pattern),
+        "langRange" => string_value(vt, value.value()).is_some_and(language_range),
         _ => true,
     };
     (!ok).then(|| {
@@ -178,6 +175,131 @@ pub fn facet_problem(datatype: &str, facet: &str, value: &Literal) -> Option<Str
             crate::ofn::Renderer::new(Vec::<(String, String)>::new()).literal(value)
         )
     })
+}
+
+/// Whether the literal `lex`^^`datatype` is a nonnegative integer: a value of an
+/// integer datatype, an `xsd:decimal` without a fractional part or an `owl:rational`
+/// whose denominator divides its numerator (§4.1 nests these value spaces in
+/// `owl:real`).
+fn nonnegative_integer(datatype: &str, lex: &str) -> bool {
+    if lexical(datatype, lex) != Some(true) {
+        return false;
+    }
+    // a sign is a minus only on a zero
+    let unsigned = |s: &str| {
+        s.strip_prefix('-')
+            .is_none_or(|d| d.bytes().all(|b| b == b'0' || b == b'.'))
+    };
+    if datatype == vocab::OWL_RATIONAL {
+        let Some((n, d)) = lex.split_once('/') else {
+            return false;
+        };
+        let Ok(d) = d.trim_start_matches('+').parse::<u64>() else {
+            return false;
+        };
+        if d == 0 {
+            return false;
+        }
+        let rem = n
+            .trim_start_matches(['+', '-'])
+            .bytes()
+            .fold(0u128, |r, b| {
+                (r * 10 + u128::from(b - b'0')) % u128::from(d)
+            });
+        return rem == 0 && unsigned(n);
+    }
+    match local(datatype) {
+        Some("decimal") => {
+            let (whole, frac) = lex.split_once('.').unwrap_or((lex, ""));
+            frac.bytes().all(|b| b == b'0') && unsigned(whole)
+        }
+        Some(l) if integer_bounds(l).is_some() => unsigned(lex),
+        _ => false,
+    }
+}
+
+/// The string that the literal `lex`^^`datatype` denotes, when its value is a string:
+/// a literal of `xsd:string` or a datatype derived from it, or an `rdf:PlainLiteral`
+/// without a language tag.
+fn string_value<'a>(datatype: &str, lex: &'a str) -> Option<&'a str> {
+    if lexical(datatype, lex) != Some(true) {
+        return None;
+    }
+    if datatype == vocab::RDF_PLAIN_LITERAL {
+        return lex.strip_suffix('@');
+    }
+    matches!(
+        local(datatype)?,
+        "string" | "normalizedString" | "token" | "language" | "Name" | "NCName" | "NMTOKEN"
+    )
+    .then_some(lex)
+}
+
+/// Whether `p` is an XML Schema regular expression. Only its syntax is judged, so the
+/// constructs that XML Schema adds to the syntax that `regex-syntax` parses are first
+/// replaced by atoms that parse alike: the name escapes `\i` and `\c` and their
+/// complements, the block escapes `\p{Is…}`, and character-class subtraction `-[…]`,
+/// which becomes `--[…]`.
+fn pattern(p: &str) -> bool {
+    let mut out = String::with_capacity(p.len() + 4);
+    let mut depth = 0usize;
+    let mut chars = p.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('i' | 'I' | 'c' | 'C') => out.push('a'),
+                Some(e @ ('p' | 'P')) if chars.peek() == Some(&'{') => {
+                    let mut body = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('}') => break,
+                            Some(c) => body.push(c),
+                            None => return false,
+                        }
+                    }
+                    if body.len() > 3 && body.starts_with("{Is") {
+                        out.push('a');
+                    } else {
+                        out.push('\\');
+                        out.push(e);
+                        out.push_str(&body);
+                        out.push('}');
+                    }
+                }
+                Some(e) => {
+                    out.push('\\');
+                    out.push(e);
+                }
+                None => return false,
+            },
+            '[' => {
+                depth += 1;
+                out.push(c);
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                out.push(c);
+            }
+            '-' if depth > 0 && chars.peek() == Some(&'[') => out.push_str("--"),
+            _ => out.push(c),
+        }
+    }
+    regex_syntax::Parser::new().parse(&out).is_ok()
+}
+
+/// Whether `r` is a language range of RFC 4647, in the extended form that contains the
+/// basic one: `*` or up to eight letters, then subtags of up to eight letters and
+/// digits or `*`, each after a hyphen.
+fn language_range(r: &str) -> bool {
+    let mut subtags = r.split('-');
+    let first = subtags.next().unwrap_or("");
+    let tag = |s: &str, alnum: bool| {
+        s == "*"
+            || (1..=8).contains(&s.len())
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphabetic() || alnum && b.is_ascii_digit())
+    };
+    tag(first, false) && subtags.all(|s| tag(s, true))
 }
 
 // ------------------------------------------------------------- lexical forms ------
@@ -389,7 +511,7 @@ fn xml_content(s: &str) -> bool {
                 return false;
             };
             let target = r[..end].split([' ', '\t', '\r', '\n']).next().unwrap_or("");
-            if !name(target, false) || target.eq_ignore_ascii_case("xml") {
+            if !name(target, false) || target.eq_ignore_ascii_case("xml") || !xml_chars(&r[..end]) {
                 return false;
             }
             rest = &r[end + 2..];
@@ -421,7 +543,8 @@ fn xml_text(s: &str) -> bool {
     xml_chars(s) && !s.contains("]]>")
 }
 
-/// The body of a reference `&…;`: a name or a character reference.
+/// The body of a reference `&…;`: a character reference or one of the five entities
+/// XML predefines, since a fragment has no document type to declare others.
 fn reference(body: &str) -> bool {
     if let Some(h) = body.strip_prefix("#x") {
         return !h.is_empty()
@@ -437,7 +560,7 @@ fn reference(body: &str) -> bool {
                 .and_then(char::from_u32)
                 .is_some_and(is_xml_char);
     }
-    name(body, true)
+    matches!(body, "amp" | "lt" | "gt" | "quot" | "apos")
 }
 
 /// A start tag after its `<`: its name, the text after its `>` and whether it is an
@@ -798,5 +921,84 @@ mod tests {
         assert_eq!(facet_problem(&xsd("dateTimeStamp"), &min, &stamp), None);
         assert!(facet_problem(&xsd("dateTimeStamp"), &min, &local_time).is_some());
         assert_eq!(facet_problem("http://ex.org/dt", &min, &int), None);
+    }
+
+    #[test]
+    fn facet_values_are_judged_by_their_data_values() {
+        let (len, pat) = (xsd("length"), xsd("pattern"));
+        let string = xsd("string");
+        let lit = |v: &str, dt: &str| Literal::typed(v, &xsd(dt));
+        for v in [
+            lit("3.0", "decimal"),
+            lit("-0", "integer"),
+            lit("3", "unsignedByte"),
+            Literal::typed("6/2", vocab::OWL_RATIONAL),
+        ] {
+            assert_eq!(facet_problem(&string, &len, &v), None, "{v:?}");
+        }
+        for v in [
+            lit("3.5", "decimal"),
+            lit("-1.0", "decimal"),
+            Literal::typed("7/2", vocab::OWL_RATIONAL),
+            lit("3", "double"),
+            lit("x", "decimal"),
+        ] {
+            assert!(facet_problem(&string, &len, &v).is_some(), "{v:?}");
+        }
+        assert_eq!(facet_problem(&string, &pat, &lit("a", "token")), None);
+        assert_eq!(
+            facet_problem(
+                &string,
+                &pat,
+                &Literal::typed("a+@", vocab::RDF_PLAIN_LITERAL)
+            ),
+            None
+        );
+        assert!(
+            facet_problem(
+                &string,
+                &pat,
+                &Literal::typed("a@en", vocab::RDF_PLAIN_LITERAL)
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn patterns_and_language_ranges_follow_their_grammars() {
+        for p in [
+            "a+",
+            r"\i\c*",
+            "[a-z-[aeiou]]",
+            r"\p{IsBasicLatin}+",
+            r"\P{Lu}",
+            r"\d{3}-\d{4}",
+            "",
+        ] {
+            assert!(pattern(p), "{p:?}");
+        }
+        for p in ["[", "a{", "(a", r"\p{IsBasicLatin", "\\"] {
+            assert!(!pattern(p), "{p:?}");
+        }
+        for r in ["en", "*", "de-*-DE", "en-US", "zh-Hant-1996"] {
+            assert!(language_range(r), "{r:?}");
+        }
+        for r in ["en_US", "", "en-", "toolongtag", "-en", "1en"] {
+            assert!(!language_range(r), "{r:?}");
+        }
+        let lr = vocab::RDF_LANG_RANGE;
+        let plain = vocab::RDF_PLAIN_LITERAL;
+        assert!(facet_problem(plain, lr, &Literal::simple("en_US")).is_some());
+        assert!(facet_problem(&xsd("string"), &xsd("pattern"), &Literal::simple("[")).is_some());
+    }
+
+    #[test]
+    fn xml_literals_need_known_entities_and_xml_characters() {
+        let xml = |s: &str| lexical(vocab::RDF_XML_LITERAL, s);
+        assert_eq!(xml("<a>&amp;&lt;&#65;&#x42;</a>"), Some(true));
+        assert_eq!(xml("<a>&unknown;</a>"), Some(false));
+        assert_eq!(xml("<a b=\"&nbsp;\"/>"), Some(false));
+        assert_eq!(xml("<?pi ok?>"), Some(true));
+        assert_eq!(xml("<?pi \u{1}?>"), Some(false));
     }
 }
