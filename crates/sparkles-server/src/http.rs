@@ -1043,6 +1043,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
         if let Some(gate) = probe.blocking {
             gate.wait();
         }
+        crate::cpus::place_request();
         span.in_scope(f)
     })
     .await
@@ -2806,6 +2807,7 @@ async fn update_endpoint(
                 .map(|stats| update_response(ds, stats, wanted, restricted)),
         };
     let run = |ds: &Dataset, update: &str, opts: &QueryOptions| {
+        crate::cpus::place_update();
         let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
             &ds.store,

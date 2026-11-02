@@ -109,7 +109,10 @@ pub fn run<T>(f: impl FnOnce() -> T) -> super::ApiResult<T> {
     #[cfg(test)]
     RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tokio::task::block_in_place(f)
+        tokio::task::block_in_place(|| {
+            crate::cpus::place_request();
+            f()
+        })
     }))
     .map_err(|p| {
         let msg = p

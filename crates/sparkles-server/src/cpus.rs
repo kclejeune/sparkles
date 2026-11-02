@@ -81,6 +81,54 @@ impl Hybrid {
     }
 }
 
+/// EXPERIMENT (item 583): where request work runs, set once at start.
+pub struct Placement {
+    pub performance: Vec<usize>,
+    pub every: Vec<usize>,
+    /// the most requests in flight at which request work runs on the performance cores
+    pub limit: usize,
+    /// updates run on every CPU
+    pub updates_everywhere: bool,
+}
+
+static PLACEMENT: std::sync::OnceLock<Placement> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// 0: as the thread started, 1: performance cores, 2: every CPU
+    static PLACED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+pub fn set_placement(p: Placement) {
+    let _ = PLACEMENT.set(p);
+}
+
+fn place_as(want: u8) {
+    let Some(p) = PLACEMENT.get() else { return };
+    PLACED.with(|w| {
+        if w.get() != want {
+            pin_current_thread(if want == 1 { &p.performance } else { &p.every });
+            w.set(want);
+        }
+    });
+}
+
+/// Place the calling thread for a request's work.
+pub fn place_request() {
+    let Some(p) = PLACEMENT.get() else { return };
+    let active = crate::alloc::active();
+    place_as(if active <= p.limit { 1 } else { 2 });
+}
+
+/// Place the calling thread for an update's work.
+pub fn place_update() {
+    let Some(p) = PLACEMENT.get() else { return };
+    if p.updates_everywhere {
+        place_as(2);
+    } else {
+        place_request();
+    }
+}
+
 /// The CPUs of a kernel CPU list such as `0-11` or `0,2-5,8`.
 pub fn parse_list(s: &str) -> Option<Vec<usize>> {
     let s = s.trim();
