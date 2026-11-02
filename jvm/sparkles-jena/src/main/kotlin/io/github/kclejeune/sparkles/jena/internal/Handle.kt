@@ -125,6 +125,9 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
     @Volatile
     var committed = false
 
+    /** Released once the transaction has ended, after [committed] is set. */
+    val done = java.util.concurrent.CountDownLatch(1)
+
     /** Throw if closing the dataset aborted this transaction, so that its writes are not lost silently. */
     fun checkNotAbortedByClose() {
         if (abortedByClose || (mode == ReadWrite.WRITE && write == null)) {
@@ -176,6 +179,7 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
     /** Free the native objects. */
     fun release() {
         active = false
+        done.countDown()
         read?.close()
         read = null
         write?.close()

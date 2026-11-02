@@ -111,6 +111,41 @@ class OntologyTest {
         }
     }
 
+    /**
+     * A write on another thread that waits for a transaction which then aborts leaves the
+     * model with that write: an addition stays, and a removal stays removed.
+     */
+    @Test fun a_write_that_waits_for_an_aborted_transaction_stays() {
+        val t = org.apache.jena.graph.Triple.create(
+            org.apache.jena.graph.NodeFactory.createURI("urn:s"),
+            org.apache.jena.vocabulary.RDFS.label.asNode(),
+            org.apache.jena.graph.NodeFactory.createLiteralString("x"),
+        )
+        for (adding in listOf(true, false)) {
+            SparklesDatasets.memory().use { ds ->
+                a1(ds)
+                val m = SparklesOnt.model(ds, "http://ex.org/onto")
+                val g = m.graph
+                if (!adding) g.add(t)
+                ds.begin(ReadWrite.WRITE)
+                val other = Thread { if (adding) g.add(t) else g.delete(t) }
+                try {
+                    if (adding) g.add(t) else g.delete(t)
+                    other.start()
+                    // the other thread's autocommit write waits for the writer lock
+                    Thread.sleep(200)
+                    ds.abort()
+                } finally {
+                    ds.end()
+                }
+                other.join()
+                val stored = SparklesOnt.graph(ds, "http://ex.org/onto").contains(t)
+                assertEquals(adding, stored, "the dataset after the other thread's write")
+                assertEquals(stored, g.contains(t), "the model keeps the committed write")
+            }
+        }
+    }
+
     /** The copy holds a larger ontology in full: it is filled by one native read, not by batches. */
     @Test fun the_model_copies_a_large_graph_in_one_read() {
         SparklesDatasets.memory().use { ds ->

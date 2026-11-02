@@ -110,11 +110,17 @@ private class ReadThroughGraph(
     private val journal = ArrayList<Pair<Boolean, Triple>>()
     private var pending: TxnState? = null
 
-    /** Undo the changes of a transaction that ended without committing. */
+    /**
+     * Undo the changes of a transaction that ended without committing. A transaction
+     * that has not ended keeps its changes, unless `wait` asks to wait for its end: a
+     * write calls it so after its native write, which another transaction holds up only
+     * until that transaction releases the writer lock, just before it ends.
+     */
     @Synchronized
-    private fun settle() {
+    private fun settle(wait: Boolean) {
         val t = pending ?: return
-        if (t.active) return
+        if (t === dataset.txn()) return
+        if (wait) t.done.await() else if (t.done.count > 0) return
         if (!t.committed) {
             for (i in journal.indices.reversed()) {
                 val (added, triple) = journal[i]
@@ -133,16 +139,17 @@ private class ReadThroughGraph(
     }
 
     override fun get(): Graph {
-        settle()
+        settle(false)
         return copy
     }
 
     // the native write runs outside the monitor, since it may wait for another thread's
-    // transaction, which reads the model meanwhile
+    // transaction, which reads the model meanwhile; the copy changes once that
+    // transaction's changes are settled
     override fun add(t: Triple) {
-        settle()
         target.add(t)
         synchronized(this) {
+            settle(true)
             if (!copy.contains(t)) {
                 copy.add(t)
                 record(true, t)
@@ -151,9 +158,9 @@ private class ReadThroughGraph(
     }
 
     override fun delete(t: Triple) {
-        settle()
         target.delete(t)
         synchronized(this) {
+            settle(true)
             if (copy.contains(t)) {
                 copy.delete(t)
                 record(false, t)
@@ -162,15 +169,14 @@ private class ReadThroughGraph(
     }
 
     override fun remove(s: Node?, p: Node?, o: Node?) {
-        settle()
-        if (dataset.txn() == null) {
-            // the removal commits on its own, so nothing needs undoing
-            target.remove(s, p, o)
-            synchronized(this) { copy.remove(s, p, o) }
-            return
-        }
         target.remove(s, p, o)
         synchronized(this) {
+            settle(true)
+            if (dataset.txn() == null) {
+                // the removal committed on its own, so nothing needs undoing
+                copy.remove(s, p, o)
+                return
+            }
             val gone = copy.find(s ?: Node.ANY, p ?: Node.ANY, o ?: Node.ANY).toList()
             for (t in gone) {
                 copy.delete(t)
