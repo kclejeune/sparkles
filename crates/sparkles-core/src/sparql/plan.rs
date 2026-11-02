@@ -2505,7 +2505,7 @@ impl<'a> Planner<'a> {
         let graph = match g {
             ActiveGraph::Default => None,
             ActiveGraph::Union => Some(format!("<{}>", super::ctx::UNION_GRAPH_IRI)),
-            ActiveGraph::Named(id) => self.ctx.term(*id).map(|t| t.to_string()),
+            ActiveGraph::Named(id) => self.ctx.plan_term(*id).map(|t| t.to_string()),
             ActiveGraph::Var(v) => Some(self.pt_str(&PT::V(*v))),
         };
         let mut pattern = Arc::new(PlanPattern {
@@ -2946,7 +2946,7 @@ impl<'a> Planner<'a> {
             }
             PT::C(id) => self
                 .ctx
-                .term(*id)
+                .plan_term(*id)
                 .map_or_else(|| format!("{id:?}"), |t| short(&t)),
         }
     }

@@ -2042,6 +2042,18 @@ impl Ctx {
         id
     }
 
+    /// A term for plan text, which no answer depends on. It is decoded without the
+    /// decode envelope in both accounting modes, as eager decoding always was, so that
+    /// describing a plan, such as a constant the planner substituted for a variable,
+    /// never fails the query it describes.
+    pub(super) fn plan_term(&self, id: Id) -> Option<Term> {
+        match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
+            Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
+            _ => self.snap.term(id),
+        }
+    }
+
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
             Tag::Local => {
