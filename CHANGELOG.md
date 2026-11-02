@@ -592,6 +592,19 @@ list of a merged batch. `scripts/gate/gate.sh` refuses to start on a host that l
 free disk after `mbx gc`. nextest retries the tests that `.config/nextest.toml` lists as
 flaky and reports each retry. The four longest tests run as one test per configuration.
 
+The batch gate selects its checks from the batch's diff. `scripts/gate/select-checks.py`
+maps the files that changed since the merge base with `origin/main` to the
+`scripts/ci.sh` tasks, the conformance suites and the spill matrices that they call for,
+and the gate runs those without `--force`, so mise's task cache skips a check whose inputs
+already passed on the gate host. Build configuration, the CI scripts and files that no
+rule covers run everything, and `scripts/gate/nightly.sh` runs every check with `--force`
+on `origin/main` each night. The conformance half goes to a second gate host only when
+one is free. `gate.sh --cargo-jobs`, `GATE_CARGO_JOBS_HOSTS` and a default from each
+host's memory cap set the compile jobs. `mise run test:w3c` and the spill matrices run
+their tests in parallel, which took the W3C suite from 433 to 82 seconds on a 20-core gate
+host. The binding checks key their task cache on the crates the bindings compile, and
+seven more slow tests run as parallel parts with the same cases.
+
 The first run of a query text that the server does not remember now runs on the thread
 that received it under the request's timeout when the server has been idle for 10 ms,
 instead of on the blocking pool. On forge that took about 1.8 ms off a fresh server's
