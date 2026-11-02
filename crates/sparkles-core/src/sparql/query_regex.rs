@@ -7,7 +7,10 @@
 //! table of at most [`PROGRAMS_MAX`] programs and [`PROGRAMS_BYTES`] bytes, so that a
 //! pattern that queries repeat compiles once. Compilation takes about as long as a
 //! filter over 10,000 keys, and the table holds at most 16 MiB outside every query's
-//! budget for that time.
+//! budget for that time. When a query ends, the workers' clones of a kept program, with
+//! their warm search caches, wait in the table for the next query that searches the same
+//! program on the same threads, up to [`PARKED_BYTES`] of their charged bounds. A cold
+//! cache cost a 1 ms filter over 100,000 IRIs about 4% on 12 threads.
 //!
 //! A program has one search cache that any thread can use behind a lock, and a clone of
 //! the program for each Rayon worker that searches it, with the worker's own cache. A
@@ -41,6 +44,8 @@ thread_local! {
 const PROGRAMS_MAX: usize = 64;
 /// The program bytes the process-wide table keeps.
 const PROGRAMS_BYTES: usize = 16 << 20;
+/// The charged cache bounds of the worker clones that wait in the table between queries.
+const PARKED_BYTES: usize = 16 << 20;
 
 /// A compiled program with the bounds it was built under. A query whose own bound is at
 /// least `nfa` would have built the same program.
@@ -51,10 +56,29 @@ struct Program {
     hybrid: usize,
 }
 
+/// A kept program and the workers' clones of it that wait for the next query, by the
+/// thread that made each clone, which is the only thread its pool serves, with the
+/// charged bound of its cache.
+struct Kept {
+    program: Program,
+    parked: FxHashMap<usize, (Regex, usize)>,
+}
+
 #[derive(Default)]
 struct Programs {
-    by_text: FxHashMap<Box<str>, Program>,
+    by_text: FxHashMap<Box<str>, Kept>,
     bytes: usize,
+    parked_bytes: usize,
+}
+
+impl Programs {
+    /// The kept entry of `text` when its program is `program` itself rather than another
+    /// compilation of the same text.
+    fn same(&mut self, text: &str, program: &Regex) -> Option<&mut Kept> {
+        self.by_text
+            .get_mut(text)
+            .filter(|kept| std::ptr::eq(kept.program.program.group_info(), program.group_info()))
+    }
 }
 
 fn programs() -> &'static Mutex<Programs> {
@@ -66,8 +90,34 @@ fn programs() -> &'static Mutex<Programs> {
 /// clone shares the compiled program and makes its own search caches.
 fn kept_program(text: &str, maximum: usize) -> Option<Program> {
     let programs = programs().lock();
-    let kept = programs.by_text.get(text)?;
+    let kept = &programs.by_text.get(text)?.program;
     (kept.nfa <= maximum).then(|| kept.clone())
+}
+
+/// The parked clone of `program` that `thread` made for an earlier query, with its warm
+/// search cache.
+fn take_parked(text: &str, program: &Regex, thread: usize) -> Option<Regex> {
+    let mut programs = programs().lock();
+    let (clone, bytes) = programs.same(text, program)?.parked.remove(&thread)?;
+    programs.parked_bytes -= bytes;
+    Some(clone)
+}
+
+/// Park a worker's clone of a kept program for the next query, unless the table no
+/// longer keeps that program, already holds a clone for `thread` or has no room.
+fn park(text: &str, clone: Regex, thread: usize, bytes: usize) {
+    let mut programs = programs().lock();
+    if programs.parked_bytes + bytes > PARKED_BYTES {
+        return;
+    }
+    let Some(kept) = programs.same(text, &clone) else {
+        return;
+    };
+    if kept.parked.contains_key(&thread) {
+        return;
+    }
+    kept.parked.insert(thread, (clone, bytes));
+    programs.parked_bytes += bytes;
 }
 
 fn keep_program(text: &str, program: &Program) {
@@ -83,7 +133,13 @@ fn keep_program(text: &str, program: &Program) {
         *programs = Programs::default();
     }
     programs.bytes += bytes;
-    programs.by_text.insert(text.into(), program.clone());
+    programs.by_text.insert(
+        text.into(),
+        Kept {
+            program: program.clone(),
+            parked: FxHashMap::default(),
+        },
+    );
 }
 
 /// The patterns a query keeps at once. Reaching it starts the cache over, and the
@@ -198,8 +254,27 @@ pub(super) struct RegexState {
     /// one clone of the program per Rayon worker of the pool that compiled it, each made
     /// on first use
     workers: Box<[OnceLock<Worker>]>,
+    /// the text of the program in the process-wide table, whose workers' clones are
+    /// parked there when the query ends
+    text: Box<str>,
     _charge: Option<RetainedCharge>,
     _shared_charge: Option<RetainedCharge>,
+}
+
+impl Drop for RegexState {
+    fn drop(&mut self) {
+        let bytes = usize::try_from(self.cache_bytes).unwrap_or(usize::MAX);
+        for slot in self.workers.iter_mut() {
+            if let Some(Worker {
+                thread,
+                program: Some(program),
+                ..
+            }) = slot.take()
+            {
+                park(&self.text, program, thread, bytes);
+            }
+        }
+    }
 }
 
 /// A worker's clone of a program, whose own pool keeps the worker's search cache, or
@@ -336,6 +411,7 @@ impl RegexState {
             shared: Mutex::new(cache),
             cache_bytes,
             workers,
+            text: text.into_boxed_str(),
             _charge: charge,
             _shared_charge: shared_charge,
         }))
@@ -367,11 +443,15 @@ impl RegexState {
 
     #[cold]
     fn new_worker(&self, thread: usize) -> Worker {
+        // A clone that this thread made for an earlier query keeps its warm cache.
+        let clone = || {
+            take_parked(&self.text, &self.program, thread).unwrap_or_else(|| self.program.clone())
+        };
         // A program compiled without an owner is uncharged, and so are its clones.
         let Some(charge) = &self._charge else {
             return Worker {
                 thread,
-                program: Some(self.program.clone()),
+                program: Some(clone()),
                 _charge: None,
             };
         };
@@ -390,7 +470,7 @@ impl RegexState {
         match room.then(|| ctx.retained_charge(self.cache_bytes)) {
             Some(Ok(charge)) => Worker {
                 thread,
-                program: Some(self.program.clone()),
+                program: Some(clone()),
                 _charge: charge,
             },
             _ => refused,
@@ -551,6 +631,51 @@ mod tests {
             first.program.group_info(),
             other.group_info()
         ));
+    }
+
+    /// A finished query parks its workers' clones of a kept program, and the next query
+    /// that searches the program on those threads takes them back with their caches. A
+    /// program that the table does not keep parks nothing.
+    #[test]
+    fn workers_take_back_the_clones_an_earlier_query_parked() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let pattern = "^parked-[0-9]+$";
+        let parked = |pattern: &str| -> Vec<usize> {
+            let programs = programs().lock();
+            let mut threads: Vec<usize> = programs
+                .by_text
+                .get(pattern)
+                .map(|kept| kept.parked.keys().copied().collect())
+                .unwrap_or_default();
+            threads.sort_unstable();
+            threads
+        };
+        let first = pool.install(|| RegexState::compile(None, pattern, "").unwrap().unwrap());
+        let mut makers: Vec<usize> = pool.broadcast(|_| {
+            assert!(first.is_match("parked-1") && !first.is_match("parked-x"));
+            THREAD.with(|t| *t)
+        });
+        makers.sort_unstable();
+        assert!(parked(pattern).is_empty());
+        drop(first);
+        assert_eq!(parked(pattern), makers);
+        let second = pool.install(|| RegexState::compile(None, pattern, "").unwrap().unwrap());
+        let found: Vec<bool> =
+            pool.broadcast(|_| second.is_match("parked-22") && !second.is_match("parked-"));
+        assert!(found.into_iter().all(|ok| ok));
+        assert!(
+            parked(pattern).is_empty(),
+            "the workers took their clones back"
+        );
+        // another compilation of the same text does not take clones of the kept program
+        drop(second);
+        assert_eq!(parked(pattern), makers);
+        let other = Regex::new(pattern).unwrap();
+        assert!(take_parked(pattern, &other, makers[0]).is_none());
+        assert_eq!(parked(pattern), makers);
     }
 
     /// A worker's clone serves only the thread that made it. A worker of another pool
