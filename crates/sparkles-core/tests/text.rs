@@ -872,10 +872,14 @@ fn limits_above_max_hits_are_refused_like_no_limit() {
 /// A SPARQL LIMIT without OFFSET over a search reaches the search, through a projection
 /// and a BIND, so it keeps only that many of its best hits: a search that would pass
 /// `maxHits` answers, with the hits of the same limit written in the call (roadmap
-/// item 7). An OFFSET passes nothing.
+/// item 7). An OFFSET passes nothing, and the result cache keeps the two searches apart.
 #[test]
 fn a_query_limit_reaches_the_search() {
-    let s = Store::in_memory(StoreOptions::default());
+    // every result is cached, so a limited search must not answer an unlimited one
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
     load(&s);
     s.enable_text(TextConfig {
         max_hits: 2,
