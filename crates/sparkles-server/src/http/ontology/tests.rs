@@ -557,3 +557,97 @@ async fn entity_routes_answer_the_accessors() {
     let r = get(&s.app, "/$/ontology/t/entity").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+#[tokio::test]
+async fn classify_answers_the_taxonomy_and_writes_it() {
+    let s = server();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"about": "http://ex.org/Professor", "nodes": true, "limit": 2}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.headers.contains_key("sparkles-commit"), "{:?}", r.headers);
+    let j = r.json();
+    assert_eq!(
+        (j["consistent"].as_bool(), j["complete"].as_bool()),
+        (Some(true), Some(true)),
+        "{j}"
+    );
+    assert_eq!(j["nodes"].as_array().unwrap().len(), 2, "{j}");
+    assert_eq!(j["next"], 2, "{j}");
+    assert!(
+        j["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("http://ex.org/Person")),
+        "{j}"
+    );
+    // the kept classification answers again
+    let j = post(&s.app, "/$/ontology/t/classify", json!({}))
+        .await
+        .json();
+    assert_eq!(j["reused"], true, "{j}");
+    // a class the ontology does not mention, a member the route does not take, inferences
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"about": "http://ex.org/Nobody"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"profiles": ["el"]}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"inferences": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // the taxonomy in functional-style syntax
+    let r = post(&s.app, "/$/ontology/t/classify?format=ofn", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(
+        r.headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/owl-functional"),
+        "{:?}",
+        r.headers
+    );
+    assert!(
+        r.text().lines().any(|l| l.starts_with("SubClassOf(")
+            && l.contains("Professor")
+            && l.contains("Person")),
+        "{}",
+        r.text()
+    );
+    // a write commits the taxonomy to the target graph, and a dry run commits nothing
+    let body = json!({"target": "http://ex.org/tax", "message": "classified"});
+    let r = post(&s.app, "/$/ontology/t/classify?dryRun=true", body.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = get(
+        &s.app,
+        "/$/ontology/t/axioms?graph=http%3A%2F%2Fex.org%2Ftax",
+    )
+    .await
+    .json();
+    assert_eq!(j["total"], 0, "{j}");
+    let r = post(&s.app, "/$/ontology/t/classify", body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["written"]["committed"], true, "{}", r.text());
+    let j = get(
+        &s.app,
+        "/$/ontology/t/axioms?type=SubClassOf&graph=http%3A%2F%2Fex.org%2Ftax",
+    )
+    .await
+    .json();
+    assert!(j["total"].as_u64().unwrap() >= 1, "{j}");
+}

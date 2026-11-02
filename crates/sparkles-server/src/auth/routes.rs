@@ -73,6 +73,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}/entities", &["GET"]),
     ("/$/ontology/{ds}/entity", &["GET"]),
     ("/$/ontology/{ds}/check", &["POST"]),
+    ("/$/ontology/{ds}/classify", &["POST"]),
     ("/$/ontology/{ds}/diff", &["GET"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
@@ -476,6 +477,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ontology/{ds}/entities"
         | "/$/ontology/{ds}/entity"
         | "/$/ontology/{ds}/check"
+        // a run that writes its taxonomy checks write in the handler
+        | "/$/ontology/{ds}/classify"
         | "/$/ontology/{ds}/diff"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
@@ -658,6 +661,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/$/forms/{ds}/check" | "/$/forms/{ds}/save" => Endpoint::Update,
         "/$/ontology/{ds}"
         | "/$/ontology/{ds}/check"
+        | "/$/ontology/{ds}/classify"
         | "/$/ontology/{ds}/entities"
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,

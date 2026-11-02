@@ -2,7 +2,8 @@
 //! `GET /$/ontology/{ds}`, the axioms `GET /$/ontology/{ds}/axioms`, the entities
 //! `GET /$/ontology/{ds}/entities` and `GET /$/ontology/{ds}/entity`, the profile checks
 //! `POST /$/ontology/{ds}/check`, edits `POST /$/ontology/{ds}/axioms` and the diff of
-//! the axioms of two commits `GET /$/ontology/{ds}/diff`. The library
+//! the axioms of two commits `GET /$/ontology/{ds}/diff`, and the OWL 2 EL
+//! classification `POST /$/ontology/{ds}/classify` (spec F24). The library
 //! reads, checks and edits (`sparkles::handles::ontology`); these handlers parse the
 //! request and apply the caller's grants through [`CallerContext`].
 //!
@@ -13,13 +14,14 @@
 
 use super::*;
 use crate::auth::Endpoint;
+use sparkles::handles::ontology::classify::ClassifyRequest;
 use sparkles::handles::ontology::{self as onto, CheckRequest, EditRequest, OntologyRequest};
 use sparkles::owl::{self, Axiom, ofn::Renderer, profiles::Profile};
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
 
 pub(crate) use onto::wire::{
-    AxiomQuery, DEFAULT_LIMIT, MAX_LIMIT, axiom_page, check_body, diff_body, diff_lines, edit_body,
-    mentioned, page_body, summary_body,
+    AxiomQuery, ClassifyQuery, DEFAULT_LIMIT, MAX_LIMIT, axiom_page, check_body, classify_body,
+    diff_body, diff_lines, edit_body, mentioned, page_body, summary_body,
 };
 
 fn bad(m: impl Into<String>) -> ApiError {
@@ -627,3 +629,180 @@ pub(super) async fn diff(
 
 #[cfg(test)]
 mod tests;
+
+/// `POST /$/ontology/{ds}/classify`: the OWL 2 EL classification of the ontology (spec
+/// F24), with the members of the ontology read and `assertions`, `about`, `nodes`,
+/// `limit`, `offset` and `threads`. `target` writes the taxonomy to that named graph in
+/// one commit, as an edit does, with `message`, a dry run and `If-Match`. `format=ofn`
+/// answers the taxonomy as a functional-style document.
+pub(super) async fn classify(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let o = body_object(
+        &bytes,
+        &[
+            "graph",
+            "imports",
+            "mode",
+            "inferences",
+            "assertions",
+            "target",
+            "message",
+            "about",
+            "nodes",
+            "limit",
+            "offset",
+            "threads",
+        ],
+    )?;
+    let req = request_body(&o, request_of(&params)?)?;
+    let flag = |k: &str| -> ApiResult<bool> {
+        match o.get(k) {
+            None | Some(J::Null) => Ok(params.get(k).is_some_and(truthy)),
+            Some(J::Bool(b)) => Ok(*b),
+            Some(_) => Err(bad(format!("{k}: true or false"))),
+        }
+    };
+    let number = |k: &str, default: usize, min: usize, max: usize| -> ApiResult<usize> {
+        let v = match o.get(k) {
+            None | Some(J::Null) => match params.get(k) {
+                None => return Ok(default),
+                Some(v) => v.parse::<u64>().ok(),
+            },
+            Some(v) => v.as_u64(),
+        };
+        v.map(|n| n as usize)
+            .filter(|n| (min..=max).contains(n))
+            .ok_or_else(|| bad(format!("{k}: an integer from {min} to {max}")))
+    };
+    let text = |k: &str| -> ApiResult<Option<String>> {
+        match o.get(k) {
+            None | Some(J::Null) => Ok(params.get(k).map(str::to_string)),
+            Some(J::String(v)) => Ok(Some(v.clone())),
+            Some(_) => Err(bad(format!("{k}: a string"))),
+        }
+    };
+    let c = ClassifyRequest {
+        assertions: flag("assertions")?,
+        threads: number("threads", 0, 0, 1024)?,
+        target: text("target")?.map(|g| graph_ref(&g)).transpose()?,
+        message: text("message")?,
+    };
+    let q = ClassifyQuery {
+        about: text("about")?.map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string()),
+        nodes: flag("nodes")?,
+        limit: number("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)?,
+        offset: number("offset", 0, 0, usize::MAX)?,
+    };
+    let ofn = match params.get("format") {
+        None | Some("json") => false,
+        Some("ofn") => true,
+        Some(f) => return Err(bad(format!("format must be json or ofn, not '{f}'"))),
+    };
+    let writes = c.target.is_some();
+    // the route table admits readers, so a run that writes its taxonomy checks write here
+    if writes
+        && let Some(denied) = crate::auth::dataset_denial(
+            &st,
+            &p,
+            &headers,
+            &name,
+            crate::auth::Level::Write,
+            Endpoint::Update,
+        )
+    {
+        return Ok(denied);
+    }
+    if writes && st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let endpoint = if writes {
+        Endpoint::Update
+    } else {
+        Endpoint::Query
+    };
+    let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, endpoint);
+    let restricted = opts.graphs.is_some();
+    let wanted = receipt_wanted(&params, &headers);
+    let mut dry = None;
+    let mut timeout = None;
+    let mut _cancel_on_drop = None;
+    if writes {
+        let (mut wopts, cancel) = body_write_options(&st, &params, &headers, Some(&p))?;
+        _cancel_on_drop = Some(cancel);
+        wopts.opts.graphs = opts.graphs.clone();
+        if wopts.opts.precondition.is_none() {
+            wopts.opts.precondition =
+                conditional::write_precondition(&headers, ds.store.dataset_id(), &Target::Dataset);
+        }
+        let d = wopts
+            .opts
+            .dry_run
+            .as_ref()
+            .map(|d| {
+                dry_run::Request::for_write(
+                    &st,
+                    &headers,
+                    &params,
+                    d,
+                    restricted,
+                    Some(&p),
+                    &ds,
+                    &wopts.opts,
+                )
+            })
+            .transpose()?;
+        let (wopts, t) = wopts.start();
+        dry = d.map(|request| request.started(&wopts));
+        timeout = t;
+        opts.cancel = wopts.cancel.clone();
+        opts.deadline = wopts.deadline;
+        opts.timeout = None;
+        opts.write = wopts;
+    }
+    blocking(move || {
+        let r = ds.dataset.ontology().classify(&req, &c, &opts);
+        let out = match (r, dry) {
+            (Err(Error::DryRun(preview)), Some(d)) => return Ok(d.respond(&ds, &preview)),
+            (Err(e @ Error::Invalid(_)), _) => return Err(ontology_error(e)),
+            (r, _) if writes => r.map_err(|e| write_error(e, restricted))?,
+            (r, _) => r.map_err(ontology_error)?,
+        };
+        let rend = renderer(&ds);
+        let seq = out.opened.snapshot.commit;
+        if ofn {
+            let axioms = out.classification.taxonomy.axioms();
+            let doc = owl::ofn::document(&rend, &owl::Header::default(), axioms.iter());
+            let resp = (
+                [(header::CONTENT_TYPE, "text/owl-functional; charset=utf-8")],
+                doc,
+            )
+                .into_response();
+            return Ok(with_commit(resp, &ds, seq));
+        }
+        let body = classify_body(&ds.name, &out, &req, &rend, &q).map_err(|e| match e {
+            Error::NotFound(m) => err_code(StatusCode::NOT_FOUND, "not-found", m),
+            e => ontology_error(e),
+        })?;
+        match &out.written {
+            Some(w) => Ok(write_response(
+                &ds,
+                StatusCode::OK,
+                Some(body),
+                &w.receipt,
+                wanted,
+                restricted,
+            )),
+            None => Ok(with_commit(Json(body).into_response(), &ds, seq)),
+        }
+    })
+    .await
+    .map_err(|e| with_timeout(e, timeout))
+}

@@ -386,6 +386,44 @@ export interface OntologyDiff {
   changedQuads: number;
   method: string;
 }
+/** One node of a taxonomy: equivalent classes and the nodes of the direct superclasses. */
+export interface OntologyTaxonomyNode {
+  node: number;
+  classes: string[];
+  parents: number[];
+  parentClasses: string[];
+  children: number;
+}
+/** An axiom a classification leaves out (`rule`, `message`) or uses in part (`partial`). */
+export interface OntologyExcluded extends OntologyAxiom {
+  rule?: string;
+  message?: string;
+  partial?: string;
+}
+/** The OWL 2 EL classification of an ontology (spec F24). */
+export interface OntologyClassification extends OntologyState {
+  consistent: boolean;
+  /** false when an axiom is left out or used in part, so that entailments may be missing */
+  complete: boolean;
+  /** whether the dataset's kept classification of the same state answered */
+  reused: boolean;
+  classes: number;
+  nodeCount: number;
+  unsatisfiableCount: number;
+  unsatisfiable: string[];
+  excludedCount: number;
+  excluded: OntologyExcluded[];
+  stats: Configuration;
+  nodes?: OntologyTaxonomyNode[];
+  next?: number;
+  class?: OntologyTaxonomyNode & {
+    iri: string;
+    unsatisfiable: boolean;
+    childClasses: string[];
+    superClasses: string[];
+  };
+  written?: OntologyEdit;
+}
 export class Administration {
   readonly snapshots;
   readonly history;
@@ -700,6 +738,44 @@ export class Administration {
           false,
         );
       },
+      /**
+       * Classify by OWL 2 EL (spec F24): consistency, the unsatisfiable classes, the axioms
+       * left out or used in part, one class (`about`) and the taxonomy's nodes (`nodes`,
+       * `limit` from `offset`). `target` writes the taxonomy to that named graph in one commit.
+       */
+      classify: (
+        o: OntologySelection &
+          UpdateOptions & {
+            at?: string | number | bigint;
+            assertions?: boolean;
+            about?: string;
+            nodes?: boolean;
+            limit?: number;
+            offset?: number;
+            threads?: number;
+            target?: OntologyGraph;
+            message?: string;
+          } = {},
+      ) =>
+        call<OntologyClassification>(
+          'ontology.classify',
+          {
+            graph: o.graph,
+            imports: o.imports,
+            mode: o.mode,
+            at: o.at === undefined || typeof o.at === 'string' ? o.at : unsigned(o.at),
+            assertions: o.assertions,
+            about: o.about,
+            nodes: o.nodes,
+            limit: o.limit,
+            offset: o.offset,
+            threads: o.threads,
+            target: o.target,
+            message: o.message,
+          },
+          o,
+          o.target !== undefined,
+        ),
     };
     this.mappings = {
       list: (o?: OperationOptions) => call<Configuration[]>('mappings.list', {}, o, false),

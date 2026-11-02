@@ -1954,13 +1954,69 @@ the `diff` endpoint. A commit that the dataset's history no longer keeps is `410
   "removed": [], "changedQuads": 2, "method": "log" }
 ```
 
+`POST /$/ontology/{ds}/classify` classifies the ontology by OWL 2 EL, in the manner of
+the ELK reasoner. It takes `graph`, `imports` and `mode` in the body and `at` as a query
+parameter, and answers the inferred class hierarchy and the unsatisfiable classes.
+`consistent` is false when the ontology has no model, and every class is then
+unsatisfiable. An axiom outside OWL 2 EL is left out and listed under `excluded` with
+the rule it breaks. An axiom that the classifier uses only in part, such as one with an
+individual in a class expression or a data range, is listed with `partial` and the
+reason. `complete` is false when anything is listed. Every subsumption the answer gives
+is entailed, and a complete answer has every entailed subsumption between named classes.
+The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
+the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
+10,000, and gives the times of the run under `stats`. `about` names a class and answers
+its node under `class`, with its equivalent classes, direct superclasses and subclasses
+and all its superclasses. An `about` class that the taxonomy does not have is `404`.
+`nodes: true` lists the taxonomy's nodes, `limit` from `offset`, each with its classes
+and its direct superclasses, and `next` when more remain. Node 0 holds `owl:Thing` and
+node 1 holds `owl:Nothing` and the unsatisfiable classes. `format=ofn` answers the
+taxonomy as a functional-style document of `EquivalentClasses` and `SubClassOf` axioms,
+as ELK and ROBOT write one. `assertions: true` also classifies with the assertions the
+store holds, which can make the ontology inconsistent. `threads` asks for worker
+threads, which the algorithm pool admits up to its share for one call. `inferences` is
+`400`, since a classification reads the asserted axioms.
+
+The dataset keeps its last classification for callers who read every graph, without
+assertions. A classification of the same ontology at the same commit answers from it
+with `reused: true`. One at a later commit gives the kept classifier the axioms that
+changed, so that it saturates again only the classes those axioms can reach, and
+`stats.incremental` says so. A change to the property hierarchy, chains, reflexivity or
+ranges saturates everything again. The kept state costs memory for the time the dataset
+is open, about 55 MB estimated for GO, and it is dropped after a run whose estimate
+passes one gigabyte. A run is bounded by the request's deadline and memory budget and
+answers `507` with `budget: "memory"` past the budget.
+
+`target` names a graph to write the taxonomy to, in one commit, with `message`. The
+graph must be a named graph that the classification does not read. The commit adds the
+taxonomy's axioms and removes the subsumptions and equivalences between named classes
+that the graph held and the taxonomy no longer has, so a diff of the graph between two
+runs shows how the hierarchy changed. The graph's ontology header carries the
+provenance as annotations: `prov:wasGeneratedBy` a `urn:uuid:` activity,
+`prov:generatedAtTime`, `prov:wasDerivedFrom` each named graph read and an
+`rdfs:comment` with the commit read. A later write replaces them. When the terminology
+read changes between the classification and the write, the write is `409` and the
+classification can run again. A write takes the parameters of the other writes, such as
+`dryRun` and `If-Match`, and needs write access to the target graph.
+
+```json
+{ "dataset": "go", "commit": 3, "mode": "lenient", "graphs": ["default"], "imports": [],
+  "warnings": [], "consistent": true, "complete": true, "reused": false,
+  "classes": 51986, "nodeCount": 51988, "unsatisfiableCount": 0, "unsatisfiable": [],
+  "excludedCount": 0, "excluded": [],
+  "stats": { "incremental": false, "added": 117650, "removed": 0, "cleared": 0,
+    "contexts": 51987, "conclusions": 2801981, "estimatedBytes": 54673800, "threads": 4,
+    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8 } }
+```
+
 The library's `sparkles::handles::ontology::wire::call` answers the same operations
 in the same JSON forms, and the bindings call it. Python's `Dataset.ontology` has
-`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity` and `diff`,
-with the members as keyword arguments, and `Axiom` reads and writes one axiom with
-structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`, `axioms`
-(an async iterable in batches), `entities`, `entity`, `check`, `edit`, `removeEntity`
-and `diff`. On the JVM, `DatasetGraphSparkles.ontology()` has the same operations,
+`summary`, `axioms`, `entities`, `entity`, `check`, `edit`, `remove_entity`, `diff` and
+`classify`, with the members as keyword arguments, and `Axiom` reads and writes one
+axiom with structural equality. Node.js's `dataset.ontology` has `summary`, `axiomPage`,
+`axioms` (an async iterable in batches), `entities`, `entity`, `check`, `edit`,
+`removeEntity`, `diff` and `classify`. On the JVM, `DatasetGraphSparkles.ontology()` has
+the same operations, with `classify` taking a `ClassifyQuery`,
 `SparklesOnt` has them over one graph, and `SparklesOnt.model` returns a `jena-ontapi`
 `OntModel` over a Sparkles graph
 ([integrations](integrations/README.md#libraries-and-bindings)). An axiom given to an
@@ -1990,7 +2046,7 @@ ds.ontology.entity("http://ex.org/Professor", "http://ex.org/onto")["class"]["su
 
 In Rust, `ds.ontology().graph(iri)` starts a scope over the request structures, with
 `imports`, `mode`, `at`, `inferences` and `options`, that ends in `open`, `check`,
-`diff`, `remove_entity` or `edit`. `edit` takes a closure that adds and removes axioms on
+`diff`, `remove_entity`, `classify` or `edit`. `edit` takes a closure that adds and removes axioms on
 an editor and commits once. The open ontology's `class(iri)` and the other lookups answer
 `NotFound` for an IRI that is not that kind of entity, its `ontology` member has the
 accessors such as `super_classes`, and `instances`, `types_of` and `property_assertions`

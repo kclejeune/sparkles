@@ -10,6 +10,7 @@
 //! ([`sparkles_owl::json`]) or as a string in functional-style syntax, with the dataset's
 //! prefixes and the standard ones.
 
+use super::classify::{Classified, ClassifyRequest};
 use super::{
     CheckRequest, EditOutcome, EditRequest, OntologyDiff, OntologyRequest, Opened, check_opened,
     parse_axiom_types, parse_profiles, report_json,
@@ -624,7 +625,7 @@ pub fn entity_body(
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 8] = [
+pub const OPERATIONS: [&str; 9] = [
     "summary",
     "axioms",
     "entities",
@@ -633,6 +634,7 @@ pub const OPERATIONS: [&str; 8] = [
     "edit",
     "removeEntity",
     "diff",
+    "classify",
 ];
 
 /// The members each operation reads besides those that name the ontology.
@@ -646,6 +648,16 @@ fn members(op: &str) -> &'static [&'static str] {
         "edit" => &["add", "remove", "declare", "target", "message"],
         "removeEntity" => &["iri", "message"],
         "diff" => &["from", "to", "assertions", "limit"],
+        "classify" => &[
+            "assertions",
+            "target",
+            "message",
+            "about",
+            "nodes",
+            "limit",
+            "offset",
+            "threads",
+        ],
         _ => &[],
     }
 }
@@ -804,6 +816,10 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 /// - `removeEntity`: an edit that removes the entity `iri`.
 /// - `diff`: the diff of `GET /$/ontology/{ds}/diff`, with `from`, `to` (the head by
 ///   default), `assertions` and `limit`.
+/// - `classify`: the OWL 2 EL classification of `POST /$/ontology/{ds}/classify`, with
+///   `assertions`, `target` and `message` (write the taxonomy to that graph), `about` (a
+///   class to describe), `nodes` (list the taxonomy's nodes), `limit`, `offset` and
+///   `threads`.
 pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> {
     let empty = Map::new();
     let a = match args {
@@ -948,6 +964,150 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let d = handle.diff(&req, &from, &to, assertions, opts)?;
             Ok(diff_body(name, &d, &req, assertions, limit, &r))
         }
+        "classify" => {
+            let c = ClassifyRequest {
+                assertions: boolean(a, "assertions")?.unwrap_or(false),
+                threads: number(a, "threads", 0, 1024)?.unwrap_or(0),
+                target: string(a, "target")?.map(graph_ref).transpose()?,
+                message: string(a, "message")?.map(str::to_string),
+            };
+            let q = ClassifyQuery {
+                about: string(a, "about")?
+                    .map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string()),
+                nodes: boolean(a, "nodes")?.unwrap_or(false),
+                limit: number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT),
+                offset: number(a, "offset", 0, usize::MAX)?.unwrap_or(0),
+            };
+            let out = handle.classify(&req, &c, opts)?;
+            classify_body(name, &out, &req, &r, &q)
+        }
         _ => unreachable!("checked above"),
     }
+}
+
+/// What the answer of a classification lists besides its counts.
+#[derive(Clone, Debug, Default)]
+pub struct ClassifyQuery {
+    /// a class whose equivalent classes, direct superclasses and subclasses and all
+    /// superclasses the answer gives
+    pub about: Option<String>,
+    /// list the taxonomy's nodes, `limit` from `offset`
+    pub nodes: bool,
+    /// the most unsatisfiable classes, excluded axioms and nodes listed
+    pub limit: usize,
+    pub offset: usize,
+}
+
+fn node_json(t: &sparkles_owl::classify::Taxonomy, i: usize) -> J {
+    let n = t.node(i);
+    let first = |k: &usize| t.node(*k).classes.first().map(|c| c.as_str().to_string());
+    json!({
+        "node": i,
+        "classes": n.classes.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        "parents": n.parents,
+        "parentClasses": n.parents.iter().filter_map(first).collect::<Vec<_>>(),
+        "children": n.children.len(),
+    })
+}
+
+/// The JSON of a classification, as `POST /$/ontology/{ds}/classify` answers it: the
+/// members of the ontology read, whether the ontology is consistent, whether the
+/// taxonomy is complete, the counts, the unsatisfiable classes and the axioms left out
+/// or used in part (at most `q.limit` of each), the times of the run, and on request
+/// the nodes, one class and the edit that wrote the taxonomy. `about` a class the
+/// taxonomy does not have is `NotFound`.
+pub fn classify_body(
+    name: &str,
+    c: &Classified,
+    req: &OntologyRequest,
+    r: &Renderer,
+    q: &ClassifyQuery,
+) -> Result<J> {
+    use sparkles_owl::classify::Gap;
+    let t = &c.classification.taxonomy;
+    let s = &c.classification.stats;
+    let mut j = opened_json(name, &c.opened, req);
+    let unsat: Vec<&str> = t.unsatisfiable().map(|c| c.as_str()).collect();
+    j["consistent"] = json!(c.classification.consistent);
+    j["complete"] = json!(c.complete());
+    j["reused"] = json!(c.reused);
+    j["classes"] = json!(t.classes().count());
+    j["nodeCount"] = json!(t.nodes().len());
+    j["unsatisfiableCount"] = json!(unsat.len());
+    j["unsatisfiable"] = json!(unsat.iter().take(q.limit).collect::<Vec<_>>());
+    j["excludedCount"] = json!(c.excluded.len());
+    j["excluded"] = J::Array(
+        c.excluded
+            .iter()
+            .take(q.limit)
+            .map(|e| {
+                let ax = Axiom::new(e.axiom.clone());
+                let mut x = json!({
+                    "type": ax.axiom_type().name(),
+                    "ofn": r.axiom(&ax),
+                    "axiom": sparkles_owl::json::axiom(&ax),
+                });
+                match &e.gap {
+                    Gap::Outside { rule, message } => {
+                        x["rule"] = json!(rule);
+                        x["message"] = json!(message);
+                    }
+                    Gap::Partial(why) => x["partial"] = json!(why),
+                }
+                x
+            })
+            .collect(),
+    );
+    j["stats"] = json!({
+        "incremental": s.incremental,
+        "added": s.added,
+        "removed": s.removed,
+        "cleared": s.cleared,
+        "contexts": s.contexts,
+        "conclusions": s.conclusions,
+        "estimatedBytes": s.memory,
+        "threads": s.threads,
+        "indexMs": s.index.as_secs_f64() * 1000.0,
+        "saturationMs": s.saturation.as_secs_f64() * 1000.0,
+        "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
+    });
+    if q.nodes {
+        let total = t.nodes().len();
+        j["nodes"] = J::Array(
+            (q.offset.min(total)..total)
+                .take(q.limit)
+                .map(|i| node_json(t, i))
+                .collect(),
+        );
+        j["offset"] = json!(q.offset);
+        if q.offset.saturating_add(q.limit) < total {
+            j["next"] = json!(q.offset + q.limit);
+        }
+    }
+    if let Some(about) = &q.about {
+        let class = sparkles_owl::Class::new(about.as_str());
+        let n = t
+            .node_of(&class)
+            .ok_or_else(|| Error::NotFound(format!("the taxonomy has no class <{about}>")))?;
+        let firsts = |ns: Vec<usize>| -> Vec<String> {
+            ns.into_iter()
+                .filter_map(|k| t.node(k).classes.first().map(|c| c.as_str().to_string()))
+                .collect()
+        };
+        let mut x = node_json(t, n);
+        x["iri"] = json!(about);
+        x["unsatisfiable"] = json!(t.is_unsatisfiable(&class));
+        x["childClasses"] = json!(firsts(t.node(n).children.clone()));
+        x["superClasses"] = json!(
+            t.ancestors(n)
+                .into_iter()
+                .flat_map(|k| t.node(k).classes.iter().map(|c| c.as_str().to_string()))
+                .collect::<Vec<_>>()
+        );
+        j["class"] = x;
+    }
+    if let Some(w) = &c.written {
+        j["written"] = edit_body(w, r);
+    }
+    Ok(j)
 }

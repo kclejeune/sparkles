@@ -202,6 +202,13 @@ pub struct DatasetState {
     /// last (at most [`crate::handles::ontology::CACHE_ENTRIES`])
     #[cfg(feature = "ontology")]
     pub ontology_cache: Mutex<Vec<crate::handles::ontology::CacheEntry>>,
+    /// the last OWL 2 EL classification of an ontology read by a caller who reads every
+    /// graph, with the classifier's saturated state
+    #[cfg(feature = "ontology")]
+    pub classify_cache: Mutex<Option<crate::handles::ontology::classify::CacheEntry>>,
+    /// held while a kept classification runs, so that one runs at a time
+    #[cfg(feature = "ontology")]
+    pub classify_flight: Mutex<()>,
     /// the objects of predicates measured for reports of [`crate::schema::Basis::Statistics`]
     pub objects_cache: Mutex<ObjectsCache>,
     /// where a clone was made from (`origin.json`, or kept in memory for an in-memory
@@ -413,6 +420,10 @@ impl Dataset {
             schema_cache: Mutex::new(Vec::new()),
             #[cfg(feature = "ontology")]
             ontology_cache: Mutex::new(Vec::new()),
+            #[cfg(feature = "ontology")]
+            classify_cache: Mutex::new(None),
+            #[cfg(feature = "ontology")]
+            classify_flight: Mutex::new(()),
             objects_cache: Mutex::new(ObjectsCache::default()),
             origin,
             store,

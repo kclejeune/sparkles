@@ -999,6 +999,12 @@ impl OntologyScope {
         self.handle.remove_entity(&self.req, iri, &self.opts)
     }
 
+    /// [`Ontologies::classify`].
+    pub fn classify(&self, c: &classify::ClassifyRequest) -> Result<classify::Classified> {
+        self.ready()?;
+        self.handle.classify(&self.req, c, &self.opts)
+    }
+
     /// Edit the ontology in one commit (spec F21 §2.1): `f` names the axioms to add and
     /// remove on an [`Editor`], and [`Ontologies::edit`] then applies them under the
     /// writer lock. `f` runs before the lock is taken, so it cannot see the head the
@@ -1267,7 +1273,13 @@ impl Ontologies {
         iri: &str,
         opts: &QueryOptions,
     ) -> Result<EditOutcome> {
-        self.edit_with(req, &EditRequest::default(), Some(iri), opts)
+        self.edit_with(
+            req,
+            &EditRequest::default(),
+            Some(iri),
+            opts,
+            Extra::default(),
+        )
     }
 
     /// Add and remove axioms in one commit. The ontology is read from the head the
@@ -1283,7 +1295,7 @@ impl Ontologies {
         edit: &EditRequest,
         opts: &QueryOptions,
     ) -> Result<EditOutcome> {
-        self.edit_with(req, edit, None, opts)
+        self.edit_with(req, edit, None, opts, Extra::default())
     }
 
     /// [`edit`](Self::edit), also removing what mentions `entity`, selected from the
@@ -1294,6 +1306,7 @@ impl Ontologies {
         edit: &EditRequest,
         entity: Option<&str>,
         opts: &QueryOptions,
+        mut extra: Extra<'_>,
     ) -> Result<EditOutcome> {
         req.validate()?;
         if req.at.is_some() {
@@ -1363,6 +1376,20 @@ impl Ontologies {
             ))
         };
         let mut removal: Vec<Axiom> = edit.remove.clone();
+        if let Some(replace) = extra.replace {
+            let adding: BTreeSet<&Axiom> = edit.add.iter().collect();
+            removal.extend(
+                o.ontology
+                    .axioms
+                    .iter()
+                    .filter(|(a, origins)| {
+                        replace(a)
+                            && !adding.contains(a)
+                            && origins.iter().any(|x| scope.contains(&x.graph))
+                    })
+                    .map(|(a, _)| a.clone()),
+            );
+        }
         if let Some(iri) = entity {
             removal.extend(
                 o.ontology
@@ -1573,6 +1600,9 @@ impl Ontologies {
             }
         }
         let added = adding.len();
+        if let Some(hook) = extra.before_commit.as_mut() {
+            hook(&mut txn, &head)?;
+        }
         let receipt = txn.commit()?;
         Ok(EditOutcome {
             receipt,
@@ -1587,6 +1617,18 @@ impl Ontologies {
         })
     }
 }
+
+/// What an edit does besides its axioms, for callers inside the handle.
+#[derive(Default)]
+struct Extra<'a> {
+    /// also remove the axioms of the edited graphs that match and that the edit does not
+    /// add, selected from the head under the writer lock
+    replace: Option<&'a dyn Fn(&Axiom) -> bool>,
+    /// runs under the writer lock after the axioms are written, before the commit
+    before_commit: Option<HookFn<'a>>,
+}
+
+type HookFn<'a> = &'a mut dyn FnMut(&mut crate::store::WriteTxn<'_>, &Arc<Snapshot>) -> Result<()>;
 
 #[derive(Default)]
 struct Plan {
@@ -2396,6 +2438,7 @@ pub fn rl_inspector(
     Arc::new(move |snap| Ok(rl_warnings(snap, &prefixes, &inputs, &opts)?))
 }
 
+pub mod classify;
 pub mod wire;
 
 #[cfg(test)]

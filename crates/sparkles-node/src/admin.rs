@@ -346,6 +346,7 @@ fn writes(op: &str) -> bool {
             | "ontology.entity"
             | "ontology.check"
             | "ontology.diff"
+            | "ontology.classify"
     )
 }
 #[napi]
@@ -476,9 +477,11 @@ impl NativeDataset {
         options: String,
         cancel: &Cancellation,
     ) -> napi::Result<String> {
-        let write = writes(&op);
-        let shared = self.get(write)?;
         let a = parse(&args)?;
+        // a classification writes only when it names a target graph
+        let write = writes(&op)
+            || (op == "ontology.classify" && a.get("target").is_some_and(|t| !t.is_null()));
+        let shared = self.get(write)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
         let _permit = if write {

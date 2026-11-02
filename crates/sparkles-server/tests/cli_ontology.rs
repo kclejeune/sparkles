@@ -189,3 +189,112 @@ fn functional_syntax_files_check_and_load() {
         err(&o)
     );
 }
+
+const EL: &str = "Prefix(:=<http://ex.org/>)
+Ontology(<http://ex.org/el>
+  Declaration(Class(:Professor))
+  Declaration(Class(:Course))
+  Declaration(Class(:Teacher))
+  Declaration(Class(:Rock))
+  Declaration(ObjectProperty(:teaches))
+  SubClassOf(:Professor ObjectSomeValuesFrom(:teaches :Course))
+  EquivalentClasses(:Teacher ObjectSomeValuesFrom(:teaches :Course))
+  SubClassOf(:Rock :Course)
+  DisjointClasses(:Rock :Course)
+)
+";
+
+#[test]
+fn classify_a_file_and_a_database() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("el.ofn"), EL).unwrap();
+    // an unsatisfiable class: exit status 1, unless allowed
+    let o = sparkles(dir, &["ontology", "classify", "el.ofn", "--format", "text"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    let s = out(&o);
+    assert!(s.contains("unsatisfiable http://ex.org/Rock"), "{s}");
+    let o = sparkles(
+        dir,
+        &["ontology", "classify", "el.ofn", "--allow-unsatisfiable"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let s = out(&o);
+    assert!(s.contains("SubClassOf(:Professor :Teacher)"), "{s}");
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "el.ofn",
+            "--allow-unsatisfiable",
+            "--format",
+            "json",
+            "--about",
+            "http://ex.org/Professor",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["unsatisfiableCount"], 1, "{j}");
+    assert!(
+        j["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("http://ex.org/Teacher")),
+        "{j}"
+    );
+    // a file classifies without a database, so it takes no target
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "el.ofn",
+            "--target",
+            "http://ex.org/t",
+        ],
+    );
+    assert_ne!(o.status.code(), Some(0));
+    // a database: classify, then write the taxonomy to a named graph
+    let o = sparkles(dir, &["load", "--loc", "db", "el.ofn"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "--loc",
+            "db",
+            "--allow-unsatisfiable",
+            "--target",
+            "http://ex.org/taxonomy",
+            "--message",
+            "classified",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["written"]["committed"], true, "{j}");
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "axioms",
+            "--loc",
+            "db",
+            "--graph",
+            "http://ex.org/taxonomy",
+            "--type",
+            "SubClassOf",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        out(&o).contains("SubClassOf(:Professor :Teacher)"),
+        "{}",
+        out(&o)
+    );
+}
