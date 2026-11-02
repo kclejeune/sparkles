@@ -40,10 +40,9 @@ vocabulary, IRI inserts reuse known terms, and deletes remove triples.
 Oxigraph issued no device writes during these runs, while a run of 5,000 Sparkles commits
 issued 14 device cache flushes.
 
-These rounds ran before the commit records and annotation records were written through
-the device cache (items 501 and 502), which took the serial p50 of the spatial cell from
-1.86 to 0.69 ms, so the Sparkles columns are an upper bound. The churn table below was
-measured after those items.
+These rounds ran before items 501 and 502 wrote the commit records and annotation records
+through the device cache, and this serial workload has not been measured since, so the
+table records the earlier build. The churn table below was measured after those items.
 
 The comparative suite's `updates` mode applies the same 5,000 single-triple INSERT and
 DELETE requests, one at a time, to every engine's store. No engine failed a commit.
@@ -558,7 +557,8 @@ within 30 s. On a processor with performance and efficiency cores, the server ru
 request threads, which also commit the writes, on the performance cores by default. On
 `atlas`, a host like `forge`, five alternating pairs of 1.05M runs committed 195 to 253
 writes/s with that placement and 279 to 367 with `--request-cpus all`, and served 9% to 14%
-fewer reads. [Item 583](../../ROADMAP.md) covers this placement. A separate run with the durable-commit harness above, with 16 readers on the
+fewer reads, as the [run record](runs/2026-11-02-changed-reads-and-placement-atlas/README.md) shows. [Item 583](../../ROADMAP.md) covers this
+placement. A separate run with the durable-commit harness above, with 16 readers on the
 10.5M store, completed 299 new-literal commits per second at a median of 3.2 ms.
 
 ### Queries after updates

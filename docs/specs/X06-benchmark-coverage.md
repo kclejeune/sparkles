@@ -1894,8 +1894,8 @@ change, `Snapshot::par_blocks_in_ranges` gave up whenever the delta had a key in
 and its callers then read the whole range in order with the delta merged in. On a store
 with 5,000 uncompacted commits, the runs of `foaf:knows` in both sorted orders were
 therefore read one block after another. On `atlas`, with other work on the host, this took
-the query's server time from 3.0 ms on the loaded store to 7.1 to 10.7 ms. The reads now merge the delta keys of each
-changed block into a copy of the columns they need and keep their parallel pieces. A first
+the query's server time from about 3 ms on the loaded store to 7.1 to 10.7 ms. The reads
+now merge the delta keys of each changed block into a copy of the columns they need and keep their parallel pieces. A first
 version that called the reader once for each run between two delta keys spent most of its
 time allocating and scheduling those pieces and took 5.4 to 6.1 ms. The copy takes 4.0 to
 4.2 ms. A read whose ranges hold more than 65,536 delta keys keeps the ordered merge,
@@ -1908,7 +1908,9 @@ On forge, `two-hop-count` on the changed 1.05M store went from 8.16 to 6.21 ms t
 of 1.019 for server time and 0.978 for client time, and its rerun left only
 `predicate-counts`, at 11 against 12 µs, at a ratio of 1.10. That query does not read
 index blocks in parallel, and on `atlas` `star-join` and `predicate-counts` kept their
-times. The [run record](../benchmarks/writes/runs/2026-11-02-competitive-writes-forge/README.md)
+times, which the access log there records to 10 µs. Item NEW-ITEM-2 checks the flag on
+the benchmark host. The [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md) has the server
+times, and the forge [run record](../benchmarks/writes/runs/2026-11-02-competitive-writes-forge/README.md)
 has every sample and answer fingerprint.
 
 The same runs refreshed the write rows against Oxigraph after items 501 and 502. The churn
@@ -1920,11 +1922,13 @@ and 252 writes/s at 1.05M and 211 at 10.5M, against Oxigraph's 1,264 and 1,277 a
 recorded 565, while serving 2,101 and 2,198 reads/s against 12 and 16. The default
 placement of request threads on the performance cores of a hybrid processor costs part
 of that write rate. On `atlas`, five alternating pairs of runs gave 195 to 253 writes/s
-with it and 279 to 367 without it, and item 583 follows this up.
+with it and 279 to 367 without it, as the [atlas record](../benchmarks/writes/runs/2026-11-02-changed-reads-and-placement-atlas/README.md)
+shows, and item 583 follows this up.
 
 A [WatDiv rerun](../benchmarks/watdiv/runs/2026-11-02-l1-rerun-forge/README.md) of L1, L3
-and S7 in three rounds found Sparkles ahead of Fluree on L1-1 and on all three templates
-in every round, so the 11% `L1-1` loss of the full run did not recur. A Sparkles server
+and S7 in three rounds gave Sparkles the lower mean on L1-1 in every round, by 0.005 to 0.146
+ms, which is within the 0.2 ms that an instance's mean varies between rounds, and on all
+three templates in every round. The 11% `L1-1` loss of the full run did not recur. A Sparkles server
 spends about 0.29 ms on that instance.
 
 ### Rewrite gates

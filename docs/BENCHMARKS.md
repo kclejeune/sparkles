@@ -27,6 +27,8 @@ This table lists recorded comparisons where another engine is ahead by about 10%
 including paired passes when only one clears that threshold.
 Fluree's warm advantages on `distinct-obj` at 1.05M, `count-all` at 10.5M and two small
 DBpedia 50M queries are within 10%. SP²Bench `q12b` is also within 8% of Oxigraph.
+Fluree's 1.11× lead on WatDiv `L1-1` in the full run did not recur in three later rounds,
+where the two engines' means differed by less than an instance's variation between rounds.
 
 | Case | Reference advantage | Qualification |
 |---|---|---|

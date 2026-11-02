@@ -1,0 +1,12 @@
+6.23 8.24 10.89 3/639 1008560
+[--request-cpus auto] {'read_qps': 2284.2, 'read_p50_ms': 6.64, 'read_p99_ms': 11.67, 'read_errors': 0, 'writes_per_s': 253.4, 'write_p50_ms': 3.731, 'write_p99_ms': 8.226, 'write_errors': 0}
+[--request-cpus all] {'read_qps': 2498.6, 'read_p50_ms': 6.21, 'read_p99_ms': 10.57, 'read_errors': 0, 'writes_per_s': 366.8, 'write_p50_ms': 2.385, 'write_p99_ms': 5.935, 'write_errors': 0}
+[--request-cpus auto] {'read_qps': 2030.6, 'read_p50_ms': 7.53, 'read_p99_ms': 12.94, 'read_errors': 0, 'writes_per_s': 239.1, 'write_p50_ms': 3.961, 'write_p99_ms': 8.626, 'write_errors': 0}
+[--request-cpus all] {'read_qps': 2348.2, 'read_p50_ms': 6.62, 'read_p99_ms': 11.01, 'read_errors': 0, 'writes_per_s': 358.7, 'write_p50_ms': 2.425, 'write_p99_ms': 6.163, 'write_errors': 0}
+[--request-cpus auto] {'read_qps': 2041.0, 'read_p50_ms': 7.5, 'read_p99_ms': 12.9, 'read_errors': 0, 'writes_per_s': 197.7, 'write_p50_ms': 4.893, 'write_p99_ms': 9.999, 'write_errors': 0}
+[--request-cpus all] {'read_qps': 2364.6, 'read_p50_ms': 6.57, 'read_p99_ms': 11.03, 'read_errors': 0, 'writes_per_s': 309.1, 'write_p50_ms': 3.009, 'write_p99_ms': 6.976, 'write_errors': 0}
+[--request-cpus auto] {'read_qps': 2036.3, 'read_p50_ms': 7.52, 'read_p99_ms': 12.9, 'read_errors': 0, 'writes_per_s': 222.9, 'write_p50_ms': 4.296, 'write_p99_ms': 9.274, 'write_errors': 0}
+[--request-cpus all] {'read_qps': 2366.7, 'read_p50_ms': 6.58, 'read_p99_ms': 10.9, 'read_errors': 0, 'writes_per_s': 314.0, 'write_p50_ms': 2.924, 'write_p99_ms': 6.778, 'write_errors': 0}
+[--request-cpus auto] {'read_qps': 2055.3, 'read_p50_ms': 7.43, 'read_p99_ms': 12.8, 'read_errors': 0, 'writes_per_s': 194.8, 'write_p50_ms': 4.893, 'write_p99_ms': 10.068, 'write_errors': 0}
+[--request-cpus all] {'read_qps': 2379.1, 'read_p50_ms': 6.54, 'read_p99_ms': 10.84, 'read_errors': 0, 'writes_per_s': 278.8, 'write_p50_ms': 3.558, 'write_p99_ms': 7.263, 'write_errors': 0}
+MIXDONE
