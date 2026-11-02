@@ -1934,8 +1934,10 @@ not declare, unless `declare` is false. Named individuals are not declared. The 
 counts the axioms added, already present and removed, and the triples inserted, deleted
 and kept. `addedAxioms` lists the axioms the edit wrote, declarations included, and
 `removedAxioms` those it removed, at most 10,000 of each with `axiomsTruncated` when a
-list is cut. Each entry has the `type`, `ofn` and `axiom` of a listing, so an edit that
-adds the removed axioms and removes the added ones, with `declare: false`, undoes it. The route takes the parameters of the other writes, such as `dryRun` and
+list is cut. Each entry has the `type`, `ofn` and `axiom` of a listing. An added axiom of
+several classes or individuals, such as an `EquivalentClasses`, is listed whole when part
+of it was already present, so the lists do not always undo the edit. A revert of the
+edit's commit (`POST /$/revert/{ds}`) undoes it exactly. The route takes the parameters of the other writes, such as `dryRun` and
 `receipt`, and an `If-Match` with the summary's tag. An axiom the forward mapping cannot
 write, such as a `DisjointClasses` of one class, is `400` with code `invalid-axiom`.
 Writing needs write access to the target graph, and a removal needs it on the graphs the

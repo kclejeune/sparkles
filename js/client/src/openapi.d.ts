@@ -2117,7 +2117,7 @@ export interface paths {
         put?: never;
         /**
          * Add and remove axioms
-         * @description Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.
+         * @description Adds and removes axioms, each in its JSON form or in functional-style syntax with the dataset's prefixes, as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.
          */
         post: operations["editOntology"];
         delete?: never;
@@ -17177,7 +17177,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    add?: Record<string, never>[];
+                    add?: (Record<string, never> | string)[];
                     declare?: boolean;
                     /** @description A graph IRI or `default`, or a list of them. */
                     graph?: unknown;
@@ -17185,7 +17185,7 @@ export interface operations {
                     message?: string;
                     /** @enum {string} */
                     mode?: "lenient" | "strict";
-                    remove?: Record<string, never>[];
+                    remove?: (Record<string, never> | string)[];
                     /** @description The graph that takes the added axioms. */
                     target?: string;
                 };

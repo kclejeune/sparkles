@@ -844,9 +844,14 @@ fn ontology(p: &mut Paths) {
             )
             .errors(&[400, 404, 408, 410]),
     );
+    // an axiom an edit takes: its JSON form, or a string in functional-style syntax
+    let axiom_in = json!({ "oneOf": [
+        { "type": "object", "description": "The axiom's JSON form." },
+        { "type": "string", "description": "The axiom in functional-style syntax with the dataset's prefixes." }
+    ] });
     p.add(
         write_params(op(POST, "/$/ontology/{ds}/axioms", "editOntology", "Ontology", "Add and remove axioms"))
-            .doc("Adds and removes axioms in their JSON form as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.")
+            .doc("Adds and removes axioms, each in its JSON form or in functional-style syntax with the dataset's prefixes, as one commit. The ontology is read from the head under the writer lock. A removed axiom takes its triples with it, except those another axiom or triple still uses, and removing an axiom the ontology does not hold is not an error. An added axiom goes to `target` (the first graph read by default) with the declarations of the entities it uses that the ontology lacks, unless `declare` is false. An axiom the forward mapping cannot write is `400` with code `invalid-axiom`.")
             .see("ontology")
             .param("ifMatch")
             .body(
@@ -859,8 +864,8 @@ fn ontology(p: &mut Paths) {
                         "graph": selection["graph"],
                         "imports": selection["imports"],
                         "mode": selection["mode"],
-                        "add": { "type": "array", "items": { "type": "object" } },
-                        "remove": { "type": "array", "items": { "type": "object" } },
+                        "add": { "type": "array", "items": axiom_in.clone() },
+                        "remove": { "type": "array", "items": axiom_in },
                         "declare": { "type": "boolean" },
                         "target": { "type": "string", "description": "The graph that takes the added axioms." },
                         "message": { "type": "string" }
