@@ -77,7 +77,14 @@ pub struct ClassifyRequest {
     pub target: Option<GraphRef>,
     /// the message of the commit that writes the taxonomy
     pub message: Option<String>,
+    /// a class the caller asks about: a taxonomy without it is not found, and then
+    /// nothing is written
+    pub about: Option<String>,
 }
+
+/// The opening of the comment the classifier writes on a taxonomy graph's header, by
+/// which a later write knows the comment it replaces.
+const COMMENT: &str = "The OWL 2 EL taxonomy that the Sparkles classifier computed from commit ";
 
 /// A classification.
 #[derive(Clone)]
@@ -183,6 +190,16 @@ impl Ontologies {
             let out = run(&mut k, c, &opts)?;
             (Arc::new(out), Arc::new(k.excluded()), false)
         };
+        if let Some(about) = &c.about
+            && classification
+                .taxonomy
+                .node_of(&sparkles_owl::Class::new(about.as_str()))
+                .is_none()
+        {
+            return Err(Error::NotFound(format!(
+                "the taxonomy has no class <{about}>"
+            )));
+        }
         let mut classified = Classified {
             opened: o,
             classification,
@@ -331,6 +348,12 @@ impl Ontologies {
             .collect();
         let activity = format!("urn:uuid:{}", uuid::Uuid::new_v4());
         let mut hook = |txn: &mut crate::store::WriteTxn<'_>, head: &Arc<Snapshot>| -> Result<()> {
+            if head.commit != read_commit && c.assertions {
+                // the assertions read are not kept to compare, so any commit refuses
+                return Err(Error::Conflict(
+                    "the dataset changed after the classification with its assertions: classify again".into(),
+                ));
+            }
             if head.commit != read_commit {
                 let now = self.open_at(head, &classified_req, opts)?;
                 if kinds_of(&now) != read_kinds {
@@ -359,11 +382,25 @@ impl Ontologies {
                 }
             }
             let gid = txn.intern(&Term::NamedNode(g_node.clone()))?;
-            let subject = Term::NamedNode(g_node.clone());
-            // the previous provenance of the header goes
-            if t.ontology.header.iri.as_ref() == Some(&g_node) {
+            // the provenance goes on the target's header, or on a new one named by the
+            // graph when it has none
+            let subject = match (&t.ontology.header.iri, t.ontology.header_graph) {
+                (Some(iri), _) => Term::NamedNode(iri.clone()),
+                (None, Some(_)) => {
+                    return Err(Error::Conflict(format!(
+                        "the ontology header of the target <{g}> has no IRI, so it cannot be named to carry the provenance"
+                    )));
+                }
+                (None, None) => Term::NamedNode(g_node.clone()),
+            };
+            // the previous provenance of the header goes, and the comment the classifier
+            // wrote, but not the other comments
+            if t.ontology.header.iri.is_some() {
                 for a in &t.ontology.header.annotations {
-                    if !props.contains(&a.property) && a.property.as_str() != vocab::RDFS_COMMENT {
+                    let ours = props.contains(&a.property)
+                        || (a.property.as_str() == vocab::RDFS_COMMENT
+                            && matches!(&a.value, AnnotationValue::Literal(l) if l.value().starts_with(COMMENT)));
+                    if !ours {
                         continue;
                     }
                     let object = match &a.value {
@@ -400,7 +437,7 @@ impl Ontologies {
                 (
                     vocab::RDFS_COMMENT.to_string(),
                     Term::Literal(Literal::new_simple_literal(format!(
-                        "The OWL 2 EL taxonomy that the Sparkles classifier computed from commit {read_commit}"
+                        "{COMMENT}{read_commit}"
                     ))),
                 ),
             ];

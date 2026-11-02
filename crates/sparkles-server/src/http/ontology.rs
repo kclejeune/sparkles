@@ -689,14 +689,16 @@ pub(super) async fn classify(
             Some(_) => Err(bad(format!("{k}: a string"))),
         }
     };
+    let about = text("about")?.map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string());
     let c = ClassifyRequest {
         assertions: flag("assertions")?,
         threads: number("threads", 0, 0, 1024)?,
         target: text("target")?.map(|g| graph_ref(&g)).transpose()?,
         message: text("message")?,
+        about: about.clone(),
     };
     let q = ClassifyQuery {
-        about: text("about")?.map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string()),
+        about,
         nodes: flag("nodes")?,
         limit: number("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)?,
         offset: number("offset", 0, 0, usize::MAX)?,
@@ -707,6 +709,11 @@ pub(super) async fn classify(
         Some(f) => return Err(bad(format!("format must be json or ofn, not '{f}'"))),
     };
     let writes = c.target.is_some();
+    if writes && ofn {
+        return Err(bad(
+            "format=ofn answers a classification without a write: leave out 'target' or 'format'",
+        ));
+    }
     // the route table admits readers, so a run that writes its taxonomy checks write here
     if writes
         && let Some(denied) = crate::auth::dataset_denial(
@@ -733,7 +740,10 @@ pub(super) async fn classify(
     let wanted = receipt_wanted(&params, &headers);
     let mut dry = None;
     let mut timeout = None;
-    let mut _cancel_on_drop = None;
+    // a client that goes away stops the run
+    let (cancel, cancel_guard) = cancel_on_drop();
+    let mut _cancel_on_drop = Some(cancel_guard);
+    opts.cancel = Some(cancel);
     if writes {
         let (mut wopts, cancel) = body_write_options(&st, &params, &headers, Some(&p))?;
         _cancel_on_drop = Some(cancel);

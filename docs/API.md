@@ -1960,19 +1960,24 @@ parameter, and answers the inferred class hierarchy and the unsatisfiable classe
 `consistent` is false when the ontology has no model, and every class is then
 unsatisfiable. An axiom outside OWL 2 EL is left out and listed under `excluded` with
 the rule it breaks. An axiom that the classifier uses only in part, such as one with an
-individual in a class expression or a data range, is listed with `partial` and the
-reason. `complete` is false when anything is listed. Every subsumption the answer gives
+individual in a class expression, a data range, an assertion on a property with a range
+or the top or bottom property, is listed with `partial` and the reason. An axiom with
+an expression nested more than 256 deep is left out and listed as partial too.
+`complete` is false when anything is listed. Every subsumption the answer gives
 is entailed, and a complete answer has every entailed subsumption between named classes.
 The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
 the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
 10,000, and gives the times of the run under `stats`. `about` names a class and answers
 its node under `class`, with its equivalent classes, direct superclasses and subclasses
-and all its superclasses. An `about` class that the taxonomy does not have is `404`.
+and all its superclasses. An unsatisfiable class is a subclass of every class, so its
+node lists no superclasses and `unsatisfiable` is true. An `about` class that the
+taxonomy does not have is `404`, and a run that would write then writes nothing.
 `nodes: true` lists the taxonomy's nodes, `limit` from `offset`, each with its classes
 and its direct superclasses, and `next` when more remain. Node 0 holds `owl:Thing` and
 node 1 holds `owl:Nothing` and the unsatisfiable classes. `format=ofn` answers the
 taxonomy as a functional-style document of `EquivalentClasses` and `SubClassOf` axioms,
-as ELK and ROBOT write one. `assertions: true` also classifies with the assertions the
+as ELK and ROBOT write one, and it is `400` with `target`. `assertions: true` also
+classifies with the assertions the
 store holds, which can make the ontology inconsistent. `threads` asks for worker
 threads, which the algorithm pool admits up to its share for one call. `inferences` is
 `400`, since a classification reads the asserted axioms.
@@ -1982,7 +1987,7 @@ assertions. A classification of the same ontology at the same commit answers fro
 with `reused: true`. One at a later commit gives the kept classifier the axioms that
 changed, so that it saturates again only the classes those axioms can reach, and
 `stats.incremental` says so. A change to the property hierarchy, chains, reflexivity or
-ranges saturates everything again. The kept state costs memory for the time the dataset
+ranges, or to an axiom with a data property or datatype, saturates everything again. The kept state costs memory for the time the dataset
 is open, about 55 MB estimated for GO, and it is dropped after a run whose estimate
 passes one gigabyte. A run is bounded by the request's deadline and memory budget and
 answers `507` with `budget: "memory"` past the budget.
@@ -1994,9 +1999,12 @@ that the graph held and the taxonomy no longer has, so a diff of the graph betwe
 runs shows how the hierarchy changed. The graph's ontology header carries the
 provenance as annotations: `prov:wasGeneratedBy` a `urn:uuid:` activity,
 `prov:generatedAtTime`, `prov:wasDerivedFrom` each named graph read and an
-`rdfs:comment` with the commit read. A later write replaces them. When the terminology
-read changes between the classification and the write, the write is `409` and the
-classification can run again. A write takes the parameters of the other writes, such as
+`rdfs:comment` with the commit read. They go on the graph's existing header when it has
+one, and a header without an IRI is `409`. A later write replaces the PROV-O
+annotations and the comment that the classifier wrote, and keeps other comments. When
+the terminology read changes between the classification and the write, the write is
+`409` and the classification can run again. With `assertions: true`, any commit in
+between is `409`. A write takes the parameters of the other writes, such as
 `dryRun` and `If-Match`, and needs write access to the target graph.
 
 ```json

@@ -395,6 +395,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     })
                     .transpose()?,
                 message: message.clone(),
+                about: about
+                    .as_deref()
+                    .map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string()),
             };
             let q = ClassifyQuery {
                 about: about

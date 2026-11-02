@@ -629,6 +629,14 @@ async fn classify_answers_the_taxonomy_and_writes_it() {
         "{}",
         r.text()
     );
+    // the functional-style form answers a classification without a write
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify?format=ofn",
+        json!({"target": "http://ex.org/tax"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     // a write commits the taxonomy to the target graph, and a dry run commits nothing
     let body = json!({"target": "http://ex.org/tax", "message": "classified"});
     let r = post(&s.app, "/$/ontology/t/classify?dryRun=true", body.clone()).await;

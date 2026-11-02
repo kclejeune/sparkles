@@ -965,15 +965,17 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             Ok(diff_body(name, &d, &req, assertions, limit, &r))
         }
         "classify" => {
+            let about = string(a, "about")?
+                .map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string());
             let c = ClassifyRequest {
                 assertions: boolean(a, "assertions")?.unwrap_or(false),
                 threads: number(a, "threads", 0, 1024)?.unwrap_or(0),
                 target: string(a, "target")?.map(graph_ref).transpose()?,
                 message: string(a, "message")?.map(str::to_string),
+                about: about.clone(),
             };
             let q = ClassifyQuery {
-                about: string(a, "about")?
-                    .map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string()),
+                about,
                 nodes: boolean(a, "nodes")?.unwrap_or(false),
                 limit: number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT),
                 offset: number(a, "offset", 0, usize::MAX)?.unwrap_or(0),

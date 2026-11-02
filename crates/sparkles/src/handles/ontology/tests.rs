@@ -1826,6 +1826,62 @@ mod classification {
     }
 
     #[test]
+    fn a_write_keeps_the_target_header_and_its_comments() {
+        let ds = dataset(&format!(
+            "{ONTO} GRAPH <http://ex.org/tax> {{ <http://ex.org/taxonomy> a owl:Ontology ; rdfs:comment \"mine\" . }}"
+        ));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let tq = OntologyRequest {
+            graphs: vec![named("http://ex.org/tax")],
+            imports: ImportMode::None,
+            ..Default::default()
+        };
+        let before = total(&ds);
+        // a class the taxonomy lacks refuses the request before anything is written
+        let missing = ClassifyRequest {
+            target: Some(named("http://ex.org/tax")),
+            about: Some("http://ex.org/Nobody".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            h.classify(&req, &missing, &opts()),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(total(&ds), before);
+        let cr = ClassifyRequest {
+            target: Some(named("http://ex.org/tax")),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            h.classify(&req, &cr, &opts()).unwrap();
+            let o = h.open(&tq, &opts()).unwrap();
+            let header = &o.ontology.header;
+            assert_eq!(
+                header.iri.as_ref().map(|i| i.as_str()),
+                Some("http://ex.org/taxonomy")
+            );
+            assert!(
+                o.ontology.other_headers.is_empty(),
+                "{:?}",
+                o.ontology.other_headers
+            );
+            let values = |p: &str| -> Vec<String> {
+                header
+                    .annotations
+                    .iter()
+                    .filter(|a| a.property.as_str() == p)
+                    .map(|a| format!("{:?}", a.value))
+                    .collect()
+            };
+            assert_eq!(values("http://www.w3.org/ns/prov#wasGeneratedBy").len(), 1);
+            let comments = values(sparkles_owl::vocab::RDFS_COMMENT);
+            assert_eq!(comments.len(), 2, "{comments:?}");
+            assert!(comments.iter().any(|c| c.contains("mine")), "{comments:?}");
+        }
+    }
+
+    #[test]
     fn budgets_bound_a_run() {
         let ds = dataset(ONTO);
         let h = ds.ontology();
