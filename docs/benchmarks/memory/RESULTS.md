@@ -243,7 +243,7 @@ An EXISTS inside a larger expression is still evaluated once per distinct outer 
 which is slower in the cursor, so plans with one stay eager. An OPTIONAL whose condition
 is an EXISTS stays eager as well, because the cursor's conditional OPTIONAL takes several
 times as long as the eager one with any condition. Automatic execution already streams
-`optional-filter` at this size, which item NEW-ITEM-1 covers.
+`optional-filter` at this size, which item 570 covers.
 
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M, with the spill directory on the instance's local disk.

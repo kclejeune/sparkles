@@ -1669,7 +1669,7 @@ cannot answer, because it binds a risky variable or leaves a key unbound, is eva
 its own, and an eager plan reports the keys and probes. Automatic execution streams a BIND
 whose EXISTS has a key set. An OPTIONAL whose condition is an EXISTS stays eager, because
 the cursor's conditional OPTIONAL takes several times as long as the eager one whatever
-its condition, which item NEW-ITEM-1 covers. The commit that admitted it and its revert
+its condition, which item 570 covers. The commit that admitted it and its revert
 are recorded in [PERFORMANCE-EXPERIMENTS.md](../PERFORMANCE-EXPERIMENTS.md#query-execution).
 On an 8-vCPU Namespace instance at 10.5M quads, automatic execution of `exists-bind` went
 from 860 ms to 8.4 ms, `exists-bind-join` from 2,003 ms to 7.4 ms and `exists-optional`
@@ -1704,4 +1704,4 @@ A Namespace screen of the 30 bench queries at 1.05M quads, four A, B, B, A round
 one query thread, compared 4bd70845 with ec6cd326. Both returned the same answers, and
 the geometric mean of server time was 1.011 and of client time 0.997. Four queries of 15
 to 26 µs were 7 to 14% slower in server time with spreads of 18 to 80%, and item
-NEW-ITEM-2 rechecks them on a quiet Intel host.
+571 rechecks them on a quiet Intel host.
