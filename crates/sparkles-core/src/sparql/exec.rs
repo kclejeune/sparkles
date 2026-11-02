@@ -6125,13 +6125,21 @@ pub(super) fn offer_rows<P>(
             Expr::Var(v) if i == 0 && t.len() > PAR_THRESHOLD => match t.col_of(*v) {
                 Some(c) => {
                     let col = &t.cols[c];
+                    let vals: Vec<SortKey> = col
+                        .par_iter()
+                        .with_min_len(PAR_MIN_LEN)
+                        .map(|&id| id_key(ctx, id))
+                        .collect();
+                    // The keys' decoded payloads stay with the column until the heap
+                    // is done, whatever the value cache keeps.
+                    let payload: u64 = vals
+                        .par_iter()
+                        .with_min_len(PAR_MIN_LEN)
+                        .map(SortKey::payload_bytes)
+                        .sum();
                     HeapKey::Column(super::exprcache::Column::Rows {
-                        vals: col
-                            .par_iter()
-                            .with_min_len(PAR_MIN_LEN)
-                            .map(|&id| id_key(ctx, id))
-                            .collect(),
-                        _charge: None,
+                        vals,
+                        _charge: ctx.retained_charge(payload)?,
                     })
                 }
                 None => HeapKey::Var(None),
@@ -6431,9 +6439,20 @@ fn key_per_value(
     if t.len() < super::exprcache::MIN_ROWS {
         return Ok(None);
     }
-    super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
+    let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
         key_rows(ctx, v, e, decode_for(ctx, v, &[e]).as_ref())
-    })
+    })?;
+    // The distinct keys' payloads stay with them until the sort is done.
+    if let Some(values) = &mut values {
+        let payload: u64 = values
+            .vals
+            .par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(key_payload)
+            .sum();
+        values.retain(ctx, payload)?;
+    }
+    Ok(values)
 }
 
 /// The value of an ORDER BY key on every row, per distinct value where it can be.

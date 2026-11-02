@@ -222,6 +222,18 @@ pub struct PerValue<T> {
 }
 
 impl<T> PerValue<T> {
+    /// Charge `bytes` more to these values until they are dropped, such as the heap
+    /// payloads of their results.
+    pub(super) fn retain(&mut self, ctx: &Ctx, bytes: u64) -> Result<()> {
+        match &mut self._charge {
+            Some(charge) => charge.resize(charge.bytes().saturating_add(bytes)),
+            None => {
+                self._charge = ctx.retained_charge(bytes)?;
+                Ok(())
+            }
+        }
+    }
+
     #[inline]
     pub fn get(&self, row: usize) -> &T {
         match &self.slot {

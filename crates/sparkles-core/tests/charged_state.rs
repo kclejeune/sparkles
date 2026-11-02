@@ -241,3 +241,91 @@ fn a_long_literal_replacement_reserves_what_it_writes() {
     }
     assert_eq!(count(&rows), 20_000);
 }
+
+fn ntriples(lines: impl Iterator<Item = String>) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let data: String = lines.collect();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+/// The rows of `q` under `options`, eagerly and from a cursor whose batches hold
+/// `batch_rows` rows, or the first error of each.
+fn both_modes(
+    s: &Store,
+    q: &str,
+    options: &QueryOptions,
+    batch_rows: usize,
+) -> [sparkles_core::Result<usize>; 2] {
+    let eager = query(s.snapshot(), q, options).map(|r| r.rows().len());
+    let cursor = (|| {
+        let cursor_options = CursorOptions {
+            batch_rows,
+            ..Default::default()
+        };
+        let mut c = select_cursor(s.snapshot(), q, options, &cursor_options)?;
+        let mut n = 0;
+        while let Some(b) = c.next_batch()? {
+            n += b.len();
+        }
+        Ok(n)
+    })();
+    [eager, cursor]
+}
+
+fn without(names: &str, max_memory_bytes: Option<u64>) -> QueryOptions {
+    QueryOptions {
+        max_memory_bytes,
+        optimizations: Some(
+            sparkles_core::sparql::Optimizations::ALL
+                .disable(names)
+                .unwrap(),
+        ),
+        no_cache: true,
+        ..Default::default()
+    }
+}
+
+/// A top k over more than 16,384 rows decodes its first key in parallel and keeps the
+/// decoded strings in its column until the heap is done, whatever the value cache
+/// keeps, so 18,000 distinct strings of 3 KiB do not fit in 24 MiB.
+#[test]
+fn a_large_heap_key_column_is_charged_for_its_strings() {
+    let pad = "x".repeat(3000);
+    let s = ntriples((0..18_000).map(|i| format!("<urn:s{i}> <urn:q> \"{i:05}{pad}\" .\n")));
+    let q = "SELECT ?s WHERE { ?s <urn:q> ?v } ORDER BY ?v LIMIT 3";
+    for result in both_modes(&s, q, &without("ordered_topk", None), 32_768) {
+        assert_eq!(result.unwrap(), 3);
+    }
+    for result in both_modes(&s, q, &without("ordered_topk", Some(24 << 20)), 32_768) {
+        match result {
+            Err(error) => assert!(is_memory(&error), "{error:?}"),
+            Ok(n) => panic!("answered {n} rows within the budget"),
+        }
+    }
+}
+
+/// A sort of more than 16,384 rows evaluates a key once per distinct value, and the
+/// computed keys stay charged until the sort is done: 512 keys of 32 KiB do not fit in
+/// 8 MiB.
+#[test]
+fn per_value_sort_keys_are_charged_for_their_strings() {
+    let pad = "y".repeat(16_000);
+    let s =
+        ntriples((0..32_768).map(|i| format!("<urn:s{i}> <urn:r> \"{:03}{pad}\" .\n", i % 512)));
+    let q = "SELECT ?s WHERE { ?s <urn:r> ?v } ORDER BY CONCAT(?v, ?v) ?s";
+    for result in both_modes(&s, q, &without("ordered_topk", None), 32_768) {
+        assert_eq!(result.unwrap(), 32_768);
+    }
+    for result in both_modes(&s, q, &without("ordered_topk", Some(8 << 20)), 32_768) {
+        match result {
+            Err(error) => assert!(is_memory(&error), "{error:?}"),
+            Ok(n) => panic!("answered {n} rows within the budget"),
+        }
+    }
+}
