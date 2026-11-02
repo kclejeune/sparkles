@@ -678,6 +678,91 @@ mod tests {
         assert_eq!(parked(pattern), makers);
     }
 
+    /// A query with an owner charges each parked clone it takes back as it charges a new
+    /// clone, and a query without room for the cache leaves the clone parked.
+    #[test]
+    fn a_charged_query_charges_the_parked_clones_it_takes() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let pattern = "^charged-parked-[0-9]+$";
+        let parked = || -> usize {
+            programs()
+                .lock()
+                .by_text
+                .get(pattern)
+                .map_or(0, |kept| kept.parked.len())
+        };
+        let store = crate::store::Store::in_memory(Default::default());
+        let query = |limit: u64| {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let ctx = Arc::new(ctx);
+            ctx.attach_owner();
+            ctx
+        };
+        let first = query(256 << 20);
+        let state = pool.install(|| {
+            RegexState::compile(Some(&first), pattern, "")
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            pool.broadcast(|_| state.is_match("charged-parked-1"))
+                .into_iter()
+                .all(|m| m)
+        );
+        assert!(
+            state
+                .workers
+                .iter()
+                .all(|w| w.get().unwrap().program.is_some())
+        );
+        let cache_bytes = state.cache_bytes;
+        drop(state);
+        assert_eq!(parked(), 2);
+        // a query whose budget leaves no room for worker caches shares the locked one
+        let tight = query(1 << 20);
+        let state = pool.install(|| {
+            RegexState::compile(Some(&tight), pattern, "")
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            pool.broadcast(|_| state.is_match("charged-parked-2"))
+                .into_iter()
+                .all(|m| m)
+        );
+        assert!(
+            state
+                .workers
+                .iter()
+                .all(|w| w.get().unwrap().program.is_none())
+        );
+        drop(state);
+        assert_eq!(parked(), 2, "a refused worker leaves the clone parked");
+        let second = query(256 << 20);
+        let state = pool.install(|| {
+            RegexState::compile(Some(&second), pattern, "")
+                .unwrap()
+                .unwrap()
+        });
+        let before = second.memory_remaining();
+        assert!(
+            pool.broadcast(|_| state.is_match("charged-parked-3"))
+                .into_iter()
+                .all(|m| m)
+        );
+        assert_eq!(parked(), 0, "both workers took their clones back");
+        assert!(
+            before - second.memory_remaining() >= 2 * cache_bytes,
+            "each clone taken back is charged its cache bound"
+        );
+        drop(state);
+        assert_eq!(parked(), 2);
+    }
+
     /// A worker's clone serves only the thread that made it. A worker of another pool
     /// whose index is the same, and a thread outside Rayon, search with the locked cache.
     #[test]
