@@ -7436,9 +7436,117 @@
         ],
         "type": "object"
       },
+      "EvidenceIdentities": {
+        "additionalProperties": false,
+        "description": "Entities to resolve through a matching policy's current resolution map.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "entities": {
+            "description": "The entity IRIs to resolve.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "policy": {
+            "description": "The name of a matching policy of the evidence settings.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy",
+          "entities"
+        ],
+        "type": "object"
+      },
+      "EvidenceIdentitiesResult": {
+        "additionalProperties": false,
+        "description": "What the current resolution map selects for each entity.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "properties": {
+          "commit": {
+            "description": "The commit the map was read at.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entities": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "decisions": {
+                  "description": "The current accepted decisions that join the cluster.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "entity": {
+                  "type": "string"
+                },
+                "members": {
+                  "description": "The members of its cluster, sorted, at most 1,000.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "membersComplete": {
+                  "type": "boolean"
+                },
+                "representative": {
+                  "description": "The entity the map selects, the entity itself when the map does not name it.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "entity",
+                "representative",
+                "members",
+                "membersComplete",
+                "decisions"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "number": {
+            "description": "Its number, 0 before the first.",
+            "type": "integer"
+          },
+          "policy": {
+            "description": "The matching policy.",
+            "type": "string"
+          },
+          "revision": {
+            "description": "The latest resolution map revision, `null` before the first.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "policy",
+          "revision",
+          "number",
+          "commit",
+          "entities"
+        ],
+        "type": "object"
+      },
       "EvidenceProposal": {
         "additionalProperties": false,
-        "description": "One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input.",
+        "description": "One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-proposals"
         },
@@ -7552,7 +7660,7 @@
                 },
                 "target": {
                   "additionalProperties": false,
-                  "description": "A claim or assessment.",
+                  "description": "A claim, assessment or identity proposal.",
                   "maxProperties": 1,
                   "minProperties": 1,
                   "properties": {
@@ -7809,6 +7917,82 @@
             "minLength": 1,
             "type": "string"
           },
+          "identities": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "author": {
+                  "description": "The attributed proposer.",
+                  "type": "string"
+                },
+                "entities": {
+                  "description": "The exact entity IRIs, distinct, in any order.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "key": {
+                  "description": "The record's key in this batch.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "method": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "method": {
+                      "description": "The method's IRI.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "description": "The method's version.",
+                      "maxLength": 256,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "method",
+                    "version"
+                  ],
+                  "type": "object"
+                },
+                "occurrenceKey": {
+                  "description": "The proposal's key within its set of entities.",
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "preferredEntity": {
+                  "description": "For a possible match, the entity it prefers as its cluster's selected entity, one of `entities`.",
+                  "type": "string"
+                },
+                "relation": {
+                  "enum": [
+                    "possibleMatch",
+                    "distinctEntities"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "occurrenceKey",
+                "entities",
+                "relation",
+                "author"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "identityGraph": {
+            "description": "The identity graph of the batch's identity proposals, needed when the settings name more than one.",
+            "type": "string"
+          },
           "ifHead": {
             "description": "Publish only while this commit is the branch head, else `409 head-changed`.",
             "minimum": 0,
@@ -7861,7 +8045,7 @@
                 },
                 "target": {
                   "additionalProperties": false,
-                  "description": "A claim or assessment.",
+                  "description": "A claim, assessment or identity proposal.",
                   "maxProperties": 1,
                   "minProperties": 1,
                   "properties": {
@@ -8458,7 +8642,8 @@
                     "IdentityProposal",
                     "AcceptanceSupport",
                     "Withdrawal",
-                    "Projection"
+                    "Projection",
+                    "ResolutionMap"
                   ],
                   "type": "string"
                 },
@@ -8545,7 +8730,8 @@
                           "IdentityProposal",
                           "AcceptanceSupport",
                           "Withdrawal",
-                          "Projection"
+                          "Projection",
+                          "ResolutionMap"
                         ],
                         "type": "string"
                       },
@@ -8675,7 +8861,8 @@
                         "IdentityProposal",
                         "AcceptanceSupport",
                         "Withdrawal",
-                        "Projection"
+                        "Projection",
+                        "ResolutionMap"
                       ],
                       "type": "string"
                     },
@@ -8868,7 +9055,7 @@
                   "type": "string"
                 },
                 "target": {
-                  "description": "The reviewed claim or assessment.",
+                  "description": "The reviewed claim or assessment, or under a matching policy the reviewed identity proposal.",
                   "type": "string"
                 },
                 "targetDigest": {
@@ -8907,7 +9094,7 @@
             "type": "string"
           },
           "policy": {
-            "description": "The name of a review policy of the evidence settings.",
+            "description": "The name of a review policy or a matching policy of the evidence settings.",
             "type": "string"
           },
           "policyVersion": {
@@ -8937,7 +9124,7 @@
           },
           "changed": {
             "additionalProperties": false,
-            "description": "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
             "properties": {
               "inserted": {
                 "items": {
@@ -8959,6 +9146,63 @@
                   "type": "object"
                 },
                 "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
               },
               "removed": {
                 "items": {
@@ -9117,6 +9361,17 @@
             ],
             "type": "object"
           },
+          "mapRevision": {
+            "description": "The resolution map revision a review under a matching policy published, also for a replay.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "operation": {
             "description": "The operation, every decision's availability receipt.",
             "type": "string"
@@ -9163,6 +9418,51 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "matchingPolicies": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "boundary": {
+                  "description": "The identity, sourceRecords and proposals graphs whose records the policy's reviews may use. At least one is an identity graph.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "decisions": {
+                  "description": "The decisions graph the policy's reviews append to.",
+                  "type": "string"
+                },
+                "maps": {
+                  "description": "The identity graph that holds the policy's resolution map revisions.",
+                  "type": "string"
+                },
+                "output": {
+                  "description": "The projection graph that holds the current resolution map.",
+                  "type": "string"
+                },
+                "version": {
+                  "description": "Raised whenever the policy's meaning changes.",
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "version",
+                "boundary",
+                "decisions",
+                "maps",
+                "output"
+              ],
+              "type": "object"
+            },
+            "description": "Named matching policies of identity proposals. Their names are distinct from the review policies' names, and the two kinds together hold at most 64 policies.",
+            "maxProperties": 64,
+            "propertyNames": {
+              "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+            },
+            "type": "object"
           },
           "policies": {
             "additionalProperties": {
@@ -9231,7 +9531,7 @@
               ],
               "type": "object"
             },
-            "description": "Named review policies.",
+            "description": "Named review policies of claims and assessments.",
             "maxProperties": 64,
             "propertyNames": {
               "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
@@ -9403,7 +9703,7 @@
           },
           "changed": {
             "additionalProperties": false,
-            "description": "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "description": "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
             "properties": {
               "inserted": {
                 "items": {
@@ -9425,6 +9725,63 @@
                   "type": "object"
                 },
                 "type": "array"
+              },
+              "map": {
+                "additionalProperties": false,
+                "description": "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                "properties": {
+                  "decisionsAdded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "decisionsEnded": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "entities": {
+                    "description": "The entities whose selected entity changed.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "number": {
+                    "type": "integer"
+                  },
+                  "policy": {
+                    "description": "The matching policy.",
+                    "type": "string"
+                  },
+                  "previous": {
+                    "description": "The revision it follows, whose consumers may need review.",
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "revision": {
+                    "description": "The resolution map revision the operation published.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "policy",
+                  "revision",
+                  "number",
+                  "previous",
+                  "decisionsAdded",
+                  "decisionsEnded",
+                  "entities"
+                ],
+                "type": "object"
               },
               "removed": {
                 "items": {
@@ -47457,6 +47814,93 @@
         "x-sparkles-permission": "write"
       }
     },
+    "/{ds}/claims/identities": {
+      "post": {
+        "description": "Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-identities"
+        },
+        "operationId": "resolveIdentities",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceIdentities"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvidenceIdentitiesResult"
+                }
+              }
+            },
+            "description": "The map's revision and each entity's resolution."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Resolve entities through a resolution map",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/claims/resolve": {
       "post": {
         "description": "Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.",
@@ -47546,7 +47990,7 @@
     },
     "/{ds}/claims/review": {
       "post": {
-        "description": "Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.",
+        "description": "Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#evidence-reviews"
         },

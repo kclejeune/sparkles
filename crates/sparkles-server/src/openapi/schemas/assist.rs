@@ -32,11 +32,27 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "supports": graphs("Graphs of acceptance supports, which own projected triples."),
                     "identity": graphs("Graphs of identity proposals and resolution maps."),
                     "projections": graphs("Dedicated graphs of accepted projections, with no other role."),
+                    "matchingPolicies": {
+                        "type": "object",
+                        "maxProperties": 64,
+                        "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+                        "description": "Named matching policies of identity proposals. Their names are distinct from the review policies' names, and the two kinds together hold at most 64 policies.",
+                        "additionalProperties": closed(
+                            &["version", "boundary", "decisions", "maps", "output"],
+                            json!({
+                                "version": with_desc(json!({ "type": "integer", "minimum": 1 }), "Raised whenever the policy's meaning changes."),
+                                "boundary": graphs("The identity, sourceRecords and proposals graphs whose records the policy's reviews may use. At least one is an identity graph."),
+                                "decisions": with_desc(string(), "The decisions graph the policy's reviews append to."),
+                                "maps": with_desc(string(), "The identity graph that holds the policy's resolution map revisions."),
+                                "output": with_desc(string(), "The projection graph that holds the current resolution map."),
+                            }),
+                        ),
+                    },
                     "policies": {
                         "type": "object",
                         "maxProperties": 64,
                         "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
-                        "description": "Named review policies.",
+                        "description": "Named review policies of claims and assessments.",
                         "additionalProperties": closed(
                             &["version", "admittedKinds", "conflicts", "boundary", "decisions", "supports", "output"],
                             json!({
@@ -331,6 +347,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "idempotencyKey": key("Makes a retry with the same payload answer the first receipt. The operation IRI is derived from the dataset, the caller and the key."),
                     "sourceGraph": iri("The source-record graph, needed when the settings name more than one."),
                     "proposalGraph": iri("The proposal graph, needed when the settings name more than one."),
+                    "identityGraph": iri("The identity graph of the batch's identity proposals, needed when the settings name more than one."),
                     "message": with_desc(string(), "The commit message."),
                     "revisions": array(closed(
                         &["key", "source", "sourceKey", "content"],
@@ -422,7 +439,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                         json!({
                             "key": key("The record's key in this batch."),
                             "occurrenceKey": key("The link's key within its target."),
-                            "target": record_ref("A claim or assessment."),
+                            "target": record_ref("A claim, assessment or identity proposal."),
                             "evidence": record_ref("An evidence reference."),
                             "relation": string_enum(&["supports", "contradicts", "mentions"]),
                             "author": iri("Who made the judgment."),
@@ -433,7 +450,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                         json!({
                             "key": key("The record's key in this batch."),
                             "occurrenceKey": key("The assessment's key within its target."),
-                            "target": record_ref("A claim or assessment."),
+                            "target": record_ref("A claim, assessment or identity proposal."),
                             "conclusion": with_desc(string(), "An N-Triples term."),
                             "method": method(),
                             "configurationDigest": digest("The digest of the method's configuration."),
@@ -443,9 +460,21 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "scope": terms(),
                         }),
                     )),
+                    "identities": array(closed(
+                        &["key", "occurrenceKey", "entities", "relation", "author"],
+                        json!({
+                            "key": key("The record's key in this batch."),
+                            "occurrenceKey": key("The proposal's key within its set of entities."),
+                            "entities": with_desc(json!({ "type": "array", "items": string(), "minItems": 2, "maxItems": 64 }), "The exact entity IRIs, distinct, in any order."),
+                            "relation": string_enum(&["possibleMatch", "distinctEntities"]),
+                            "preferredEntity": iri("For a possible match, the entity it prefers as its cluster's selected entity, one of `entities`."),
+                            "author": iri("The attributed proposer."),
+                            "method": method(),
+                        }),
+                    )),
                 }),
             ),
-            "One batch of evidence records. At most 1,000 claims, 10,000 links and 16 MiB of decoded input.",
+            "One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input.",
             "evidence-proposals",
         ),
     );
@@ -526,9 +555,24 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "supportsEnded": array(string()),
                     "inserted": change(),
                     "removed": change(),
+                    "map": with_desc(
+                        closed(
+                            &["policy", "revision", "number", "previous", "decisionsAdded", "decisionsEnded", "entities"],
+                            json!({
+                                "policy": iri("The matching policy."),
+                                "revision": iri("The resolution map revision the operation published."),
+                                "number": int(),
+                                "previous": with_desc(or_null(string()), "The revision it follows, whose consumers may need review."),
+                                "decisionsAdded": array(string()),
+                                "decisionsEnded": array(string()),
+                                "entities": with_desc(array(string()), "The entities whose selected entity changed."),
+                            }),
+                        ),
+                        "A review under a matching policy that changed which accepted decisions its resolution map follows.",
+                    ),
                 }),
             ),
-            "The supports and projected triples the operation changed, for consumers that track dependent results. Empty for a replay.",
+            "The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay.",
         )
     };
     put(
@@ -537,7 +581,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             closed(
                 &["policy", "policyVersion", "ifHead", "decisions"],
                 json!({
-                    "policy": with_desc(string(), "The name of a review policy of the evidence settings."),
+                    "policy": with_desc(string(), "The name of a review policy or a matching policy of the evidence settings."),
                     "policyVersion": with_desc(int(), "The policy version the reviewer saw, else `409 policy-changed`."),
                     "ifHead": commit("The branch head the review was prepared at, else `409 head-changed`. Every read is made at this head."),
                     "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
@@ -547,7 +591,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                         &["key", "target", "targetDigest", "disposition"],
                         json!({
                             "key": key("The decision's key in this request."),
-                            "target": iri("The reviewed claim or assessment."),
+                            "target": iri("The reviewed claim or assessment, or under a matching policy the reviewed identity proposal."),
                             "targetDigest": digest("The target's record digest as the reviewer saw it, else `409 target-changed`."),
                             "disposition": string_enum(&["accepted", "rejected", "needsEvidence"]),
                             "supersedes": iri("The target's current decision under the policy, required when it has one, else `409 decision-superseded`."),
@@ -592,6 +636,7 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
                         }),
                     )),
                     "changed": changed(),
+                    "mapRevision": with_desc(or_null(string()), "The resolution map revision a review under a matching policy published, also for a replay."),
                     "dryRun": dry_run(),
                 }),
             ),
@@ -659,9 +704,49 @@ fn evidence(put: &mut dyn FnMut(&str, J)) {
             "evidence-reviews",
         ),
     );
+    put(
+        "EvidenceIdentities",
+        doc(
+            closed(
+                &["policy", "entities"],
+                json!({
+                    "policy": with_desc(string(), "The name of a matching policy of the evidence settings."),
+                    "entities": with_desc(json!({ "type": "array", "items": string(), "minItems": 1, "maxItems": 100 }), "The entity IRIs to resolve."),
+                }),
+            ),
+            "Entities to resolve through a matching policy's current resolution map.",
+            "evidence-identities",
+        ),
+    );
+    put(
+        "EvidenceIdentitiesResult",
+        doc(
+            closed(
+                &["policy", "revision", "number", "commit", "entities"],
+                json!({
+                    "policy": iri("The matching policy."),
+                    "revision": with_desc(or_null(string()), "The latest resolution map revision, `null` before the first."),
+                    "number": with_desc(int(), "Its number, 0 before the first."),
+                    "commit": commit("The commit the map was read at."),
+                    "entities": array(closed(
+                        &["entity", "representative", "members", "membersComplete", "decisions"],
+                        json!({
+                            "entity": string(),
+                            "representative": with_desc(string(), "The entity the map selects, the entity itself when the map does not name it."),
+                            "members": with_desc(array(string()), "The members of its cluster, sorted, at most 1,000."),
+                            "membersComplete": boolean(),
+                            "decisions": with_desc(array(string()), "The current accepted decisions that join the cluster."),
+                        }),
+                    )),
+                }),
+            ),
+            "What the current resolution map selects for each entity.",
+            "evidence-identities",
+        ),
+    );
 }
 
-const KINDS: [&str; 15] = [
+const KINDS: [&str; 16] = [
     "SourceRevision",
     "Rendition",
     "Passage",
@@ -677,6 +762,7 @@ const KINDS: [&str; 15] = [
     "AcceptanceSupport",
     "Withdrawal",
     "Projection",
+    "ResolutionMap",
 ];
 
 fn explaining(put: &mut dyn FnMut(&str, J)) {

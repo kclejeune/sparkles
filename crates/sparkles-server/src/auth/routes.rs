@@ -286,6 +286,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // review decisions, accepted projections and withdrawals (C25 §5 and §6)
     ("/{ds}/claims/review", &["POST"]),
     ("/{ds}/claims/withdraw", &["POST"]),
+    // resolution maps of identity reviews (C25 §6)
+    ("/{ds}/claims/identities", &["POST"]),
     // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
     ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
@@ -510,6 +512,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/claims/resolve"
+        | "/{ds}/claims/identities"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
@@ -649,6 +652,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/claims/resolve"
+        | "/{ds}/claims/identities"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"

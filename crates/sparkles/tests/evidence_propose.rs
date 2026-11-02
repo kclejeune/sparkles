@@ -189,6 +189,7 @@ fn batch(ds: &Dataset, fact_commit: u64) -> EvidenceInput {
             confidence: None,
             scope: Default::default(),
         }],
+        identities: Vec::new(),
     }
 }
 

@@ -97,8 +97,12 @@ pub use propose::{
     AuthorityFence, Options as ProposeOptions, Proposed, ProposedRecord, operation_recorded,
     propose, reconcile_operation_holds,
 };
+pub use review::identity::{
+    self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,
+    resolve as resolve_entities,
+};
 pub use review::{
-    Changed, Decided, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
+    Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
     WithdrawnClaim, review, withdraw,
 };
 pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
@@ -109,11 +113,13 @@ pub use sparkles_core::evidence::{
     RecordVersion, RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage,
     SourceMetadata, SourceRevisionInput, SourceTimes,
 };
+pub use sparkles_core::evidence::{MAX_IDENTITIES, MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES};
 
 // ------------------------------------------------------------ settings ------------
 
 pub use sparkles_core::evidence::{
-    CanonicalSettings, ClaimKind, ConflictMode, Policy, Settings, Sha256Digest,
+    CanonicalSettings, ClaimKind, ConflictMode, IdentityInput, IdentityRelation, MatchingPolicy,
+    Policy, RecordKind, Settings, Sha256Digest,
 };
 
 use crate::managed::{OwnerEntry, OwnerKind};
