@@ -1,0 +1,566 @@
+{
+ "checks": [
+  {
+   "detail": {
+    "classes": 51988,
+    "edges": 71353,
+    "extraEdges": 0,
+    "missingEdges": 0,
+    "nodeDifferences": 0,
+    "nodes": 51988,
+    "onlyOurs": 0,
+    "onlyReference": 0,
+    "unsatisfiable": 0,
+    "unsatisfiableDifferences": 0
+   },
+   "name": "go/t1/elk-agrees",
+   "ok": true
+  },
+  {
+   "detail": {
+    "classes": 51988,
+    "edges": 71353,
+    "extraEdges": 0,
+    "missingEdges": 0,
+    "nodeDifferences": 0,
+    "nodes": 51988,
+    "onlyOurs": 0,
+    "onlyReference": 0,
+    "unsatisfiable": 0,
+    "unsatisfiableDifferences": 0
+   },
+   "name": "go/t8/elk-agrees",
+   "ok": true
+  },
+  {
+   "detail": {
+    "classes": 238152,
+    "edges": 315603,
+    "extraEdges": 0,
+    "missingEdges": 0,
+    "nodeDifferences": 0,
+    "nodes": 238152,
+    "onlyOurs": 0,
+    "onlyReference": 0,
+    "unsatisfiable": 0,
+    "unsatisfiableDifferences": 0
+   },
+   "name": "chebi_lite/t1/elk-agrees",
+   "ok": true
+  },
+  {
+   "detail": {
+    "classes": 238152,
+    "edges": 315603,
+    "extraEdges": 0,
+    "missingEdges": 0,
+    "nodeDifferences": 0,
+    "nodes": 238152,
+    "onlyOurs": 0,
+    "onlyReference": 0,
+    "unsatisfiable": 0,
+    "unsatisfiableDifferences": 0
+   },
+   "name": "chebi_lite/t8/elk-agrees",
+   "ok": true
+  },
+  {
+   "detail": "1 distinct taxonomy hash(es)",
+   "name": "chebi_lite.elk/taxonomy-identical-across-threads",
+   "ok": true
+  },
+  {
+   "detail": "1 distinct taxonomy hash(es)",
+   "name": "chebi_lite.sparkles/taxonomy-identical-across-threads",
+   "ok": true
+  },
+  {
+   "detail": "1 distinct taxonomy hash(es)",
+   "name": "go.elk/taxonomy-identical-across-threads",
+   "ok": true
+  },
+  {
+   "detail": "1 distinct taxonomy hash(es)",
+   "name": "go.sparkles/taxonomy-identical-across-threads",
+   "ok": true
+  }
+ ],
+ "host": {
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "kernel": "7.2.9",
+  "name": "forge",
+  "ram_mib": 15620
+ },
+ "kind": "measurement",
+ "manifest": {
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "binary_sha256": "0bba3629a057ea5077a9ac61a3d4dd711d239504aa1ff4008e292bd5f988458d",
+  "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to the benchmark host",
+  "commit": "aa0a41a6",
+  "data": {
+   "chebi_lite": {
+    "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+   },
+   "go": {
+    "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+   }
+  },
+  "ended": "2026-11-02T20:50:54Z",
+  "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Another lane's benchmark jobs ran between the processes and never beside them.",
+  "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224\u2026, pins.tsv sha256 4d470f93\u2026), Temurin 17.0.20+8",
+  "started": "2026-11-02T17:11:55Z"
+ },
+ "method": "One process per tool, ontology and thread count, each run five times. el_classify's classifyMs holds each classification by a fresh classifier with the axioms in memory, and readMs the parse of the file. ElkClassify's loadMs holds each OWL API load and classifyMs the time from the creation of the reasoner to the end of precomputeInferences, with a fresh OWL API manager and reasoner each run. peakRssKib is each process's peak resident memory, and retainedHeapMib ELK's live heap after a full collection with the reasoner open. The oracle files compare each ELK taxonomy with the classifier's of the same thread count.",
+ "results": [
+  {
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 577.494046,
+   "classifyMs": [
+    620.511597,
+    571.516531,
+    580.114167,
+    577.494046,
+    577.354557
+   ],
+   "conclusions": 2802242,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 121202815,
+   "indexMs": 163.93694200000002,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "ontology": "go",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 358784,
+   "peakRssKibAfterRead": 79060,
+   "readMs": 103.166017,
+   "saturationMs": 281.676103,
+   "taxonomyMs": 90.238817,
+   "threads": 1,
+   "tool": "sparkles",
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 135031,
+   "classes": 51986,
+   "classifyMedianMs": 353.834429,
+   "classifyMs": [
+    397.633083,
+    353.834429,
+    349.128684,
+    348.60882799999996,
+    361.515146
+   ],
+   "conclusions": 2802242,
+   "consistent": true,
+   "contexts": 51987,
+   "estimatedBytes": 121202815,
+   "indexMs": 160.835812,
+   "input": "data/go.ofn",
+   "nodes": 51988,
+   "ontology": "go",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 371672,
+   "peakRssKibAfterRead": 79132,
+   "readMs": 105.476903,
+   "saturationMs": 63.455124000000005,
+   "taxonomyMs": 93.942566,
+   "threads": 8,
+   "tool": "sparkles",
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 4022.586414,
+   "classifyMs": [
+    4159.065490999999,
+    3659.39957,
+    3695.512337,
+    4026.286635,
+    4022.586414
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 687989114,
+   "indexMs": 1022.738119,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "ontology": "chebi_lite",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 1436760,
+   "peakRssKibAfterRead": 275624,
+   "readMs": 453.14411,
+   "saturationMs": 1833.226922,
+   "taxonomyMs": 917.061647,
+   "threads": 1,
+   "tool": "sparkles",
+   "unsatisfiable": 0
+  },
+  {
+   "axioms": 647721,
+   "classes": 238150,
+   "classifyMedianMs": 2966.6983609999997,
+   "classifyMs": [
+    3109.2903610000003,
+    2966.6983609999997,
+    2969.265611,
+    2753.013278,
+    2926.6837809999997
+   ],
+   "conclusions": 26995717,
+   "consistent": true,
+   "contexts": 238151,
+   "estimatedBytes": 687989114,
+   "indexMs": 1020.952004,
+   "input": "data/chebi_lite.ofn",
+   "nodes": 238152,
+   "ontology": "chebi_lite",
+   "outside": 1,
+   "partial": {},
+   "peakRssKib": 1682480,
+   "peakRssKibAfterRead": 275528,
+   "readMs": 445.209884,
+   "saturationMs": 830.545994,
+   "taxonomyMs": 822.138763,
+   "threads": 8,
+   "tool": "sparkles",
+   "unsatisfiable": 0
+  },
+  {
+   "classes": 51986,
+   "classifyCpuMs": [
+    8090.0,
+    2250.0,
+    1900.0,
+    1360.0,
+    1280.0
+   ],
+   "classifyMs": [
+    1674.5,
+    1210.3,
+    1193.5,
+    1321.8,
+    1175.6
+   ],
+   "consistent": true,
+   "heap": "4g",
+   "input": "data/go.ofn",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20",
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "loadMs": [
+    1210.7,
+    848.2,
+    758.5,
+    732.2,
+    720.8
+   ],
+   "logicalAxioms": 82950,
+   "maxHeapMib": 4096,
+   "medianClassifyMs": 1210.3,
+   "medianLoadAndClassifyMs": 2054.0,
+   "medianLoadMs": 758.5,
+   "ontology": "go",
+   "peakRssKib": 2507584,
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "retainedHeapMib": [
+    142.2,
+    152.0,
+    151.2,
+    150.2,
+    150.2
+   ],
+   "threads": 1,
+   "tool": "elk",
+   "unsatisfiable": 0
+  },
+  {
+   "classes": 51986,
+   "classifyCpuMs": [
+    11410.0,
+    3930.0,
+    2510.0,
+    2450.0,
+    2280.0
+   ],
+   "classifyMs": [
+    1060.7,
+    686.2,
+    514.0,
+    553.4,
+    518.6
+   ],
+   "consistent": true,
+   "heap": "4g",
+   "input": "data/go.ofn",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20",
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "loadMs": [
+    1138.6,
+    888.2,
+    741.1,
+    728.0,
+    729.6
+   ],
+   "logicalAxioms": 82950,
+   "maxHeapMib": 4096,
+   "medianClassifyMs": 553.4,
+   "medianLoadAndClassifyMs": 1281.4,
+   "medianLoadMs": 741.1,
+   "ontology": "go",
+   "peakRssKib": 2487804,
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "retainedHeapMib": [
+    141.8,
+    152.1,
+    150.2,
+    150.0,
+    149.9
+   ],
+   "threads": 8,
+   "tool": "elk",
+   "unsatisfiable": 0
+  },
+  {
+   "classes": 238150,
+   "classifyCpuMs": [
+    13610.0,
+    10130.0,
+    10690.0,
+    10480.0,
+    10490.0
+   ],
+   "classifyMs": [
+    7202.2,
+    6422.5,
+    6484.9,
+    6713.3,
+    6694.2
+   ],
+   "consistent": true,
+   "heap": "4g",
+   "input": "data/chebi_lite.ofn",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20",
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "loadMs": [
+    3310.3,
+    3548.5,
+    3635.5,
+    3615.5,
+    3550.9
+   ],
+   "logicalAxioms": 409525,
+   "maxHeapMib": 4096,
+   "medianClassifyMs": 6694.2,
+   "medianLoadAndClassifyMs": 10245.0,
+   "medianLoadMs": 3550.9,
+   "ontology": "chebi_lite",
+   "peakRssKib": 4519848,
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "retainedHeapMib": [
+    648.8,
+    687.7,
+    686.5,
+    687.6,
+    688.0
+   ],
+   "threads": 1,
+   "tool": "elk",
+   "unsatisfiable": 0
+  },
+  {
+   "classes": 238150,
+   "classifyCpuMs": [
+    20410.0,
+    16310.0,
+    14270.0,
+    14040.0,
+    14410.0
+   ],
+   "classifyMs": [
+    2969.3,
+    2672.3,
+    2547.8,
+    2461.7,
+    2501.1
+   ],
+   "consistent": true,
+   "heap": "4g",
+   "input": "data/chebi_lite.ofn",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20",
+   "jvmArgs": [
+    "-Xms4g",
+    "-Xmx4g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "loadMs": [
+    3357.3,
+    3549.0,
+    3590.0,
+    3597.2,
+    3496.9
+   ],
+   "logicalAxioms": 409525,
+   "maxHeapMib": 4096,
+   "medianClassifyMs": 2547.8,
+   "medianLoadAndClassifyMs": 6137.8,
+   "medianLoadMs": 3549.0,
+   "ontology": "chebi_lite",
+   "peakRssKib": 4473500,
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "retainedHeapMib": [
+    648.3,
+    688.7,
+    688.5,
+    688.0,
+    688.9
+   ],
+   "threads": 8,
+   "tool": "elk",
+   "unsatisfiable": 0
+  },
+  {
+   "classes": 51986,
+   "classifyCpuMs": [
+    10940.0,
+    3140.0,
+    3240.0,
+    2710.0,
+    2930.0
+   ],
+   "classifyMs": [
+    1053.0,
+    539.1,
+    561.9,
+    514.5,
+    511.9
+   ],
+   "consistent": true,
+   "heap": "1g",
+   "input": "data/go.ofn",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20",
+   "jvmArgs": [
+    "-Xms1g",
+    "-Xmx1g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "loadMs": [
+    1260.4,
+    830.6,
+    749.8,
+    726.9,
+    728.4
+   ],
+   "logicalAxioms": 82950,
+   "maxHeapMib": 1024,
+   "medianClassifyMs": 539.1,
+   "medianLoadAndClassifyMs": 1311.7,
+   "medianLoadMs": 749.8,
+   "ontology": "go",
+   "peakRssKib": 1301948,
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "retainedHeapMib": [
+    147.2,
+    157.3,
+    156.8,
+    156.5,
+    156.4
+   ],
+   "threads": 8,
+   "tool": "elk",
+   "unsatisfiable": 0
+  },
+  {
+   "classes": 238150,
+   "classifyCpuMs": [
+    22540.0,
+    17310.0,
+    17130.0,
+    20550.0,
+    16900.0
+   ],
+   "classifyMs": [
+    2998.1,
+    2792.2,
+    3014.7,
+    3126.2,
+    2685.2
+   ],
+   "consistent": true,
+   "heap": "2g",
+   "input": "data/chebi_lite.ofn",
+   "java": "OpenJDK 64-Bit Server VM 17.0.20",
+   "jvmArgs": [
+    "-Xms2g",
+    "-Xmx2g",
+    "-XX:+UseG1GC",
+    "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
+    "-Dorg.slf4j.simpleLogger.log.org.semanticweb.elk.reasoner.completeness=info"
+   ],
+   "loadMs": [
+    3743.6,
+    3669.4,
+    3504.3,
+    3492.5,
+    3445.1
+   ],
+   "logicalAxioms": 409525,
+   "maxHeapMib": 2048,
+   "medianClassifyMs": 2998.1,
+   "medianLoadAndClassifyMs": 6519.1,
+   "medianLoadMs": 3504.3,
+   "ontology": "chebi_lite",
+   "peakRssKib": 2484436,
+   "reasoner": "ELK 0.6.0.2024-05-24T16:54:10Z",
+   "retainedHeapMib": [
+    626.4,
+    667.8,
+    667.6,
+    668.2,
+    667.9
+   ],
+   "threads": 8,
+   "tool": "elk",
+   "unsatisfiable": 0
+  }
+ ],
+ "scale": "GO 2026-07-26 and ChEBI lite 256",
+ "settings": {
+  "elk_heap": "4g for -Xms and -Xmx, with 1g for GO and 2g for ChEBI lite in the smaller-heap runs on eight threads",
+  "gc": "G1",
+  "repeat": 5,
+  "threads": [
+   1,
+   8
+  ]
+ },
+ "suite": "el-classification"
+}

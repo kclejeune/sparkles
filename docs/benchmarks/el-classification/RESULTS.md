@@ -7,28 +7,85 @@ This report is a manual import of the retained run records. Read the
 
 <a id="agreement"></a>
 
-The classifier's direct hierarchy of the Gene Ontology release of 2026-07-26 is the
+The classifier's taxonomies equal ELK 0.6.0's on the Gene Ontology, ChEBI lite and all
+298 ontologies of the ORE 2015 EL classification sample. `scripts/el-oracle.py`
+compared each pair over the same classes and found no class whose node differs, no
+difference in the unsatisfiable classes and no missing or extra direct edge. The ORE
+ontologies hold 11,183,153 classes and 13,144,288 direct edges in all, and the largest
+has 981,153 classes. ELK and the classifier both find `ore_ont_6720` inconsistent, and
+both find the same 13, 1 and 18 unsatisfiable classes in `ore_ont_1325`, `ore_ont_2497`
+and `ore_ont_7868`.
+
+No difference needed an explanation, including on the ontologies that use axioms
+outside the calculus. The classifier reported axioms used in part in 18 ORE ontologies,
+and ELK reported possible incompleteness in 31, from object property ranges, nominals,
+`ObjectHasValue`, property assertions and data property axioms. Thirteen ontologies are
+in both groups. The taxonomies agree on these ontologies too, so the axioms that each
+reasoner leaves out or uses in part do not separate the two on this sample. GO and ChEBI
+lite each have one `InverseObjectProperties` axiom, which both reasoners leave out and
+report. The classifier's taxonomy is the same on one and eight threads.
+
+<a id="complete-reasoner"></a>
+
+HermiT 1.4.5.519, a complete OWL 2 DL reasoner, checked the 36 ORE ontologies where
+either EL reasoner reports axioms it uses in part or possible incompleteness. Its
+taxonomy equals the classifier's and ELK's on all 36, so neither EL reasoner misses a
+subsumption or an unsatisfiable class there. Four small test ontologies show the
+entailments that both EL reasoners miss when a property's range meets an individual.
+HermiT derives a subsumption through a range on an asserted property and one through a
+range reached by `ObjectHasValue`, and it finds an individual in two disjoint ranges
+inconsistent. ELK and the classifier miss all three, and the classifier reports the
+axioms involved as used in part. A fourth ontology, where one range clashes with a class
+assertion, is inconsistent for all three reasoners. The tests in
+`crates/sparkles-owl/tests/classify.rs` hold these cases as known gaps of roadmap item
+587.
+
+The classifier's direct hierarchy of the Gene Ontology release of 2026-07-26 is also the
 hierarchy that the release asserts, which GO's pipeline computes with ELK. Both sides
 have 57,456 direct subsumptions between named classes, and none is missing or extra.
 For the ChEBI lite release 256, every one of the 300,224 asserted subsumptions between
 named classes is entailed, and every one of the classifier's 296,173 direct
 subsumptions is asserted. ChEBI asserts some edges that other edges imply, so the
-classifier's direct hierarchy is the transitive reduction of the asserted one. Neither
-ontology has an unsatisfiable class. Each has one axiom outside OWL 2 EL, an
-`InverseObjectProperties` axiom, which the classifier leaves out and reports, as ELK
-also ignores inverse properties. The taxonomy is the same on one, four and eight
-threads. `scripts/el-oracle.py --asserted` made both comparisons.
+classifier's direct hierarchy is the transitive reduction of the asserted one.
+`scripts/el-oracle.py --asserted` made both of these comparisons.
 
-All 298 ontologies of the ORE 2015 EL classification sample classify, with taxonomies
-that do not change between the builds of the record below and the build with the
-review fixes. One of them is inconsistent, four have unsatisfiable classes and 18 have
-axioms the classifier uses only in part. Each classifies within 21 s on four threads of
-a loaded laptop, the largest having 981,151 classes, which is a completion check and
-not a timing.
-
-The classifier has not been compared with ELK itself on these ontologies, and its time
-and memory have not been measured against ELK's. Roadmap item 591 covers both.
 SNOMED CT is not available to the project and was not used.
+
+## Against ELK
+
+<a id="against-elk"></a>
+
+ELK 0.6.0 and the classifier of commit aa0a41a6 ran on forge, the benchmark host, one
+process at a time under the bench lock. Each process ran five classifications. Times are
+the median of the five in ms. ELK's classification excludes the OWL API's load of the
+file, which the load column gives, and its first run, which includes the compilation of
+the JVM's hot code, is listed apart. The classifier's read is its single parse of the same
+file in each process, so it is one measurement and not a median.
+Peak memory is each process's peak resident set in MiB, which for the classifier
+includes the axioms read and for ELK the OWL API ontology. ELK ran with a 4 GiB heap,
+and its live heap is the heap in use after a full collection with the reasoner open.
+
+| Ontology | Threads | Classifier | Read | Peak RSS | ELK | ELK first run | OWL API load | ELK with load | ELK peak RSS | ELK live heap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| GO 2026-07-26 | 1 | 577 | 103 | 350 | 1,210 | 1,674 | 758 | 2,054 | 2,449 | 150 |
+| | 8 | 354 | 105 | 363 | 553 | 1,061 | 741 | 1,281 | 2,429 | 150 |
+| ChEBI lite 256 | 1 | 4,023 | 453 | 1,403 | 6,694 | 7,202 | 3,551 | 10,245 | 4,414 | 688 |
+| | 8 | 2,967 | 445 | 1,643 | 2,548 | 2,969 | 3,549 | 6,138 | 4,369 | 688 |
+
+The classifier classifies GO 2.1 times as fast as ELK on one thread and 1.6 times as fast
+on eight, and ChEBI lite 1.7 times as fast on one thread. On eight threads ELK classifies
+ChEBI lite in 2,548 ms against the classifier's 2,967, so ELK is 1.16 times as fast. The
+classifier's saturation scales as ELK's does, but its indexing and its taxonomy, about
+1.8 s of the 3 s, run on one thread, which roadmap item 592 follows. With the reading of
+the file counted on both sides, the classifier takes 459 ms on GO and 3.4 s on ChEBI
+lite on eight threads, against ELK's 1.3 s and 6.1 s.
+
+ELK's resident memory follows its heap setting. With a 1 GiB heap for GO and 2 GiB for
+ChEBI lite on eight threads, ELK classified in 539 ms and 3.0 s at peak resident sets of
+1,271 MiB and 2,426 MiB. The classifier's peak is 363 MiB on GO and 1,643 MiB on ChEBI
+lite, which includes its own copy of the axioms, as the section below describes. Both
+reasoners give the same taxonomy on one and eight threads, and the ELK taxonomies of the
+run agree with the classifier's.
 
 ## Classification time and memory
 
@@ -86,3 +143,10 @@ The [run record](runs/2026-11-02-go-chebi-forge-8e73284a/record.json) holds the 
 the binary and data hashes, the settings, every classification time, the taxonomy
 hashes and the agreement checks. Its directory keeps the raw metrics, the environment
 and the script that ran.
+
+The [ELK run record](runs/2026-11-02-elk-forge-aa0a41a6/record.json) holds the same for
+the comparison with ELK on forge, with both tools' output lines, ELK's warnings and the
+oracle's reports. The [ORE agreement record](runs/2026-11-02-ore-elk-agreement-aa0a41a6/record.json)
+and the [HermiT agreement record](runs/2026-11-02-hermit-agreement-aa0a41a6/record.json)
+hold the comparisons on the ORE 2015 sample and the range test ontologies. Their times
+come from a loaded laptop and are not measurements.

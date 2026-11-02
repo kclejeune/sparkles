@@ -1,0 +1,143 @@
+{
+ "ore_ont_10242": [
+  "ObjectOneOf"
+ ],
+ "ore_ont_1034": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_10413": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_10749": [
+  "ObjectOneOf"
+ ],
+ "ore_ont_10833": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_11526": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_11866": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_11978": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_13035": [
+  "ObjectOneOf"
+ ],
+ "ore_ont_13066": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_13621": [
+  "ObjectOneOf"
+ ],
+ "ore_ont_13772": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_14273": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_1481": [
+  "ObjectOneOf"
+ ],
+ "ore_ont_1555": [
+  "DataProperty",
+  "DataPropertyAssertion",
+  "DataPropertyDomain",
+  "DataPropertyRange"
+ ],
+ "ore_ont_16777": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_1793": [
+  "DataProperty",
+  "DataPropertyDomain",
+  "DataPropertyRange",
+  "SubDataPropertyOf"
+ ],
+ "ore_ont_2195": [
+  "DataProperty",
+  "DataPropertyDomain",
+  "DataPropertyRange",
+  "FunctionalDataProperty"
+ ],
+ "ore_ont_2228": [
+  "DataProperty",
+  "DataPropertyRange"
+ ],
+ "ore_ont_2237": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_2453": [
+  "ObjectOneOf"
+ ],
+ "ore_ont_2557": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_3259": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_338": [
+  "DataProperty",
+  "DataPropertyRange"
+ ],
+ "ore_ont_3770": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_5164": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_6024": [
+  "DataProperty",
+  "DataPropertyRange"
+ ],
+ "ore_ont_6226": [
+  "ObjectOneOf"
+ ],
+ "ore_ont_7418": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_8462": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ],
+ "ore_ont_8730": [
+  "ObjectHasValue",
+  "ObjectPropertyAssertion",
+  "ObjectPropertyRange"
+ ]
+}

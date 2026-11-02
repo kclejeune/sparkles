@@ -272,6 +272,7 @@ const ADMIN_BRANCH_ROUTES: &[&str] = &[
     "schema",
     "graph",
     "forms",
+    "ontology",
     "reason",
     "validation",
     "prefixes",

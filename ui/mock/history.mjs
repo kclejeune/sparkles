@@ -28,6 +28,9 @@ export function recordState(ds, commit) {
   );
 }
 
+/** The state right after `commit` as N-Quads lines, with the store's blank-node labels. */
+export const stateLines = (commit) => statesOf.get(commit);
+
 const pinned = (ds, seq) => [...snaps(ds)].filter(([, s]) => s.seq === seq).map(([n]) => n);
 
 /** Whether a read can see the state after `c`. An in-memory dataset keeps only pinned ones. */

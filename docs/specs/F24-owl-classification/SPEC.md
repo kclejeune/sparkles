@@ -59,8 +59,9 @@ representation.
 
 ## Non-goals
 
-* A native tableau reasoner for OWL 2 DL. DL reasoning goes through the external
-  bridge.
+* A native reasoner for OWL 2 DL in the phases above. DL reasoning goes through the
+  external bridge until roadmap item 603 adds native DL classification on top of the EL
+  classifier.
 
 ## Design constraints
 
@@ -164,18 +165,30 @@ GO's pipeline computes with ELK and reduces, with 57,456 direct subsumptions on 
 side and no difference. On ChEBI lite (release 256, 238,150 classes) every asserted
 subsumption between named classes is entailed and every direct subsumption the
 classifier gives is asserted. `scripts/el-oracle.py --asserted` makes these
-comparisons. All 298 ontologies of the ORE 2015 EL classification sample classify.
-ELK itself has not been run beside the classifier, so a comparison with ELK 0.4.3 on
-GO, ChEBI and the ORE sample, and the measurements against ELK, remain in roadmap item
-591. SNOMED CT is not available to the project and was not used.
+comparisons. ELK 0.6.0, run through the OWL API by `scripts/elk-compare/elk.sh`, gives
+the same taxonomy as the classifier on GO, ChEBI lite and all 298 ontologies of the ORE
+2015 EL classification sample, with the same unsatisfiable classes and the same
+inconsistent ontology. `scripts/el-oracle.py` found no difference to explain, including
+on the 18 ORE ontologies with axioms the classifier uses in part and the 31 where ELK
+reports possible incompleteness. HermiT 1.4.5.519, a complete OWL 2 DL reasoner, gives
+the same taxonomy on the 36 ORE ontologies where either EL reasoner uses axioms in part.
+Four test ontologies show what both EL reasoners miss when a property's range meets an
+individual, two subsumptions and an inconsistency, which the classifier reports as axioms
+used in part and item 587 covers. SNOMED CT is not available to the project and was not
+used, so the acceptance gate's SNOMED CT comparison remains open.
 
 **Measurements.** On forge, GO classifies in 410 ms and ChEBI lite in 2.97 s on four
 threads, at peak resident sets of 438 MiB and 1.66 GiB that include the axioms read.
 Saturation scales with the threads, and indexing and the taxonomy, which run on one
 thread, take most of the time from four threads on. Keeping each worker's activations
 on a stack of its own instead of a shared queue took ChEBI on eight threads from 6.0 s
-to 2.8 s. The [benchmark report](../../benchmarks/el-classification/RESULTS.md) has the
-numbers and the records.
+to 2.8 s. Beside ELK 0.6.0 on forge, the classifier classifies GO in 354 ms against
+ELK's 553 ms on eight threads, and ChEBI lite in 4.0 s against 6.7 s on one thread. ELK is
+1.16 times as fast on ChEBI lite on eight threads, 2.5 s against 3.0 s, because the
+classifier's indexing and taxonomy stages run on one thread. With the OWL API's load
+counted, ELK takes 1.3 s and 6.1 s on eight threads. The classifier's peak resident set is
+363 MiB and 1.6 GiB, and ELK's is 2.4 GiB and 4.3 GiB with a 4 GiB heap. The [benchmark
+report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the records.
 
 **Testing.** Tests in `crates/sparkles-owl/tests/classify.rs` cover worked examples of
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
@@ -191,6 +204,6 @@ taxonomy.
 individuals and datatypes is item 587. Reads that answer from the classification
 and DL Query are item 588. Durable and automatic classification is item
 589, after item 339. A kept classification with assertions is item 590,
-the comparison and measurements against ELK are item 591, and a classifier that
+the comparison and measurements against ELK were item 591, and a classifier that
 shares the ontology's axioms and builds its index and taxonomy in parallel is item
 592.

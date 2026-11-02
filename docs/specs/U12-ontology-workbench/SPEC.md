@@ -1,6 +1,7 @@
 # U12: Ontology workbench
 
-> **Status:** planned.
+> **Status:** partially complete. The ontology editor phase is built, and the SKOS editor,
+> the DL Query tab and the editable schema diagram are planned.
 >
 > **Roadmap:** [item 457](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -60,4 +61,105 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 457](../../ROADMAP.md) tracks the work.
+### Ontology editor
+
+The ontology editor phase is built as the UI's **Ontology** page, `/ui/ontology`. It reads
+and edits one graph of a dataset, the default graph unless the caller picks another, with
+the graphs that graph imports. Every read and write goes through the `/$/ontology/{ds}`
+routes of [F21](../F21-ontology-api.md#outcome), with the caller's grants, and through
+`/{ds}/update` for renames and header edits.
+
+**Trees.** The page has trees of classes, object properties, data properties,
+annotation properties and individuals. Each tree shows the asserted hierarchy from the
+`SubClassOf`, `SubObjectPropertyOf`, `SubDataPropertyOf` and `SubAnnotationPropertyOf`
+axioms, and the individuals are listed with their asserted classes beside each name. Entities are named by
+their `rdfs:label` or `skos:prefLabel` in the browser's language, with the prefixed name
+beside a label. A filter keeps the matching entities and their ancestors. A cycle in the
+asserted hierarchy is drawn once and not followed. The trees read every entity and
+hierarchy axiom of the graph in pages of 10,000, up to 50,000 of each, so very large
+ontologies load slowly and a lazy hierarchy route remains a follow-up.
+
+**Inferred tree.** The **Inferred** switch shows the class taxonomy of the EL classifier
+of [F24](../F24-owl-classification/README.md) beside the asserted tree. Its nodes are the
+classifier's equivalence classes, so equivalent classes share a node, and the
+unsatisfiable classes sit under `owl:Nothing`. Property and individual trees show the
+asserted hierarchy only.
+
+**Frame.** Selecting an entity opens its frame. The frame lists the entity's annotations,
+its characteristics as checkboxes for properties, and its axioms in sections such as
+SubClass Of, Equivalent To, Disjoint With, Domains, Ranges, Inverse Of, Types and the
+property assertions of an individual. Class expressions are rendered in Manchester
+syntax with labels. Each axiom row shows its annotations and can be removed. An add
+field per section takes an entity name, an IRI or a class expression in functional-style
+syntax with the dataset's prefixes. Axioms that fit no section are listed last.
+
+**Annotations.** The annotation editor adds, changes and removes annotations of an entity
+or of one axiom. A value is text with a BCP 47 language tag or a datatype, or an IRI. An
+annotation of an axiom is written as an annotated axiom, so the edit removes the plain
+axiom and adds it with its annotations in one commit.
+
+**Header.** The header tab edits the ontology IRI, the version IRI, the imports and the
+header's annotations, and shows the graph's axiom counts by type and the read's
+diagnostics. Header edits are `DELETE DATA` and `INSERT DATA` updates with their exact
+inverse.
+
+**Usage.** The usage tab lists every axiom that mentions the entity, grouped by axiom
+type, including the assertions about it.
+
+**Create, rename and delete.** **New** creates an entity of the tree's kind with its
+declaration and label, under the selected entity when there is one. Its IRI is minted by
+the IRI policy, which takes a namespace and builds the local name from the label, from a
+UUID or from a prefix and a zero-padded number. The policy is kept in the browser per
+dataset. The dialog refuses an IRI the graph already uses. Rename replaces an IRI in every
+triple of the graph through a SPARQL update that renames nothing when the new IRI is
+already in use. Delete removes the entity's declarations, its axioms and the assertions
+about it through `DELETE /$/ontology/{ds}/entity`.
+
+**Previews and sessions.** Every edit opens a preview that runs it as a dry run with
+`If-Match` naming the commit the page shows. The preview lists the axioms the edit adds
+and removes, the triples it changes and the write's outcome, and **Commit** writes it
+with the same precondition, so a commit by another writer in between refuses the edit
+with `412` and the page reloads. **Start session** creates a branch named
+`onto.<user>.<date>` from the current branch and edits there, and the Merge link opens the
+branch's merge page. A protected branch, or a caller without write access, makes the page
+read-only.
+
+**Undo.** The page keeps an undo stack of its commits for the browser session. An undo
+reverts the commit through `POST /$/revert/{ds}`, a three-way merge that restores exactly
+the triples and blank nodes the commit changed, and a redo reverts that revert. Undo and
+redo are previewed with a dry run that expects the head the page shows, so another
+writer's commit in between refuses them, and a later commit that changed the same triples
+makes the revert conflict. Ctrl+Z and Ctrl+Shift+Z run them. A revert needs write access
+to the whole branch, so a caller whose grants cover only some graphs can edit but not
+undo. A first version built each commit's inverse from the axioms the edit answer lists.
+That inverse also removed the part of an n-ary axiom that was present before the edit and
+gave a restored restriction a new blank node when another axiom shared the old one, so
+undo uses reverts.
+
+**Live refresh.** The page follows `GET /{ds}/changes` for the branch it edits. A commit
+by another writer reloads the trees and the frame and shows a notice with the commit
+number.
+
+The server gained what the editor needs. The ontology routes take `?branch=` and the
+`/{ds}@{branch}` form, and `DELETE /$/ontology/{ds}/entity` removes an entity with
+preview, precondition and receipt. Edits accept axioms in functional-style syntax, and an
+edit's answer lists the axioms it added and removed, up to 10,000 of each. The server
+tests check that an edit and its inverse leave unrelated triples unchanged, and the
+real-server Playwright test checks that an undo on a branch leaves its triple count as it
+was. The UI's unit tests cover the tree, frame, Manchester rendering, IRI minting,
+rename and undo logic. Playwright covers each view, the edits on a session branch, undo
+and redo, the refusal of a stale edit and the refresh after another writer's commit
+against the mock backend, and the trees, the inferred tree, edits on a branch and the
+unchanged main branch against a real server.
+
+The editor reuses neither the shape-driven forms of U02 nor their field editors. Its
+annotation and axiom editors are its own components, so editing an entity's terms
+through a form remains for later. Manchester syntax is rendered but not parsed, so class
+expressions are typed in functional-style syntax. Rename covers the one graph the page
+reads and does not reach IRIs inside triple terms. Real-time co-editing stays with the
+U05 §1 open question. The page decides whether the caller can write from its level on
+the dataset, so write grants on a branch alone leave the page read-only, roadmap item
+611. Roadmap item 607 covers a lazy hierarchy route for large
+ontologies, 608 Manchester input of class expressions, 609 inferred
+property trees and 610 an IRI policy kept on the server with the resource catalog
+of [C30](../C30-resource-catalog/README.md).

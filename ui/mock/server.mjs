@@ -50,6 +50,7 @@ import { handleProjection } from './projection.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { WORLD, worldTurtle } from './world.mjs';
 import { handleForms } from './forms.mjs';
+import { handleOntology, UNI_PREFIXES, UNI_TURTLE } from './ontology.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
@@ -234,6 +235,12 @@ function seedHistory(ds) {
   world.baseQuads = world.store.size;
   addCommit(world, 'upload', world.store.size, 0, { bulk: true });
   seedVectors(datasets);
+  // the ontology editor's university ontology (mock/ontology.mjs)
+  const uni = makeDataset('uni', 'persistent');
+  uni.prefixes = { ...UNI_PREFIXES };
+  uni.store.load(UNI_TURTLE, { format: 'text/turtle' });
+  uni.baseQuads = uni.store.size;
+  addCommit(uni, 'upload', uni.store.size, 0, { bulk: true });
   // a branch of foaf two commits ahead of main
   const dev = createBranch(foaf, { name: 'dev', note: 'schema migration' }).branch;
   for (const u of [
@@ -2423,6 +2430,20 @@ const server = http.createServer(async (req, res) => {
         fail,
         readBody,
         sparklesResult,
+      })
+    )
+      return;
+    // the ontology editor's routes and the change feed (mock/ontology.mjs)
+    if (
+      await handleOntology(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        headCommit,
+        quadSet,
+        commitWrite,
+        allCommits,
       })
     )
       return;

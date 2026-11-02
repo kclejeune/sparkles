@@ -1,6 +1,7 @@
 //! The OWL 2 ontology of a dataset over HTTP (spec F21 §2.4): the summary
 //! `GET /$/ontology/{ds}`, the axioms `GET /$/ontology/{ds}/axioms`, the entities
-//! `GET /$/ontology/{ds}/entities` and `GET /$/ontology/{ds}/entity`, the profile checks
+//! `GET /$/ontology/{ds}/entities` and `GET /$/ontology/{ds}/entity`, the removal of an
+//! entity `DELETE /$/ontology/{ds}/entity`, the profile checks
 //! `POST /$/ontology/{ds}/check`, edits `POST /$/ontology/{ds}/axioms` and the diff of
 //! the axioms of two commits `GET /$/ontology/{ds}/diff`, and the OWL 2 EL
 //! classification `POST /$/ontology/{ds}/classify` (spec F24). The library
@@ -452,20 +453,25 @@ pub(super) async fn check(
     .await
 }
 
-/// The axioms of a body member, in their JSON form.
-fn axiom_list(o: &serde_json::Map<String, J>, k: &str) -> ApiResult<Vec<Axiom>> {
+/// The axioms of a body member, each in its JSON form or as a string in functional-style
+/// syntax with the dataset's prefixes, as the library's edit takes them.
+fn axiom_list(
+    o: &serde_json::Map<String, J>,
+    k: &str,
+    prefixes: &[(String, String)],
+) -> ApiResult<Vec<Axiom>> {
     match o.get(k) {
         None | Some(J::Null) => Ok(Vec::new()),
         Some(J::Array(a)) => a
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                owl::json::read_axiom(v).map_err(|e| {
-                    err_code(
-                        StatusCode::BAD_REQUEST,
-                        "invalid-axiom",
-                        format!("{k}[{i}]: {e}"),
-                    )
+                onto::wire::axiom_of(v, &format!("{k}[{i}]"), prefixes).map_err(|e| {
+                    let m = match e {
+                        Error::Invalid(m) => m,
+                        e => e.to_string(),
+                    };
+                    err_code(StatusCode::BAD_REQUEST, "invalid-axiom", m)
                 })
             })
             .collect(),
@@ -497,9 +503,10 @@ pub(super) async fn edit(
         ],
     )?;
     let req = request_body(&o, request_of(&params)?)?;
+    let prefixes: Vec<(String, String)> = ds.dataset.prefixes().into_iter().collect();
     let edit = EditRequest {
-        add: axiom_list(&o, "add")?,
-        remove: axiom_list(&o, "remove")?,
+        add: axiom_list(&o, "add", &prefixes)?,
+        remove: axiom_list(&o, "remove", &prefixes)?,
         declare: match o.get("declare") {
             None | Some(J::Null) => None,
             Some(J::Bool(b)) => Some(*b),
@@ -553,6 +560,95 @@ pub(super) async fn edit(
     opts.write = wopts;
     blocking(move || {
         let r = ds.dataset.ontology().edit(&req, &edit, &opts);
+        let e = match (r, dry) {
+            (Err(Error::DryRun(preview)), Some(d)) => return Ok(d.respond(&ds, &preview)),
+            (Err(e @ Error::Invalid(_)), _) => return Err(ontology_error(e)),
+            (r, _) => r.map_err(|e| write_error(e, restricted))?,
+        };
+        let body = edit_body(&e, &renderer(&ds));
+        Ok(write_response(
+            &ds,
+            StatusCode::OK,
+            Some(body),
+            &e.receipt,
+            wanted,
+            restricted,
+        ))
+    })
+    .await
+    .map_err(|e| with_timeout(e, timeout))
+}
+
+/// `DELETE /$/ontology/{ds}/entity?iri=IRI`: remove an entity in one commit, with its
+/// declarations, the axioms that mention it and the assertions about it in the graphs
+/// read (spec F21 §5.3). Takes the write parameters of the other write routes (`dryRun`,
+/// `receipt`, the commit message header or `message`) and `If-Match` with the summary's
+/// tag. Answers as an edit does, so `removedAxioms` lists what the removal took.
+pub(super) async fn remove_entity(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    history::reject_at(&params)?;
+    let req = request_of(&params)?;
+    if req.inferences {
+        return Err(bad(
+            "a removal changes the asserted axioms: leave out 'inferences'",
+        ));
+    }
+    let iri = params
+        .get("iri")
+        .ok_or_else(|| bad("iri names the entity to remove"))?
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string();
+    if iri.is_empty() {
+        return Err(bad("iri names the entity to remove"));
+    }
+    let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Update);
+    let restricted = opts.graphs.is_some();
+    let wanted = receipt_wanted(&params, &headers);
+    let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers, Some(&p))?;
+    wopts.opts.graphs = opts.graphs.clone();
+    if let Some(m) = params.get("message") {
+        wopts.opts.message = Some(std::sync::Arc::from(m));
+    }
+    if wopts.opts.precondition.is_none() {
+        wopts.opts.precondition =
+            conditional::write_precondition(&headers, ds.store.dataset_id(), &Target::Dataset);
+    }
+    let dry = wopts
+        .opts
+        .dry_run
+        .as_ref()
+        .map(|d| {
+            dry_run::Request::for_write(
+                &st,
+                &headers,
+                &params,
+                d,
+                restricted,
+                Some(&p),
+                &ds,
+                &wopts.opts,
+            )
+        })
+        .transpose()?;
+    let (wopts, timeout) = wopts.start();
+    let dry = dry.map(|request| request.started(&wopts));
+    opts.cancel = wopts.cancel.clone();
+    opts.deadline = wopts.deadline;
+    opts.timeout = None;
+    opts.write = wopts;
+    blocking(move || {
+        let r = ds.dataset.ontology().remove_entity(&req, &iri, &opts);
         let e = match (r, dry) {
             (Err(Error::DryRun(preview)), Some(d)) => return Ok(d.respond(&ds, &preview)),
             (Err(e @ Error::Invalid(_)), _) => return Err(ontology_error(e)),

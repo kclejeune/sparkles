@@ -36,6 +36,21 @@ Rust library and Python's `ds.forms.model(…, nested=True)` expose the same mod
 bodies now accept blank node terms, a conflict on a child's field carries the child's
 `node`, and a form model's values carry a list's `items`.
 
+The web UI has an ontology editor, the **Ontology** page (spec U12, roadmap item 457). It
+shows trees of classes, object, data and annotation properties and individuals, an entity
+frame with its axioms in Manchester syntax, an annotation editor with language tags and
+annotations of axioms, a header editor, an axiom-level usage view and the EL classifier's
+inferred class tree beside the asserted one. It creates entities with IRIs from a
+per-dataset IRI policy, renames and deletes them, and previews every edit as a dry run
+before committing it with `If-Match`. **Start session** edits on a branch of its own, an
+undo stack undoes and redoes commits by reverting them, and the change feed reloads the
+views after another writer's commit. For the editor, the `/$/ontology/{ds}` routes take `?branch=` and
+the `/{ds}@{branch}` form, `DELETE /$/ontology/{ds}/entity` removes an entity with its
+axioms, edits accept axioms in functional-style syntax over HTTP, and an edit's answer
+lists the axioms it added and removed as `addedAxioms` and `removedAxioms` in every
+surface that answers the edit body. The OpenAPI description of an edit's `add` and
+`remove` takes functional-style strings beside the JSON form.
+
 An OWL 2 EL classifier computes the inferred class hierarchy and the unsatisfiable
 classes of an ontology (spec F24, roadmap item 580). `sparkles_owl::classify` follows
 ELK's consequence-based calculus on several threads, keeps its state so that a run after
@@ -45,6 +60,12 @@ leaves out as outside OWL 2 EL or uses only in part. `ds.ontology().classify()`,
 and JVM bindings run it. A run can write the taxonomy to a named graph in one commit with
 PROV-O provenance on the graph's header, and the dataset keeps its last classification
 so that the next one is incremental.
+
+The OWL 2 EL classifier's taxonomies equal those of ELK 0.6.0 on GO, ChEBI lite and the
+298 ontologies of the ORE 2015 EL classification sample, and those of HermiT 1.4.5.519 on
+the 36 ORE ontologies with individuals (roadmap item 591). `scripts/elk-compare/elk.sh`
+runs ELK or HermiT through the OWL API from pinned Maven Central jars, and the EL
+classification report gives times and memory beside ELK's on the benchmark host.
 
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and

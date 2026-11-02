@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Classify each ORE 2015 EL ontology with el_classify and with ELK, and compare the two
+# taxonomies with scripts/el-oracle.py. Usage: run-ore.sh ours|elk|compare
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$L/../../.." && pwd)
+DATA=$ROOT/../sparkles-lane-el-classifier-580/.artifacts/lanes/el-580/data/ore-el
+OUT=$L/out/ore
+mkdir -p "$OUT"
+BIN=$L/bin/el_classify
+files() { ls -Sr "$DATA"/*.owl; }
+case $1 in
+  ours)
+    : > "$OUT/ours.jsonl"
+    for f in $(files); do
+      n=$(basename "$f" .owl)
+      if out=$(timeout 600 systemd-run --user --scope --quiet -p MemoryMax=14G -p MemorySwapMax=0 \
+        -p OOMPolicy=continue "$BIN" --threads 4 --taxonomy "$OUT/$n.ours.txt" "$f" 2> "$OUT/$n.ours.err"); then
+        echo "$out" >> "$OUT/ours.jsonl"
+      else
+        echo "{\"input\":\"$f\",\"failed\":$?}" >> "$OUT/ours.jsonl"
+      fi
+    done
+    echo ORE-OURS-DONE
+    ;;
+  elk)
+    : > "$OUT/elk.jsonl"
+    for f in $(files); do
+      n=$(basename "$f" .owl)
+      mb=$(( $(stat -c %s "$f") / 1048576 ))
+      heap=$(( mb * 16 / 1024 + 1 ))
+      [ $heap -gt 12 ] && heap=12
+      if out=$(ELK_HEAP=${heap}g ELK_MEM_MAX=14G timeout 900 "$ROOT/scripts/elk-compare/elk.sh" run \
+        --threads 4 --taxonomy "$OUT/$n.elk.ofn" "$f" 2> "$OUT/$n.elk.err"); then
+        echo "$out" >> "$OUT/elk.jsonl"
+      else
+        echo "{\"input\":\"$f\",\"failed\":$?,\"heapGib\":$heap}" >> "$OUT/elk.jsonl"
+      fi
+    done
+    echo ORE-ELK-DONE
+    ;;
+  compare)
+    : > "$OUT/compare.jsonl"
+    for f in $(files); do
+      n=$(basename "$f" .owl)
+      if [ -s "$OUT/$n.elk.ofn" ] && [ -s "$OUT/$n.ours.txt" ]; then
+        r=$(python3 "$ROOT/scripts/el-oracle.py" "$OUT/$n.elk.ofn" "$OUT/$n.ours.txt")
+        echo "{\"name\":\"$n\",\"report\":$r}" >> "$OUT/compare.jsonl"
+      else
+        echo "{\"name\":\"$n\",\"missing\":true}" >> "$OUT/compare.jsonl"
+      fi
+    done
+    echo ORE-COMPARE-DONE
+    ;;
+esac
