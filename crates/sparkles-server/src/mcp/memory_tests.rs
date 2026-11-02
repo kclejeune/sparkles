@@ -280,6 +280,21 @@ async fn check_query_class_lookup_names_its_terms() {
         "{s}"
     );
     assert_eq!(s["ok"], true, "{s}");
+    // the suggestions are the predicates that the class's instances use
+    let issue = s["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["code"] == "class-mismatch")
+        .unwrap();
+    assert_eq!(issue["suggestions"][0]["why"], "class-profile", "{s}");
+    assert!(
+        issue["suggestions"][0]["term"]
+            .as_str()
+            .unwrap()
+            .contains("length"),
+        "{s}"
+    );
 }
 
 /// The `mem` dataset of [`mem`] on a server whose tools read schema reports from the
