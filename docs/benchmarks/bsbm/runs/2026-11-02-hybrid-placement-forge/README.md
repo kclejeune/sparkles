@@ -40,12 +40,12 @@ slice of the [DBpedia reports](../../../dbpedia/RESULTS.md), loaded with
 round, in rotated order with every second round reversed. A configuration names the
 process's CPU affinity, its `RAYON_NUM_THREADS`, the CPUs that every thread but the query
 pool's is pinned to after startup, and extra `serve` arguments. Each process answers every
-BI instance and `births-by-decade` three times untimed and fifteen times timed (twenty for
-the runs of `births-by-decade` alone), one request at a time over a new connection, with
-result caches off. The client runs on CPU 19 unless `CLIENT_CPU` says otherwise. The
-record keeps the client's wall time, the server's own time from its access log, and the
-CPU time of every server thread by its kind (query pool, runtime worker or other) and by
-the kind of core it last ran on. `scripts/summarize.py` prints the pooled medians, the
+BI instance and `births-by-decade` three times untimed and fifteen times timed, one
+request at a time over a new connection, with result caches off. The runs of
+`births-by-decade` alone time twenty requests. The client runs on CPU 19 unless
+`CLIENT_CPU` says otherwise. The record keeps the client's wall time, the server's own
+time from its access log, and the CPU time of every server thread by the kind of core it
+last ran on and by whether it is a query pool thread, a runtime worker or another thread. `scripts/summarize.py` prints the pooled medians, the
 medians of each process and the CPU split.
 
 `scripts/exp10.sh` times `births-by-decade` with `execution=streaming` and

@@ -587,8 +587,9 @@ because eager execution spreads more of its work over the query threads. When su
 text's cursor answers whole in 10 to 50 ms and no eager run of it is known, its next run
 is eager, on the pool. The server keeps the fastest eager run and the fastest cursor run
 of each text, and once both are known the text runs in the faster mode, so one slow run
-does not change it. The remembered times do not age, and the server forgets a text only
-after 4,096 others, which roadmap item NEW-ITEM-3 covers. On forge, DBpedia's
+does not change it. The remembered times do not age. The server remembers up to 4,096
+texts and forgets all of them at once when a new text arrives after that, and roadmap
+item NEW-ITEM-3 covers aging. On forge, DBpedia's
 `births-by-decade` at 50M triples takes 3.2 ms as a cursor and 1.8 ms eagerly, and it
 runs eagerly after its first run. An eager trial that outgrows its memory budget runs
 again with automatic execution within the same deadline and budgets, and the text keeps
@@ -600,8 +601,10 @@ A request runs its sequential parts on the thread that serves it and its paralle
 on the query pool, which by default has a thread per logical CPU. On a processor with
 performance and efficiency cores, a serving thread that waits for the pool often finds
 only an efficiency core free when the pool's work ends, and finishes the request there.
-On Linux, when the server may run on cores of both kinds, `--request-cpus auto` runs the
-serving threads on the performance cores, and the query pool leaves one CPU free for
+On Linux, the kernel lists the two kinds of core of an Intel hybrid processor in
+`/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`. When both lists exist
+and the server may run on cores of both kinds, `--request-cpus auto` runs the serving
+threads on the performance cores, and the query pool leaves one CPU free for
 every four efficiency cores, or part of four. The pool's threads run on every CPU. On
 forge, an Intel Core i5-13500 with twelve logical CPUs on its performance cores and
 eight efficiency cores, the pool has 18 threads. The third instance of BSBM BI `q3` at
@@ -609,8 +612,9 @@ eight efficiency cores, the pool has 18 threads. The third instance of BSBM BI `
 `--request-cpus all`. The server logs the split at startup.
 
 `--request-cpus all` keeps every thread free to run anywhere, with a pool thread per
-logical CPU. On other processors, on other systems and when the server's CPU affinity
-holds cores of only one kind, both modes behave as `all`. `RAYON_NUM_THREADS` sets the
+logical CPU. Both modes behave as `all` on processors with one kind of core, on hybrid
+processors whose kernel does not provide those two lists, on systems other than Linux,
+and when the server's CPU affinity holds cores of only one kind. `RAYON_NUM_THREADS` sets the
 pool's size in either mode.
 
 ### Memory and caches

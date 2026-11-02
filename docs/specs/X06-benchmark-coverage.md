@@ -1841,8 +1841,10 @@ each text's fastest eager and fastest cursor run and runs the text in the faster
 that one slow run does not hold it in the slower one. On Linux, when the process may run
 on cores of both kinds, the runtime's threads run on the performance cores and the query
 pool leaves one logical CPU free for every four efficiency cores, 18 threads on forge.
-`serve --request-cpus all` keeps the earlier placement. On macOS and on processors with
-one kind of core nothing changes.
+`serve --request-cpus all` keeps the earlier placement. The server finds the two kinds
+in `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`, which Linux provides
+for Intel hybrid processors. Without those lists, on macOS and on processors with one
+kind of core nothing changes.
 
 Pinning the request threads with twenty query threads took `q3` to 23.3 ms against
 18.5 ms with sixteen, and sixteen threads without pinning made `q6` and `q1` slower.
