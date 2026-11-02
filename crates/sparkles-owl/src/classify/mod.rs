@@ -140,6 +140,8 @@ struct Held {
 /// An incremental OWL 2 EL classifier. See the [module documentation](self).
 pub struct Classifier {
     axioms: FxHashMap<AxiomKind, Held>,
+    /// the estimated bytes of the held axioms
+    held_bytes: usize,
     /// the classes of the axioms' signature, with the number of axioms naming each
     classes: FxHashMap<Class, u32>,
     /// changes since the last run, as signed counts
@@ -186,26 +188,33 @@ fn logical(ax: &AxiomKind) -> bool {
     )
 }
 
-fn classes_of(ax: &AxiomKind) -> impl Iterator<Item = Class> {
+/// The classes of an axiom's signature, and the bytes the classifier's copy of the
+/// axiom takes, roughly: the axiom, its entry and each entity's IRI with the expression
+/// that holds it.
+fn signature_of(ax: &AxiomKind) -> (Vec<Class>, usize) {
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.0.into_iter().filter_map(|e| match e {
-        Entity::Class(c)
-            if !matches!(
+    let mut bytes = std::mem::size_of::<AxiomKind>() + std::mem::size_of::<Held>() + 16;
+    let mut classes = Vec::new();
+    for e in sig.0 {
+        bytes += e.iri().as_str().len() + 64;
+        if let Entity::Class(c) = e
+            && !matches!(
                 c.as_str(),
                 crate::vocab::OWL_THING | crate::vocab::OWL_NOTHING
-            ) =>
+            )
         {
-            Some(c)
+            classes.push(c);
         }
-        _ => None,
-    })
+    }
+    (classes, bytes)
 }
 
 impl Classifier {
     pub fn new() -> Classifier {
         Classifier {
             axioms: FxHashMap::default(),
+            held_bytes: 0,
             classes: FxHashMap::default(),
             pending: FxHashMap::default(),
             interner: Interner::new(),
@@ -294,9 +303,11 @@ impl Classifier {
         out
     }
 
-    /// Applies the pending changes to the held axioms. The answer is the axioms that
-    /// came to be held and those that stopped being held.
-    fn apply_pending(&mut self) -> (Vec<AxiomKind>, Vec<AxiomKind>) {
+    /// Applies the pending changes to the held axioms. The answer is the numbers of
+    /// axioms that came to be held and that stopped being held, and with `keep` the
+    /// axioms themselves, which only an incremental run needs.
+    fn apply_pending(&mut self, keep: bool) -> (usize, usize, Vec<AxiomKind>, Vec<AxiomKind>) {
+        let (mut n_added, mut n_removed) = (0, 0);
         let mut added = Vec::new();
         let mut removed = Vec::new();
         for (ax, d) in std::mem::take(&mut self.pending) {
@@ -311,9 +322,11 @@ impl Classifier {
                     .into_iter()
                     .next()
                     .map(|b| (b.rule.to_string(), b.message));
-                for c in classes_of(&ax) {
+                let (classes, bytes) = signature_of(&ax);
+                for c in classes {
                     *self.classes.entry(c).or_default() += 1;
                 }
+                self.held_bytes += bytes;
                 self.axioms.insert(
                     ax.clone(),
                     Held {
@@ -321,10 +334,15 @@ impl Classifier {
                         outside,
                     },
                 );
-                added.push(ax);
+                n_added += 1;
+                if keep {
+                    added.push(ax);
+                }
             } else if have > 0 && now == 0 {
                 self.axioms.remove(&ax);
-                for c in classes_of(&ax) {
+                let (classes, bytes) = signature_of(&ax);
+                self.held_bytes = self.held_bytes.saturating_sub(bytes);
+                for c in classes {
                     if let Some(n) = self.classes.get_mut(&c) {
                         *n -= 1;
                         if *n == 0 {
@@ -332,12 +350,15 @@ impl Classifier {
                         }
                     }
                 }
-                removed.push(ax);
+                n_removed += 1;
+                if keep {
+                    removed.push(ax);
+                }
             } else if let Some(h) = self.axioms.get_mut(&ax) {
                 h.count = now as u32;
             }
         }
-        (added, removed)
+        (n_added, n_removed, added, removed)
     }
 
     /// Normalizes the held axioms inside OWL 2 EL and builds the index.
@@ -407,11 +428,12 @@ impl Classifier {
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
         let mut stats = Stats::default();
         let start = Instant::now();
-        let (added, removed) = self.apply_pending();
-        stats.added = added.len();
-        stats.removed = removed.len();
-        let full =
-            self.dirty || self.index.is_none() || added.iter().chain(&removed).any(role_axiom);
+        // a run that starts again needs no copies of the changed axioms
+        let again = self.dirty || self.index.is_none();
+        let (n_added, n_removed, added, removed) = self.apply_pending(!again);
+        stats.added = n_added;
+        stats.removed = n_removed;
+        let full = again || added.iter().chain(&removed).any(role_axiom);
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
@@ -427,6 +449,9 @@ impl Classifier {
             }
             Some(scratch)
         };
+        // the copies of the changed axioms are not needed past this point
+        drop(added);
+        drop(removed);
         let (ax, ix) = self.build();
         let n = self.interner.len();
         self.ctx.resize_with(n, OnceLock::new);
@@ -518,13 +543,25 @@ impl Classifier {
     fn index_bytes(&self, ix: &Index) -> usize {
         let vecs = |v: &Vec<Vec<Ex>>| v.iter().map(|x| 24 + x.len() * 4).sum::<usize>();
         let pairs = |v: &Vec<Vec<(u32, u32)>>| v.iter().map(|x| 24 + x.len() * 8).sum::<usize>();
+        let iris = |len: usize| len + 56;
         self.interner.len() * 40
+            + self
+                .interner
+                .classes
+                .iter()
+                .map(|c| 2 * iris(c.as_str().len()))
+                .sum::<usize>()
+            + self
+                .classes
+                .keys()
+                .map(|c| iris(c.as_str().len()))
+                .sum::<usize>()
             + vecs(&ix.told)
             + pairs(&ix.conj)
             + pairs(&ix.exist)
             + ix.disjoint.iter().map(|x| 24 + x.len() * 4).sum::<usize>()
             + ix.succ.len() * 12
-            + self.axioms.len() * 64
+            + self.held_bytes
     }
 
     fn context_bytes(&self) -> usize {
