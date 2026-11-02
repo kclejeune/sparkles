@@ -122,7 +122,7 @@ class OntologyTest {
             org.apache.jena.graph.NodeFactory.createLiteralString("x"),
         )
         for (adding in listOf(true, false)) {
-            SparklesDatasets.memory().use { ds ->
+            SparklesDatasets.memory(SparklesOptions.builder().autocommit(true).build()).use { ds ->
                 a1(ds)
                 val m = SparklesOnt.model(ds, "http://ex.org/onto")
                 val g = m.graph
