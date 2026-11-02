@@ -7,6 +7,10 @@ import tempfile
 import tomllib
 import unittest
 
+# scripts/ci.sh --changed narrows the lint and test tasks through this variable. The
+# task commands below run as a full run would, whatever the caller narrowed.
+os.environ.pop("SPARKLES_CHANGED_PACKAGES", None)
+
 ROOT = Path(__file__).resolve().parents[2]
 
 FULL_TASKS = {
