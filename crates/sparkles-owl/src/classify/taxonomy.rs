@@ -246,7 +246,7 @@ pub(super) fn build(
     let stopped = AtomicBool::new(false);
     // `i` counts the items of a chunk, so each chunk polls when it starts
     let halt = |i: usize| {
-        if i % POLL_EVERY == 0 && (stopped.load(Ordering::Relaxed) || stop()) {
+        if i.is_multiple_of(POLL_EVERY) && (stopped.load(Ordering::Relaxed) || stop()) {
             stopped.store(true, Ordering::Relaxed);
             return true;
         }

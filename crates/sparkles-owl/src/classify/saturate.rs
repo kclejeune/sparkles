@@ -564,7 +564,6 @@ impl<'a> Run<'a> {
             out.local.append(&mut batch);
         }
         tally.queued += out.sent as isize;
-        drop(out);
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
         if !self.stopped() && !ctx.todo.lock().is_empty() && self.mark(ctx) {
