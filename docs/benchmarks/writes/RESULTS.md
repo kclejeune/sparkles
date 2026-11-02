@@ -547,6 +547,13 @@ writes at both sizes while it serves far fewer reads. At 10.5M no Oxigraph reade
 within 30 s. A separate run with the durable-commit harness above, with 16 readers on the
 10.5M store, completed 299 new-literal commits per second at a median of 3.2 ms.
 
+On a hybrid processor the server runs request work on the performance cores only while
+at most one request per performance core is in flight. With sixteen readers it runs on
+every CPU, and on atlas, an i5-13500 like forge, it answered 2,358.9 reads a second at
+1.05M against 2,365.2 with `--request-cpus all` in five alternating pairs. The [hybrid
+placement run](runs/2026-11-02-hybrid-mixed-atlas/README.md) records the measurements
+and why confining every request to the performance cores lost about a third of the writes.
+
 ### Queries after updates
 
 The `updates` mode applies the same 5,000 single-triple changes to each engine's store and

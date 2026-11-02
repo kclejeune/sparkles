@@ -1,0 +1,12 @@
+{
+ "sparkles": {
+  "read_qps": 2358.9,
+  "read_p50_ms": 6.61,
+  "read_p99_ms": 10.91,
+  "read_errors": 0,
+  "writes_per_s": 334.6,
+  "write_p50_ms": 2.566,
+  "write_p99_ms": 6.568,
+  "write_errors": 0
+ }
+}

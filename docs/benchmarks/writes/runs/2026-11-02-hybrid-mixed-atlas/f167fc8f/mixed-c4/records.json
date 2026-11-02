@@ -1,0 +1,242 @@
+[
+ {
+  "bin": "fix6",
+  "config": "auto",
+  "run": 1,
+  "read_qps": 1019.1,
+  "read_p50_ms": 3.77,
+  "read_p99_ms": 5.32,
+  "read_errors": 0,
+  "writes_per_s": 775.2,
+  "write_p50_ms": 1.116,
+  "write_p99_ms": 2.811,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1050.6,
+    "wait_ms": 26.0,
+    "slices": 81224,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 26559.2,
+    "wait_ms": 1817.2,
+    "slices": 793497,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 115863.3,
+    "wait_ms": 365.4,
+    "slices": 243011,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.396,
+  "busy_e": 0.127,
+  "loadavg": [
+   "16.43",
+   "19.36",
+   "15.09"
+  ]
+ },
+ {
+  "bin": "fix6",
+  "config": "all",
+  "run": 2,
+  "read_qps": 977.0,
+  "read_p50_ms": 3.93,
+  "read_p99_ms": 5.54,
+  "read_errors": 0,
+  "writes_per_s": 409.5,
+  "write_p50_ms": 2.691,
+  "write_p99_ms": 3.305,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 793.4,
+    "wait_ms": 25.7,
+    "slices": 47841,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 27873.1,
+    "wait_ms": 1388.3,
+    "slices": 887716,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 114480.2,
+    "wait_ms": 172.3,
+    "slices": 189737,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.236,
+  "busy_e": 0.337,
+  "loadavg": [
+   "13.18",
+   "18.30",
+   "14.87"
+  ]
+ },
+ {
+  "bin": "fix6",
+  "config": "auto",
+  "run": 3,
+  "read_qps": 1035.9,
+  "read_p50_ms": 3.71,
+  "read_p99_ms": 5.27,
+  "read_errors": 0,
+  "writes_per_s": 549.8,
+  "write_p50_ms": 1.227,
+  "write_p99_ms": 2.891,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 884.6,
+    "wait_ms": 24.6,
+    "slices": 60351,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 27233.7,
+    "wait_ms": 1354.3,
+    "slices": 749466,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 114353.8,
+    "wait_ms": 338.4,
+    "slices": 211586,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.387,
+  "busy_e": 0.112,
+  "loadavg": [
+   "9.98",
+   "16.93",
+   "14.54"
+  ]
+ },
+ {
+  "bin": "fix6",
+  "config": "all",
+  "run": 4,
+  "read_qps": 975.9,
+  "read_p50_ms": 3.94,
+  "read_p99_ms": 5.51,
+  "read_errors": 0,
+  "writes_per_s": 433.7,
+  "write_p50_ms": 2.65,
+  "write_p99_ms": 3.256,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 796.9,
+    "wait_ms": 38.4,
+    "slices": 50065,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 27549.5,
+    "wait_ms": 1234.5,
+    "slices": 860270,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 114707.3,
+    "wait_ms": 172.7,
+    "slices": 192481,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.232,
+  "busy_e": 0.343,
+  "loadavg": [
+   "8.58",
+   "15.94",
+   "14.28"
+  ]
+ },
+ {
+  "bin": "fix6",
+  "config": "auto",
+  "run": 5,
+  "read_qps": 1018.8,
+  "read_p50_ms": 3.78,
+  "read_p99_ms": 5.34,
+  "read_errors": 0,
+  "writes_per_s": 842.3,
+  "write_p50_ms": 1.102,
+  "write_p99_ms": 2.78,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1103.8,
+    "wait_ms": 34.8,
+    "slices": 87346,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 26162.3,
+    "wait_ms": 1974.2,
+    "slices": 806392,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 116228.0,
+    "wait_ms": 393.5,
+    "slices": 253709,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.397,
+  "busy_e": 0.129,
+  "loadavg": [
+   "7.22",
+   "14.77",
+   "13.95"
+  ]
+ },
+ {
+  "bin": "fix6",
+  "config": "all",
+  "run": 6,
+  "read_qps": 976.5,
+  "read_p50_ms": 3.95,
+  "read_p99_ms": 5.49,
+  "read_errors": 0,
+  "writes_per_s": 395.4,
+  "write_p50_ms": 2.7,
+  "write_p99_ms": 3.361,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 772.4,
+    "wait_ms": 30.7,
+    "slices": 46545,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 27831.2,
+    "wait_ms": 1420.0,
+    "slices": 875596,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 114371.3,
+    "wait_ms": 184.8,
+    "slices": 187682,
+    "threads": 26
+   }
+  },
+  "busy_p": 0.234,
+  "busy_e": 0.332,
+  "loadavg": [
+   "6.73",
+   "13.93",
+   "13.70"
+  ]
+ }
+]

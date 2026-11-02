@@ -1,0 +1,482 @@
+[
+ {
+  "bin": "fix2",
+  "config": "auto",
+  "run": 1,
+  "read_qps": 2426.7,
+  "read_p50_ms": 6.45,
+  "read_p99_ms": 10.71,
+  "read_errors": 0,
+  "writes_per_s": 287.2,
+  "write_p50_ms": 3.499,
+  "write_p99_ms": 7.062,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 913.4,
+    "wait_ms": 3162.8,
+    "slices": 34882,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 57133.2,
+    "wait_ms": 192504.9,
+    "slices": 10571393,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 398201.8,
+    "wait_ms": 27374.6,
+    "slices": 420649,
+    "threads": 40
+   }
+  },
+  "busy_p": 0.777,
+  "busy_e": 0.919,
+  "loadavg": [
+   "26.58",
+   "23.44",
+   "20.37"
+  ]
+ },
+ {
+  "bin": "fix2",
+  "config": "all",
+  "run": 2,
+  "read_qps": 2408.2,
+  "read_p50_ms": 6.48,
+  "read_p99_ms": 10.83,
+  "read_errors": 0,
+  "writes_per_s": 254.8,
+  "write_p50_ms": 3.766,
+  "write_p99_ms": 7.378,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 882.4,
+    "wait_ms": 2246.0,
+    "slices": 31996,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 61178.5,
+    "wait_ms": 216620.0,
+    "slices": 11928121,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 395202.9,
+    "wait_ms": 29796.2,
+    "slices": 422149,
+    "threads": 43
+   }
+  },
+  "busy_p": 0.779,
+  "busy_e": 0.917,
+  "loadavg": [
+   "25.30",
+   "23.37",
+   "20.45"
+  ]
+ },
+ {
+  "bin": "p449",
+  "config": "auto",
+  "run": 3,
+  "read_qps": 2024.3,
+  "read_p50_ms": 7.56,
+  "read_p99_ms": 13.06,
+  "read_errors": 0,
+  "writes_per_s": 213.7,
+  "write_p50_ms": 4.486,
+  "write_p99_ms": 9.594,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 583.9,
+    "wait_ms": 8453.6,
+    "slices": 27830,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 56871.5,
+    "wait_ms": 77523.1,
+    "slices": 12926784,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 332308.5,
+    "wait_ms": 129171.0,
+    "slices": 374970,
+    "threads": 46
+   }
+  },
+  "busy_p": 0.95,
+  "busy_e": 0.332,
+  "loadavg": [
+   "24.25",
+   "23.30",
+   "20.52"
+  ]
+ },
+ {
+  "bin": "p449",
+  "config": "all",
+  "run": 4,
+  "read_qps": 2344.8,
+  "read_p50_ms": 6.66,
+  "read_p99_ms": 11.11,
+  "read_errors": 0,
+  "writes_per_s": 364.1,
+  "write_p50_ms": 2.386,
+  "write_p99_ms": 6.066,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1045.8,
+    "wait_ms": 2547.6,
+    "slices": 42287,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 58869.0,
+    "wait_ms": 222485.8,
+    "slices": 11513948,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 399027.6,
+    "wait_ms": 29755.5,
+    "slices": 427040,
+    "threads": 42
+   }
+  },
+  "busy_p": 0.79,
+  "busy_e": 0.921,
+  "loadavg": [
+   "25.33",
+   "23.61",
+   "20.73"
+  ]
+ },
+ {
+  "bin": "fix2",
+  "config": "auto",
+  "run": 5,
+  "read_qps": 2391.1,
+  "read_p50_ms": 6.54,
+  "read_p99_ms": 10.85,
+  "read_errors": 0,
+  "writes_per_s": 366.2,
+  "write_p50_ms": 2.378,
+  "write_p99_ms": 6.014,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1056.0,
+    "wait_ms": 4447.2,
+    "slices": 42497,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 55930.9,
+    "wait_ms": 195323.9,
+    "slices": 10219529,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 398901.7,
+    "wait_ms": 28308.1,
+    "slices": 425797,
+    "threads": 42
+   }
+  },
+  "busy_p": 0.786,
+  "busy_e": 0.921,
+  "loadavg": [
+   "25.00",
+   "23.70",
+   "20.85"
+  ]
+ },
+ {
+  "bin": "p449",
+  "config": "all",
+  "run": 6,
+  "read_qps": 2341.9,
+  "read_p50_ms": 6.67,
+  "read_p99_ms": 11.11,
+  "read_errors": 0,
+  "writes_per_s": 363.6,
+  "write_p50_ms": 2.376,
+  "write_p99_ms": 6.121,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1046.0,
+    "wait_ms": 2628.5,
+    "slices": 42306,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 58505.3,
+    "wait_ms": 221594.7,
+    "slices": 11440068,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 399251.5,
+    "wait_ms": 28985.1,
+    "slices": 423885,
+    "threads": 41
+   }
+  },
+  "busy_p": 0.788,
+  "busy_e": 0.923,
+  "loadavg": [
+   "25.37",
+   "23.88",
+   "21.01"
+  ]
+ },
+ {
+  "bin": "p449",
+  "config": "auto",
+  "run": 7,
+  "read_qps": 2006.6,
+  "read_p50_ms": 7.62,
+  "read_p99_ms": 13.28,
+  "read_errors": 0,
+  "writes_per_s": 242.1,
+  "write_p50_ms": 3.891,
+  "write_p99_ms": 8.675,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 663.7,
+    "wait_ms": 9515.9,
+    "slices": 31429,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 55863.5,
+    "wait_ms": 77590.9,
+    "slices": 12726888,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 331041.7,
+    "wait_ms": 130275.3,
+    "slices": 378892,
+    "threads": 48
+   }
+  },
+  "busy_p": 0.948,
+  "busy_e": 0.33,
+  "loadavg": [
+   "26.51",
+   "24.31",
+   "21.25"
+  ]
+ },
+ {
+  "bin": "fix2",
+  "config": "all",
+  "run": 8,
+  "read_qps": 2381.8,
+  "read_p50_ms": 6.55,
+  "read_p99_ms": 11.08,
+  "read_errors": 0,
+  "writes_per_s": 360.9,
+  "write_p50_ms": 2.41,
+  "write_p99_ms": 6.212,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1066.9,
+    "wait_ms": 2586.8,
+    "slices": 42084,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 59898.4,
+    "wait_ms": 221534.0,
+    "slices": 11646815,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 397212.0,
+    "wait_ms": 30958.1,
+    "slices": 430477,
+    "threads": 42
+   }
+  },
+  "busy_p": 0.79,
+  "busy_e": 0.922,
+  "loadavg": [
+   "24.97",
+   "24.12",
+   "21.29"
+  ]
+ },
+ {
+  "bin": "p449",
+  "config": "auto",
+  "run": 9,
+  "read_qps": 2009.4,
+  "read_p50_ms": 7.61,
+  "read_p99_ms": 13.18,
+  "read_errors": 0,
+  "writes_per_s": 239.8,
+  "write_p50_ms": 3.935,
+  "write_p99_ms": 8.764,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 639.8,
+    "wait_ms": 9401.3,
+    "slices": 31281,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 56122.6,
+    "wait_ms": 77219.7,
+    "slices": 12798223,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 331274.7,
+    "wait_ms": 130698.6,
+    "slices": 377870,
+    "threads": 48
+   }
+  },
+  "busy_p": 0.948,
+  "busy_e": 0.332,
+  "loadavg": [
+   "25.40",
+   "24.26",
+   "21.43"
+  ]
+ },
+ {
+  "bin": "p449",
+  "config": "all",
+  "run": 10,
+  "read_qps": 2342.3,
+  "read_p50_ms": 6.66,
+  "read_p99_ms": 11.15,
+  "read_errors": 0,
+  "writes_per_s": 364.1,
+  "write_p50_ms": 2.381,
+  "write_p99_ms": 6.027,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1098.3,
+    "wait_ms": 2601.6,
+    "slices": 42542,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 59019.1,
+    "wait_ms": 223209.0,
+    "slices": 11605114,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 399227.0,
+    "wait_ms": 29363.3,
+    "slices": 425958,
+    "threads": 42
+   }
+  },
+  "busy_p": 0.792,
+  "busy_e": 0.923,
+  "loadavg": [
+   "24.47",
+   "24.17",
+   "21.49"
+  ]
+ },
+ {
+  "bin": "fix2",
+  "config": "auto",
+  "run": 11,
+  "read_qps": 2394.1,
+  "read_p50_ms": 6.53,
+  "read_p99_ms": 10.87,
+  "read_errors": 0,
+  "writes_per_s": 365.1,
+  "write_p50_ms": 2.383,
+  "write_p99_ms": 6.091,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1088.6,
+    "wait_ms": 2414.9,
+    "slices": 42592,
+    "threads": 25
+   },
+   "rayon": {
+    "run_ms": 56310.3,
+    "wait_ms": 196139.4,
+    "slices": 10390645,
+    "threads": 18
+   },
+   "tokio": {
+    "run_ms": 398639.3,
+    "wait_ms": 29552.6,
+    "slices": 428881,
+    "threads": 43
+   }
+  },
+  "busy_p": 0.784,
+  "busy_e": 0.923,
+  "loadavg": [
+   "24.27",
+   "24.07",
+   "21.55"
+  ]
+ },
+ {
+  "bin": "fix2",
+  "config": "all",
+  "run": 12,
+  "read_qps": 2385.1,
+  "read_p50_ms": 6.55,
+  "read_p99_ms": 10.91,
+  "read_errors": 0,
+  "writes_per_s": 358.3,
+  "write_p50_ms": 2.432,
+  "write_p99_ms": 6.107,
+  "write_errors": 0,
+  "sched": {
+   "other": {
+    "run_ms": 1089.5,
+    "wait_ms": 2656.0,
+    "slices": 41997,
+    "threads": 27
+   },
+   "rayon": {
+    "run_ms": 60172.1,
+    "wait_ms": 220950.6,
+    "slices": 11769807,
+    "threads": 20
+   },
+   "tokio": {
+    "run_ms": 396647.8,
+    "wait_ms": 30303.5,
+    "slices": 431657,
+    "threads": 42
+   }
+  },
+  "busy_p": 0.787,
+  "busy_e": 0.922,
+  "loadavg": [
+   "25.37",
+   "24.36",
+   "21.73"
+  ]
+ }
+]

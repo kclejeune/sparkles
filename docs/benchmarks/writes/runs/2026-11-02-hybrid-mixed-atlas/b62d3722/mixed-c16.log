@@ -1,0 +1,15 @@
+locks held 2026-11-02T12:41:59Z load 0.20 5.59 9.88 1/644 1019247
+r0   b62d3722         auto reads/s  2241.4 writes/s  255.6 wp50 3.651 busyP 0.948 busyE 0.304 other:run=683,wait=9598,n=25 rayon:run=52371,wait=73826,n=18 tokio:run=331747,wait=132334,n=49
+r0   b62d3722          all reads/s  2606.4 writes/s  366.5 wp50 2.374 busyP 0.8 busyE 0.91 other:run=1078,wait=3088,n=27 rayon:run=54255,wait=223474,n=20 tokio:run=397798,wait=30710,n=43
+r0   b62d3722       auto20 reads/s  2019.0 writes/s  242.8 wp50 3.876 busyP 0.95 busyE 0.351 other:run=654,wait=9473,n=25 rayon:run=60637,wait=91900,n=20 tokio:run=331633,wait=131088,n=47
+r0   b62d3722        all18 reads/s  2357.1 writes/s  370.3 wp50 2.341 busyP 0.782 busyE 0.921 other:run=1090,wait=2492,n=27 rayon:run=55632,wait=195984,n=18 tokio:run=400416,wait=27932,n=43
+r1   b62d3722         auto reads/s  2004.7 writes/s  240.7 wp50 3.886 busyP 0.948 busyE 0.333 other:run=639,wait=9340,n=25 rayon:run=57292,wait=78203,n=18 tokio:run=331536,wait=130951,n=48
+r1   b62d3722        all18 reads/s  2355.2 writes/s  366.1 wp50 2.37 busyP 0.782 busyE 0.921 other:run=1090,wait=2602,n=27 rayon:run=55420,wait=194510,n=18 tokio:run=400523,wait=27863,n=42
+r1   b62d3722       auto20 reads/s  1999.3 writes/s  240.9 wp50 3.904 busyP 0.95 busyE 0.345 other:run=637,wait=9397,n=25 rayon:run=59405,wait=90216,n=20 tokio:run=331298,wait=133117,n=47
+r1   b62d3722          all reads/s  2354.0 writes/s  359.3 wp50 2.404 busyP 0.788 busyE 0.922 other:run=1085,wait=2740,n=27 rayon:run=59994,wait=223231,n=20 tokio:run=398716,wait=29502,n=42
+r2   b62d3722       auto20 reads/s  2006.1 writes/s  241.7 wp50 3.885 busyP 0.949 busyE 0.345 other:run=641,wait=9340,n=25 rayon:run=60271,wait=91425,n=20 tokio:run=331217,wait=130536,n=49
+r2   b62d3722        all18 reads/s  2356.9 writes/s  367.0 wp50 2.366 busyP 0.785 busyE 0.923 other:run=1050,wait=2443,n=27 rayon:run=56019,wait=196301,n=18 tokio:run=400618,wait=29574,n=42
+r2   b62d3722         auto reads/s  2004.4 writes/s  241.3 wp50 3.891 busyP 0.948 busyE 0.333 other:run=644,wait=9324,n=25 rayon:run=56500,wait=76593,n=18 tokio:run=331640,wait=130520,n=48
+r2   b62d3722          all reads/s  2349.7 writes/s  359.6 wp50 2.402 busyP 0.785 busyE 0.921 other:run=1070,wait=2630,n=27 rayon:run=59113,wait=220731,n=20 tokio:run=398108,wait=29015,n=42
+MIXABDONE
+LOCKRUN-EXIT=0

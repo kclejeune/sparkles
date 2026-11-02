@@ -134,6 +134,12 @@ request that waited for it often finished its sequential work on an efficiency c
 `serve --request-cpus all` keeps the earlier placement, and `RAYON_NUM_THREADS` still
 sets the pool's size. The default pool on such a processor is smaller, 18 threads instead
 of 20 on an Intel Core i5-13500, which a query bound by its parallel work can feel.
+Request work runs on the performance cores only while at most one request per physical
+performance core is in flight, and on every CPU when more are. With every request on the
+performance cores, sixteen concurrent readers and a writer on an Intel Core i5-13500
+answered about 0.86 of the reads and 0.66 of the writes a second of
+`--request-cpus all`, since the performance cores were full while the efficiency cores
+idled.
 
 A cursor batch of BIND or FILTER rows whose expressions are expensive, such as date
 functions and decimal arithmetic, is mapped over the query pool instead of on the

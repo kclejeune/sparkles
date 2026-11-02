@@ -210,7 +210,7 @@ implementation status.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Server and Fuseki integration](server/README.md#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. On Linux, request threads keep to the performance cores of Intel hybrid processors. Further integration and ARQ extensions remain. |
+| [Server and Fuseki integration](server/README.md#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. On Linux, request work keeps to the performance cores of Intel hybrid processors while they can hold it. Further integration and ARQ extensions remain. |
 | [Access control and authentication](server/README.md#access-control-and-security) | Partially complete. | Dataset, graph and triple protections, OIDC and API tokens are available. Derived visibility, guarded caller adoption and authentication extensions remain planned. |
 | [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete within the documented settings scope. | Layered settings, operator locks, runtime administration and prefix completion are available. |
 | [Resource catalog](server/README.md#resource-catalog) | Partially complete. | Versioned resources, SPDX licence classes with propagated obligations and a NOTICE, and vocabulary namespaces are available in DCAT 3. The licence gate reports a verdict that warns by default. Fetching, loading, mirrors and gates on export routes remain under items 458, 525 and 526. |
