@@ -36,12 +36,12 @@ mod swap;
 /// real handles refuse the change. It holds the registry's management lock meanwhile.
 const WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Pause the views workers of `runtimes`, waiting up to [`WORKER_WAIT`] in all for
-/// rounds in progress. `None` when a round outlasts it.
+/// Pause the views workers of `runtimes`, waiting until `until` for rounds in progress.
+/// `None` when a round outlasts it.
 fn pause_workers(
     runtimes: &[Arc<crate::incr::Runtime>],
+    until: std::time::Instant,
 ) -> Option<Vec<crate::incr::WorkerPause<'_>>> {
-    let until = std::time::Instant::now() + WORKER_WAIT;
     runtimes.iter().map(|r| r.pause_worker(until)).collect()
 }
 
@@ -623,16 +623,30 @@ impl Catalog {
         }
         Ok(self.get(name))
     }
-    /// The views runtimes of a managed persistent dataset and its branches, whose
-    /// workers a rename or delete pauses while it checks for handles and closes it.
-    fn managed_views(&self, name: &str) -> Vec<Arc<crate::incr::Runtime>> {
-        self.inner
+    /// Pause the views workers of a managed persistent dataset and its branches while
+    /// a rename or delete checks for other handles and closes it, waiting up to
+    /// [`WORKER_WAIT`] in all. The pauses borrow `runtimes`. Other datasets need no pause.
+    fn pause_managed_views<'a>(
+        &self,
+        name: &str,
+        runtimes: &'a mut Vec<Arc<crate::incr::Runtime>>,
+    ) -> Result<Vec<crate::incr::WorkerPause<'a>>> {
+        let until = std::time::Instant::now() + WORKER_WAIT;
+        // A clone, so that no registry lock is held while the branch caches are waited for.
+        let dataset = self
+            .inner
             .entries
             .read()
             .get(name)
             .filter(|e| e.kind == DatasetKind::Persistent && !e.attached)
-            .map(|e| e.dataset.views_runtimes())
-            .unwrap_or_default()
+            .map(|e| e.dataset.clone());
+        if let Some(dataset) = dataset {
+            *runtimes = dataset.views_runtimes(until).ok_or_else(|| {
+                Error::Conflict(format!("dataset /{name} still has live handles"))
+            })?;
+        }
+        pause_workers(runtimes, until)
+            .ok_or_else(|| Error::Conflict(format!("dataset /{name} is still updating its views")))
     }
 
     /// Whether a registered dataset has handles besides the catalog's own, including
@@ -850,12 +864,8 @@ impl Catalog {
                     "dataset /{name} is reserved by task {holder}"
                 )));
             }
-            let runtimes = self.managed_views(name);
-            let Some(paused) = pause_workers(&runtimes) else {
-                return Err(Error::Conflict(format!(
-                    "dataset /{name} is still updating its views"
-                )));
-            };
+            let mut runtimes = Vec::new();
+            let paused = self.pause_managed_views(name, &mut runtimes)?;
             let mut map = Some(self.inner.entries.write());
             let Some(entry) = map.as_ref().expect("entries").get(name) else {
                 return Ok(false);
@@ -1033,12 +1043,8 @@ impl Catalog {
         if self.reserved_by(from).is_some() {
             return Err(Error::Conflict(format!("dataset /{from} is reserved")));
         }
-        let runtimes = self.managed_views(from);
-        let Some(paused) = pause_workers(&runtimes) else {
-            return Err(Error::Conflict(format!(
-                "dataset /{from} is still updating its views"
-            )));
-        };
+        let mut runtimes = Vec::new();
+        let paused = self.pause_managed_views(from, &mut runtimes)?;
         let mut map = Some(self.inner.entries.write());
         let mut entry = {
             let map = map.as_mut().expect("entries");

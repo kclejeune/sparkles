@@ -446,20 +446,32 @@ impl Dataset {
     }
 
     /// The views runtimes of this dataset and of the branches it keeps open, each
-    /// once, for a catalog that pauses their workers around a close.
-    pub(crate) fn views_runtimes(&self) -> Vec<Arc<crate::incr::Runtime>> {
-        fn collect(state: &DatasetState, out: &mut Vec<Arc<crate::incr::Runtime>>) {
+    /// once, for a catalog that pauses their workers around a close. `None` when a
+    /// branch cache stays locked until `until`. A thread that drops a cached branch
+    /// holds the cache while it waits for that branch's views round, and the round can
+    /// be the caller, so the wait for the cache is bounded.
+    pub(crate) fn views_runtimes(
+        &self,
+        until: std::time::Instant,
+    ) -> Option<Vec<Arc<crate::incr::Runtime>>> {
+        fn collect(
+            state: &DatasetState,
+            until: std::time::Instant,
+            out: &mut Vec<Arc<crate::incr::Runtime>>,
+        ) -> bool {
             if out.iter().any(|r| Arc::ptr_eq(r, &state.views)) {
-                return;
+                return true;
             }
             out.push(state.views.clone());
-            for branch in state.branches.lock().values() {
-                collect(&branch.inner, out);
-            }
+            let Some(branches) = state.branches.try_lock_until(until) else {
+                return false;
+            };
+            branches
+                .values()
+                .all(|branch| collect(&branch.inner, until, out))
         }
         let mut out = Vec::new();
-        collect(&self.inner, &mut out);
-        out
+        collect(&self.inner, until, &mut out).then_some(out)
     }
 
     #[cfg(feature = "backup")]
