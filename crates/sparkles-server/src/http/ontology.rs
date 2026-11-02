@@ -3,8 +3,10 @@
 //! `GET /$/ontology/{ds}/entities` and `GET /$/ontology/{ds}/entity`, the removal of an
 //! entity `DELETE /$/ontology/{ds}/entity`, the profile checks
 //! `POST /$/ontology/{ds}/check`, edits `POST /$/ontology/{ds}/axioms` and the diff of
-//! the axioms of two commits `GET /$/ontology/{ds}/diff`, and the OWL 2 EL
-//! classification `POST /$/ontology/{ds}/classify` (spec F24). The library
+//! the axioms of two commits `GET /$/ontology/{ds}/diff`, the OWL 2 EL
+//! classification `POST /$/ontology/{ds}/classify` (spec F24), and the Manchester
+//! reader `POST /$/ontology/{ds}/parse` and DL queries `POST /$/ontology/{ds}/dl-query`
+//! (spec U12). The library
 //! reads, checks and edits (`sparkles::handles::ontology`); these handlers parse the
 //! request and apply the caller's grants through [`CallerContext`].
 //!
@@ -449,6 +451,125 @@ pub(super) async fn check(
             check.assertions,
         );
         Ok(with_commit(Json(j).into_response(), &ds, o.snapshot.commit))
+    })
+    .await
+}
+
+/// `POST /$/ontology/{ds}/parse`: read Manchester `text` against the ontology (spec
+/// U12), as `as` says: a class expression (the default), a data range, an individual,
+/// a literal or an axiom. The answer has the value in its JSON form, in functional-style
+/// syntax and as the Manchester renderer writes it back. Text that does not parse is a
+/// `400` with the code `invalid-manchester`, its `reason` (`syntax`, `unknown`,
+/// `ambiguous` or `kind`), its span as `start` and `end` in UTF-16 code units, and the
+/// `candidates` of an ambiguous name.
+pub(super) async fn parse(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    bytes: Bytes,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let o = body_object(&bytes, &["graph", "imports", "mode", "text", "as"])?;
+    let req = request_body(&o, request_of(&params)?)?;
+    if req.inferences {
+        return Err(bad(
+            "a parse reads the asserted axioms: leave out 'inferences'",
+        ));
+    }
+    let text = match o.get("text") {
+        Some(J::String(s)) => s.clone(),
+        _ => return Err(bad("text: the Manchester text to read")),
+    };
+    let what = match o.get("as") {
+        None | Some(J::Null) => onto::wire::what_of(None),
+        Some(J::String(s)) => onto::wire::what_of(Some(s)),
+        Some(_) => return Err(bad("as: a string")),
+    }
+    .map_err(ontology_error)?;
+    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    blocking(move || {
+        let handle = ds.dataset.ontology();
+        let opts = handle.anchored(&opts).map_err(ontology_error)?;
+        let o = handle.open(&req, &opts).map_err(ontology_error)?;
+        let parsed = handle
+            .parse_manchester(&o, &text, what)
+            .map_err(ontology_error)?;
+        let body = onto::wire::parse_body(
+            &ds.name,
+            &o,
+            &req,
+            &renderer(&ds),
+            &handle.vocabulary(&o),
+            what,
+            &parsed,
+        );
+        Ok(with_commit(
+            Json(body).into_response(),
+            &ds,
+            o.snapshot.commit,
+        ))
+    })
+    .await
+}
+
+/// `POST /$/ontology/{ds}/dl-query`: a DL query (spec U12). `expression` is a class
+/// expression in Manchester syntax, in functional-style syntax with
+/// `syntax: "functional"`, or in its JSON form. `reasoning` is `auto` (the default),
+/// `el` or `rl`, `answers` lists the answers wanted (every one by default), and `limit`
+/// caps each list. The answer lists the classes and individuals by IRI, with the
+/// reasoning used, its gaps and notes, and the counts.
+pub(super) async fn dl_query(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    bytes: Bytes,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let o = body_object(
+        &bytes,
+        &[
+            "graph",
+            "imports",
+            "mode",
+            "expression",
+            "syntax",
+            "reasoning",
+            "answers",
+            "limit",
+            "threads",
+            "maxDerived",
+        ],
+    )?;
+    let req = request_body(&o, request_of(&params)?)?;
+    let (q, limit) = onto::wire::dl_query_of(&o).map_err(ontology_error)?;
+    let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    // a client that goes away stops the run
+    let (cancel, _cancel_on_drop) = cancel_on_drop();
+    opts.cancel = Some(cancel);
+    blocking(move || {
+        let handle = ds.dataset.ontology();
+        let opts = handle.anchored(&opts).map_err(ontology_error)?;
+        let opened = handle.open(&req, &opts).map_err(ontology_error)?;
+        let prefixes: Vec<(String, String)> = ds.dataset.prefixes().into_iter().collect();
+        let q = onto::wire::dl_expression(&handle, &opened, &o, q, &prefixes)
+            .map_err(ontology_error)?;
+        let out = handle
+            .dl_query_opened(opened, &req, &q, &opts)
+            .map_err(ontology_error)?;
+        let seq = out.opened.snapshot.commit;
+        let body = onto::wire::dl_query_body(
+            &ds.name,
+            &out,
+            &req,
+            &renderer(&ds),
+            &handle.vocabulary(&out.opened),
+            limit,
+        );
+        Ok(with_commit(Json(body).into_response(), &ds, seq))
     })
     .await
 }

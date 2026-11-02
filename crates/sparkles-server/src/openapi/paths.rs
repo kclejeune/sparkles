@@ -826,6 +826,60 @@ fn ontology(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 507]),
     );
     p.add(
+        op(POST, "/$/ontology/{ds}/parse", "parseManchester", "Ontology", "Read Manchester syntax")
+            .param("branch")
+            .doc("Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.")
+            .see("ontology")
+            .body(
+                true,
+                "The ontology and the text.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["text"],
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "text": { "type": "string", "description": "The Manchester text." },
+                        "as": { "type": "string", "enum": ["classExpression", "dataRange", "individual", "literal", "axiom"], "description": "What the text is (`classExpression` by default)." }
+                    }
+                } } }),
+            )
+            .resp("200", "The value in its JSON form, `ofn` and `manchester`.", Some(object.clone()))
+            .errors(&[400, 404, 408]),
+    );
+    p.add(
+        op(POST, "/$/ontology/{ds}/dl-query", "dlQueryOntology", "Ontology", "Answer a DL query")
+            .param("branch")
+            .doc("Answers the class expression `expression` with its equivalent classes, its direct and inferred superclasses and subclasses, and its instances, as `answers` selects (every one by default). When the expression and every logical axiom of the ontology are in OWL 2 EL, the EL classifier answers it completely by classifying the expression as a fresh class with the dataset's kept classification, incrementally, and leaves the kept taxonomy as it was. Otherwise the OWL 2 RL rules answer it by demand reasoning over a copy of the terminology and the assertions, which can miss class answers. `reasoning` (`auto`, `el` or `rl`) chooses the engine, and `el` keeps to the classifier outside EL, leaving out the axioms it cannot use. The answer's `reasoning` names the engine, why it was chosen, whether the answers are complete, and the axioms outside the profile that can make them incomplete. `syntax` reads a text expression as Manchester syntax (the default) or functional-style syntax, and an object expression is read as the JSON form. A Manchester expression that does not read is `400` as `POST /$/ontology/{ds}/parse` answers it. A caller whose grants limit endpoints needs the `query` endpoint.")
+            .see("ontology")
+            .param("timeout")
+            .body(
+                true,
+                "The ontology, the expression and the answers.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["expression"],
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "expression": { "description": "The class expression: Manchester or functional-style text, or the JSON form." },
+                        "syntax": { "type": "string", "enum": ["manchester", "functional"], "description": "The syntax of a text expression (`manchester` by default). An object is read as the JSON form." },
+                        "reasoning": { "type": "string", "enum": ["auto", "el", "rl"], "description": "The engine (`auto` by default)." },
+                        "answers": { "type": "array", "items": { "type": "string", "enum": ["equivalents", "superclasses", "directSuperclasses", "subclasses", "directSubclasses", "instances"] } },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most IRIs each answer and the gaps list (1,000 by default)." },
+                        "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant)." },
+                        "maxDerived": { "type": "integer", "minimum": 1, "description": "The most facts the classifier derives before the run stops with `507`." }
+                    }
+                } } }),
+            )
+            .resp("200", "The answers, each a list of IRIs with its count, and the reasoning that found them.", Some(object.clone()))
+            .errors(&[400, 404, 408, 507]),
+    );
+    p.add(
         read(op(GET, "/$/ontology/{ds}/diff", "diffOntology", "Ontology", "Diff the axioms of two commits"))
             .doc("The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs the `diff` endpoint.")
             .see("ontology")

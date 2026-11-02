@@ -36691,6 +36691,163 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/ontology/{ds}/dl-query": {
+      "post": {
+        "description": "Answers the class expression `expression` with its equivalent classes, its direct and inferred superclasses and subclasses, and its instances, as `answers` selects (every one by default). When the expression and every logical axiom of the ontology are in OWL 2 EL, the EL classifier answers it completely by classifying the expression as a fresh class with the dataset's kept classification, incrementally, and leaves the kept taxonomy as it was. Otherwise the OWL 2 RL rules answer it by demand reasoning over a copy of the terminology and the assertions, which can miss class answers. `reasoning` (`auto`, `el` or `rl`) chooses the engine, and `el` keeps to the classifier outside EL, leaving out the axioms it cannot use. The answer's `reasoning` names the engine, why it was chosen, whether the answers are complete, and the axioms outside the profile that can make them incomplete. `syntax` reads a text expression as Manchester syntax (the default) or functional-style syntax, and an object expression is read as the JSON form. A Manchester expression that does not read is `400` as `POST /$/ontology/{ds}/parse` answers it. A caller whose grants limit endpoints needs the `query` endpoint.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "dlQueryOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "answers": {
+                    "items": {
+                      "enum": [
+                        "equivalents",
+                        "superclasses",
+                        "directSuperclasses",
+                        "subclasses",
+                        "directSubclasses",
+                        "instances"
+                      ],
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "expression": {
+                    "description": "The class expression: Manchester or functional-style text, or the JSON form."
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "limit": {
+                    "description": "The most IRIs each answer and the gaps list (1,000 by default).",
+                    "maximum": 10000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "maxDerived": {
+                    "description": "The most facts the classifier derives before the run stops with `507`.",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "reasoning": {
+                    "description": "The engine (`auto` by default).",
+                    "enum": [
+                      "auto",
+                      "el",
+                      "rl"
+                    ],
+                    "type": "string"
+                  },
+                  "syntax": {
+                    "description": "The syntax of a text expression (`manchester` by default). An object is read as the JSON form.",
+                    "enum": [
+                      "manchester",
+                      "functional"
+                    ],
+                    "type": "string"
+                  },
+                  "threads": {
+                    "description": "The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant).",
+                    "maximum": 1024,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "expression"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The ontology, the expression and the answers.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answers, each a list of IRIs with its count, and the reasoning that found them."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Answer a DL query",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/ontology/{ds}/entities": {
       "get": {
         "description": "The entities the ontology declares or, in a lenient read, types by their use, with their kinds, in IRI order and one page at a time.",
@@ -37183,6 +37340,121 @@
           }
         },
         "summary": "Ontology entity",
+        "tags": [
+          "Ontology"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/parse": {
+      "post": {
+        "description": "Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
+        },
+        "operationId": "parseManchester",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "as": {
+                    "description": "What the text is (`classExpression` by default).",
+                    "enum": [
+                      "classExpression",
+                      "dataRange",
+                      "individual",
+                      "literal",
+                      "axiom"
+                    ],
+                    "type": "string"
+                  },
+                  "graph": {
+                    "description": "A graph IRI or `default`, or a list of them."
+                  },
+                  "imports": {
+                    "type": "boolean"
+                  },
+                  "mode": {
+                    "enum": [
+                      "lenient",
+                      "strict"
+                    ],
+                    "type": "string"
+                  },
+                  "text": {
+                    "description": "The Manchester text.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The ontology and the text.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The value in its JSON form, `ofn` and `manchester`."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Read Manchester syntax",
         "tags": [
           "Ontology"
         ],

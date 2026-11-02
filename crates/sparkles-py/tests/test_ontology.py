@@ -345,3 +345,27 @@ def test_classify(ds: sparkles.Dataset) -> None:
     assert sparkles.Axiom(sub) in [
         e["axiom"] for e in ds.ontology.axioms(EX + "taxonomy")["axioms"]
     ]
+
+
+def test_manchester_and_dl_query(ds: sparkles.Dataset) -> None:
+    ds.update(f'{PREFIXES} INSERT DATA {{ :Course rdfs:label "Course unit" . }}')
+    p = ds.ontology.parse("teaches some 'Course unit'")
+    assert p["value"] == {
+        "type": "ObjectSomeValuesFrom",
+        "property": EX + "teaches",
+        "class": EX + "Course",
+    }
+    ax = ds.ontology.parse("Professor SubClassOf teaches some Course", as_="axiom")
+    assert ax["value"]["type"] == "SubClassOf"
+    with pytest.raises(sparkles.SparklesError, match="Lecture"):
+        ds.ontology.parse("teaches some Lecture")
+    r = ds.ontology.dl_query("teaches some Course", answers=["subclasses", "instances"])
+    assert r["reasoning"]["engine"] == "el" and r["reasoning"]["complete"]
+    assert r["subclasses"] == [EX + "Professor"]
+    assert r["instances"] == [EX + "ann"]
+    j = ds.ontology.dl_query(
+        {"type": "ObjectSomeValuesFrom", "property": EX + "teaches", "class": EX + "Course"},
+        reasoning="rl",
+        answers=["subclasses"],
+    )
+    assert j["reasoning"]["engine"] == "rl"

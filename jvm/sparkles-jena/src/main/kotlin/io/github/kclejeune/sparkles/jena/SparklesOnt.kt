@@ -118,6 +118,18 @@ public object SparklesOnt {
     @JvmOverloads
     public fun classify(dataset: DatasetGraphSparkles, graphIri: String? = null, query: ClassifyQuery = ClassifyQuery()): JsonObject =
         dataset.ontology().classify(OntologyRead(graph = graphIri), query)
+
+    /** Manchester text read against the graph's names and labels, as [SparklesOntology.parse] reads it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun parse(dataset: DatasetGraphSparkles, text: String, `as`: String = "classExpression", graphIri: String? = null): JsonObject =
+        dataset.ontology().parse(text, `as`, OntologyRead(graph = graphIri))
+
+    /** A DL query of the graph, as [SparklesOntology.dlQuery] answers it. */
+    @JvmStatic
+    @JvmOverloads
+    public fun dlQuery(dataset: DatasetGraphSparkles, query: DlQuery, graphIri: String? = null): JsonObject =
+        dataset.ontology().dlQuery(query, OntologyRead(graph = graphIri))
 }
 
 /**
@@ -392,6 +404,61 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         val args = read.value()
         query.into(args)
         return call("classify", args, operation, query.target != null)
+    }
+
+    /**
+     * Manchester text read against the ontology's names and labels as `as`
+     * (`classExpression`, `dataRange`, `individual`, `literal` or `axiom`): the value in its
+     * JSON form, `ofn` and `manchester`. Text that does not read throws, with the span and,
+     * for an ambiguous name, the candidates in the message.
+     */
+    @JvmOverloads public fun parse(text: String, `as`: String = "classExpression", read: OntologyRead = OntologyRead()): JsonObject =
+        SparklesOperation().use { parse(text, `as`, read, it) }
+    public fun parse(text: String, `as`: String, read: OntologyRead, operation: SparklesOperation): JsonObject {
+        val args = read.value()
+        args.put("text", text)
+        args.put("as", `as`)
+        return call("parse", args, operation, false)
+    }
+
+    /**
+     * A DL query (spec U12): the equivalents, superclasses, subclasses and instances of a
+     * class expression. The EL classifier answers inside OWL 2 EL and the RL rules outside
+     * it, and the answer's `reasoning` names the engine and whether the answers are complete.
+     */
+    @JvmOverloads public fun dlQuery(query: DlQuery, read: OntologyRead = OntologyRead()): JsonObject =
+        SparklesOperation().use { dlQuery(query, read, it) }
+    public fun dlQuery(query: DlQuery, read: OntologyRead, operation: SparklesOperation): JsonObject {
+        val args = read.value()
+        query.into(args)
+        return call("dlQuery", args, operation, false)
+    }
+}
+
+/**
+ * A DL query: the class expression in Manchester syntax, or in functional-style syntax with
+ * `syntax = "functional"`, the engine (`auto`, `el` or `rl`), the answers wanted (every one
+ * when empty) and the most IRIs each answer lists.
+ */
+public data class DlQuery @JvmOverloads public constructor(
+    public val expression: String,
+    public val syntax: String = "manchester",
+    public val reasoning: String = "auto",
+    public val answers: List<String> = emptyList(),
+    public val limit: Int = 1000,
+    public val threads: Int = 0,
+) {
+    init {
+        require(limit > 0 && threads >= 0)
+    }
+
+    internal fun into(j: JsonObject) {
+        j.put("expression", expression)
+        j.put("syntax", syntax)
+        j.put("reasoning", reasoning)
+        if (answers.isNotEmpty()) j.put("answers", JsonArray().also { a -> answers.forEach { a.add(it) } })
+        j.put("limit", limit.toLong())
+        j.put("threads", threads.toLong())
     }
 }
 

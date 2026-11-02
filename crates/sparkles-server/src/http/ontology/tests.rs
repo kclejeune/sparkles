@@ -997,3 +997,130 @@ async fn edits_take_functional_syntax() {
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     assert_eq!(r.json()["code"], "invalid-axiom", "{}", r.text());
 }
+
+#[tokio::test]
+async fn parse_reads_manchester_and_reports_the_span() {
+    let s = server();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "Person and teaches some Course"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["as"], "classExpression", "{j}");
+    // the dataset's prefixes write the names, which read back as they are written
+    assert_eq!(
+        j["manchester"], ":Person and (:teaches some :Course)",
+        "{j}"
+    );
+    assert_eq!(j["value"]["type"], "ObjectIntersectionOf", "{j}");
+    assert_eq!(
+        j["ofn"], "ObjectIntersectionOf(:Person ObjectSomeValuesFrom(:teaches :Course))",
+        "{j}"
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "Professor SubClassOf Person", "as": "axiom"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["value"]["type"], "SubClassOf");
+    // the span counts UTF-16 code units: the emoji before the name takes two
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "'😀' or Robot"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "invalid-manchester", "{j}");
+    assert_eq!(j["reason"], "unknown", "{j}");
+    assert_eq!(
+        (j["start"].as_u64(), j["end"].as_u64()),
+        (Some(0), Some(4)),
+        "{j}"
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/parse",
+        json!({"text": "x", "as": "frame"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = post(&s.app, "/$/ontology/t/parse", json!({"txt": "x"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
+async fn dl_query_answers_with_the_reasoning_used() {
+    let s = server();
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({"expression": "teaches some Course"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.headers.contains_key("sparkles-commit"), "{:?}", r.headers);
+    let j = r.json();
+    assert_eq!(j["reasoning"]["engine"], "el", "{j}");
+    assert_eq!(j["reasoning"]["complete"], true, "{j}");
+    assert_eq!(j["subclasses"], json!(["http://ex.org/Professor"]), "{j}");
+    assert_eq!(
+        j["directSubclasses"],
+        json!(["http://ex.org/Professor"]),
+        "{j}"
+    );
+    assert_eq!(j["instances"], json!(["http://ex.org/ada"]), "{j}");
+    assert_eq!(
+        j["superclasses"],
+        json!(["http://www.w3.org/2002/07/owl#Thing"]),
+        "{j}"
+    );
+    assert_eq!(j["counts"]["subclasses"], 1, "{j}");
+    // the functional-style and JSON forms, and the RL engine by name
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({
+            "expression": "ObjectSomeValuesFrom(<http://ex.org/teaches> <http://ex.org/Course>)",
+            "syntax": "functional",
+            "reasoning": "rl",
+            "answers": ["subclasses", "instances"],
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["reasoning"]["engine"], "rl", "{j}");
+    assert_eq!(j["instances"], json!(["http://ex.org/ada"]), "{j}");
+    assert!(j.get("superclasses").is_none(), "{j}");
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({"expression": {"type": "ObjectSomeValuesFrom", "property": "http://ex.org/teaches", "class": "http://ex.org/Course"}, "answers": "subclasses"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // an expression that does not read, an answer and an engine the route does not know
+    let r = post(
+        &s.app,
+        "/$/ontology/t/dl-query",
+        json!({"expression": "teaches some"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["code"], "invalid-manchester", "{}", r.text());
+    for body in [
+        json!({"expression": "Course", "answers": ["cousins"]}),
+        json!({"expression": "Course", "reasoning": "dl"}),
+        json!({}),
+    ] {
+        let r = post(&s.app, "/$/ontology/t/dl-query", body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    }
+}

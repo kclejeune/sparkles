@@ -526,6 +526,18 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("ontology", "classifyOntology", "ontology.classify", |ds| {
             ds.ontology().classify(&any(), &any(), &any());
         }),
+        op_if!("ontology", "parseManchester", "ontology.parse", |ds| {
+            if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                let _ = ds.ontology().parse_manchester(
+                    &o,
+                    "",
+                    sparkles::owl::manchester::What::ClassExpression,
+                );
+            }
+        }),
+        op_if!("ontology", "dlQueryOntology", "ontology.dl_query", |ds| {
+            let _ = ds.ontology().dl_query(&any(), &any(), &any());
+        }),
         op_if!("ontology", "diffOntology", "ontology.diff", |ds| {
             ds.ontology().diff(
                 &any(),

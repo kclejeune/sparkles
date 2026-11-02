@@ -11,6 +11,7 @@
 //! prefixes and the standard ones.
 
 use super::classify::{Classified, ClassifyRequest};
+use super::dl_query::{DlAnswers, DlQueryAnswer, DlQueryRequest, DlReasoning};
 use super::{
     CheckRequest, EditOutcome, EditRequest, OntologyDiff, OntologyRequest, Opened, check_opened,
     parse_axiom_types, parse_profiles, report_json,
@@ -636,7 +637,7 @@ pub fn entity_body(
 // ------------------------------------------------------------- requests ------
 
 /// The operations [`call`] answers, in the names of the bindings' surface keys.
-pub const OPERATIONS: [&str; 9] = [
+pub const OPERATIONS: [&str; 11] = [
     "summary",
     "axioms",
     "entities",
@@ -646,6 +647,8 @@ pub const OPERATIONS: [&str; 9] = [
     "removeEntity",
     "diff",
     "classify",
+    "parse",
+    "dlQuery",
 ];
 
 /// The members each operation reads besides those that name the ontology.
@@ -668,6 +671,16 @@ fn members(op: &str) -> &'static [&'static str] {
             "limit",
             "offset",
             "threads",
+        ],
+        "parse" => &["text", "as"],
+        "dlQuery" => &[
+            "expression",
+            "syntax",
+            "reasoning",
+            "answers",
+            "limit",
+            "threads",
+            "maxDerived",
         ],
         _ => &[],
     }
@@ -831,6 +844,13 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 ///   `assertions`, `target` and `message` (write the taxonomy to that graph), `about` (a
 ///   class to describe), `nodes` (list the taxonomy's nodes), `limit`, `offset` and
 ///   `threads`.
+/// - `parse`: Manchester `text` read against the ontology, as
+///   `POST /$/ontology/{ds}/parse` answers it, with `as` (`classExpression`, the
+///   default, `dataRange`, `individual`, `literal` or `axiom`).
+/// - `dlQuery`: the DL query of `POST /$/ontology/{ds}/dl-query`, with `expression`
+///   (Manchester text, functional-style text with `syntax: "functional"`, or the JSON
+///   form), `reasoning` (`auto`, `el` or `rl`), `answers` (a list of
+///   [`DlAnswers::NAMES`]), `limit`, `threads` and `maxDerived`.
 pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> {
     let empty = Map::new();
     let a = match args {
@@ -994,6 +1014,38 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let out = handle.classify(&req, &c, opts)?;
             classify_body(name, &out, &req, &r, &q)
         }
+        "parse" => {
+            let text =
+                string(a, "text")?.ok_or_else(|| bad("text: the Manchester text to read"))?;
+            let what = what_of(string(a, "as")?)?;
+            let opts = handle.anchored(opts)?;
+            let o = handle.open(&req, &opts)?;
+            let parsed = handle.parse_manchester(&o, text, what)?;
+            Ok(parse_body(
+                name,
+                &o,
+                &req,
+                &r,
+                &handle.vocabulary(&o),
+                what,
+                &parsed,
+            ))
+        }
+        "dlQuery" => {
+            let (q, limit) = dl_query_of(a)?;
+            let opts = handle.anchored(opts)?;
+            let o = handle.open(&req, &opts)?;
+            let q = dl_expression(&handle, &o, a, q, &prefixes)?;
+            let out = handle.dl_query_opened(o, &req, &q, &opts)?;
+            Ok(dl_query_body(
+                name,
+                &out,
+                &req,
+                &r,
+                &handle.vocabulary(&out.opened),
+                limit,
+            ))
+        }
         _ => unreachable!("checked above"),
     }
 }
@@ -1123,4 +1175,200 @@ pub fn classify_body(
         j["written"] = edit_body(w, r);
     }
     Ok(j)
+}
+
+// --------------------------------------------------------- Manchester and DL query ---
+
+/// What `as` names for a parse: a class expression when absent.
+pub fn what_of(s: Option<&str>) -> Result<sparkles_owl::manchester::What> {
+    use sparkles_owl::manchester::What;
+    match s {
+        None => Ok(What::ClassExpression),
+        Some(s) => What::parse(s).ok_or_else(|| {
+            bad(format!(
+                "as must be one of {}, not '{s}'",
+                What::ALL.map(|w| w.as_str()).join(", ")
+            ))
+        }),
+    }
+}
+
+/// The JSON of a parse, as `POST /$/ontology/{ds}/parse` answers it: the value in its
+/// JSON form, in functional-style syntax and as the Manchester renderer writes it back,
+/// with the members of the ontology read.
+pub fn parse_body(
+    name: &str,
+    o: &Opened,
+    req: &OntologyRequest,
+    r: &Renderer,
+    v: &sparkles_owl::manchester::Vocabulary,
+    what: sparkles_owl::manchester::What,
+    p: &sparkles_owl::manchester::Parsed,
+) -> J {
+    use sparkles_owl::manchester::{Parsed, Renderer as Mr};
+    let m = Mr::of_vocabulary(v);
+    let (ofn, manchester) = match p {
+        Parsed::ClassExpression(c) => (r.class_expression(c), Some(m.class_expression(c))),
+        Parsed::DataRange(d) => (r.data_range(d), Some(m.data_range(d))),
+        Parsed::Individual(i) => (r.individual(i), Some(m.individual(i))),
+        Parsed::Literal(l) => (r.literal(l), Some(m.literal(l))),
+        Parsed::Axiom(a) => (r.axiom(a), m.axiom(a)),
+    };
+    let mut j = opened_json(name, o, req);
+    j["as"] = json!(what.as_str());
+    j["value"] = p.json();
+    j["ofn"] = json!(ofn);
+    j["manchester"] = json!(manchester);
+    j
+}
+
+/// The query and the list limit of a `dlQuery` request, with the expression left to
+/// [`dl_expression`].
+pub fn dl_query_of(a: &Map<String, J>) -> Result<(DlQueryRequest, usize)> {
+    let mut q = DlQueryRequest::new(ClassExpression::Class(sparkles_owl::Class::thing()));
+    if let Some(s) = string(a, "reasoning")? {
+        q.reasoning = DlReasoning::parse(s)
+            .ok_or_else(|| bad(format!("reasoning must be auto, el or rl, not '{s}'")))?;
+    }
+    match a.get("answers") {
+        None | Some(J::Null) => {}
+        Some(J::String(s)) => {
+            q.answers = DlAnswers::none();
+            for n in s.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                q.answers.set(n)?;
+            }
+        }
+        Some(J::Array(v)) => {
+            q.answers = DlAnswers::none();
+            for n in v {
+                q.answers
+                    .set(n.as_str().ok_or_else(|| bad("answers: a list of names"))?)?;
+            }
+        }
+        Some(_) => return Err(bad("answers: a list of names")),
+    }
+    q.threads = number(a, "threads", 0, 1024)?.unwrap_or(0);
+    q.max_derived = number(a, "maxDerived", 1, usize::MAX)?;
+    let limit = number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DL_QUERY_LIMIT);
+    Ok((q, limit))
+}
+
+/// The entries each list of a DL query's answer holds by default.
+pub const DL_QUERY_LIMIT: usize = 1000;
+
+/// The expression of a `dlQuery` request read against the open ontology: Manchester
+/// text by default, functional-style text with `syntax: "functional"`, or the JSON form.
+pub fn dl_expression(
+    handle: &super::Ontologies,
+    o: &Opened,
+    a: &Map<String, J>,
+    mut q: DlQueryRequest,
+    prefixes: &[(String, String)],
+) -> Result<DlQueryRequest> {
+    let syntax = string(a, "syntax")?.unwrap_or("manchester");
+    q.expression = match (a.get("expression"), syntax) {
+        (None | Some(J::Null), _) => return Err(bad("expression: the class expression to query")),
+        (Some(J::String(s)), "manchester") => {
+            match handle.parse_manchester(o, s, sparkles_owl::manchester::What::ClassExpression)? {
+                sparkles_owl::manchester::Parsed::ClassExpression(c) => c,
+                _ => unreachable!("asked for a class expression"),
+            }
+        }
+        (Some(J::String(s)), "functional") => {
+            sparkles_owl::ofn_read::parse_class_expression(s, prefixes)
+                .map_err(|e| bad(format!("expression: {e}")))?
+        }
+        (Some(J::String(_)), s) => {
+            return Err(bad(format!(
+                "syntax must be manchester or functional, not '{s}'"
+            )));
+        }
+        (Some(v @ J::Object(_)), _) => sparkles_owl::json::read_class_expression(v)
+            .map_err(|e| bad(format!("expression: {e}")))?,
+        (Some(_), _) => {
+            return Err(bad(
+                "expression: Manchester or functional-style text, or the JSON form",
+            ));
+        }
+    };
+    Ok(q)
+}
+
+/// The JSON of a DL query's answer, as `POST /$/ontology/{ds}/dl-query` answers it:
+/// the members of the ontology read, the expression in Manchester and functional-style
+/// syntax, the reasoning used with its gaps (at most `limit`) and notes, whether the
+/// expression is satisfiable and the ontology consistent, and each list asked for (at
+/// most `limit` of each) with its count.
+pub fn dl_query_body(
+    name: &str,
+    a: &DlQueryAnswer,
+    req: &OntologyRequest,
+    r: &Renderer,
+    v: &sparkles_owl::manchester::Vocabulary,
+    limit: usize,
+) -> J {
+    let m = sparkles_owl::manchester::Renderer::of_vocabulary(v);
+    let mut j = opened_json(name, &a.opened, req);
+    j["expression"] = json!({
+        "manchester": m.class_expression(&a.expression),
+        "ofn": r.class_expression(&a.expression),
+        "json": sparkles_owl::json::class_expression(&a.expression),
+    });
+    let u = &a.reasoning;
+    j["reasoning"] = json!({
+        "engine": u.engine.as_str(),
+        "title": u.engine.title(),
+        "why": u.why,
+        "complete": u.complete,
+        "instancesComplete": u.instances_complete,
+        "gapCount": u.gaps.len(),
+        "gaps": u.gaps.iter().take(limit).map(|g| {
+            let mut x = json!({
+                "message": g.message,
+                "rule": g.rule,
+                "partial": g.partial,
+            });
+            if let Some(ax) = &g.axiom {
+                x["type"] = json!(ax.axiom_type().name());
+                x["ofn"] = json!(r.axiom(ax));
+                x["manchester"] = json!(m.axiom(ax));
+                x["axiom"] = sparkles_owl::json::axiom(ax);
+            }
+            x
+        }).collect::<Vec<_>>(),
+        "notes": u.notes,
+    });
+    j["satisfiable"] = json!(a.satisfiable);
+    j["consistent"] = json!(a.consistent);
+    j["incremental"] = json!(a.incremental);
+    j["elapsedMs"] = json!(a.elapsed.as_secs_f64() * 1000.0);
+    let mut counts = Map::new();
+    let mut list = |k: &str, v: Option<Vec<String>>| {
+        if let Some(v) = v {
+            counts.insert(k.to_string(), json!(v.len()));
+            j[k] = json!(v.into_iter().take(limit).collect::<Vec<_>>());
+        }
+    };
+    let iris = |v: &Option<Vec<sparkles_owl::Class>>| {
+        v.as_ref()
+            .map(|v| v.iter().map(|c| c.as_str().to_string()).collect::<Vec<_>>())
+    };
+    list("equivalents", iris(&a.equivalents));
+    list("superclasses", iris(&a.superclasses));
+    list("directSuperclasses", iris(&a.direct_superclasses));
+    list("subclasses", iris(&a.subclasses));
+    list("directSubclasses", iris(&a.direct_subclasses));
+    list(
+        "instances",
+        a.instances.as_ref().map(|v| {
+            v.iter()
+                .map(|i| match i {
+                    Individual::Named(n) => n.as_str().to_string(),
+                    Individual::Anonymous(b) => format!("_:{}", b.label()),
+                })
+                .collect()
+        }),
+    );
+    j["counts"] = J::Object(counts);
+    j
 }

@@ -110,9 +110,11 @@ impl Classified {
 /// The classification the dataset keeps.
 pub struct CacheEntry {
     key: String,
-    commit: u64,
+    /// the commit whose terminology the classifier holds, once it holds one
+    commit: Option<u64>,
     kinds: FxHashSet<AxiomKind>,
-    classifier: Classifier,
+    pub(super) classifier: Classifier,
+    /// the taxonomy of that terminology, once a classification computed it
     result: Option<(Arc<Classification>, Arc<Vec<Excluded>>)>,
 }
 
@@ -187,7 +189,7 @@ impl Ontologies {
                     Ok(true)
                 })?;
             }
-            let out = run(&mut k, c, &opts)?;
+            let out = run(&mut k, c.threads, &opts)?;
             (Arc::new(out), Arc::new(k.excluded()), false)
         };
         if let Some(about) = &c.about
@@ -221,6 +223,35 @@ impl Ontologies {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> Result<(Arc<Classification>, Arc<Vec<Excluded>>, bool)> {
+        self.with_kept(o, req, opts, |e| {
+            if let Some((cl, ex)) = &e.result {
+                return Ok(((cl.clone(), ex.clone(), true), true));
+            }
+            let out = run(&mut e.classifier, c.threads, opts)?;
+            let cl = Arc::new(out);
+            let ex = Arc::new(e.classifier.excluded());
+            let keep = cl.stats.memory <= CACHE_MAX_BYTES;
+            if keep {
+                e.result = Some((cl.clone(), ex.clone()));
+            }
+            Ok(((cl, ex, false), keep))
+        })
+    }
+
+    /// Runs `f` on the dataset's kept classifier of the ontology `o` reads, which then
+    /// holds the terminology of `o`'s state: the axioms that changed since the state it
+    /// held are added and removed, and are classified by the next run. One caller at a
+    /// time holds the classifier, and a second waits under its own deadline. `f`
+    /// answers whether the dataset keeps the classifier afterwards, and an error from
+    /// `f` keeps it. The classifier is kept for callers who read every graph of a
+    /// state that can be kept, and otherwise `f` gets a classifier of its own.
+    pub(super) fn with_kept<T>(
+        &self,
+        o: &Opened,
+        req: &OntologyRequest,
+        opts: &QueryOptions,
+        f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
+    ) -> Result<T> {
         let key = format!("{:?}|{:?}|{}", req.graphs(), req.imports, req.mode.as_str());
         let state = self.ds.state();
         // one run at a time: a second caller waits, then reads the first one's answer
@@ -238,53 +269,45 @@ impl Ontologies {
             Some(e) if e.key == key => e,
             _ => CacheEntry {
                 key,
-                commit: 0,
+                commit: None,
                 kinds: FxHashSet::default(),
                 classifier: Classifier::new(),
                 result: None,
             },
         };
         let commit = o.snapshot.commit;
-        if e.commit == commit
-            && let Some((cl, ex)) = &e.result
-        {
-            let answer = (cl.clone(), ex.clone(), true);
-            *state.classify_cache.lock() = Some(e);
-            return Ok(answer);
+        if e.commit != Some(commit) {
+            let kinds = kinds_of(o);
+            let added: Vec<Axiom> = kinds
+                .iter()
+                .filter(|k| !e.kinds.contains(*k))
+                .map(|k| Axiom::new(k.clone()))
+                .collect();
+            let removed: Vec<Axiom> = e
+                .kinds
+                .iter()
+                .filter(|k| !kinds.contains(*k))
+                .map(|k| Axiom::new(k.clone()))
+                .collect();
+            e.classifier.add(&added);
+            e.classifier.remove(&removed);
+            // the classifier holds the new axioms whether the run ends or not
+            e.kinds = kinds;
+            e.commit = Some(commit);
+            e.result = None;
         }
-        let kinds = kinds_of(o);
-        let added: Vec<Axiom> = kinds
-            .iter()
-            .filter(|k| !e.kinds.contains(*k))
-            .map(|k| Axiom::new(k.clone()))
-            .collect();
-        let removed: Vec<Axiom> = e
-            .kinds
-            .iter()
-            .filter(|k| !kinds.contains(*k))
-            .map(|k| Axiom::new(k.clone()))
-            .collect();
-        e.classifier.add(&added);
-        e.classifier.remove(&removed);
-        // the classifier holds the new axioms whether the run ends or not
-        e.kinds = kinds;
-        e.commit = commit;
-        e.result = None;
-        let out = run(&mut e.classifier, c, opts);
-        let out = match out {
-            Ok(out) => out,
+        match f(&mut e) {
+            Ok((out, keep)) => {
+                if keep {
+                    *state.classify_cache.lock() = Some(e);
+                }
+                Ok(out)
+            }
             Err(err) => {
                 *state.classify_cache.lock() = Some(e);
-                return Err(err);
+                Err(err)
             }
-        };
-        let cl = Arc::new(out);
-        let ex = Arc::new(e.classifier.excluded());
-        if cl.stats.memory <= CACHE_MAX_BYTES {
-            e.result = Some((cl.clone(), ex.clone()));
-            *state.classify_cache.lock() = Some(e);
         }
-        Ok((cl, ex, false))
     }
 
     /// Write the taxonomy to `target` in one commit: add its axioms, remove the taxonomy
@@ -474,10 +497,29 @@ impl Ontologies {
 
 /// Runs a classifier under the options' deadline, cancellation and memory budget, with
 /// threads from the algorithm pool.
-fn run(k: &mut Classifier, c: &ClassifyRequest, opts: &QueryOptions) -> Result<Classification> {
+fn run(k: &mut Classifier, threads: usize, opts: &QueryOptions) -> Result<Classification> {
+    bounded(threads, opts, |limits| k.classify(limits))
+}
+
+/// Saturates a classifier without a taxonomy, under the bounds [`run`] sets.
+pub(super) fn saturate(
+    k: &mut Classifier,
+    threads: usize,
+    opts: &QueryOptions,
+) -> Result<sparkles_owl::classify::Saturation> {
+    bounded(threads, opts, |limits| k.saturate(limits))
+}
+
+/// Calls `f` with the limits of `opts`: its deadline, cancellation and memory budget,
+/// and threads from the algorithm pool.
+fn bounded<T>(
+    threads: usize,
+    opts: &QueryOptions,
+    f: impl FnOnce(&Limits) -> std::result::Result<T, sparkles_owl::classify::Error>,
+) -> Result<T> {
     let flag = opts.cancel.clone().unwrap_or_default();
     let ctl = Control::new(flag, opts.deadline, u64::MAX);
-    let par = Par::acquire(c.threads, &ctl)?;
+    let par = Par::acquire(threads, &ctl)?;
     let cancel = opts.cancel.clone();
     let cancellation = opts.cancellation.clone();
     let grant = opts.grant.clone();
@@ -494,7 +536,7 @@ fn run(k: &mut Classifier, c: &ClassifyRequest, opts: &QueryOptions) -> Result<C
                 as Arc<dyn Fn(usize) -> bool + Send + Sync>
         }),
     };
-    let out = k.classify(&limits);
+    let out = f(&limits);
     drop(par);
     out.map_err(|e| match e {
         sparkles_owl::classify::Error::Cancelled => Error::Cancelled,

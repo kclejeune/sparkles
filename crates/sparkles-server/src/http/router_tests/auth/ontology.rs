@@ -247,3 +247,23 @@ async fn classify_reads_the_callers_view_and_writes_need_write() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["written"]["committed"], true, "{}", r.text());
 }
+
+#[tokio::test]
+async fn dl_query_and_parse_read_the_callers_view() {
+    let (_dir, app) = server();
+    let q = json!({"graph": "http://ex/open", "expression": "A", "answers": ["superclasses"]});
+    let r = as_user(&app, "ofull", "POST", "/$/ontology/ont/dl-query", &q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("Hidden"), "{}", r.text());
+    // a reader limited to one graph queries what it reads, without the import it cannot read
+    let r = as_user(&app, "oopen", "POST", "/$/ontology/ont/dl-query", &q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    // and the names it cannot read do not resolve
+    let p = json!({"graph": "http://ex/open", "text": "Hidden"});
+    let r = as_user(&app, "oopen", "POST", "/$/ontology/ont/parse", &p).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["reason"], "unknown", "{}", r.text());
+    let r = as_user(&app, "oread", "POST", "/$/ontology/ont/parse", &p).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}

@@ -424,6 +424,56 @@ export interface OntologyClassification extends OntologyState {
   };
   written?: OntologyEdit;
 }
+/** What `ontology.parse` reads Manchester text as. */
+export type ManchesterAs = 'classExpression' | 'dataRange' | 'individual' | 'literal' | 'axiom';
+/** Manchester text read against the ontology (spec F21, item 608). */
+export interface ManchesterParsed extends OntologyState {
+  as: ManchesterAs;
+  /** the value in its JSON form */
+  value: unknown;
+  ofn: string;
+  manchester: string | null;
+}
+/** The answers a DL query can ask for. */
+export type DlAnswer =
+  | 'equivalents'
+  | 'superclasses'
+  | 'directSuperclasses'
+  | 'subclasses'
+  | 'directSubclasses'
+  | 'instances';
+/** An axiom outside the profile of the engine that answered a DL query. */
+export interface DlGap extends Partial<OntologyAxiom> {
+  message: string;
+  rule: string | null;
+  partial: boolean;
+  manchester?: string | null;
+}
+/** A DL query's answers and the reasoning that found them (spec U12). */
+export interface DlQueryAnswer extends OntologyState {
+  expression: { manchester: string; ofn: string; json: unknown };
+  reasoning: {
+    engine: 'el' | 'rl';
+    title: string;
+    why: string;
+    complete: boolean;
+    instancesComplete: boolean | null;
+    gapCount: number;
+    gaps: DlGap[];
+    notes: string[];
+  };
+  satisfiable: boolean | null;
+  consistent: boolean | null;
+  incremental: boolean;
+  elapsedMs: number;
+  counts: Partial<Record<DlAnswer, number>>;
+  equivalents?: string[];
+  superclasses?: string[];
+  directSuperclasses?: string[];
+  subclasses?: string[];
+  directSubclasses?: string[];
+  instances?: string[];
+}
 export class Administration {
   readonly snapshots;
   readonly history;
@@ -775,6 +825,53 @@ export class Administration {
           },
           o,
           o.target !== undefined,
+        ),
+      /**
+       * Read Manchester text against the ontology's names and labels as `as`
+       * (`classExpression` by default). Text that does not read throws a
+       * `SparklesError` whose details carry the span and the candidates.
+       */
+      parse: (text: string, o: OntologySelection & OperationOptions & { as?: ManchesterAs } = {}) =>
+        call<ManchesterParsed>(
+          'ontology.parse',
+          { graph: o.graph, imports: o.imports, mode: o.mode, text, as: o.as },
+          o,
+          false,
+        ),
+      /**
+       * A DL query (spec U12): the equivalents, superclasses, subclasses and instances
+       * of a class expression in Manchester syntax, functional-style syntax
+       * (`syntax: 'functional'`) or the JSON form. The EL classifier answers inside
+       * OWL 2 EL and the RL rules outside it, and `reasoning` names the engine used.
+       */
+      dlQuery: (
+        expression: string | Record<string, unknown>,
+        o: OntologySelection &
+          OperationOptions & {
+            syntax?: 'manchester' | 'functional';
+            reasoning?: 'auto' | 'el' | 'rl';
+            answers?: DlAnswer[];
+            limit?: number;
+            threads?: number;
+            maxDerived?: number;
+          } = {},
+      ) =>
+        call<DlQueryAnswer>(
+          'ontology.dlQuery',
+          {
+            graph: o.graph,
+            imports: o.imports,
+            mode: o.mode,
+            expression,
+            syntax: o.syntax,
+            reasoning: o.reasoning,
+            answers: o.answers,
+            limit: o.limit,
+            threads: o.threads,
+            maxDerived: o.maxDerived,
+          },
+          o,
+          false,
         ),
     };
     this.mappings = {

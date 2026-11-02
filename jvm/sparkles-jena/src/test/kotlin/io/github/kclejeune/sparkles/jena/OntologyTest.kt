@@ -285,4 +285,30 @@ class OntologyTest {
             assertTrue(tax.getNumber("total").toInt() >= 1)
         }
     }
+
+    /** Items 608 and 457: Manchester text read against the graph, and a DL query of it. */
+    @Test fun the_native_handle_reads_manchester_and_answers_dl_queries() {
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            UpdateAction.parseExecute(
+                """$prefixes
+                INSERT DATA { GRAPH <http://ex.org/onto> { :ann a :Professor . :Course rdfs:label "Course unit" } }""",
+                ds,
+            )
+            val p = SparklesOnt.parse(ds, "teaches some 'Course unit'", graphIri = "http://ex.org/onto")
+            assertEquals("http://ex.org/Course", p.get("value").asObject.getString("class"))
+            val e = assertThrows(RuntimeException::class.java) {
+                SparklesOnt.parse(ds, "teaches some Lecture", graphIri = "http://ex.org/onto")
+            }
+            assertTrue(e is SparklesError && "Lecture" in e.engineMessage, e.toString())
+            val r = SparklesOnt.dlQuery(
+                ds,
+                DlQuery("teaches some Course", answers = listOf("subclasses", "instances")),
+                "http://ex.org/onto",
+            )
+            assertEquals("el", r.get("reasoning").asObject.getString("engine"))
+            assertEquals(listOf("http://ex.org/Professor"), r.get("subclasses").asArray.map { it.asString.value() })
+            assertEquals(listOf("http://ex.org/ann"), r.get("instances").asArray.map { it.asString.value() })
+        }
+    }
 }
