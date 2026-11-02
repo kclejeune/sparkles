@@ -460,7 +460,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   dataset keeps only classifications of the terminology. Roadmap item 590.
 * The classifier keeps its own copy of the axioms, its peak resident memory is about 1.6
   times the estimate that its memory budget uses, and its indexing and taxonomy stages
-  run on one thread. Roadmap item 592.
+  run on one thread, so ELK classifies ChEBI lite faster on eight threads. Roadmap item
+  592.
 
 ## Configuration and usage
 

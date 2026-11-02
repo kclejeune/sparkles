@@ -51,6 +51,41 @@ classifier's direct hierarchy is the transitive reduction of the asserted one.
 
 SNOMED CT is not available to the project and was not used.
 
+## Against ELK
+
+<a id="against-elk"></a>
+
+ELK 0.6.0 and the classifier of commit aa0a41a6 ran on forge, the benchmark host, one
+process at a time under the bench lock. Each process ran five classifications. Times are
+the median of the five in ms. ELK's classification excludes the OWL API's load of the
+file, which the load column gives, and its first run, which includes the compilation of
+the JVM's hot code, is listed apart. The classifier's read is its parse of the same file.
+Peak memory is each process's peak resident set in MiB, which for the classifier
+includes the axioms read and for ELK the OWL API ontology. ELK ran with a 4 GiB heap,
+and its live heap is the heap in use after a full collection with the reasoner open.
+
+| Ontology | Threads | Classifier | Read | Peak RSS | ELK | ELK first run | OWL API load | ELK with load | ELK peak RSS | ELK live heap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| GO 2026-07-26 | 1 | 577 | 103 | 350 | 1,210 | 1,674 | 758 | 2,054 | 2,449 | 150 |
+| | 8 | 354 | 105 | 363 | 553 | 1,061 | 741 | 1,281 | 2,429 | 150 |
+| ChEBI lite 256 | 1 | 4,023 | 453 | 1,403 | 6,694 | 7,202 | 3,551 | 10,245 | 4,414 | 688 |
+| | 8 | 2,967 | 445 | 1,643 | 2,548 | 2,969 | 3,549 | 6,138 | 4,369 | 688 |
+
+The classifier classifies GO 2.1 times as fast as ELK on one thread and 1.6 times as fast
+on eight, and ChEBI lite 1.7 times as fast on one thread. On eight threads ELK classifies
+ChEBI lite in 2,548 ms against the classifier's 2,967, so ELK is 1.16 times as fast. The
+classifier's saturation scales as ELK's does, but its indexing and its taxonomy, about
+1.8 s of the 3 s, run on one thread, which roadmap item 592 follows. With the reading of
+the file counted on both sides, the classifier takes 459 ms on GO and 3.4 s on ChEBI
+lite on eight threads, against ELK's 1.3 s and 6.1 s.
+
+ELK's resident memory follows its heap setting. With a 1 GiB heap for GO and 2 GiB for
+ChEBI lite on eight threads, ELK classified in 539 ms and 3.0 s at peak resident sets of
+1,271 MiB and 2,426 MiB. The classifier's peak is 363 MiB on GO and 1,643 MiB on ChEBI
+lite, which includes its own copy of the axioms, as the section below describes. Both
+reasoners give the same taxonomy on one and eight threads, and the ELK taxonomies of the
+run agree with the classifier's.
+
 ## Classification time and memory
 
 The run on forge, the benchmark host, took the bench lock and classified each ontology
@@ -107,3 +142,10 @@ The [run record](runs/2026-11-02-go-chebi-forge-8e73284a/record.json) holds the 
 the binary and data hashes, the settings, every classification time, the taxonomy
 hashes and the agreement checks. Its directory keeps the raw metrics, the environment
 and the script that ran.
+
+The [ELK run record](runs/2026-11-02-elk-forge-aa0a41a6/record.json) holds the same for
+the comparison with ELK on forge, with both tools' output lines, ELK's warnings and the
+oracle's reports. The [ORE agreement record](runs/2026-11-02-ore-elk-agreement-aa0a41a6/record.json)
+and the [HermiT agreement record](runs/2026-11-02-hermit-agreement-aa0a41a6/record.json)
+hold the comparisons on the ORE 2015 sample and the range test ontologies. Their times
+come from a loaded laptop and are not measurements.

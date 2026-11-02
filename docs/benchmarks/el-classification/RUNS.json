@@ -136,6 +136,56 @@
     }
    },
    "metadata_note": "A manual agreement record of HermiT 1.4.5.519 against the classifier and ELK on the ORE ontologies whose axioms either EL reasoner uses in part, and on four range test ontologies. Read the record for its method and checks."
+  },
+  {
+   "run_id": "sha256-bf4b54770e6cf14d250ade1a70867b02f689e4746596d0a826314308a6229e44",
+   "path": "runs/2026-11-02-elk-forge-aa0a41a6/record.json",
+   "sha256": "bf4b54770e6cf14d250ade1a70867b02f689e4746596d0a826314308a6229e44",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26 and ChEBI lite 256",
+    "manifest": {
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "0bba3629a057ea5077a9ac61a3d4dd711d239504aa1ff4008e292bd5f988458d",
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to the benchmark host",
+     "commit": "aa0a41a6",
+     "data": {
+      "chebi_lite": {
+       "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      },
+      "go": {
+       "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      }
+     },
+     "ended": "2026-11-02T20:50:54Z",
+     "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Another lane's benchmark jobs ran between the processes and never beside them.",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224…, pins.tsv sha256 4d470f93…), Temurin 17.0.20+8",
+     "started": "2026-11-02T17:11:55Z"
+    },
+    "settings": {
+     "elk_heap": "4g for -Xms and -Xmx, with 1g for GO and 2g for ChEBI lite in the smaller-heap runs on eight threads",
+     "gc": "G1",
+     "repeat": 5,
+     "threads": [
+      1,
+      8
+     ]
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "kernel": "7.2.9",
+      "name": "forge",
+      "ram_mib": 15620
+     },
+     "method": "One process per tool, ontology and thread count, each run five times. el_classify's classifyMs holds each classification by a fresh classifier with the axioms in memory, and readMs the parse of the file. ElkClassify's loadMs holds each OWL API load and classifyMs the time from the creation of the reasoner to the end of precomputeInferences, with a fresh OWL API manager and reasoner each run. peakRssKib is each process's peak resident memory, and retainedHeapMib ELK's live heap after a full collection with the reasoner open. The oracle files compare each ELK taxonomy with the classifier's of the same thread count.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of el_classify and ELK 0.6.0 on GO and ChEBI lite on the benchmark host. Read the record for its method, results and checks."
   }
  ]
 }

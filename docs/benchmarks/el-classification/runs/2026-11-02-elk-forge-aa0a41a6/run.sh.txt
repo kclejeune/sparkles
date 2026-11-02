@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Measure el_classify and ELK on GO and ChEBI lite on the benchmark host. Each process
+# takes the bench lock (and the heavy lock) for itself and releases it after, so other
+# lanes' jobs can run between stages.
+# Usage: forge-measure.sh DIR   (DIR holds bin/el_classify, data/{go,chebi_lite}.ofn,
+#        scripts/elk-compare and elk-work with the fetched jars)
+set -euo pipefail
+D=$1
+cd "$D"
+BIN=bin/el_classify
+OUT=out-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+export ELK_WORK=$PWD/elk-work
+export JAVA=${JAVA:-$HOME/.local/share/mise/installs/java/temurin-17.0.20+8/bin/java}
+export PATH=$(dirname "$JAVA"):$PATH
+{
+  echo "host=$(hostname)"
+  echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')"
+  echo "cpus=$(nproc)"
+  echo "ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  echo "java=$("$JAVA" -version 2>&1 | tr '\n' ' ')"
+  echo "binary_sha256=$(sha256sum "$BIN" | cut -d' ' -f1)"
+  echo "harness_sha256=$(sha256sum scripts/elk-compare/ElkClassify.java | cut -d' ' -f1)"
+  echo "pins_sha256=$(sha256sum scripts/elk-compare/pins.tsv | cut -d' ' -f1)"
+  for f in data/*.ofn; do echo "data_sha256 $f=$(sha256sum "$f" | cut -d' ' -f1)"; done
+  echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$OUT/env.txt"
+scripts/elk-compare/elk.sh fetch
+
+locked() {
+  local label=$1
+  shift
+  (
+    flock 9
+    flock 8
+    echo "$label locked=$(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$OUT/env.txt"
+    "$@"
+  ) 9> "$HOME/lanes/.bench.lock" 8> "$HOME/lanes/.heavy.lock"
+}
+
+for ont in go chebi_lite; do
+  for t in 1 8; do
+    locked "sparkles-$ont-t$t" "$BIN" --threads "$t" --repeat 5 --taxonomy "$OUT/$ont.sparkles.t$t.txt" \
+      "data/$ont.ofn" >> "$OUT/sparkles.jsonl" 2>> "$OUT/sparkles.err"
+    locked "elk-$ont-t$t-4g" env ELK_HEAP=4g ELK_MEM_MAX=8G scripts/elk-compare/elk.sh run --threads "$t" \
+      --repeat 5 --taxonomy "$OUT/$ont.elk.t$t.ofn" "data/$ont.ofn" >> "$OUT/elk.jsonl" 2>> "$OUT/elk.err"
+  done
+done
+# Heap sensitivity: ELK on eight threads with a smaller heap.
+locked elk-go-t8-1g env ELK_HEAP=1g ELK_MEM_MAX=4G scripts/elk-compare/elk.sh run --threads 8 --repeat 5 \
+  data/go.ofn >> "$OUT/elk-small-heap.jsonl" 2>> "$OUT/elk.err"
+locked elk-chebi_lite-t8-2g env ELK_HEAP=2g ELK_MEM_MAX=6G scripts/elk-compare/elk.sh run --threads 8 --repeat 5 \
+  data/chebi_lite.ofn >> "$OUT/elk-small-heap.jsonl" 2>> "$OUT/elk.err"
+echo "ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/env.txt"
+sha256sum "$OUT"/*.t*.txt "$OUT"/*.t*.ofn > "$OUT/taxonomy.sha256"
+for ont in go chebi_lite; do
+  for t in 1 8; do
+    python3 scripts/el-oracle.py "$OUT/$ont.elk.t$t.ofn" "$OUT/$ont.sparkles.t$t.txt" \
+      > "$OUT/$ont.t$t.oracle.json" || true
+  done
+done
+echo "done $OUT"
