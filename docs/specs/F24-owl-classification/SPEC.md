@@ -59,8 +59,9 @@ representation.
 
 ## Non-goals
 
-* A native tableau reasoner for OWL 2 DL. DL reasoning goes through the external
-  bridge.
+* A native reasoner for OWL 2 DL in the phases above. DL reasoning goes through the
+  external bridge until roadmap item 603 adds native DL classification on top of the EL
+  classifier.
 
 ## Design constraints
 
