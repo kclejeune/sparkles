@@ -57,6 +57,9 @@
   /** The tag and head of the state the dry run read, which the commit names too. */
   let tag: string | null = null;
   let at: number | null = null;
+  /** The target and graphs the dry run ran on, which the commit writes to. */
+  let ranTarget = '';
+  let ranSel: Selection = { graph: null, imports: true };
   /** A refusal because another commit landed: `412`, or a revert's `409` `head-moved`. */
   const isStale = (e: unknown) =>
     e instanceof ApiError && (e.status === 412 || (e.status === 409 && e.code === 'head-moved'));
@@ -66,6 +69,8 @@
     ran = op;
     tag = etag;
     at = head;
+    ranTarget = target;
+    ranSel = sel;
     message = title;
     void dry(op);
   });
@@ -80,7 +85,7 @@
     movedOn = false;
     busy = true;
     try {
-      const r = await runOp(target, sel, o, { dryRun: true, etag: tag, head: at });
+      const r = await runOp(ranTarget, ranSel, o, { dryRun: true, etag: tag, head: at });
       if (ran !== o) return;
       if (isPreview(r)) preview = r;
       else error = 'The server answered a dry run without its preview.';
@@ -95,10 +100,15 @@
 
   async function commit() {
     if (!op) return;
+    // the page moved to another dataset, branch or graph since the dry run
+    if (ranTarget !== target || ranSel.graph !== sel.graph) {
+      open = false;
+      return;
+    }
     busy = true;
     error = null;
     try {
-      const r = await runOp(target, sel, op, {
+      const r = await runOp(ranTarget, ranSel, op, {
         etag: tag,
         head: at,
         message: message.trim() || title,
@@ -119,6 +129,8 @@
   const lists = $derived(op ? opAxioms(op) : { add: [], remove: [] });
   const stale = $derived(movedOn || preview?.outcome === 'precondition-failed');
   const canCommit = $derived(!!preview && preview.outcome === 'commit' && !busy);
+  /** An undo or redo whose changes the head no longer holds, which only leaves the list. */
+  const spent = $derived(op?.kind === 'revert' && preview?.outcome === 'no-change');
 </script>
 
 <Modal bind:open {title} width={620}>
@@ -146,6 +158,12 @@
         Reverts commit {op.commit}, which restores exactly the triples that commit changed. A later
         commit that changed the same triples makes the revert conflict.
       </p>
+      {#if spent}
+        <p class="warn-text">
+          The branch no longer holds the changes of commit {op.commit}, so there is nothing to
+          revert. The entry can only leave the list.
+        </p>
+      {/if}
     {:else if op?.kind === 'update'}
       <details>
         <summary>SPARQL update</summary>
@@ -205,6 +223,15 @@
           open = false;
           onstale();
         }}>Reload</button
+      >
+    {:else if spent && op}
+      <button
+        class="btn primary"
+        onclick={() => {
+          const o = op;
+          open = false;
+          if (o) oncommitted(o, { inserted: 0, deleted: 0 }, message.trim() || title);
+        }}>Remove from the list</button
       >
     {:else}
       <button class="btn primary" disabled={!canCommit} onclick={commit}>

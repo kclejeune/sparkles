@@ -14,6 +14,7 @@ import {
   mintIri,
   pickLabel,
   renameUpdate,
+  revertCommit,
   replaceAnnotation,
   sectionAxiom,
   sessionBranchName,
@@ -434,5 +435,49 @@ describe('annotation drafts', () => {
   it('holds IRIs as prefixed names or in angle brackets, never as labels', () => {
     expect(editableIri(EX + 'Person', { ex: EX })).toBe('ex:Person');
     expect(editableIri('http://other.org/x', { ex: EX })).toBe('<http://other.org/x>');
+  });
+});
+
+describe('reverts', () => {
+  afterEach(() => void vi.unstubAllGlobals());
+  const answer = (body: unknown) => {
+    const calls: { url: string; body: unknown }[] = [];
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit = {}) => {
+      calls.push({ url, body: JSON.parse(String(init.body ?? '{}')) });
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    return calls;
+  };
+
+  it('previews the revert of a commit on the branch the target names', async () => {
+    const calls = answer({ dryRun: true, wouldCommit: true, outcome: 'commit', head: 9 });
+    const r = await revertCommit('uni@onto.ada.20261102', 4, { dryRun: true, head: 9 });
+    expect(r).toMatchObject({ dryRun: true, outcome: 'commit' });
+    expect(calls).toEqual([
+      {
+        url: '/$/revert/uni?branch=onto.ada.20261102&commit=4',
+        body: { dryRun: true, changes: 50, expect: { target: 9 } },
+      },
+    ]);
+  });
+
+  it('reads an up-to-date answer to a dry run as a preview that changes nothing', async () => {
+    answer({ upToDate: true, merged: false, commit: null, target: { branch: 'main', seq: 9 } });
+    expect(await revertCommit('uni', 4, { dryRun: true, head: 9 })).toEqual({
+      dryRun: true,
+      wouldCommit: false,
+      outcome: 'no-change',
+      head: 9,
+    });
+  });
+
+  it('answers the commit a revert made as its receipt', async () => {
+    answer({ upToDate: false, commit: { seq: 10 }, changes: { inserted: 2, deleted: 3 } });
+    const r = await revertCommit('uni', 4, { head: 9 });
+    expect(r).toMatchObject({ inserted: 2, deleted: 3, receipt: { committed: true } });
+    expect((r as { receipt: { commit: { seq: number } } }).receipt.commit.seq).toBe(10);
   });
 });

@@ -207,6 +207,8 @@
     void target;
     void graph;
     untrack(() => {
+      // a preview belongs to the target and graph it ran on
+      previewOpen = false;
       summary = null;
       shown = 0;
       loadedTarget = null;

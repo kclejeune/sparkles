@@ -13,7 +13,7 @@
 // tree. Functional-style axioms are parsed for the forms the editor sends.
 
 import ox from 'oxigraph';
-import { changesOf } from './branches.mjs';
+import { stateLines } from './history.mjs';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 const RDFS = 'http://www.w3.org/2000/01/rdf-schema#';
@@ -1500,11 +1500,32 @@ function changes(req, res, url, seg, ctx) {
 }
 
 /**
- * `POST /$/revert/{ds}?branch=&commit=`: the revert of a commit of the branch, from the
- * changes the mock recorded for it (none for the seeded history). A quad the commit added
- * goes and a quad it removed comes back, unless a later commit already did that. The mock
- * reports no conflicts. `expect.target` is the head the caller saw, and a head that moved
- * since answers `409` `head-moved`. With `dryRun` it answers the write preview.
+ * The quad of an N-Quads line (without the final " .") with its blank nodes as labelled,
+ * since loading a line into a store renames them.
+ */
+function quadOfLine(line) {
+  const st = new ox.Store();
+  st.load(`${line} .`, { format: 'application/n-quads' });
+  const q = st.match()[0];
+  const labels = [...line.matchAll(/(?:^|\s)_:([^\s]+)/g)].map((m) => m[1]);
+  const fix = (t) =>
+    t.termType === 'BlankNode' && labels.length ? ox.blankNode(labels.shift()) : t;
+  return ox.quad(fix(q.subject), q.predicate, fix(q.object), fix(q.graph));
+}
+
+/** The cell of a quad, which a revert compares as the server's default `cell` scope does. */
+const cellKey = (q) =>
+  `${q.graph.termType === 'DefaultGraph' ? '' : q.graph}\u0000${q.subject}\u0000${q.predicate}`;
+
+/**
+ * `POST /$/revert/{ds}?branch=&commit=`: the revert of a commit of the branch, a three-way
+ * merge of the commit's parent into the head with the commit as its base. The mock diffs
+ * the states it kept before and after the commit, so blank nodes keep their identity, and
+ * a cell the commit changed that a later commit changed again conflicts with `409`
+ * `merge-conflict`. A revert whose changes the head no longer holds answers `upToDate`
+ * with no commit, a dry run included. `expect.target` is the head the caller saw, and a
+ * head that moved since answers `409` `head-moved`. With `dryRun` it answers the write
+ * preview.
  */
 async function revert(req, res, url, seg, ctx) {
   const { datasets, send, fail, readBody, headCommit, quadSet, commitWrite, allCommits } = ctx;
@@ -1521,9 +1542,17 @@ async function revert(req, res, url, seg, ctx) {
     return (fail(res, 400, 'invalid JSON'), true);
   }
   const seq = Number(url.searchParams.get('commit'));
-  const commit = allCommits(ds).find((c) => c.seq === seq);
-  if (!commit || seq === 0)
+  const list = allCommits(ds);
+  const commit = list.find((c) => c.seq === seq);
+  const parent = list.find((c) => c.seq === seq - 1);
+  if (!commit || !parent)
     return (fail(res, 400, `cannot revert commit ${seq}`, { code: 'invalid-merge' }), true);
+  const after = stateLines(commit);
+  const before = stateLines(parent);
+  if (!after || !before)
+    return (
+      fail(res, 410, `commit ${seq} is outside the kept history`, { code: 'history-gone' }), true
+    );
   const head = headCommit(ds).seq;
   if (body.expect?.target != null && body.expect.target !== head)
     return (
@@ -1532,37 +1561,67 @@ async function revert(req, res, url, seg, ctx) {
       }),
       true
     );
-  const has = (q) => ds.store.match(q.subject, q.predicate, q.object, q.graph).length > 0;
-  const before = quadSet(ds);
-  const beforeQuads = ds.store.match();
-  const removed = [];
-  const added = [];
-  for (const { op, quad } of changesOf.get(commit) ?? []) {
-    if (op === '+' && has(quad)) {
-      ds.store.delete(quad);
-      removed.push(quad);
-    } else if (op === '-' && !has(quad)) {
-      ds.store.add(quad);
-      added.push(quad);
-    }
-  }
   const branch = ds.branchName ?? 'main';
+  const afterSet = new Set(after);
+  const beforeSet = new Set(before);
+  const now = quadSet(ds);
+  // the commit's changes, reversed: what it added goes, what it removed comes back
+  const drop = after.filter((l) => !beforeSet.has(l)).map(quadOfLine);
+  const restore = before.filter((l) => !afterSet.has(l)).map(quadOfLine);
+  // a cell the commit changed conflicts when the head holds other objects there than both
+  // the commit left and the revert would leave
+  const cells = new Set([...drop, ...restore].map(cellKey));
+  const objects = (lines) => {
+    const m = new Map();
+    for (const l of lines) {
+      const q = quadOfLine(l);
+      const k = cellKey(q);
+      if (cells.has(k)) m.set(k, [...(m.get(k) ?? []), l].sort().join('\n'));
+    }
+    return m;
+  };
+  const left = objects(after);
+  const reverted = objects(before);
+  const current = objects([...now]);
+  const conflicts = [...cells].filter((k) => {
+    const c = current.get(k) ?? '';
+    return c !== (left.get(k) ?? '') && c !== (reverted.get(k) ?? '');
+  });
+  if (conflicts.length)
+    return (
+      fail(res, 409, `the revert of commit ${seq} conflicts in ${conflicts.length} cells`, {
+        code: 'merge-conflict',
+        conflicts: { found: conflicts.length, resolved: 0 },
+      }),
+      true
+    );
+  const removed = drop.filter((q) => now.has(String(q)));
+  const added = restore.filter((q) => !now.has(String(q)));
+  if (!removed.length && !added.length) {
+    send(res, 200, {
+      merged: false,
+      upToDate: true,
+      fastForward: false,
+      source: { branch, seq: seq - 1 },
+      target: { branch, seq: head },
+      base: { branch, seq },
+      reverted: { branch, seq },
+      commit: null,
+      changes: { inserted: 0, deleted: 0 },
+      conflicts: { found: 0, resolved: 0 },
+    });
+    return true;
+  }
   const message = body.message || `revert commit ${seq}`;
   if (body.dryRun) {
-    for (const q of ds.store.match()) ds.store.delete(q);
-    for (const q of beforeQuads) ds.store.add(q);
     const changes = [...removed.map(quadJson('-')), ...added.map(quadJson('+'))];
     const limit = Number(body.changes ?? 0);
     send(res, 200, {
       dryRun: true,
-      wouldCommit: changes.length > 0,
-      outcome: changes.length ? 'commit' : 'no-change',
+      wouldCommit: true,
+      outcome: 'commit',
       head,
-      commit: {
-        seq: head + (changes.length ? 1 : 0),
-        inserted: added.length,
-        deleted: removed.length,
-      },
+      commit: { seq: head + 1, inserted: added.length, deleted: removed.length },
       ...(limit
         ? {
             changes: {
@@ -1576,16 +1635,18 @@ async function revert(req, res, url, seg, ctx) {
     });
     return true;
   }
-  const receipt = commitWrite(ds, 'revert', before, { message });
+  for (const q of removed) ds.store.delete(q);
+  for (const q of added) ds.store.add(q);
+  const receipt = commitWrite(ds, 'revert', now, { message });
   send(res, 200, {
-    merged: receipt.committed,
-    upToDate: !receipt.committed,
+    merged: true,
+    upToDate: false,
     fastForward: false,
     source: { branch, seq: seq - 1 },
     target: { branch, seq: receipt.commit.seq },
     base: { branch, seq },
     reverted: { branch, seq },
-    commit: receipt.committed ? receipt.commit : null,
+    commit: receipt.commit,
     changes: { inserted: added.length, deleted: removed.length },
     conflicts: { found: 0, resolved: 0 },
   });

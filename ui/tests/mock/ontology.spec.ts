@@ -260,4 +260,91 @@ test('a stale edit is refused and another writer’s commit refreshes the views'
   expect(again.ok()).toBe(true);
   await expect(page.getByRole('status').filter({ hasText: 'by another writer' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'uni:Workshop' })).toBeVisible();
+
+  // an undo previewed on uni closes when the page moves to another dataset, so its commit
+  // cannot revert a commit of the same number there
+  await page.getByRole('button', { name: 'New', exact: true }).click();
+  await create.getByRole('textbox', { name: 'Label', exact: true }).fill('Lab');
+  await create.getByRole('button', { name: 'Preview' }).click();
+  await commitPreview(page);
+  await page.getByRole('button', { name: /^Undo/ }).click();
+  await expect(preview(page)).toContainText('Reverts commit');
+  // back past the new class's page, then to foaf
+  await page.goBack();
+  await expect(page).toHaveURL(/ds=uni$/);
+  await page.goBack();
+  await expect(page).toHaveURL(/ds=foaf/);
+  await expect(preview(page)).toBeHidden();
+  await page.goForward();
+  await expect(page).toHaveURL(/ds=uni$/);
+  await expect(page.getByRole('button', { name: /^Undo/ })).toHaveText('Undo (1)');
+});
+
+test('the mock revert keeps blank nodes and refuses a cell a later commit changed', async ({
+  request,
+}) => {
+  /** The members of the answers this test reads: writes, reverts and listings. */
+  type Answer = {
+    commit: { seq: number } | null;
+    changes: { inserted: number; deleted: number };
+    upToDate?: boolean;
+    axioms: { ofn: string }[];
+  };
+  const json = async (r: Awaited<ReturnType<typeof request.get>>): Promise<Answer> => {
+    expect(r.ok(), await r.text()).toBe(true);
+    return (await r.json()) as Answer;
+  };
+  const headOf = async () =>
+    ((await (await request.get('/$/ontology/uni')).json()) as { commit: number }).commit;
+  const about = async (iri: string) => {
+    const r = await request.get(
+      `/$/ontology/uni/axioms?about=${encodeURIComponent(iri)}&limit=100`,
+    );
+    // an entity the ontology no longer uses answers 404
+    if (r.status() === 404) return '';
+    return (await json(r)).axioms.map((a) => a.ofn).join('\n');
+  };
+  const update = async (sparql: string) =>
+    request.post('/uni/update?receipt=true', {
+      headers: { 'Content-Type': 'application/sparql-update', Accept: 'application/json' },
+      data: sparql,
+    });
+
+  // a restriction, reverted and then restored by reverting the revert
+  const added = await json(
+    await request.post('/$/ontology/uni/axioms?receipt=true', {
+      data: { add: ['SubClassOf(uni:Tutorial ObjectSomeValuesFrom(uni:teaches uni:Course))'] },
+    }),
+  );
+  const seq = added.commit!.seq;
+  expect(await about(`${UNI}Tutorial`)).toContain('ObjectSomeValuesFrom');
+  const undone = await json(await request.post(`/$/revert/uni?commit=${seq}`, { data: {} }));
+  expect(undone.commit?.seq).toBe(seq + 1);
+  expect(undone.changes.deleted).toBeGreaterThan(0);
+  expect(await about(`${UNI}Tutorial`)).not.toContain('ObjectSomeValuesFrom');
+  const redone = await json(await request.post(`/$/revert/uni?commit=${seq + 1}`, { data: {} }));
+  expect(redone.changes.inserted).toBe(undone.changes.deleted);
+  expect(await about(`${UNI}Tutorial`)).toContain('ObjectSomeValuesFrom');
+  // the head holds the changes no longer, so reverting the revert again changes nothing
+  const spent = await json(
+    await request.post(`/$/revert/uni?commit=${seq + 1}`, { data: { dryRun: true } }),
+  );
+  expect(spent.upToDate).toBe(true);
+  expect(spent.commit).toBeNull();
+
+  // A to B, then B to C by another writer: reverting the first conflicts and writes nothing
+  const comment = (v: string) =>
+    `<${UNI}Seminar> <http://www.w3.org/2000/01/rdf-schema#comment> "${v}"`;
+  expect((await update(`INSERT DATA { ${comment('A')} }`)).ok()).toBe(true);
+  const ab = await json(
+    await update(`DELETE DATA { ${comment('A')} } ; INSERT DATA { ${comment('B')} }`),
+  );
+  expect(
+    (await update(`DELETE DATA { ${comment('B')} } ; INSERT DATA { ${comment('C')} }`)).ok(),
+  ).toBe(true);
+  const head = await headOf();
+  const refused = await request.post(`/$/revert/uni?commit=${ab.commit!.seq}`, { data: {} });
+  expect(refused.status()).toBe(409);
+  expect((await refused.json()).code).toBe('merge-conflict');
+  expect(await headOf()).toBe(head);
 });

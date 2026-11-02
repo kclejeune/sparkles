@@ -1937,7 +1937,7 @@ and kept. `addedAxioms` lists the axioms the edit wrote, declarations included, 
 list is cut. Each entry has the `type`, `ofn` and `axiom` of a listing. An added axiom of
 several classes or individuals, such as an `EquivalentClasses`, is listed whole when part
 of it was already present, so the lists do not always undo the edit. A revert of the
-edit's commit (`POST /$/revert/{ds}`) undoes it exactly. The route takes the parameters of the other writes, such as `dryRun` and
+edit's commit through `POST /$/revert/{ds}` undoes it exactly. The route takes the parameters of the other writes, such as `dryRun` and
 `receipt`, and an `If-Match` with the summary's tag. An axiom the forward mapping cannot
 write, such as a `DisjointClasses` of one class, is `400` with code `invalid-axiom`.
 Writing needs write access to the target graph, and a removal needs it on the graphs the

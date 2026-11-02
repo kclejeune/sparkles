@@ -390,6 +390,15 @@ export async function revertCommit(
     !!o.dryRun,
   );
   if (isPreview(r)) return r;
+  // the head no longer holds the commit's changes, for instance because another writer
+  // reverted it: the server answers `upToDate` with no commit, for a dry run too
+  if (o.dryRun && r.upToDate === true)
+    return {
+      dryRun: true,
+      wouldCommit: false,
+      outcome: 'no-change',
+      head: Number((r.target as { seq?: number } | undefined)?.seq ?? o.head ?? 0),
+    };
   const c = r.commit as Receipt['commit'] | null | undefined;
   const changes = (r.changes ?? {}) as { inserted?: number; deleted?: number };
   return {
