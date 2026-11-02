@@ -12,6 +12,7 @@ The summary also records measurement coverage and the full loss table. The
 | WatDiv | [Read](watdiv/README.md) | [Read](watdiv/RESULTS.md) |
 | SP²Bench | [Read](sp2bench/README.md) | [Read](sp2bench/RESULTS.md) |
 | LUBM and reasoning | [Read](reasoning/README.md) | [Read](reasoning/RESULTS.md) |
+| OWL 2 EL classification | [Read](el-classification/README.md) | [Read](el-classification/RESULTS.md) |
 | DBpedia | [Read](dbpedia/README.md) | [Read](dbpedia/RESULTS.md) |
 | BSBM | [Read](bsbm/README.md) | [Read](bsbm/RESULTS.md) |
 | Full-text search | [Read](full-text/README.md) | [Read](full-text/RESULTS.md) |

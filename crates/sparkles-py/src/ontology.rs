@@ -511,6 +511,51 @@ impl PyOntologies {
         let j = self.run(py, "diff", a, cancel, timeout, false)?;
         answer(py, j, &["added", "removed"])
     }
+
+    /// Classify by OWL 2 EL (spec F24): whether the ontology is consistent, its
+    /// unsatisfiable classes, the axioms left out or used in part, and on request one
+    /// class (`about`) and the taxonomy's nodes (`nodes`, `limit` from `offset`).
+    /// `target` writes the taxonomy to that named graph in one commit.
+    #[pyo3(signature=(graph=None, *, assertions=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn classify<'py>(
+        &self,
+        py: Python<'py>,
+        graph: Option<&Bound<'py, PyAny>>,
+        assertions: bool,
+        about: Option<&Bound<'py, PyAny>>,
+        nodes: bool,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        threads: Option<usize>,
+        target: Option<&Bound<'py, PyAny>>,
+        message: Option<String>,
+        imports: bool,
+        mode: &str,
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut a = base(graph, imports, mode, false)?;
+        a.remove("inferences");
+        a.insert("at".into(), at_json(at)?);
+        a.insert("assertions".into(), json!(assertions));
+        if let Some(c) = about {
+            a.insert(
+                "about".into(),
+                J::String(crate::terms::iri_from_py(c)?.into_string()),
+            );
+        }
+        a.insert("nodes".into(), json!(nodes));
+        a.insert("limit".into(), json!(limit));
+        a.insert("offset".into(), json!(offset));
+        a.insert("threads".into(), json!(threads));
+        let writes = target.is_some();
+        a.insert("target".into(), graph_json(target)?);
+        a.insert("message".into(), json!(message));
+        let j = self.run(py, "classify", a, cancel, timeout, writes)?;
+        answer(py, j, &["excluded"])
+    }
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

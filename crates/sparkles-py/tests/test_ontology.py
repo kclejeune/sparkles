@@ -321,3 +321,27 @@ def test_an_edit_takes_constructed_axioms(ds: sparkles.Dataset) -> None:
     assert done["added"] >= 1
     course = ds.ontology.entity(EX + "Course")
     assert [c["expression"] for c in course["class"]["superClasses"]] == [EX + "Event"]
+
+
+def test_classify(ds: sparkles.Dataset) -> None:
+    ds.update(
+        f"{PREFIXES} INSERT DATA {{ :FullProfessor rdfs:subClassOf :Professor . "
+        ":Teacher a owl:Class ; owl:equivalentClass [ a owl:Restriction ; "
+        "owl:onProperty :teaches ; owl:someValuesFrom :Course ] . }"
+    )
+    r = ds.ontology.classify(about=EX + "FullProfessor")
+    assert r["consistent"] and r["complete"]
+    assert not r["reused"]
+    assert EX + "Teacher" in r["class"]["superClasses"]
+    again = ds.ontology.classify()
+    assert again["reused"]
+    page = ds.ontology.classify(nodes=True, limit=2)
+    assert len(page["nodes"]) == 2 and page["next"] == 2
+    with pytest.raises(sparkles.NotFoundError):
+        ds.ontology.classify(about=EX + "Nobody")
+    written = ds.ontology.classify(target=EX + "taxonomy", message="classified")
+    assert written["written"]["committed"]
+    sub = f"SubClassOf(<{EX}Professor> <{EX}Teacher>)"
+    assert sparkles.Axiom(sub) in [
+        e["axiom"] for e in ds.ontology.axioms(EX + "taxonomy")["axioms"]
+    ]

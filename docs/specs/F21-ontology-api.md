@@ -11,7 +11,8 @@
 > the profile partition that F17's OWL 2 QL rewriting is to use. Phase 3 provides the
 > functional-style syntax reader, an MCP tool and ontology diffs between commits. Roadmap
 > items 540 and 541 added entity accessors, an edit builder, typed axiom constructors and
-> literal checks, and items 539 and 559 extend the delivered phases.
+> literal checks, item 580 added OWL 2 EL classification, and items 539 and 559 extend
+> the delivered phases.
 >
 > **User docs:** [OWL 2 ontologies](../reasoning/README.md#owl-2-ontologies) and
 > [API: Ontology](../API.md#ontology).
@@ -838,6 +839,28 @@ and the datatype check reports the datatype instead. Edits still write ill-typed
 literals, since the forward mapping can write them, and a check reports them. The W3C
 OWL 2 test cases agree as before, and profile tests cover each datatype and facet rule.
 
+### Classification
+
+Roadmap item 580 adds OWL 2 EL classification to the handle as F24's first phase.
+`OntologyScope::classify` classifies the ontology that `open` reads, and the wire
+operation `classify` and `POST /$/ontology/{ds}/classify` answer it in the same JSON form
+for every surface. The handle keeps one classification per dataset and reuses it
+incrementally when the ontology changes. [F24's Outcome](F24-owl-classification/SPEC.md#outcome)
+describes the classifier.
+
+A classification can write its direct taxonomy into a named graph through the handle's
+edit, which gained a replacement predicate and a hook that runs inside the write
+transaction. The predicate removes the axioms of the previous taxonomy, and the hook
+refuses the write when a graph the classification read changed after it ran.
+Provenance departs from the MCP tool's form. The taxonomy is many axioms of one
+activity, so the provenance is written once as annotations of the target graph's
+ontology header rather than on each axiom. The header carries `prov:wasGeneratedBy` a
+`urn:uuid:` activity, `prov:generatedAtTime`, `prov:wasDerivedFrom` each graph read and
+an `rdfs:comment` that names the commit read, and a later write replaces them. The
+message goes to the commit. A target that
+declares a PROV-O property as an object or data property refuses the write with a
+conflict, as the MCP tool refuses provenance, so the header stays in OWL 2 DL.
+
 ### Decisions and departures from the design
 
 **Shared expressions in strict mode.** The first design made a blank node structure used
@@ -937,7 +960,7 @@ is tested with F17's mode.
 
 ### Scope changes
 
-**OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 EL classification. It is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md).
+**OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 EL classification. Roadmap item 580 delivers it as [F24](F24-owl-classification/README.md)'s first phase, and the [Classification](#classification) section above describes how it reaches this spec's surfaces.
 
 **External OWL DL reasoner bridge.** The non-goal in §1 excluded an OWL 2 DL reasoner and anything beyond C08, F16 and F17. A bridge to external DL reasoners is now planned under item 457 and [F24](F24-owl-classification/README.md). A native DL reasoner stays a non-goal.
 

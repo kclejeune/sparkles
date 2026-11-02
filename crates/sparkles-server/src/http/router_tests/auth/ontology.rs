@@ -175,3 +175,36 @@ async fn edits_need_write_on_the_graph() {
     let r = as_user(&app, "ofull", "GET", uri, &json!(null)).await;
     assert_eq!(r.json()["total"], 1, "{}", r.text());
 }
+
+#[tokio::test]
+async fn classify_reads_the_callers_view_and_writes_need_write() {
+    let (_dir, app) = server();
+    let about = json!({"graph": "http://ex/open", "about": "http://ex/A"});
+    let r = as_user(&app, "ofull", "POST", "/$/ontology/ont/classify", &about).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("Hidden"), "{}", r.text());
+    // a reader limited to one graph classifies what it reads, without the import it cannot read
+    let r = as_user(&app, "oopen", "POST", "/$/ontology/ont/classify", &about).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    assert_eq!(r.json()["reused"], false, "{}", r.text());
+    // a reader classifies but cannot write the taxonomy
+    let r = as_user(
+        &app,
+        "oread",
+        "POST",
+        "/$/ontology/ont/classify",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let write = json!({"graph": "http://ex/open", "target": "http://ex/tax"});
+    let r = as_user(&app, "oread", "POST", "/$/ontology/ont/classify", &write).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // a writer limited to one graph cannot write another
+    let r = as_user(&app, "oopen", "POST", "/$/ontology/ont/classify", &write).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let r = as_user(&app, "ofull", "POST", "/$/ontology/ont/classify", &write).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["written"]["committed"], true, "{}", r.text());
+}

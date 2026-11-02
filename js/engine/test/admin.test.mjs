@@ -916,6 +916,31 @@ test('the ontology handle reads, checks, edits and diffs axioms', async (t) => {
   }, QueryTimeoutError);
 });
 
+test('the ontology handle classifies by OWL 2 EL and writes the taxonomy', async (t) => {
+  const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
+  await ds.update(`PREFIX : <http://ex.org/>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA { :o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class .
+      :p a owl:ObjectProperty .
+      :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+      :C owl:equivalentClass [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] . }`);
+  const onto = ds.ontology;
+  const r = await onto.classify({ about: 'http://ex.org/A' });
+  assert.equal(r.consistent, true);
+  assert.equal(r.complete, true);
+  assert.equal(r.reused, false);
+  assert.ok(r.class.superClasses.includes('http://ex.org/C'), r.class.superClasses.join());
+  assert.equal((await onto.classify()).reused, true);
+  const page = await onto.classify({ nodes: true, limit: 2 });
+  assert.equal(page.nodes.length, 2);
+  await assert.rejects(onto.classify({ about: 'http://ex.org/nobody' }));
+  const written = await onto.classify({ target: 'http://ex.org/taxonomy', message: 'classified' });
+  assert.equal(written.written.committed, true);
+  const tax = await onto.axiomPage({ graph: 'http://ex.org/taxonomy', type: ['SubClassOf'] });
+  assert.ok(Number(tax.total) >= 1);
+});
+
 test('the ontology handle lists entities and answers entity accessors', async (t) => {
   const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
   await ds.update(`PREFIX : <http://ex.org/>

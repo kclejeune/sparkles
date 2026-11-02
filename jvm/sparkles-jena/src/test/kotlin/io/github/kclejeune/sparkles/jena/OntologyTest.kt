@@ -255,4 +255,34 @@ class OntologyTest {
             }
         }
     }
+
+    /** Roadmap item 580: the OWL 2 EL classification of a graph, and its taxonomy written to another. */
+    @Test fun the_native_handle_classifies_and_writes_the_taxonomy() {
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            UpdateAction.parseExecute(
+                """$prefixes
+                INSERT DATA { GRAPH <http://ex.org/onto> {
+                  :Teacher a owl:Class ;
+                    owl:equivalentClass [ a owl:Restriction ; owl:onProperty :teaches ; owl:someValuesFrom :Course ] .
+                } }""",
+                ds,
+            )
+            val r = SparklesOnt.classify(ds, "http://ex.org/onto", ClassifyQuery(about = "http://ex.org/Professor"))
+            assertTrue(r.getBoolean("consistent"))
+            assertTrue(r.getBoolean("complete"))
+            val sups = r.get("class").asObject.get("superClasses").asArray.map { it.asString.value() }
+            assertTrue("http://ex.org/Teacher" in sups, sups.toString())
+            assertTrue(SparklesOnt.classify(ds, "http://ex.org/onto").getBoolean("reused"))
+            assertThrows(SparklesNotFoundException::class.java) {
+                SparklesOnt.classify(ds, "http://ex.org/onto", ClassifyQuery(about = "http://ex.org/Nobody"))
+            }
+            val before = ds.headCommit().seq
+            val w = SparklesOnt.classify(ds, "http://ex.org/onto", ClassifyQuery(target = "http://ex.org/taxonomy"))
+            assertTrue(w.get("written").asObject.getBoolean("committed"))
+            assertEquals(before + 1, ds.headCommit().seq)
+            val tax = SparklesOnt.axioms(ds, "http://ex.org/taxonomy", AxiomQuery(types = listOf("SubClassOf")))
+            assertTrue(tax.getNumber("total").toInt() >= 1)
+        }
+    }
 }

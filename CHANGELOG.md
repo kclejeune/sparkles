@@ -24,6 +24,16 @@ monitor. Scripts, clients and probes that used `/$/ping` as ready to serve move 
 
 ### Added
 
+An OWL 2 EL classifier computes the inferred class hierarchy and the unsatisfiable
+classes of an ontology (spec F24, roadmap item 580). `sparkles_owl::classify` follows
+ELK's consequence-based calculus on several threads, keeps its state so that a run after
+added or removed axioms saturates again only what they reach, and reports the axioms it
+leaves out as outside OWL 2 EL or uses only in part. `ds.ontology().classify()`,
+`POST /$/ontology/{ds}/classify`, `sparkles ontology classify` and the Python, Node.js
+and JVM bindings run it. A run can write the taxonomy to a named graph in one commit with
+PROV-O provenance on the graph's header, and the dataset keeps its last classification
+so that the next one is incremental.
+
 The OWL 2 ontology handle reaches the bindings. Python's `Dataset.ontology`, Node.js's
 `dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()` read summaries and
 axioms, check profiles, edit axioms, remove entities and diff commits in the JSON forms

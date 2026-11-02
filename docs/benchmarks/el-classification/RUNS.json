@@ -1,0 +1,62 @@
+{
+ "catalog_version": 1,
+ "sources": [
+  {
+   "run_id": "sha256-161c992ec667e66dcba96140e437cd3edfd5983b034852e27f4fce26084b58a1",
+   "path": "runs/2026-11-02-go-chebi-forge-8e73284a/record.json",
+   "sha256": "161c992ec667e66dcba96140e437cd3edfd5983b034852e27f4fce26084b58a1",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "GO 2026-07-26 and ChEBI lite 256",
+    "manifest": {
+     "commit": "8e73284a",
+     "binary": "crates/sparkles-owl/examples/el_classify.rs",
+     "binary_sha256": "3e217c9234c38ed6ea34da8872a02bc40a02ca63495e94c1639fde19b3debec8",
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to the benchmark host",
+     "build_note": "Built from the lane's working tree, whose sparkles-owl sources equal the commit up to rustfmt formatting.",
+     "started": "2026-11-02T14:14:39Z",
+     "ended": "2026-11-02T14:52:29Z",
+     "host_load_before": "1.47 1.65 2.32",
+     "host_load_after": "2.44 2.34 2.01",
+     "data": {
+      "go": {
+       "release": "2026-07-26",
+       "url": "http://purl.obolibrary.org/obo/go/releases/2026-07-26/go.owl",
+       "rdfxml_sha256": "653ce47cd7b02304e67eb67c54d3be02ec5b0ba5e00eb7384dfa0da00f9682ec",
+       "ofn_sha256": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375"
+      },
+      "chebi_lite": {
+       "release": "256",
+       "url": "http://purl.obolibrary.org/obo/chebi/256/chebi_lite.owl",
+       "rdfxml_sha256": "ebea75e0500818e319245a1bf605a684b2e22a2069680290b5dda638d5d25b16",
+       "ofn_sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
+      }
+     }
+    },
+    "settings": {
+     "harness": "crates/sparkles-owl/examples/el_classify.rs",
+     "repeat": 5,
+     "threads": [
+      1,
+      4,
+      8
+     ]
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620,
+      "kernel": "7.2.9"
+     },
+     "method": "el_classify --threads N --repeat 5 --taxonomy FILE INPUT.ofn, one process per ontology and thread count, run under the benchmark host's lock. classifyMs holds the wall time of each of five classifications by a fresh classifier with the axioms in memory, and peakRssKib the process's peak resident memory including the axioms read.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "A manual measurement record of el_classify. Read the record for its method, results and checks."
+  }
+ ]
+}

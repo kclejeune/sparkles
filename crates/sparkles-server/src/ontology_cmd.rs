@@ -1,13 +1,16 @@
 //! `sparkles ontology`: the OWL 2 ontology of a database's graphs (spec F21) on a local
-//! database directory or on a server: its summary, its axioms, its profile checks and
-//! edits, and the check of an ontology file without a database.
+//! database directory or on a server: its summary, its axioms, its profile checks,
+//! edits and OWL 2 EL classification, and the check and classification of an ontology
+//! file without a database.
 
 use crate::http::ontology::{
-    AxiomQuery, axiom_page, check_body, edit_body, mentioned, page_body, summary_body,
+    AxiomQuery, ClassifyQuery, MAX_LIMIT, axiom_page, check_body, classify_body, edit_body,
+    mentioned, page_body, summary_body,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use serde_json::{Value as J, json};
+use sparkles::handles::ontology::classify::ClassifyRequest;
 use sparkles::handles::ontology::{
     self as onto, CheckRequest, EditRequest, OntologyRequest, check_opened,
 };
@@ -73,6 +76,41 @@ pub enum OntologyCmd {
         max_violations: usize,
         /// text or json
         #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Classify by OWL 2 EL: the inferred class hierarchy and the unsatisfiable
+    /// classes. Exits with status 1 when the ontology is inconsistent or has an
+    /// unsatisfiable class
+    Classify {
+        /// An ontology file to classify without a database (Turtle, RDF/XML, OWL
+        /// functional-style syntax, … by its extension)
+        file: Option<PathBuf>,
+        #[command(flatten)]
+        at: Target,
+        #[command(flatten)]
+        read: Read,
+        /// Also classify with the assertions the store holds
+        #[arg(long)]
+        assertions: bool,
+        /// Write the taxonomy to this named graph in one commit
+        #[arg(long)]
+        target: Option<String>,
+        /// The commit message of the write
+        #[arg(long)]
+        message: Option<String>,
+        /// Describe this class: its equivalent classes, direct superclasses and
+        /// subclasses, and all superclasses
+        #[arg(long)]
+        about: Option<String>,
+        /// Worker threads (0: the algorithm pool's share for one call)
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+        /// Exit with status 0 when classes are unsatisfiable but the ontology is
+        /// consistent
+        #[arg(long)]
+        allow_unsatisfiable: bool,
+        /// ofn (the taxonomy as a functional-style document), json or text
+        #[arg(long, default_value = "ofn")]
         format: String,
     },
     /// Add and remove axioms in one commit
@@ -331,6 +369,123 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             }
             Ok(())
         }
+        OntologyCmd::Classify {
+            file,
+            at,
+            read,
+            assertions,
+            target,
+            message,
+            about,
+            threads,
+            allow_unsatisfiable,
+            format,
+        } => {
+            if !["ofn", "json", "text"].contains(&format.as_str()) {
+                bail!("unknown --format {format}: ofn, json or text");
+            }
+            let c = ClassifyRequest {
+                assertions,
+                threads,
+                target: target
+                    .as_deref()
+                    .map(|g| {
+                        GraphRef::parse(g.trim_start_matches('<').trim_end_matches('>'))
+                            .map_err(anyhow::Error::msg)
+                    })
+                    .transpose()?,
+                message: message.clone(),
+                about: about
+                    .as_deref()
+                    .map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string()),
+            };
+            let q = ClassifyQuery {
+                about: about
+                    .as_deref()
+                    .map(|a| a.trim_start_matches('<').trim_end_matches('>').to_string()),
+                nodes: false,
+                limit: MAX_LIMIT,
+                offset: 0,
+            };
+            let loc = if file.is_some() && at.server.is_none() {
+                at.loc.as_deref()
+            } else {
+                local(&at)?
+            };
+            let local_run = |ds: &sparkles::Dataset, name: &str| -> Result<(J, String)> {
+                let req = read.request()?;
+                let out = ds.ontology().classify(&req, &c, &Default::default())?;
+                let r = renderer(ds);
+                let j = classify_body(name, &out, &req, &r, &q)?;
+                let doc = owl::ofn::document(
+                    &r,
+                    &owl::Header::default(),
+                    out.classification.taxonomy.axioms().iter(),
+                );
+                Ok((j, doc))
+            };
+            let (j, doc) = match (file, loc) {
+                (Some(_), Some(_)) => bail!("classify a FILE or a database (--loc), not both"),
+                (Some(_), None) if at.server.is_some() => {
+                    bail!("classify a FILE or a dataset on --server, not both")
+                }
+                (Some(_), None) if c.target.is_some() => {
+                    bail!("--target writes to a database: name --loc or --server, not a FILE")
+                }
+                (Some(f), None) => {
+                    let ds = sparkles::Dataset::memory();
+                    let source = sparkles::io::Source::from_path(&f, None)
+                        .with_context(|| format!("cannot read {}", f.display()))?;
+                    ds.store()
+                        .load(&[source])
+                        .with_context(|| format!("cannot read {}", f.display()))?;
+                    local_run(&ds, &f.display().to_string())?
+                }
+                (None, Some(loc)) => {
+                    let ds = crate::open_dataset(loc, opts)?;
+                    local_run(&ds, &name_of(loc))?
+                }
+                (None, None) => {
+                    let mut body = read.body();
+                    body["assertions"] = json!(assertions);
+                    body["threads"] = json!(threads);
+                    body["limit"] = json!(MAX_LIMIT);
+                    if let Some(t) = &target {
+                        body["target"] = json!(t);
+                    }
+                    if let Some(m) = &message {
+                        body["message"] = json!(m);
+                    }
+                    if let Some(a) = &q.about {
+                        body["about"] = json!(a);
+                    }
+                    let j = remote_post(&at, "/classify", &body)?;
+                    let doc = if format == "ofn" {
+                        // the kept classification answers the second request
+                        if let Some(o) = body.as_object_mut() {
+                            o.remove("target");
+                            o.remove("message");
+                            o.remove("about");
+                        }
+                        remote_post_text(&at, "/classify?format=ofn", &body)?
+                    } else {
+                        String::new()
+                    };
+                    (j, doc)
+                }
+            };
+            match format.as_str() {
+                "ofn" => print!("{doc}"),
+                "json" => println!("{}", serde_json::to_string_pretty(&j)?),
+                _ => print_classify(&j),
+            }
+            let consistent = j["consistent"].as_bool().unwrap_or(false);
+            let unsat = j["unsatisfiableCount"].as_u64().unwrap_or(0);
+            if !consistent || (unsat > 0 && !allow_unsatisfiable) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         OntologyCmd::Edit {
             at,
             read,
@@ -512,6 +667,21 @@ fn remote_post(at: &Target, path: &str, body: &J) -> Result<J> {
     r.check(req.send(), Some(&ds))?.json_value()
 }
 
+#[cfg(feature = "auth")]
+fn remote_post_text(at: &Target, path: &str, body: &J) -> Result<String> {
+    let (r, ds) = remote(at)?;
+    let req = r
+        .req(reqwest::Method::POST, &format!("/$/ontology/{ds}{path}"))
+        .header("content-type", "application/json")
+        .body(body.to_string());
+    Ok(r.check(req.send(), Some(&ds))?.text()?)
+}
+
+#[cfg(not(feature = "auth"))]
+fn remote_post_text(_: &Target, _: &str, _: &J) -> Result<String> {
+    bail!("--server: built without the remote client (cargo feature \"auth\")")
+}
+
 #[cfg(not(feature = "auth"))]
 fn remote_text(_: &Target, _: &str, _: &[(String, String)]) -> Result<String> {
     bail!("--server: built without the remote client (cargo feature \"auth\")")
@@ -613,4 +783,78 @@ fn print_check(j: &J, format: &str) -> Result<()> {
         f => bail!("unknown --format {f}: text or json"),
     }
     Ok(())
+}
+
+fn print_classify(j: &J) {
+    let n = |k: &str| j[k].as_u64().unwrap_or(0);
+    let consistent = j["consistent"].as_bool().unwrap_or(false);
+    println!(
+        "{}: {} classes in {} nodes, {} unsatisfiable",
+        if consistent {
+            "consistent"
+        } else {
+            "inconsistent"
+        },
+        n("classes"),
+        n("nodeCount"),
+        n("unsatisfiableCount"),
+    );
+    for c in j["unsatisfiable"].as_array().into_iter().flatten() {
+        println!("  unsatisfiable {}", c.as_str().unwrap_or(""));
+    }
+    if j["complete"].as_bool() != Some(true) {
+        println!(
+            "incomplete: {} axioms left out or used in part",
+            n("excludedCount")
+        );
+        for e in j["excluded"].as_array().into_iter().flatten() {
+            let why = e["partial"]
+                .as_str()
+                .map(|p| format!("partly used ({p})"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}: {}",
+                        e["rule"].as_str().unwrap_or(""),
+                        e["message"].as_str().unwrap_or("")
+                    )
+                });
+            println!("  {why}\n    {}", e["ofn"].as_str().unwrap_or(""));
+        }
+    }
+    let s = &j["stats"];
+    println!(
+        "{} run on {} threads: index {:.1} ms, saturation {:.1} ms, taxonomy {:.1} ms",
+        if s["incremental"].as_bool() == Some(true) {
+            "incremental"
+        } else {
+            "full"
+        },
+        s["threads"],
+        s["indexMs"].as_f64().unwrap_or(0.0),
+        s["saturationMs"].as_f64().unwrap_or(0.0),
+        s["taxonomyMs"].as_f64().unwrap_or(0.0),
+    );
+    let c = &j["class"];
+    if c.is_object() {
+        let list = |k: &str| -> String {
+            c[k].as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(J::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!("class {}", c["iri"].as_str().unwrap_or(""));
+        println!("  equivalent   {}", list("classes"));
+        println!("  parents      {}", list("parentClasses"));
+        println!("  children     {}", list("childClasses"));
+        println!("  superclasses {}", list("superClasses"));
+    }
+    if let Some(w) = j["written"].as_object() {
+        println!(
+            "wrote the taxonomy: {} axioms added, {} removed",
+            w.get("added").and_then(J::as_u64).unwrap_or(0),
+            w.get("removed").and_then(J::as_u64).unwrap_or(0)
+        );
+    }
 }

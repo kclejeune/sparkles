@@ -781,6 +781,42 @@ fn ontology(p: &mut Paths) {
             .errors(&[400, 404, 408]),
     );
     p.add(
+        write_params(op(POST, "/$/ontology/{ds}/classify", "classifyOntology", "Ontology", "Classify an OWL 2 EL ontology"))
+            .doc("Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`.")
+            .see("ontology")
+            .query("format", json!({ "type": "string", "enum": ["json", "ofn"] }), "`json` (the default) or `ofn`.")
+            .body(
+                false,
+                "The ontology and what to answer.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "assertions": { "type": "boolean", "description": "Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept." },
+                        "target": { "type": "string", "description": "A named graph outside the graphs read that takes the direct taxonomy." },
+                        "message": { "type": "string", "description": "The commit message of the write, also kept as a comment on the header." },
+                        "about": { "type": "string", "description": "A class IRI to describe." },
+                        "nodes": { "type": "boolean", "description": "List the taxonomy's nodes." },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most nodes, unsatisfiable classes and excluded axioms listed (100 by default)." },
+                        "offset": { "type": "integer", "minimum": 0, "description": "The first node listed." },
+                        "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads, within the algorithm pool's grant (0 for the grant)." }
+                    }
+                } } }),
+            )
+            .resp(
+                "200",
+                "The classification, with the receipt when a write asked for one.",
+                Some(json!({
+                    "application/json": { "schema": { "type": "object" } },
+                    "text/owl-functional": { "schema": { "type": "string" } }
+                })),
+            )
+            .errors(&[400, 403, 404, 408, 409, 507]),
+    );
+    p.add(
         read(op(GET, "/$/ontology/{ds}/diff", "diffOntology", "Ontology", "Diff the axioms of two commits"))
             .doc("The axioms that differ between the commits `from` and `to` (the head by default), with the graph of each. The terminology of each state is read as the summary reads it, and the two sets of axioms are compared. With `assertions=true`, the assertions that the triples changed between the two commits carry are added and removed too. When no triple of the graphs read changed, the diff is empty. `format=text` answers `+ axiom` and `- axiom` lines in functional-style syntax. A caller whose grants limit endpoints needs the `diff` endpoint.")
             .see("ontology")
