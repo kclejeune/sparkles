@@ -423,8 +423,8 @@ of the fusion's sums, weights and ties.
 
 ### Charged query state and chunked live reservations
 
-The accounting steps of stage 4 that leave item 7's operators alone shipped, apart from
-the regular-expression step of item NEW-ITEM-2, and so did the first step of item
+The accounting steps of stage 4 that leave item 7's operators alone shipped, with the
+regular-expression step of item NEW-ITEM-2, and so did the first step of item
 NEW-ITEM-4, which charges retained scratch and the EXISTS memo in both modes. Every context now
 carries its accounting regime as `Accounting::Collect` or `Accounting::Cursor`, one
 record of a memory failure and one checked counter of produced rows, so the state that
@@ -507,8 +507,47 @@ distinct EXISTS keys raise an eager query's peak by their entries, and
 `a_finished_result_gives_back_its_exists_state` checks that a one-row COUNT over 100,000
 EXISTS keys keeps at most 2 MiB of the pool.
 
-Item NEW-ITEM-2 holds the regular expressions, and the rest of item NEW-ITEM-4 merges the
-remaining `cursor_*` twins.
+Regular expressions have one engine in both modes. `REGEX`, `REPLACE` and the key filters
+on vocabulary keys compile each pattern once per query into a program of
+`regex_automata` with a bounded hybrid DFA and PikeVM, charged to the query with its
+search cache, and the program goes when the query's work ends. Eager execution used a
+process-wide thread-local cache of up to 1,000 uncharged programs of up to 4 MiB, which
+outlived the query, and it is gone. On atlas, a lock on one shared search cache cost
+about 9 ns a row, nearly as much as the 11 ns of matching `regex-iri`'s pattern against
+an IRI, so each Rayon worker that searches a program gets a clone of it with its own
+cache. The clone's cache is
+charged when it is made and is optional, so a worker whose cache would leave less than
+three quarters of the budget shares the locked cache instead. A key filter copy no
+longer forks a cache of its own. The per-row lookup of a pattern reads the query's map
+of programs without a lock, and the planner reads a filter's key prefixes without
+compiling its patterns. SHACL and ShEx compile their patterns once per shape through
+`compile_regex`, which no longer caches. `a_regular_expression_beyond_the_budget_fails_the_query_in_both_modes`
+checks that a program a 32 KiB budget cannot hold fails an eager query, which compiled it
+uncharged before, and
+`regular_expressions_on_rayon_workers_count_what_the_data_holds` checks key filters,
+`REGEX` on computed strings and `REPLACE` against counts that follow from the data on
+four workers in both modes.
+
+Per-value reuse in BIND and FILTER has one implementation, which chooses its algorithm
+by the size of its input rather than by the accounting mode. An input of at most 16,384
+rows, which holds a cursor's batches, keeps only ids and slots under one reservation until
+the output is expanded, finds its distinct inputs from a dense integer range or one sort
+and expands on the calling thread. A larger input estimates its distinct inputs before it
+collects them and expands in parallel, and its slots, distinct values and results are a
+retained charge until they are read, in both modes. Eager tables of 1,024 to 16,384 rows
+therefore take the batch algorithms, and a FILTER whose conjuncts read several variables
+groups them by variable in a cursor batch too. When the key tests that a FILTER's shape
+admits do not compile, the distinct values go to the general evaluator, where a cursor
+batch used to panic. FILTER and BIND inputs of at most 16,384 rows time their first 256
+rows before spreading the rest over the pool in both modes.
+`the_table_and_batch_algorithms_agree_with_rows_on_both_sides_of_the_threshold` compares
+reuse with row-by-row evaluation over 32,768 rows in eager execution and in cursors with
+batches on both sides of the threshold.
+
+A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
+calls of `is_cursor()` outside tests and fails above its bound, which each step lowers. It
+was 26 after the regular expressions and is 17 after per-value reuse. The rest of item
+NEW-ITEM-4 merges the remaining `cursor_*` twins.
 
 ### Measurements of stage 1
 

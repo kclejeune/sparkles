@@ -108,6 +108,17 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+Eager queries now count against their memory budget the query state that only cursors
+counted before. The decoded value cache, which holds at most 64 MiB or an eighth of the
+budget, the decoding of dictionary keys, the terms that expressions compute, the memos of
+blank nodes, callback terms, geometries and EXISTS, retained scratch and the programs of
+regular expressions are charged in both execution modes. An eager query close to its
+memory budget can therefore fail with the memory budget where it used to answer. Regular
+expressions compile once per query with bounded search caches and no longer stay in a
+process-wide cache of up to 1,000 programs. A cursor's account reserves from the query
+pool in steps of 64 KiB and can hold about 1 MiB of the pool above its live bytes, and
+cursors keep their decoded values across batches (spec X14 stage 4).
+
 Streaming cursors run FOLD and registered aggregates over the key runs of their input,
 sorting it on the group keys when it does not arrive that way, and DESCRIBE describes
 each batch of solutions as it arrives, so the strict policy admits both. A LIMIT without
