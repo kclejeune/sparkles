@@ -1942,3 +1942,23 @@ async fn explicit_streaming_commits_after_the_first_batch() {
         }
     }
 }
+
+/// An explicitly streamed CONSTRUCT commits after its first batch as well, in an RDF
+/// format, in a Jena format and in the native graph format.
+#[tokio::test]
+async fn explicit_streaming_graphs_commit_after_the_first_batch() {
+    let s = server();
+    let q = "/ds/sparql?query=CONSTRUCT%20%7B%3Fs%20%3Fp%20%3Fo%7D%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D&execution=streaming";
+    for accept in ["application/n-triples", "application/rdf+json", "sparkles"] {
+        let r = if accept == "sparkles" {
+            get(&s.app, &format!("{q}&format=sparkles")).await
+        } else {
+            get_with(&s.app, q, "accept", accept).await
+        };
+        assert_eq!(r.status, StatusCode::OK, "{accept}: {}", r.text());
+        assert!(
+            r.header("content-length").is_empty(),
+            "{accept}: an explicit stream was buffered"
+        );
+    }
+}

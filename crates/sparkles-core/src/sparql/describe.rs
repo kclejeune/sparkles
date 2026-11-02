@@ -291,6 +291,9 @@ struct Describer<'a> {
     bytes: u64,
     /// the triples earlier batches of a streamed DESCRIBE returned
     emitted: u64,
+    /// The bytes of `bytes` that the output and the queue hold, which a streamed
+    /// DESCRIBE releases once it hands its batch on, keeping only the traversal state.
+    transient: u64,
 }
 
 /// Where a description reads: the graphs of the dataset and the reification
@@ -491,6 +494,7 @@ pub(super) fn describe_batch(
         },
         bytes: state.bytes,
         emitted: state.emitted,
+        transient: 0,
     };
     // the resources this batch added, in the set of described resources
     let added = (state.described.len() - before) as u64 * 48;
@@ -506,9 +510,11 @@ pub(super) fn describe_batch(
     state.linked = std::mem::take(&mut d.linked);
     state.truncated = d.truncated;
     state.emitted = d.emitted.saturating_add(d.out.len() as u64);
-    state.bytes = d.bytes;
+    // The triples go to the caller, which charges them itself, and the queue is empty.
+    state.bytes = d.bytes.saturating_sub(d.transient).max(4096);
     let DescriptionCharge { inner, .. } = d.charge;
-    if let DescriptionChargeKind::Cursor(charge) = inner {
+    if let DescriptionChargeKind::Cursor(mut charge) = inner {
+        let _ = charge.resize(state.bytes);
         state.charge = Some(charge);
     }
     result?;
@@ -547,6 +553,7 @@ pub(super) fn describe<'a>(
         charge: DescriptionCharge::new(ctx, 4096)?,
         bytes: 4096,
         emitted: 0,
+        transient: 0,
     };
     d.describe_all(resources, true)?;
     if d.truncated {
@@ -601,7 +608,9 @@ impl<'a> Describer<'a> {
             return Ok(());
         }
         if self.queue.len() == self.queue.capacity() {
-            self.reserve((self.queue.capacity().max(4) as u64).saturating_mul(128))?;
+            let bytes = (self.queue.capacity().max(4) as u64).saturating_mul(128);
+            self.reserve(bytes)?;
+            self.transient = self.transient.saturating_add(bytes);
         }
         self.queue.push(Item {
             node,
@@ -745,6 +754,7 @@ impl<'a> Describer<'a> {
             Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(4)))
         })?;
         self.reserve(bytes)?;
+        self.transient = self.transient.saturating_add(bytes);
         if let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH]) {
             self.out.push(Triple::new(q.subject, q.predicate, q.object));
         }

@@ -588,3 +588,91 @@ fn a_streamed_description_stays_within_its_budget() {
         }
     }
 }
+
+/// The triples of a streamed description stay charged only until the batch that holds
+/// them is dropped, so a description larger than the budget streams through it.
+#[test]
+fn a_streamed_description_releases_what_it_returned() {
+    use sparkles_core::sparql::{CursorOptions, graph_cursor};
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..4000 {
+        data.push_str(&format!(
+            "<urn:s:{i}> <urn:text> \"{i}{}\" .\n",
+            "y".repeat(2000)
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let opts = QueryOptions {
+        max_memory_bytes: Some(16 << 20),
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 50,
+        ..Default::default()
+    };
+    let mut c = graph_cursor(
+        s.snapshot(),
+        "DESCRIBE ?s WHERE { ?s <urn:text> ?o }",
+        &opts,
+        &cursor,
+    )
+    .unwrap();
+    let mut count = 0;
+    while let Some(batch) = c.next_batch().unwrap() {
+        count += batch.len();
+    }
+    assert_eq!(count, 4000);
+}
+
+/// Closing a streamed description returns what it held to the query pool, even while
+/// the closed cursor stays alive.
+#[test]
+fn a_closed_description_returns_its_memory() {
+    use sparkles_core::sparql::pool::QueryPool;
+    use sparkles_core::sparql::{CursorOptions, graph_cursor};
+    use std::sync::Arc;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..20_000 {
+        data.push_str(&format!("<urn:s:{i}> <urn:p> <urn:o:{}> .\n", i % 97));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let pool = QueryPool::new(1 << 30);
+    let grant = Arc::new(pool.try_grant(0).unwrap());
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1000,
+        ..Default::default()
+    };
+    let mut c = graph_cursor(
+        s.snapshot(),
+        "DESCRIBE ?s WHERE { ?s <urn:p> ?o }",
+        &opts,
+        &cursor,
+    )
+    .unwrap();
+    for _ in 0..10 {
+        assert!(c.next_batch().unwrap().is_some());
+    }
+    let open = grant.used();
+    c.close();
+    let closed = grant.used();
+    assert!(closed < open / 2, "open {open}, closed {closed}");
+    assert!(c.next_batch().unwrap().is_none());
+    drop(c);
+}

@@ -180,3 +180,26 @@ fn ordered_aggregates_spill_their_sort() {
         Err(e) => panic!("{e}"),
     }
 }
+
+/// One group that spans hundreds of batches, beside small ones, gives the eager
+/// answer.
+#[test]
+fn a_group_spanning_many_batches() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..40_000 {
+        let g = if i % 10 == 0 { i } else { 1 };
+        data.push_str(&format!("<urn:s:{g}> <urn:p> {i} .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let opts = options(None, None);
+    let q = "SELECT ?s (AGG <urn:test:sequence>(?v) AS ?a) (COUNT(*) AS ?n) { ?s <urn:p> ?v } GROUP BY ?s";
+    let expected = bag(query(s.snapshot(), q, &opts).unwrap().rows());
+    let (rows, _) = cursor(&s, q, &opts, 64).unwrap();
+    assert_eq!(rows, expected);
+}

@@ -405,6 +405,9 @@ impl GraphCursor {
             self.pending = None;
             self.seen.clear();
             self.seen.shrink_to_fit();
+            // what a DESCRIBE kept, with its charge; `truncated` stays
+            self.described = Default::default();
+            self.described_all = true;
         });
         let _ = self.seen_charge.resize(self.base_bytes);
     }
@@ -463,8 +466,10 @@ pub fn write_cursor_graph(
             oxrdfio::RdfSerializer::from_format(format),
             prefixes.iter().cloned(),
         );
-        let mut writer = serializer.for_writer(output);
+        let shared = std::cell::RefCell::new(output);
+        let mut writer = serializer.for_writer(crate::sparql::results::Shared(&shared));
         let mut sent = 0usize;
+        let mut first = true;
         while send.is_none_or(|max| sent < max) {
             let Some(batch) =
                 cursor.next_at_most(send.map_or(usize::MAX, |max| max.saturating_sub(sent)))?
@@ -484,6 +489,11 @@ pub fn write_cursor_graph(
                         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
                 }
                 sent += 1;
+            }
+            // what the first batch wrote reaches a writer that commits on a flush; a
+            // serializer that groups triples by subject may still hold the last ones
+            if std::mem::take(&mut first) {
+                shared.borrow_mut().flush()?;
             }
         }
         if send.is_some_and(|max| sent >= max) {

@@ -438,7 +438,7 @@ impl RowCharge {
 /// the next batch. A later error leaves partial bytes and no success terminator.
 /// A writer that a serializer writes to while the code around it keeps a way to flush
 /// it, which the cursor writers use after their first batch.
-struct Shared<'a, W>(&'a std::cell::RefCell<W>);
+pub(in crate::sparql) struct Shared<'a, W>(pub(in crate::sparql) &'a std::cell::RefCell<W>);
 
 impl<W: Write> Write for Shared<'_, W> {
     #[inline]
@@ -1184,8 +1184,10 @@ pub fn write_cursor_jena_graph(
     let result = super::depth::with_stack(cursor.stack_depth(), || {
         let mut charge = cursor.charge(128 << 10)?;
         let mut bytes = 128 << 10;
-        let mut writer = crate::jena_formats::RdfWriter::new(format, output);
+        let shared = std::cell::RefCell::new(output);
+        let mut writer = crate::jena_formats::RdfWriter::new(format, Shared(&shared));
         let mut sent = 0usize;
+        let mut first = true;
         while send.is_none_or(|max| sent < max) {
             let Some(batch) = cursor.next_at_most(send.map_or(usize::MAX, |max| max - sent))?
             else {
@@ -1211,6 +1213,10 @@ pub fn write_cursor_jena_graph(
                         .map_err(io)?;
                 }
                 sent += 1;
+            }
+            // what the first batch wrote reaches a writer that commits on a flush
+            if std::mem::take(&mut first) {
+                shared.borrow_mut().flush()?;
             }
         }
         if send.is_some_and(|max| sent >= max) {

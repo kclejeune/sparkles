@@ -48,6 +48,10 @@ pub(super) struct RunGroup {
     cols: Vec<usize>,
     /// Input rows of groups not yet aggregated.
     held: Option<Buffer>,
+    /// The first held row of the last group, which may not be complete. Each appended
+    /// batch moves it by comparing only its own rows, so a group that spans many
+    /// batches is read once.
+    open: usize,
     /// Aggregated groups not yet returned, and how many of them were.
     output: Option<(Buffer, usize)>,
     input_done: bool,
@@ -69,6 +73,7 @@ impl RunGroup {
             aggs: aggs.clone(),
             cols,
             held: None,
+            open: 0,
             output: None,
             input_done: false,
             ran: false,
@@ -79,22 +84,28 @@ impl RunGroup {
         self.input_done && self.held.is_none() && self.output.is_none() && self.ran
     }
 
-    /// The first row of the last group that `table` holds, which may not be complete.
-    fn last_start(&self, table: &crate::sparql::table::Table) -> usize {
-        if self.cols.is_empty() || table.len == 0 {
-            return 0;
-        }
-        let last = table.len - 1;
-        let same = |row: usize| {
-            self.cols
-                .iter()
-                .all(|&c| table.cols[c][row] == table.cols[c][last])
+    /// Move [`Self::open`] over the held rows from `from` on, which a batch appended.
+    fn advance(&mut self, ctx: &Ctx, from: usize) -> Result<()> {
+        let Some(held) = &self.held else {
+            return Ok(());
         };
-        let mut start = last;
-        while start > 0 && same(start - 1) {
-            start -= 1;
+        let table = &held.table;
+        if self.cols.is_empty() {
+            return Ok(());
         }
-        start
+        for row in from.max(1)..table.len {
+            if row.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if self
+                .cols
+                .iter()
+                .any(|&c| table.cols[c][row] != table.cols[c][row - 1])
+            {
+                self.open = row;
+            }
+        }
+        Ok(())
     }
 
     fn aggregate(&mut self, ctx: &Arc<Ctx>, rows: Buffer, vars: &[VarId]) -> Result<()> {
@@ -163,20 +174,23 @@ impl RunGroup {
                 Some(held) => held,
                 None => self.held.insert(Buffer::new(ctx, &child.vars, 0)?),
             };
+            let from = held.table.len;
             merge::append(ctx, held, &batch.table, 0..batch.table.len)?;
+            let len = held.table.len;
             drop(batch);
-            if self.input_done || held.table.len < options.batch_rows {
+            self.advance(ctx, from)?;
+            if self.input_done || len < options.batch_rows {
                 continue;
             }
             // Aggregate the finished groups and keep the rows of the last one.
-            let start = self.last_start(&self.held.as_ref().expect("held rows").table);
+            let start = self.open;
             if start == 0 {
                 continue;
             }
             let held = self.held.as_mut().expect("held rows");
             let finished = copy_rows(ctx, &held.table, 0, start)?.expect("finished groups");
-            let rest = held.table.len - start;
-            held.slice_in_place(start, rest)?;
+            held.slice_in_place(start, len - start)?;
+            self.open = 0;
             self.aggregate(ctx, finished, vars)?;
         }
     }
