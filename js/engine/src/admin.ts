@@ -6,7 +6,7 @@ import type {
   UpdateOptions,
   CommitReceipt,
 } from '@sparkles-rdf/common';
-import { decodeTerm, unsigned } from '@sparkles-rdf/common';
+import { QueryTimeoutError, decodeTerm, unsigned } from '@sparkles-rdf/common';
 export type Configuration = Record<string, unknown>;
 export interface CommitInfo {
   seq: bigint;
@@ -477,6 +477,17 @@ export class Administration {
       profiles: o.profiles,
       maxViolations: o.maxViolations,
     });
+    // what an edit or a diff reads; `at` and `inferences` go on, for the native call to refuse
+    const writeSelection = (o: OntologySelection) => {
+      const { at, inferences } = o as OntologyRead;
+      return {
+        graph: o.graph,
+        imports: o.imports,
+        mode: o.mode,
+        at: at === undefined || typeof at === 'string' ? at : unsigned(at),
+        inferences,
+      };
+    };
     this.ontology = {
       /** The header, the counts of entities and axioms, the graphs read and the diagnostics. */
       summary: (o: OntologyRead & OperationOptions = {}) =>
@@ -487,24 +498,29 @@ export class Administration {
       ) => call<OntologyAxiomPage>('ontology.axioms', ontologyArgs(o), o, false),
       /**
        * The axioms, read in batches of `batch` (1,000 by default) from the commit of the first
-       * batch, so that a commit made meanwhile does not mix into the listing.
+       * batch, so that a commit made meanwhile does not mix into the listing. `timeout`
+       * bounds the whole listing, from the first batch on.
        */
       axioms: (
         o: OntologyAxiomQuery & OperationOptions & { batch?: number } = {},
       ): AsyncIterable<OntologyAxiom> => {
-        const { batch = 1000, ...rest } = o;
+        const { batch = 1000, timeout, ...rest } = o;
         return {
           [Symbol.asyncIterator]: async function* () {
             let offset = 0;
             let at = rest.at;
+            const end = timeout === undefined ? undefined : Date.now() + timeout;
             for (;;) {
+              const left = end === undefined ? undefined : end - Date.now();
+              if (left !== undefined && left <= 0) throw new QueryTimeoutError();
               const page = await call<OntologyAxiomPage>(
                 'ontology.axioms',
                 ontologyArgs({ ...rest, at, limit: batch, offset }),
-                rest,
+                { ...rest, timeout: left },
                 false,
               );
-              if (at === undefined) at = 'commit:' + page.commit.toString();
+              // the later batches read the commit the first one read, whatever `at` named
+              at = 'commit:' + page.commit.toString();
               yield* page.axioms;
               if (page.next === null || page.next === undefined) return;
               offset = Number(page.next);
@@ -532,18 +548,16 @@ export class Administration {
         },
         o: OntologySelection & UpdateOptions = {},
       ) => {
-        const { graph, imports, mode } = o;
-        return call<OntologyEdit>('ontology.edit', { graph, imports, mode, ...change }, o, true);
+        return call<OntologyEdit>('ontology.edit', { ...writeSelection(o), ...change }, o, true);
       },
       /** Remove an entity: its declarations, the axioms that mention it and the assertions about it. */
       removeEntity: (
         iri: string,
         o: OntologySelection & UpdateOptions & { message?: string } = {},
       ) => {
-        const { graph, imports, mode, message } = o;
         return call<OntologyEdit>(
           'ontology.removeEntity',
-          { graph, imports, mode, iri, message },
+          { ...writeSelection(o), iri, message: o.message },
           o,
           true,
         );
@@ -558,13 +572,11 @@ export class Administration {
             limit?: number;
           } = {},
       ) => {
-        const { graph, imports, mode, to, assertions, limit } = o;
+        const { to, assertions, limit } = o;
         return call<OntologyDiff>(
           'ontology.diff',
           {
-            graph,
-            imports,
-            mode,
+            ...writeSelection(o),
             from: typeof from === 'string' ? from : unsigned(from),
             to: to === undefined || typeof to === 'string' ? to : unsigned(to),
             assertions,

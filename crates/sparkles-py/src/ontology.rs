@@ -20,7 +20,14 @@ handle!(PyOntologies, "Ontologies");
 /// An OWL 2 axiom, compared and hashed by its structure and annotations. `Axiom(text)`
 /// reads one axiom in functional-style syntax, and `str()` writes it back with the
 /// standard prefixes.
-#[pyclass(frozen, eq, hash, module = "sparkles", name = "Axiom")]
+#[pyclass(
+    frozen,
+    eq,
+    hash,
+    module = "sparkles",
+    name = "Axiom",
+    skip_from_py_object
+)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PyAxiom(pub Axiom);
 
@@ -258,7 +265,7 @@ impl PyOntologies {
     /// One page of the axioms with a type in `type` and mentioning `about`, with the
     /// assertions the store holds when `assertions` is true. Each entry's `axiom` is an
     /// `Axiom`, and `next` is the offset of the next page.
-    #[pyo3(signature=(graph=None, *, type=None, about=None, assertions=false, limit=100, offset=0, imports=true, mode="lenient", at=None, inferences=false, cancel=None, timeout=None))]
+    #[pyo3(signature=(graph=None, *, r#type=None, about=None, assertions=false, limit=100, offset=0, imports=true, mode="lenient", at=None, inferences=false, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn axioms<'py>(
         &self,

@@ -1158,6 +1158,58 @@ fn owl_rl_runs_warn_about_axioms_outside_rl() {
     );
 }
 
+/// The warnings check the state the run reads under the writer lock: an axiom that a
+/// commit adds after the run starts, before it takes the lock, is checked too.
+#[test]
+fn owl_rl_warnings_check_the_state_the_run_reads() {
+    let ds = dataset(":o a owl:Ontology . :A a owl:Class . :B a owl:Class . :C a owl:Class .");
+    let writer = ds.clone();
+    let wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let w = wrote.clone();
+    let ctl = crate::task::Control {
+        progress: crate::task::Progress::new(move |_, msg| {
+            if msg == "loading triples" && !w.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                writer
+                    .update(&format!(
+                        "{PREFIXES} INSERT DATA {{ :A owl:disjointUnionOf ( :B :C ) . }}"
+                    ))
+                    .unwrap();
+            }
+        }),
+        ..crate::task::Control::none()
+    };
+    let out = ds
+        .reasoning()
+        .run_with(
+            &crate::reasoning::ReasonRequest {
+                profile: sparkles_reasoner::Profile::OwlRl,
+                ..Default::default()
+            },
+            &ctl,
+        )
+        .unwrap();
+    assert!(wrote.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        out.report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("1 axiom is outside OWL 2 RL")),
+        "{:?}",
+        out.report.warnings
+    );
+}
+
+fn rl(ds: &Dataset) -> Vec<String> {
+    let store = ds.store();
+    rl_warnings(
+        &store.snapshot(),
+        &store.prefixes(),
+        &Default::default(),
+        &opts(),
+    )
+    .unwrap()
+}
+
 /// spec F21 §7: an axiom in OWL 2 RL whose rule the subset covers only up to a size is
 /// named, from the gap table beside the rules.
 #[test]
@@ -1168,7 +1220,7 @@ fn owl_rl_runs_warn_about_rules_the_subset_lacks() {
         :t owl:propertyChainAxiom ( :p :q :r :s ) .
         :u owl:propertyChainAxiom ( :p :q ) . :u a owl:ObjectProperty .",
     );
-    let w = rl_warnings(ds.store(), &Default::default(), &opts()).unwrap();
+    let w = rl(&ds);
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(
         w[0].starts_with("1 axiom in OWL 2 RL needs rule prp-spo2 for more than 3"),
@@ -1177,11 +1229,7 @@ fn owl_rl_runs_warn_about_rules_the_subset_lacks() {
     );
     let clean =
         dataset(":o a owl:Ontology . :A a owl:Class . :B a owl:Class . :A rdfs:subClassOf :B .");
-    assert!(
-        rl_warnings(clean.store(), &Default::default(), &opts())
-            .unwrap()
-            .is_empty()
-    );
+    assert!(rl(&clean).is_empty());
 }
 
 /// The gap table names rules whose sizes up to its limit, and no larger one, are in the

@@ -110,8 +110,6 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         fetched.extend(f.fetched);
         fetch_warnings = f.warnings;
     }
-    // the input graphs' axioms outside OWL 2 RL, before the run changes the head
-    let rl = rl_warnings(store, req, ctl)?;
     ctl.progress.report(0.05, "loading triples");
     // the reasoner reports progress only once it holds the writer lock
     let locked = Arc::new(AtomicBool::new(false));
@@ -133,6 +131,8 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             .max_inferred
             .unwrap_or(sparkles_reasoner::DEFAULT_MAX_INFERRED),
         pool: super::reason_pool(),
+        // the input graphs' axioms outside OWL 2 RL, in the state the run reads
+        inspect: rl_inspector(store, req, ctl),
         ..Default::default()
     };
     let superseded = AtomicBool::new(false);
@@ -171,7 +171,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         done.store(true, Ordering::Relaxed);
         r
     });
-    let mut report = match result {
+    let report = match result {
         Ok(r) => r,
         Err(_) if superseded.load(Ordering::Relaxed) => {
             return Err(Error::Component(Box::new(ComponentError::new(
@@ -191,7 +191,6 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             return Err(from_anyhow(e));
         }
     };
-    report.warnings.extend(rl);
     let mut record = recorded(&req.profile, &req.extras, &report, store);
     record_inputs(&mut record, &req.inputs, &report, fetched);
     record.warnings.splice(0..0, fetch_warnings);
@@ -205,7 +204,11 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
 /// The warnings of spec F21 §7 for an `owl-rl` run: the axioms of its inputs outside
 /// OWL 2 RL and those whose rules the rule subset lacks. Other profiles have none, and
 /// so does a library built without the `ontology` feature.
-fn rl_warnings(store: &Store, req: &ReasonRequest, ctl: &Control) -> Result<Vec<String>> {
+fn rl_inspector(
+    store: &Store,
+    req: &ReasonRequest,
+    ctl: &Control,
+) -> Option<sparkles_reasoner::InspectFn> {
     #[cfg(feature = "ontology")]
     if req.profile == Profile::OwlRl {
         let opts = QueryOptions {
@@ -213,10 +216,14 @@ fn rl_warnings(store: &Store, req: &ReasonRequest, ctl: &Control) -> Result<Vec<
             deadline: ctl.deadline,
             ..Default::default()
         };
-        return crate::handles::ontology::rl_warnings(store, &req.inputs, &opts);
+        return Some(crate::handles::ontology::rl_inspector(
+            store,
+            &req.inputs,
+            opts,
+        ));
     }
     let _ = (store, req, ctl);
-    Ok(Vec::new())
+    None
 }
 
 /// The record of a materialization.

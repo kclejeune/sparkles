@@ -59,6 +59,38 @@ class OntologyTest {
         }
     }
 
+    /** An aborted transaction undoes the model's additions and deletions in its copy too. */
+    @Test fun an_aborted_transaction_leaves_the_model_as_the_dataset_is() {
+        SparklesDatasets.memory().use { ds ->
+            a1(ds)
+            val m = SparklesOnt.model(ds, "http://ex.org/onto")
+            val before = ds.headCommit().seq
+            ds.begin(ReadWrite.WRITE)
+            try {
+                m.createOntClass("urn:X")
+                m.getOntClass("http://ex.org/Course")!!.removeProperties()
+                assertNotNull(m.getOntClass("urn:X"), "the transaction sees its own writes")
+                ds.abort()
+            } finally {
+                ds.end()
+            }
+            assertEquals(before, ds.headCommit().seq)
+            assertNull(m.getOntClass("urn:X"))
+            assertNotNull(m.getOntClass("http://ex.org/Course"))
+            assertEquals(SparklesOnt.graph(ds, "http://ex.org/onto").size(), m.graph.size())
+            // a committed transaction keeps its writes
+            ds.begin(ReadWrite.WRITE)
+            try {
+                m.createOntClass("urn:Y")
+                ds.commit()
+            } finally {
+                ds.end()
+            }
+            assertNotNull(m.getOntClass("urn:Y"))
+            assertNotNull(SparklesOnt.model(ds, "http://ex.org/onto").getOntClass("urn:Y"))
+        }
+    }
+
     /** The copy holds a larger ontology in full: it is filled by one native read, not by batches. */
     @Test fun the_model_copies_a_large_graph_in_one_read() {
         SparklesDatasets.memory().use { ds ->

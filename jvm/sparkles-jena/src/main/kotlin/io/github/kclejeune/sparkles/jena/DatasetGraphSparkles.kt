@@ -294,6 +294,7 @@ public class DatasetGraphSparkles internal constructor(
                 val w = t.writeOrThrow()
                 t.flush()
                 val r = ffi { w.commit() }
+                t.committed = true
                 handle.lastReceipt.set(r.toReceipt())
             }
         } catch (e: RuntimeException) {

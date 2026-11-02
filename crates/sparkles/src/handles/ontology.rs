@@ -1632,7 +1632,7 @@ pub fn rl_gaps() -> Vec<(&'static str, usize, &'static str)> {
         .collect()
 }
 
-/// The warnings of an `owl-rl` materialization over `inputs` at the head of `store`
+/// The warnings of an `owl-rl` materialization over `inputs` in the state `snap`
 /// (spec F21 §7):
 /// how many axioms of the input graphs and the imports they resolve to lie outside
 /// OWL 2 RL, for which the rules may miss entailments (OWL 2 Profiles §4.3, Theorem
@@ -1643,13 +1643,14 @@ pub fn rl_gaps() -> Vec<(&'static str, usize, &'static str)> {
 /// assertion with a class expression is read with the terminology and the other
 /// assertions are always in OWL 2 RL. Fetching imports is the run's work, so an import
 /// is followed only to a graph of the dataset. The answer is empty when everything is
-/// in OWL 2 RL and covered.
+/// in OWL 2 RL and covered. `prefixes` abbreviate the IRIs of the axioms the warnings
+/// quote.
 pub fn rl_warnings(
-    store: &crate::store::Store,
+    snap: &Arc<Snapshot>,
+    prefixes: &BTreeMap<String, String>,
     inputs: &Inputs,
     opts: &QueryOptions,
 ) -> Result<Vec<String>> {
-    let snap = &store.snapshot();
     let inputs = Inputs {
         data_graphs: inputs.configured(),
         ontology_graphs: Vec::new(),
@@ -1664,7 +1665,7 @@ pub fn rl_warnings(
     let requested = inputs.data_graphs.len();
     let (ontology, _) = read_store(snap, &graph_ids, requested, Mode::Lenient, opts)?;
     let part = sparkles_owl::profiles::partition(&ontology, Profile::Rl);
-    let render = sparkles_owl::ofn::Renderer::new(store.prefixes());
+    let render = sparkles_owl::ofn::Renderer::new(prefixes.clone());
     let mut out = Vec::new();
     let outside = part.outside_axioms();
     if let Some(first) = part.outside.first() {
@@ -1697,6 +1698,19 @@ pub fn rl_warnings(
         }
     }
     Ok(out)
+}
+
+/// The [`rl_warnings`] of an `owl-rl` run over `inputs` in `store`, as a check the run
+/// makes of the state it reads under the writer lock
+/// ([`sparkles_reasoner::ReasonOptions::inspect`]).
+pub fn rl_inspector(
+    store: &crate::store::Store,
+    inputs: &Inputs,
+    opts: QueryOptions,
+) -> sparkles_reasoner::InspectFn {
+    let prefixes = store.prefixes();
+    let inputs = inputs.clone();
+    Arc::new(move |snap| Ok(rl_warnings(snap, &prefixes, &inputs, &opts)?))
 }
 
 pub mod wire;

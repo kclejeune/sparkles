@@ -121,6 +121,10 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
     @Volatile
     var abortedByClose = false
 
+    /** True once the transaction's writes committed. */
+    @Volatile
+    var committed = false
+
     /** Throw if closing the dataset aborted this transaction, so that its writes are not lost silently. */
     fun checkNotAbortedByClose() {
         if (abortedByClose || (mode == ReadWrite.WRITE && write == null)) {

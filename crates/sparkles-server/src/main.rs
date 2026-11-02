@@ -4580,16 +4580,15 @@ fn run() -> Result<()> {
                     }
                     fetched.extend(f.fetched);
                 }
-                // the input graphs' axioms outside OWL 2 RL (spec F21 §7)
+                // the input graphs' axioms outside OWL 2 RL, in the state the run reads
+                // (spec F21 §7)
                 #[cfg(not(feature = "ontology"))]
-                let rl: Vec<String> = Vec::new();
+                let inspect: Option<sparkles_reasoner::InspectFn> = None;
                 #[cfg(feature = "ontology")]
-                let rl = if profile == sparkles_reasoner::Profile::OwlRl {
-                    sparkles::handles::ontology::rl_warnings(&store, &inputs, &Default::default())?
-                } else {
-                    Vec::new()
-                };
-                let mut r = sparkles_reasoner::materialize_incremental(
+                let inspect = (profile == sparkles_reasoner::Profile::OwlRl).then(|| {
+                    sparkles::handles::ontology::rl_inspector(&store, &inputs, Default::default())
+                });
+                let r = sparkles_reasoner::materialize_incremental(
                     &store,
                     &profile,
                     &extras,
@@ -4598,10 +4597,10 @@ fn run() -> Result<()> {
                         inputs: inputs.clone(),
                         threads,
                         max_inferred: no_limit_if_zero(max_inferred),
+                        inspect,
                         ..Default::default()
                     },
                 )?;
-                r.warnings.extend(rl);
                 // lets `sparkles serve` pick the inferences up for this database, with
                 // the database's automatic re-run setting kept
                 let mut info = reasoning::recorded(&profile, &extras, &r, &store);

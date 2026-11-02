@@ -888,4 +888,28 @@ test('the ontology handle reads, checks, edits and diffs axioms', async (t) => {
   // an inferred read says whether it found materialized inferences
   const inferred = await onto.summary({ inferences: true });
   assert.equal(inferred.inferences.included, false);
+  // edits and diffs refuse an inferred or historical read, and commit nothing
+  const head = (await onto.summary()).commit;
+  const add = { add: ['Declaration(Class(<http://ex.org/Y>))'] };
+  await assert.rejects(onto.edit(add, { inferences: true }), InvalidInputError);
+  await assert.rejects(onto.edit(add, { at: 'commit:1' }), InvalidInputError);
+  await assert.rejects(
+    onto.removeEntity('http://ex.org/A', { inferences: true }),
+    InvalidInputError,
+  );
+  await assert.rejects(onto.diff(before, { inferences: true }), InvalidInputError);
+  assert.equal((await onto.summary()).commit, head);
+  // a listing at the head reads the commit of its first batch, whatever commits meanwhile
+  const total = Number((await onto.axiomPage({ at: 'head' })).total);
+  let seen = 0;
+  for await (const _ of onto.axioms({ at: 'head', batch: 1 })) {
+    if (seen++ === 0) await onto.edit({ add: ['Declaration(Class(<http://ex.org/Z>))'] });
+  }
+  assert.equal(seen, total);
+  // the timeout bounds the whole listing, not each batch
+  await assert.rejects(async () => {
+    for await (const _ of onto.axioms({ batch: 1, timeout: 50 })) {
+      await new Promise((r) => setTimeout(r, 60));
+    }
+  }, QueryTimeoutError);
 });

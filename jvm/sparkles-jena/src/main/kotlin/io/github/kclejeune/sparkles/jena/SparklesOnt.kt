@@ -1,5 +1,6 @@
 package io.github.kclejeune.sparkles.jena
 
+import io.github.kclejeune.sparkles.jena.internal.TxnState
 import io.github.kclejeune.sparkles.jena.internal.decodeTriples
 import io.github.kclejeune.sparkles.jena.internal.encodePattern
 import io.github.kclejeune.sparkles.jena.internal.ffi
@@ -31,8 +32,9 @@ public object SparklesOnt {
      * thread's transaction when it has one and from the head otherwise. Its writes go to
      * the copy and to the Sparkles graph, in the thread's write transaction when there is
      * one, so the additions of a transaction make one commit. Without a transaction each
-     * write commits on its own when the dataset allows autocommit. A commit made through
-     * another handle after the model is built is not seen by it.
+     * write commits on its own when the dataset allows autocommit. A transaction that
+     * aborts undoes its writes in the copy too. A commit made through another handle after
+     * the model is built is not seen by it.
      */
     @JvmStatic
     @JvmOverloads
@@ -57,7 +59,7 @@ public object SparklesOnt {
         val mem = GraphMemFactory.createDefaultGraph()
         val bytes = dataset.source().findAll(encodePattern(node, null, null, null))
         for (t in decodeTriples(bytes)) mem.add(t)
-        return ReadThroughGraph(mem, dataset.getGraph(node))
+        return ReadThroughGraph(mem, dataset, dataset.getGraph(node))
     }
 
     private fun graphNode(iri: String?): Node = if (iri == null || iri == "default") Quad.defaultGraphIRI else NodeFactory.createURI(iri)
@@ -92,27 +94,76 @@ public object SparklesOnt {
         dataset.ontology().diff(from, to, OntologyRead(graph = graphIri))
 }
 
-/** A graph whose reads come from `copy` and whose writes go to `target` and to `copy`. */
-private class ReadThroughGraph(private val copy: Graph, private val target: Graph) : GraphWrapper(copy) {
+/**
+ * A graph whose reads come from `copy` and whose writes go to `target` and to `copy`. The
+ * changes a write transaction makes to the copy are kept until the transaction ends, and
+ * undone when it does not commit, so that the copy keeps the state of the dataset.
+ */
+private class ReadThroughGraph(
+    private val copy: Graph,
+    private val dataset: DatasetGraphSparkles,
+    private val target: Graph,
+) : GraphWrapper(copy) {
+    // the changes to the copy in the transaction `pending`, newest last: true for an addition
+    private val journal = ArrayList<Pair<Boolean, Triple>>()
+    private var pending: TxnState? = null
+
+    /** Undo the changes of a transaction that ended without committing. */
+    @Synchronized
+    private fun settle() {
+        val t = pending ?: return
+        if (t === dataset.txn()) return
+        if (!t.committed) {
+            for (i in journal.indices.reversed()) {
+                val (added, triple) = journal[i]
+                if (added) copy.delete(triple) else copy.add(triple)
+            }
+        }
+        journal.clear()
+        pending = null
+    }
+
+    /** Note a change to the copy; a change outside a transaction has committed already. */
+    private fun record(added: Boolean, t: Triple) {
+        val txn = dataset.txn() ?: return
+        pending = txn
+        journal.add(added to t)
+    }
+
+    override fun get(): Graph {
+        settle()
+        return copy
+    }
+
     override fun add(t: Triple) {
+        settle()
         target.add(t)
-        copy.add(t)
+        if (!copy.contains(t)) {
+            copy.add(t)
+            record(true, t)
+        }
     }
 
     override fun delete(t: Triple) {
+        settle()
         target.delete(t)
-        copy.delete(t)
+        if (copy.contains(t)) {
+            copy.delete(t)
+            record(false, t)
+        }
     }
 
     override fun remove(s: Node?, p: Node?, o: Node?) {
+        settle()
+        val gone = copy.find(s ?: Node.ANY, p ?: Node.ANY, o ?: Node.ANY).toList()
         target.remove(s, p, o)
-        copy.remove(s, p, o)
+        for (t in gone) {
+            copy.delete(t)
+            record(false, t)
+        }
     }
 
-    override fun clear() {
-        target.clear()
-        copy.clear()
-    }
+    override fun clear() = remove(Node.ANY, Node.ANY, Node.ANY)
 }
 
 /**
