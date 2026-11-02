@@ -541,7 +541,16 @@ mod tests {
         let second = RegexState::compile(None, pattern, "").unwrap().unwrap();
         assert!(second.is_match("kept-12x") && !second.is_match("kept-123x"));
         assert!(first.is_match("kept-99x"));
-        assert_eq!(first.program.memory_usage(), second.program.memory_usage());
+        // clones of one compiled program share its group information
+        assert!(std::ptr::eq(
+            first.program.group_info(),
+            second.program.group_info()
+        ));
+        let other = Regex::new(pattern).unwrap();
+        assert!(!std::ptr::eq(
+            first.program.group_info(),
+            other.group_info()
+        ));
     }
 
     /// A worker's clone serves only the thread that made it. A worker of another pool
