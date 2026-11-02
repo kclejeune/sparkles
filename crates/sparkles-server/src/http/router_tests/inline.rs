@@ -549,3 +549,51 @@ async fn a_first_run_that_fails_to_answer_sends_the_next_run_to_the_pool() {
         crate::http::inline::History::Slow
     );
 }
+
+/// The options of an eager trial and the run after it share one deadline and the
+/// cumulative budgets, and a timeout too large for a deadline stays for the run to refuse.
+#[test]
+fn an_eager_trial_and_its_fallback_count_as_one_request() {
+    let opts = sparkles::sparql::QueryOptions {
+        timeout: Some(std::time::Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let shared = crate::http::one_request(&opts);
+    assert_eq!(shared.timeout, None);
+    let deadline = shared.deadline.expect("a deadline");
+    assert!(deadline <= std::time::Instant::now() + std::time::Duration::from_secs(5));
+    let work = shared
+        .work
+        .clone()
+        .expect("a shared count of rows produced");
+    let budget = shared
+        .outbound_budget
+        .clone()
+        .expect("a shared outbound budget");
+    let again = shared.clone();
+    assert!(std::sync::Arc::ptr_eq(&work, again.work.as_ref().unwrap()));
+    assert!(std::sync::Arc::ptr_eq(
+        &budget,
+        again.outbound_budget.as_ref().unwrap()
+    ));
+    // an earlier deadline of the request stays
+    let early = std::time::Instant::now();
+    let opts = sparkles::sparql::QueryOptions {
+        deadline: Some(early),
+        ..opts
+    };
+    assert_eq!(crate::http::one_request(&opts).deadline, Some(early));
+    // with --max-timeout 0, timeout=1e19 is accepted but has no deadline
+    let opts = sparkles::sparql::QueryOptions {
+        timeout: Some(std::time::Duration::from_secs_f64(1e19)),
+        ..Default::default()
+    };
+    let shared = crate::http::one_request(&opts);
+    assert_eq!(shared.timeout, opts.timeout);
+    assert_eq!(shared.deadline, None);
+    let snapshot = sparkles::store::Store::in_memory(Default::default()).snapshot();
+    let err = sparkles::sparql::query_with_plan(snapshot, "SELECT * { ?s ?p ?o }", &shared)
+        .err()
+        .expect("an unrepresentable timeout is refused");
+    assert!(err.error.to_string().contains("timeout"), "{}", err.error);
+}

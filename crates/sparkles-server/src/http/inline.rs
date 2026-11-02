@@ -181,12 +181,13 @@ pub enum QuickExecution {
     PreserveAuto,
 }
 
-/// What is remembered of one text: its [`History`], and whether an eager run of it was
-/// slow.
+/// What is remembered of one text: its [`History`], whether an eager run of it was
+/// slow, and whether a request holds its eager trial.
 #[derive(Clone, Copy, Debug)]
 struct Seen {
     history: History,
     eager_slow: bool,
+    trial: bool,
 }
 
 /// The query texts (per dataset) whose last run is remembered, quick or not.
@@ -252,16 +253,23 @@ impl QuickQueries {
     }
 
     /// Claim the eager trial of a text whose history is [`History::TryEager`]. It is true
-    /// for one caller, and the text counts as slow until the trial records its run, so
-    /// that requests that overlap the trial keep automatic execution.
+    /// for one caller until that caller calls [`Self::end_trial`], and requests that
+    /// overlap the trial keep automatic execution, whatever their own runs record.
     pub fn claim_trial(&self, key: u64) -> bool {
         let mut set = self.quick.lock();
         match set.get_mut(&key) {
-            Some(seen) if seen.history == History::TryEager => {
-                seen.history = History::Slow;
+            Some(seen) if seen.history == History::TryEager && !seen.trial => {
+                seen.trial = true;
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Release the eager trial of a text that [`Self::claim_trial`] gave its caller.
+    pub fn end_trial(&self, key: u64) {
+        if let Some(seen) = self.quick.lock().get_mut(&key) {
+            seen.trial = false;
         }
     }
 
@@ -295,6 +303,7 @@ impl QuickQueries {
             set.clear();
         }
         let mut eager_slow = set.get(&key).is_some_and(|seen| seen.eager_slow);
+        let trial = set.get(&key).is_some_and(|seen| seen.trial);
         let history = match run {
             _ if !ms.is_finite() => History::Slow,
             Run::Ask if ms < QUICK_QUERY_MS => History::Quick(QuickExecution::PreserveAuto),
@@ -317,6 +326,7 @@ impl QuickQueries {
             Seen {
                 history,
                 eager_slow,
+                trial,
             },
         );
     }
@@ -411,14 +421,25 @@ mod tests {
             History::TryEager,
             "a failure says nothing of eager time"
         );
-        // one request claims the trial, and the text is slow until the trial records
+        // one request holds the trial until it ends it, even when an overlapping cursor
+        // run records another slow cursor
         assert!(q.claim_trial(e));
         assert!(!q.claim_trial(e));
-        assert_eq!(q.history(e), History::Slow);
+        q.record_cursor(e, 15.0);
+        assert_eq!(q.history(e), History::TryEager);
+        assert!(
+            !q.claim_trial(e),
+            "an overlapping cursor run starts no second trial"
+        );
+        q.end_trial(e);
+        assert!(q.claim_trial(e));
         q.record(e, 3.0);
+        q.end_trial(e);
         assert_eq!(q.history(e), History::Quick(QuickExecution::Eager));
         assert!(!q.claim_trial(e));
         assert!(!q.claim_trial(99), "an unseen text has no trial");
+        q.end_trial(99);
+        assert_eq!(q.history(99), History::Unseen);
     }
 
     #[test]

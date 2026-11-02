@@ -1601,6 +1601,34 @@ enum Ran {
 /// Run a query as `/{ds}/sparql` does: the request's budgets, graph view, result format
 /// and history parameters, with `bindings` as initial bindings (stored queries).
 #[allow(clippy::too_many_arguments)]
+/// The eager trial of a text, which [`inline::QuickQueries::claim_trial`] gave the request
+/// that holds this, until it drops.
+struct TrialClaim(u64);
+
+impl Drop for TrialClaim {
+    fn drop(&mut self) {
+        QUICK.end_trial(self.0);
+    }
+}
+
+/// `opts` for runs that count as one request: a relative timeout becomes one deadline from
+/// now, and the runs share one count of rows produced and one outbound budget. A timeout
+/// too large for a deadline stays relative, so that the run refuses it as it would alone.
+pub(crate) fn one_request(opts: &sparkles::sparql::QueryOptions) -> sparkles::sparql::QueryOptions {
+    let mut shared = opts.clone();
+    if let Some(timeout) = shared.timeout
+        && let Some(deadline) = std::time::Instant::now().checked_add(timeout)
+    {
+        shared.timeout = None;
+        shared.deadline = Some(shared.deadline.map_or(deadline, |d| d.min(deadline)));
+    }
+    shared.work.get_or_insert_with(Default::default);
+    if shared.outbound_budget.is_none() {
+        shared.outbound_budget = Some(sparkles::outbound::RequestBudget::new(&shared.outbound));
+    }
+    shared
+}
+
 pub(crate) async fn run_query(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
@@ -1734,6 +1762,8 @@ pub(crate) async fn run_query(
     // blocking pool, so that it settles in the faster mode (see `inline`). One request
     // claims the trial, and requests that overlap it keep automatic execution.
     let trial = auto && history == inline::History::TryEager && QUICK.claim_trial(quick_key);
+    // the claim ends with the request, whether it answers, fails or its client leaves
+    let _trial = trial.then(|| TrialClaim(quick_key));
     let auto = auto
         && !trial
         && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
@@ -1766,16 +1796,7 @@ pub(crate) async fn run_query(
                 // execution, as an eager run that automatic execution chose would, and its
                 // text is not tried eagerly again. The two runs count as one request: they
                 // share one deadline, one count of rows produced and one outbound budget.
-                let mut shared = opts.clone();
-                if let Some(timeout) = shared.timeout.take() {
-                    let deadline = std::time::Instant::now() + timeout;
-                    shared.deadline = Some(shared.deadline.map_or(deadline, |d| d.min(deadline)));
-                }
-                shared.work.get_or_insert_with(Default::default);
-                if shared.outbound_budget.is_none() {
-                    shared.outbound_budget =
-                        Some(sparkles::outbound::RequestBudget::new(&shared.outbound));
-                }
+                let shared = one_request(&opts);
                 match sparkles::sparql::query_with_plan(snap.clone(), &query, &shared) {
                     Err(f)
                         if matches!(
