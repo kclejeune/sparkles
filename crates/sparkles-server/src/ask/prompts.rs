@@ -281,12 +281,95 @@ pub fn summary_user(question: &str, query: &str, rows: &str, total: &str) -> Str
     )
 }
 
+/// Prefixes that drafts often use from habit without declaring them, with the
+/// namespaces that their vocabularies publish.
+const KNOWN_PREFIXES: &[(&str, &str)] = &[
+    ("dbo", "http://dbpedia.org/ontology/"),
+    ("dbr", "http://dbpedia.org/resource/"),
+    ("dbp", "http://dbpedia.org/property/"),
+    ("dbc", "http://dbpedia.org/resource/Category:"),
+    ("yago", "http://dbpedia.org/class/yago/"),
+    ("dct", "http://purl.org/dc/terms/"),
+    ("geo", "http://www.w3.org/2003/01/geo/wgs84_pos#"),
+    ("wd", "http://www.wikidata.org/entity/"),
+    ("wdt", "http://www.wikidata.org/prop/direct/"),
+    ("wikibase", "http://wikiba.se/ontology#"),
+];
+
+/// `q` with a `PREFIX` declaration added for each prefix of [`KNOWN_PREFIXES`] that it
+/// uses without declaring and that `prefixes` does not define. Declarations stop at the
+/// first other parse error or unknown prefix, so the check still reports it.
+pub(crate) fn complete_prefixes(q: &str, prefixes: &[(String, String)]) -> String {
+    static POS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"error at (\d+):(\d+)").unwrap());
+    let mut out = q.to_string();
+    let mut added = Vec::new();
+    while added.len() < KNOWN_PREFIXES.len() {
+        let Err(e) = sparkles::sparql::parse_query(&out, None, prefixes) else {
+            return out;
+        };
+        let text = e.to_string();
+        let name = text
+            .contains("Prefix not found")
+            .then(|| POS.captures(&text))
+            .flatten()
+            .and_then(|c| Some((c[1].parse::<usize>().ok()?, c[2].parse::<usize>().ok()?)))
+            .and_then(|(line, col)| crate::mcp::memory::check::prefix_at(&out, line, col));
+        let Some(&(name, ns)) = name.and_then(|n| {
+            KNOWN_PREFIXES
+                .iter()
+                .find(|(k, _)| *k == n && !added.contains(k))
+        }) else {
+            return q.to_string();
+        };
+        if prefixes.iter().any(|(k, _)| k == name) {
+            return q.to_string();
+        }
+        added.push(name);
+        out = format!("PREFIX {name}: <{ns}>\n{out}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A repair's follow-up form starts with the first draft's user message byte for byte,
     /// and its second message holds the repair and the format.
+    #[test]
+    fn well_known_prefixes_are_declared_when_a_draft_omits_them() {
+        let ds = vec![(
+            "rdf".to_string(),
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string(),
+        )];
+        let q = "SELECT ?c WHERE { ?c rdf:type dbo:City ; dbo:country dbr:Germany }";
+        let out = complete_prefixes(q, &ds);
+        assert!(
+            out.contains("PREFIX dbo: <http://dbpedia.org/ontology/>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("PREFIX dbr: <http://dbpedia.org/resource/>"),
+            "{out}"
+        );
+        assert!(
+            sparkles::sparql::parse_query(&out, None, &ds).is_ok(),
+            "{out}"
+        );
+        // a query that parses, one with another error and an unknown prefix stay as
+        // they are, apart from the known prefixes before the unknown one
+        let ok = "PREFIX dbo: <http://example.org/> SELECT * WHERE { ?s dbo:p ?o }";
+        assert_eq!(complete_prefixes(ok, &ds), ok);
+        let broken = "SELECT ?s WHERE { ?s <http://example.org/p> }";
+        assert_eq!(complete_prefixes(broken, &ds), broken);
+        let unknown = "SELECT * WHERE { ?s nope:p ?o }";
+        assert_eq!(complete_prefixes(unknown, &ds), unknown);
+        // a prefix that the dataset defines is never redeclared
+        let own = vec![("dbo".to_string(), "http://example.org/own/".to_string())];
+        let q = "SELECT * WHERE { ?s dbo:p ?o }";
+        assert_eq!(complete_prefixes(q, &own), q);
+    }
     #[test]
     fn the_follow_up_form_repeats_the_first_draft() {
         let notes = vec!["A note.".to_string()];

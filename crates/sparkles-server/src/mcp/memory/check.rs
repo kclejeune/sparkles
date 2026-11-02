@@ -915,7 +915,7 @@ fn finish(mut out: Value, issues: &[Issue], estimated: Option<u64>, terms: &Term
 }
 
 /// The prefix name of the prefixed name at a 1-based line and column.
-fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
+pub(crate) fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
     let l: Vec<char> = q.lines().nth(line.checked_sub(1)?)?.chars().collect();
     let pn = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':');
     let at = col.checked_sub(1)?.min(l.len());
