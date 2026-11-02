@@ -88,6 +88,8 @@ rust = [
 # when other crates, such as the server, change. scripts/bench-tests/test_binding_sources.py
 # checks the list against cargo metadata.
 binding-deps = [
+  # The crates inherit [workspace.package] and [workspace.dependencies] from it.
+  "Cargo.toml",
   "Cargo.lock",
   "rust-toolchain.toml",
   ".mbx.toml",

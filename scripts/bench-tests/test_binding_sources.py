@@ -68,7 +68,9 @@ class BindingSources(unittest.TestCase):
                 for d in COMPILED_DIRS:
                     if (ROOT / rel / d).is_dir():
                         self.assertIn(f"{rel}/{d}/**", group, f"{binding} compiles {name}")
-        for f in ["Cargo.lock", "rust-toolchain.toml", "vendor/**"]:
+        # The root manifest holds the workspace dependencies and package fields that the
+        # crates inherit.
+        for f in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "vendor/**"]:
             self.assertIn(f, group)
 
     def test_each_binding_group_covers_its_own_crate(self):
