@@ -531,6 +531,8 @@ happens to materialized inferences, and the limits.
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
 | `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
 | `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. A global flag. |
+| `--no-warm-up` | | Skip the query that `serve` runs before it reports ready. That query reads no data, runs on a scratch in-memory dataset and is neither logged nor counted, and it builds the state the query path builds once, so that the first request after a start does not wait for it. See [Memory and caches](#memory-and-caches). |
+| `--no-code-prefault` | | Do not map the executable's code into memory at start. Without the flag, a background thread maps it so that the first requests do not fault it in, which adds about 100 MB of shared file pages to the resident set. The kernel can reclaim those pages under memory pressure. |
 | `--prewarm` | off | Record the decoded blocks and file pages each persistent dataset used, and read the recorded ones again in the background after the next start is ready. See [Memory and caches](#memory-and-caches). |
 | `--prewarm-interval S` | `300` | Seconds between two recordings of the prewarm lists while the server runs, with `--prewarm`, from 1 to 1e9. The shutdown records them too. |
 | `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
@@ -613,6 +615,17 @@ stale. On forge at 10.5M, with the list of a warm pass, a cold `star-lookup` too
 instead of 11.4 ms after a background read of 15 ms, and the time to ready stayed at
 52 ms. The prewarm reads data that the next queries may never touch, so it is off by
 default.
+
+Two steps that `serve` takes by default shorten the first request after a start without
+reading any data. Before the server reports ready, it runs one query that reads nothing
+through its query path on a scratch in-memory dataset, so that the first real query finds
+the parser, the planner, the executor and the result writer ready. That query is not
+logged, counted or visible to clients. A background thread also maps the executable's
+code into memory, so that the first requests do not fault it in page by page. The code
+stays mapped, which adds about 100 MB of shared file pages to the resident set. The kernel
+can drop those pages under memory pressure and fault them in again later. `--no-warm-up`
+and `--no-code-prefault` turn the steps off, and neither runs outside `serve`, so the
+embedded library is unaffected.
 
 The query memory pool bounds what all running queries may hold together, so that sixteen
 queries that each stay within `--query-memory-mb` cannot add up to more than the host has.

@@ -98,6 +98,7 @@ mod validation_cmd;
 mod validation_common;
 mod vector;
 mod vector_cmd;
+mod warm;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -1065,6 +1066,14 @@ enum Cmd {
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
+        /// Do not run the query that builds the query path's one-time state before the
+        /// server reports ready
+        #[arg(long)]
+        no_warm_up: bool,
+        /// Do not map the executable's code into memory at start, which keeps about 100 MB
+        /// of shared file pages out of the resident set
+        #[arg(long)]
+        no_code_prefault: bool,
         /// Record the index blocks and file pages that each persistent dataset used, at
         /// shutdown and every --prewarm-interval seconds, and after a start is ready read
         /// the ones recorded before in the background (off by default)
@@ -2716,6 +2725,8 @@ fn run() -> Result<()> {
             ask_history_days,
             load_dir,
             idle_release_ms,
+            no_warm_up,
+            no_code_prefault,
             prewarm,
             prewarm_interval,
             mut text,
@@ -3248,6 +3259,10 @@ fn run() -> Result<()> {
                 .thread_name(|i| format!("query-{i}"))
                 .build_global();
             rayon::broadcast(|_| ());
+            // the first request would otherwise fault in the code it runs (see `warm`)
+            if !no_code_prefault {
+                warm::spawn_prefault();
+            }
             alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             // at least a second, and small enough for an `Instant` deadline
@@ -3263,6 +3278,20 @@ fn run() -> Result<()> {
             // use. One started here serves a first query that arrives soon after the
             // server is ready, which then does not wait for a thread to be created.
             rt.block_on(async { tokio::task::spawn_blocking(|| ()).await })?;
+            // After the datasets open and before the server reports ready, one query that
+            // reads no data builds what a first query would build once (see `warm`).
+            let after_open = {
+                let rt = rt.handle().clone();
+                move |st: &Arc<state::AppState>, stop: &startup::StopFlag| -> Result<()> {
+                    after_open(st, stop)?;
+                    if !no_warm_up {
+                        stop.check()?;
+                        // the outcome is in the debug log: the server serves either way
+                        let _ = warm::warm_up(st, &rt);
+                    }
+                    Ok(())
+                }
+            };
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());
