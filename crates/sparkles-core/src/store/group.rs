@@ -936,6 +936,14 @@ mod tests {
             ..Default::default()
         }
     }
+    /// [`options`] without the change log, whose background appends grow the directory
+    /// outside any fence, for tests that compare the quota's count with a walk.
+    fn quota_options() -> StoreOptions {
+        StoreOptions {
+            change_log: false,
+            ..options()
+        }
+    }
     /// A transaction of the kind that may begin from an unsynced group head.
     fn speculative(s: &Store) -> WriteTxn<'_> {
         s.write_with(CommitKind::Update, Default::default())
@@ -2503,7 +2511,7 @@ mod tests {
     #[test]
     fn a_quota_walk_during_a_fence_is_not_counted_twice() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let s = Arc::new(Store::open(dir.path(), quota_options()).unwrap());
         s.set_quota(Some(1 << 40)).unwrap();
         s.set_failpoint(
             "group-written",
@@ -2777,7 +2785,7 @@ mod tests {
     #[test]
     fn a_quota_walk_running_across_a_fence_is_not_counted_twice() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let s = Arc::new(Store::open(dir.path(), quota_options()).unwrap());
         s.set_quota(Some(1 << 40)).unwrap();
         let (hit, go) = pause(&s, "group-sealed");
         let fenced = {
@@ -2825,7 +2833,7 @@ mod tests {
     #[test]
     fn a_fence_releases_its_reservation_with_its_growth() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let s = Arc::new(Store::open(dir.path(), quota_options()).unwrap());
         insert(&s, "seed").unwrap();
         let (seen_tx, seen) = mpsc::channel();
         s.set_failpoint(
