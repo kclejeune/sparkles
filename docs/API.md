@@ -1873,13 +1873,15 @@ literals and annotation assertions. Each kind adds a member. `class` has
 `annotationProperty` the hierarchy, domains and ranges, `datatype` its `definitions`, and
 `namedIndividual` its `types`, `sameIndividuals`, `differentIndividuals` and
 `assertions`. Each expression is `{ofn, expression}`, its functional-style form and its
-JSON form. Without `assertions=true` the instances, types and property assertions are
-those the read holds, such as annotated assertions and class assertions of class
-expressions. With it, they also stream from the store's assertions in the graphs read,
-at most `limit` of each list, 100 by default, and `truncated` says whether a list was cut.
-`kind` answers one kind only. An IRI that the ontology neither declares nor uses as an
-entity, or as that `kind`, is `404`. An individual that only the stored assertions use
-is found as the subject of one of them. With `inferences=true` the lists include the
+JSON form. Without `assertions=true` the instances, types, equalities, inequalities and
+property assertions are those the read holds, such as annotated assertions and class
+assertions of class expressions. With it, they also stream from the store's assertions
+in the graphs read, at most `limit` of each list, 100 by default, and `truncated` says
+whether a list was cut. `kind` answers one kind only. An IRI that the ontology neither
+declares nor uses as an entity, or as that `kind`, is `404`. An entity that only the
+stored assertions use is found as the class of a class assertion, the property of a
+property assertion, or the subject of an assertion or object of an equality for an
+individual. With `inferences=true` the lists include the
 materialized closure, such as the inferred superclasses of a class.
 
 ```json

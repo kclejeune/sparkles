@@ -486,7 +486,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("ontology", "getOntologyEntity", "ontology.entity", |ds| {
             if let Ok(o) = ds.ontology().open(&any(), &any()) {
                 o.entity(any(), "i");
-                o.ontology.super_classes(&sparkles::owl::Class::new("c"));
+                o.ontology.super_classes(sparkles::owl::Class::new("c"));
                 o.instances(&any(), &any(), |_, _| Ok(true));
                 o.types_of(&any(), &any(), |_, _| Ok(true));
                 o.property_assertions(&any(), &any(), |_, _| Ok(true));

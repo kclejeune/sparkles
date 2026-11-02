@@ -1427,6 +1427,87 @@ fn instances_types_and_property_assertions_stream_from_the_store() {
 }
 
 #[test]
+fn entities_used_only_by_stored_assertions_are_found() {
+    let ds = dataset(
+        ":o a owl:Ontology . :alice a :Person ; :knows :bob ; :age 3 ; rdfs:seeAlso :x .
+         :carol owl:sameAs :dave . :erin owl:differentFrom :carol .",
+    );
+    let o = ds
+        .ontology()
+        .graph("default")
+        .mode(Mode::Lenient)
+        .open()
+        .unwrap();
+    let kinds = |iri: &str| o.kinds(&ex(iri), &opts()).unwrap();
+    assert!(o.class(&ex("Person")).is_ok());
+    assert_eq!(kinds("Person"), vec![EntityKind::Class]);
+    assert_eq!(kinds("knows"), vec![EntityKind::ObjectProperty]);
+    assert_eq!(kinds("age"), vec![EntityKind::DataProperty]);
+    for i in ["alice", "carol", "dave", "erin"] {
+        assert!(o.named_individual(&ex(i)).is_ok(), "{i}");
+    }
+    assert!(o.class(&ex("alice")).is_err());
+    assert!(o.object_property(&ex("age")).is_err());
+    assert!(matches!(
+        o.entity(EntityKind::Class, &ex("nothing"), &opts()),
+        Err(Error::NotFound(_))
+    ));
+    // the equalities of an individual stream in both directions
+    let mut seen = Vec::new();
+    o.equalities(&Individual::named(ex("carol")), &opts(), |ax, _| {
+        seen.push(ax.axiom_type());
+        Ok(true)
+    })
+    .unwrap();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![AxiomType::SameIndividual, AxiomType::DifferentIndividuals]
+    );
+    let body = wire::call(
+        &ds,
+        "entity",
+        &serde_json::json!({"iri": ex("carol"), "assertions": true, "mode": "lenient"}),
+        &opts(),
+    )
+    .unwrap();
+    let carol = &body["namedIndividual"];
+    assert_eq!(
+        carol["sameIndividuals"].as_array().unwrap().len(),
+        1,
+        "{body}"
+    );
+    assert_eq!(carol["differentIndividuals"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn streams_give_every_graph_of_an_assertion() {
+    let held = ":o a owl:Ontology . :A a owl:Class . :p a owl:ObjectProperty .
+        :a a owl:NamedIndividual , [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :A ] .
+        [] a owl:NegativePropertyAssertion ; owl:sourceIndividual :a ;
+           owl:assertionProperty :p ; owl:targetIndividual :a .";
+    let ds = dataset(&format!("GRAPH :g1 {{ {held} }} GRAPH :g2 {{ {held} }}"));
+    let o = ds.ontology().graphs([ex("g1"), ex("g2")]).open().unwrap();
+    let a = Individual::named(ex("a"));
+    let mut graphs = Vec::new();
+    o.types_of(&a, &opts(), |_, g| {
+        graphs.push(g);
+        Ok(true)
+    })
+    .unwrap();
+    graphs.sort();
+    assert_eq!(graphs, vec![0, 1]);
+    let mut graphs = Vec::new();
+    o.property_assertions(&a, &opts(), |_, g| {
+        graphs.push(g);
+        Ok(true)
+    })
+    .unwrap();
+    graphs.sort();
+    assert_eq!(graphs, vec![0, 1]);
+}
+
+#[test]
 fn streams_read_only_the_graphs_of_the_ontology() {
     let ds = dataset(&format!(
         "GRAPH :g {{ {ENTITIES} }} GRAPH :other {{ :x a :A . }}"

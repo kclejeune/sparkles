@@ -951,6 +951,16 @@ test('the ontology handle lists entities and answers entity accessors', async (t
   await assert.rejects(onto.entity('http://ex.org/nothing'), NotFoundError);
 });
 
+test('owl literals of numbers take XML Schema lexical forms', () => {
+  const XSD = 'http://www.w3.org/2001/XMLSchema#';
+  assert.deepEqual(owl.Literal(1e21), { '@value': '1' + '0'.repeat(21), '@type': XSD + 'integer' });
+  assert.deepEqual(owl.Literal(Infinity), { '@value': 'INF', '@type': XSD + 'double' });
+  assert.equal(owl.Literal(-Infinity)['@value'], '-INF');
+  assert.equal(owl.Literal(NaN)['@value'], 'NaN');
+  assert.equal(owl.Literal(1.5)['@value'], '1.5');
+  assert.equal(owl.Literal(Infinity, { datatype: XSD + 'float' })['@value'], 'INF');
+});
+
 test('the owl constructors build axioms an edit takes', async (t) => {
   const ds = t.resource(await Dataset.open(join(await temp(), 'db')));
   const EX = 'http://ex.org/';

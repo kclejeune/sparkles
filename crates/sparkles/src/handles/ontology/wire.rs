@@ -22,7 +22,7 @@ use serde_json::{Map, Value as J, json};
 use sparkles_owl::ofn::Renderer;
 use sparkles_owl::profiles::{Profile, Report};
 use sparkles_owl::{
-    Axiom, AxiomType, ClassExpression, DataRange, Entity, EntityKind, Individual,
+    Axiom, AxiomKind, AxiomType, ClassExpression, DataRange, Entity, EntityKind, Individual,
     ObjectPropertyExpression, SubObjectPropertyExpression, read,
 };
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
@@ -412,10 +412,10 @@ pub fn entity_body(
     let iri = q.iri.as_str();
     let kinds: Vec<EntityKind> = match q.kind {
         Some(k) => {
-            o.entity(k, iri)?;
+            o.entity(k, iri, opts)?;
             vec![k]
         }
-        None => o.kinds(iri)?,
+        None => o.kinds(iri, opts)?,
     };
     if kinds.is_empty() {
         return Err(Error::NotFound(format!(
@@ -571,10 +571,37 @@ pub fn entity_body(
                         assertions.push(axiom_json(&ax, g.map(|g| o.graph_name(g)), r));
                     }
                 }
+                let (same, different) = if q.assertions {
+                    let mut same: BTreeSet<Individual> = BTreeSet::new();
+                    let mut different: BTreeSet<Individual> = BTreeSet::new();
+                    o.equalities(&i, opts, |ax, _| {
+                        let (AxiomKind::SameIndividual(set) | AxiomKind::DifferentIndividuals(set)) =
+                            &ax.kind
+                        else {
+                            return Ok(true);
+                        };
+                        let into = if matches!(ax.kind, AxiomKind::SameIndividual(_)) {
+                            &mut same
+                        } else {
+                            &mut different
+                        };
+                        for x in set.iter().filter(|x| **x != i) {
+                            if into.len() >= q.limit && !into.contains(x) {
+                                truncated = true;
+                                return Ok(false);
+                            }
+                            into.insert(x.clone());
+                        }
+                        Ok(true)
+                    })?;
+                    (same.into_iter().collect(), different.into_iter().collect())
+                } else {
+                    (onto.same_individuals(&i), onto.different_individuals(&i))
+                };
                 j["namedIndividual"] = json!({
                     "types": types,
-                    "sameIndividuals": onto.same_individuals(&i).iter().map(|x| individual_json(x, r)).collect::<Vec<_>>(),
-                    "differentIndividuals": onto.different_individuals(&i).iter().map(|x| individual_json(x, r)).collect::<Vec<_>>(),
+                    "sameIndividuals": same.iter().map(|x| individual_json(x, r)).collect::<Vec<_>>(),
+                    "differentIndividuals": different.iter().map(|x| individual_json(x, r)).collect::<Vec<_>>(),
                     "assertions": assertions,
                 });
             }

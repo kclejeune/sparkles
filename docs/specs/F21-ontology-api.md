@@ -777,8 +777,11 @@ individual's assertions by subject in each graph read. Each first answers the
 assertions the read holds, such as annotated ones, and then those the store holds,
 with the filter that `Opened::assertions` applies. `Opened::class` and the other
 lookups answer `NotFound` for an IRI that the ontology does not have as that kind, as
-§2.5 asks. A named individual that only the stored assertions use is found when one of
-them has it as its subject, which one stopped scan of the graphs read decides.
+§2.5 asks. An entity that only the stored assertions use is found by a probe of the
+graphs read that stops at its first match. A class is found as the class of a class
+assertion, a property as the property of a property or annotation assertion, and a named
+individual as the subject of an assertion or the object of an `owl:sameAs` or
+`owl:differentFrom` assertion. The probes keep the request's deadline and cancellation.
 
 `Ontologies::graph` and `Ontologies::graphs` start an `OntologyScope`, a builder over
 `OntologyRequest` and `QueryOptions` with `imports`, `mode`, `at`, `inferences` and
@@ -791,8 +794,9 @@ The JSON operations add `entities` and `entity`, which `GET /$/ontology/{ds}/ent
 and `GET /$/ontology/{ds}/entity` serve. `entity` answers an IRI's kinds, labels and
 annotations and, for each kind, the accessors of that kind, with each expression in
 functional-style syntax and in its JSON form. With `assertions`, it streams the
-instances of a class and the types and property assertions of an individual from the
-store, at most `limit` of each. Python's `Dataset.ontology`, Node.js's `dataset.ontology`
+instances of a class and the types, equalities, inequalities and property assertions of
+an individual from the store, at most `limit` of each. Each stream reports an assertion
+once for every graph that holds it. Python's `Dataset.ontology`, Node.js's `dataset.ontology`
 and the JVM's `SparklesOnt` and `DatasetGraphSparkles.ontology()` have both operations.
 The JVM's `SparklesOnt` also gains `removeEntity`, which the bindings table now lists.
 The CLI and the MCP tool do not have the two operations, roadmap item NEW-ITEM-1.
@@ -815,11 +819,14 @@ Part 2 for the `xsd:` datatypes, without trimming white space, with the ranges o
 integer datatypes and the `xsd:language` pattern. `owl:rational` takes the forms of §4.1,
 `owl:real` has none, `rdf:PlainLiteral` is a string, `@` and an empty or well-formed
 language tag, and `rdf:XMLLiteral` is well-balanced XML content without namespace
-resolution. Each pair of a datatype restriction must be in the facet space of its
+resolution, whose entity references are the five that XML predefines. Each pair of a datatype restriction must be in the facet space of its
 datatype (§7.5), so the facet must be one of the datatype's normative facets and its
-value of the type the facet ranges over. A datatype that a datatype definition introduces
+value must be in the value space the facet ranges over. The value is judged by its data
+value, so `"3.0"^^xsd:decimal` is a valid length and an `xsd:token` is a valid pattern.
+A pattern must parse as an XML Schema regular expression and a language range must
+follow the grammar of RFC 4647. A datatype that a datatype definition introduces
 occurs in no literal and no restriction (§9.4). The check covers the literals of
-annotations and of the ontology header too, since §5.7 applies to every literal of the
+annotations and of the headers of the ontology and its imports too, since §5.7 applies to every literal of the
 ontology, and it covers streamed assertions, as the other rules of one axiom do.
 
 The rules are part of OWL 2 DL, so every EL, QL and RL report lists their violations with

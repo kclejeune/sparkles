@@ -159,6 +159,17 @@ def test_individual_accessors_stream_assertions(ds: sparkles.Dataset) -> None:
 # ------------------------------------------ roadmap item 540: typed constructors ----
 
 
+def test_numeric_literals_take_xml_schema_lexical_forms() -> None:
+    from sparkles import owl
+
+    xsd = "http://www.w3.org/2001/XMLSchema#"
+    assert owl.Literal(float("inf")) == {"@value": "INF", "@type": xsd + "double"}
+    assert owl.Literal(float("-inf"))["@value"] == "-INF"
+    assert owl.Literal(float("nan"))["@value"] == "NaN"
+    assert owl.Literal(10**21) == {"@value": "1" + "0" * 21, "@type": xsd + "integer"}
+    assert owl.Literal(float("inf"), datatype=xsd + "float")["@value"] == "INF"
+
+
 def test_typed_constructors_build_axioms() -> None:
     from sparkles import owl
 

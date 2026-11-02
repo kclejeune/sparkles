@@ -24,6 +24,7 @@ own: its ``Class`` and ``Literal`` are not the package's terms.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -194,14 +195,20 @@ def Literal(value: Any, datatype: Any = None, lang: str | None = None) -> Json:
     if isinstance(value, int):
         return {"@value": str(value), "@type": XSD + "integer"}
     if isinstance(value, float):
-        return {"@value": repr(value), "@type": XSD + "double"}
+        return {"@value": _lexical(value), "@type": XSD + "double"}
     return {"@value": str(value)}
 
 
 def _lexical(value: Any) -> str:
+    """The XML Schema lexical form of a value, with the infinities and NaN of a
+    ``float`` as ``INF``, ``-INF`` and ``NaN``."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "INF" if value > 0 else "-INF"
         return repr(value)
     return str(value)
 

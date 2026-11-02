@@ -313,16 +313,14 @@ impl Opened {
     /// accessors of [`read::Ontology`], such as
     /// [`super_classes`](read::Ontology::super_classes), answer from the terminology.
     ///
-    /// A named individual that only the assertions left in the store use is found too,
-    /// as the subject of one of them.
-    pub fn entity(&self, kind: EntityKind, iri: &str) -> Result<Entity> {
+    /// An entity that only the assertions left in the store use is found too, by the
+    /// probes of [`kinds`](Self::kinds) under the deadline of `opts`.
+    pub fn entity(&self, kind: EntityKind, iri: &str, opts: &QueryOptions) -> Result<Entity> {
         if let Some(e) = self.ontology.entity(kind, iri) {
             return Ok(e);
         }
-        if kind == EntityKind::NamedIndividual && self.asserted_about(iri)? {
-            return Ok(Entity::NamedIndividual(sparkles_owl::NamedIndividual::new(
-                iri,
-            )));
+        if self.stored_kinds(iri, &[kind], opts)?.contains(&kind) {
+            return Ok(entity_of(kind, iri));
         }
         Err(Error::NotFound(format!(
             "the ontology neither declares nor uses <{iri}> as {}",
@@ -330,68 +328,162 @@ impl Opened {
         )))
     }
 
-    /// The kinds of [`read::Ontology::kinds`], with `NamedIndividual` for an IRI that
-    /// only the assertions left in the store use as a subject.
-    pub fn kinds(&self, iri: &str) -> Result<Vec<EntityKind>> {
+    /// The kinds of [`read::Ontology::kinds`], with the kinds that only the assertions
+    /// left in the store give `iri`. A class is found as the class of a stored class
+    /// assertion, a property as the property of a stored property or annotation
+    /// assertion, and a named individual as the subject of a stored assertion or the
+    /// object of a stored equality or inequality. Each probe stops at its first match,
+    /// runs only for a kind the read does not already give, and keeps the deadline and
+    /// cancellation of `opts`.
+    pub fn kinds(&self, iri: &str, opts: &QueryOptions) -> Result<Vec<EntityKind>> {
+        use EntityKind as K;
         let mut kinds = self.ontology.kinds(iri);
-        if !kinds.contains(&EntityKind::NamedIndividual) && self.asserted_about(iri)? {
-            kinds.push(EntityKind::NamedIndividual);
-            kinds.sort();
-        }
+        let missing: Vec<EntityKind> = [
+            K::Class,
+            K::ObjectProperty,
+            K::DataProperty,
+            K::AnnotationProperty,
+            K::NamedIndividual,
+        ]
+        .into_iter()
+        .filter(|k| !kinds.contains(k))
+        .collect();
+        kinds.extend(self.stored_kinds(iri, &missing, opts)?);
+        kinds.sort();
+        kinds.dedup();
         Ok(kinds)
     }
 
-    /// Whether an assertion the store holds in the graphs read has `iri` as its subject.
-    fn asserted_about(&self, iri: &str) -> Result<bool> {
-        let i = Individual::named(iri);
-        let mut found = false;
-        let opts = QueryOptions::default();
-        self.types_of(&i, &opts, |_, _| {
-            found = true;
-            Ok(false)
-        })?;
-        if !found {
-            self.property_assertions(&i, &opts, |_, _| {
-                found = true;
+    /// The kinds among `wanted` that the assertions the store holds in the graphs read
+    /// give `iri` (see [`kinds`](Self::kinds)).
+    fn stored_kinds(
+        &self,
+        iri: &str,
+        wanted: &[EntityKind],
+        opts: &QueryOptions,
+    ) -> Result<Vec<EntityKind>> {
+        use AxiomKind as A;
+        use EntityKind as K;
+        let mut found = Vec::new();
+        let Some(id) = self.snapshot.lookup_iri(iri) else {
+            return Ok(found);
+        };
+        if vocab::is_reserved(iri) || wanted.is_empty() {
+            return Ok(found);
+        }
+        let opts = &*crate::overview::one_deadline(opts)?;
+        let mut stream = self.stream(opts);
+        let want = |k: &EntityKind| wanted.contains(k);
+        let read = |q: &[Id; 4]| self.graph_index(q[3]).is_some();
+        if want(&K::Class)
+            && let Some(t) = stream.rdf_type
+        {
+            stream.scan(Perm::Pos, &[t.0, id.0], |t, q| {
+                if read(q)
+                    && let Some(Axiom {
+                        kind: A::ClassAssertion(..),
+                        ..
+                    }) = self.ontology.map_assertion(&t)
+                {
+                    found.push(K::Class);
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+        }
+        if [K::ObjectProperty, K::DataProperty, K::AnnotationProperty]
+            .iter()
+            .any(want)
+        {
+            // the first assertion that maps decides the property's kind
+            stream.scan(Perm::Pso, &[id.0], |t, q| {
+                if !read(q) {
+                    return Ok(true);
+                }
+                let Some(ax) = self.ontology.map_assertion(&t) else {
+                    return Ok(true);
+                };
+                let kind = match ax.kind {
+                    A::ObjectPropertyAssertion(..) => K::ObjectProperty,
+                    A::DataPropertyAssertion(..) => K::DataProperty,
+                    A::AnnotationAssertion(..) => K::AnnotationProperty,
+                    _ => return Ok(false),
+                };
+                if want(&kind) {
+                    found.push(kind);
+                }
                 Ok(false)
             })?;
+        }
+        if want(&K::NamedIndividual) {
+            let individual = |ax: &Axiom| !matches!(ax.kind, A::AnnotationAssertion(..));
+            let mut hit = false;
+            for g in self.inner.graph_ids.iter().flatten() {
+                stream.scan(Perm::Gspo, &[g.0, id.0], |t, _| {
+                    hit = self
+                        .ontology
+                        .map_assertion(&t)
+                        .is_some_and(|ax| individual(&ax));
+                    Ok(!hit)
+                })?;
+                if hit {
+                    break;
+                }
+            }
+            for p in [vocab::OWL_SAME_AS, vocab::OWL_DIFFERENT_FROM] {
+                let Some(pid) = self.snapshot.lookup_iri(p).filter(|_| !hit) else {
+                    continue;
+                };
+                stream.scan(Perm::Ops, &[id.0, pid.0], |t, q| {
+                    hit = read(q) && self.ontology.map_assertion(&t).is_some();
+                    Ok(!hit)
+                })?;
+            }
+            if hit {
+                found.push(K::NamedIndividual);
+            }
         }
         Ok(found)
     }
 
-    /// The class `iri` names, or `NotFound`.
+    /// The class `iri` names, or `NotFound`. This and the other typed lookups probe the
+    /// store without a deadline; [`entity`](Self::entity) takes one.
     pub fn class(&self, iri: &str) -> Result<sparkles_owl::Class> {
-        self.entity(EntityKind::Class, iri)
+        self.entity(EntityKind::Class, iri, &QueryOptions::default())
             .map(|_| sparkles_owl::Class::new(iri))
     }
 
     /// The object property `iri` names, or `NotFound`.
     pub fn object_property(&self, iri: &str) -> Result<sparkles_owl::ObjectProperty> {
-        self.entity(EntityKind::ObjectProperty, iri)
+        self.entity(EntityKind::ObjectProperty, iri, &QueryOptions::default())
             .map(|_| sparkles_owl::ObjectProperty::new(iri))
     }
 
     /// The data property `iri` names, or `NotFound`.
     pub fn data_property(&self, iri: &str) -> Result<sparkles_owl::DataProperty> {
-        self.entity(EntityKind::DataProperty, iri)
+        self.entity(EntityKind::DataProperty, iri, &QueryOptions::default())
             .map(|_| sparkles_owl::DataProperty::new(iri))
     }
 
     /// The annotation property `iri` names, or `NotFound`.
     pub fn annotation_property(&self, iri: &str) -> Result<sparkles_owl::AnnotationProperty> {
-        self.entity(EntityKind::AnnotationProperty, iri)
-            .map(|_| sparkles_owl::AnnotationProperty::new(iri))
+        self.entity(
+            EntityKind::AnnotationProperty,
+            iri,
+            &QueryOptions::default(),
+        )
+        .map(|_| sparkles_owl::AnnotationProperty::new(iri))
     }
 
     /// The datatype `iri` names, or `NotFound`.
     pub fn datatype(&self, iri: &str) -> Result<sparkles_owl::Datatype> {
-        self.entity(EntityKind::Datatype, iri)
+        self.entity(EntityKind::Datatype, iri, &QueryOptions::default())
             .map(|_| sparkles_owl::Datatype::new(iri))
     }
 
     /// The named individual `iri` names, or `NotFound`.
     pub fn named_individual(&self, iri: &str) -> Result<sparkles_owl::NamedIndividual> {
-        self.entity(EntityKind::NamedIndividual, iri)
+        self.entity(EntityKind::NamedIndividual, iri, &QueryOptions::default())
             .map(|_| sparkles_owl::NamedIndividual::new(iri))
     }
 
@@ -411,9 +503,12 @@ impl Opened {
         for (ax, origins) in &self.ontology.axioms {
             if let AxiomKind::ClassAssertion(x, i) = &ax.kind
                 && *x == ce
-                && !f(i.clone(), origins.first().map_or(0, |o| o.graph))?
             {
-                return Ok(());
+                for g in origin_graphs(origins) {
+                    if !f(i.clone(), g)? {
+                        return Ok(());
+                    }
+                }
             }
         }
         let mut stream = self.stream(opts);
@@ -447,9 +542,12 @@ impl Opened {
         for (ax, origins) in &self.ontology.axioms {
             if let AxiomKind::ClassAssertion(c, x) = &ax.kind
                 && x == i
-                && !f(c.clone(), origins.first().map_or(0, |o| o.graph))?
             {
-                return Ok(());
+                for g in origin_graphs(origins) {
+                    if !f(c.clone(), g)? {
+                        return Ok(());
+                    }
+                }
             }
         }
         let mut stream = self.stream(opts);
@@ -493,8 +591,12 @@ impl Opened {
             _ => false,
         };
         for (ax, origins) in &self.ontology.axioms {
-            if about(ax) && !f(ax.clone(), origins.first().map_or(0, |o| o.graph))? {
-                return Ok(());
+            if about(ax) {
+                for g in origin_graphs(origins) {
+                    if !f(ax.clone(), g)? {
+                        return Ok(());
+                    }
+                }
             }
         }
         let mut stream = self.stream(opts);
@@ -514,6 +616,94 @@ impl Opened {
             }
         }
         Ok(())
+    }
+}
+
+impl Opened {
+    /// Stream the individual equalities and inequalities that name `i`: the
+    /// `SameIndividual` and `DifferentIndividuals` axioms the read holds, then the
+    /// `owl:sameAs` and `owl:differentFrom` assertions the store holds in the graphs read
+    /// with `i` as subject or object. `f` gets each axiom once per graph that holds it
+    /// and returns `false` to stop.
+    pub fn equalities(
+        &self,
+        i: &Individual,
+        opts: &QueryOptions,
+        mut f: impl FnMut(Axiom, u32) -> Result<bool>,
+    ) -> Result<()> {
+        use AxiomKind as K;
+        let opts = &*crate::overview::one_deadline(opts)?;
+        for (ax, origins) in &self.ontology.axioms {
+            if let K::SameIndividual(set) | K::DifferentIndividuals(set) = &ax.kind
+                && set.contains(i)
+            {
+                for g in origin_graphs(origins) {
+                    if !f(ax.clone(), g)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let Some(iid) = self.individual_id(i) else {
+            return Ok(());
+        };
+        let mut stream = self.stream(opts);
+        let preds: Vec<Id> = [vocab::OWL_SAME_AS, vocab::OWL_DIFFERENT_FROM]
+            .iter()
+            .filter_map(|p| self.snapshot.lookup_iri(p))
+            .collect();
+        for &p in &preds {
+            for (g, id) in self.inner.graph_ids.iter().enumerate() {
+                let Some(id) = id else { continue };
+                let more = stream.scan(Perm::Gspo, &[id.0, iid.0, p.0], |t, _| {
+                    match self.ontology.map_assertion(&t) {
+                        Some(ax) => f(ax, g as u32),
+                        None => Ok(true),
+                    }
+                })?;
+                if !more {
+                    return Ok(());
+                }
+            }
+            let more = stream.scan(Perm::Ops, &[iid.0, p.0], |t, q| {
+                // a reflexive assertion was streamed with the subjects
+                if q[0] == iid {
+                    return Ok(true);
+                }
+                match (self.graph_index(q[3]), self.ontology.map_assertion(&t)) {
+                    (Some(g), Some(ax)) => f(ax, g),
+                    _ => Ok(true),
+                }
+            })?;
+            if !more {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The distinct graphs of an axiom's origins, or graph 0 for an axiom without one.
+fn origin_graphs(origins: &[read::Origin]) -> BTreeSet<u32> {
+    let mut graphs: BTreeSet<u32> = origins.iter().map(|o| o.graph).collect();
+    if graphs.is_empty() {
+        graphs.insert(0);
+    }
+    graphs
+}
+
+/// The entity of kind `kind` that `iri` names.
+fn entity_of(kind: EntityKind, iri: &str) -> Entity {
+    use sparkles_owl as o;
+    match kind {
+        EntityKind::Class => Entity::Class(o::Class::new(iri)),
+        EntityKind::Datatype => Entity::Datatype(o::Datatype::new(iri)),
+        EntityKind::ObjectProperty => Entity::ObjectProperty(o::ObjectProperty::new(iri)),
+        EntityKind::DataProperty => Entity::DataProperty(o::DataProperty::new(iri)),
+        EntityKind::AnnotationProperty => {
+            Entity::AnnotationProperty(o::AnnotationProperty::new(iri))
+        }
+        EntityKind::NamedIndividual => Entity::NamedIndividual(o::NamedIndividual::new(iri)),
     }
 }
 

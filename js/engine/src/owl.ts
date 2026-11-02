@@ -122,15 +122,27 @@ export function Literal(
   if (o.datatype !== undefined && o.lang !== undefined) {
     throw new TypeError('a literal has a datatype or a language tag, not both');
   }
-  if (o.lang !== undefined) return { '@value': String(value), '@language': o.lang };
-  if (o.datatype !== undefined) return { '@value': String(value), '@type': iri(o.datatype) };
+  if (o.lang !== undefined) return { '@value': lexical(value), '@language': o.lang };
+  if (o.datatype !== undefined) return { '@value': lexical(value), '@type': iri(o.datatype) };
   if (typeof value === 'boolean') return { '@value': String(value), '@type': XSD_NS + 'boolean' };
   if (typeof value === 'bigint') return { '@value': value.toString(), '@type': XSD_NS + 'integer' };
   if (typeof value === 'number') {
-    if (Number.isInteger(value)) return { '@value': String(value), '@type': XSD_NS + 'integer' };
-    return { '@value': String(value), '@type': XSD_NS + 'double' };
+    const type = Number.isInteger(value) ? 'integer' : 'double';
+    return { '@value': lexical(value), '@type': XSD_NS + type };
   }
   return { '@value': value };
+}
+
+/**
+ * The XML Schema lexical form of a value: an integer number without an exponent, and
+ * the infinities and NaN as `INF`, `-INF` and `NaN`.
+ */
+function lexical(value: string | boolean | number | bigint): string {
+  if (typeof value !== 'number') return String(value);
+  if (Number.isNaN(value)) return 'NaN';
+  if (!Number.isFinite(value)) return value > 0 ? 'INF' : '-INF';
+  if (Number.isInteger(value)) return BigInt(value).toString();
+  return String(value);
 }
 
 function literal(x: LiteralArg): OwlLiteral {
