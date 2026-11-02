@@ -617,12 +617,11 @@ The performance cores hold only so many requests at once. Request work runs ther
 at most one request per physical performance core is in flight, counting the request
 itself and every response still being sent, and runs on every CPU when more are. A
 thread moves when it starts a request's work, and only when the load asks for the other
-placement. On a host with forge's processor, sixteen concurrent readers and a writer with every
-request on the performance cores answered 2,018 reads and 241 writes a second against
-2,346 and 362 with every CPU, because the performance cores were 95% busy while the
-efficiency cores idled. Two readers and a writer were faster on the performance cores,
-at 528 reads a second against 405. The server logs the split and the request limit at
-startup.
+placement. On a host with forge's processor, four readers and a writer get 1,019 reads a
+second against 977 with `--request-cpus all`, and sixteen readers get as many reads and
+writes as with every CPU. The [hybrid placement
+run](benchmarks/writes/runs/2026-11-02-hybrid-mixed-atlas/README.md) records the
+measurements. The server logs the split and the request limit at startup.
 
 `--request-cpus all` keeps every thread free to run anywhere, with a pool thread per
 logical CPU. Both modes behave as `all` on processors with one kind of core, on hybrid
