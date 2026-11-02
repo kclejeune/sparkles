@@ -81,6 +81,11 @@ impl Interner {
         i
     }
 
+    /// The role of a name, if the interner has it.
+    pub fn role_id(&self, name: &RoleName) -> Option<Role> {
+        self.role_ids.get(name).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -205,6 +210,23 @@ pub struct Roles {
 }
 
 impl Roles {
+    /// The bytes the tables take, roughly.
+    pub fn bytes(&self) -> usize {
+        self.sup
+            .iter()
+            .map(|v| 24 + v.capacity() * 4)
+            .sum::<usize>()
+            + self
+                .comp
+                .values()
+                .map(|v| 40 + v.capacity() * 4)
+                .sum::<usize>()
+            + self.right.len()
+            + self.left.len()
+            + self.reflexive.len() * 4
+            + self.range.len() * 8
+    }
+
     /// Whether `r` is a subrole of `s`, itself included.
     #[inline]
     pub fn sub(&self, r: Role, s: Role) -> bool {
@@ -258,17 +280,36 @@ pub struct Axioms {
 }
 
 /// Maps one axiom's logical content into the interner. `out` collects what it means,
-/// and the answer says what of it the classifier may not fully take into account.
+/// and the answer says what of it the classifier may not fully take into account. An
+/// axiom with an expression the classifier cannot represent adds nothing to `out`.
 pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<&'static str> {
+    match normalize_axiom(ax, it, out) {
+        Ok(partial) => partial,
+        Err(why) => Some(why),
+    }
+}
+
+/// [`normalize`], with an error for an axiom left out. Every branch interns all its
+/// expressions before it adds to `out`, so that an error leaves `out` as it was.
+fn normalize_axiom(
+    ax: &AxiomKind,
+    it: &mut Interner,
+    out: &mut Axioms,
+) -> Result<Option<&'static str>, &'static str> {
     use AxiomKind as K;
     let mut partial: Option<&'static str> = None;
-    fn ce(c: &ClassExpression, it: &mut Interner, partial: &mut Option<&'static str>) -> Ex {
-        let (e, p) = class_expression(c, it, 0);
+    fn ce(
+        c: &ClassExpression,
+        it: &mut Interner,
+        partial: &mut Option<&'static str>,
+    ) -> Result<Ex, &'static str> {
+        let (e, p) = class_expression(c, it, 0)?;
         if partial.is_none() {
             *partial = p;
         }
-        e
+        Ok(e)
     }
+    const BUILTIN: &str = "the top and bottom object and data properties";
     match ax {
         K::Declaration(Entity::Class(c)) => {
             let e = it.class(c);
@@ -276,12 +317,15 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
         }
         K::Declaration(_) => {}
         K::SubClassOf(a, b) => {
-            let a = ce(a, it, &mut partial);
-            let b = ce(b, it, &mut partial);
+            let a = ce(a, it, &mut partial)?;
+            let b = ce(b, it, &mut partial)?;
             out.subs.push((a, b));
         }
         K::EquivalentClasses(cs) => {
-            let es: Vec<Ex> = cs.iter().map(|c| ce(c, it, &mut partial)).collect();
+            let es: Vec<Ex> = cs
+                .iter()
+                .map(|c| ce(c, it, &mut partial))
+                .collect::<Result<_, _>>()?;
             for w in 0..es.len() {
                 let next = es[(w + 1) % es.len()];
                 if es[w] != next {
@@ -290,7 +334,10 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
             }
         }
         K::DisjointClasses(cs) => {
-            let mut es: Vec<Ex> = cs.iter().map(|c| ce(c, it, &mut partial)).collect();
+            let mut es: Vec<Ex> = cs
+                .iter()
+                .map(|c| ce(c, it, &mut partial))
+                .collect::<Result<_, _>>()?;
             es.sort_unstable();
             let before = es.len();
             es.dedup();
@@ -298,7 +345,7 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
                 // two operands that normalize to one expression make it unsatisfiable
                 let mut seen = FxHashSet::default();
                 for c in cs {
-                    let e = ce(c, it, &mut partial);
+                    let e = ce(c, it, &mut partial)?;
                     if !seen.insert(e) {
                         out.subs.push((e, BOTTOM));
                     }
@@ -310,12 +357,12 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
         }
         K::SubObjectPropertyOf(sub, sup) => {
             let Some(s) = object_role(sup, it) else {
-                return Some("inverse properties");
+                return Err("inverse properties");
             };
             match sub {
                 SubObjectPropertyExpression::Expression(p) => {
                     let Some(r) = object_role(p, it) else {
-                        return Some("inverse properties");
+                        return Err("inverse properties");
                     };
                     out.role_subs.push((r, s));
                 }
@@ -323,7 +370,7 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
                     let mut rs = Vec::with_capacity(ps.len());
                     for p in ps {
                         let Some(r) = object_role(p, it) else {
-                            return Some("inverse properties");
+                            return Err("inverse properties");
                         };
                         rs.push(r);
                     }
@@ -335,7 +382,7 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
                 }
             }
             if is_top_or_bottom_role(sup) || is_top_or_bottom_sub(sub) {
-                partial = Some("the top and bottom object properties");
+                partial = Some(BUILTIN);
             }
         }
         K::EquivalentObjectProperties(ps) => {
@@ -347,30 +394,42 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
                 }
             }
             if ps.iter().any(is_top_or_bottom_role) {
-                partial = Some("the top and bottom object properties");
+                partial = Some(BUILTIN);
             }
         }
         K::TransitiveObjectProperty(p) => {
             if let Some(r) = object_role(p, it) {
                 out.chains.push((vec![r, r], r));
             }
+            if is_top_or_bottom_role(p) {
+                partial = Some(BUILTIN);
+            }
         }
         K::ReflexiveObjectProperty(p) => {
             if let Some(r) = object_role(p, it) {
                 out.reflexive.push(r);
             }
+            if is_top_or_bottom_role(p) {
+                partial = Some(BUILTIN);
+            }
         }
         K::ObjectPropertyDomain(p, c) => {
             if let Some(r) = object_role(p, it) {
-                let c = ce(c, it, &mut partial);
+                let c = ce(c, it, &mut partial)?;
                 let e = it.node(Node::Exist(r, TOP));
                 out.subs.push((e, c));
+            }
+            if is_top_or_bottom_role(p) {
+                partial = Some(BUILTIN);
             }
         }
         K::ObjectPropertyRange(p, c) => {
             if let Some(r) = object_role(p, it) {
-                let c = ce(c, it, &mut partial);
+                let c = ce(c, it, &mut partial)?;
                 out.ranges.push((r, c));
+            }
+            if is_top_or_bottom_role(p) {
+                partial = Some(BUILTIN);
             }
         }
         K::SubDataPropertyOf(a, b) => {
@@ -391,14 +450,14 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
             }
         }
         K::DataPropertyDomain(d, c) => {
+            let c = ce(c, it, &mut partial)?;
             let r = it.role(RoleName::Data(d.clone()));
-            let c = ce(c, it, &mut partial);
             let top = it.data(DataAtom::Range(DataRange::Datatype(Datatype::literal())));
             let e = it.node(Node::Exist(r, top));
             out.subs.push((e, c));
         }
         K::ClassAssertion(c, Individual::Named(i)) => {
-            let c = ce(c, it, &mut partial);
+            let c = ce(c, it, &mut partial)?;
             let n = it.nominal(i);
             out.individuals.push(n);
             out.subs.push((n, c));
@@ -411,6 +470,9 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
                 out.individuals.push(a);
                 out.individuals.push(b);
                 out.subs.push((a, e));
+            }
+            if is_top_or_bottom_role(p) {
+                partial = Some(BUILTIN);
             }
         }
         K::DataPropertyAssertion(d, Individual::Named(a), v) => {
@@ -455,12 +517,12 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
             }
         }
         K::NegativeObjectPropertyAssertion(..) | K::NegativeDataPropertyAssertion(..) => {
-            return Some("negative property assertions");
+            return Err("negative property assertions");
         }
-        K::HasKey(..) => return Some("keys"),
-        K::FunctionalDataProperty(_) => return Some("functional data properties"),
-        K::DataPropertyRange(..) => return Some("data property ranges"),
-        K::DatatypeDefinition(..) => return Some("datatype definitions"),
+        K::HasKey(..) => return Err("keys"),
+        K::FunctionalDataProperty(_) => return Err("functional data properties"),
+        K::DataPropertyRange(..) => return Err("data property ranges"),
+        K::DatatypeDefinition(..) => return Err("datatype definitions"),
         // annotations carry no logical content
         K::AnnotationAssertion(..)
         | K::SubAnnotationPropertyOf(..)
@@ -469,7 +531,25 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
         // the profile check leaves the remaining types out of OWL 2 EL
         _ => {}
     }
-    partial
+    let data_builtin = match ax {
+        K::SubDataPropertyOf(a, b) => is_builtin_data(a) || is_builtin_data(b),
+        K::EquivalentDataProperties(ps) => ps.iter().any(is_builtin_data),
+        K::DataPropertyDomain(d, _) | K::DataPropertyAssertion(d, ..) => is_builtin_data(d),
+        _ => false,
+    };
+    if data_builtin {
+        partial = Some(BUILTIN);
+    }
+    Ok(partial)
+}
+
+/// Whether a data property is the top or bottom one, which the classifier treats as an
+/// ordinary property.
+fn is_builtin_data(p: &DataProperty) -> bool {
+    matches!(
+        p.as_str(),
+        vocab::OWL_TOP_DATA_PROPERTY | vocab::OWL_BOTTOM_DATA_PROPERTY
+    )
 }
 
 fn is_top_or_bottom_role(p: &ObjectPropertyExpression) -> bool {
@@ -498,36 +578,38 @@ fn object_role(p: &ObjectPropertyExpression, it: &mut Interner) -> Option<Role> 
 const MAX_DEPTH: usize = 256;
 
 /// The interned form of a class expression and, when the classifier may miss some of
-/// its consequences, why.
+/// its consequences, why. An expression the classifier cannot represent is an error
+/// with the reason, and the axiom that holds it is left out: no stand-in for it is sound
+/// on both sides of a subsumption.
 pub fn class_expression(
     c: &ClassExpression,
     it: &mut Interner,
     depth: usize,
-) -> (Ex, Option<&'static str>) {
+) -> Result<(Ex, Option<&'static str>), &'static str> {
     use ClassExpression as C;
     if depth > MAX_DEPTH {
-        return (TOP, Some("class expressions nested too deeply"));
+        return Err("class expressions nested too deeply");
     }
-    match c {
+    Ok(match c {
         C::Class(c) => (it.class(c), None),
         C::ObjectIntersectionOf(cs) => {
             let mut partial = None;
             let mut es: Vec<Ex> = cs
                 .iter()
                 .map(|c| {
-                    let (e, p) = class_expression(c, it, depth + 1);
+                    let (e, p) = class_expression(c, it, depth + 1)?;
                     partial = partial.or(p);
-                    e
+                    Ok(e)
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             es.sort_unstable();
             es.dedup();
             es.retain(|&e| e != TOP);
             if es.contains(&BOTTOM) {
-                return (BOTTOM, partial);
+                return Ok((BOTTOM, partial));
             }
             let mut acc = match es.first() {
-                None => return (TOP, partial),
+                None => return Ok((TOP, partial)),
                 Some(&e) => e,
             };
             for &e in &es[1..] {
@@ -536,7 +618,7 @@ pub fn class_expression(
             (acc, partial)
         }
         C::ObjectSomeValuesFrom(p, f) => {
-            let (f, partial) = class_expression(f, it, depth + 1);
+            let (f, partial) = class_expression(f, it, depth + 1)?;
             match p {
                 ObjectPropertyExpression::Property(p)
                     if p.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY =>
@@ -546,34 +628,34 @@ pub fn class_expression(
                 ObjectPropertyExpression::Property(p) => {
                     let r = it.role(RoleName::Object(p.clone()));
                     let partial = if p.as_str() == vocab::OWL_TOP_OBJECT_PROPERTY {
-                        Some("the top and bottom object properties")
+                        Some("the top and bottom object and data properties")
                     } else {
                         partial
                     };
                     if f == BOTTOM {
-                        return (BOTTOM, partial);
+                        return Ok((BOTTOM, partial));
                     }
                     (it.node(Node::Exist(r, f)), partial)
                 }
-                ObjectPropertyExpression::InverseOf(_) => (TOP, Some("inverse properties")),
+                ObjectPropertyExpression::InverseOf(_) => return Err("inverse properties"),
             }
         }
         C::ObjectHasValue(p, i) => {
             let f = match i {
                 Individual::Named(i) => it.nominal(i),
-                Individual::Anonymous(_) => return (TOP, Some("anonymous individuals")),
+                Individual::Anonymous(_) => return Err("anonymous individuals"),
             };
             match p {
                 ObjectPropertyExpression::Property(p) => {
                     let r = it.role(RoleName::Object(p.clone()));
                     (it.node(Node::Exist(r, f)), Some("individuals"))
                 }
-                ObjectPropertyExpression::InverseOf(_) => (TOP, Some("inverse properties")),
+                ObjectPropertyExpression::InverseOf(_) => return Err("inverse properties"),
             }
         }
         C::ObjectOneOf(is) if is.len() == 1 => match is.iter().next() {
             Some(Individual::Named(i)) => (it.nominal(i), Some("individuals")),
-            _ => (TOP, Some("anonymous individuals")),
+            _ => return Err("anonymous individuals"),
         },
         C::ObjectHasSelf(ObjectPropertyExpression::Property(p)) => {
             let r = it.role(RoleName::Object(p.clone()));
@@ -583,6 +665,9 @@ pub fn class_expression(
             let role = it.role(RoleName::Data(ps[0].clone()));
             let atom = data_range(r, it);
             let partial = match r {
+                _ if is_builtin_data(&ps[0]) => {
+                    Some("the top and bottom object and data properties")
+                }
                 DataRange::Datatype(d) if d.as_str() == vocab::RDFS_LITERAL => None,
                 _ => Some("data ranges"),
             };
@@ -594,8 +679,8 @@ pub fn class_expression(
             (it.node(Node::Exist(role, atom)), Some("data values"))
         }
         // outside OWL 2 EL: the profile check has already left the axiom out
-        _ => (TOP, Some("a class expression outside OWL 2 EL")),
-    }
+        _ => return Err("a class expression outside OWL 2 EL"),
+    })
 }
 
 fn data_range(r: &DataRange, it: &mut Interner) -> Ex {
@@ -647,9 +732,12 @@ impl Index {
 
     /// Builds the index of normalized axioms. It may intern new expressions: the
     /// intersections of fillers with ranges and the roles of chains.
-    pub fn build(ax: &Axioms, it: &mut Interner) -> Index {
+    ///
+    /// The property closure can grow with the square of the properties, so it stops with
+    /// the bytes it reached when they pass `limit`.
+    pub fn build(ax: &Axioms, it: &mut Interner, limit: Option<usize>) -> Result<Index, usize> {
         let mut ix = Index {
-            roles: roles(ax, it),
+            roles: roles(ax, it, limit)?,
             ..Index::default()
         };
         let mut neg_seen: FxHashSet<Ex> = FxHashSet::default();
@@ -714,7 +802,7 @@ impl Index {
         ix.disjoint.resize_with(n, Vec::new);
         ix.conj.resize_with(n, Vec::new);
         ix.exist.resize_with(n, Vec::new);
-        ix
+        Ok(ix)
     }
 }
 
@@ -775,7 +863,15 @@ fn positive(e: Ex, it: &mut Interner, ix: &mut Index, seen: &mut FxHashSet<Ex>) 
 
 /// The role table: the reflexive and transitive closure of the role hierarchy, the
 /// binarized chains with their compositions, the reflexive roles and the ranges.
-fn roles(ax: &Axioms, it: &mut Interner) -> Roles {
+fn roles(ax: &Axioms, it: &mut Interner, limit: Option<usize>) -> Result<Roles, usize> {
+    let mut bytes = 0usize;
+    let mut grow = |b: usize| -> Result<(), usize> {
+        bytes += b;
+        if limit.is_some_and(|l| bytes > l) {
+            return Err(bytes);
+        }
+        Ok(())
+    };
     // binarize chains: r1 ∘ r2 ∘ … ∘ rn ⊑ s becomes r1 ∘ r2 ⊑ u1, u1 ∘ r3 ⊑ u2, …
     let mut binary: Vec<(Role, Role, Role)> = Vec::new();
     let mut prefixes: FxHashMap<(Role, Role), Role> = FxHashMap::default();
@@ -819,6 +915,7 @@ fn roles(ax: &Axioms, it: &mut Interner) -> Roles {
                 stack.extend(direct[x as usize].iter().copied());
             }
         }
+        grow(24 + seen.len() * 4)?;
         sup.push(seen.into_iter().collect());
     }
     let mut sub: Vec<Vec<Role>> = vec![Vec::new(); n];
@@ -833,6 +930,7 @@ fn roles(ax: &Axioms, it: &mut Interner) -> Roles {
     for &(s1, s2, t) in &binary {
         for &r1 in &sub[s1 as usize] {
             left[r1 as usize] = true;
+            grow(sub[s2 as usize].len() * 40)?;
             for &r2 in &sub[s2 as usize] {
                 right[r2 as usize] = true;
                 comp.entry((r1, r2)).or_default().push(t);
@@ -868,12 +966,12 @@ fn roles(ax: &Axioms, it: &mut Interner) -> Roles {
             range[r] = Some(acc);
         }
     }
-    Roles {
+    Ok(Roles {
         sup,
         comp,
         right,
         left,
         reflexive: reflexive.into_iter().collect(),
         range,
-    }
+    })
 }

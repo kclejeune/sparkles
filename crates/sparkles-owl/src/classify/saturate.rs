@@ -18,7 +18,7 @@ use parking_lot::{Condvar, Mutex};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// A conclusion waiting in a context's to-do list.
@@ -137,6 +137,8 @@ const STOP_MEMORY: u8 = 3;
 
 /// The conclusions a worker applies between checks of the bounds.
 const CHECK_EVERY: usize = 4096;
+/// The messages a worker sends between checks of the bounds.
+const SEND_EVERY: usize = 16_384;
 /// The bytes counted for each stored conclusion.
 const CONCLUSION_BYTES: usize = 16;
 /// The bytes counted for each context a saturation starts.
@@ -153,7 +155,12 @@ struct Run<'a> {
     /// the workers waiting for the queue
     idle: AtomicUsize,
     stop: AtomicU8,
+    /// the estimated bytes of the stored conclusions and the index
     memory: AtomicUsize,
+    /// the messages waiting in to-do lists, which count as memory while they wait
+    queued: AtomicIsize,
+    /// the most memory counted so far, which the pool's grant covers
+    peak: AtomicUsize,
     applied: AtomicUsize,
     bounds: &'a Bounds<'a>,
 }
@@ -184,6 +191,8 @@ pub fn saturate(
         idle: AtomicUsize::new(0),
         stop: AtomicU8::new(STOP_NONE),
         memory: AtomicUsize::new(bounds.base_memory),
+        queued: AtomicIsize::new(0),
+        peak: AtomicUsize::new(bounds.base_memory),
         applied: AtomicUsize::new(0),
         bounds,
     };
@@ -226,6 +235,8 @@ struct Out<'r, 'a> {
     local: Vec<Concl>,
     /// the contexts this worker activated
     woke: &'r mut Vec<Ex>,
+    /// the messages sent to other contexts since the last check
+    sent: usize,
 }
 
 impl Out<'_, '_> {
@@ -236,6 +247,7 @@ impl Out<'_, '_> {
         } else {
             let ctx = self.run.get(to);
             ctx.todo.lock().push(c);
+            self.sent += 1;
             if self.run.mark(ctx) {
                 self.woke.push(to);
             }
@@ -332,16 +344,22 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Checks the bounds, and stops the run when one is reached.
-    fn check(&self, applied: usize, bytes: usize) -> bool {
+    /// Checks the bounds, and stops the run when one is reached. `bytes` is the growth
+    /// of the stored conclusions and `queued` the change in waiting messages since the
+    /// worker's last check.
+    fn check(&self, applied: usize, bytes: usize, queued: isize) -> bool {
         self.applied.fetch_add(applied, Ordering::Relaxed);
-        let used = self.memory.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let held = self.memory.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let waiting = self.queued.fetch_add(queued, Ordering::Relaxed) + queued;
+        let used = held + waiting.max(0) as usize * std::mem::size_of::<Concl>();
+        let before = self.peak.fetch_max(used, Ordering::Relaxed);
         if self.stopped() {
             return false;
         }
         let b = self.bounds;
+        let grown = used.saturating_sub(before);
         if b.max_memory.is_some_and(|m| used > m)
-            || b.charge.is_some_and(|f| bytes > 0 && !f(bytes))
+            || b.charge.is_some_and(|f| grown > 0 && !f(grown))
         {
             self.halt(STOP_MEMORY);
             return false;
@@ -365,9 +383,11 @@ impl<'a> Run<'a> {
             me,
             local: Vec::new(),
             woke: mine,
+            sent: 0,
         };
         let mut applied = 0usize;
         let mut stored = 0usize;
+        let mut taken = 0usize;
         if !st.init {
             st.init = true;
             stored += CONTEXT_BYTES / CONCLUSION_BYTES;
@@ -384,12 +404,15 @@ impl<'a> Run<'a> {
                     stored += 1;
                 }
                 applied += 1;
-                if applied.is_multiple_of(CHECK_EVERY) {
-                    if !self.check(applied, stored * CONCLUSION_BYTES) {
+                if applied.is_multiple_of(CHECK_EVERY) || out.sent >= SEND_EVERY {
+                    let queued = out.sent as isize - taken as isize;
+                    if !self.check(applied, stored * CONCLUSION_BYTES, queued) {
                         break 'outer;
                     }
                     applied = 0;
                     stored = 0;
+                    taken = 0;
+                    out.sent = 0;
                 }
             }
             {
@@ -399,11 +422,16 @@ impl<'a> Run<'a> {
                 }
                 std::mem::swap(&mut *t, &mut batch);
             }
+            taken += batch.len();
             // apply the batch in the order it arrived
             batch.reverse();
             out.local.append(&mut batch);
         }
-        self.check(applied, stored * CONCLUSION_BYTES);
+        self.check(
+            applied,
+            stored * CONCLUSION_BYTES,
+            out.sent as isize - taken as isize,
+        );
         drop(out);
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);

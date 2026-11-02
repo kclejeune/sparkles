@@ -32,6 +32,8 @@ pub struct Taxonomy {
 pub const TOP_NODE: usize = 0;
 /// The direct parents the greedy reduction finds before it marks instead.
 const GREEDY_MAX: usize = 32;
+/// The classes between two polls of the run's deadline and cancellation.
+const POLL_EVERY: usize = 4096;
 pub const BOTTOM_NODE: usize = 1;
 
 impl Taxonomy {
@@ -162,8 +164,8 @@ fn sort_classes(cs: &mut [Class]) {
 }
 
 /// Builds the taxonomy of the classes of the classifier's signature from its saturated
-/// contexts.
-pub(super) fn build(k: &Classifier, consistent: bool) -> Taxonomy {
+/// contexts. It polls `stop` as it goes and answers `None` when that asks it to stop.
+pub(super) fn build(k: &Classifier, consistent: bool, stop: &dyn Fn() -> bool) -> Option<Taxonomy> {
     let mut classes: Vec<(Class, Ex)> = k
         .classes
         .keys()
@@ -180,7 +182,7 @@ pub(super) fn build(k: &Classifier, consistent: bool) -> Taxonomy {
         for c in &bottom[2..] {
             of.insert(c.clone(), BOTTOM_NODE);
         }
-        return Taxonomy {
+        return Some(Taxonomy {
             nodes: vec![
                 Node {
                     classes: Vec::new(),
@@ -194,12 +196,15 @@ pub(super) fn build(k: &Classifier, consistent: bool) -> Taxonomy {
                 },
             ],
             of,
-        };
+        });
     }
     // the named subsumers of each class, sorted for lookups
     let mut subs: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
     let mut unsat: FxHashMap<Ex, bool> = FxHashMap::default();
-    for &(_, e) in &classes {
+    for (i, &(_, e)) in classes.iter().enumerate() {
+        if i % POLL_EVERY == 0 && stop() {
+            return None;
+        }
         let (b, mut s) = k.named_subsumers(e).unwrap_or((false, vec![e, TOP]));
         s.sort_unstable();
         unsat.insert(e, b);
@@ -270,7 +275,10 @@ pub(super) fn build(k: &Classifier, consistent: bool) -> Taxonomy {
         });
     }
     // the direct superclasses of each group: the minimal groups among its subsumers
-    for &r in &reps {
+    for (i, &r) in reps.iter().enumerate() {
+        if i % POLL_EVERY == 0 && stop() {
+            return None;
+        }
         let mut cands: Vec<Ex> = subs[&r]
             .iter()
             .filter(|&&b| b != TOP && name_of.contains_key(&b))
@@ -339,5 +347,5 @@ pub(super) fn build(k: &Classifier, consistent: bool) -> Taxonomy {
             of.insert(c.clone(), i);
         }
     }
-    Taxonomy { nodes, of }
+    Some(Taxonomy { nodes, of })
 }

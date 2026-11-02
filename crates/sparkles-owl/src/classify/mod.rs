@@ -163,6 +163,20 @@ impl Default for Classifier {
     }
 }
 
+/// Whether a change to the axiom needs a run that starts again: one that changes the
+/// role table, which a run builds once, or one with data, whose generated rules for
+/// literals and data ranges the invalidation does not follow.
+fn needs_full_run(ax: &AxiomKind) -> bool {
+    if role_axiom(ax) {
+        return true;
+    }
+    let mut sig = crate::model::Signature::default();
+    sig.axiom(ax);
+    sig.0
+        .iter()
+        .any(|e| matches!(e, Entity::DataProperty(_) | Entity::Datatype(_)))
+}
+
 /// Whether a change to the axiom affects the role table, which a run builds once.
 fn role_axiom(ax: &AxiomKind) -> bool {
     matches!(
@@ -243,10 +257,16 @@ impl Classifier {
         }
     }
 
-    /// Removes axioms. Removing an axiom the classifier does not hold does nothing.
+    /// Removes axioms. Removing an axiom the classifier does not hold, counting the
+    /// changes not yet classified, does nothing.
     pub fn remove<'a>(&mut self, axioms: impl IntoIterator<Item = &'a Axiom>) {
         for ax in axioms {
-            if logical(&ax.kind) {
+            if !logical(&ax.kind) {
+                continue;
+            }
+            let have = self.axioms.get(&ax.kind).map_or(0, |h| h.count as i64);
+            let d = self.pending.get(&ax.kind).copied().unwrap_or(0);
+            if have + d > 0 {
                 *self.pending.entry(ax.kind.clone()).or_default() -= 1;
             }
         }
@@ -362,7 +382,7 @@ impl Classifier {
     }
 
     /// Normalizes the held axioms inside OWL 2 EL and builds the index.
-    fn build(&mut self) -> (Axioms, Index) {
+    fn build(&mut self, limits: &Limits) -> Result<(Axioms, Index), Error> {
         let mut ax = Axioms::default();
         let mut partial = BTreeMap::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
@@ -371,7 +391,10 @@ impl Classifier {
             .iter()
             .filter(|(_, h)| h.outside.is_none())
             .map(|(k, _)| k);
-        for k in kinds {
+        for (i, k) in kinds.enumerate() {
+            if i % POLL_AXIOMS == 0 {
+                poll(limits)?;
+            }
             if matches!(
                 k,
                 AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
@@ -414,18 +437,49 @@ impl Classifier {
                 }
             }
         }
-        self.partial = partial;
         for c in self.classes.keys() {
             let e = self.interner.class(c);
             ax.classes.push(e);
         }
-        let ix = Index::build(&ax, &mut self.interner);
-        (ax, ix)
+        let ix = Index::build(&ax, &mut self.interner, limits.max_memory).map_err(|used| {
+            Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            }
+        })?;
+        // an individual that fills a property with a range has a context for each range,
+        // which nominal reasoning would merge
+        for (k, h) in &self.axioms {
+            if let (
+                None,
+                AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::Property(p), ..),
+            ) = (&h.outside, k)
+                && let Some(r) = self.interner.role_id(&index::RoleName::Object(p.clone()))
+                && ix.roles.range.get(r as usize).is_some_and(|c| c.is_some())
+            {
+                partial
+                    .entry(k.clone())
+                    .or_insert("individuals that fill a property with a range");
+            }
+        }
+        self.partial = partial;
+        Ok((ax, ix))
     }
 
     /// Classifies the axioms held, saturating again only what changed since the last
     /// run.
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
+        let r = self.run(limits);
+        if r.is_err() && self.dirty {
+            // the next run starts again, so the state of this one is of no use
+            self.index = None;
+            self.interner = Interner::new();
+            self.ctx = Vec::new();
+        }
+        r
+    }
+
+    fn run(&mut self, limits: &Limits) -> Result<Classification, Error> {
         let mut stats = Stats::default();
         let start = Instant::now();
         // a run that starts again needs no copies of the changed axioms
@@ -433,7 +487,9 @@ impl Classifier {
         let (n_added, n_removed, added, removed) = self.apply_pending(!again);
         stats.added = n_added;
         stats.removed = n_removed;
-        let full = again || added.iter().chain(&removed).any(role_axiom);
+        // until the saturation ends, a stop leaves the state for a run that starts again
+        self.dirty = true;
+        let full = again || added.iter().chain(&removed).any(needs_full_run);
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
@@ -452,12 +508,14 @@ impl Classifier {
         // the copies of the changed axioms are not needed past this point
         drop(added);
         drop(removed);
-        let (ax, ix) = self.build();
+        let (ax, ix) = self.build(limits)?;
+        poll(limits)?;
         let n = self.interner.len();
         self.ctx.resize_with(n, OnceLock::new);
         if let Some(scratch) = premises {
             stats.incremental = true;
             stats.cleared = self.invalidate(&scratch, &ix);
+            poll(limits)?;
         }
         let mut roots: Vec<Ex> = ax.classes.clone();
         roots.push(TOP);
@@ -489,8 +547,6 @@ impl Classifier {
             base_memory: base,
         };
         if limits.max_memory.is_some_and(|m| base > m) || charge_fn.is_some_and(|f| !f(base)) {
-            self.dirty = true;
-            self.index = None;
             return Err(Error::Memory {
                 limit: limits.max_memory.unwrap_or(base),
                 used: base,
@@ -502,8 +558,6 @@ impl Classifier {
         let totals = match totals {
             Ok(t) => t,
             Err(stop) => {
-                self.dirty = true;
-                self.index = None;
                 return Err(match stop {
                     Stop::Cancelled => Error::Cancelled,
                     Stop::Timeout => Error::Timeout,
@@ -516,13 +570,17 @@ impl Classifier {
         };
         stats.conclusions = totals.conclusions;
         stats.memory = totals.memory;
+        // the saturated state is complete: a stop from here on keeps it for the next run
         self.dirty = false;
+        self.index = Some(ix);
         let t = Instant::now();
         let consistent = self.consistent(&ax);
-        let taxonomy = taxonomy::build(self, consistent);
+        let stop = || poll(limits).is_err();
+        let taxonomy = taxonomy::build(self, consistent, &stop)
+            .ok_or_else(|| poll(limits).err().unwrap_or(Error::Cancelled))?;
         stats.taxonomy = t.elapsed();
         stats.contexts = self.ctx.iter().filter(|c| c.get().is_some()).count();
-        self.index = Some(ix);
+        poll(limits)?;
         Ok(Classification {
             consistent,
             taxonomy,
@@ -561,6 +619,7 @@ impl Classifier {
             + pairs(&ix.exist)
             + ix.disjoint.iter().map(|x| 24 + x.len() * 4).sum::<usize>()
             + ix.succ.len() * 12
+            + ix.roles.bytes()
             + self.held_bytes
     }
 
@@ -720,4 +779,18 @@ fn range_table(
         out.insert(p.to_string(), rs);
     }
     out
+}
+
+/// The axioms normalized between two polls of the run's deadline and cancellation.
+const POLL_AXIOMS: usize = 65_536;
+
+/// The run's deadline and cancellation, as an error when either has come.
+fn poll(limits: &Limits) -> Result<(), Error> {
+    if limits.deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(Error::Timeout);
+    }
+    if limits.cancelled.as_ref().is_some_and(|f| f()) {
+        return Err(Error::Cancelled);
+    }
+    Ok(())
 }

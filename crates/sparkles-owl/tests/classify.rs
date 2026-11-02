@@ -314,6 +314,170 @@ fn incremental_runs_reuse_contexts() {
     );
 }
 
+fn nested(depth: usize, filler: &str) -> ClassExpression {
+    let mut e = ce(filler);
+    for _ in 0..depth {
+        e = some("r", e);
+    }
+    e
+}
+
+#[test]
+fn an_expression_nested_too_deeply_leaves_its_axiom_out() {
+    // a stand-in for the deep fillers would make the two left sides one expression
+    let mut k = Classifier::of(&[sub(c("A"), nested(300, "C")), sub(nested(300, "D"), c("B"))]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("B")));
+    let partial = k
+        .excluded()
+        .iter()
+        .filter(|e| matches!(e.gap, Gap::Partial("class expressions nested too deeply")))
+        .count();
+    assert_eq!(partial, 2);
+}
+
+fn dp(s: &str) -> DataProperty {
+    DataProperty::new(format!("http://ex.org/{s}"))
+}
+
+#[test]
+fn a_change_to_a_data_axiom_runs_everything_again() {
+    let has = ClassExpression::DataHasValue(dp("p"), Literal::simple("x"));
+    let mut k = Classifier::of(&[sub(c("A"), has)]);
+    k.classify(&Limits::default()).unwrap();
+    let domain = ax(AxiomKind::DataPropertyDomain(dp("p"), ce("D")));
+    k.add([&domain]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+}
+
+#[test]
+fn assertions_on_a_property_with_a_range_are_partial() {
+    let i = |s: &str| Individual::named(format!("http://ex.org/{s}"));
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
+        ax(AxiomKind::ObjectPropertyRange(ope("s"), ce("D"))),
+        ax(AxiomKind::DisjointClasses(
+            [ce("C"), ce("D")].into_iter().collect(),
+        )),
+        ax(AxiomKind::ObjectPropertyAssertion(ope("r"), i("a"), i("b"))),
+        ax(AxiomKind::ObjectPropertyAssertion(ope("s"), i("d"), i("b"))),
+    ]);
+    k.classify(&Limits::default()).unwrap();
+    let partial = k
+        .excluded()
+        .iter()
+        .filter(|e| matches!(e.gap, Gap::Partial(_)))
+        .count();
+    assert_eq!(partial, 2, "{:#?}", k.excluded());
+}
+
+#[test]
+fn axioms_on_the_top_and_bottom_properties_are_partial() {
+    let top = ObjectPropertyExpression::from(ObjectProperty::top());
+    let bottom = ObjectPropertyExpression::from(ObjectProperty::bottom());
+    let mut k = Classifier::of(&[
+        ax(AxiomKind::ObjectPropertyDomain(top, ce("C"))),
+        ax(AxiomKind::ReflexiveObjectProperty(bottom)),
+    ]);
+    k.classify(&Limits::default()).unwrap();
+    let ex = k.excluded();
+    assert_eq!(ex.len(), 2, "{ex:#?}");
+    assert!(ex.iter().all(|e| matches!(e.gap, Gap::Partial(_))));
+}
+
+#[test]
+fn the_property_closure_is_bounded_by_the_memory_limit() {
+    let mut axioms = Vec::new();
+    for i in 0..1000 {
+        axioms.push(ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Expression(ope(&format!("r{i}"))),
+            ope(&format!("r{}", i + 1)),
+        )));
+    }
+    let limit = Limits {
+        max_memory: Some(128_000),
+        ..Limits::default()
+    };
+    assert!(matches!(
+        Classifier::of(&axioms).classify(&limit).unwrap_err(),
+        Error::Memory { .. }
+    ));
+}
+
+#[test]
+fn waiting_messages_count_against_the_memory_limit() {
+    // every link from A to B through a subrole of s meets every rule at B, so A's
+    // to-do list takes the square of n messages and stores only n of them
+    let n = 300;
+    let mut axioms = Vec::new();
+    for i in 0..n {
+        let r = format!("r{i}");
+        axioms.push(ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Expression(ope(&r)),
+            ope("s"),
+        )));
+        axioms.push(sub(c("A"), some(&r, c("B"))));
+        axioms.push(sub(c("B"), c(&format!("F{i}"))));
+        axioms.push(sub(some("s", c(&format!("F{i}"))), c(&format!("G{i}"))));
+    }
+    let full = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    assert!(full.taxonomy.is_subclass(&c("A"), &c("G7")));
+    let limit = Limits {
+        threads: 1,
+        max_memory: Some(full.stats.memory + 200_000),
+        ..Limits::default()
+    };
+    assert!(matches!(
+        Classifier::of(&axioms).classify(&limit).unwrap_err(),
+        Error::Memory { .. }
+    ));
+}
+
+#[test]
+fn a_stop_after_the_saturation_keeps_the_saturated_state() {
+    let mut axioms = Vec::new();
+    for i in 0..1000 {
+        axioms.push(sub(c(&format!("A{i}")), c(&format!("A{}", i + 1))));
+    }
+    let counting = |stop_at: usize| {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let m = n.clone();
+        let limits = Limits {
+            threads: 1,
+            cancelled: Some(Arc::new(move || {
+                m.fetch_add(1, Ordering::Relaxed) + 1 == stop_at
+            })),
+            ..Limits::default()
+        };
+        (n, limits)
+    };
+    // the number of polls of a whole run, the last of them after the taxonomy
+    let (n, limits) = counting(0);
+    Classifier::of(&axioms).classify(&limits).unwrap();
+    let last = n.load(Ordering::Relaxed);
+    let (_, limits) = counting(last);
+    let mut k = Classifier::of(&axioms);
+    assert_eq!(k.classify(&limits).unwrap_err(), Error::Cancelled);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.stats.incremental);
+    assert_eq!(out.stats.cleared, 0);
+    assert!(out.taxonomy.is_subclass(&c("A0"), &c("A1000")));
+}
+
+#[test]
+fn removing_an_axiom_not_held_does_not_cancel_a_later_addition() {
+    let a = sub(c("A"), c("B"));
+    let mut k = Classifier::new();
+    k.remove([&a]);
+    k.add([&a]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+}
+
 // ---------------------------------------------------------------------------------
 // A naive completion procedure for EL++ without nominals or concrete domains (Baader,
 // Brandt and Lutz, "Pushing the EL Envelope", IJCAI 2005, with the range rule of their
