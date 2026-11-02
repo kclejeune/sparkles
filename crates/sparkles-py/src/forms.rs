@@ -128,11 +128,13 @@ mod imp {
             let k = k.extract::<String>().unwrap_or_default();
             if !matches!(
                 k.as_str(),
-                "focus" | "class" | "changes" | "expect" | "message"
+                "focus" | "class" | "changes" | "expect" | "message" | "nested"
             ) {
                 return Err(invalid(
                     py,
-                    format!("unknown member '{k}': focus, class, changes, expect and message"),
+                    format!(
+                        "unknown member '{k}': focus, class, changes, expect, message and nested"
+                    ),
                 ));
             }
         }
@@ -161,10 +163,15 @@ mod imp {
             }
             let field = string(&c, "field")?
                 .ok_or_else(|| invalid(py, format!("changes[{i}].field: a field id")))?;
+            let list = match get(&c, "list")? {
+                Some(l) if !l.is_none() => Some(terms(Some(l), &format!("changes[{i}].list"))?),
+                _ => None,
+            };
             changes.push(FieldChange {
                 field,
                 remove: terms(get(&c, "remove")?, &format!("changes[{i}].remove"))?,
                 add: terms(get(&c, "add")?, &format!("changes[{i}].add"))?,
+                list,
             });
         }
         let mut expect = BTreeMap::new();
@@ -194,6 +201,14 @@ mod imp {
             expect,
             message: string(m, "message")?,
             settings,
+            // nested entries name blank nodes, so they take the JSON spelling of the route
+            nested: match get(m, "nested")? {
+                Some(n) if !n.is_none() => {
+                    let j: J = admin::from_py(&n, "nested")?;
+                    sparkles::forms::nested_from_json(Some(&j)).py(py)?
+                }
+                _ => Vec::new(),
+            },
         })
     }
 

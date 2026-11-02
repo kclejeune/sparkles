@@ -41,7 +41,19 @@ pub const MAX_DEPENDENTS: usize = 500;
 
 #[path = "nested.rs"]
 mod nested;
-pub use nested::{NestedAnchor, NestedFormModel, NestedNode};
+pub use nested::{
+    MAX_NESTED_ANCHORS, MAX_NESTED_DEPTH, MAX_NESTED_FIELDS, MAX_NESTED_NODES, NestedAnchor,
+    NestedFormModel, NestedNode,
+};
+
+#[path = "edit.rs"]
+mod edit;
+use edit::{Guard, Plan};
+pub use edit::{MAX_LIST_ITEMS, MAX_SUBTREE_QUADS, NodeChange};
+
+#[path = "wire.rs"]
+mod wire;
+pub use wire::{expect_from_json, field_changes_from_json, nested_from_json};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 use sparkles_core::INFERRED_GRAPH as INFERRED;
@@ -125,6 +137,10 @@ pub struct FormValue {
     /// the caller cannot write the graph that holds it
     #[serde(skip_serializing_if = "std::ops::Not::not", rename = "readOnly")]
     pub read_only: bool,
+    /// the members of an `rdf:List` value of a list field, in order (`None`: not a list
+    /// field, or the value is not a well-formed list)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<FormValue>>,
 }
 
 fn ser_term<S: serde::Serializer>(t: &Term, s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -143,7 +159,7 @@ pub struct Field {
     pub inverse: bool,
     pub editable: bool,
     /// why the field is read-only: `readOnly`, `protected`, `graph`, `complex-path`,
-    /// `too-many` or `state`
+    /// `too-many`, `list` (not exactly one well-formed `rdf:List`) or `state`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     pub label: String,
@@ -198,12 +214,19 @@ pub struct FormModel {
 // ------------------------------------------------------------------ changes ------
 
 /// A change to one field.
+///
+/// A value to `remove` may be a stored blank node of a field that declares `sh:node`:
+/// the change then also deletes the child's visible quads when nothing else refers to it.
+/// A blank node in `add` names a new child that [`FormChange::nested`] describes.
 #[derive(Clone, Debug, Default)]
 pub struct FieldChange {
     /// the field's id
     pub field: String,
     pub remove: Vec<Term>,
     pub add: Vec<Term>,
+    /// a list field (SHACL 1.2 list constraints): the members its `rdf:List` value takes,
+    /// replacing the stored list; `remove` and `add` stay empty
+    pub list: Option<Vec<Term>>,
 }
 
 /// The changes a form makes to a resource.
@@ -215,10 +238,13 @@ pub struct FormChange {
     /// a new instance of this class: the change also adds `focus rdf:type class`
     pub class: Option<String>,
     pub changes: Vec<FieldChange>,
-    /// the values the form loaded, by field id: one entry for every changed field
+    /// the values the form loaded, by field id: one entry for every changed field, and
+    /// for a list field the members of its list in order
     pub expect: BTreeMap<String, Vec<Term>>,
     pub message: Option<String>,
     pub settings: FormSettings,
+    /// changes to nested blank-node children, which commit atomically with `changes`
+    pub nested: Vec<NodeChange>,
 }
 
 /// What a check found (spec U02 §3.2).
@@ -245,8 +271,25 @@ pub struct FormCheck {
 #[derive(Clone, Debug, Serialize)]
 pub struct FieldConflict {
     pub id: String,
+    /// the nested node the field belongs to (`None`: the root)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_term"
+    )]
+    pub node: Option<Term>,
+    /// the stored values now, or for a list field the members of its list
     #[serde(serialize_with = "ser_terms")]
     pub now: Vec<Term>,
+}
+
+fn ser_opt_term<S: serde::Serializer>(
+    t: &Option<Term>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match t {
+        Some(t) => term_json(t).serialize(s),
+        None => s.serialize_none(),
+    }
 }
 
 fn ser_terms<S: serde::Serializer>(t: &[Term], s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -289,10 +332,12 @@ pub enum FormSaved {
 ///         field: model.fields[0].id.clone(),
 ///         remove: vec![name.clone().into()],
 ///         add: vec![oxrdf::Literal::new_simple_literal("Ann").into()],
+///         list: None,
 ///     }],
 ///     expect: [(model.fields[0].id.clone(), vec![name.into()])].into(),
 ///     message: Some("rename".into()),
 ///     settings,
+///     nested: vec![],
 /// };
 /// let saved = ds.forms().save(&change, &Default::default())?;
 /// assert!(matches!(saved, sparkles::forms::FormSaved::Saved(_)));
@@ -393,16 +438,12 @@ impl Forms {
         }
         let withheld = opts.graphs.as_ref().is_some_and(|a| !a.reads_everything());
         let plan = built.plan(change, !withheld && !built.shapes.is_empty())?;
-        let checks = expected(&built, &plan, change)?;
-        let conflicts = conflicts_at(
-            txn.base(),
-            opts.graphs.as_deref(),
-            &built.focus,
-            &checks,
-            &Limits::of(opts),
-        )?
-        .0;
-        crate::sparql::update::update_in(&mut txn, &plan.update, opts)?;
+        let guard = Guard::of(&built, &plan, change)?;
+        let mut conflicts = guard
+            .differ(txn.base(), opts.graphs.as_deref(), &Limits::of(opts))?
+            .0;
+        conflicts.extend(plan.lost.iter().cloned());
+        let fresh = edit::apply(&mut txn, &plan, &built.limits)?;
         let (mut results, mut conforms, mut timed_out) = (None, None, false);
         if !withheld && !built.shapes.is_empty() {
             let post = Arc::new(txn.view());
@@ -422,18 +463,28 @@ impl Forms {
                     .max_memory_bytes
                     .map_or(100_000, |bytes| (bytes / 128).min(100_000)),
             };
+            let quads: Vec<Quad> = plan
+                .quads
+                .iter()
+                .map(|q| edit::stored_quad(q, &fresh))
+                .collect();
+            let touched: Vec<Term> = plan
+                .touched
+                .iter()
+                .map(|t| edit::stored(t, &fresh))
+                .collect();
             match sparkles_shacl::incremental::validate_affected(
                 txn.base(),
                 &post,
                 &built.shapes,
-                &plan.quads,
-                &plan.touched,
+                &quads,
+                &touched,
                 &v,
                 discovery,
             ) {
                 Ok(report) => {
                     conforms = Some(report.conforms);
-                    results = Some(built.map_results(&report));
+                    results = Some(built.map_results(&report, &plan, &fresh));
                 }
                 Err(e) if format!("{e:#}").contains("timed out") => timed_out = true,
                 Err(e) => return Err(crate::handles::from_anyhow(e)),
@@ -443,7 +494,7 @@ impl Forms {
         Ok(FormCheck {
             preview,
             conflicts,
-            update: plan.update,
+            update: plan.update(),
             results,
             conforms,
             timed_out,
@@ -465,29 +516,15 @@ impl Forms {
         for _ in 0..SAVE_ROUNDS {
             let built = self.build_for(&head, change, opts)?;
             let plan = built.plan(change, false)?;
-            let checks = expected(&built, &plan, change)?;
-            let focus = built.focus.clone();
+            // a nested node the form edits no longer hangs from its parent
+            if !plan.lost.is_empty() {
+                return Ok(FormSaved::Conflict(plan.lost));
+            }
+            let guard = Arc::new(Guard::of(&built, &plan, change)?);
             let access = opts.graphs.clone();
-            let (settings, target) = (change.settings.clone(), built.target.clone());
             let lim = limits.clone();
-            let new_instance = built.new_class.is_some();
-            let differ = Arc::new(move |snap: &Arc<Snapshot>| {
-                // a new instance's IRI must still describe nothing when the write starts
-                if new_instance {
-                    let mut read = Reader::new(snap, access.as_deref())?;
-                    read.limits = lim.clone();
-                    if describes(&read, &focus)? {
-                        return Err(used_iri(&focus));
-                    }
-                }
-                let (c, mut stale) = conflicts_at(snap, access.as_deref(), &focus, &checks, &lim)?;
-                if c.is_empty() && !stale {
-                    // new values go to a graph that depends on the state
-                    let read = Reader::new(snap, access.as_deref())?;
-                    stale = target_graph(&read, &focus, &settings.target_graph)? != target;
-                }
-                Ok::<_, Error>((c, stale))
-            });
+            let differ =
+                Arc::new(move |snap: &Arc<Snapshot>| guard.differ(snap, access.as_deref(), &lim));
             // a conflict already at the head: no need to wait for the writer
             let (early, _) = differ(&head)?;
             if !early.is_empty() {
@@ -528,7 +565,7 @@ impl Forms {
                 }
                 Err(e) => return Err(e),
             };
-            crate::sparql::update::update_in(&mut txn, &plan.update, opts)?;
+            edit::apply(&mut txn, &plan, &limits)?;
             return Ok(FormSaved::Saved(Box::new(txn.commit()?)));
         }
         Err(Error::PreconditionFailed(format!(
@@ -543,17 +580,21 @@ impl Forms {
         change: &FormChange,
         opts: &QueryOptions,
     ) -> Result<Built> {
-        self.build(
+        // the nested nodes a change edits come from the same bounded pool discovery as
+        // the nested read model
+        let preparation = (!change.nested.is_empty()).then(|| nested::Preparation::of(opts));
+        self.build_prepared(
             snap,
             &change.focus,
             &change.settings,
             opts,
-            change.class.as_deref(),
-            opts.graphs.as_ref(),
+            (change.class.as_deref(), opts.graphs.as_ref()),
+            preparation,
         )
     }
 
     /// The fields of a resource at `snap`.
+    #[cfg(test)]
     fn build(
         &self,
         snap: &Arc<Snapshot>,
@@ -669,6 +710,7 @@ impl Forms {
         let (read_snap, masked) = (read.snap().clone(), read.masked);
         drop(read);
         Ok(Built {
+            raw: snap.clone(),
             focus,
             new_class,
             types,
@@ -818,20 +860,11 @@ struct Built {
     limits: Limits,
     /// the state read, masked by the view
     snap: Arc<Snapshot>,
+    /// the same state without the view's mask, for the references of removed children
+    raw: Arc<Snapshot>,
     masked: bool,
     lang: Option<String>,
     prefixes: BTreeMap<String, String>,
-}
-
-/// The update a change makes, and what it touches.
-struct Plan {
-    update: String,
-    /// the changed fields, by id
-    changed: Vec<(String, FieldPath)>,
-    /// the nodes whose validation the change can affect
-    touched: Vec<Term>,
-    /// Distinct changed triples in graphs of the validation data graph.
-    quads: Vec<Quad>,
 }
 
 /// Known DASH editors and viewers (spec U02 §2.3).
@@ -947,12 +980,33 @@ impl Built {
                     v.label = read.label(n, lang)?;
                 }
             }
+            // a list field edits exactly one well-formed rdf:List
+            let mut list_ok = true;
+            if f.constraints.list.is_some() {
+                list_ok = values.len() <= 1 && !matches!(f.path, FieldPath::Inverse(_));
+                for v in &mut values {
+                    v.items = read.list_items(&v.term)?;
+                    match &mut v.items {
+                        None => list_ok = false,
+                        Some(items) => {
+                            for item in items {
+                                item.read_only = v.read_only;
+                                if let Term::NamedNode(n) = &item.term {
+                                    item.label = read.label(n, lang)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let reason = if !writable {
                 Some("state")
             } else if f.read_only {
                 Some("readOnly")
             } else if matches!(f.path, FieldPath::Complex(_)) {
                 Some("complex-path")
+            } else if !list_ok {
+                Some("list")
             } else if self.protected(f, target_term.as_ref()) {
                 Some("protected")
             } else if !self.writable_graph(self.target.as_deref()) {
@@ -1145,357 +1199,63 @@ impl Built {
     }
 
     fn writable_graph(&self, g: Option<&str>) -> bool {
-        if g == Some(INFERRED) {
-            return false;
-        }
-        match &self.write_access {
-            None => true,
-            Some(a) => {
-                let t = g.map(|g| Term::NamedNode(NamedNode::new_unchecked(g)));
-                a.writable(t.as_ref())
-            }
-        }
-    }
-
-    fn change_quad(
-        &self,
-        out: &mut Vec<Quad>,
-        predicate: &NamedNode,
-        value: &Term,
-        inverse: bool,
-        graph: Option<&str>,
-    ) -> Result<()> {
-        if graph.is_some_and(|g| self.vopts.exclude_graphs.iter().any(|x| x == g)) {
-            return Ok(());
-        }
-        let selected = match self.vopts.data_graph.as_deref() {
-            None => self.snap.union_default_graph || graph.is_none(),
-            Some("urn:x-arq:UnionGraph") => true,
-            Some("urn:x-arq:DefaultGraph") => graph.is_none(),
-            Some(g) => graph == Some(g),
-        } || graph.is_some_and(|g| self.vopts.extra_graphs.iter().any(|x| x == g));
-        if !selected {
-            return Ok(());
-        }
-        let Term::NamedNode(focus) = &self.focus else {
-            return Err(Error::invalid("form focus must be an IRI"));
-        };
-        let (subject, object) = if inverse {
-            let Term::NamedNode(subject) = value else {
-                return Err(Error::invalid("inverse form value must be an IRI"));
-            };
-            (subject, &self.focus)
-        } else {
-            (focus, value)
-        };
-        // A triple present in several selected graphs is one validation dependency.
-        // Compare before cloning values so graph multiplicity cannot multiply retained terms.
-        if out.iter().any(|q| {
-            q.subject.as_ref() == subject.as_ref().into()
-                && q.predicate == *predicate
-                && q.object == *object
-        }) {
-            return Ok(());
-        }
-        if out.len() > MAX_CHANGED_TERMS {
-            return Err(Error::invalid(
-                "form validation change admission exceeded its bound",
-            ));
-        }
-        out.push(Quad::new(
-            subject.clone(),
-            predicate.clone(),
-            object.clone(),
-            graph.map_or(GraphName::DefaultGraph, |g| {
-                GraphName::NamedNode(NamedNode::new_unchecked(g))
-            }),
-        ));
-        Ok(())
-    }
-
-    /// The update of a change, after checking it against the fields.
-    fn plan(&self, change: &FormChange, track_changes: bool) -> Result<Plan> {
-        let read = self.read()?;
-        let target = self
-            .target
-            .as_ref()
-            .map(|g| Term::NamedNode(NamedNode::new_unchecked(g.as_str())));
-        let terms: usize = change
-            .changes
-            .iter()
-            .map(|c| c.add.len() + c.remove.len())
-            .sum();
-        if terms > MAX_CHANGED_TERMS {
-            return Err(Error::invalid(format!(
-                "a change may remove and add at most {MAX_CHANGED_TERMS} terms, not {terms}"
-            )));
-        }
-        let mut del: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
-        let mut ins: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
-        let mut quads = Vec::new();
-        if let Some(c) = &self.new_class {
-            // a new instance takes an IRI nothing describes yet
-            if describes(&read, &self.focus)? {
-                return Err(used_iri(&self.focus));
-            }
-            if !self.writable_graph(self.target.as_deref()) {
-                return Err(Error::NotPermitted(format!(
-                    "new values go to {}, which you cannot write",
-                    self.target
-                        .as_deref()
-                        .map_or("the default graph".into(), |g| format!("<{g}>"))
-                )));
-            }
-            ins.entry(self.target.clone()).or_default().push(format!(
-                "{} <{RDF_TYPE}> <{}>",
-                self.focus,
-                c.as_str()
-            ));
-            if track_changes {
-                self.change_quad(
-                    &mut quads,
-                    &NamedNode::new_unchecked(RDF_TYPE),
-                    &Term::NamedNode(c.clone()),
-                    false,
-                    self.target.as_deref(),
-                )?;
-            }
-        }
-        let mut changed = Vec::new();
-        let mut touched: Vec<Term> = vec![self.focus.clone()];
-        for c in &change.changes {
-            let f = self
-                .layout
-                .fields
-                .iter()
-                .find(|f| f.id() == c.field)
-                .filter(|f| !self.hidden(f, target.as_ref()))
-                .ok_or_else(|| Error::invalid(format!("no field {} in this form", c.field)))?;
-            if c.add.is_empty() && c.remove.is_empty() {
-                continue;
-            }
-            if f.read_only {
-                return Err(Error::NotPermitted(format!(
-                    "field {} is read-only (dash:readOnly)",
-                    c.field
-                )));
-            }
-            if matches!(f.path, FieldPath::Complex(_)) {
-                return Err(Error::invalid(format!(
-                    "field {} has a complex path, which a form cannot change",
-                    c.field
-                )));
-            }
-            if self.protected(f, target.as_ref()) {
-                return Err(Error::NotPermitted(format!(
-                    "your access protects the predicate of field {} from writes",
-                    c.field
-                )));
-            }
-            let p = f.path.predicate().expect("a predicate or inverse path");
-            let inverse = matches!(f.path, FieldPath::Inverse(_));
-            let triple = |v: &Term| -> Result<String> {
-                if let Term::BlankNode(_) = v {
-                    return Err(Error::invalid(format!(
-                        "field {}: a blank node cannot be named in a change",
-                        c.field
-                    )));
-                }
-                if inverse {
-                    if !matches!(v, Term::NamedNode(_)) {
-                        return Err(Error::invalid(format!(
-                            "field {} has an inverse path: its values are IRIs",
-                            c.field
-                        )));
-                    }
-                    Ok(format!("{v} <{}> {}", p.as_str(), self.focus))
-                } else {
-                    Ok(format!("{} <{}> {v}", self.focus, p.as_str()))
-                }
-            };
-            let stored = read.values(&self.focus, &f.path)?;
-            for v in &c.remove {
-                let line = triple(v)?;
-                let graphs: Vec<Option<String>> = stored
-                    .iter()
-                    .filter(|s| s.term == *v)
-                    .map(|s| s.graph.clone())
-                    .collect();
-                for g in &graphs {
-                    if !self.writable_graph(g.as_deref()) {
-                        return Err(Error::NotPermitted(format!(
-                            "field {}: the value {v} is in a graph you cannot write",
-                            c.field
-                        )));
-                    }
-                    del.entry(g.clone()).or_default().push(line.clone());
-                    if track_changes {
-                        self.change_quad(&mut quads, p, v, inverse, g.as_deref())?;
-                    }
-                }
-                if let Term::NamedNode(_) = v {
-                    touched.push(v.clone());
-                }
-            }
-            if !c.add.is_empty() && !self.writable_graph(self.target.as_deref()) {
-                return Err(Error::NotPermitted(format!(
-                    "new values go to {}, which you cannot write",
-                    self.target
-                        .as_deref()
-                        .map_or("the default graph".into(), |g| format!("<{g}>"))
-                )));
-            }
-            for v in &c.add {
-                let line = triple(v)?;
-                ins.entry(self.target.clone()).or_default().push(line);
-                if track_changes {
-                    self.change_quad(&mut quads, p, v, inverse, self.target.as_deref())?;
-                }
-                if let Term::NamedNode(_) = v {
-                    touched.push(v.clone());
-                }
-            }
-            if !changed
-                .iter()
-                .any(|(id, _): &(String, FieldPath)| *id == c.field)
-            {
-                changed.push((c.field.clone(), f.path.clone()));
-            }
-        }
-        let block = |m: &BTreeMap<Option<String>, Vec<String>>| {
-            let mut s = String::new();
-            for (g, lines) in m {
-                match g {
-                    None => {
-                        for l in lines {
-                            s.push_str(&format!("  {l} .\n"));
-                        }
-                    }
-                    Some(g) => {
-                        s.push_str(&format!("  GRAPH <{g}> {{\n"));
-                        for l in lines {
-                            s.push_str(&format!("    {l} .\n"));
-                        }
-                        s.push_str("  }\n");
-                    }
-                }
-            }
-            s
-        };
-        let mut update = String::new();
-        if !del.is_empty() {
-            update.push_str(&format!("DELETE DATA {{\n{}}}", block(&del)));
-        }
-        if !ins.is_empty() {
-            if !update.is_empty() {
-                update.push_str(" ;\n");
-            }
-            update.push_str(&format!("INSERT DATA {{\n{}}}", block(&ins)));
-        }
-        if update.is_empty() {
-            return Err(Error::invalid("the change changes nothing"));
-        }
-        touched.dedup();
-        let mut seen = BTreeSet::new();
-        touched.retain(|t| seen.insert(t.to_string()));
-        Ok(Plan {
-            update,
-            changed,
-            touched,
-            quads,
-        })
+        writable_in(self.write_access.as_deref(), g)
     }
 
     /// The results of a validation as JSON, each with the field it belongs to (`null`
-    /// for a result on another focus node or a path no field has).
-    fn map_results(&self, report: &ValidationReport) -> Vec<J> {
+    /// for a result on another focus node or a path no field has), and the nested node
+    /// whose field it is.
+    fn map_results(
+        &self,
+        report: &ValidationReport,
+        plan: &Plan,
+        fresh: &std::collections::HashMap<String, Id>,
+    ) -> Vec<J> {
         report
             .results
             .iter()
             .map(|r| {
                 let mut j = sparkles_shacl::report::result_json(r);
-                let field = (r.focus_node == self.focus)
-                    .then(|| {
-                        r.result_path.as_ref().and_then(|p| {
-                            self.layout
-                                .fields
-                                .iter()
-                                .find(|f| f.path.matches(p))
-                                .map(|f| f.id())
-                        })
+                let field_of = |layout: &FormLayout| {
+                    r.result_path.as_ref().and_then(|p| {
+                        layout
+                            .fields
+                            .iter()
+                            .find(|f| f.path.matches(p))
+                            .map(|f| f.id())
                     })
-                    .flatten();
-                j["field"] = json!(field);
+                };
+                if r.focus_node == self.focus {
+                    j["field"] = json!(field_of(&self.layout));
+                } else if let Some((term, layout)) = plan
+                    .nodes
+                    .iter()
+                    .find(|(t, _)| edit::stored(t, fresh) == r.focus_node)
+                {
+                    j["field"] = json!(field_of(layout));
+                    j["node"] = term_json(&edit::stored(term, fresh));
+                } else {
+                    j["field"] = J::Null;
+                }
                 j
             })
             .collect()
     }
 }
 
-/// A changed field's values as the form loaded them (`change.expect` must name them
-/// all), and the values with their graphs in the state its update was planned on.
-struct Check {
-    id: String,
-    path: FieldPath,
-    want: BTreeMap<String, Term>,
-    planned: BTreeSet<(String, Option<String>)>,
-}
-
-type Expected = Vec<Check>;
-
-fn placed(values: &[FormValue]) -> BTreeSet<(String, Option<String>)> {
-    values
-        .iter()
-        .map(|v| (v.term.to_string(), v.graph.clone()))
-        .collect()
-}
-
-fn expected(built: &Built, plan: &Plan, change: &FormChange) -> Result<Expected> {
-    let read = built.read()?;
-    let mut checks = Vec::new();
-    for (id, path) in &plan.changed {
-        let want = change.expect.get(id).ok_or_else(|| {
-            Error::invalid(format!(
-                "expect: give the values the form loaded for field {id}"
-            ))
-        })?;
-        checks.push(Check {
-            id: id.clone(),
-            path: path.clone(),
-            want: set(&mut want.iter().cloned()),
-            planned: placed(&read.values(&built.focus, path)?),
-        });
+/// Whether a view lets writes into a graph (`None`: the default graph). The inferred
+/// graph is never written by a form.
+fn writable_in(access: Option<&GraphAccess>, g: Option<&str>) -> bool {
+    if g == Some(INFERRED) {
+        return false;
     }
-    Ok(checks)
-}
-
-/// The changed fields whose values at `snap`, under the caller's view, are not those the
-/// form loaded; and whether, with the same values, one of them sits in other graphs than
-/// in the state the update was planned on, so that the update no longer fits.
-fn conflicts_at(
-    snap: &Arc<Snapshot>,
-    access: Option<&GraphAccess>,
-    focus: &Term,
-    checks: &Expected,
-    limits: &Limits,
-) -> Result<(Vec<FieldConflict>, bool)> {
-    let mut read = Reader::new(snap, access)?;
-    read.limits = limits.clone();
-    let mut out = Vec::new();
-    let mut stale = false;
-    for c in checks {
-        let values = read.values(focus, &c.path)?;
-        let now = set(&mut values.iter().map(|v| v.term.clone()));
-        if now.keys().ne(c.want.keys()) {
-            out.push(FieldConflict {
-                id: c.id.clone(),
-                now: now.into_values().collect(),
-            });
-        } else if placed(&values) != c.planned {
-            stale = true;
+    match access {
+        None => true,
+        Some(a) => {
+            let t = g.map(|g| Term::NamedNode(NamedNode::new_unchecked(g)));
+            a.writable(t.as_ref())
         }
     }
-    Ok((out, stale))
 }
 
 /// Whether `focus` is the subject of a triple the reader sees.
@@ -1607,7 +1367,32 @@ fn cmp_order(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
 
 /// The constraints of a field the browser checks, as JSON.
 fn constraints_json(f: &FormField) -> J {
-    let c = &f.constraints;
+    value_constraints_json(&f.constraints, f.single_line, f.default_value.as_ref())
+}
+
+/// The label of an option of an alternative: its `sh:name`, else what it constrains.
+fn option_label(o: &sparkles_shacl::form::Alternative, n: usize) -> String {
+    let local = |iri: &str| {
+        iri.rsplit(['#', '/'])
+            .find(|s| !s.is_empty())
+            .unwrap_or(iri)
+            .to_string()
+    };
+    let c = &o.constraints;
+    pick_lang(&o.names, None)
+        .map(|l| l.value().to_string())
+        .or_else(|| c.classes.first().map(|n| local(n.as_str())))
+        .or_else(|| c.datatype.as_ref().map(|n| local(n.as_str())))
+        .or_else(|| c.node_kind.map(|k| local(k.iri().as_str())))
+        .unwrap_or_else(|| format!("Option {}", n + 1))
+}
+
+/// Value constraints as JSON: those of a field, of a list's members or of an option.
+fn value_constraints_json(
+    c: &sparkles_shacl::form::FieldConstraints,
+    single_line: Option<bool>,
+    default_value: Option<&Term>,
+) -> J {
     let mut o = serde_json::Map::new();
     let mut put = |k: &str, v: J| {
         o.insert(k.into(), v);
@@ -1675,11 +1460,55 @@ fn constraints_json(f: &FormField) -> J {
     if c.unique_lang {
         put("uniqueLang", json!(true));
     }
-    if let Some(s) = f.single_line {
+    if let Some(s) = single_line {
         put("singleLine", json!(s));
     }
-    if let Some(d) = &f.default_value {
+    if let Some(d) = default_value {
         put("defaultValue", term_json(d));
+    }
+    if let Some(l) = &c.list {
+        let mut list = serde_json::Map::new();
+        if let Some(n) = l.min_length {
+            list.insert("minLength".into(), json!(n));
+        }
+        if let Some(n) = l.max_length {
+            list.insert("maxLength".into(), json!(n));
+        }
+        if l.unique {
+            list.insert("unique".into(), json!(true));
+        }
+        list.insert(
+            "memberShapes".into(),
+            json!(
+                l.member_shapes
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        list.insert(
+            "member".into(),
+            value_constraints_json(&l.member, None, None),
+        );
+        list.insert(
+            "memberWidget".into(),
+            json!(sparkles_shacl::form::widget_of(&l.member, None)),
+        );
+        put("list", J::Object(list));
+    }
+    if let Some(a) = &c.alternatives {
+        put(
+            "or",
+            json!({
+                "kind": a.kind.name(),
+                "options": a.options.iter().enumerate().map(|(n, o)| json!({
+                    "shape": o.shape.to_string(),
+                    "label": option_label(o, n),
+                    "widget": sparkles_shacl::form::widget_of(&o.constraints, None),
+                    "constraints": value_constraints_json(&o.constraints, None, None),
+                })).collect::<Vec<_>>(),
+            }),
+        );
     }
     if !c.node.is_empty() {
         put(
@@ -1820,6 +1649,7 @@ impl<'a> Reader<'a> {
                 graph,
                 label: None,
                 read_only: false,
+                items: None,
             });
         }
         if self.limits.preparation.is_none() {
@@ -1837,6 +1667,46 @@ impl<'a> Reader<'a> {
         }
         keyed.sort_by(|a, b| (&a.0, &a.1.graph).cmp(&(&b.0, &b.1.graph)));
         Ok(keyed.into_iter().map(|(_, value)| value).collect())
+    }
+
+    /// The members of the `rdf:List` that `head` starts, with their graphs, or `None`
+    /// when it is not a well-formed list the reader sees: every cell a blank node with
+    /// one `rdf:first` and one `rdf:rest`, no cycle, at most [`MAX_LIST_ITEMS`] members.
+    fn list_items(&self, head: &Term) -> Result<Option<Vec<FormValue>>> {
+        let first = FieldPath::Predicate(NamedNode::new_unchecked(edit::RDF_FIRST));
+        let rest = FieldPath::Predicate(NamedNode::new_unchecked(edit::RDF_REST));
+        let one = |vs: Vec<FormValue>| {
+            let mut distinct: Vec<FormValue> = Vec::new();
+            for v in vs {
+                if !distinct.iter().any(|d| d.term == v.term) {
+                    distinct.push(v);
+                }
+            }
+            (distinct.len() == 1).then(|| distinct.pop()).flatten()
+        };
+        let mut items = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cell = head.clone();
+        loop {
+            self.limits.unit()?;
+            match &cell {
+                Term::NamedNode(n) if n.as_str() == edit::RDF_NIL => return Ok(Some(items)),
+                Term::BlankNode(b) => {
+                    if !seen.insert(b.as_str().to_string()) || items.len() >= MAX_LIST_ITEMS {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+            let (Some(item), Some(next)) = (
+                one(self.values(&cell, &first)?),
+                one(self.values(&cell, &rest)?),
+            ) else {
+                return Ok(None);
+            };
+            items.push(item);
+            cell = next.term;
+        }
     }
 
     /// A label of an IRI in the readable graphs, in `lang` when it has one.
@@ -1908,6 +1778,7 @@ impl<'a> Reader<'a> {
                 graph,
                 label: None,
                 read_only: true,
+                items: None,
             });
         }
         Ok(by.into_iter().collect())

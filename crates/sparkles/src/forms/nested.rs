@@ -106,7 +106,7 @@ struct Pending {
     model: Option<FormModel>,
 }
 
-struct Pool {
+pub(super) struct Pool {
     entries: Vec<Pending>,
     indices: BTreeMap<String, usize>,
     queue: VecDeque<usize>,
@@ -123,24 +123,7 @@ impl Forms {
         let built = self.prepare_model(req, opts, Some(preparation))?;
         let branch = self.ds.store().branch_name();
         let writable = req.writable && req.at.is_none();
-        let root = built.model(writable, &branch)?;
-        let mut pool = Pool {
-            entries: Vec::new(),
-            indices: BTreeMap::new(),
-            queue: VecDeque::new(),
-        };
-        pool.discover(&built, &root, "root", 0)?;
-        while let Some(index) = pool.queue.pop_front() {
-            built.limits.unit()?;
-            pool.entries[index].queued = false;
-            let entry = &pool.entries[index];
-            let child = built.child(&entry.term, &entry.shapes)?;
-            let model = child.model(writable, &branch)?;
-            let id = format!("n{index}");
-            let depth = entry.depth;
-            pool.discover(&child, &model, &id, depth)?;
-            pool.entries[index].model = Some(model);
-        }
+        let (root, pool) = built.pool(writable, &branch)?;
         let mut nested_nodes = Vec::new();
         for (index, entry) in pool.entries.into_iter().enumerate() {
             built.limits.unit()?;
@@ -157,7 +140,22 @@ impl Forms {
     }
 }
 
+/// A pooled nested node: its stored identity and the declared shapes that reach it.
+pub(super) struct Pooled<'a> {
+    pub(super) shapes: &'a [usize],
+}
+
 impl Pool {
+    pub(super) fn get(&self, term: &Term) -> Option<Pooled<'_>> {
+        let Term::BlankNode(b) = term else {
+            return None;
+        };
+        let entry = &self.entries[*self.indices.get(b.as_str())?];
+        Some(Pooled {
+            shapes: &entry.shapes,
+        })
+    }
+
     fn discover(
         &mut self,
         built: &Built,
@@ -331,6 +329,68 @@ fn admit_path(path: &sparkles_shacl::PropertyPath, limits: &Limits, depth: usize
 }
 
 impl Built {
+    /// The root model and the pool of its declared nested children, discovered under
+    /// the shared preparation allowance. `self` must carry a preparation.
+    pub(super) fn pool(&self, writable: bool, branch: &str) -> Result<(FormModel, Pool)> {
+        let root = self.model(writable, branch)?;
+        let mut pool = Pool {
+            entries: Vec::new(),
+            indices: BTreeMap::new(),
+            queue: VecDeque::new(),
+        };
+        pool.discover(self, &root, "root", 0)?;
+        while let Some(index) = pool.queue.pop_front() {
+            self.limits.unit()?;
+            pool.entries[index].queued = false;
+            let entry = &pool.entries[index];
+            let anchor = entry.anchors.first().map(|a| a.graph.clone());
+            let child = self.child(&entry.term, &entry.shapes, anchor)?;
+            let model = child.model(writable, branch)?;
+            let id = format!("n{index}");
+            let depth = entry.depth;
+            pool.discover(&child, &model, &id, depth)?;
+            pool.entries[index].model = Some(model);
+        }
+        Ok((root, pool))
+    }
+
+    /// A new nested child that a change creates: the fields of `shapes`, no stored
+    /// values, and new values in the graph of the edge from its parent.
+    pub(super) fn fresh_child(
+        &self,
+        focus: &Term,
+        shapes: &[usize],
+        target: Option<String>,
+    ) -> Result<Built> {
+        self.limits.retained_term(focus, 0)?;
+        let layout = sparkles_shacl::form::form_layout_with(&self.shapes, shapes, &mut || {
+            self.limits.unit().map_err(anyhow::Error::new)
+        })
+        .map_err(crate::handles::from_anyhow)?;
+        Ok(Built {
+            focus: focus.clone(),
+            new_class: None,
+            types: Vec::new(),
+            commit: self.commit,
+            source: self.source,
+            shapes: self.shapes.clone(),
+            vopts: self.vopts.clone(),
+            missing: None,
+            node_shapes: shapes.to_vec(),
+            layout,
+            target,
+            target_policy: self.target_policy.clone(),
+            access: self.access.clone(),
+            write_access: self.write_access.clone(),
+            limits: self.limits.clone(),
+            snap: self.snap.clone(),
+            raw: self.raw.clone(),
+            masked: self.masked,
+            lang: self.lang.clone(),
+            prefixes: self.prefixes.clone(),
+        })
+    }
+
     pub(super) fn admit_metadata(&self, field: &FormField) -> Result<()> {
         if self.limits.preparation.is_none() {
             return Ok(());
@@ -429,7 +489,14 @@ impl Built {
         Ok(())
     }
 
-    fn child(&self, focus: &Term, shapes: &[usize]) -> Result<Built> {
+    /// The fields of a pooled child. With the `type` target policy, a child that has no
+    /// type of its own takes new values into the graph of its first anchor.
+    pub(super) fn child(
+        &self,
+        focus: &Term,
+        shapes: &[usize],
+        anchor: Option<Option<String>>,
+    ) -> Result<Built> {
         self.limits.retained_term(focus, 0)?;
         for _ in shapes {
             self.limits.unit()?;
@@ -456,7 +523,7 @@ impl Built {
         })
         .map_err(crate::handles::from_anyhow)?;
         let read = self.read()?;
-        let target = target_graph(&read, focus, &self.target_policy)?;
+        let mut target = target_graph(&read, focus, &self.target_policy)?;
         let mut types = BTreeSet::new();
         for value in read.values(
             focus,
@@ -467,6 +534,12 @@ impl Built {
                 self.limits.unit()?;
                 types.insert(iri.into_string());
             }
+        }
+        if self.target_policy == "type"
+            && types.is_empty()
+            && let Some(graph) = anchor
+        {
+            target = graph;
         }
         Ok(Built {
             focus: focus.clone(),
@@ -485,6 +558,7 @@ impl Built {
             write_access: self.write_access.clone(),
             limits: self.limits.clone(),
             snap: self.snap.clone(),
+            raw: self.raw.clone(),
             masked: self.masked,
             lang: self.lang.clone(),
             prefixes: self.prefixes.clone(),
