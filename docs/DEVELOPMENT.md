@@ -346,6 +346,9 @@ store, gets the machine's own loader.
 Each share's JUnit report, log and exit code land in
 `.artifacts/test-partitioned/<time>/share-K/`, and the run fails unless every share passed
 and the shares together ran exactly the tests that an unpartitioned run selects.
+A run that ends, times out or is interrupted stops each remote share's process group,
+with KILL after 30 seconds, and removes the share's directory and lock only once the group
+is gone. When the group survives, the directory and its lock stay and the run names them.
 Arguments after `--` are nextest filters for both the listing and the shares, and
 `--reuse DIR` sends an earlier run's archive again without a build. Doctests do not
 archive, so `mise run test` still runs them.

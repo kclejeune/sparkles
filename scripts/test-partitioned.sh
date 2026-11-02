@@ -456,6 +456,11 @@ run_remote() {
   rsh "cat > $s/run.sh" << EOF
 #!/usr/bin/env bash
 set -uo pipefail
+# The share's process group is recorded before any setup, so a cleanup can stop it at any
+# point. A cleanup writes cancel before it reads pid, and this checks cancel after writing
+# pid, so either the cleanup sees the pid or the share sees the request.
+echo \$\$ > $s/pid
+[ -e $s/cancel ] && exit 0
 cd $root
 env_file=$(printf '%q' "$env_file")
 if [ -n "\$env_file" ] && [ -f "\$env_file" ]; then set -a; . "\$env_file"; set +a; fi
@@ -492,7 +497,6 @@ if [ "\$(stat -f -c %T /tmp 2> /dev/null)" = tmpfs ]; then
   export TMPDIR=$root/target/share-tmp
   mkdir -p "\$TMPDIR"
 fi
-echo \$\$ > $s/pid
 date +%s > $s/started
 env $(suite_env)"\${lock[@]}" "\${cap[@]}" $s/cargo-nextest nextest run \\
   --binaries-metadata $root/target/nextest/binaries-metadata.json \\
@@ -503,15 +507,16 @@ mv $s/exit.tmp $s/exit
 EOF
   local addr=
   if [ "$how" = ssh ] && [ "$transport" = hc ]; then
+    rsh "touch $s/launched" < /dev/null || true
     addr=$(hc run --bg --on "$h" --json --no-parent --cwd "$root" --name "test-share-$k-of-$n" \
       -- bash "$s/run.sh" | python3 -c 'import json, sys; print(json.load(sys.stdin)["address"])') || addr=
     [ -n "$addr" ] && echo "$addr" > "$d/hc-address"
   fi
   if [ -z "$addr" ]; then
     if [ -n "$runas" ]; then
-      rsh "chown -R share $root && nohup setsid $runas 'bash $s/run.sh' > /dev/null 2>&1 < /dev/null &" < /dev/null
+      rsh "chown -R share $root && touch $s/launched && nohup setsid $runas 'bash $s/run.sh' > /dev/null 2>&1 < /dev/null &" < /dev/null
     else
-      rsh "nohup setsid bash $s/run.sh > /dev/null 2>&1 < /dev/null &" < /dev/null
+      rsh "touch $s/launched && nohup setsid bash $s/run.sh > /dev/null 2>&1 < /dev/null &" < /dev/null
     fi
   fi
   # Poll for the exit file. A lost connection only delays the collection, but a share that
@@ -564,10 +569,43 @@ remote_cleanup() {
     fi
     return 0
   fi
-  rsh "if [ -s $s/pid ]; then kill -TERM -- -\$(ps -o pgid= -p \$(cat $s/pid) | tr -d ' ') 2> /dev/null; fi
-    if [ -z '$keep' ] && [ -e $root/.sparkles-test-share ]; then rm -rf $root; fi
-    rmdir $root.share-lock 2> /dev/null; true" < /dev/null || true
-  rm -f "$d/remote-locked"
+  if rsh "$(stop_share)" < /dev/null; then
+    rm -f "$d/remote-locked"
+  else
+    echo "test-partitioned.sh: could not confirm that the share on $h stopped; its directory and $root.share-lock stay" >&2
+  fi
+}
+
+# The remote shell code that stops a share and releases its directory. It asks the share
+# to cancel, waits up to 30 s for a launched share to record its process group, sends TERM
+# to the group, then KILL after 30 s, and removes the directory and the lock only once no
+# process of the group is left. It exits 1, keeping both, when the group survives.
+stop_share() {
+  local s=$root/.artifacts/test-share
+  cat << EOF
+s=$s
+if [ -d \$s ]; then
+  touch \$s/cancel
+  i=0
+  while [ -e \$s/launched ] && [ ! -s \$s/pid ] && [ \$i -lt 30 ]; do sleep 1; i=\$((i + 1)); done
+  if [ -e \$s/launched ] && [ ! -s \$s/pid ]; then echo 'the share launched but recorded no process'; exit 1; fi
+  if [ -s \$s/pid ]; then
+    pg=\$(ps -o pgid= -p "\$(cat \$s/pid)" 2> /dev/null | tr -d ' ')
+    if [ -n "\$pg" ]; then
+      kill -TERM -- "-\$pg" 2> /dev/null
+      i=0
+      while kill -0 -- "-\$pg" 2> /dev/null && [ \$i -lt 30 ]; do sleep 1; i=\$((i + 1)); done
+      kill -KILL -- "-\$pg" 2> /dev/null
+      i=0
+      while kill -0 -- "-\$pg" 2> /dev/null && [ \$i -lt 10 ]; do sleep 1; i=\$((i + 1)); done
+      if kill -0 -- "-\$pg" 2> /dev/null; then echo "process group \$pg survived KILL"; exit 1; fi
+    fi
+  fi
+fi
+if [ -z '$keep' ] && [ -e $root/.sparkles-test-share ]; then rm -rf $root; fi
+rmdir $root.share-lock 2> /dev/null
+exit 0
+EOF
 }
 
 # Stop every share's process group and wait for it, then stop the remote shares that were
@@ -582,10 +620,8 @@ cleanup() {
     [ -f "$f" ] || continue
     h=$(cat "$f")
     # shellcheck disable=SC2029
-    ssh "${ssh_opts[@]}" "$h" "s=$root/.artifacts/test-share
-      if [ -s \$s/pid ]; then kill -TERM -- -\$(ps -o pgid= -p \$(cat \$s/pid) | tr -d ' ') 2> /dev/null; fi
-      if [ -z '$keep' ] && [ -e $root/.sparkles-test-share ]; then rm -rf $root; fi
-      rmdir $root.share-lock 2> /dev/null; true" < /dev/null > /dev/null 2>&1 || echo "test-partitioned.sh: could not stop the share on $h" >&2
+    ssh "${ssh_opts[@]}" "$h" "$(stop_share)" < /dev/null > /dev/null 2>&1 ||
+      echo "test-partitioned.sh: could not confirm that the share on $h stopped; check it and remove $root.share-lock there" >&2
     rm -f "$f"
   done
   while read -r id; do
