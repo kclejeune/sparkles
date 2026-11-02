@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Classifies an ontology with ELK, the OWL 2 EL reasoner, for the comparison with the
-# classifier of sparkles-owl in docs/benchmarks/el-classification.
+# Classifies an ontology with ELK, the OWL 2 EL reasoner, or with HermiT, a complete OWL 2
+# DL reasoner, for the comparison with the classifier of sparkles-owl in
+# docs/benchmarks/el-classification.
 #
 #   scripts/elk-compare/elk.sh fetch
-#   scripts/elk-compare/elk.sh run [--threads N] [--repeat N] [--taxonomy FILE] INPUT
+#   scripts/elk-compare/elk.sh run [--reasoner elk|hermit] [--threads N] [--repeat N]
+#     [--taxonomy FILE] INPUT
 #
-# `fetch` downloads the jars that scripts/elk-compare/pins.tsv lists from Maven Central into
-# ELK_WORK/lib, checks each against its pinned SHA-256 and Maven Central's SHA-1, and
+# `fetch` downloads the jars that scripts/elk-compare/pins.tsv and hermit-pins.tsv list
+# from Maven Central into ELK_WORK/lib, checks each against its pinned SHA-256 and Maven Central's SHA-1, and
 # compiles ElkClassify.java into ELK_WORK/classes. A jar already present with the pinned
 # hash is not downloaded again. `run` fetches when needed and runs ElkClassify, which prints
 # one JSON line and writes the taxonomy that scripts/el-oracle.py reads (see the comment at
@@ -25,6 +27,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 WORK=${ELK_WORK:-$ROOT/.artifacts/elk-compare}
 JAVA=${JAVA:-java}
+if ! command -v "$JAVA" > /dev/null; then
+  echo "java not found; set JAVA" >&2
+  exit 2
+fi
 JAVAC=${JAVAC:-$(dirname "$(command -v "$JAVA")")/javac}
 CENTRAL=https://repo1.maven.org/maven2
 
@@ -34,7 +40,7 @@ jars() {
   while IFS=$'\t' read -r path _; do
     case $path in '#'* | '') continue ;; esac
     out=$out${out:+:}$WORK/lib/$(basename "$path")
-  done < "$HERE/pins.tsv"
+  done < <(cat "$HERE/pins.tsv" "$HERE/hermit-pins.tsv")
   echo "$out"
 }
 
@@ -55,7 +61,7 @@ fetch() {
       exit 1
     fi
     mv "$jar.part" "$jar"
-  done < "$HERE/pins.tsv"
+  done < <(cat "$HERE/pins.tsv" "$HERE/hermit-pins.tsv")
   if [ ! -f "$WORK/classes/ElkClassify.class" ] ||
     [ "$HERE/ElkClassify.java" -nt "$WORK/classes/ElkClassify.class" ]; then
     "$JAVAC" -proc:none -nowarn -cp "$(jars)" -d "$WORK/classes" "$HERE/ElkClassify.java"
@@ -86,7 +92,7 @@ case ${1:-} in
     exec "${cmd[@]}"
     ;;
   *)
-    sed -n '2,22p' "$0" >&2
+    sed -n '2,24p' "$0" >&2
     exit 2
     ;;
 esac

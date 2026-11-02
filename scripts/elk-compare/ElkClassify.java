@@ -2,7 +2,10 @@
 // docs/benchmarks/el-classification. scripts/elk-compare/elk.sh fetches the pinned jars,
 // compiles this file and runs it with explicit heap settings.
 //
-//   ElkClassify [--threads N] [--repeat N] [--taxonomy FILE] INPUT
+//   ElkClassify [--reasoner elk|hermit] [--threads N] [--repeat N] [--taxonomy FILE] INPUT
+//
+// --reasoner hermit runs HermiT, a complete OWL 2 DL reasoner, in place of ELK, with its
+// default configuration and on one thread.
 //
 // Each of the N runs loads INPUT with a fresh OWL API manager, creates an ELK reasoner with
 // N worker threads and precomputes the class hierarchy. loadMs is the OWL API's parse of
@@ -63,11 +66,13 @@ public class ElkClassify {
         int repeat = 1;
         String taxonomy = null;
         String input = null;
+        String which = "elk";
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--threads": threads = Integer.parseInt(args[++i]); break;
                 case "--repeat": repeat = Integer.parseInt(args[++i]); break;
                 case "--taxonomy": taxonomy = args[++i]; break;
+                case "--reasoner": which = args[++i]; break;
                 default: input = args[i];
             }
         }
@@ -107,12 +112,14 @@ public class ElkClassify {
                 ElkReasonerConfiguration.getDefaultOwlReasonerConfiguration(), elk);
             long c0 = os.getProcessCpuTime();
             long t2 = System.nanoTime();
-            OWLReasoner reasoner = new ElkReasonerFactory().createReasoner(ontology, config);
+            OWLReasoner reasoner = which.equals("elk")
+                ? new ElkReasonerFactory().createReasoner(ontology, config)
+                : hermit().createReasoner(ontology);
             // ELK answers an inconsistent ontology with an exception once it has found the
             // inconsistency, which ends that classification.
             try {
                 reasoner.precomputeInferences(InferenceType.CLASS_HIERARCHY);
-                consistent = true;
+                consistent = reasoner.isConsistent();
             } catch (InconsistentOntologyException e) {
                 consistent = false;
             }
@@ -140,7 +147,9 @@ public class ElkClassify {
         }
         StringBuilder out = new StringBuilder("{");
         field(out, "input", "\"" + input.replace("\\", "\\\\").replace("\"", "\\\"") + "\"");
-        field(out, "reasoner", "\"ELK " + ElkReasonerFactory.class.getPackage().getImplementationVersion() + "\"");
+        Class<?> impl = which.equals("elk") ? ElkReasonerFactory.class : hermit().getClass();
+        field(out, "reasoner", "\"" + (which.equals("elk") ? "ELK " : "HermiT ")
+            + impl.getPackage().getImplementationVersion() + "\"");
         field(out, "java", "\"" + System.getProperty("java.vm.name") + " " + System.getProperty("java.version") + "\"");
         field(out, "threads", Integer.toString(threads));
         field(out, "classes", Integer.toString(classes));
@@ -166,6 +175,11 @@ public class ElkClassify {
         out.setLength(out.length() - 1);
         out.append('}');
         System.out.println(out);
+    }
+
+    static org.semanticweb.owlapi.reasoner.OWLReasonerFactory hermit() throws Exception {
+        return (org.semanticweb.owlapi.reasoner.OWLReasonerFactory)
+            Class.forName("org.semanticweb.HermiT.ReasonerFactory").getDeclaredConstructor().newInstance();
     }
 
     static boolean startsFunctional(File file) throws Exception {
