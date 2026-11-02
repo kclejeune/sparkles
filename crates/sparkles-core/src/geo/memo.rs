@@ -43,6 +43,8 @@ impl MemoKey {
 pub struct GeoMemo {
     lru: Mutex<Lru>,
     budget: usize,
+    /// the charge of the memo's entries to the query (see [`GeoMemo::get_or_parse_charged`])
+    charged: crate::sparql::ctx::StepReservation,
     op_vertices: AtomicU64,
     /// the registered CRSs whose geometries this query has seen, by index (see
     /// [`note_crs`])
@@ -62,6 +64,7 @@ impl GeoMemo {
         GeoMemo {
             lru: Mutex::new(Lru::default()),
             budget: bytes,
+            charged: Default::default(),
             op_vertices: AtomicU64::new(DEFAULT_OP_VERTICES),
             noted: Default::default(),
             noted_unknown: Default::default(),
@@ -85,6 +88,37 @@ impl GeoMemo {
         let g = parse();
         let bytes = g.as_ref().map_or(64, |g| g.mem_size());
         self.lru.lock().insert(key, g.clone(), bytes, self.budget);
+        g
+    }
+
+    /// [`GeoMemo::get_or_parse`] for a query's memo, whose entries are charged to the query
+    /// in steps. A geometry whose charge the budget or the pool refuses is returned
+    /// without being memoized, and no failure is recorded, since the memo is optional.
+    pub(crate) fn get_or_parse_charged(
+        &self,
+        ctx: &Ctx,
+        key: MemoKey,
+        parse: impl FnOnce() -> Option<GeomRef>,
+    ) -> Option<GeomRef> {
+        if self.budget == 0 {
+            return parse();
+        }
+        if let Some(hit) = self.lru.lock().get(key) {
+            return hit;
+        }
+        let g = parse();
+        let bytes = g.as_ref().map_or(64, |g| g.mem_size());
+        let mut lru = self.lru.lock();
+        // The memo holds at most its budget, or one entry that alone is over it.
+        let need = (lru.bytes + bytes).min(self.budget.max(bytes)) as u64;
+        if !self.charged.covers(need)
+            && ctx
+                .grow_reservation(&self.charged, need, u64::MAX, false)
+                .is_err()
+        {
+            return g;
+        }
+        lru.insert(key, g.clone(), bytes, self.budget);
         g
     }
 
@@ -149,7 +183,7 @@ pub(crate) fn note_crs_ref(ctx: &Ctx, crs_ref: &crate::geo::crs::CrsRef) {
                 if seen.iter().any(|s| **s == **iri) {
                     return;
                 }
-                if !ctx.retain_cursor_bytes(iri.len() as u64 + 64) {
+                if !ctx.retain_bytes(iri.len() as u64 + 64) {
                     return;
                 }
                 seen.push(iri.clone());
@@ -322,7 +356,7 @@ pub(crate) fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<Ge
     noted(
         ctx,
         ctx.geo
-            .get_or_parse(MemoKey::Id(id), || match decoded {
+            .get_or_parse_charged(ctx, MemoKey::Id(id), || match decoded {
                 Some(v) => parse_value(v, max),
                 None => parse_value(&ctx.value(id)?, max),
             })
@@ -366,7 +400,7 @@ pub(crate) fn geom_arg(args: &[Expr], i: usize, row: &Row<'_>, ctx: &Ctx) -> Eva
                 noted(
                     ctx,
                     ctx.geo
-                        .get_or_parse(MemoKey::lex(dt, lex), || parse_value(&v, max))
+                        .get_or_parse_charged(ctx, MemoKey::lex(dt, lex), || parse_value(&v, max))
                         .ok_or(TypeError),
                 )
             }
@@ -387,6 +421,39 @@ mod tests {
             CrsRef::Known(crate::geo::crs::CRS84),
             georust::Point::new(f64::from(n), 0.0).into(),
         ))
+    }
+
+    /// A query's memo charges its geometries to the query, and a geometry whose charge
+    /// is refused is returned without being memoized and without a failure.
+    #[test]
+    fn a_charged_memo_keeps_answers_when_its_charge_is_refused() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 1 << 20;
+        let key = |n: u64| MemoKey::Id(Id(n));
+        let before = ctx.live_bytes_for_tests();
+        assert!(
+            ctx.geo
+                .get_or_parse_charged(&ctx, key(1), || Some(point(1)))
+                .is_some()
+        );
+        assert_eq!(ctx.geo.len(), 1);
+        assert!(ctx.live_bytes_for_tests() > before, "the memo is charged");
+        let held = ctx
+            .charge((1 << 20) - ctx.live_bytes_for_tests() - 16)
+            .unwrap();
+        let mut parsed = 0;
+        for n in 2..10_000u32 {
+            let g = ctx.geo.get_or_parse_charged(&ctx, key(u64::from(n)), || {
+                parsed += 1;
+                Some(point(n))
+            });
+            assert!(g.is_some());
+        }
+        assert_eq!(parsed, 9_998);
+        assert!(ctx.geo.len() < 9_999, "refused geometries are not memoized");
+        assert!(ctx.check().is_ok());
+        drop(held);
     }
 
     #[test]

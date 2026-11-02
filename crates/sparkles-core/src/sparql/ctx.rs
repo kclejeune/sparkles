@@ -91,6 +91,40 @@ const VALUE_SHARDS: usize = 64;
 /// decoded values kept per shard before the shard is cleared
 const VALUE_SHARD_CAP: usize = 1 << 16;
 
+/// Bytes of query state that a context charges in steps and keeps charged until
+/// it drops: its decoded value cache, its query-local terms and memos and its parsed
+/// geometries. The state counts its bytes itself, and [`Ctx::grow_reservation`] grows
+/// the reservation to cover them, so that most additions take one atomic load.
+#[derive(Default)]
+pub(crate) struct StepReservation {
+    /// the bytes charged
+    reserved: AtomicU64,
+    /// serializes growth, with the owner the charges went to
+    grow: parking_lot::Mutex<Option<u64>>,
+}
+
+impl StepReservation {
+    /// Whether the reservation covers `bytes` already.
+    #[inline]
+    pub(crate) fn covers(&self, bytes: u64) -> bool {
+        bytes <= self.reserved.load(Ordering::Acquire)
+    }
+
+    /// The bytes charged.
+    pub(crate) fn reserved(&self) -> u64 {
+        self.reserved.load(Ordering::Acquire)
+    }
+}
+
+/// The query-local terms and memos of a context: the terms its expressions compute and
+/// the blank nodes it mints, charged in both accounting modes (see [`Ctx::retain_bytes`]).
+#[derive(Default)]
+struct RetainedTerms {
+    /// the estimated bytes retained
+    used: AtomicU64,
+    charge: StepReservation,
+}
+
 /// The most the decoded value cache of one query holds, before the memory budget's
 /// share (see [`ValueCache::cap`]).
 const VALUE_CACHE_BYTES: u64 = 64 << 20;
@@ -107,9 +141,7 @@ pub(super) struct ValueCache {
     /// the estimated bytes of the entries held now
     used: AtomicU64,
     /// the bytes charged for the cache, never fewer than `used`
-    reserved: AtomicU64,
-    /// serializes growth of `reserved`, with the owner its charges went to
-    grow: parking_lot::Mutex<Option<u64>>,
+    charge: StepReservation,
 }
 
 #[derive(Default)]
@@ -121,7 +153,7 @@ struct ValueShard {
 
 #[cfg(test)]
 thread_local! {
-    /// growths of a value cache's reservation on this thread
+    /// growths of a step reservation on this thread
     static VALUE_GROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -130,8 +162,7 @@ impl Default for ValueCache {
         Self {
             shards: (0..VALUE_SHARDS).map(|_| Default::default()).collect(),
             used: AtomicU64::new(0),
-            reserved: AtomicU64::new(0),
-            grow: Default::default(),
+            charge: Default::default(),
         }
     }
 }
@@ -171,7 +202,7 @@ impl ValueCache {
     /// The bytes charged for the cache.
     #[cfg(test)]
     fn reserved(&self) -> u64 {
-        self.reserved.load(Ordering::Acquire)
+        self.charge.reserved()
     }
 }
 
@@ -639,6 +670,8 @@ pub struct Ctx {
     memory_failure: MemoryFailure,
     /// the envelope of transient dictionary decoding
     decode: DecodeEnvelope,
+    /// the charge of the query-local terms and memos
+    retained: RetainedTerms,
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
     // Data and weak retained caches drop before final ledger ownership.
@@ -926,6 +959,12 @@ impl Ctx {
         }
     }
 
+    /// [`Ctx::live_bytes`] for the tests of other modules.
+    #[cfg(test)]
+    pub(crate) fn live_bytes_for_tests(&self) -> u64 {
+        self.live_bytes()
+    }
+
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
     pub(super) fn live_bytes(&self) -> u64 {
@@ -950,6 +989,7 @@ impl Ctx {
             callback_terms: Default::default(),
             memory_failure: Default::default(),
             decode: Default::default(),
+            retained: Default::default(),
             cursor_memory: None,
             fast: Default::default(),
             memory: Default::default(),
@@ -1170,7 +1210,7 @@ impl Ctx {
     /// Record a warning for the plan (once, however often it is raised).
     pub fn warn(&self, w: PlanWarning) {
         let mut ws = self.warnings.lock();
-        if !ws.contains(&w) && self.retain_cursor_bytes(w.message.len() as u64 + 128) {
+        if !ws.contains(&w) && self.retain_bytes(w.message.len() as u64 + 128) {
             ws.push(w);
         }
     }
@@ -1279,22 +1319,13 @@ impl Ctx {
         self.memory().check_cursor_transition()?;
         // A cursor reserves its decoding on the ledger, so the eager envelope goes.
         self.release_decode_envelope();
-        // The decoded value cache is charged already, and the ledger carries its
-        // reservation over, so the cursor keeps it.
-        let bytes = self.local.read().bytes() as u64;
-        std::mem::forget(self.charge(bytes)?);
+        // The decoded value cache, the query-local terms and the parsed geometries are
+        // charged already, and the ledger carries their reservations over, so the
+        // cursor keeps them.
         self.memory().cursor_mode()?;
         self.cursor_memory = Some(Box::default());
         self.use_cache = false;
         self.opt.sampled_filters = false;
-        #[cfg(feature = "geo")]
-        {
-            let vertices = self.geo.op_vertices();
-            // Parsed geometry retention is separate from ID batches. Until its
-            // cache has charge-owning entries, cursor evaluation does not keep it.
-            self.geo = crate::geo::memo::GeoMemo::with_budget(0);
-            self.geo.set_op_vertices(vertices);
-        }
         Ok(())
     }
 
@@ -1458,25 +1489,26 @@ impl Ctx {
         failure.failed.store(true, Ordering::Release);
     }
 
-    // Infallible expression interning must not turn a resource failure into an
-    // ordinary unbound BIND. Record it, refuse allocation, and fail the next check.
-    pub(crate) fn retain_cursor_bytes(&self, bytes: u64) -> bool {
-        if !self.is_cursor() {
-            return true;
-        }
+    /// Charge `bytes` more of query-local terms and memos, which stay until the context
+    /// drops, in both accounting modes. Infallible expression interning must not turn a
+    /// resource failure into an ordinary unbound BIND, so a refusal is recorded and fails
+    /// the next check, and `false` tells the caller not to allocate.
+    pub(crate) fn retain_bytes(&self, bytes: u64) -> bool {
         if self.memory_failure.failed.load(Ordering::Acquire) {
             return false;
         }
-        match self.charge(bytes) {
-            Ok(charge) => {
-                std::mem::forget(charge);
-                true
-            }
-            Err(Error::BudgetExceeded(budget)) => {
-                self.record_failure(budget);
+        let retained = &self.retained;
+        let used = retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        if retained.charge.covers(used) {
+            return true;
+        }
+        match self.grow_reservation(&retained.charge, used, u64::MAX, true) {
+            Ok(()) => true,
+            Err(error) => {
+                retained.used.fetch_sub(bytes, Ordering::AcqRel);
+                self.fail_memory(&error);
                 false
             }
-            Err(_) => unreachable!("memory charge returns a budget error"),
         }
     }
 
@@ -1667,16 +1699,13 @@ impl Ctx {
         Ok(c)
     }
 
-    /// The highest memory estimate of this context so far.
     /// Lower a finished eager query's retained pool contribution to what its result
-    /// keeps: `result` bytes of allocated output columns, the uncharged state that the
-    /// context still owns ([`Ctx::retained_state_bytes`]) and its live charges
-    /// (X08-P1-retained-results). The contribution otherwise stays at the query's
-    /// highest admitted estimate, including build and transient state, until the context
-    /// drops. A fast account within [`RETAIN_SLACK`] of what the result keeps is left
-    /// alone, so that a small query never takes the ledger. The grant and the fast
-    /// account are read before the context's caches, so that a query without a pool or
-    /// with a small contribution takes none of their locks.
+    /// keeps: `result` bytes of allocated output columns and its live charges, which
+    /// include the state the context keeps, its value cache, terms, memos and
+    /// geometries (X08-P1-retained-results). The contribution otherwise stays at the
+    /// query's highest admitted estimate, including build and transient state, until the
+    /// context drops. A fast account within [`RETAIN_SLACK`] of what the result keeps is
+    /// left alone, so that a small query never takes the ledger.
     pub(super) fn shrink_retained(&self, result: u64) -> Result<()> {
         if self.cursor_memory.is_some() {
             return Ok(());
@@ -1688,50 +1717,12 @@ impl Ctx {
                 _ => return Ok(()),
             },
         };
-        // What the context keeps is never less than its columns, so a contribution
-        // within the slack of those cannot shrink by more than the slack.
-        if fast.is_some_and(|admitted| admitted <= result.saturating_add(RETAIN_SLACK)) {
-            return Ok(());
-        }
-        let keep = result.saturating_add(self.retained_state_bytes());
+        let keep = result;
+        // A contribution within the slack of what the result keeps is left alone.
         if fast.is_some_and(|admitted| admitted <= keep.saturating_add(RETAIN_SLACK)) {
             return Ok(());
         }
         self.memory().shrink_eager(keep)
-    }
-
-    /// The bytes of the state an eager context keeps after execution without a charge:
-    /// the terms computed into its local vocabulary, its
-    /// parsed geometries and the memos of its blank nodes and callback terms. A map
-    /// counts the slots it has allocated, which clearing it keeps, and the heap storage
-    /// of its live keys and values.
-    fn retained_state_bytes(&self) -> u64 {
-        /// The slots of a hash map with `capacity` entries of type `T`, with one
-        /// control byte each.
-        fn slots<T>(capacity: usize) -> u64 {
-            (capacity as u64).saturating_mul(std::mem::size_of::<T>() as u64 + 1)
-        }
-        // The decoded value cache is charged, so its reservation is live already.
-        let mut bytes = (self.local.read().bytes() as u64).saturating_add(self.geo.bytes() as u64);
-        {
-            let memo = self.bnode_memo.lock();
-            bytes = bytes.saturating_add(slots::<((Vec<Id>, String), Id)>(memo.capacity()));
-            for (key, label) in memo.keys() {
-                bytes = bytes.saturating_add(key.capacity() as u64 * 8 + label.capacity() as u64);
-            }
-        }
-        for labels in [
-            &self.outside_bnodes,
-            &self.literal_bnodes,
-            &self.callback_bnodes,
-        ] {
-            let labels = labels.lock();
-            bytes = bytes.saturating_add(slots::<(String, Id)>(labels.capacity()));
-            for label in labels.keys() {
-                bytes = bytes.saturating_add(label.capacity() as u64);
-            }
-        }
-        bytes.saturating_add(slots::<(Id, u64)>(self.callback_terms.lock().capacity()))
     }
 
     pub fn mem_peak(&self) -> u64 {
@@ -1823,7 +1814,7 @@ impl Ctx {
             let mut memo = self.literal_bnodes.lock();
             let id = match memo.get(b) {
                 Some(id) => *id,
-                None if self.retain_cursor_bytes(b.len() as u64 + 128) => {
+                None if self.retain_bytes(b.len() as u64 + 128) => {
                     let id = self.fresh_bnode();
                     memo.insert(b.to_string(), id);
                     id
@@ -1862,7 +1853,7 @@ impl Ctx {
             if let Some(&id) = scope.get(b) {
                 return id;
             }
-            if !self.retain_cursor_bytes(b.len() as u64 + 128) {
+            if !self.retain_bytes(b.len() as u64 + 128) {
                 return Id::UNDEF;
             }
             let id = self.fresh_bnode();
@@ -1895,7 +1886,7 @@ impl Ctx {
         if let Some(&id) = memo.get(label) {
             return id;
         }
-        if !self.retain_cursor_bytes(label.len() as u64 + 128) {
+        if !self.retain_bytes(label.len() as u64 + 128) {
             return Id::UNDEF;
         }
         let id = self.fresh_bnode();
@@ -1929,7 +1920,7 @@ impl Ctx {
         if let Some(i) = local.find(key) {
             return Id::local(i);
         }
-        if !self.retain_cursor_bytes(key.len() as u64 + 96) {
+        if !self.retain_bytes(key.len() as u64 + 96) {
             return Id::UNDEF;
         }
         Id::local(local.insert(key).0)
@@ -1999,7 +1990,11 @@ impl Ctx {
     /// Take the local terms and minted blank nodes of `other`, so that this context reads
     /// the ids `other` gave them (a query that reads a view with derived facts).
     pub(crate) fn share_local(&self, other: &Ctx) {
-        *self.local.write() = other.local.read().clone();
+        let local = other.local.read().clone();
+        // The copy is this context's own, so it is charged here, and a refusal fails the
+        // next check.
+        self.retain_bytes(local.bytes() as u64);
+        *self.local.write() = local;
         self.next_bnode
             .store(other.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -2015,7 +2010,7 @@ impl Ctx {
         if let Some(id) = memo.get(&key) {
             return *id;
         }
-        if !self.retain_cursor_bytes(key.0.len() as u64 * 8 + s.len() as u64 + 128) {
+        if !self.retain_bytes(key.0.len() as u64 * 8 + s.len() as u64 + 128) {
             return Id::UNDEF;
         }
         let id = self.fresh_bnode();
@@ -2305,7 +2300,11 @@ impl Ctx {
             shard.map.clear();
         }
         let used = cache.used.fetch_add(entry, Ordering::AcqRel) + entry;
-        if used > cache.reserved.load(Ordering::Acquire) && !self.grow_value_cache(used, cap) {
+        if !cache.charge.covers(used)
+            && self
+                .grow_reservation(&cache.charge, used, cap, false)
+                .is_err()
+        {
             cache.used.fetch_sub(entry, Ordering::AcqRel);
             return;
         }
@@ -2313,35 +2312,47 @@ impl Ctx {
         shard.map.insert(id, v.clone());
     }
 
-    /// Grow the value cache's reservation to cover `used` bytes of entries, a step ahead
-    /// within `cap`. Each shard holds at most its share of `cap`, so `used` never passes
-    /// it. `false` when the query's budget or the pool refuses the growth.
+    /// Grow `reservation` to cover `used` bytes, a step ahead within `cap`. The step is
+    /// [`EAGER_STEP`], or a sixty-fourth of a smaller memory budget. When the
+    /// budget or the pool cannot give the step, state that the query needs (`exact`)
+    /// takes exactly what it needs, while an optional cache declines, so that it never
+    /// takes the last room an operator needs. The charge stays with the context until it
+    /// drops. A refusal changes nothing.
     #[cold]
     #[inline(never)]
-    fn grow_value_cache(&self, used: u64, cap: u64) -> bool {
+    pub(crate) fn grow_reservation(
+        &self,
+        reservation: &StepReservation,
+        used: u64,
+        cap: u64,
+        exact: bool,
+    ) -> Result<()> {
         #[cfg(test)]
         VALUE_GROWS.with(|n| n.set(n.get() + 1));
-        let cache = &self.values;
-        let mut owner = cache.grow.lock();
-        let reserved = cache.reserved.load(Ordering::Acquire);
+        let mut owner = reservation.grow.lock();
+        let reserved = reservation.reserved.load(Ordering::Acquire);
         if used <= reserved {
-            return true;
+            return Ok(());
         }
-        let ahead = used.next_multiple_of(EAGER_STEP).min(cap).max(used);
-        let Ok(charge) = self.charge(ahead - reserved) else {
-            return false;
+        // A small budget takes small steps, so that the slack of the steps never holds
+        // more than a sixty-fourth of it.
+        let step = (self.mem_limit / 64).clamp(256, EAGER_STEP);
+        let ahead = used.next_multiple_of(step).min(cap).max(used);
+        let (charge, admitted) = match self.charge(ahead - reserved) {
+            Ok(charge) => (charge, ahead),
+            Err(_) if exact && ahead > used => (self.charge(used - reserved)?, used),
+            Err(error) => return Err(error),
         };
-        // The charge stays with the context until it drops, as its interned terms do.
         let id = charge.disarm();
         debug_assert!(
             owner.is_none() || id.is_none() || *owner == id,
-            "one owner of the cache"
+            "one owner of a reservation"
         );
         if owner.is_none() {
             *owner = id;
         }
-        cache.reserved.store(ahead, Ordering::Release);
-        true
+        reservation.reserved.store(admitted, Ordering::Release);
+        Ok(())
     }
 
     /// Is the id an IRI / blank node / literal (without full decoding where possible)?

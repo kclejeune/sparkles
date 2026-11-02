@@ -1792,11 +1792,13 @@ fn construct_budgets_count_decoded_literals_and_template_fanout() {
     let s = Store::in_memory(StoreOptions::default());
     let literal = "x".repeat(4096);
     let where_clause = format!("WHERE {{ VALUES ?o {{ \"{literal}\" }} }}");
+    // The query literal is a query-local term charged to the query, about 4.2 KB.
     let opts = QueryOptions {
-        max_memory_bytes: Some(1024),
+        max_memory_bytes: Some(8192),
         ..Default::default()
     };
-    // The one-row ID table fits; retaining two decoded graph copies does not.
+    // The literal and the one-row ID table fit; retaining two decoded graph copies does
+    // not.
     assert_eq!(
         query(s.snapshot(), &format!("SELECT ?o {where_clause}"), &opts)
             .unwrap()
