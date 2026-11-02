@@ -1598,16 +1598,17 @@ enum Ran {
     Cursor(Box<sparkles::sparql::QueryExecution>),
 }
 
-/// Run a query as `/{ds}/sparql` does: the request's budgets, graph view, result format
-/// and history parameters, with `bindings` as initial bindings (stored queries).
-#[allow(clippy::too_many_arguments)]
-/// The eager trial of a text, which [`inline::QuickQueries::claim_trial`] gave the request
-/// that holds this, until it drops.
-struct TrialClaim(u64);
+/// The eager trial of a text that [`inline::QuickQueries::claim_trial`] gave a request,
+/// released when the last clone drops: the request's own once it has recorded the run, and
+/// the blocking work's once that work has ended, even after its client left.
+struct TrialClaim {
+    key: u64,
+    token: u64,
+}
 
 impl Drop for TrialClaim {
     fn drop(&mut self) {
-        QUICK.end_trial(self.0);
+        QUICK.end_trial(self.key, self.token);
     }
 }
 
@@ -1629,6 +1630,9 @@ pub(crate) fn one_request(opts: &sparkles::sparql::QueryOptions) -> sparkles::sp
     shared
 }
 
+/// Run a query as `/{ds}/sparql` does: the request's budgets, graph view, result format
+/// and history parameters, with `bindings` as initial bindings (stored queries).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_query(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
@@ -1761,9 +1765,19 @@ pub(crate) async fn run_query(
     // A text whose automatic cursor answered whole but slowly runs eagerly once, on the
     // blocking pool, so that it settles in the faster mode (see `inline`). One request
     // claims the trial, and requests that overlap it keep automatic execution.
-    let trial = auto && history == inline::History::TryEager && QUICK.claim_trial(quick_key);
-    // the claim ends with the request, whether it answers, fails or its client leaves
-    let _trial = trial.then(|| TrialClaim(quick_key));
+    // The claim ends when both this request and its blocking work are done, whether the
+    // request answers, fails or its client leaves.
+    let claim = if auto && history == inline::History::TryEager {
+        QUICK.claim_trial(quick_key).map(|token| {
+            Arc::new(TrialClaim {
+                key: quick_key,
+                token,
+            })
+        })
+    } else {
+        None
+    };
+    let trial = claim.is_some();
     let auto = auto
         && !trial
         && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
@@ -1771,7 +1785,9 @@ pub(crate) async fn run_query(
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
         let ds = ds.clone();
+        let claim = claim.clone();
         move || {
+            let _claim = claim;
             let t = std::time::Instant::now();
             let t0 = crate::otel::start();
             let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;

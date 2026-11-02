@@ -182,18 +182,20 @@ pub enum QuickExecution {
 }
 
 /// What is remembered of one text: its [`History`], whether an eager run of it was
-/// slow, and whether a request holds its eager trial.
+/// slow, and the token of the request that holds its eager trial (0: none).
 #[derive(Clone, Copy, Debug)]
 struct Seen {
     history: History,
     eager_slow: bool,
-    trial: bool,
+    trial: u64,
 }
 
 /// The query texts (per dataset) whose last run is remembered, quick or not.
 #[derive(Default)]
 pub struct QuickQueries {
     quick: Mutex<HashMap<u64, Seen>>,
+    /// the last token that [`Self::claim_trial`] gave out
+    trials: std::sync::atomic::AtomicU64,
     /// test hook: queries whose runs count as quick however long they took
     #[cfg(test)]
     timeless: Mutex<HashSet<u64>>,
@@ -252,24 +254,33 @@ impl QuickQueries {
         self.timeless.lock().insert(key);
     }
 
-    /// Claim the eager trial of a text whose history is [`History::TryEager`]. It is true
-    /// for one caller until that caller calls [`Self::end_trial`], and requests that
-    /// overlap the trial keep automatic execution, whatever their own runs record.
-    pub fn claim_trial(&self, key: u64) -> bool {
+    /// Claim the eager trial of a text whose history is [`History::TryEager`]. One caller
+    /// gets a token, which holds the trial until it passes the token to
+    /// [`Self::end_trial`], and requests that overlap the trial keep automatic execution,
+    /// whatever their own runs record.
+    pub fn claim_trial(&self, key: u64) -> Option<u64> {
         let mut set = self.quick.lock();
         match set.get_mut(&key) {
-            Some(seen) if seen.history == History::TryEager && !seen.trial => {
-                seen.trial = true;
-                true
+            Some(seen) if seen.history == History::TryEager && seen.trial == 0 => {
+                let token = self
+                    .trials
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                seen.trial = token;
+                Some(token)
             }
-            _ => false,
+            _ => None,
         }
     }
 
-    /// Release the eager trial of a text that [`Self::claim_trial`] gave its caller.
-    pub fn end_trial(&self, key: u64) {
-        if let Some(seen) = self.quick.lock().get_mut(&key) {
-            seen.trial = false;
+    /// Release the eager trial that [`Self::claim_trial`] gave out as `token`. A trial
+    /// claimed since by another request, after the text was forgotten and seen again,
+    /// stays held.
+    pub fn end_trial(&self, key: u64, token: u64) {
+        if let Some(seen) = self.quick.lock().get_mut(&key)
+            && seen.trial == token
+        {
+            seen.trial = 0;
         }
     }
 
@@ -303,7 +314,7 @@ impl QuickQueries {
             set.clear();
         }
         let mut eager_slow = set.get(&key).is_some_and(|seen| seen.eager_slow);
-        let trial = set.get(&key).is_some_and(|seen| seen.trial);
+        let trial = set.get(&key).map_or(0, |seen| seen.trial);
         let history = match run {
             _ if !ms.is_finite() => History::Slow,
             Run::Ask if ms < QUICK_QUERY_MS => History::Quick(QuickExecution::PreserveAuto),
@@ -423,23 +434,44 @@ mod tests {
         );
         // one request holds the trial until it ends it, even when an overlapping cursor
         // run records another slow cursor
-        assert!(q.claim_trial(e));
-        assert!(!q.claim_trial(e));
+        let a = q.claim_trial(e).unwrap();
+        assert_eq!(q.claim_trial(e), None);
         q.record_cursor(e, 15.0);
         assert_eq!(q.history(e), History::TryEager);
-        assert!(
-            !q.claim_trial(e),
+        assert_eq!(
+            q.claim_trial(e),
+            None,
             "an overlapping cursor run starts no second trial"
         );
-        q.end_trial(e);
-        assert!(q.claim_trial(e));
+        q.end_trial(e, a);
+        let b = q.claim_trial(e).unwrap();
+        assert_ne!(a, b);
         q.record(e, 3.0);
-        q.end_trial(e);
+        q.end_trial(e, b);
         assert_eq!(q.history(e), History::Quick(QuickExecution::Eager));
-        assert!(!q.claim_trial(e));
-        assert!(!q.claim_trial(99), "an unseen text has no trial");
-        q.end_trial(99);
+        assert_eq!(q.claim_trial(e), None);
+        assert_eq!(q.claim_trial(99), None, "an unseen text has no trial");
+        q.end_trial(99, a);
         assert_eq!(q.history(99), History::Unseen);
+    }
+
+    /// A trial whose text was forgotten and claimed again by another request stays held
+    /// when the first request ends.
+    #[test]
+    fn ending_a_forgotten_trial_keeps_a_newer_claim() {
+        let q = QuickQueries::default();
+        q.record_cursor(1, 15.0);
+        let a = q.claim_trial(1).unwrap();
+        for k in 2..=REMEMBERED as u64 + 1 {
+            q.record(k, 1.0);
+        }
+        assert_eq!(q.history(1), History::Unseen, "the text was forgotten");
+        q.record_cursor(1, 15.0);
+        let b = q.claim_trial(1).unwrap();
+        q.end_trial(1, a);
+        assert_eq!(q.claim_trial(1), None, "the newer claim stays held");
+        q.end_trial(1, b);
+        assert!(q.claim_trial(1).is_some());
     }
 
     #[test]
